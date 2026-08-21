@@ -198,7 +198,10 @@ class TestInitialHandoffRuntimeGenerationFence:
         "cli_agent_orchestrator.mcp_server.server._SIDECAR_RUNTIME_GENERATION",
         "generation-N",
     )
-    @patch.dict(os.environ, {RUNTIME_GENERATION_ENV: "generation-N"})
+    @patch.dict(
+        os.environ,
+        {"CAO_TERMINAL_ID": "parent-processing", RUNTIME_GENERATION_ENV: "generation-N"},
+    )
     def test_processing_initial_handoff_waits_without_claim_or_replacement(
         self,
         mock_active_generation,

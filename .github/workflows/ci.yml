@@ -45,7 +45,35 @@ jobs:
             --cov=src/cli_agent_orchestrator \
             --cov-report=xml \
             --cov-report=term-missing \
+            --junitxml=pytest-results.xml \
             -v
+
+      - name: Report unit test failures
+        if: failure()
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          report = Path("pytest-results.xml")
+          if not report.is_file():
+              print("::error title=pytest report missing::pytest failed before it wrote pytest-results.xml")
+              raise SystemExit(0)
+
+          def escape(value: str) -> str:
+              return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+          root = ET.parse(report).getroot()
+          for case in root.findall(".//testcase"):
+              problem = case.find("failure")
+              if problem is None:
+                  problem = case.find("error")
+              if problem is None:
+                  continue
+              name = f"{case.get('classname', 'pytest')}.{case.get('name', 'failure')}"
+              detail = (problem.text or problem.get("message") or "pytest failure")[-4000:]
+              print(f"::error title={escape(name)}::{escape(detail)}")
+          PY
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4

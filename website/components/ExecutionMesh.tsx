@@ -49,7 +49,7 @@ export function ExecutionMesh() {
           {packets.map(([from, to, begin]) => {
             const a = nodeMap.get(from)!
             const b = nodeMap.get(to)!
-            return <circle key={`packet-${from}-${to}`} className="mesh-packet" r="0.6" cx={a.x} cy={a.y}>
+            return <circle key={`packet-${from}-${to}`} className="mesh-packet" r="0.6">
               <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.12;0.82;1" dur="2.5s" begin={begin} repeatCount="indefinite" />
               <animateMotion path={`M ${a.x} ${a.y} L ${b.x} ${b.y}`} dur="2.5s" begin={begin} repeatCount="indefinite" />
             </circle>

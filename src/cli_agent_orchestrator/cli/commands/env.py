@@ -14,7 +14,7 @@ from cli_agent_orchestrator.utils.env import (
 @click.group(name="env", invoke_without_command=True)
 @click.pass_context
 def env(ctx: click.Context) -> None:
-    """Manage CAO environment variables."""
+    """Manage ThreadCells environment variables."""
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
 

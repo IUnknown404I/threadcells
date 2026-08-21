@@ -1099,7 +1099,7 @@ def run_housekeeping(
 
 
 def housekeeping_main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="cao-housekeeping")
+    parser = argparse.ArgumentParser(prog="threadcells-housekeeping")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--mode", choices=("frequent", "weekly", "pressure"), default="frequent")
     parser.add_argument(

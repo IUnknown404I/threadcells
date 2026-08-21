@@ -222,7 +222,7 @@ def test_launch_request_exception():
         result = runner.invoke(launch, ["--agents", "test-agent", "--yolo"])
 
         assert result.exit_code != 0
-        assert "Failed to connect to cao-server" in result.output
+        assert "Failed to connect to ThreadCells server" in result.output
 
 
 def test_launch_generic_exception():

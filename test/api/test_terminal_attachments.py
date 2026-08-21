@@ -162,7 +162,7 @@ def test_text_attachment_returns_404_for_unknown_terminal(client):
     [
         ("notes.md", "notes.md"),
         ("%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82.md", "привет.md"),
-        ("Sample%20Project%20%E2%80%94%20title.md", "Sample Project — title.md"),
+        ("ThreadCells%20%E2%80%94%20title.md", "ThreadCells — title.md"),
         ("%E6%97%A5%E6%9C%AC%E8%AA%9E.md", "日本語.md"),
         ("emoji%20%F0%9F%98%80%25%26.md", "emoji 😀%&.md"),
     ],

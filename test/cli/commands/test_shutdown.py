@@ -59,7 +59,7 @@ class TestShutdownCommand:
         result = runner.invoke(shutdown, ["--all"])
 
         assert result.exit_code == 0
-        assert "No cao sessions found to shutdown" in result.output
+        assert "No ThreadCells sessions found to shutdown" in result.output
 
     @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.delete")
     def test_shutdown_specific_session(self, mock_delete, runner):
@@ -79,7 +79,7 @@ class TestShutdownCommand:
         result = runner.invoke(shutdown, ["--all"])
 
         assert result.exit_code != 0
-        assert "Failed to connect to cao-server" in result.output
+        assert "Failed to connect to ThreadCells server" in result.output
 
     @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.delete")
     def test_shutdown_session_server_not_running(self, mock_delete, runner):
@@ -89,7 +89,7 @@ class TestShutdownCommand:
         result = runner.invoke(shutdown, ["--session", "cao-test"])
 
         assert result.exit_code != 0
-        assert "Failed to connect to cao-server" in result.output
+        assert "Failed to connect to ThreadCells server" in result.output
 
     @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.delete")
     def test_shutdown_session_404_already_removed(self, mock_delete, runner):
@@ -127,7 +127,7 @@ class TestShutdownCommand:
         assert result.exit_code == 0
         assert "Shutdown session 'session-1'" in result.output
         assert "Shutdown session 'session-3'" in result.output
-        assert "Failed to connect to cao-server" in result.output
+        assert "Failed to connect to ThreadCells server" in result.output
 
     @patch("cli_agent_orchestrator.cli.commands.shutdown.requests.delete")
     def test_shutdown_session_http_error(self, mock_delete, runner):
@@ -141,4 +141,4 @@ class TestShutdownCommand:
         result = runner.invoke(shutdown, ["--session", "cao-test"])
 
         assert result.exit_code != 0
-        assert "Failed to connect to cao-server" in result.output
+        assert "Failed to connect to ThreadCells server" in result.output

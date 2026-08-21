@@ -42,13 +42,13 @@ If the candidate set changes between plan and execution, manual execution reject
 From the installed environment, first request JSON output:
 
 ```bash
-cao-housekeeping --dry-run --json
+threadcells-housekeeping --dry-run --json
 ```
 
 Review every candidate and copy the returned `plan_id`. Execute only that inspected plan:
 
 ```bash
-cao-housekeeping --plan-id PLAN_ID_FROM_DRY_RUN
+threadcells-housekeeping --plan-id PLAN_ID_FROM_DRY_RUN
 ```
 
 Do not script `plan_id` extraction and immediate execution until you understand the plan. A dry-run never implies approval to delete.

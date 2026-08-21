@@ -151,7 +151,7 @@ export default function Home() {
         <section className="experience section-shell" aria-labelledby="experience-title">
           <div className="section-heading product-heading">
             <div><p className="eyebrow">PRODUCT EXPERIENCE / 06</p><h2 id="experience-title">Operational detail,<br />without terminal archaeology.</h2></div>
-            <p>Move from fleet state to agent profiles, capacity, and packaged documentation without losing the current operating context.</p>
+            <p>Move from fleet state to agent profiles, capacity, Statistics, and packaged documentation without losing the current operating context.</p>
           </div>
           <div className="shot-gallery">
             <ProductShot src="/media/screenshots/threadcells-agents.webp" alt="ThreadCells Agents screen with searchable synthetic agent profiles" label="AGENTS / PROFILE DISCOVERY" detail="Search authority and execution roles" />

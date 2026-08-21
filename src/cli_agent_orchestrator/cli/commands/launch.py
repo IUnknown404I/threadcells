@@ -138,7 +138,7 @@ def launch(
     working_directory,
     owner_xhigh,
 ):
-    """Launch cao session with specified agent profile."""
+    """Launch a ThreadCells session with the specified agent profile."""
     try:
         display_dir = working_directory or os.path.realpath(os.getcwd())
 
@@ -368,7 +368,7 @@ def launch(
                 click.echo(output)
 
     except requests.exceptions.RequestException as e:
-        raise click.ClickException(f"Failed to connect to cao-server: {str(e)}")
+        raise click.ClickException(f"Failed to connect to ThreadCells server: {str(e)}")
     except click.ClickException:
         raise
     except Exception as e:

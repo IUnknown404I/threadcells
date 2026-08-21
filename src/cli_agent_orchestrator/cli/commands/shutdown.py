@@ -12,7 +12,7 @@ def _list_sessions():
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
-        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+        raise click.ClickException(f"Failed to connect to ThreadCells server: {e}")
 
 
 def _delete_session(name):
@@ -24,11 +24,11 @@ def _delete_session(name):
         response.raise_for_status()
         return True
     except requests.exceptions.RequestException as e:
-        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+        raise click.ClickException(f"Failed to connect to ThreadCells server: {e}")
 
 
 @click.command()
-@click.option("--all", "shutdown_all", is_flag=True, help="Shutdown all cao sessions")
+@click.option("--all", "shutdown_all", is_flag=True, help="Shutdown all ThreadCells sessions")
 @click.option("--session", help="Shutdown specific session")
 def shutdown(shutdown_all, session):
     """Shutdown tmux sessions and cleanup terminal records."""
@@ -46,7 +46,7 @@ def shutdown(shutdown_all, session):
         sessions_to_shutdown = [session]
 
     if not sessions_to_shutdown:
-        click.echo("No cao sessions found to shutdown")
+        click.echo("No ThreadCells sessions found to shutdown")
         return
 
     for session_name in sessions_to_shutdown:

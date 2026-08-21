@@ -4,7 +4,7 @@ import path from 'node:path'
 import { chromium } from '@playwright/test'
 import { startStaticServer } from './static-server.mjs'
 
-const basePath = process.env.BASE_PATH || ''
+const basePath = process.env.BASE_PATH ?? process.env.NEXT_PUBLIC_BASE_PATH ?? ''
 const productRoot = path.resolve(process.env.THREADCELLS_PRODUCT_ROOT || path.join(process.cwd(), '..'))
 const manifest = JSON.parse(await readFile(path.join(productRoot, 'docs', 'DOCS_MANIFEST.json'), 'utf8'))
 const routes = ['', '/docs', ...manifest.documents.map(document => `/docs/${document.slug}`)]

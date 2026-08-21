@@ -1214,8 +1214,14 @@ class TestCodexV0146FooterAndPromptRegressions:
                 "__CAO_CODEX_STARTUP_EXIT_c3d28adf_1__:0\n"
             ),
             "__CAO_CODEX_STARTUP_EXIT_c3d28adf_1__:0\n",
-            ("__CAO_CODEX_STARTUP_EXIT_c3d28adf_2__:0\n" "agentctl@cao:/workspace/sample-project$\n"),
-            ("__CAO_CODEX_STARTUP_EXIT_c3d28adf_1__:1\n" "agentctl@cao:/workspace/sample-project$\n"),
+            (
+                "__CAO_CODEX_STARTUP_EXIT_c3d28adf_2__:0\n"
+                "agentctl@cao:/workspace/sample-project$\n"
+            ),
+            (
+                "__CAO_CODEX_STARTUP_EXIT_c3d28adf_1__:1\n"
+                "agentctl@cao:/workspace/sample-project$\n"
+            ),
             ("__CAO_CODEX_STARTUP_EXIT_c3d28adf_1__:0\n" "Assistant prose ending in currency $\n"),
             (
                 "__CAO_CODEX_STARTUP_EXIT_c3d28adf_1__:0\n"

@@ -38,6 +38,7 @@ def test_tmux_36_80_column_capture_joins_soft_wraps_but_keeps_v1_hard_newline():
     session_name = f"logical-{uuid.uuid4().hex[:8]}"
     target = f"{session_name}:0"
     payload, wire = _soft_wrap_boundary_wire()
+    payload_line = wire.split("\n", 1)[1]
     shell_command = (
         "printf '%b\\n%s\\n' "
         + shlex.quote("\\033[36m• CAO_RESULT_V1\\033[0m")
@@ -87,13 +88,17 @@ def test_tmux_36_80_column_capture_joins_soft_wraps_but_keeps_v1_hard_newline():
                 check=True,
                 text=True,
             ).stdout
-            if "\x1b[36m• CAO_RESULT_V1" in history:
+            # tmux can expose the first rendered line before the following
+            # soft-wrapped payload has reached pane history. Wait for the
+            # complete write so the assertion measures capture semantics,
+            # rather than scheduler timing on a busy runner.
+            if "\x1b[36m• CAO_RESULT_V1" in history and payload_line in history:
                 break
             time.sleep(0.05)
 
         assert "\x1b[36m• CAO_RESULT_V1" in history
         logical_history = re.sub(r"\x1b\[[0-9;]*m", "", history)
-        assert f"• CAO_RESULT_V1\n{wire.split(chr(10), 1)[1]}" in logical_history
+        assert f"• CAO_RESULT_V1\n{payload_line}" in logical_history
         assert payload in logical_history
         assert f"{payload[:80]}\n" not in logical_history
     finally:

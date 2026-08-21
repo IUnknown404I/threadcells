@@ -98,6 +98,23 @@ def _write_token(token: str) -> None:
             temporary.unlink()
 
 
+def _clear_token() -> None:
+    """Remove the configured credential without following an unsafe path."""
+    _ensure_secret_directory()
+    try:
+        metadata = TELEGRAM_TOKEN_FILE.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(metadata.st_mode):
+        raise TelegramSecretError("Telegram token storage is unsafe")
+    TELEGRAM_TOKEN_FILE.unlink()
+    directory_fd = os.open(TELEGRAM_SECRET_DIR, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _load_token() -> str:
     try:
         metadata = TELEGRAM_TOKEN_FILE.lstat()
@@ -145,7 +162,9 @@ def get_settings() -> dict[str, Any]:
 def update_settings(values: Mapping[str, Any], *, actor: str) -> dict[str, Any]:
     if not actor or len(actor) > 120:
         raise ValueError("Telegram settings actor is required")
-    if set(values) != {"enabled", "chat_id", "message_thread_id", "bot_token"}:
+    required_keys = {"enabled", "chat_id", "message_thread_id", "bot_token"}
+    allowed_keys = required_keys | {"clear_bot_token"}
+    if not required_keys.issubset(values) or not set(values).issubset(allowed_keys):
         raise ValueError("Telegram settings payload is invalid")
     enabled = values["enabled"]
     if not isinstance(enabled, bool):
@@ -153,16 +172,25 @@ def update_settings(values: Mapping[str, Any], *, actor: str) -> dict[str, Any]:
     chat_id = _validate_destination(values.get("chat_id"))
     thread_id = _validate_thread_id(values.get("message_thread_id"))
     token = values.get("bot_token")
+    clear_token = values.get("clear_bot_token", False)
+    if not isinstance(clear_token, bool):
+        raise ValueError("Telegram token clear flag must be a boolean")
     token_value: Optional[str] = None
     if token is not None:
         if not isinstance(token, str):
             raise ValueError("Telegram bot token is invalid")
         token_value = _validate_token(token)
+    if clear_token and token_value is not None:
+        raise ValueError("Replace or clear the Telegram bot token, not both")
+    if clear_token and enabled:
+        raise ValueError("Disable Telegram notifications before clearing the bot token")
     if enabled and chat_id is None:
         raise ValueError("Configure a bot token and chat ID before enabling Telegram")
     if enabled and token_value is None and _token_state() != "configured":
         raise ValueError("Configure a bot token and chat ID before enabling Telegram")
-    if token_value is not None:
+    if clear_token:
+        _clear_token()
+    elif token_value is not None:
         _write_token(token_value)
     persist_telegram_settings(
         enabled=enabled,

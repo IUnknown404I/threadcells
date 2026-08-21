@@ -39,7 +39,7 @@ Profiles prioritize searchable built-in/custom discovery and resolved previews. 
 
 ## Telegram notifications
 
-Settings → Telegram configures one installation-global destination independently of projects. The bot token is write-only in the UI; connection and test-message actions are explicit. Enabled delivery covers only top-level completion, owner-attention gates, and unexpected top-level terminal failure, with durable duplicate suppression and fail-open delivery. See [Telegram notifications](TELEGRAM_NOTIFICATIONS.md).
+Settings → Telegram configures one installation-global destination independently of projects. The bot token is write-only in the UI; connection and test-message actions are explicit, and the separate confirmed clear action disables delivery while removing the credential. Enabled delivery covers only top-level completion, owner-attention gates, and unexpected top-level terminal failure, with durable duplicate suppression and fail-open delivery. See [Telegram notifications](TELEGRAM_NOTIFICATIONS.md).
 
 ## Statistics
 

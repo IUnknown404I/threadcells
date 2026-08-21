@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { CheckCircle2, Radio, Send, ShieldCheck } from 'lucide-react'
 import { api, TelegramSettings as TelegramSettingsState } from '../api'
+import { ConfirmModal } from './ConfirmModal'
 import { OperatorAccessCard, useOperatorAccess } from './OperatorAccess'
 
 const RESULT_LABELS: Record<string, string> = {
@@ -18,7 +19,8 @@ export function TelegramSettings() {
   const [chatId, setChatId] = useState('')
   const [threadId, setThreadId] = useState('')
   const [token, setToken] = useState('')
-  const [busy, setBusy] = useState<'save' | 'check' | 'test' | null>(null)
+  const [busy, setBusy] = useState<'save' | 'check' | 'test' | 'clear' | null>(null)
+  const [confirmClear, setConfirmClear] = useState(false)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
 
@@ -36,7 +38,7 @@ export function TelegramSettings() {
 
   useEffect(() => { void load() }, [])
 
-  const run = async (kind: 'save' | 'check' | 'test') => {
+  const run = async (kind: 'save' | 'check' | 'test' | 'clear') => {
     setError(''); setNotice(''); setBusy(kind)
     try {
       if (kind === 'save') {
@@ -47,16 +49,26 @@ export function TelegramSettings() {
           chat_id: chatId.trim() || null,
           message_thread_id: threadId.trim() ? Number(threadId) : null,
           bot_token: token.trim() || null,
+          clear_bot_token: false,
         })
         apply(next); setToken(''); setNotice('Telegram settings saved.')
       } else if (kind === 'check') {
         const result = await api.checkTelegramConnection()
         setNotice(result.ok ? 'Telegram connection check passed.' : 'Telegram connection check failed safely.')
         await load()
-      } else {
+      } else if (kind === 'test') {
         const result = await api.sendTelegramTest()
         setNotice(result.ok ? 'Test notification sent.' : 'Test notification was not sent.')
         await load()
+      } else {
+        const next = await api.updateTelegramSettings({
+          enabled: false,
+          chat_id: chatId.trim() || null,
+          message_thread_id: threadId.trim() ? Number(threadId) : null,
+          bot_token: null,
+          clear_bot_token: true,
+        })
+        apply(next); setToken(''); setNotice('Telegram bot token cleared and notifications disabled.')
       }
     } catch (reason: any) {
       setError(reason.message || `Telegram ${kind} failed`)
@@ -100,6 +112,7 @@ export function TelegramSettings() {
         <button disabled={!access.status?.authenticated || busy !== null} onClick={() => void run('save')} className="inline-flex min-h-11 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-medium text-white disabled:opacity-40"><ShieldCheck size={15}/>{busy === 'save' ? 'Saving…' : 'Save settings'}</button>
         <button disabled={!access.status?.authenticated || busy !== null || !settings.token_configured} onClick={() => void run('check')} className="inline-flex min-h-11 items-center gap-2 rounded-lg border border-gray-700 px-4 text-sm text-gray-300 disabled:opacity-40"><Radio size={15}/>{busy === 'check' ? 'Checking…' : 'Check connection'}</button>
         <button disabled={!access.status?.authenticated || busy !== null || !configured} onClick={() => void run('test')} className="inline-flex min-h-11 items-center gap-2 rounded-lg border border-gray-700 px-4 text-sm text-gray-300 disabled:opacity-40"><Send size={15}/>{busy === 'test' ? 'Sending…' : 'Send test notification'}</button>
+        <button disabled={!access.status?.authenticated || busy !== null || settings.token_state === 'missing'} onClick={() => setConfirmClear(true)} className="inline-flex min-h-11 items-center gap-2 rounded-lg border border-red-800/70 px-4 text-sm text-red-300 disabled:opacity-40">Clear bot token</button>
       </div>
     </div>
     <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-gray-800 bg-gray-900/40 p-4 text-xs text-gray-500">
@@ -107,5 +120,13 @@ export function TelegramSettings() {
     </div>
     {notice && <p role="status" className="rounded-lg border border-emerald-800/40 bg-emerald-950/20 p-3 text-sm text-emerald-200">{notice}</p>}
     {error && <p role="alert" className="break-words rounded-lg border border-red-700/50 bg-red-950/30 p-3 text-sm text-red-300">{error}</p>}
+    <ConfirmModal
+      open={confirmClear}
+      title="Clear Telegram bot token"
+      message="This removes the stored credential and disables Telegram notifications. The destination fields are retained."
+      confirmLabel="Clear token"
+      onConfirm={() => { setConfirmClear(false); void run('clear') }}
+      onCancel={() => setConfirmClear(false)}
+    />
   </section>
 }

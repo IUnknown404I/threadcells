@@ -60,7 +60,7 @@ def test_rejects_oversized_image_before_writing():
     [
         "notes.md",
         "привет.md",
-        "Sample Project — title.md",
+        "ThreadCells — title.md",
         "日本語.md",
         "emoji 😀%&.md",
         "notes.txt",

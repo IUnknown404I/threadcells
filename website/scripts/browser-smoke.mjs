@@ -4,7 +4,7 @@ import path from 'node:path'
 import { chromium } from '@playwright/test'
 import { startStaticServer } from './static-server.mjs'
 
-const basePath = process.env.BASE_PATH || ''
+const basePath = process.env.BASE_PATH ?? process.env.NEXT_PUBLIC_BASE_PATH ?? ''
 const evidenceDir = process.env.WEBSITE_EVIDENCE_DIR || '/tmp/threadcells-website-evidence'
 await mkdir(evidenceDir, { recursive: true })
 const server = await startStaticServer({ basePath })

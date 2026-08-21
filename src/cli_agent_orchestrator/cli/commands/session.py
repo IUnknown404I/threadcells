@@ -51,17 +51,17 @@ def _resolve_conductor(session_name):
 
 @click.group()
 def session():
-    """Manage CAO sessions."""
+    """Manage ThreadCells sessions."""
 
 
 @session.command("list")
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON")
 def list_sessions(as_json):
-    """List all active CAO sessions."""
+    """List all active ThreadCells sessions."""
     try:
         sessions = _get_sessions()
     except requests.exceptions.RequestException as e:
-        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+        raise click.ClickException(f"Failed to connect to ThreadCells server: {e}")
 
     if not sessions:
         if as_json:
@@ -129,7 +129,7 @@ def status(session_name, terminal_id, workers, as_json):
             conductor_raw, all_terminals = _resolve_conductor(session_name)
             target = _get_terminal(conductor_raw["id"])
     except requests.exceptions.RequestException as e:
-        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+        raise click.ClickException(f"Failed to connect to ThreadCells server: {e}")
 
     try:
         output_data = _get_terminal_output(target["id"])
@@ -230,7 +230,7 @@ def send(session_name, message, terminal_id, is_async, timeout):
         )
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
-        raise click.ClickException(f"Failed to connect to cao-server: {e}")
+        raise click.ClickException(f"Failed to connect to ThreadCells server: {e}")
 
     if is_async:
         click.echo(f"Message sent to terminal {target_id}")

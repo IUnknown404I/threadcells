@@ -642,7 +642,7 @@ def acquire_heavy_slot(
 
 
 def resource_status_main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="cao-resource-status")
+    parser = argparse.ArgumentParser(prog="threadcells-resource-status")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     status = get_resource_status()
@@ -677,7 +677,7 @@ def resource_status_main(argv: Sequence[str] | None = None) -> int:
 
 
 def heavy_run_main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="cao-heavy-run")
+    parser = argparse.ArgumentParser(prog="threadcells-heavy-run")
     parser.add_argument(
         "--recovery-safe",
         action="store_true",

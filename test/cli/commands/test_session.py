@@ -82,7 +82,7 @@ class TestListSessions:
         result = runner.invoke(session, ["list"])
 
         assert result.exit_code != 0
-        assert "Failed to connect to cao-server" in result.output
+        assert "Failed to connect to ThreadCells server" in result.output
 
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
     def test_list_sessions_terminal_fetch_error_skips_session(self, mock_get, runner):
@@ -372,7 +372,7 @@ class TestSend:
         result = runner.invoke(session, ["send", "cao-test", "hello"])
 
         assert result.exit_code != 0
-        assert "Failed to connect to cao-server" in result.output
+        assert "Failed to connect to ThreadCells server" in result.output
 
     @patch("cli_agent_orchestrator.cli.commands.session.requests.get")
     def test_send_terminal_not_idle(self, mock_get, runner):

@@ -50,6 +50,41 @@ def test_operator_can_set_or_replace_token_without_response_reflection(client):
 
     assert response.status_code == 200
     assert token not in response.text
+    update.assert_called_once_with(
+        {**payload, "clear_bot_token": False}, actor="operator_session:test"
+    )
+
+
+def test_operator_can_clear_token_without_response_reflection(client):
+    cleared = {
+        **SAFE_SETTINGS,
+        "enabled": False,
+        "token_configured": False,
+        "token_state": "missing",
+        "configuration_state": "not_configured",
+    }
+    payload = {
+        "enabled": False,
+        "chat_id": "-1001234567890",
+        "message_thread_id": 77,
+        "bot_token": None,
+        "clear_bot_token": True,
+    }
+    with (
+        patch(
+            "cli_agent_orchestrator.api.main._require_operator",
+            return_value="operator_session:test",
+        ),
+        patch(
+            "cli_agent_orchestrator.api.main.telegram_notification_service.update_settings",
+            return_value=cleared,
+        ) as update,
+    ):
+        response = client.put("/api/v1/telegram", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == cleared
+    assert "bot_token" not in response.text
     update.assert_called_once_with(payload, actor="operator_session:test")
 
 

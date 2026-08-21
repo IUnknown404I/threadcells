@@ -110,6 +110,57 @@ def test_secret_set_replace_persists_but_is_never_returned(telegram_state):
     assert telegram.get_settings()["configuration_state"] == "enabled"
 
 
+def test_secret_clear_is_explicit_disables_delivery_and_retains_destination(telegram_state):
+    _configure(enabled=True, thread_id=77)
+
+    cleared = telegram.update_settings(
+        {
+            "enabled": False,
+            "chat_id": "-1001234567890",
+            "message_thread_id": 77,
+            "bot_token": None,
+            "clear_bot_token": True,
+        },
+        actor="operator:test",
+    )
+
+    assert cleared["enabled"] is False
+    assert cleared["chat_id"] == "-1001234567890"
+    assert cleared["message_thread_id"] == 77
+    assert cleared["token_configured"] is False
+    assert cleared["token_state"] == "missing"
+    assert cleared["configuration_state"] == "not_configured"
+    assert not telegram.TELEGRAM_TOKEN_FILE.exists()
+
+
+@pytest.mark.parametrize(
+    ("enabled", "token", "message"),
+    [
+        (True, None, "Disable Telegram notifications"),
+        (False, TOKEN_TWO, "Replace or clear"),
+    ],
+)
+def test_secret_clear_rejects_ambiguous_or_enabled_requests(
+    telegram_state, enabled, token, message
+):
+    _configure(enabled=True)
+
+    with pytest.raises(ValueError, match=message):
+        telegram.update_settings(
+            {
+                "enabled": enabled,
+                "chat_id": "-1001234567890",
+                "message_thread_id": None,
+                "bot_token": token,
+                "clear_bot_token": True,
+            },
+            actor="operator:test",
+        )
+
+    assert telegram._load_token() == TOKEN_ONE
+    assert telegram.get_settings()["configuration_state"] == "enabled"
+
+
 def test_failed_destination_validation_does_not_mutate_secret(telegram_state):
     with pytest.raises(ValueError, match="Configure a bot token"):
         telegram.update_settings(

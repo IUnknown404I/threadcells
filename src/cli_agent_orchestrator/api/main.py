@@ -184,6 +184,7 @@ class TelegramSettingsUpdate(BaseModel):
     enabled: bool
     chat_id: Optional[str] = Field(default=None, max_length=128)
     message_thread_id: Optional[int] = Field(default=None, ge=1, le=2_147_483_647)
+    clear_bot_token: bool = False
     # Accept the opaque input at the model boundary so Pydantic never embeds a
     # malformed credential in its standard validation response. ``repr=False``
     # and ``exclude=True`` keep it out of model diagnostics/serialization; the

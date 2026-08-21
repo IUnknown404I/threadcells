@@ -61,6 +61,7 @@ describe('Telegram settings', () => {
       chat_id: '-1001234567890',
       message_thread_id: 77,
       bot_token: '123456789:abcdefghijklmnopqrstuvwxyz',
+      clear_bot_token: false,
     }))
     expect(screen.getByLabelText('Telegram bot token')).toHaveValue('')
     expect(screen.getByText('Telegram settings saved.')).toBeInTheDocument()
@@ -80,6 +81,39 @@ describe('Telegram settings', () => {
     await waitFor(() => expect(check).toHaveBeenCalledTimes(1))
     fireEvent.click(screen.getByRole('button', { name: 'Send test notification' }))
     await waitFor(() => expect(send).toHaveBeenCalledTimes(1))
+  })
+
+  it('confirms token clearing, disables delivery, and retains the destination', async () => {
+    operator()
+    vi.spyOn(api, 'getTelegramSettings').mockResolvedValue({
+      ...settings,
+      enabled: true,
+      configuration_state: 'enabled',
+    })
+    const update = vi.spyOn(api, 'updateTelegramSettings').mockResolvedValue({
+      ...settings,
+      enabled: false,
+      token_configured: false,
+      token_state: 'missing',
+      configuration_state: 'not_configured',
+    })
+    render(<TelegramSettings />)
+    await screen.findByRole('heading', { name: 'Telegram notifications' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Clear bot token' }))
+    expect(screen.getByRole('dialog', { name: 'Clear Telegram bot token' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Clear token' }))
+
+    await waitFor(() => expect(update).toHaveBeenCalledWith({
+      enabled: false,
+      chat_id: '-1001234567890',
+      message_thread_id: 77,
+      bot_token: null,
+      clear_bot_token: true,
+    }))
+    expect(screen.getByLabelText('Telegram chat ID')).toHaveValue('-1001234567890')
+    expect(screen.getByLabelText('Telegram topic ID')).toHaveValue(77)
+    expect(screen.getByText('Telegram bot token cleared and notifications disabled.')).toBeInTheDocument()
   })
 
   it('keeps protected actions unavailable while operator changes are locked', async () => {

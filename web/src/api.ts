@@ -341,7 +341,7 @@ export const api = {
   createXHighGrant: (data: { agent_profile: string; provider: string; working_directory?: string; requested_session_name?: string; project_id?: string; launch_mode: 'new_session' | 'existing_session'; confirmed: true }) =>
     fetchJSON<OwnerLaunchGrant>('/operator/xhigh-grants', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }),
   getTelegramSettings: () => fetchJSON<TelegramSettings>('/api/v1/telegram'),
-  updateTelegramSettings: (data: { enabled: boolean; chat_id: string | null; message_thread_id: number | null; bot_token: string | null }) =>
+  updateTelegramSettings: (data: { enabled: boolean; chat_id: string | null; message_thread_id: number | null; bot_token: string | null; clear_bot_token?: boolean }) =>
     fetchJSON<TelegramSettings>('/api/v1/telegram', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }),
   checkTelegramConnection: () => fetchJSON<{ ok: boolean; status: string; reason_code?: string }>('/api/v1/telegram/check', { method: 'POST' }),
   sendTelegramTest: () => fetchJSON<{ ok: boolean; status: string; reason_code?: string }>('/api/v1/telegram/test', { method: 'POST' }),

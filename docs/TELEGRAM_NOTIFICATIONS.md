@@ -12,7 +12,7 @@ ThreadCells can send low-noise lifecycle notifications to one Telegram destinati
 6. Use **Check connection** to validate the bot credential, then **Send test notification** to validate the destination.
 7. Enable notifications and save again.
 
-The test action is explicit; opening Settings never contacts Telegram. Disabling notifications retains the configured destination and token so they can be re-enabled later.
+The test action is explicit; opening Settings never contacts Telegram. Disabling notifications retains the configured destination and token so they can be re-enabled later. **Clear bot token** is a separate confirmed operator action: it removes the credential, disables notifications, and retains the non-secret destination fields.
 
 ## Secret handling
 
@@ -24,7 +24,7 @@ The server stores the token at:
 $CAO_HOME_DIR/secrets/telegram-bot-token
 ```
 
-The parent directory is restricted to the runtime account and the token file uses mode `0600`. Replacement uses an atomic filesystem rename. `CAO_HOME_DIR` is the installation's private mutable state root, not a public repository path.
+The parent directory is restricted to the runtime account and the token file uses mode `0600`. Replacement uses an atomic filesystem rename; clearing unlinks the credential without following it and synchronizes the secret directory. `CAO_HOME_DIR` is the installation's private mutable state root, not a public repository path.
 
 Treat this file as a credential. Do not copy it into source control, ordinary support bundles, database exports, shell history, or screenshots. Rotate it through Telegram if disclosure is suspected.
 

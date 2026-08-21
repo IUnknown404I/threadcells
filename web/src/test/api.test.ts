@@ -214,7 +214,7 @@ describe('API wrapper', () => {
   it.each([
     ['notes.md', 'notes.md'],
     ['привет.md', '%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82.md'],
-    ['Sample Project — title.md', 'Sample%20Project%20%E2%80%94%20title.md'],
+    ['ThreadCells — title.md', 'ThreadCells%20%E2%80%94%20title.md'],
     ['日本語.md', '%E6%97%A5%E6%9C%AC%E8%AA%9E.md'],
     ['emoji 😀%&.md', 'emoji%20%F0%9F%98%80%25%26.md'],
   ])('encodes the full %s terminal filename into an ASCII header', async (filename, expectedHeader) => {

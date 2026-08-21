@@ -15,7 +15,7 @@ class TestEnvCommand:
         result = runner.invoke(cli, ["env"])
 
         assert result.exit_code == 0
-        assert "Manage CAO environment variables" in result.output
+        assert "Manage ThreadCells environment variables" in result.output
         assert "set" in result.output
         assert "get" in result.output
         assert "list" in result.output

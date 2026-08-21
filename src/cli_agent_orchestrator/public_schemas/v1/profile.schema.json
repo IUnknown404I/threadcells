@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/IUnknown404I/threadcells/main/schemas/v1/profile.schema.json",
+  "title": "ThreadCells ProfileDefinition V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "profile_id", "display_name", "description", "provider_config_id", "role", "execution_mode", "instructions"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "profile_id": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"},
+    "display_name": {"type": "string", "minLength": 1, "maxLength": 120},
+    "description": {"type": "string", "minLength": 1, "maxLength": 500},
+    "provider_config_id": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"},
+    "role": {"enum": ["supervisor", "developer", "reviewer", "worker"]},
+    "execution_mode": {"enum": ["orchestrator", "owner_executor", "executor", "reviewer"]},
+    "enabled": {"type": "boolean", "default": true},
+    "owner_authorization_required": {"type": "boolean", "default": false},
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "approval_policy": {"enum": ["untrusted", "on-failure", "on-request", "never"]},
+        "sandbox_mode": {"enum": ["read-only", "workspace-write", "danger-full-access"]},
+        "unrestricted_tools_authorized": {"type": "boolean"}
+      }
+    },
+    "model": {"type": ["string", "null"], "maxLength": 120},
+    "reasoning_level": {"type": ["string", "null"], "enum": ["minimal", "low", "medium", "high", "xhigh", null]},
+    "allowed_tools": {"type": "array", "maxItems": 128, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 120}},
+    "mcp_server_refs": {"type": "array", "maxItems": 32, "uniqueItems": true, "items": {"type": "string"}},
+    "timeouts": {"type": "object", "additionalProperties": {"type": "integer", "minimum": 1, "maximum": 86400}},
+    "instructions": {"type": "string", "minLength": 1, "maxLength": 250000}
+  }
+}

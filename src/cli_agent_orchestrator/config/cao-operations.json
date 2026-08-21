@@ -1,0 +1,42 @@
+{
+  "max_resident_supervisors": 5,
+  "max_provider_executions": 3,
+  "max_work_contexts": 2,
+  "max_heavy_execution_slots": 1,
+  "memory_green_mib": 1536,
+  "memory_red_mib": 800,
+  "root_used_yellow_percent": 70,
+  "root_used_red_percent": 85,
+  "root_used_critical_percent": 92,
+  "root_free_green_gib": 10,
+  "memory_pressure_some_yellow_avg10": 5.0,
+  "memory_pressure_full_red_avg10": 1.0,
+  "pressure_recovery_timeout_seconds": 30,
+  "subprocess_timeout_seconds": 20,
+  "context_launch_lock_timeout_seconds": 120,
+  "heavy_slot_wait_timeout_seconds": 3600,
+  "log_compress_after_minutes": 1440,
+  "retention_minutes": 10080,
+  "orphan_browser_age_minutes": 120,
+  "log_tree_warning_gib": 5,
+  "backup_tree_warning_gib": 5,
+  "cache_prune_threshold_gib": 5,
+  "root": "/var/lib/threadcells",
+  "lock_dir": "/var/lock/threadcells",
+  "release_staging_lock": "/var/lock/threadcells/release-staging.lock",
+  "release_metadata": "/var/lib/threadcells/state/cao/release-metadata.json",
+  "release_roots": [
+    "/var/lib/threadcells/releases"
+  ],
+  "runtime_user": "threadcells",
+  "playwright_manifest_roots": [
+    "/var/lib/threadcells/sources",
+    "/var/lib/threadcells/projects"
+  ],
+  "playwright_browser_cache": "/var/cache/threadcells/ms-playwright",
+  "package_caches": [
+    {"name": "uv", "path": "/var/cache/threadcells/uv", "command": ["uv", "cache", "prune"]},
+    {"name": "pnpm", "path": "/var/cache/threadcells/pnpm", "command": ["pnpm", "store", "prune"]},
+    {"name": "npm", "path": "/var/cache/threadcells/npm", "command": ["npm", "cache", "clean", "--force"]}
+  ]
+}

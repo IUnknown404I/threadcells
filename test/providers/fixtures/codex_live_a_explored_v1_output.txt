@@ -1,0 +1,14 @@
+› [CAO Handoff] Produce the final structured result.
+• Ran rg --files src test
+  └ located the provider and handoff tests
+• Explored
+  ├ src/cli_agent_orchestrator/providers/codex.py
+  └ test/mcp_server/test_handoff.py
+
+────────────────────────────────────────────────────────────────────────────────
+
+• CAO_RESULT_V1
+  {"summary": "Live A handoff complete", "body_markdown": "The final structured handoff report.", "changed_files": ["src/cli_agent_orchestrator/providers/codex.py"], "checks": [{"command": "pytest", "result": "passed"}], "risks": [], "blockers": [], "format": "v1"}
+
+› Continue working
+  gpt-5.6-terra high · 96% left · /workspace/sample-project

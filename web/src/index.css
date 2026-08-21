@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background: #0f0f14;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  min-width: 320px;
+}
+
+button, input, select, textarea {
+  max-width: 100%;
+}
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
+
+.primary-navigation-rail {
+  scrollbar-color: #374151 transparent;
+  scrollbar-width: thin;
+}
+
+.primary-navigation-rail::-webkit-scrollbar { height: 4px; }
+
+*:focus-visible {
+  outline: 2px solid #059669;
+  outline-offset: 2px;
+}

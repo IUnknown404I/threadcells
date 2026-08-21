@@ -1,0 +1,33 @@
+{
+  "schema": 2,
+  "product": "ThreadCells",
+  "source": "ThreadCells Brand Asset Pack",
+  "canonical_pack_root": "brand/threadcells_brand_asset_pack",
+  "canonical_pack_checksum_file": "brand/threadcells_brand_asset_pack/SHA256SUMS.txt",
+  "surface": "bg-101622",
+  "assets": [
+    {"source": "logos/bg-101622/threadcells-logo-horizontal.png", "destination": "docs/assets/threadcells-logo-horizontal.png", "sha256": "0d4308df8009f5881e7fbeb0a72b3f47d8aec42c1c423f8516e9e375b7d99035"},
+    {"source": "favicons/bg-101622/android-chrome-192x192.png", "destination": "web/public/android-chrome-192x192.png", "sha256": "1599bb386fc4fd5db4c546a5373412b657c3cda4e04e875db8b135ddc2704143"},
+    {"source": "favicons/bg-101622/android-chrome-512x512.png", "destination": "web/public/android-chrome-512x512.png", "sha256": "74071ffcf3380e1262b0f664232b53f89a57d12dbf78f93368d182c7555cc718"},
+    {"source": "favicons/bg-101622/apple-touch-icon.png", "destination": "web/public/apple-touch-icon.png", "sha256": "4bebddf4db682414ec511a4e20de02d051c25e5b69ddbf67c0c770116320c829"},
+    {"source": "favicons/bg-101622/favicon-16x16.png", "destination": "web/public/favicon-16x16.png", "sha256": "482cc77aa2ac29046e99f8e84164eb9c122aa7d5992a6b7fa4c30e00853fd33a"},
+    {"source": "favicons/bg-101622/favicon-32x32.png", "destination": "web/public/favicon-32x32.png", "sha256": "2de7269ac6c61363c8b14e55b760347db2dbc308925fb948814e9543711afc11"},
+    {"source": "favicons/bg-101622/favicon-48x48.png", "destination": "web/public/favicon-48x48.png", "sha256": "61e8273147995aaa83b88882b7aed1493ce2f891387234bd13b0349107274b36"},
+    {"source": "favicons/bg-101622/favicon.ico", "destination": "web/public/favicon.ico", "sha256": "e743d123dfce1d3d356d149431074984dee6efa498deb9863aed2cd211b205c4"},
+    {"source": "favicons/bg-101622/mstile-150x150.png", "destination": "web/public/mstile-150x150.png", "sha256": "e01bb5fce877e05a3bffbc27333ba928962d8ab0de3b32fa8ce02b5cddea14f1"},
+    {"source": "favicons/bg-101622/site.webmanifest", "destination": "web/public/site.webmanifest", "sha256": "497a890f756912bb3ea62337b328dcd90e6f41a779a5a217a99cc9292b0612fb"},
+    {"source": "logos/bg-101622/threadcells-logo-horizontal.png", "destination": "web/public/threadcells-logo-horizontal.png", "sha256": "0d4308df8009f5881e7fbeb0a72b3f47d8aec42c1c423f8516e9e375b7d99035"},
+    {"source": "logos/bg-101622/threadcells-og-1200x630.png", "destination": "web/public/threadcells-og-1200x630.png", "sha256": "bd7e89fdef0beb16dccb9c4ea318005df47c7c6611ae498596926f395cc6a71d"},
+    {"source": "symbols/bg-101622/threadcells-symbol-1024.png", "destination": "web/public/threadcells-symbol.png", "sha256": "28016ca5b130e57c8863e044b84685d3ff946005fcfd3b0c25cb9377b12d3f32"},
+    {"source": "favicons/bg-black/android-chrome-192x192.png", "destination": "website/public/android-chrome-192x192.png", "sha256": "1599bb386fc4fd5db4c546a5373412b657c3cda4e04e875db8b135ddc2704143"},
+    {"source": "favicons/bg-black/android-chrome-512x512.png", "destination": "website/public/android-chrome-512x512.png", "sha256": "74071ffcf3380e1262b0f664232b53f89a57d12dbf78f93368d182c7555cc718"},
+    {"source": "favicons/bg-black/apple-touch-icon.png", "destination": "website/public/apple-touch-icon.png", "sha256": "4bebddf4db682414ec511a4e20de02d051c25e5b69ddbf67c0c770116320c829"},
+    {"source": "favicons/bg-black/favicon-16x16.png", "destination": "website/public/favicon-16x16.png", "sha256": "482cc77aa2ac29046e99f8e84164eb9c122aa7d5992a6b7fa4c30e00853fd33a"},
+    {"source": "favicons/bg-black/favicon-32x32.png", "destination": "website/public/favicon-32x32.png", "sha256": "2de7269ac6c61363c8b14e55b760347db2dbc308925fb948814e9543711afc11"},
+    {"source": "favicons/bg-black/favicon.ico", "destination": "website/public/favicon.ico", "sha256": "e743d123dfce1d3d356d149431074984dee6efa498deb9863aed2cd211b205c4"},
+    {"source": "favicons/bg-black/site.webmanifest", "destination": "website/public/site.webmanifest", "sha256": "497a890f756912bb3ea62337b328dcd90e6f41a779a5a217a99cc9292b0612fb"},
+    {"source": "logos/bg-101622/threadcells-logo-horizontal.png", "destination": "website/public/threadcells-logo-horizontal.webp", "sha256": "0e282c206f633e65e7d99f4f3542a9d6290b04d643435e31031cc3311c318ade", "transform": "webp-quality-92"},
+    {"source": "symbols/bg-101622/threadcells-symbol-1024.png", "destination": "website/public/threadcells-symbol.webp", "sha256": "d3676404c6959f06841b2adbbef4083e1f493ca1edc32ac34f3a678a7457c2dd", "transform": "webp-quality-92"},
+    {"source": "logos/bg-black/threadcells-og-1200x630.png", "destination": "website/public/media/threadcells-social.png", "sha256": "e3c22b226ebafc44ca79dbe073054efd94724e8adb6b44c1ede0bf39436902e4"}
+  ]
+}

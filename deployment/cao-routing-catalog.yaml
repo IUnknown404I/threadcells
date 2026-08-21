@@ -1,0 +1,20 @@
+version: 2
+profiles:
+  supervisor_terra_medium:
+    execution_mode: orchestrator
+    routing_role: everyday_supervisor
+    default: true
+  supervisor_sol_medium:
+    execution_mode: orchestrator
+    routing_role: complex_supervisor
+    description: High-reasoning orchestration for important, risky, cross-module, and architecture-sensitive workflows
+  critical_sol_xhigh_owner:
+    execution_mode: owner_executor
+    routing_role: exceptional_owner_executor
+    owner_authorization_required: true
+    automatic_escalation: false
+routing:
+  everyday_orchestration: supervisor_terra_medium
+  complex_orchestration: supervisor_sol_medium
+  critical_owner_execution: critical_sol_xhigh_owner
+  automatic_xhigh_escalation: false

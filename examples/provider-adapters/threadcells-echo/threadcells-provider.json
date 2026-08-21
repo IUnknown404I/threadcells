@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "adapter_id": "community.echo",
+  "display_name": "Community Echo",
+  "plugin_api_version": "1.0",
+  "implementation_version": "0.1.0",
+  "description": "Deterministic example adapter for a trusted installed CLI.",
+  "capabilities": {
+    "start_turn": "supported",
+    "resume_turn": "supported",
+    "cancel": "supported",
+    "structured_completion": "supported",
+    "usage": "unsupported",
+    "input_tokens": "unsupported",
+    "output_tokens": "unsupported",
+    "cached_input_tokens": "unsupported",
+    "session_persistence": "supported",
+    "model_selection": "supported",
+    "model_discovery": "unsupported",
+    "reasoning_controls": "unsupported",
+    "health": "supported"
+  },
+  "configuration_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "model": {
+        "type": "string",
+        "enum": ["echo-v1"],
+        "default": "echo-v1"
+      }
+    }
+  }
+}
+

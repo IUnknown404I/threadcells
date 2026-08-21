@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/IUnknown404I/threadcells/main/schemas/v1/capabilities.schema.json",
+  "title": "ThreadCells AdapterCapabilities V1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "start_turn": {"$ref": "#/$defs/support"},
+    "resume_turn": {"$ref": "#/$defs/support"},
+    "cancel": {"$ref": "#/$defs/support"},
+    "structured_completion": {"$ref": "#/$defs/support"},
+    "usage": {"$ref": "#/$defs/support"},
+    "input_tokens": {"$ref": "#/$defs/support"},
+    "output_tokens": {"$ref": "#/$defs/support"},
+    "cached_input_tokens": {"$ref": "#/$defs/support"},
+    "session_persistence": {"$ref": "#/$defs/support"},
+    "model_selection": {"$ref": "#/$defs/support"},
+    "model_discovery": {"$ref": "#/$defs/support"},
+    "reasoning_controls": {"$ref": "#/$defs/support"},
+    "health": {"$ref": "#/$defs/support"}
+  },
+  "$defs": {"support": {"enum": ["supported", "unsupported", "conditional"]}}
+}

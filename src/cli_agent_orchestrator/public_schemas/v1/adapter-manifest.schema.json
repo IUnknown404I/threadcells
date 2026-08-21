@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/IUnknown404I/threadcells/main/schemas/v1/adapter-manifest.schema.json",
+  "title": "ThreadCells AdapterManifest V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "adapter_id", "display_name", "plugin_api_version", "implementation_version", "description", "capabilities", "configuration_schema"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "adapter_id": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"},
+    "display_name": {"type": "string", "minLength": 1, "maxLength": 120},
+    "plugin_api_version": {"const": "1.0"},
+    "implementation_version": {"type": "string", "minLength": 1, "maxLength": 64},
+    "description": {"type": "string", "minLength": 1, "maxLength": 500},
+    "capabilities": {"$ref": "capabilities.schema.json"},
+    "configuration_schema": {"type": "object"}
+  }
+}

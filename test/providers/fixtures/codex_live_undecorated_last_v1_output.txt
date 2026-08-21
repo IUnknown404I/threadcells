@@ -1,0 +1,8 @@
+› [CAO Handoff] Return the final structured result.
+CAO_RESULT_V1
+  {"summary":"Live undecorated LAST handoff complete","body_markdown":"Recovered the exact live re-
+  port fold.","changed_files":["src/cli_agent_orchestrator/clients/database.py"],"checks":[],"risks":[],"blockers":[],"format":"v1"}
+────────────────────────────────────────────────────────────────────────────────
+
+› Continue working
+  gpt-5.6-terra high · 96% left · /workspace/sample-project

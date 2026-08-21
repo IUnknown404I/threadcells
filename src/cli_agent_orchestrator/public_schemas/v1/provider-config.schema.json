@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/IUnknown404I/threadcells/main/schemas/v1/provider-config.schema.json",
+  "title": "ThreadCells ProviderConfiguration V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "config_id", "adapter_id", "display_name"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "config_id": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"},
+    "adapter_id": {"type": "string", "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$"},
+    "display_name": {"type": "string", "minLength": 1, "maxLength": 120},
+    "enabled": {"type": "boolean", "default": true},
+    "settings": {"type": "object", "description": "Declarative adapter-owned settings; executable and secret fields are forbidden."},
+    "secret_refs": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,254}$"}}
+  }
+}

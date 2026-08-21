@@ -1,0 +1,29 @@
+name: ThreadCells local candidate
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --ignore-scripts
+        working-directory: web
+      - run: python scripts/build_local_candidate.py --output "$RUNNER_TEMP/threadcells-candidate"
+      - run: |
+          candidate="$RUNNER_TEMP/threadcells-candidate/threadcells-0.1.0a1-local"
+          wheel="$(find "$candidate/packages" -maxdepth 1 -name 'threadcells-*.whl' -print -quit)"
+          python scripts/verify_local_candidate.py --candidate "$candidate"
+          python scripts/audit_public_surface.py --candidate "$candidate" --wheel "$wheel"
+          "$candidate/scripts/install-threadcells.sh" --source "$candidate" --dry-run --prefix "$RUNNER_TEMP/threadcells-install"

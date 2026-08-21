@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "threadcells-echo-adapter"
+version = "0.1.0"
+description = "Minimal trusted provider adapter example for ThreadCells"
+requires-python = ">=3.10"
+dependencies = ["threadcells>=0.1.0a1"]
+
+[project.entry-points."threadcells.provider_adapters.v1"]
+echo = "threadcells_echo_adapter:provider_adapter"
+
+[tool.hatch.build.targets.wheel]
+packages = ["threadcells_echo_adapter"]
+

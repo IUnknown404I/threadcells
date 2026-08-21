@@ -1,0 +1,463 @@
+const BASE = ''  // Vite proxy handles routing to backend
+
+type ApiFailureBody = { reason_code?: unknown; detail?: unknown; message?: unknown }
+
+export class CaoApiError extends Error {
+  constructor(
+    public readonly title: string,
+    public readonly description: string,
+    public readonly status: number,
+    public readonly reasonCode?: string,
+  ) {
+    const technical = [`HTTP ${status}`, reasonCode].filter(Boolean).join(' · ')
+    super(`${title}: ${description}${technical ? `\n${technical}` : ''}`)
+    this.name = 'CaoApiError'
+  }
+}
+
+const REASON_COPY: Record<string, [string, string]> = {
+  WORKTREE_WRITER_LEASE_HELD: ['Working directory is locked', 'Another active write-capable agent is already using this working directory. Gracefully exit that agent or choose another working directory.'],
+  WORKTREE_AUTHORITY_UNRECONCILED: ['Working directory needs attention', 'ThreadCells could not verify worktree authority. Reconcile the existing worktree before starting another writer.'],
+  TOTAL_PROVIDER_CAPACITY_EXHAUSTED: ['Capacity limit reached', 'No compatible provider slot is currently available. Wait for an active agent to finish or choose another provider.'],
+  PROVIDER_EXECUTION_CAPACITY_EXHAUSTED: ['Provider turns are queued', 'All provider execution slots are active. This input will continue automatically when a slot is released.'],
+  RESIDENT_SUPERVISOR_CAPACITY_EXHAUSTED: ['Resident supervisor limit reached', 'Five supervisors are already resident. Exit one before starting another project supervisor.'],
+  PROJECT_SUPERVISOR_ALREADY_RESIDENT: ['Project supervisor already resident', 'Open or reuse the existing supervisor for this project.'],
+  WORK_CONTEXT_CAPACITY_EXHAUSTED: ['Capacity limit reached', 'No compatible work slot is currently available. Wait for an active work agent to finish and try again.'],
+  RESOURCE_HEALTH_REJECTED: ['ThreadCells resources are unavailable', 'ThreadCells temporarily rejected new work because host resources are not healthy. Wait for the resource state to recover.'],
+  CONTEXT_INVENTORY_UNAVAILABLE: ['Capacity status is unavailable', 'ThreadCells cannot safely confirm available execution capacity yet. Wait for runtime inventory to recover and try again.'],
+  ADMISSION_FENCE_TIMEOUT: ['Admission timed out', 'ThreadCells could not safely reserve a slot in time. Try again shortly.'],
+  HEAVY_SLOT_WAIT_TIMEOUT: ['Capacity limit reached', 'A compatible heavy-execution slot did not become available in time. Try again after active work finishes.'],
+}
+
+const STATUS_COPY: Record<number, [string, string]> = {
+  400: ['Invalid request', 'One or more submitted values are invalid. Review the form and try again.'],
+  401: ['Not authorized', 'The current operation is not permitted.'],
+  403: ['Not authorized', 'The current operation is not permitted.'],
+  404: ['Resource not found', 'The requested session, terminal, agent, or resource no longer exists.'],
+  409: ['Conflict', 'The requested operation conflicts with the current ThreadCells state. Refresh and try again.'],
+  422: ['Invalid request', 'One or more submitted values are invalid. Review the form and try again.'],
+  423: ['Resource is locked', 'This resource is currently locked by another operation. Wait for it to finish or choose another resource.'],
+  429: ['Capacity limit reached', 'No compatible provider or work slot is currently available. Try again after active work finishes.'],
+  500: ['ThreadCells server error', 'The operation failed unexpectedly on the ThreadCells server. Try again shortly.'],
+  502: ['Provider unavailable', 'An upstream provider is currently unavailable. Try again shortly.'],
+  503: ['ThreadCells service unavailable', 'ThreadCells is temporarily unable to accept this operation. Try again shortly.'],
+  504: ['Provider timeout', 'The upstream provider did not respond in time. Try again shortly.'],
+}
+
+export function normalizeApiError(status: number, body: ApiFailureBody | null, statusText = ''): CaoApiError {
+  const structuredDetail = body?.detail && typeof body.detail === 'object' ? body.detail as ApiFailureBody : null
+  const reasonValue = body?.reason_code ?? structuredDetail?.reason_code
+  const reasonCode = typeof reasonValue === 'string' && reasonValue.trim() ? reasonValue.trim() : undefined
+  const backendMessage = [structuredDetail?.message, structuredDetail?.detail, body?.detail, body?.message].find(value => typeof value === 'string' && value.trim()) as string | undefined
+  const [title, fallback] = (reasonCode && REASON_COPY[reasonCode]) || STATUS_COPY[status] || ['Request failed', 'ThreadCells could not complete this operation. Try again shortly.']
+  const description = reasonCode && REASON_COPY[reasonCode] ? fallback : backendMessage?.trim() || fallback || statusText || 'ThreadCells could not complete this operation. Try again shortly.'
+  return new CaoApiError(title, description, status, reasonCode)
+}
+
+async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: number | null }): Promise<T> {
+  const controller = new AbortController()
+  const timeoutMs = opts?.timeoutMs === undefined ? 10000 : opts.timeoutMs
+  const timeout = timeoutMs === null ? undefined : setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const res = await fetch(`${BASE}${url}`, { ...opts, signal: controller.signal })
+    if (!res.ok) {
+      const error = await res.json().catch(() => null) as ApiFailureBody | null
+      throw normalizeApiError(res.status, error, res.statusText)
+    }
+    return res.json()
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout)
+  }
+}
+
+export interface Session {
+  id: string
+  name: string
+  status: string
+  created_at: string | null
+}
+
+export interface Terminal {
+  id: string
+  name: string
+  provider: string
+  session_name: string
+  agent_profile: string | null
+  status: string | null
+  execution_state?: 'ready' | 'processing' | 'queued_provider_execution' | null
+  lifecycle?: 'running' | 'exited' | null
+  workflow_state?: 'open' | 'active' | 'waiting' | 'recoverable' | 'result_ready' | 'owner_gate' | 'completed' | 'incomplete' | 'failed' | 'cancelled' | null
+  workflow_status?: string | null
+  assignment_status?: string | null
+  result_status?: string | null
+  delivery_status?: string | null
+  context_role?: 'supervisor' | 'work' | null
+  launch_worktree?: string | null
+  managed_worktree_kind?: 'task' | 'reviewer' | null
+  managed_worktree_commit?: string | null
+  managed_worktree_branch?: string | null
+  last_active: string | null
+}
+
+export interface ExitTerminalResponse {
+  success: boolean
+  lifecycle: 'exited' | 'exit_pending'
+  outcome: 'command_delivered' | 'already_exited' | 'exit_pending'
+  message: string
+  command_delivered: boolean
+}
+
+export interface SessionDetail {
+  session: Session
+  terminals: TerminalMeta[]
+}
+
+export interface TerminalMeta {
+  id: string
+  tmux_session: string
+  tmux_window: string
+  provider: string
+  agent_profile: string | null
+  last_active: string | null
+  project_id?: string | null
+  project_name?: string | null
+  project_path?: string | null
+}
+
+export interface AgentProfileInfo {
+  name: string
+  description: string
+  source: 'built-in' | 'custom' | 'local' | 'kiro' | 'q_cli'
+  enabled?: boolean
+  built_in?: boolean
+  revision_id?: string
+  execution_mode?: 'orchestrator' | 'owner_executor' | 'executor' | 'reviewer'
+  owner_authorization_required?: boolean
+  document?: Record<string, unknown>
+}
+
+export interface AgentDirsSettings {
+  agent_dirs: Record<string, string>
+  extra_dirs: string[]
+}
+
+export interface RuntimeBranding {
+  title: string
+  subtitle: string
+  logoUrl: string
+  customLogo: boolean
+}
+
+export interface TelegramSettings {
+  schema_version: 1
+  enabled: boolean
+  chat_id: string | null
+  message_thread_id: number | null
+  token_configured: boolean
+  token_state: 'missing' | 'configured' | 'invalid'
+  configuration_state: 'not_configured' | 'invalid' | 'disabled' | 'enabled'
+  last_result: 'connection_ok' | 'connection_failed' | 'test_sent' | 'test_failed' | 'not_configured' | null
+  last_result_at: string | null
+  updated_at: string | null
+}
+
+export interface OrchestrationCapacity {
+  resource_state: 'GREEN' | 'YELLOW' | 'RED'
+  reasons: string[]
+  resident_supervisors: { active: number; limit: number; available: number; draining?: boolean; certain: boolean }
+  provider_executions: { active: number; limit: number; available: number; draining?: boolean; certain: boolean }
+  /** Compatibility alias; carries provider execution semantics. */
+  provider_contexts?: { active: number; limit: number; available: number; certain: boolean }
+  work_contexts: { active: number; limit: number; available: number; draining?: boolean; certain: boolean }
+  heavy_executions: { active: number; limit: number; available: number; draining?: boolean; waiting: number | null }
+  memory: { available_mib: number; swap_total_mib: number; swap_free_mib: number }
+  root_disk: { used_percent: number; free_gib: number }
+  memory_pressure: { some_avg10: number; full_avg10: number }
+  cpu_load: { one_minute: number; cpu_count: number }
+  housekeeping: { ok?: boolean; warnings?: string[] } | null
+}
+
+export interface InboxMessage {
+  id: string
+  sender_id: string
+  receiver_id: string
+  message: string
+  status: 'pending' | 'delivered' | 'failed'
+  result_id?: string | null
+  kind?: 'message' | 'delegation_result_notice'
+  superseded_at?: string | null
+  created_at: string | null
+}
+
+export interface DelegationResult {
+  id: string
+  delegation_kind: 'assign' | 'handoff'
+  status: 'awaiting' | 'complete' | 'incomplete' | 'cancelled'
+  delivery_status?: string
+  authorship: string
+  document: { summary?: string; body_markdown?: string; changed_files?: string[]; checks?: { command: string; outcome: string }[]; risks?: string[]; blockers?: string[] } | null
+  created_at: string | null
+  finalized_at: string | null
+}
+
+export interface Flow {
+  name: string
+  file_path: string
+  schedule: string
+  agent_profile: string
+  provider: string
+  script: string | null
+  last_run: string | null
+  next_run: string | null
+  enabled: boolean
+  prompt_template: string | null
+  projectId?: string | null
+  project_name?: string | null
+  project_path?: string | null
+}
+
+export interface Project {
+  projectId: string
+  name: string
+  path: string
+  description: string | null
+  isDefault: boolean
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export type ProviderAvailability =
+  | 'INSTALLED_AND_READY'
+  | 'INSTALLED_NOT_AUTHENTICATED'
+  | 'INSTALLED_BUT_UNHEALTHY'
+  | 'NOT_INSTALLED'
+  | 'UNKNOWN'
+
+export interface ProviderRuntimeInfo {
+  installed: boolean
+  available?: boolean
+  availability?: ProviderAvailability
+  state?: string
+  authentication?: string
+  version?: string | null
+  reason_code?: string | null
+}
+
+export interface ProviderInfo extends ProviderRuntimeInfo {
+  name: string
+  binary: string | null
+  adapter_available?: boolean
+  capabilities?: Record<string, string>
+}
+
+export interface RegistryRecord {
+  profile_id?: string
+  config_id?: string
+  display_name: string
+  description?: string
+  enabled: boolean
+  built_in: boolean
+  revision_id: string
+  revision_number: number
+  fingerprint: string
+  document: Record<string, any>
+  runtime?: ProviderRuntimeInfo
+}
+
+export interface ProviderSettings {
+  api_version: string
+  entry_point_group: string
+  adapters: Array<Record<string, any> & { runtime?: ProviderRuntimeInfo; adapter_available?: boolean }>
+  configurations: RegistryRecord[]
+  load_failures: Array<Record<string, string>>
+}
+
+export interface HousekeepingSettings {
+  schema_version: 1
+  policy: Record<string, Record<string, boolean | number>>
+  schedule: Record<'frequent' | 'weekly' | 'pressure', string>
+  updated_at?: string | null
+}
+
+export interface OwnerLaunchGrant {
+  launch_id: string
+  grant: string
+  expires_in_seconds: number
+}
+
+export interface OperatorSessionStatus {
+  configured: boolean
+  configuration_state?: 'missing' | 'invalid' | 'ready'
+  authenticated: boolean
+  expires_in_seconds: number
+  session_ttl_seconds: number
+  verifier_reference: string
+}
+
+export interface UsageAggregate {
+  id?: string | null
+  label?: string | null
+  /** An unreconciled historical record; it was not merged by reusable name. */
+  legacy?: boolean
+  provider_run_count: number
+  input_tokens: number | null
+  cached_input_tokens: number | null
+  cache_write_input_tokens: number | null
+  output_tokens: number | null
+  reasoning_output_tokens: number | null
+  total_tokens: number | null
+}
+
+export interface UsageStatistics {
+  label: string
+  global: UsageAggregate
+  terminals: UsageAggregate[]
+  sessions: UsageAggregate[]
+  projects: UsageAggregate[]
+  providers: UsageAggregate[]
+  profiles: UsageAggregate[]
+}
+
+export const api = {
+  // Agent Profiles & Providers
+  listProfiles: () => fetchJSON<AgentProfileInfo[]>('/agents/profiles'),
+  listProviders: () => fetchJSON<ProviderInfo[]>('/agents/providers'),
+
+  // Settings
+  getAgentDirs: () => fetchJSON<AgentDirsSettings>('/settings/agent-dirs'),
+  setAgentDirs: (data: { agent_dirs?: Record<string, string>; extra_dirs?: string[] }) =>
+    fetchJSON<AgentDirsSettings>('/settings/agent-dirs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    }),
+  getOrchestrationCapacity: () =>
+    fetchJSON<OrchestrationCapacity>('/settings/orchestration-capacity'),
+  updateOrchestrationCapacity: (data: { max_resident_supervisors: number; max_provider_executions: number; max_work_contexts: number; max_heavy_execution_slots: number }) =>
+    fetchJSON<OrchestrationCapacity>('/settings/orchestration-capacity', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }),
+  getOperatorSession: () => fetchJSON<OperatorSessionStatus>('/operator/session'),
+  createOperatorSession: (secret: string) => fetchJSON<{ authenticated: boolean }>('/operator/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ secret }) }),
+  deleteOperatorSession: () => fetchJSON<{ revoked: boolean }>('/operator/session', { method: 'DELETE' }),
+  createXHighGrant: (data: { agent_profile: string; provider: string; working_directory?: string; requested_session_name?: string; project_id?: string; launch_mode: 'new_session' | 'existing_session'; confirmed: true }) =>
+    fetchJSON<OwnerLaunchGrant>('/operator/xhigh-grants', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }),
+  getTelegramSettings: () => fetchJSON<TelegramSettings>('/api/v1/telegram'),
+  updateTelegramSettings: (data: { enabled: boolean; chat_id: string | null; message_thread_id: number | null; bot_token: string | null }) =>
+    fetchJSON<TelegramSettings>('/api/v1/telegram', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }),
+  checkTelegramConnection: () => fetchJSON<{ ok: boolean; status: string; reason_code?: string }>('/api/v1/telegram/check', { method: 'POST' }),
+  sendTelegramTest: () => fetchJSON<{ ok: boolean; status: string; reason_code?: string }>('/api/v1/telegram/test', { method: 'POST' }),
+  listRegistryProfiles: (includeDisabled = true) => fetchJSON<RegistryRecord[]>(`/api/v1/profiles?include_disabled=${includeDisabled}`),
+  validateProfile: (document: Record<string, unknown>) => fetchJSON<{ valid: boolean; issues: Array<Record<string, string>>; document?: Record<string, unknown> }>('/api/v1/profiles/validate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ document }) }),
+  importProfile: (document: Record<string, unknown>, duplicate_builtin = false) => fetchJSON<RegistryRecord>('/api/v1/profiles/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ document, duplicate_builtin }) }),
+  previewProfile: (profileId: string) => fetchJSON<Record<string, any>>(`/api/v1/profiles/${encodeURIComponent(profileId)}/preview`),
+  exportProfile: (profileId: string) => fetchJSON<{ document: Record<string, unknown> }>(`/api/v1/profiles/${encodeURIComponent(profileId)}/export`),
+  setProfileEnabled: (profileId: string, enabled: boolean) => fetchJSON<RegistryRecord>(`/api/v1/profiles/${encodeURIComponent(profileId)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) }),
+  getProfileAiPrompt: () => fetchJSON<{ prompt: string }>('/api/v1/profiles/ai-prompt'),
+  getProviderSettings: () => fetchJSON<ProviderSettings>('/api/v1/providers'),
+  preflightProvider: (configId: string) => fetchJSON<Record<string, any>>(`/api/v1/providers/${encodeURIComponent(configId)}/preflight`, { method: 'POST' }),
+  exportProvider: (configId: string) => fetchJSON<{ document: Record<string, unknown>; redacted: boolean }>(`/api/v1/providers/${encodeURIComponent(configId)}/export`),
+  importProvider: (document: Record<string, unknown>) => fetchJSON<RegistryRecord>('/api/v1/providers/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ document }) }),
+  getProviderAiPrompt: () => fetchJSON<{ prompt: string }>('/api/v1/providers/ai-prompt'),
+  getHousekeepingSettings: () => fetchJSON<HousekeepingSettings>('/api/v1/housekeeping'),
+  updateHousekeepingSettings: (data: HousekeepingSettings) => fetchJSON<HousekeepingSettings>('/api/v1/housekeeping', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }),
+  getHousekeepingPlan: (mode: 'frequent' | 'weekly' | 'pressure') => fetchJSON<Record<string, any>>(`/api/v1/housekeeping/plan?mode=${mode}`),
+  runHousekeeping: (mode: 'frequent' | 'weekly' | 'pressure', dry_run: boolean, expectedPlanId?: string) => fetchJSON<Record<string, any>>('/api/v1/housekeeping/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, dry_run, expected_plan_id: expectedPlanId }), timeoutMs: null }),
+  getHousekeepingReport: () => fetchJSON<Record<string, any>>('/api/v1/housekeeping/report'),
+  getUsageStatistics: () => fetchJSON<UsageStatistics>('/usage/statistics'),
+  getBranding: () => fetchJSON<RuntimeBranding>('/settings/branding'),
+  updateBranding: (data: { title?: string; subtitle?: string }) => fetchJSON<RuntimeBranding>('/settings/branding', {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data),
+  }),
+  uploadBrandingLogo: (file: File) => fetchJSON<RuntimeBranding>('/settings/branding/logo', {
+    method: 'POST', headers: { 'Content-Type': file.type || 'application/octet-stream' }, body: file,
+  }),
+  resetBrandingLogo: () => fetchJSON<RuntimeBranding>('/settings/branding/logo/reset', { method: 'POST' }),
+
+  // Sessions
+  listSessions: () => fetchJSON<Session[]>('/sessions'),
+  getSession: (name: string) => fetchJSON<SessionDetail>(`/sessions/${encodeURIComponent(name)}`),
+  getSessionWorkingDirectory: (name: string) =>
+    fetchJSON<{ working_directory: string | null }>(`/sessions/${encodeURIComponent(name)}/working-directory`),
+  createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string, projectId?: string, ownerGrant?: OwnerLaunchGrant) =>
+    // Session startup can outlive a browser request. Keep this request owned by
+    // the UI until it settles so the backend cancellation reconciliation only
+    // runs for genuine caller cancellation (navigation, disconnect, etc.).
+    fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}${projectId ? `&projectId=${encodeURIComponent(projectId)}` : ''}${ownerGrant ? `&owner_grant_launch_id=${encodeURIComponent(ownerGrant.launch_id)}` : ''}`, { method: 'POST', headers: ownerGrant ? { 'X-ThreadCells-Owner-Grant': ownerGrant.grant } : undefined, timeoutMs: null }),
+  deleteSession: (name: string) => fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
+  // Terminals
+  getTerminalStatus: (id: string) => fetchJSON<Terminal>(`/terminals/${id}`),
+  getTerminalOutput: (id: string, mode: 'full' | 'last' = 'full') =>
+    fetchJSON<{ output: string; mode: string }>(`/terminals/${id}/output?mode=${mode}`),
+  sendInput: (id: string, message: string) =>
+    fetchJSON<{ success: boolean }>(`/terminals/${id}/input?message=${encodeURIComponent(message)}`, { method: 'POST' }),
+  sendWorkflowInput: (id: string, message: string) =>
+    fetchJSON<{ success: boolean }>(`/terminals/${id}/workflow-input`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    }),
+  uploadTerminalImage: (id: string, image: File) =>
+    fetchJSON<{ path: string }>(`/terminals/${id}/attachments/image`, {
+      method: 'POST',
+      headers: { 'Content-Type': image.type },
+      body: image,
+      timeoutMs: 30000,
+    }),
+  uploadTerminalFile: (id: string, file: File) =>
+    fetchJSON<{ path: string }>(`/terminals/${id}/attachments/file`, {
+      method: 'POST',
+      // HTTP header values are ASCII. Preserve the complete browser filename
+      // across the boundary without relying on browser-specific Unicode header handling.
+      headers: { 'Content-Type': file.type || 'application/octet-stream', 'X-Terminal-Filename': encodeURIComponent(file.name) },
+      body: file,
+      timeoutMs: 30000,
+    }),
+  exitTerminal: (id: string) =>
+    fetchJSON<ExitTerminalResponse>(`/terminals/${id}/exit`, { method: 'POST' }),
+  deleteTerminal: (id: string) => fetchJSON<{ success: boolean }>(`/terminals/${id}`, { method: 'DELETE' }),
+  getWorkingDirectory: (id: string) =>
+    fetchJSON<{ working_directory: string | null }>(`/terminals/${id}/working-directory`),
+  addTerminalToSession: (sessionName: string, provider: string, agentProfile: string, workingDirectory?: string, projectId?: string, ownerGrant?: OwnerLaunchGrant) =>
+    fetchJSON<Terminal>(`/sessions/${encodeURIComponent(sessionName)}/terminals?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}${projectId ? `&projectId=${encodeURIComponent(projectId)}` : ''}${ownerGrant ? `&owner_grant_launch_id=${encodeURIComponent(ownerGrant.launch_id)}` : ''}`, { method: 'POST', headers: ownerGrant ? { 'X-ThreadCells-Owner-Grant': ownerGrant.grant } : undefined, timeoutMs: 90000 }),
+
+  // Projects
+  listProjects: () => fetchJSON<Project[]>('/projects'),
+  createProject: (data: { name: string; path: string; description?: string; isDefault?: boolean; createDirectory?: boolean }) =>
+    fetchJSON<Project>('/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }),
+  setDefaultProject: (projectId: string) => fetchJSON<Project>(`/projects/${encodeURIComponent(projectId)}/default`, { method: 'POST' }),
+  deleteProject: (projectId: string) => fetchJSON<{ success: boolean }>(`/projects/${encodeURIComponent(projectId)}`, { method: 'DELETE' }),
+  updateProject: (projectId: string, data: { name?: string; path?: string; description?: string | null; isDefault?: boolean }) =>
+    fetchJSON<Project>(`/projects/${encodeURIComponent(projectId)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }),
+
+  // Inbox
+  getInboxMessages: (terminalId: string, limit?: number, status?: string) =>
+    fetchJSON<InboxMessage[]>(`/terminals/${terminalId}/inbox/messages?limit=${limit || 50}${status ? `&status=${status}` : ''}`),
+  sendInboxMessage: (receiverId: string, senderId: string, message: string) =>
+    fetchJSON<{ success: boolean }>(`/terminals/${receiverId}/inbox/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sender_id: senderId, message }),
+    }),
+  getDelegationResult: (id: string) => fetchJSON<DelegationResult>(`/delegation-results/${encodeURIComponent(id)}`),
+  listDelegationResults: (params?: { terminalId?: string; sessionName?: string; status?: string }) => {
+    const search = new URLSearchParams()
+    if (params?.terminalId) search.set('terminal_id', params.terminalId)
+    if (params?.sessionName) search.set('session_name', params.sessionName)
+    if (params?.status) search.set('status', params.status)
+    return fetchJSON<DelegationResult[]>(`/delegation-results${search.size ? `?${search}` : ''}`)
+  },
+
+  // Flows
+  listFlows: () => fetchJSON<Flow[]>('/flows'),
+  createFlow: (data: { name: string; schedule: string; agent_profile: string; provider?: string; prompt_template: string; projectId?: string }) =>
+    fetchJSON<Flow>('/flows', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+      timeoutMs: 30000,
+    }),
+  deleteFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${name}`, { method: 'DELETE' }),
+  enableFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${name}/enable`, { method: 'POST' }),
+  disableFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${name}/disable`, { method: 'POST' }),
+  runFlow: (name: string) => fetchJSON<{ executed: boolean }>(`/flows/${name}/run`, { method: 'POST', timeoutMs: 90000 }),
+}

@@ -1,0 +1,21 @@
+• Summary
+
+  Stage 1 is blocked before changes: the approved contract lacks the
+  consumer-to-preset mapping and required public response shape.
+
+• Commands/checks run
+
+  - Public media boundary test: 8 passed.
+  - git diff --check: passed.
+
+• Risks/blockers
+
+  status: blocked
+  classification: OWNER_GATE
+  recommendation: approve the explicit consumer mapping before runtime work.
+
+─ Worked for 4m 04s ─────────────────────────────────────────────────────────
+
+› Explain this codebase
+
+  gpt-5.6-terra high · /workspace/sample-project

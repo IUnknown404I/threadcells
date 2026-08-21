@@ -1,0 +1,16 @@
+[Unit]
+Description=ThreadCells weekly reference-aware maintenance
+After=agent-control-cao.service
+
+[Service]
+Type=oneshot
+User=agentctl
+Group=agentctl
+SupplementaryGroups=docker
+Environment=HOME=/home/agentctl
+Environment=PATH=/srv/agent-control/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/srv/agent-control/bin/cao-housekeeping --mode weekly --scheduled
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+UMask=0077

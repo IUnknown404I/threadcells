@@ -14,9 +14,13 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
-import tomllib
 from pathlib import Path
 from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 compatibility
+    import tomli as tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 PRIVATE_PATH_PARTS = {"agents", "memory", "source-pack", ".git"}

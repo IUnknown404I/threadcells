@@ -3,7 +3,6 @@ import json
 import shutil
 import subprocess
 import sys
-import venv
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -126,7 +125,13 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
     policy.parent.mkdir(parents=True)
     policy.write_text("# Existing authority\n")
     base_runtime = tmp_path / "known-good-runtime"
-    venv.EnvBuilder(with_pip=True).create(base_runtime)
+    # Python 3.10's venv module does not resolve a uv-created environment's
+    # interpreter symlink before recording its base home. Invoke the resolved
+    # base interpreter so this exercises the deployment code on every supported
+    # Python version instead of constructing a broken nested test environment.
+    subprocess.run(
+        [str(Path(sys.executable).resolve()), "-m", "venv", str(base_runtime)], check=True
+    )
     stale_wheel = _local_wheel(
         tmp_path / "stale-wheel",
         web_assets={"assets/subaev-cao-old.png": b"obsolete image"},

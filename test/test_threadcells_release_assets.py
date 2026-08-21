@@ -8,10 +8,14 @@ import os
 import stat
 import subprocess
 import sys
-import tomllib
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 compatibility
+    import tomli as tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 

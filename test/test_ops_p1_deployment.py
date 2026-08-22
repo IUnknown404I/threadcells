@@ -163,7 +163,9 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
     commit = subprocess.run(
         ["git", "-C", str(SOURCE), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
     ).stdout.strip()
-    candidate_root = tmp_path / "candidate"
+    candidate_root = agent_root / "releases/candidate"
+    release_lock = agent_root / "state/cao/locks/release-staging.lock"
+    release_metadata = agent_root / "state/cao/release-metadata.json"
     command = [
         sys.executable,
         str(SOURCE / "deployment/stage-ops-p1.py"),
@@ -180,14 +182,14 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
         "--wheel",
         str(wheel),
         "--release-lock",
-        str(tmp_path / "locks/release-staging.lock"),
+        str(release_lock),
         "--release-metadata",
-        str(tmp_path / "state/cao/release-metadata.json"),
+        str(release_metadata),
         "--expected-commit",
         commit,
     ]
 
-    rejected_root = tmp_path / "rejected-candidate"
+    rejected_root = agent_root / "releases/rejected-candidate"
     rejected_command = [
         str(rejected_root) if value == str(candidate_root) else value for value in command
     ]
@@ -199,11 +201,20 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
     assert not (tmp_path / "etc/agent-control/cao-operations.json").exists()
     assert _tree_hash(base_runtime) == base_hash
 
+    outside_root = tmp_path / "outside-candidate"
+    outside_command = [
+        str(outside_root) if value == str(candidate_root) else value for value in command
+    ]
+    outside = subprocess.run(outside_command, capture_output=True, text=True)
+    assert outside.returncode != 0
+    assert "reason_code=RUNTIME_PATH_OUTSIDE_OWNERSHIP_ROOT" in outside.stderr
+    assert not outside_root.exists()
+
     staged = subprocess.run(command, capture_output=True, text=True)
 
     assert staged.returncode == 0, staged.stderr
     marker = json.loads((candidate_root / ".threadcells-release.json").read_text())
-    metadata = json.loads((tmp_path / "state/cao/release-metadata.json").read_text())
+    metadata = json.loads(release_metadata.read_text())
     assert marker == {
         "schema_version": 1,
         "release_id": "candidate",
@@ -213,6 +224,16 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
     assert metadata["candidate_releases"] == [str(candidate_root.resolve())]
     candidate_runtime = candidate_root / "runtime"
     candidate_python = candidate_runtime / "bin/python"
+    assert candidate_root.stat().st_mode & 0o777 == 0o755
+    assert candidate_runtime.stat().st_mode & 0o777 == 0o755
+    assert (candidate_runtime / "bin").stat().st_mode & 0o777 == 0o755
+    assert (candidate_runtime / "pyvenv.cfg").stat().st_mode & 0o777 == 0o644
+    assert (candidate_runtime / "bin/cao").stat().st_mode & 0o777 == 0o755
+    assert (candidate_root / ".threadcells-release.json").stat().st_mode & 0o777 == 0o644
+    assert release_lock.parent.stat().st_mode & 0o777 == 0o700
+    assert release_lock.stat().st_mode & 0o777 == 0o600
+    assert release_metadata.parent.stat().st_mode & 0o777 == 0o700
+    assert release_metadata.stat().st_mode & 0o777 == 0o600
     assert (candidate_runtime / "bin/cao").read_text(encoding="utf-8").splitlines()[
         0
     ] == f"#!{candidate_python}"

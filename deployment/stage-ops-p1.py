@@ -149,6 +149,41 @@ def _remove_candidate_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
+def _seal_candidate_tree(candidate_root: Path) -> None:
+    """Make a root-staged runtime traversable but immutable to the service user."""
+    candidate_root.chmod(0o755)
+    for path in candidate_root.rglob("*"):
+        if path.is_symlink():
+            continue
+        if path.is_dir():
+            path.chmod(0o755)
+            continue
+        executable = bool(path.stat().st_mode & 0o111)
+        path.chmod(0o755 if executable else 0o644)
+
+
+def _ensure_owned_private_directory_tree(
+    ownership_root: Path,
+    target: Path,
+    owner: tuple[int, int],
+) -> None:
+    """Create a private runtime path without leaving root-owned parents behind."""
+    root = ownership_root.resolve()
+    destination = target.resolve()
+    if destination != root and not _is_within(destination, root):
+        fail("RUNTIME_PATH_OUTSIDE_OWNERSHIP_ROOT")
+    current = root
+    for part in destination.relative_to(root).parts:
+        current /= part
+        current.mkdir(exist_ok=True)
+        if current.is_symlink() or not current.is_dir():
+            fail("RUNTIME_DIRECTORY_INVALID")
+        current.chmod(0o700)
+        current_stat = current.stat()
+        if (current_stat.st_uid, current_stat.st_gid) != owner:
+            os.chown(current, *owner)
+
+
 def _purge_candidate_package_payload(
     site_packages: Path, payload: dict[PurePosixPath, bytes]
 ) -> None:
@@ -318,6 +353,7 @@ def _stage_candidate_runtime(
         candidate_created = True
         shutil.copytree(base_runtime, candidate_runtime, symlinks=True)
         _validate_candidate_runtime(source, candidate_runtime, wheel.resolve(), expected_commit)
+        _seal_candidate_tree(candidate_root)
         if _tree_hash(base_runtime) != base_before:
             fail("BASE_RUNTIME_MUTATED")
     except BaseException:
@@ -328,14 +364,31 @@ def _stage_candidate_runtime(
         raise
 
 
-def _atomic_json(path: Path, value: dict) -> None:
+def _atomic_json(
+    path: Path,
+    value: dict,
+    *,
+    mode: int = 0o600,
+    owner: tuple[int, int] | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}")
     temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary.chmod(mode)
+    if owner is not None:
+        current = temporary.stat()
+        if (current.st_uid, current.st_gid) != owner:
+            os.chown(temporary, *owner)
     os.replace(temporary, path)
 
 
-def _record_staged_candidate(metadata_path: Path, candidate_root: Path, commit: str) -> None:
+def _record_staged_candidate(
+    metadata_path: Path,
+    candidate_root: Path,
+    commit: str,
+    *,
+    metadata_owner: tuple[int, int],
+) -> None:
     """Publish bounded release references only after an immutable stage validates."""
     if metadata_path.exists():
         try:
@@ -369,9 +422,10 @@ def _record_staged_candidate(metadata_path: Path, candidate_root: Path, commit: 
             "source_commit": commit,
             "state": "candidate",
         },
+        mode=0o644,
     )
     metadata["candidate_releases"] = candidates[:2]
-    _atomic_json(metadata_path, metadata)
+    _atomic_json(metadata_path, metadata, mode=0o600, owner=metadata_owner)
 
 
 def main() -> int:
@@ -412,6 +466,7 @@ def main() -> int:
     # canonical ThreadCells ownership root atomically so Housekeeping cannot
     # silently inspect an unrelated default tree.
     root = args.agent_control_root.resolve()
+    root_stat = root.stat()
     runtime_user = root.owner()
     config.update(
         root=str(root),
@@ -464,8 +519,15 @@ def main() -> int:
     if all(value is not None for value in candidate_arguments):
         release_lock = args.release_lock or Path(str(config["release_staging_lock"]))
         release_metadata = args.release_metadata or Path(str(config["release_metadata"]))
-        release_lock.parent.mkdir(parents=True, exist_ok=True)
+        runtime_owner = (root_stat.st_uid, root_stat.st_gid)
+        _ensure_owned_private_directory_tree(root, args.candidate_root.parent, runtime_owner)
+        _ensure_owned_private_directory_tree(root, release_lock.parent, runtime_owner)
+        _ensure_owned_private_directory_tree(root, release_metadata.parent, runtime_owner)
         with release_lock.open("a+") as lock_handle:
+            os.fchmod(lock_handle.fileno(), 0o600)
+            lock_stat = os.fstat(lock_handle.fileno())
+            if (lock_stat.st_uid, lock_stat.st_gid) != runtime_owner:
+                os.fchown(lock_handle.fileno(), *runtime_owner)
             try:
                 fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
@@ -481,6 +543,7 @@ def main() -> int:
                 release_metadata,
                 args.candidate_root,
                 args.expected_commit,
+                metadata_owner=runtime_owner,
             )
     targets[0].parent.mkdir(parents=True, exist_ok=True)
     targets[0].write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")

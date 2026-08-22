@@ -342,6 +342,7 @@ def test_managed_new_session_inventory_exception_retains_worktree_for_recovery(
     cleanup = MagicMock(return_value={"removed": True})
     tmux = object.__new__(TmuxClient)
     tmux.server = MagicMock()
+    tmux._start_credential_free_bootstrap = MagicMock(return_value="cao-bootstrap-test")
     tmux.server.sessions.get.side_effect = [None, None, RuntimeError("inventory unavailable")]
     tmux.server.new_session.side_effect = RuntimeError("tmux create then raise")
     monkeypatch.setattr(
@@ -383,6 +384,8 @@ def test_managed_new_session_inventory_exception_retains_worktree_for_recovery(
     outcome = raised.value._cao_launch_cleanup_outcome
     assert outcome.target_attempted is True
     assert outcome.death_confirmed is False
+    tmux._start_credential_free_bootstrap.assert_called_once_with(str(managed_path))
+    tmux.server.cmd.assert_called_once_with("kill-session", "-t", "cao-bootstrap-test")
     assert tmux.server.sessions.get.call_count == 3
     cleanup.assert_not_called()
 

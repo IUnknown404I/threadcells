@@ -14,7 +14,6 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
 import cli_agent_orchestrator.clients.database as database
 from cli_agent_orchestrator import constants
@@ -84,15 +83,17 @@ from cli_agent_orchestrator.services.terminal_service import ExitTerminalResult
 
 
 @pytest.fixture
-def workflow_db(monkeypatch):
+def workflow_db(monkeypatch, tmp_path):
+    database_path = tmp_path / "workflow.db"
     engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+        f"sqlite:///{database_path}",
+        connect_args={"check_same_thread": False, "timeout": 30},
     )
     Base.metadata.create_all(bind=engine)
     monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
     monkeypatch.setattr(database, "_child_assignment_schema_ready", True)
+    yield
+    engine.dispose()
 
 
 def _authorized_callback(child_id: str):

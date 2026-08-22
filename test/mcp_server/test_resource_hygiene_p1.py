@@ -582,6 +582,49 @@ def test_p1_current_supervisor_sidecar_runs_assigned_retirement_saga(
     exit_terminal.assert_called_once_with(child)
 
 
+def test_p1_mid_retirement_identity_outage_releases_claim_then_fresh_turn_retries(
+    resource_db, monkeypatch, mocker
+):
+    parent, child = "parent-p1-runtime-outage", "child-p1-runtime-outage"
+    first_turn = _admit(parent, monkeypatch)
+    _acknowledged_child(parent, child, monkeypatch)
+    monkeypatch.setattr(mcp_server, "_SIDECAR_RUNTIME_GENERATION", "managed-build")
+    active_generation = mocker.patch.object(
+        mcp_server,
+        "_active_runtime_generation",
+        side_effect=["managed-build", "managed-build", None],
+    )
+    mocker.patch.object(
+        mcp_server,
+        "_read_terminal_state",
+        return_value=("completed", "running"),
+    )
+    exit_terminal = mocker.patch.object(
+        mcp_server.terminal_service, "exit_terminal", return_value=True
+    )
+
+    first = asyncio.run(mcp_server.retire_completed_child(first_turn, child))
+
+    assert first["status"] == "runtime_identity_unavailable"
+    assert "CAO_RUNTIME_GENERATION_UNAVAILABLE" in first["error"]
+    assert "CAO_SIDECAR_RECONNECT_REQUIRED" not in first["error"]
+    exit_terminal.assert_not_called()
+    with database.SessionLocal() as db:
+        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id=child).one()
+        assert assignment.retirement_claim_token is None
+        assert assignment.retirement_exit_dispatched_at is None
+
+    retry_turn = _admit(parent, monkeypatch)
+    monkeypatch.setattr(mcp_server, "_SIDECAR_RUNTIME_GENERATION", "managed-build")
+    active_generation.side_effect = None
+    active_generation.return_value = "managed-build"
+
+    retry = asyncio.run(mcp_server.retire_completed_child(retry_turn, child))
+
+    assert retry == {"success": True, "child_terminal_id": child, "status": "retired"}
+    exit_terminal.assert_called_once_with(child)
+
+
 def test_c1_stale_sidecar_cannot_enter_direct_handoff_retirement(resource_db, monkeypatch, mocker):
     parent, child = "parent-c1-stale-handoff", "child-c1-stale-handoff"
     turn_id = _admit(parent, monkeypatch)
@@ -1786,6 +1829,46 @@ def test_c1_r1_direct_handoff_cleanup_retry_finalizes_before_result_delivery(res
         assert assignment.status == ChildAssignmentStatus.HANDOFF_RESULT_DELIVERED.value
         assert assignment.retirement_cleanup_completed_at is not None
         assert assignment.retirement_completed_at is not None
+
+
+def test_c1_r1_mid_handoff_identity_outage_retains_recoverable_exit_claim_for_retry(
+    resource_db, monkeypatch, mocker
+):
+    parent, child = "parent-c1-r1-runtime-outage", "child-c1-r1-runtime-outage"
+    _completed_handoff_child(parent, child)
+    with database.SessionLocal() as db:
+        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id=child).one()
+        assignment.status = ChildAssignmentStatus.HANDOFF_DIRECT_RESULT_CLAIMED.value
+        assignment.cleanup_acknowledged = False
+        db.commit()
+    monkeypatch.setattr(mcp_server, "_SIDECAR_RUNTIME_GENERATION", "managed-build")
+    active_generation = mocker.patch.object(
+        mcp_server,
+        "_active_runtime_generation",
+        side_effect=["managed-build", "managed-build", None],
+    )
+    cleanup = mocker.patch.object(mcp_server.terminal_service, "cleanup_managed_worktree")
+
+    first = mcp_server._cleanup_claimed_handoff_result(parent, child, "exited", 1)
+
+    assert "CAO_RUNTIME_GENERATION_UNAVAILABLE" in first.message
+    assert "CAO_SIDECAR_RECONNECT_REQUIRED" not in first.message
+    cleanup.assert_not_called()
+    with database.SessionLocal() as db:
+        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id=child).one()
+        # The child was already durably exited, so this claim is intentionally
+        # retained as reconciliation authority rather than releasing the exit
+        # boundary. The database returns this same token on retry.
+        assert assignment.retirement_claim_token is not None
+        assert assignment.retirement_exit_dispatched_at is not None
+        assert assignment.retirement_completed_at is None
+
+    active_generation.side_effect = None
+    active_generation.return_value = "managed-build"
+    retry = mcp_server._cleanup_claimed_handoff_result(parent, child, "exited", 1)
+
+    assert retry.state.value == "completed"
+    cleanup.assert_called_once()
 
 
 @pytest.mark.parametrize("kind", ["task", "reviewer"])

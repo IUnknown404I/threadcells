@@ -201,18 +201,35 @@ def _runtime_reconnect_response(child_terminal_id: str) -> Dict[str, Any]:
     }
 
 
+def _runtime_identity_unavailable_response(child_terminal_id: str) -> Dict[str, Any]:
+    """Return a retry boundary without claiming a proven code mismatch."""
+    return {
+        "success": False,
+        "child_terminal_id": child_terminal_id,
+        "status": "runtime_identity_unavailable",
+        "recoverable": True,
+        "error": (
+            "CAO_RUNTIME_GENERATION_UNAVAILABLE: child retirement was not started; "
+            "retry after the active runtime identity is available"
+        ),
+    }
+
+
 def _retirement_runtime_fence(child_terminal_id: str) -> Optional[Dict[str, Any]]:
     """Recheck code ownership immediately before a retirement mutation boundary."""
     try:
         _fence_privileged_runtime()
     except SidecarRuntimeRecoveryRequired:
         return _runtime_reconnect_response(child_terminal_id)
+    except SidecarRuntimeIdentityUnavailable:
+        return _runtime_identity_unavailable_response(child_terminal_id)
     return None
 
 
 def _finish_stale_retirement_boundary(
     effect: Dict[str, Any],
     child_terminal_id: str,
+    runtime_fence: Dict[str, Any],
     *,
     claim_token: Optional[str] = None,
     exit_reserved_but_undispatched: bool = False,
@@ -227,11 +244,15 @@ def _finish_stale_retirement_boundary(
         else:
             released = release_completed_assigned_child_retirement(child_terminal_id, claim_token)
     _finish_privileged_effect(effect, "rejected" if released else "indeterminate")
-    response = _runtime_reconnect_response(child_terminal_id)
+    response = dict(runtime_fence)
     if not released:
-        response.update(
-            status="retirement_release_indeterminate",
-            error="CAO_SIDECAR_RECONNECT_REQUIRED: retirement state release was not confirmed",
+        marker = (
+            "CAO_RUNTIME_GENERATION_UNAVAILABLE"
+            if response.get("status") == "runtime_identity_unavailable"
+            else "CAO_SIDECAR_RECONNECT_REQUIRED"
+        )
+        response["error"] = (
+            f"{marker}: the durable retirement claim was retained for safe reconciliation"
         )
     return response
 
@@ -302,8 +323,12 @@ def _finish_retired_child(
     """Fulfil exact cleanup intent, then CAS-seal final retirement."""
     runtime_fence = _retirement_runtime_fence(child_terminal_id)
     if runtime_fence is not None:
-        _finish_privileged_effect(effect, "indeterminate")
-        return runtime_fence
+        return _finish_stale_retirement_boundary(
+            effect,
+            child_terminal_id,
+            runtime_fence,
+            claim_token=claim_token,
+        )
     cleanup_state = get_assigned_child_retirement_cleanup_intent(child_terminal_id, claim_token)
     if cleanup_state is None:
         _finish_privileged_effect(effect, "indeterminate")
@@ -331,8 +356,12 @@ def _finish_retired_child(
         }
     runtime_fence = _retirement_runtime_fence(child_terminal_id)
     if runtime_fence is not None:
-        _finish_privileged_effect(effect, "indeterminate")
-        return runtime_fence
+        return _finish_stale_retirement_boundary(
+            effect,
+            child_terminal_id,
+            runtime_fence,
+            claim_token=claim_token,
+        )
     try:
         terminal_service.cleanup_managed_worktree(cleanup_state["intent"])
     except Exception as exc:
@@ -348,8 +377,12 @@ def _finish_retired_child(
         }
     runtime_fence = _retirement_runtime_fence(child_terminal_id)
     if runtime_fence is not None:
-        _finish_privileged_effect(effect, "indeterminate")
-        return runtime_fence
+        return _finish_stale_retirement_boundary(
+            effect,
+            child_terminal_id,
+            runtime_fence,
+            claim_token=claim_token,
+        )
     if not complete_assigned_child_retirement(
         child_terminal_id,
         claim_token,
@@ -914,6 +947,53 @@ def _runtime_reconnect_handoff_result(terminal_id: Optional[str]) -> HandoffResu
     )
 
 
+def _runtime_identity_unavailable_handoff_result(
+    terminal_id: Optional[str],
+) -> HandoffResult:
+    return HandoffResult(
+        success=False,
+        message=(
+            "CAO_RUNTIME_GENERATION_UNAVAILABLE: handoff lifecycle mutation was not started; "
+            "retry after the active runtime identity is available"
+        ),
+        output=None,
+        terminal_id=terminal_id,
+        state=HandoffState.FAILED,
+    )
+
+
+def _handoff_runtime_fence_result(terminal_id: str) -> Optional[HandoffResult]:
+    try:
+        _fence_privileged_runtime()
+    except SidecarRuntimeRecoveryRequired:
+        return _runtime_reconnect_handoff_result(terminal_id)
+    except SidecarRuntimeIdentityUnavailable:
+        return _runtime_identity_unavailable_handoff_result(terminal_id)
+    return None
+
+
+def _finish_claimed_handoff_runtime_fence(
+    terminal_id: str,
+    claim_token: Optional[str],
+    runtime_fence: HandoffResult,
+) -> HandoffResult:
+    """Release a pre-cleanup handoff retirement claim before retrying."""
+    if claim_token is None or release_completed_assigned_child_retirement(terminal_id, claim_token):
+        return runtime_fence
+    marker = (
+        "CAO_RUNTIME_GENERATION_UNAVAILABLE"
+        if "CAO_RUNTIME_GENERATION_UNAVAILABLE" in runtime_fence.message
+        else "CAO_SIDECAR_RECONNECT_REQUIRED"
+    )
+    return HandoffResult(
+        success=False,
+        message=f"{marker}: handoff retirement state release was not confirmed",
+        output=None,
+        terminal_id=terminal_id,
+        state=HandoffState.FAILED,
+    )
+
+
 def _cleanup_claimed_handoff_result(
     parent_terminal_id: Optional[str],
     terminal_id: str,
@@ -921,10 +1001,9 @@ def _cleanup_claimed_handoff_result(
     timeout: int,
 ) -> HandoffResult:
     """Exit, retire managed worktree authority, then deliver one direct claim."""
-    try:
-        _fence_privileged_runtime()
-    except SidecarRuntimeRecoveryRequired:
-        return _runtime_reconnect_handoff_result(terminal_id)
+    runtime_fence = _handoff_runtime_fence_result(terminal_id)
+    if runtime_fence is not None:
+        return runtime_fence
     if not parent_terminal_id:
         return _waiting_handoff_result(
             terminal_id, timeout, "direct-handoff parent identity is unavailable"
@@ -940,11 +1019,11 @@ def _cleanup_claimed_handoff_result(
                 f"cleanup is retryable after final-result claim: {cleanup_exc}",
             )
     retirement: Dict[str, Any] = {"cleanup_required": False}
+    claim_token: Optional[str] = None
     if managed_handoff_retirement_required(parent_terminal_id, terminal_id) is True:
-        try:
-            _fence_privileged_runtime()
-        except SidecarRuntimeRecoveryRequired:
-            return _runtime_reconnect_handoff_result(terminal_id)
+        runtime_fence = _handoff_runtime_fence_result(terminal_id)
+        if runtime_fence is not None:
+            return runtime_fence
         retirement = claim_completed_handoff_child_retirement(parent_terminal_id, terminal_id)
         if not retirement.get("eligible"):
             return _waiting_handoff_result(
@@ -962,10 +1041,11 @@ def _cleanup_claimed_handoff_result(
                     timeout,
                     "managed retirement claim is not durable",
                 )
-            try:
-                _fence_privileged_runtime()
-            except SidecarRuntimeRecoveryRequired:
-                return _runtime_reconnect_handoff_result(terminal_id)
+            runtime_fence = _handoff_runtime_fence_result(terminal_id)
+            if runtime_fence is not None:
+                return _finish_claimed_handoff_runtime_fence(
+                    terminal_id, claim_token, runtime_fence
+                )
             cleanup_state = get_child_retirement_cleanup_intent(terminal_id, claim_token)
             if cleanup_state is None:
                 return _waiting_handoff_result(
@@ -973,21 +1053,24 @@ def _cleanup_claimed_handoff_result(
                     timeout,
                     "managed retirement cleanup intent is not durable",
                 )
+            runtime_fence = _handoff_runtime_fence_result(terminal_id)
+            if runtime_fence is not None:
+                return _finish_claimed_handoff_runtime_fence(
+                    terminal_id, claim_token, runtime_fence
+                )
             try:
-                _fence_privileged_runtime()
                 terminal_service.cleanup_managed_worktree(cleanup_state["intent"])
-            except SidecarRuntimeRecoveryRequired:
-                return _runtime_reconnect_handoff_result(terminal_id)
             except Exception as cleanup_exc:
                 return _waiting_handoff_result(
                     terminal_id,
                     timeout,
                     f"managed worktree cleanup is retryable: {cleanup_exc}",
                 )
-            try:
-                _fence_privileged_runtime()
-            except SidecarRuntimeRecoveryRequired:
-                return _runtime_reconnect_handoff_result(terminal_id)
+            runtime_fence = _handoff_runtime_fence_result(terminal_id)
+            if runtime_fence is not None:
+                return _finish_claimed_handoff_runtime_fence(
+                    terminal_id, claim_token, runtime_fence
+                )
             if not complete_child_retirement(
                 terminal_id, claim_token, cleanup_state["intent"], "handoff"
             ):
@@ -996,10 +1079,10 @@ def _cleanup_claimed_handoff_result(
                     timeout,
                     "managed retirement finalization is retryable",
                 )
-    try:
-        _fence_privileged_runtime()
-    except SidecarRuntimeRecoveryRequired:
-        return _runtime_reconnect_handoff_result(terminal_id)
+            claim_token = None
+    runtime_fence = _handoff_runtime_fence_result(terminal_id)
+    if runtime_fence is not None:
+        return _finish_claimed_handoff_runtime_fence(terminal_id, claim_token, runtime_fence)
     acknowledged_output = acknowledge_handoff_child_result_direct(parent_terminal_id, terminal_id)
     if acknowledged_output is None:
         return _waiting_handoff_result(
@@ -1944,13 +2027,15 @@ async def retire_completed_child(
         )
     except SidecarRuntimeRecoveryRequired:
         return _runtime_reconnect_response(child_terminal_id)
+    except SidecarRuntimeIdentityUnavailable:
+        return _runtime_identity_unavailable_response(child_terminal_id)
     if effect is None:
         return _privileged_effect_rejection(
             logical_turn_id, "retire_completed_child", child_terminal_id
         )
     runtime_fence = _retirement_runtime_fence(child_terminal_id)
     if runtime_fence is not None:
-        return _finish_stale_retirement_boundary(effect, child_terminal_id)
+        return _finish_stale_retirement_boundary(effect, child_terminal_id, runtime_fence)
     fence = claim_completed_assigned_child_retirement(parent_terminal_id, child_terminal_id)
     if not fence["eligible"]:
         _finish_privileged_effect(effect, "rejected")
@@ -2053,7 +2138,12 @@ async def retire_completed_child(
         return {"success": False, "error": "child_terminal_lifecycle_unknown"}
     runtime_fence = _retirement_runtime_fence(child_terminal_id)
     if runtime_fence is not None:
-        return _finish_stale_retirement_boundary(effect, child_terminal_id, claim_token=claim_token)
+        return _finish_stale_retirement_boundary(
+            effect,
+            child_terminal_id,
+            runtime_fence,
+            claim_token=claim_token,
+        )
     if not reserve_completed_assigned_child_retirement_exit(child_terminal_id, claim_token):
         # Do not release this claim: the failed compare-and-mutate may mean a
         # prior process already reserved /exit.  Holding the fence is safer
@@ -2071,6 +2161,7 @@ async def retire_completed_child(
         return _finish_stale_retirement_boundary(
             effect,
             child_terminal_id,
+            runtime_fence,
             claim_token=claim_token,
             exit_reserved_but_undispatched=True,
         )

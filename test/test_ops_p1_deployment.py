@@ -401,6 +401,39 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
     assert "OPS_P1_PROMOTE_DRY_RUN" in dry_promotion.stdout
     assert not active_link.exists()
 
+    original_var_mode = (tmp_path / "var").stat().st_mode & 0o777
+    (tmp_path / "var").chmod(0o775)
+    untrusted_parent = subprocess.run(promote_command, capture_output=True, text=True)
+    assert untrusted_parent.returncode != 0
+    assert "reason_code=RELEASE_CONTROL_ROOT_UNTRUSTED" in untrusted_parent.stderr
+    assert not active_link.exists()
+    (tmp_path / "var").chmod(original_var_mode)
+
+    marker_crash = subprocess.run(
+        [*promote_command, "--test-crash-after", "marker"],
+        capture_output=True,
+        text=True,
+    )
+    assert marker_crash.returncode != 0
+    assert "reason_code=TEST_CRASH_AFTER_MARKER" in marker_crash.stderr
+    assert json.loads((candidate_root / ".threadcells-release.json").read_text())["state"] == (
+        "active"
+    )
+    assert not active_link.exists()
+    assert json.loads(release_metadata.read_text())["candidate_releases"] == [
+        str(candidate_root.resolve())
+    ]
+
+    link_crash = subprocess.run(
+        [*promote_command, "--test-crash-after", "link"],
+        capture_output=True,
+        text=True,
+    )
+    assert link_crash.returncode != 0
+    assert "reason_code=TEST_CRASH_AFTER_LINK" in link_crash.stderr
+    assert active_link.resolve() == candidate_root.resolve()
+    assert json.loads(release_metadata.read_text())["active_release"] is None
+
     promoted = subprocess.run(promote_command, capture_output=True, text=True)
     assert promoted.returncode == 0, promoted.stderr
     assert "OPS_P1_PROMOTED" in promoted.stdout

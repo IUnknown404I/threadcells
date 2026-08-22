@@ -456,6 +456,15 @@ def execute_plan(
                     or resolved in allowed_roots
                 ):
                     raise RuntimeError("candidate canonical identity changed")
+                if candidate.category == "releases":
+                    assert release_group is not None and release_control_uid is not None
+                    release_stat = path.lstat()
+                    if (
+                        release_stat.st_uid != release_control_uid
+                        or release_stat.st_gid != release_group.gr_gid
+                        or release_stat.st_mode & 0o002
+                    ):
+                        raise RuntimeError("release candidate ownership changed")
                 current_fingerprint, _size = candidate_fingerprint(path)
                 if current_fingerprint != candidate.fingerprint:
                     raise RuntimeError("candidate fingerprint changed")

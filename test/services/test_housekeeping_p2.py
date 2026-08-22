@@ -54,6 +54,7 @@ def _config(root: Path):
         "retention_minutes": 120,
         "release_roots": [str(root / "tools")],
         "release_metadata": str(root / "state/cao/release-metadata.json"),
+        "active_release_link": str(root / "state/cao/active"),
         "release_staging_lock": str(release_lock),
         "release_admin_group": grp.getgrgid(os.getgid()).gr_name,
         "release_control_uid": os.getuid(),
@@ -705,6 +706,7 @@ def test_release_gc_preserves_active_rollback_and_backups_and_removes_only_stale
     )
     monkeypatch.setattr("cli_agent_orchestrator.clients.database.list_all_terminals", lambda: [])
     config = _config(tmp_path)
+    Path(config["active_release_link"]).symlink_to(active, target_is_directory=True)
     settings = default_settings(config)
     settings["policy"]["releases"]["retain_count"] = 1
     plan = build_plan(
@@ -726,6 +728,49 @@ def test_release_gc_preserves_active_rollback_and_backups_and_removes_only_stale
     assert report.ok is True
     assert active.exists() and rollback.exists() and backup.exists()
     assert not stale.exists()
+
+
+def test_active_link_target_remains_protected_after_candidate_metadata_eviction(
+    tmp_path, monkeypatch
+):
+    linked_active = _release(tmp_path, "linked-active", minutes=400)
+    newer_one = _release(tmp_path, "newer-one", minutes=300)
+    newer_two = _release(tmp_path, "newer-two", minutes=200)
+    stale = _release(tmp_path, "stale", minutes=500)
+    config = _config(tmp_path)
+    metadata = Path(config["release_metadata"])
+    metadata.parent.mkdir(parents=True, exist_ok=True)
+    metadata.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "active_release": None,
+                "rollback_releases": [],
+                "candidate_releases": [str(newer_two.resolve()), str(newer_one.resolve())],
+            }
+        ),
+        encoding="utf-8",
+    )
+    Path(config["active_release_link"]).symlink_to(linked_active, target_is_directory=True)
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.list_all_terminals", lambda: [])
+    settings = default_settings(config)
+    settings["policy"]["releases"]["retain_count"] = 1
+
+    plan = build_plan(
+        root=tmp_path,
+        config=config,
+        settings=settings,
+        mode="weekly",
+        now=NOW,
+        open_inventory=lambda: (set(), True),
+    )
+    by_name = {Path(item.path).name: item for item in plan.candidates}
+
+    assert by_name["linked-active"].protection_reason == "ACTIVE_OR_ROLLBACK_RELEASE"
+    assert by_name["newer-one"].protection_reason == "ACTIVE_OR_ROLLBACK_RELEASE"
+    assert by_name["newer-two"].protection_reason == "ACTIVE_OR_ROLLBACK_RELEASE"
+    assert by_name["stale"].action == "delete"
+    assert "active_release_metadata_diverged" in plan.warnings
 
 
 def test_unknown_release_metadata_fails_closed(tmp_path, monkeypatch):

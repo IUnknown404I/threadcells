@@ -85,6 +85,16 @@ def _validate_anchor(
 ) -> tuple[Path, Path]:
     state_root = system_root / "var/lib/threadcells"
     release_root = state_root / "releases"
+    current = system_root
+    for part in ("var", "lib"):
+        current /= part
+        if current.is_symlink() or not current.is_dir():
+            fail("RELEASE_CONTROL_ROOT_INVALID")
+        current_stat = current.stat()
+        if (current_stat.st_uid, current_stat.st_gid) != trusted_owner or (
+            current_stat.st_mode & 0o022
+        ):
+            fail("RELEASE_CONTROL_ROOT_UNTRUSTED")
     for path, owner, mode in (
         (state_root, trusted_owner, 0o755),
         (release_root, release_owner, 0o775),
@@ -204,11 +214,18 @@ def main() -> int:
     parser.add_argument(
         "--test-unprivileged-promotion", action="store_true", help=argparse.SUPPRESS
     )
+    parser.add_argument(
+        "--test-crash-after",
+        choices=("marker", "link"),
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     system_root = args.system_root.resolve()
     production = system_root == Path("/")
     if args.test_unprivileged_promotion and production:
+        fail("TEST_PROMOTION_OVERRIDE_FORBIDDEN")
+    if args.test_crash_after and (production or not args.test_unprivileged_promotion):
         fail("TEST_PROMOTION_OVERRIDE_FORBIDDEN")
     if production and os.geteuid() != 0:
         fail("PROMOTION_PRIVILEGE_REQUIRED")
@@ -321,6 +338,8 @@ def main() -> int:
             _atomic_json(
                 candidate / ".threadcells-release.json", candidate_marker, owner=release_owner
             )
+        if args.test_crash_after == "marker":
+            fail("TEST_CRASH_AFTER_MARKER")
         for value in rollback_values[:2]:
             rollback_path = Path(value)
             marker = _open_json(rollback_path / ".threadcells-release.json", owner=release_owner)
@@ -331,6 +350,8 @@ def main() -> int:
                 )
         if active != candidate:
             _replace_active(active_link, candidate, owner=release_owner)
+        if args.test_crash_after == "link":
+            fail("TEST_CRASH_AFTER_LINK")
         metadata["active_release"] = candidate_value
         metadata["rollback_releases"] = rollback_values[:2]
         metadata["candidate_releases"] = [

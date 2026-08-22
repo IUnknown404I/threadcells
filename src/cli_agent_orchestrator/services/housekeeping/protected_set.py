@@ -80,18 +80,48 @@ def _active_terminal_inventory() -> tuple[set[str], bool]:
 def _release_metadata(
     root: Path, config: Mapping[str, Any]
 ) -> tuple[tuple[Path, ...], set[Path], bool, list[str]]:
-    release_roots = tuple(
-        Path(str(value)).resolve() for value in config.get("release_roots", [str(root / "tools")])
+    configured_release_roots = tuple(
+        Path(str(value)) for value in config.get("release_roots", [str(root / "tools")])
     )
+    release_roots = tuple(path.resolve() for path in configured_release_roots)
     metadata_path = Path(
         str(config.get("release_metadata", root / "state" / "cao" / "release-metadata.json"))
     )
+    active_link_path = Path(str(config.get("active_release_link", metadata_path.parent / "active")))
     warnings: list[str] = []
     try:
         if metadata_path.is_symlink():
             raise ValueError("missing release metadata")
         release_group = grp.getgrnam(str(config["release_admin_group"]))
         release_control_uid = int(config["release_control_uid"])
+        if (
+            not metadata_path.is_absolute()
+            or metadata_path.parent.is_symlink()
+            or metadata_path.parent.stat().st_uid != release_control_uid
+            or metadata_path.parent.stat().st_mode & 0o022
+            or not active_link_path.is_absolute()
+            or active_link_path.parent != metadata_path.parent
+        ):
+            raise ValueError("release control parent is invalid")
+        for configured_root, release_root in zip(configured_release_roots, release_roots):
+            if (
+                not configured_root.is_absolute()
+                or configured_root != release_root
+                or configured_root.is_symlink()
+                or not release_root.is_dir()
+            ):
+                raise ValueError("release root identity is invalid")
+            release_stat = release_root.stat()
+            parent_stat = release_root.parent.stat()
+            if (
+                release_stat.st_uid != release_control_uid
+                or release_stat.st_gid != release_group.gr_gid
+                or release_stat.st_mode & 0o002
+                or release_root.parent.is_symlink()
+                or parent_stat.st_uid != release_control_uid
+                or parent_stat.st_mode & 0o022
+            ):
+                raise ValueError("release root ownership is invalid")
         descriptor = os.open(metadata_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
         try:
             metadata_stat = os.fstat(descriptor)
@@ -126,12 +156,34 @@ def _release_metadata(
             if not isinstance(value, str) or not Path(value).is_absolute():
                 raise ValueError("release reference must be absolute")
             candidate = Path(value).resolve()
-            if not any(
-                candidate == release_root or _within(candidate, release_root)
-                for release_root in release_roots
-            ):
+            if candidate.parent not in release_roots:
                 raise ValueError("release reference is outside configured roots")
             protected.add(candidate)
+        configured_active = raw.get("active_release")
+        if active_link_path.exists() or active_link_path.is_symlink():
+            if not active_link_path.is_symlink():
+                raise ValueError("active release link is invalid")
+            active_stat = active_link_path.lstat()
+            if (
+                active_stat.st_uid != release_control_uid
+                or active_stat.st_gid != release_group.gr_gid
+            ):
+                raise ValueError("active release link ownership is invalid")
+            active_target = active_link_path.resolve(strict=True)
+            if active_target.parent not in release_roots or not active_target.is_dir():
+                raise ValueError("active release target is invalid")
+            target_stat = active_target.stat()
+            if (
+                target_stat.st_uid != release_control_uid
+                or target_stat.st_gid != release_group.gr_gid
+                or target_stat.st_mode & 0o002
+            ):
+                raise ValueError("active release target ownership is invalid")
+            protected.add(active_target)
+            if configured_active != str(active_target):
+                warnings.append("active_release_metadata_diverged")
+        elif configured_active is not None:
+            raise ValueError("active release link is missing")
         return release_roots, protected, True, warnings
     except (KeyError, OSError, ValueError, TypeError, json.JSONDecodeError):
         warnings.append("release_metadata_inventory_uncertain")

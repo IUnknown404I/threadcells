@@ -323,9 +323,7 @@ def test_housekeeping_cli_forwards_the_inspected_plan_id(monkeypatch, capsys):
     assert "HOUSEKEEPING_OK" in capsys.readouterr().out
 
 
-def test_scheduled_housekeeping_treats_an_active_canonical_run_as_a_safe_skip(
-    monkeypatch, capsys
-):
+def test_scheduled_housekeeping_treats_an_active_canonical_run_as_a_safe_skip(monkeypatch, capsys):
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.housekeeping_service.run_housekeeping",
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("HOUSEKEEPING_BUSY")),

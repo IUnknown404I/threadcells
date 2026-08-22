@@ -1,6 +1,7 @@
 """Focused P1 lifecycle/result fences for acknowledged assigned-child retirement."""
 
 import asyncio
+import json
 import subprocess
 import threading
 from datetime import datetime
@@ -43,7 +44,12 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.mcp_server import server as mcp_server
 from cli_agent_orchestrator.models.inbox import ChildAssignmentStatus
 from cli_agent_orchestrator.models.result import DelegationResultStatus
-from cli_agent_orchestrator.runtime_generation import RUNTIME_GENERATION_ENV
+from cli_agent_orchestrator.providers.codex import _has_runtime_reconnect_signal
+from cli_agent_orchestrator.runtime_generation import (
+    ACTIVE_RUNTIME_GENERATION,
+    PROVIDER_RECONNECT_ATTEMPT_ENV,
+    RUNTIME_GENERATION_ENV,
+)
 from cli_agent_orchestrator.services import (
     housekeeping_service,
     managed_worktree_service,
@@ -500,8 +506,10 @@ def test_p1_stale_supervisor_sidecar_cannot_report_assigned_child_retired(
     resource_db, monkeypatch, mocker
 ):
     parent, child = "parent-p1-stale-runtime", "child-p1-stale-runtime"
+    attempt_token = "c" * 32
     turn_id = _admit(parent, monkeypatch)
     _acknowledged_child(parent, child, monkeypatch)
+    monkeypatch.setenv(PROVIDER_RECONNECT_ATTEMPT_ENV, attempt_token)
     monkeypatch.setattr(
         mcp_server, "_SIDECAR_RUNTIME_GENERATION", "generation-before-cleanup-contract"
     )
@@ -523,15 +531,72 @@ def test_p1_stale_supervisor_sidecar_cannot_report_assigned_child_retired(
         "status": "runtime_reconnect_required",
         "recoverable": True,
         "error": (
-            "CAO_SIDECAR_RECONNECT_REQUIRED: child retirement was not started; "
+            "CAO_SIDECAR_RECONNECT_REQUIRED "
+            f"[{PROVIDER_RECONNECT_ATTEMPT_ENV}={attempt_token}]: "
+            "child retirement was not started; "
             "reconnect/reinitialize before retrying"
         ),
     }
+    assert _has_runtime_reconnect_signal(json.dumps(result), attempt_token) is True
     claim_effect.assert_not_called()
     claim_retirement.assert_not_called()
     exit_terminal.assert_not_called()
     cleanup.assert_not_called()
     finalize.assert_not_called()
+
+
+def test_p1_stale_resumed_sidecar_reconnect_signal_is_attempt_bound(monkeypatch, mocker):
+    attempt_token = "a" * 32
+    monkeypatch.setenv(PROVIDER_RECONNECT_ATTEMPT_ENV, attempt_token)
+    monkeypatch.setattr(mcp_server, "_SIDECAR_RUNTIME_GENERATION", "generation-old")
+    mocker.patch.object(mcp_server, "_active_runtime_generation", return_value="generation-current")
+
+    with pytest.raises(mcp_server.SidecarRuntimeRecoveryRequired) as error:
+        mcp_server._fence_privileged_runtime()
+
+    assert f"[{PROVIDER_RECONNECT_ATTEMPT_ENV}={attempt_token}]" in str(error.value)
+
+
+def test_p1_new_resumed_sidecar_registers_nonce_bound_process_identity(monkeypatch, mocker):
+    terminal_id = "resumed-root"
+    attempt_token = "b" * 32
+    monkeypatch.setenv("CAO_TERMINAL_ID", terminal_id)
+    monkeypatch.setenv(PROVIDER_RECONNECT_ATTEMPT_ENV, attempt_token)
+    monkeypatch.setattr(mcp_server, "_SIDECAR_RUNTIME_GENERATION", ACTIVE_RUNTIME_GENERATION)
+    mocker.patch.object(mcp_server, "_current_process_start_ticks", return_value=987654)
+    record_ready = mocker.patch.object(
+        mcp_server,
+        "record_workflow_provider_reconnect_runtime_ready",
+        return_value=True,
+    )
+
+    mcp_server._register_provider_reconnect_runtime_ready()
+
+    record_ready.assert_called_once_with(
+        terminal_id,
+        attempt_token,
+        ACTIVE_RUNTIME_GENERATION,
+        mcp_server.os.getpid(),
+        987654,
+    )
+
+
+def test_p1_reconnect_readiness_is_published_after_mcp_initialize(mocker):
+    readiness = mocker.patch.object(mcp_server, "_register_provider_reconnect_runtime_ready")
+    initialize_result = object()
+
+    async def accept_initialize(_context):
+        readiness.assert_not_called()
+        return initialize_result
+
+    result = asyncio.run(
+        mcp_server._ProviderReconnectReadinessMiddleware().on_initialize(
+            mocker.Mock(), accept_initialize
+        )
+    )
+
+    assert result is initialize_result
+    readiness.assert_called_once_with()
 
 
 @pytest.mark.parametrize("failure", ["connection", "http", "malformed"])
@@ -627,8 +692,10 @@ def test_p1_mid_retirement_identity_outage_releases_claim_then_fresh_turn_retrie
 
 def test_c1_stale_sidecar_cannot_enter_direct_handoff_retirement(resource_db, monkeypatch, mocker):
     parent, child = "parent-c1-stale-handoff", "child-c1-stale-handoff"
+    attempt_token = "d" * 32
     turn_id = _admit(parent, monkeypatch)
     _completed_handoff_child(parent, child)
+    monkeypatch.setenv(PROVIDER_RECONNECT_ATTEMPT_ENV, attempt_token)
     monkeypatch.setattr(mcp_server, "_SIDECAR_RUNTIME_GENERATION", "generation-old-code")
     monkeypatch.setenv(RUNTIME_GENERATION_ENV, "generation-current")
     mocker.patch.object(mcp_server, "_active_runtime_generation", return_value="generation-current")
@@ -641,6 +708,7 @@ def test_c1_stale_sidecar_cannot_enter_direct_handoff_retirement(resource_db, mo
 
     assert result.state.value == "failed"
     assert "CAO_SIDECAR_RECONNECT_REQUIRED" in result.message
+    assert _has_runtime_reconnect_signal(result.model_dump_json(), attempt_token) is True
     claim_effect.assert_not_called()
     provider_exit.assert_not_called()
     claim_retirement.assert_not_called()

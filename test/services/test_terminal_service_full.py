@@ -3,7 +3,7 @@
 from contextlib import nullcontext
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
@@ -1762,16 +1762,54 @@ class TestSendInput:
             logical_turn_id=42,
         )
 
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.record_workflow_provider_reconnect_output_boundary",
+        return_value=True,
+    )
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.get_workflow_provider_reconnect_runtime_ready"
+    )
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.mark_workflow_provider_reconnect_launch_dispatched",
+        return_value=True,
+    )
     @patch("cli_agent_orchestrator.services.terminal_service.send_input")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     def test_sidecar_reconnect_prefers_exact_provider_resume(
-        self, mock_provider_manager, mock_send_input
+        self,
+        mock_provider_manager,
+        mock_send_input,
+        mock_mark_launch,
+        mock_runtime_ready,
+        mock_record_boundary,
     ):
         provider = mock_provider_manager.get_provider.return_value
 
-        request_provider_runtime_sidecar_reconnect("test1234", 42, "resume-exact")
+        request_provider_runtime_sidecar_reconnect(
+            "test1234",
+            42,
+            "resume-exact",
+            claim_token="claim-token",
+            attempt_token="a" * 32,
+            attempt_state="reserved",
+        )
 
-        provider.reconnect_runtime_sidecar.assert_called_once_with("resume-exact")
+        provider.reconnect_runtime_sidecar.assert_called_once_with(
+            "resume-exact",
+            attempt_token="a" * 32,
+            attempt_state="reserved",
+            mark_launch_dispatched=ANY,
+            runtime_ready=ANY,
+            record_output_boundary=ANY,
+            side_effect_guard=ANY,
+        )
+        kwargs = provider.reconnect_runtime_sidecar.call_args.kwargs
+        assert kwargs["mark_launch_dispatched"]() is True
+        mock_mark_launch.assert_called_once_with("test1234", 42, "claim-token", "a" * 32)
+        kwargs["runtime_ready"]()
+        mock_runtime_ready.assert_called_once_with("test1234", "a" * 32)
+        assert kwargs["record_output_boundary"](11, 22, 33) is True
+        mock_record_boundary.assert_called_once_with("test1234", "a" * 32, 11, 22, 33)
         mock_send_input.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")

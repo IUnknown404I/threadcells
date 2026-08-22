@@ -693,6 +693,50 @@ class WorkflowTurnModel(Base):
     updated_at = Column(DateTime, default=datetime.now)
 
 
+class WorkflowProviderReconnectAttemptModel(Base):
+    """One bounded, durable provider resume attempt and its final outcome.
+
+    The row is reserved before the external pane mutation.  Reconciliation
+    reuses a non-terminal row instead of purchasing another provider launch,
+    while a new row is possible only after the prior attempt has one durable
+    outcome.  A sidecar-ready record is bound to the opaque attempt token, the
+    active workflow turn, and the process identity of the newly launched MCP
+    runtime.
+    """
+
+    __tablename__ = "workflow_provider_reconnect_attempts"
+    __table_args__ = (
+        UniqueConstraint(
+            "workflow_turn_id",
+            "attempt_number",
+            name="uq_workflow_provider_reconnect_attempt_number",
+        ),
+        UniqueConstraint("attempt_token", name="uq_workflow_provider_reconnect_attempt_token"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    workflow_id = Column(Integer, nullable=False, index=True)
+    workflow_turn_id = Column(Integer, nullable=False, index=True)
+    root_terminal_id = Column(String, nullable=False, index=True)
+    attempt_number = Column(Integer, nullable=False)
+    attempt_token = Column(String, nullable=False)
+    resume_identity = Column(String, nullable=True)
+    state = Column(String, nullable=False, default="reserved")
+    outcome_code = Column(String, nullable=True)
+    runtime_generation = Column(String, nullable=True)
+    sidecar_process_id = Column(Integer, nullable=True)
+    sidecar_process_start_ticks = Column(Integer, nullable=True)
+    output_log_device = Column(Integer, nullable=True)
+    output_log_inode = Column(Integer, nullable=True)
+    output_log_offset = Column(Integer, nullable=True)
+    output_boundary_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    launched_at = Column(DateTime, nullable=True)
+    ready_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
 class WorkflowTurnReceiptModel(Base):
     """One irreversible receiver-side admission for a stable logical turn.
 
@@ -2125,6 +2169,7 @@ def _ensure_workflow_schema() -> None:
     """Create additive F13 tables without altering existing runtime data."""
     WorkflowModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowTurnModel.__table__.create(bind=engine, checkfirst=True)
+    WorkflowProviderReconnectAttemptModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowTurnReceiptModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowEffectModel.__table__.create(bind=engine, checkfirst=True)
     _migrate_workflow_turn_columns()
@@ -4549,6 +4594,16 @@ DEFER_UNADMITTED = "DEFER_UNADMITTED"
 DEFER_STABLE_READY = "DEFER_STABLE_READY"
 WORKFLOW_TURN_CLAIM_LEASE_SECONDS = 30
 WORKFLOW_PROVIDER_RECONNECT_LEASE_SECONDS = 30
+MAX_WORKFLOW_PROVIDER_RECONNECT_ATTEMPTS = 3
+PROVIDER_RECONNECT_RESERVED = "reserved"
+PROVIDER_RECONNECT_LAUNCHED = "launch_dispatched"
+PROVIDER_RECONNECT_READY = "runtime_ready"
+PROVIDER_RECONNECT_SUCCEEDED = "succeeded"
+PROVIDER_RECONNECT_FAILED = "failed"
+PROVIDER_RECONNECT_RECOVERY_EXHAUSTED_REASON = (
+    "Provider reconnect recovery exhausted after three bounded exact-resume attempts. "
+    "No further provider launch will occur automatically."
+)
 WORKFLOW_READY_AFTER_PROCESSING_GRACE_SECONDS = 3
 WORKFLOW_READY_WITHOUT_PROCESSING_GRACE_SECONDS = 30
 # Provider finals are transport observations, not semantic mission outcomes.
@@ -5864,13 +5919,14 @@ def mark_workflow_turn_sent_for_inbox(message_id: int) -> bool:
 def claim_workflow_provider_reconnect(
     root_terminal_id: str, now: Optional[datetime] = None
 ) -> Optional[Dict[str, Any]]:
-    """Claim one retryable provider-context reinitialization for the active turn."""
+    """Claim one bounded provider reconnect without duplicating an attempt."""
     _ensure_workflow_schema()
     now = now or datetime.now()
     stale_before = datetime.fromtimestamp(
         now.timestamp() - WORKFLOW_PROVIDER_RECONNECT_LEASE_SECONDS
     )
     claim_token = uuid.uuid4().hex
+    exhausted_workflow_id: Optional[int] = None
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         workflow = _open_workflow(db, root_terminal_id, create=False)
@@ -5903,6 +5959,89 @@ def claim_workflow_provider_reconnect(
         if admitted is None:
             db.rollback()
             return None
+        active_turn = db.get(WorkflowTurnModel, active_turn_id)
+        if active_turn is None:
+            db.rollback()
+            return None
+        attempts = (
+            db.query(WorkflowProviderReconnectAttemptModel)
+            .filter_by(
+                workflow_id=workflow.id,
+                workflow_turn_id=active_turn_id,
+                root_terminal_id=root_terminal_id,
+            )
+            .order_by(WorkflowProviderReconnectAttemptModel.attempt_number.asc())
+            .all()
+        )
+        attempt = next(
+            (
+                candidate
+                for candidate in reversed(attempts)
+                if candidate.state
+                in {
+                    PROVIDER_RECONNECT_RESERVED,
+                    PROVIDER_RECONNECT_LAUNCHED,
+                    PROVIDER_RECONNECT_READY,
+                }
+            ),
+            None,
+        )
+        if attempt is None and len(attempts) >= MAX_WORKFLOW_PROVIDER_RECONNECT_ATTEMPTS:
+            workflow.status = WORKFLOW_OWNER_GATE
+            workflow.terminal_reason = PROVIDER_RECONNECT_RECOVERY_EXHAUSTED_REASON
+            workflow.updated_at = now
+            turn = db.get(WorkflowTurnModel, active_turn_id)
+            if turn is not None:
+                turn.provider_reconnect_requested_at = None
+                turn.provider_reconnect_claim_token = None
+                turn.updated_at = now
+            if terminal.runtime_operation_kind == "reconnect":
+                terminal.runtime_operation_kind = None
+                terminal.runtime_operation_token = None
+                terminal.runtime_operation_claimed_at = None
+                terminal.runtime_operation_expires_at = None
+            db.query(WorkflowTurnModel).filter(
+                WorkflowTurnModel.workflow_id == workflow.id,
+                WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+            ).update(
+                {
+                    WorkflowTurnModel.state: TURN_CANCELLED,
+                    WorkflowTurnModel.claim_token: None,
+                    WorkflowTurnModel.claim_expires_at: None,
+                    WorkflowTurnModel.updated_at: now,
+                },
+                synchronize_session=False,
+            )
+            _cancel_parent_assignments(db, root_terminal_id, now)
+            db.query(ProviderExecutionLeaseModel).filter_by(terminal_id=root_terminal_id).delete(
+                synchronize_session=False
+            )
+            exhausted_workflow_id = int(workflow.id)
+            db.commit()
+            result = {
+                "exhausted": True,
+                "turn_id": active_turn_id,
+                "attempt_count": len(attempts),
+            }
+            # Notification is deliberately outside the state transaction.
+            _dispatch_workflow_notification_fail_open(
+                root_terminal_id, "owner_attention", exhausted_workflow_id
+            )
+            return result
+        if attempt is None:
+            attempt = WorkflowProviderReconnectAttemptModel(
+                workflow_id=workflow.id,
+                workflow_turn_id=active_turn_id,
+                root_terminal_id=root_terminal_id,
+                attempt_number=len(attempts) + 1,
+                attempt_token=uuid.uuid4().hex,
+                resume_identity=active_turn.provider_reconnect_resume_identity,
+                state=PROVIDER_RECONNECT_RESERVED,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(attempt)
+            db.flush()
         claimed = (
             db.query(WorkflowTurnModel)
             .filter(
@@ -5954,6 +6093,10 @@ def claim_workflow_provider_reconnect(
             "claimed_at": now,
             "claim_token": claim_token,
             "resume_identity": resume_identity,
+            "attempt_token": str(attempt.attempt_token),
+            "attempt_state": str(attempt.state),
+            "attempt_number": int(attempt.attempt_number),
+            "attempt_limit": MAX_WORKFLOW_PROVIDER_RECONNECT_ATTEMPTS,
         }
 
 
@@ -6000,6 +6143,7 @@ def persist_workflow_provider_reconnect_identity(
     root_terminal_id: str,
     turn_id: int,
     claim_token: str,
+    attempt_token: str,
     resume_identity: str,
 ) -> bool:
     """Persist one provider resume identity before any reconnect side effect."""
@@ -6037,14 +6181,296 @@ def persist_workflow_provider_reconnect_identity(
             return False
         if turn.provider_reconnect_resume_identity not in (None, resume_identity):
             return False
+        attempt = (
+            db.query(WorkflowProviderReconnectAttemptModel)
+            .filter_by(
+                workflow_turn_id=turn_id,
+                root_terminal_id=root_terminal_id,
+                attempt_token=attempt_token,
+            )
+            .one_or_none()
+        )
+        if attempt is None or attempt.state not in {
+            PROVIDER_RECONNECT_RESERVED,
+            PROVIDER_RECONNECT_LAUNCHED,
+            PROVIDER_RECONNECT_READY,
+        }:
+            return False
+        if attempt.resume_identity not in (None, resume_identity):
+            return False
         turn.provider_reconnect_resume_identity = resume_identity
         turn.updated_at = datetime.now()
+        attempt.resume_identity = resume_identity
+        attempt.updated_at = turn.updated_at
         db.commit()
         return True
 
 
+def mark_workflow_provider_reconnect_launch_dispatched(
+    root_terminal_id: str,
+    turn_id: int,
+    claim_token: str,
+    attempt_token: str,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Persist the paid-launch boundary before sending the shell command."""
+    _ensure_workflow_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.get(TerminalModel, root_terminal_id)
+        turn = db.get(WorkflowTurnModel, turn_id)
+        attempt = (
+            db.query(WorkflowProviderReconnectAttemptModel)
+            .filter_by(
+                workflow_turn_id=turn_id,
+                root_terminal_id=root_terminal_id,
+                attempt_token=attempt_token,
+            )
+            .one_or_none()
+        )
+        workflow = db.get(WorkflowModel, turn.workflow_id) if turn is not None else None
+        if (
+            terminal is None
+            or turn is None
+            or attempt is None
+            or workflow is None
+            or workflow.status != WORKFLOW_OPEN
+            or workflow.active_turn_id != turn_id
+            or terminal.runtime_lifecycle not in (None, "running")
+            or terminal.runtime_operation_kind != "reconnect"
+            or terminal.runtime_operation_token != claim_token
+            or turn.provider_reconnect_claim_token != claim_token
+            or turn.provider_reconnect_requested_at is None
+            or attempt.state != PROVIDER_RECONNECT_RESERVED
+        ):
+            db.rollback()
+            return False
+        attempt.state = PROVIDER_RECONNECT_LAUNCHED
+        attempt.launched_at = now
+        attempt.updated_at = now
+        db.commit()
+        return True
+
+
+def record_workflow_provider_reconnect_runtime_ready(
+    root_terminal_id: str,
+    attempt_token: str,
+    runtime_generation: str,
+    sidecar_process_id: int,
+    sidecar_process_start_ticks: int,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Register the new nonce-bound MCP sidecar process exactly once."""
+    from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
+
+    _ensure_workflow_schema()
+    if (
+        not re.fullmatch(r"[0-9a-f]{32}", attempt_token)
+        or not re.fullmatch(r"[0-9a-f]{64}", runtime_generation)
+        or not hmac.compare_digest(runtime_generation, ACTIVE_RUNTIME_GENERATION)
+        or sidecar_process_id <= 1
+        or sidecar_process_start_ticks <= 0
+    ):
+        return False
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        attempt = (
+            db.query(WorkflowProviderReconnectAttemptModel)
+            .filter_by(root_terminal_id=root_terminal_id, attempt_token=attempt_token)
+            .one_or_none()
+        )
+        if attempt is None:
+            db.rollback()
+            return False
+        workflow = db.get(WorkflowModel, attempt.workflow_id)
+        turn = db.get(WorkflowTurnModel, attempt.workflow_turn_id)
+        terminal = db.get(TerminalModel, root_terminal_id)
+        if (
+            workflow is None
+            or turn is None
+            or terminal is None
+            or workflow.status != WORKFLOW_OPEN
+            or workflow.active_turn_id != turn.id
+            or turn.provider_reconnect_requested_at is None
+            or terminal.runtime_lifecycle not in (None, "running")
+            or terminal.runtime_operation_kind != "reconnect"
+            or attempt.state not in {PROVIDER_RECONNECT_LAUNCHED, PROVIDER_RECONNECT_READY}
+        ):
+            db.rollback()
+            return False
+        identity = (
+            runtime_generation,
+            sidecar_process_id,
+            sidecar_process_start_ticks,
+        )
+        existing_identity = (
+            attempt.runtime_generation,
+            attempt.sidecar_process_id,
+            attempt.sidecar_process_start_ticks,
+        )
+        if attempt.state == PROVIDER_RECONNECT_READY:
+            db.rollback()
+            return existing_identity == identity
+        attempt.state = PROVIDER_RECONNECT_READY
+        attempt.runtime_generation = runtime_generation
+        attempt.sidecar_process_id = sidecar_process_id
+        attempt.sidecar_process_start_ticks = sidecar_process_start_ticks
+        attempt.ready_at = now
+        attempt.updated_at = now
+        db.commit()
+        return True
+
+
+def get_workflow_provider_reconnect_runtime_ready(
+    root_terminal_id: str, attempt_token: str
+) -> Optional[Dict[str, Any]]:
+    """Return the exact registered sidecar identity for an active attempt."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        attempt = (
+            db.query(WorkflowProviderReconnectAttemptModel)
+            .filter_by(
+                root_terminal_id=root_terminal_id,
+                attempt_token=attempt_token,
+                state=PROVIDER_RECONNECT_READY,
+            )
+            .one_or_none()
+        )
+        if attempt is None:
+            return None
+        workflow = db.get(WorkflowModel, attempt.workflow_id)
+        turn = db.get(WorkflowTurnModel, attempt.workflow_turn_id)
+        if (
+            workflow is None
+            or turn is None
+            or workflow.status != WORKFLOW_OPEN
+            or workflow.active_turn_id != turn.id
+            or turn.provider_reconnect_requested_at is None
+        ):
+            return None
+        return {
+            "runtime_generation": attempt.runtime_generation,
+            "sidecar_process_id": attempt.sidecar_process_id,
+            "sidecar_process_start_ticks": attempt.sidecar_process_start_ticks,
+            "ready_at": attempt.ready_at,
+        }
+
+
+def record_workflow_provider_reconnect_output_boundary(
+    root_terminal_id: str,
+    attempt_token: str,
+    output_log_device: int,
+    output_log_inode: int,
+    output_log_offset: int,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Persist the exact private-log byte boundary for one ready runtime."""
+    _ensure_workflow_schema()
+    if (
+        not re.fullmatch(r"[0-9a-f]{32}", attempt_token)
+        or output_log_device < 0
+        or output_log_inode <= 0
+        or output_log_offset < 0
+    ):
+        return False
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        attempt = (
+            db.query(WorkflowProviderReconnectAttemptModel)
+            .filter_by(
+                root_terminal_id=root_terminal_id,
+                attempt_token=attempt_token,
+                state=PROVIDER_RECONNECT_READY,
+            )
+            .one_or_none()
+        )
+        if attempt is None:
+            db.rollback()
+            return False
+        workflow = db.get(WorkflowModel, attempt.workflow_id)
+        turn = db.get(WorkflowTurnModel, attempt.workflow_turn_id)
+        terminal = db.get(TerminalModel, root_terminal_id)
+        if (
+            workflow is None
+            or turn is None
+            or terminal is None
+            or workflow.status != WORKFLOW_OPEN
+            or workflow.active_turn_id != turn.id
+            or turn.provider_reconnect_requested_at is None
+            or terminal.runtime_lifecycle not in (None, "running")
+            or terminal.runtime_operation_kind != "reconnect"
+        ):
+            db.rollback()
+            return False
+        identity = (output_log_device, output_log_inode, output_log_offset)
+        existing = (
+            attempt.output_log_device,
+            attempt.output_log_inode,
+            attempt.output_log_offset,
+        )
+        if attempt.output_boundary_at is not None:
+            db.rollback()
+            return existing == identity
+        attempt.output_log_device = output_log_device
+        attempt.output_log_inode = output_log_inode
+        attempt.output_log_offset = output_log_offset
+        attempt.output_boundary_at = now
+        attempt.updated_at = now
+        db.commit()
+        return True
+
+
+def get_latest_workflow_provider_reconnect_output_boundary(
+    root_terminal_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Return the newest DB-authorized log boundary for this provider runtime."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        attempt = (
+            db.query(WorkflowProviderReconnectAttemptModel)
+            .filter(
+                WorkflowProviderReconnectAttemptModel.root_terminal_id == root_terminal_id,
+                WorkflowProviderReconnectAttemptModel.state.in_(
+                    (PROVIDER_RECONNECT_READY, PROVIDER_RECONNECT_SUCCEEDED)
+                ),
+                WorkflowProviderReconnectAttemptModel.output_log_device.is_not(None),
+                WorkflowProviderReconnectAttemptModel.output_log_inode.is_not(None),
+                WorkflowProviderReconnectAttemptModel.output_log_offset.is_not(None),
+                WorkflowProviderReconnectAttemptModel.output_boundary_at.is_not(None),
+            )
+            .order_by(WorkflowProviderReconnectAttemptModel.id.desc())
+            .first()
+        )
+        if attempt is None:
+            return None
+        if attempt.state == PROVIDER_RECONNECT_READY:
+            workflow = db.get(WorkflowModel, attempt.workflow_id)
+            turn = db.get(WorkflowTurnModel, attempt.workflow_turn_id)
+            if (
+                workflow is None
+                or turn is None
+                or workflow.status != WORKFLOW_OPEN
+                or workflow.active_turn_id != turn.id
+                or turn.provider_reconnect_requested_at is None
+            ):
+                return None
+        return {
+            "attempt_token": str(attempt.attempt_token),
+            "output_log_device": int(attempt.output_log_device),
+            "output_log_inode": int(attempt.output_log_inode),
+            "output_log_offset": int(attempt.output_log_offset),
+            "output_boundary_at": attempt.output_boundary_at,
+        }
+
+
 def complete_workflow_provider_reconnect(
-    root_terminal_id: str, turn_id: int, claim_token: str
+    root_terminal_id: str,
+    turn_id: int,
+    claim_token: str,
+    attempt_token: str,
 ) -> bool:
     """Close the durable reconnect episode after the resumed TUI is ready."""
     _ensure_workflow_schema()
@@ -6059,6 +6485,28 @@ def complete_workflow_provider_reconnect(
         ):
             db.rollback()
             return False
+        attempt = (
+            db.query(WorkflowProviderReconnectAttemptModel)
+            .filter_by(
+                workflow_turn_id=turn_id,
+                root_terminal_id=root_terminal_id,
+                attempt_token=attempt_token,
+                state=PROVIDER_RECONNECT_READY,
+            )
+            .one_or_none()
+        )
+        if attempt is None:
+            db.rollback()
+            return False
+        if (
+            attempt.output_log_device is None
+            or attempt.output_log_inode is None
+            or attempt.output_log_offset is None
+            or attempt.output_boundary_at is None
+        ):
+            db.rollback()
+            return False
+        now = datetime.now()
         completed = (
             db.query(WorkflowTurnModel)
             .filter(
@@ -6078,7 +6526,7 @@ def complete_workflow_provider_reconnect(
                     WorkflowTurnModel.provider_reconnect_requested_at: None,
                     WorkflowTurnModel.provider_reconnect_claim_token: None,
                     WorkflowTurnModel.provider_reconnect_resume_identity: None,
-                    WorkflowTurnModel.updated_at: datetime.now(),
+                    WorkflowTurnModel.updated_at: now,
                 },
                 synchronize_session=False,
             )
@@ -6090,8 +6538,105 @@ def complete_workflow_provider_reconnect(
         terminal.runtime_operation_token = None
         terminal.runtime_operation_claimed_at = None
         terminal.runtime_operation_expires_at = None
+        attempt.state = PROVIDER_RECONNECT_SUCCEEDED
+        attempt.outcome_code = "runtime_ready"
+        attempt.finished_at = now
+        attempt.updated_at = now
         db.commit()
         return True
+
+
+def fail_workflow_provider_reconnect_attempt(
+    root_terminal_id: str,
+    turn_id: int,
+    claim_token: str,
+    attempt_token: str,
+    outcome_code: str,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Give one attempt a durable failure and exhaust the shared budget safely."""
+    _ensure_workflow_schema()
+    if not re.fullmatch(r"[a-z0-9_]{1,64}", outcome_code):
+        outcome_code = "reconnect_failed"
+    now = now or datetime.now()
+    notify_workflow_id: Optional[int] = None
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.get(TerminalModel, root_terminal_id)
+        turn = db.get(WorkflowTurnModel, turn_id)
+        attempt = (
+            db.query(WorkflowProviderReconnectAttemptModel)
+            .filter_by(
+                workflow_turn_id=turn_id,
+                root_terminal_id=root_terminal_id,
+                attempt_token=attempt_token,
+            )
+            .one_or_none()
+        )
+        workflow = db.get(WorkflowModel, turn.workflow_id) if turn is not None else None
+        if (
+            terminal is None
+            or turn is None
+            or attempt is None
+            or workflow is None
+            or workflow.status != WORKFLOW_OPEN
+            or workflow.active_turn_id != turn_id
+            or terminal.runtime_operation_kind != "reconnect"
+            or terminal.runtime_operation_token != claim_token
+            or turn.provider_reconnect_claim_token != claim_token
+            or turn.provider_reconnect_requested_at is None
+            or attempt.state
+            not in {
+                PROVIDER_RECONNECT_RESERVED,
+                PROVIDER_RECONNECT_LAUNCHED,
+                PROVIDER_RECONNECT_READY,
+            }
+        ):
+            db.rollback()
+            return False
+        attempt.state = PROVIDER_RECONNECT_FAILED
+        attempt.outcome_code = outcome_code
+        attempt.finished_at = now
+        attempt.updated_at = now
+        turn.provider_reconnect_claim_token = None
+        # Keep the reconnect episode durable, but make its failed lease
+        # immediately reclaimable for the next bounded attempt.
+        turn.provider_reconnect_requested_at = datetime.fromtimestamp(
+            now.timestamp() - WORKFLOW_PROVIDER_RECONNECT_LEASE_SECONDS - 1
+        )
+        turn.updated_at = now
+        terminal.runtime_operation_kind = None
+        terminal.runtime_operation_token = None
+        terminal.runtime_operation_claimed_at = None
+        terminal.runtime_operation_expires_at = None
+        if attempt.attempt_number >= MAX_WORKFLOW_PROVIDER_RECONNECT_ATTEMPTS:
+            workflow.status = WORKFLOW_OWNER_GATE
+            workflow.terminal_reason = PROVIDER_RECONNECT_RECOVERY_EXHAUSTED_REASON
+            workflow.updated_at = now
+            turn.provider_reconnect_requested_at = None
+            db.query(WorkflowTurnModel).filter(
+                WorkflowTurnModel.workflow_id == workflow.id,
+                WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+            ).update(
+                {
+                    WorkflowTurnModel.state: TURN_CANCELLED,
+                    WorkflowTurnModel.claim_token: None,
+                    WorkflowTurnModel.claim_expires_at: None,
+                    WorkflowTurnModel.updated_at: now,
+                },
+                synchronize_session=False,
+            )
+            _cancel_parent_assignments(db, root_terminal_id, now)
+            db.query(ProviderExecutionLeaseModel).filter_by(terminal_id=root_terminal_id).delete(
+                synchronize_session=False
+            )
+            notify_workflow_id = int(workflow.id)
+        db.commit()
+    if notify_workflow_id is not None:
+        _dispatch_workflow_notification_fail_open(
+            root_terminal_id, "owner_attention", notify_workflow_id
+        )
+    return True
 
 
 def renew_workflow_provider_reconnect(

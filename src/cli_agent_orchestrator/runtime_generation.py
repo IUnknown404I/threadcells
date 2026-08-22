@@ -13,6 +13,10 @@ from pathlib import Path
 
 RUNTIME_GENERATION_ENV = "CAO_RUNTIME_GENERATION"
 RUNTIME_GENERATION_HEADER = "X-CAO-Runtime-Generation"
+# Present only in a provider process launched for one durable reconnect
+# attempt.  Codex forwards this value to the newly spawned CAO MCP sidecar;
+# the sidecar then registers its own process identity against the attempt.
+PROVIDER_RECONNECT_ATTEMPT_ENV = "CAO_PROVIDER_RECONNECT_ATTEMPT"
 
 
 def _runtime_compatibility_identity() -> str:

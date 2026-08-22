@@ -5,16 +5,19 @@ import logging
 import os
 import re
 import shlex
+import stat
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.constants import TERMINAL_LOG_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.usage import UsageObservation
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.runtime_generation import (
     ACTIVE_RUNTIME_GENERATION,
+    PROVIDER_RECONNECT_ATTEMPT_ENV,
     RUNTIME_GENERATION_ENV,
 )
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -138,12 +141,20 @@ TUI_SEPARATOR_PATTERN = r"^[^\S\n]*─{3,}[^\S\n]*$"
 # the notice itself as a successful worker result.
 TUI_INFO_NOTICE_PREFIX_PATTERN = r"^[^\S\n]*ⓘ(?:[^\S\n]+|$)"
 SIDECAR_RECONNECT_REQUIRED_TEXT = "CAO_SIDECAR_RECONNECT_REQUIRED"
+PROVIDER_RECONNECT_ATTEMPT_TAG_PREFIX = f"[{PROVIDER_RECONNECT_ATTEMPT_ENV}="
 CONTEXT_COMPACTED_TEXT = "Context compacted"
 SIDECAR_RECONNECTED_PREFIX = "__CAO_SIDECAR_RECONNECTED_"
+SIDECAR_RECONNECT_LAUNCH_PREFIX = "__CAO_SIDECAR_RECONNECT_LAUNCH_"
+FRESH_RUNTIME_OUTPUT_BOUNDARY_PREFIX = "__CAO_FRESH_RUNTIME_OUTPUT_BOUNDARY_"
 SIDECAR_RECONNECT_REQUIRED_LINE_PATTERN = re.compile(
-    rf"^[^\S\n]*Error calling tool(?: '[^'\n]+')?:[^\n]*"
-    rf"{SIDECAR_RECONNECT_REQUIRED_TEXT}(?::|\b)",
+    rf"^(?:[^\S\n]*Error calling tool(?: '[^'\n]+')?:|"
+    rf"[^\n]*(?:[\"'](?:message|error)[\"'][^\S\n]*:|"
+    rf"\b(?:message|error)[^\S\n]*=))[^\n]*"
+    rf"{SIDECAR_RECONNECT_REQUIRED_TEXT}(?::|\b)[^\n]*$",
     re.MULTILINE,
+)
+PROVIDER_RECONNECT_ATTEMPT_TAG_PATTERN = re.compile(
+    rf"\{PROVIDER_RECONNECT_ATTEMPT_TAG_PREFIX}(?P<attempt>[0-9a-f]{{32}})\]"
 )
 CONTEXT_COMPACTED_LINE_PATTERN = re.compile(
     rf"^[^\S\n]*•[^\S\n]+{CONTEXT_COMPACTED_TEXT}[^\S\n]*$",
@@ -309,6 +320,40 @@ def _strip_terminal_noise(output: str) -> str:
     return output
 
 
+def _process_start_ticks(process_id: int, proc_root: Path = Path("/proc")) -> Optional[int]:
+    """Read Linux process start ticks without trusting a reusable PID alone."""
+    if process_id <= 1:
+        return None
+    try:
+        stat_text = (proc_root / str(process_id) / "stat").read_text(encoding="utf-8")
+        suffix = stat_text[stat_text.rfind(")") + 2 :].split()
+        start_ticks = int(suffix[19])
+    except (OSError, ValueError, IndexError):
+        return None
+    return start_ticks if start_ticks > 0 else None
+
+
+def _durable_reconnect_output_boundary(terminal_id: str) -> Optional[dict[str, Any]]:
+    """Load the DB-authorized byte boundary without creating a provider import cycle."""
+    from cli_agent_orchestrator.clients.database import (
+        get_latest_workflow_provider_reconnect_output_boundary,
+    )
+
+    return get_latest_workflow_provider_reconnect_output_boundary(terminal_id)
+
+
+def _has_runtime_reconnect_signal(output: str, attempt_token: Optional[str]) -> bool:
+    """Recognize protocol errors and structured semantic failures for one runtime."""
+    matches = SIDECAR_RECONNECT_REQUIRED_LINE_PATTERN.finditer(output)
+    if attempt_token is None:
+        return any(True for _ in matches)
+    return any(
+        (tagged := PROVIDER_RECONNECT_ATTEMPT_TAG_PATTERN.search(match.group(0))) is not None
+        and tagged.group("attempt") == attempt_token
+        for match in matches
+    )
+
+
 def _normalize_terminal_suffix_blank_rows(output: str) -> str:
     """Remove only trailing blank capture rows made of horizontal whitespace.
 
@@ -443,6 +488,18 @@ class CodexStartupNoReadyError(CodexStartupError):
     pass
 
 
+class CodexReconnectEarlyExitError(CodexStartupError):
+    """The exact resumed process exited before its sidecar became ready."""
+
+    reconnect_outcome_code = "process_exited_before_runtime_ready"
+
+
+class CodexReconnectNoReadyError(CodexStartupNoReadyError):
+    """The exact resumed process never established the runtime handshake."""
+
+    reconnect_outcome_code = "runtime_readiness_timeout"
+
+
 class CodexProvider(BaseProvider):
     """Provider for Codex CLI tool integration."""
 
@@ -482,6 +539,10 @@ class CodexProvider(BaseProvider):
         self._startup_attempt = 0
         self._process_exited = False
         self._runtime_sidecar_reconnect_pending = False
+        self._reconnect_log_offset: Optional[int] = None
+        self._reconnect_log_identity: Optional[tuple[int, int]] = None
+        self._reconnect_runtime_attempt_token: Optional[str] = None
+        self._reconnect_output_boundary: Optional[tuple[str, int, int, int]] = None
 
     def _reset_completion_candidate(self) -> None:
         """Forget a pending completion candidate after terminal activity."""
@@ -498,6 +559,183 @@ class CodexProvider(BaseProvider):
     def runtime_sidecar_reconnect_required(self) -> bool:
         """Return the signal cached by the normal provider status capture."""
         return self._runtime_sidecar_reconnect_pending
+
+    def _refresh_runtime_reconnect_signal(self, fallback_output: str) -> None:
+        """Consume only nonce-bound output from the latest proven runtime.
+
+        A resumed Codex TUI redraws its transcript into tmux.  The pipe-pane
+        log therefore contains replay too. The byte offset accepted after the
+        nonce-bound MCP initialize handshake is persisted in the attempt row;
+        transcript text can imitate the presentation marker but cannot move
+        this DB-owned boundary. After that offset, even later repaint is
+        ignored unless the newly launched sidecar tags its result with the
+        same attempt nonce. Before the first durable boundary, the complete
+        log retains the original backward-compatible reconnect signal.
+        """
+        trusted_boundary: Optional[tuple[str, int, int, int]] = None
+        path = TERMINAL_LOG_DIR / f"{self.terminal_id}.log"
+        descriptor = -1
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            file_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise OSError("terminal log is not a regular file")
+            try:
+                boundary = _durable_reconnect_output_boundary(self.terminal_id)
+            except Exception:
+                logger.warning(
+                    "Codex reconnect output boundary is unavailable for %s",
+                    self.terminal_id,
+                    exc_info=True,
+                )
+                self._runtime_sidecar_reconnect_pending = False
+                return
+            if boundary is not None:
+                attempt_token = boundary.get("attempt_token")
+                device = boundary.get("output_log_device")
+                inode = boundary.get("output_log_inode")
+                offset = boundary.get("output_log_offset")
+                if (
+                    not isinstance(attempt_token, str)
+                    or not re.fullmatch(r"[0-9a-f]{32}", attempt_token)
+                    or not isinstance(device, int)
+                    or device < 0
+                    or not isinstance(inode, int)
+                    or inode <= 0
+                    or not isinstance(offset, int)
+                    or offset < 0
+                ):
+                    self._runtime_sidecar_reconnect_pending = False
+                    return
+                trusted_boundary = (attempt_token, device, inode, offset)
+            if trusted_boundary != self._reconnect_output_boundary:
+                self._reconnect_output_boundary = trusted_boundary
+                self._runtime_sidecar_reconnect_pending = False
+                if trusted_boundary is None:
+                    self._reconnect_runtime_attempt_token = None
+                    self._reconnect_log_identity = None
+                    self._reconnect_log_offset = None
+                else:
+                    attempt_token, device, inode, offset = trusted_boundary
+                    self._reconnect_runtime_attempt_token = attempt_token
+                    self._reconnect_log_identity = (device, inode)
+                    self._reconnect_log_offset = offset
+            identity = (file_stat.st_dev, file_stat.st_ino)
+            if trusted_boundary is not None and identity != trusted_boundary[1:3]:
+                # Log replacement loses byte-order authority. Do not interpret
+                # retained pane transcript as fresh output.
+                self._runtime_sidecar_reconnect_pending = False
+                self._reconnect_log_identity = identity
+                self._reconnect_log_offset = file_stat.st_size
+                return
+            if trusted_boundary is None and self._reconnect_log_identity != identity:
+                self._reconnect_log_identity = identity
+                self._reconnect_log_offset = 0
+                self._runtime_sidecar_reconnect_pending = False
+                self._reconnect_runtime_attempt_token = None
+            if self._reconnect_log_offset is None:
+                self._reconnect_log_offset = (
+                    trusted_boundary[3] if trusted_boundary is not None else 0
+                )
+            if file_stat.st_size < self._reconnect_log_offset:
+                # Truncation destroys the prior ordering proof. Fail closed.
+                self._reconnect_log_offset = file_stat.st_size
+                self._runtime_sidecar_reconnect_pending = False
+                return
+            # Retain a small overlap so a pipe-pane write observed between two
+            # polls cannot split the reconnect or boundary line across reads.
+            minimum_offset = trusted_boundary[3] if trusted_boundary is not None else 0
+            read_from = max(minimum_offset, self._reconnect_log_offset - 4096)
+            os.lseek(descriptor, read_from, os.SEEK_SET)
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            self._reconnect_log_offset = os.lseek(descriptor, 0, os.SEEK_CUR)
+            if not chunks:
+                return
+            new_output = _strip_terminal_noise(b"".join(chunks).decode("utf-8", "replace"))
+        except OSError:
+            clean_fallback = _strip_terminal_noise(fallback_output)
+            if _has_runtime_reconnect_signal(clean_fallback, self._reconnect_runtime_attempt_token):
+                self._runtime_sidecar_reconnect_pending = True
+            return
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+        if _has_runtime_reconnect_signal(new_output, self._reconnect_runtime_attempt_token):
+            self._runtime_sidecar_reconnect_pending = True
+
+    def _publish_fresh_runtime_output_boundary(
+        self,
+        attempt_token: str,
+        record_output_boundary: Callable[[int, int, int], bool],
+    ) -> None:
+        """Append evidence and persist its unforgeable private-log byte offset."""
+        if not re.fullmatch(r"[0-9a-f]{32}", attempt_token):
+            raise ProviderError("Codex reconnect attempt token is invalid")
+        existing = _durable_reconnect_output_boundary(self.terminal_id)
+        if existing is not None and existing.get("attempt_token") == attempt_token:
+            device = existing.get("output_log_device")
+            inode = existing.get("output_log_inode")
+            offset = existing.get("output_log_offset")
+            if isinstance(device, int) and isinstance(inode, int) and isinstance(offset, int):
+                self._reconnect_output_boundary = (
+                    attempt_token,
+                    device,
+                    inode,
+                    offset,
+                )
+                self._reconnect_runtime_attempt_token = attempt_token
+                self._reconnect_log_identity = (device, inode)
+                self._reconnect_log_offset = offset
+                self._runtime_sidecar_reconnect_pending = False
+                return
+        path = TERMINAL_LOG_DIR / f"{self.terminal_id}.log"
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_APPEND | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        try:
+            file_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ProviderError("Codex terminal log is not a regular file")
+            marker = f"\n{FRESH_RUNTIME_OUTPUT_BOUNDARY_PREFIX}{attempt_token}__\n".encode()
+            written = os.write(descriptor, marker)
+            if written != len(marker):
+                raise ProviderError("Codex runtime output boundary write was incomplete")
+            # This descriptor's file position advances to the exact end of
+            # our O_APPEND write and is unaffected by appends through other
+            # descriptors. Capture it before fsync/fstat can interleave with
+            # fresh sidecar output; total file size is not our boundary.
+            boundary_offset = os.lseek(descriptor, 0, os.SEEK_CUR)
+            os.fsync(descriptor)
+            file_stat = os.fstat(descriptor)
+            if boundary_offset > file_stat.st_size:
+                raise ProviderError("Codex runtime output boundary exceeds terminal log size")
+            if not record_output_boundary(
+                file_stat.st_dev,
+                file_stat.st_ino,
+                boundary_offset,
+            ):
+                raise ProviderError("Codex runtime output boundary lost durable admission")
+        finally:
+            os.close(descriptor)
+        # Re-scan once so this process and a reconstructed provider use the
+        # same file-owned boundary semantics.
+        self._reconnect_output_boundary = (
+            attempt_token,
+            file_stat.st_dev,
+            file_stat.st_ino,
+            boundary_offset,
+        )
+        self._reconnect_log_identity = (file_stat.st_dev, file_stat.st_ino)
+        self._reconnect_log_offset = boundary_offset
+        self._reconnect_runtime_attempt_token = attempt_token
+        self._runtime_sidecar_reconnect_pending = False
 
     @property
     def runtime_sidecar_reconnect_input(self) -> str:
@@ -544,9 +782,36 @@ class CodexProvider(BaseProvider):
             raise ProviderError("Codex resume identity is ambiguous")
         return identities.pop()
 
-    def _wait_for_reconnected_runtime(self, marker: str, timeout: float = 60.0) -> None:
-        """Wait for a new resumed TUI after the durable reconnect marker."""
+    def _registered_sidecar_is_live(
+        self, registration: object, proc_root: Path = Path("/proc")
+    ) -> bool:
+        """Validate the registered sidecar by generation, PID, and start ticks."""
+        if not isinstance(registration, dict):
+            return False
+        process_id = registration.get("sidecar_process_id")
+        start_ticks = registration.get("sidecar_process_start_ticks")
+        return bool(
+            registration.get("runtime_generation") == ACTIVE_RUNTIME_GENERATION
+            and isinstance(process_id, int)
+            and isinstance(start_ticks, int)
+            and _process_start_ticks(process_id, proc_root) == start_ticks
+        )
+
+    def _wait_for_reconnected_runtime(
+        self,
+        attempt_token: str,
+        runtime_ready: Callable[[], Optional[dict[str, Any]]],
+        timeout: float = 60.0,
+        proc_root: Path = Path("/proc"),
+    ) -> None:
+        """Wait for a nonce-bound sidecar plus a stable resumed Codex TUI."""
+        if self._startup_exit_marker != (
+            f"__CAO_CODEX_RECONNECT_EXIT_{self.terminal_id}_{attempt_token}__"
+        ):
+            raise ProviderError("Codex reconnect attempt marker is not current")
         deadline = time.monotonic() + timeout
+        ready_fingerprint: Optional[str] = None
+        ready_polls = 0
         while time.monotonic() < deadline:
             output = tmux_client.get_history(
                 self.session_name,
@@ -555,24 +820,44 @@ class CodexProvider(BaseProvider):
             )
             clean_output = _strip_terminal_noise(output) if output else ""
             self._startup_evidence = clean_output[-STARTUP_EVIDENCE_LIMIT:]
-            marker_at = clean_output.rfind(marker)
-            if marker_at >= 0:
-                resumed_output = clean_output[marker_at + len(marker) :]
-                self._raise_if_startup_failed(resumed_output)
-                pane_command = tmux_client.get_pane_current_command(
-                    self.session_name, self.window_name
-                )
-                if (
-                    pane_command
-                    and CODEX_PANE_COMMAND_PATTERN.fullmatch(pane_command)
-                    and (
-                        re.search(CODEX_WELCOME_PATTERN, resumed_output)
-                        or re.search(TUI_FOOTER_PATTERN, resumed_output)
+            if clean_output:
+                exit_code = self._startup_exit_code(clean_output)
+                if exit_code is not None:
+                    raise CodexReconnectEarlyExitError(
+                        f"Codex reconnect exited before runtime readiness with status {exit_code}",
+                        self._startup_evidence,
                     )
-                ):
+                # A resumed TUI can repaint arbitrary historical ``Error:``
+                # lines. Only the nonce-bound shell exit marker above belongs
+                # unambiguously to this reconnect attempt; generic startup
+                # text cannot be used as fresh reconnect evidence.
+            registration = runtime_ready()
+            pane_command = tmux_client.get_pane_current_command(self.session_name, self.window_name)
+            normalized = _normalize_terminal_suffix_blank_rows(clean_output)
+            lines = normalized.splitlines()
+            footer_start = _find_active_footer_start(lines)
+            footer_ready = footer_start is not None and not _has_current_tui_progress(
+                lines, footer_start
+            )
+            if (
+                self._registered_sidecar_is_live(registration, proc_root=proc_root)
+                and pane_command
+                and CODEX_PANE_COMMAND_PATTERN.fullmatch(pane_command)
+                and footer_ready
+            ):
+                fingerprint = "\n".join(lines[-IDLE_PROMPT_TAIL_LINES:])
+                if fingerprint == ready_fingerprint:
+                    ready_polls += 1
+                else:
+                    ready_fingerprint = fingerprint
+                    ready_polls = 1
+                if ready_polls >= 2:
                     return
+            else:
+                ready_fingerprint = None
+                ready_polls = 0
             time.sleep(0.5)
-        raise CodexStartupNoReadyError(
+        raise CodexReconnectNoReadyError(
             f"Codex sidecar reconnect timed out after {int(timeout)} seconds",
             self._startup_evidence,
         )
@@ -581,12 +866,34 @@ class CodexProvider(BaseProvider):
         self,
         resume_identity: str,
         *,
+        attempt_token: str,
+        attempt_state: str,
+        mark_launch_dispatched: Callable[[], bool],
+        runtime_ready: Callable[[], Optional[dict[str, Any]]],
+        record_output_boundary: Callable[[int, int, int], bool],
         side_effect_guard: Callable[[], bool] = lambda: True,
     ) -> None:
         """Restart Codex's MCP subprocess and resume the exact conversation."""
         identity_match = CODEX_SESSION_ID_PATTERN.fullmatch(f"{resume_identity}.jsonl")
         if not identity_match or identity_match.group("session") != resume_identity.lower():
             raise ProviderError("Codex resume identity is invalid")
+        if not re.fullmatch(r"[0-9a-f]{32}", attempt_token):
+            raise ProviderError("Codex reconnect attempt token is invalid")
+        self._startup_evidence = ""
+        self._startup_exit_marker = (
+            f"__CAO_CODEX_RECONNECT_EXIT_{self.terminal_id}_{attempt_token}__"
+        )
+        self._process_exited = False
+        if attempt_state in {"launch_dispatched", "runtime_ready"}:
+            self._wait_for_reconnected_runtime(attempt_token, runtime_ready)
+            if not side_effect_guard():
+                raise ProviderError("Codex sidecar reconnect lost ownership before output boundary")
+            self._publish_fresh_runtime_output_boundary(attempt_token, record_output_boundary)
+            self._runtime_sidecar_reconnect_pending = False
+            self._initialized = True
+            return
+        if attempt_state != "reserved":
+            raise ProviderError("Codex reconnect attempt state is invalid")
         pane_command = tmux_client.get_pane_current_command(self.session_name, self.window_name)
         if pane_command is None:
             raise ProviderError("Codex pane command is unavailable during reconnect")
@@ -609,23 +916,26 @@ class CodexProvider(BaseProvider):
             else:
                 raise ProviderError("Codex did not exit for sidecar reconnect")
 
-        if not side_effect_guard():
+        if not mark_launch_dispatched():
             raise ProviderError("Codex sidecar reconnect lost ownership before resume")
-        command = self._build_codex_command(resume_session_id=resume_identity)
-        marker = f"{SIDECAR_RECONNECTED_PREFIX}{ACTIVE_RUNTIME_GENERATION}__"
-        self._startup_attempt += 1
-        self._startup_evidence = ""
-        self._startup_exit_marker = (
-            f"__CAO_CODEX_STARTUP_EXIT_{self.terminal_id}_{self._startup_attempt}__"
+        command = self._build_codex_command(
+            resume_session_id=resume_identity,
+            reconnect_attempt_token=attempt_token,
         )
-        self._process_exited = False
+        marker = f"{SIDECAR_RECONNECTED_PREFIX}{ACTIVE_RUNTIME_GENERATION}__"
+        launch_marker = (
+            f"{SIDECAR_RECONNECT_LAUNCH_PREFIX}{ACTIVE_RUNTIME_GENERATION}_{attempt_token}__"
+        )
         launch_command = (
-            f"printf '\\n%s\\n' {shlex.quote(marker)}; {command}; "
-            f"codex_startup_status=$?; printf '\\n{self._startup_exit_marker}:%s\\n' "
-            '"$codex_startup_status"'
+            f"printf '\\n%s\\n%s\\n' {shlex.quote(marker)} {shlex.quote(launch_marker)}; "
+            f"{command}; codex_reconnect_status=$?; "
+            f"printf '\\n{self._startup_exit_marker}:%s\\n' \"$codex_reconnect_status\""
         )
         tmux_client.send_keys(self.session_name, self.window_name, launch_command)
-        self._wait_for_reconnected_runtime(marker)
+        self._wait_for_reconnected_runtime(attempt_token, runtime_ready)
+        if not side_effect_guard():
+            raise ProviderError("Codex sidecar reconnect lost ownership before output boundary")
+        self._publish_fresh_runtime_output_boundary(attempt_token, record_output_boundary)
         self._runtime_sidecar_reconnect_pending = False
         self._initialized = True
 
@@ -712,7 +1022,10 @@ class CodexProvider(BaseProvider):
         marker_pattern = (
             re.escape(self._startup_exit_marker)
             if self._startup_exit_marker
-            else rf"__CAO_CODEX_STARTUP_EXIT_{re.escape(self.terminal_id)}_\d+__"
+            else (
+                rf"(?:__CAO_CODEX_STARTUP_EXIT_{re.escape(self.terminal_id)}_\d+__|"
+                rf"__CAO_CODEX_RECONNECT_EXIT_{re.escape(self.terminal_id)}_[0-9a-f]{{32}}__)"
+            )
         )
         matches = list(re.finditer(rf"^{marker_pattern}:(\d+)\s*$", output, re.MULTILINE))
         if not matches:
@@ -763,7 +1076,11 @@ class CodexProvider(BaseProvider):
             return TerminalStatus.COMPLETED
         return TerminalStatus.PROCESSING
 
-    def _build_codex_command(self, resume_session_id: str | None = None) -> str:
+    def _build_codex_command(
+        self,
+        resume_session_id: str | None = None,
+        reconnect_attempt_token: str | None = None,
+    ) -> str:
         """Build Codex command with agent profile if provided.
 
         Returns properly escaped shell command string that can be safely sent via tmux.
@@ -850,6 +1167,16 @@ class CodexProvider(BaseProvider):
                                     f'{prefix}.env.{RUNTIME_GENERATION_ENV}="{ACTIVE_RUNTIME_GENERATION}"',
                                 ]
                             )
+                            if reconnect_attempt_token is not None:
+                                if not re.fullmatch(r"[0-9a-f]{32}", reconnect_attempt_token):
+                                    raise ValueError("invalid provider reconnect attempt token")
+                                command_parts.extend(
+                                    [
+                                        "-c",
+                                        f"{prefix}.env.{PROVIDER_RECONNECT_ATTEMPT_ENV}="
+                                        f'"{reconnect_attempt_token}"',
+                                    ]
+                                )
                         # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
                         # can identify the current session for handoff/assign operations.
                         # Codex does not forward env vars to MCP subprocesses by default;
@@ -1018,14 +1345,7 @@ class CodexProvider(BaseProvider):
             return TerminalStatus.ERROR
 
         clean_output = _strip_terminal_noise(output)
-        reconnect_matches = list(SIDECAR_RECONNECT_REQUIRED_LINE_PATTERN.finditer(clean_output))
-        reconnected_matches = list(SIDECAR_RECONNECTED_LINE_PATTERN.finditer(clean_output))
-        reconnect = reconnect_matches[-1].start() if reconnect_matches else -1
-        reconnected = reconnected_matches[-1].start() if reconnected_matches else -1
-        if reconnect >= 0 and reconnect > reconnected:
-            self._runtime_sidecar_reconnect_pending = True
-        elif reconnected >= 0:
-            self._runtime_sidecar_reconnect_pending = False
+        self._refresh_runtime_reconnect_signal(clean_output)
         normalized_output = _normalize_terminal_suffix_blank_rows(clean_output)
         tail_output = "\n".join(normalized_output.splitlines()[-25:])
 

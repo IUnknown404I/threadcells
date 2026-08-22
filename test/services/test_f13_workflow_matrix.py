@@ -26,6 +26,7 @@ from cli_agent_orchestrator.clients.database import (
     TerminalModel,
     WorkflowEffectModel,
     WorkflowModel,
+    WorkflowProviderReconnectAttemptModel,
     WorkflowTurnModel,
     WorkflowTurnReceiptModel,
     acknowledge_child_assignment_result,
@@ -72,6 +73,7 @@ from cli_agent_orchestrator.mcp_server import server as mcp_server
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.codex import CodexProvider
+from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
 from cli_agent_orchestrator.services import workflow_service
 from cli_agent_orchestrator.services.inbox_service import (
     LogFileHandler,
@@ -1486,40 +1488,73 @@ def test_f13_stale_sidecar_requests_one_retryable_context_reinitialization(
         False,
     ]
     mock_terminal.provider_runtime_sidecar_resume_identity.return_value = "resume-exact"
-    mock_terminal.request_provider_runtime_sidecar_reconnect.side_effect = [
-        RuntimeError("service stopped after provider exit"),
-        None,
-    ]
+
+    request_attempts = []
+
+    def reconnect_request(
+        terminal_id,
+        turn_id,
+        resume_identity,
+        *,
+        registry,
+        claim_token,
+        attempt_token,
+        attempt_state,
+        side_effect_guard,
+    ):
+        request_attempts.append(attempt_token)
+        assert terminal_id == root
+        assert turn_id == reconnect_turn_id
+        assert resume_identity == "resume-exact"
+        assert registry is None
+        assert attempt_state == "reserved"
+        if len(request_attempts) == 1:
+            raise RuntimeError("service stopped after provider exit")
+        assert database.mark_workflow_provider_reconnect_launch_dispatched(
+            root, turn_id, claim_token, attempt_token, now=now + timedelta(seconds=1)
+        )
+        assert database.record_workflow_provider_reconnect_runtime_ready(
+            root,
+            attempt_token,
+            ACTIVE_RUNTIME_GENERATION,
+            4321,
+            987654,
+            now=now + timedelta(seconds=1),
+        )
+        assert database.record_workflow_provider_reconnect_output_boundary(
+            root,
+            attempt_token,
+            11,
+            22,
+            333,
+            now=now + timedelta(seconds=1),
+        )
+
+    mock_terminal.request_provider_runtime_sidecar_reconnect.side_effect = reconnect_request
 
     assert workflow_service.reconcile_root_workflow(root, now=now) is False
+    # The failed attempt has an outcome; the next scheduler consumes one new
+    # bounded attempt even though the volatile provider signal disappeared.
     assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=1)) is False
-    mock_terminal.request_provider_runtime_sidecar_reconnect.assert_called_once_with(
-        root,
-        reconnect_turn_id,
-        "resume-exact",
-        registry=None,
-        claim_token=ANY,
-        side_effect_guard=ANY,
-    )
-
-    # The retry is owned by durable state even after the volatile provider
-    # signal disappears across a service restart.
-    assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=31)) is False
     assert mock_terminal.request_provider_runtime_sidecar_reconnect.call_count == 2
-    mock_terminal.request_provider_runtime_sidecar_reconnect.assert_called_with(
-        root,
-        reconnect_turn_id,
-        "resume-exact",
-        registry=None,
-        claim_token=ANY,
-        side_effect_guard=ANY,
-    )
+    assert request_attempts[0] != request_attempts[1]
     mock_terminal.provider_runtime_sidecar_resume_identity.assert_called_once_with(root)
     assert get_workflow_status(root) == "open"
+    with database.SessionLocal() as db:
+        attempts = (
+            db.query(WorkflowProviderReconnectAttemptModel)
+            .order_by(WorkflowProviderReconnectAttemptModel.attempt_number)
+            .all()
+        )
+        assert [(attempt.attempt_number, attempt.state) for attempt in attempts] == [
+            (1, "failed"),
+            (2, "succeeded"),
+        ]
 
     # Once the exact runtime is back, the same OPEN workflow advances normally
     # without an owner wake or a duplicate reconnect.
-    assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=32)) is True
+    assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=2)) is True
+    assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=3)) is False
     assert mock_terminal.request_provider_runtime_sidecar_reconnect.call_count == 2
     assert mock_terminal.send_input.call_count == 1
 
@@ -1543,6 +1578,9 @@ def test_f13_concurrent_sidecar_reconnect_claims_admit_one_control_input(workflo
     assert admitted[0]["claimed_at"] == now
     assert admitted[0]["resume_identity"] is None
     assert len(admitted[0]["claim_token"]) == 32
+    assert len(admitted[0]["attempt_token"]) == 32
+    assert admitted[0]["attempt_number"] == 1
+    assert admitted[0]["attempt_state"] == "reserved"
 
 
 def test_f13_reconnect_identity_is_durable_and_cannot_be_replaced(workflow_db):
@@ -1555,14 +1593,16 @@ def test_f13_reconnect_identity_is_durable_and_cannot_be_replaced(workflow_db):
     assert claimed["claimed_at"] == now
     assert claimed["resume_identity"] is None
     original_token = claimed["claim_token"]
+    attempt_token = claimed["attempt_token"]
     identity = "01234567-89ab-cdef-0123-456789abcdef"
     assert database.persist_workflow_provider_reconnect_identity(
-        root, reconnect_turn_id, original_token, identity
+        root, reconnect_turn_id, original_token, attempt_token, identity
     )
     assert not database.persist_workflow_provider_reconnect_identity(
         root,
         reconnect_turn_id,
         original_token,
+        attempt_token,
         "fedcba98-7654-3210-fedc-ba9876543210",
     )
     assert database.renew_workflow_provider_reconnect(
@@ -1580,16 +1620,142 @@ def test_f13_reconnect_identity_is_durable_and_cannot_be_replaced(workflow_db):
     assert reclaimed["claimed_at"] == now + timedelta(seconds=41)
     assert reclaimed["resume_identity"] == identity
     assert reclaimed["claim_token"] != original_token
+    assert reclaimed["attempt_token"] == attempt_token
+    assert reclaimed["attempt_number"] == 1
     assert not database.renew_workflow_provider_reconnect(
         root,
         reconnect_turn_id,
         original_token,
         now=now + timedelta(seconds=42),
     )
+    assert database.mark_workflow_provider_reconnect_launch_dispatched(
+        root,
+        reconnect_turn_id,
+        reclaimed["claim_token"],
+        attempt_token,
+        now=now + timedelta(seconds=42),
+    )
+    assert database.record_workflow_provider_reconnect_runtime_ready(
+        root,
+        attempt_token,
+        ACTIVE_RUNTIME_GENERATION,
+        4321,
+        987654,
+        now=now + timedelta(seconds=42),
+    )
+    assert database.record_workflow_provider_reconnect_output_boundary(
+        root,
+        attempt_token,
+        11,
+        22,
+        333,
+        now=now + timedelta(seconds=42),
+    )
+    assert not database.record_workflow_provider_reconnect_output_boundary(
+        root,
+        attempt_token,
+        11,
+        22,
+        334,
+        now=now + timedelta(seconds=43),
+    )
+    boundary = database.get_latest_workflow_provider_reconnect_output_boundary(root)
+    assert boundary is not None
+    assert boundary["attempt_token"] == attempt_token
+    assert boundary["output_log_offset"] == 333
     assert database.complete_workflow_provider_reconnect(
-        root, reconnect_turn_id, reclaimed["claim_token"]
+        root, reconnect_turn_id, reclaimed["claim_token"], attempt_token
     )
     assert not database.workflow_provider_reconnect_pending(root)
+
+
+def test_f13_reconnect_runtime_generation_mismatch_fails_closed(workflow_db):
+    root = "root-sidecar-generation-fence"
+    turn_id = _start_admitted_input(root)
+    reconnect = database.claim_workflow_provider_reconnect(root)
+    assert reconnect is not None
+    assert database.mark_workflow_provider_reconnect_launch_dispatched(
+        root,
+        turn_id,
+        reconnect["claim_token"],
+        reconnect["attempt_token"],
+    )
+    wrong_generation = "0" * 64 if ACTIVE_RUNTIME_GENERATION != "0" * 64 else "1" * 64
+    assert not database.record_workflow_provider_reconnect_runtime_ready(
+        root,
+        reconnect["attempt_token"],
+        wrong_generation,
+        4321,
+        987654,
+    )
+    assert (
+        database.get_workflow_provider_reconnect_runtime_ready(root, reconnect["attempt_token"])
+        is None
+    )
+    assert database.record_workflow_provider_reconnect_runtime_ready(
+        root,
+        reconnect["attempt_token"],
+        ACTIVE_RUNTIME_GENERATION,
+        4321,
+        987654,
+    )
+
+
+@patch("cli_agent_orchestrator.services.workflow_service.terminal_service")
+def test_f13_reconnect_attempt_budget_survives_restart_and_stops_launches(
+    mock_terminal, workflow_db
+):
+    root = "root-sidecar-attempt-exhaustion"
+    turn_id = _start_admitted_input(root)
+    now = datetime(2026, 8, 22, 14, 0, 0)
+
+    tokens = []
+    for attempt_number in range(1, 4):
+        reconnect = database.claim_workflow_provider_reconnect(
+            root, now=now + timedelta(seconds=attempt_number)
+        )
+        assert reconnect is not None and reconnect.get("exhausted") is not True
+        assert reconnect["attempt_number"] == attempt_number
+        tokens.append(reconnect["attempt_token"])
+        assert database.mark_workflow_provider_reconnect_launch_dispatched(
+            root,
+            turn_id,
+            reconnect["claim_token"],
+            reconnect["attempt_token"],
+            now=now + timedelta(seconds=attempt_number),
+        )
+        assert database.fail_workflow_provider_reconnect_attempt(
+            root,
+            turn_id,
+            reconnect["claim_token"],
+            reconnect["attempt_token"],
+            "process_exited_before_runtime_ready",
+            now=now + timedelta(seconds=attempt_number),
+        )
+        # Dispose every pooled connection to model an API/service restart; the
+        # next attempt must come from the same durable budget.
+        database.engine.dispose()
+        assert get_workflow_status(root) == ("open" if attempt_number < 3 else "owner_gate")
+
+    assert len(set(tokens)) == 3
+    assert database.claim_workflow_provider_reconnect(root, now=now + timedelta(seconds=10)) is None
+    with database.SessionLocal() as db:
+        attempts = (
+            db.query(WorkflowProviderReconnectAttemptModel)
+            .filter_by(root_terminal_id=root)
+            .order_by(WorkflowProviderReconnectAttemptModel.attempt_number)
+            .all()
+        )
+        assert [attempt.state for attempt in attempts] == ["failed", "failed", "failed"]
+        assert all(attempt.finished_at is not None for attempt in attempts)
+
+    mock_terminal.get_terminal.return_value = {
+        "status": TerminalStatus.COMPLETED.value,
+        "lifecycle": "running",
+    }
+    mock_terminal.provider_runtime_sidecar_reconnect_required.return_value = True
+    assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=11)) is False
+    mock_terminal.request_provider_runtime_sidecar_reconnect.assert_not_called()
 
 
 def test_f13_reconnect_and_input_transport_have_one_terminal_mutation_owner(workflow_db):
@@ -1635,8 +1801,27 @@ def test_f13_external_input_queues_without_replacing_reconnect_owned_turn(workfl
         assert queued is not None
         assert queued.state == "queued"
         assert queued.payload == "continue after recovery"
+    assert database.mark_workflow_provider_reconnect_launch_dispatched(
+        root,
+        active_turn_id,
+        reconnect["claim_token"],
+        reconnect["attempt_token"],
+    )
+    assert database.record_workflow_provider_reconnect_runtime_ready(
+        root, reconnect["attempt_token"], ACTIVE_RUNTIME_GENERATION, 4321, 987654
+    )
+    assert database.record_workflow_provider_reconnect_output_boundary(
+        root,
+        reconnect["attempt_token"],
+        11,
+        22,
+        333,
+    )
     assert database.complete_workflow_provider_reconnect(
-        root, active_turn_id, reconnect["claim_token"]
+        root,
+        active_turn_id,
+        reconnect["claim_token"],
+        reconnect["attempt_token"],
     )
     claimed = claim_workflow_turn(root)
     assert claimed is not None and claimed["id"] == prepared["turn_id"]

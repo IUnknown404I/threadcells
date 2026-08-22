@@ -6,10 +6,13 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
+import mcp.types as mcp_types
 import requests
 from fastmcp import FastMCP
+from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from pydantic import Field
 
 from cli_agent_orchestrator.clients.database import (
@@ -51,6 +54,7 @@ from cli_agent_orchestrator.clients.database import (
     managed_final_problem,
     managed_handoff_retirement_required,
     parse_v1_result_capture,
+    record_workflow_provider_reconnect_runtime_ready,
     register_child_assignment,
     register_handoff_child,
     release_completed_assigned_child_retirement,
@@ -68,6 +72,7 @@ from cli_agent_orchestrator.models.result import HandoffResultDocumentV1
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.runtime_generation import (
     ACTIVE_RUNTIME_GENERATION,
+    PROVIDER_RECONNECT_ATTEMPT_ENV,
     RUNTIME_GENERATION_ENV,
 )
 from cli_agent_orchestrator.services import inbox_service, terminal_service
@@ -103,6 +108,78 @@ class SidecarRuntimeRecoveryRequired(RuntimeError):
 
 class SidecarRuntimeIdentityUnavailable(RuntimeError):
     """Fail closed until a managed sidecar can prove active-code compatibility."""
+
+
+def _runtime_reconnect_attempt_tag() -> str:
+    """Bind a reconnect signal to the exact resumed MCP runtime when possible."""
+    attempt_token = os.environ.get(PROVIDER_RECONNECT_ATTEMPT_ENV, "")
+    if not re.fullmatch(r"[0-9a-f]{32}", attempt_token):
+        return ""
+    return f" [{PROVIDER_RECONNECT_ATTEMPT_ENV}={attempt_token}]"
+
+
+def _runtime_reconnect_required_message(detail: str) -> str:
+    """Return a replay-safe reconnect error for this sidecar process."""
+    marker = f"CAO_SIDECAR_RECONNECT_REQUIRED{_runtime_reconnect_attempt_tag()}"
+    return f"{marker}: {detail}"
+
+
+def _current_process_start_ticks(proc_root: Path = Path("/proc")) -> Optional[int]:
+    """Return this sidecar's Linux process-start identity."""
+    process_id = os.getpid()
+    try:
+        stat_text = (proc_root / str(process_id) / "stat").read_text(encoding="utf-8")
+        suffix = stat_text[stat_text.rfind(")") + 2 :].split()
+        start_ticks = int(suffix[19])
+    except (OSError, ValueError, IndexError):
+        return None
+    return start_ticks if start_ticks > 0 else None
+
+
+def _register_provider_reconnect_runtime_ready() -> None:
+    """Register a newly launched, nonce-bound MCP runtime after initialize."""
+    attempt_token = os.environ.get(PROVIDER_RECONNECT_ATTEMPT_ENV)
+    if not attempt_token:
+        return
+    terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    start_ticks = _current_process_start_ticks()
+    if (
+        not terminal_id
+        or start_ticks is None
+        or _SIDECAR_RUNTIME_GENERATION != ACTIVE_RUNTIME_GENERATION
+    ):
+        logger.warning("Rejected provider reconnect sidecar readiness registration")
+        return
+    try:
+        accepted = record_workflow_provider_reconnect_runtime_ready(
+            terminal_id,
+            attempt_token,
+            ACTIVE_RUNTIME_GENERATION,
+            os.getpid(),
+            start_ticks,
+        )
+    except Exception:
+        logger.warning(
+            "Provider reconnect sidecar readiness registration failed",
+            exc_info=True,
+        )
+        return
+    if not accepted:
+        logger.warning("Provider reconnect sidecar readiness registration was fenced")
+
+
+class _ProviderReconnectReadinessMiddleware(Middleware):
+    """Publish readiness only after FastMCP accepts the client initialize request."""
+
+    async def on_initialize(
+        self,
+        context: MiddlewareContext[mcp_types.InitializeRequest],
+        call_next: CallNext[mcp_types.InitializeRequest, mcp_types.InitializeResult | None],
+    ) -> mcp_types.InitializeResult | None:
+        result = await call_next(context)
+        if result is not None:
+            _register_provider_reconnect_runtime_ready()
+        return result
 
 
 def _suspend_provider_execution(logical_turn_id: int) -> tuple[str, bool]:
@@ -182,8 +259,9 @@ def _fence_privileged_runtime() -> None:
         active_generation,
     )
     raise SidecarRuntimeRecoveryRequired(
-        "CAO_SIDECAR_RECONNECT_REQUIRED: privileged operation was not started; "
-        "reconnect/reinitialize before retrying"
+        _runtime_reconnect_required_message(
+            "privileged operation was not started; reconnect/reinitialize before retrying"
+        )
     )
 
 
@@ -194,9 +272,8 @@ def _runtime_reconnect_response(child_terminal_id: str) -> Dict[str, Any]:
         "child_terminal_id": child_terminal_id,
         "status": "runtime_reconnect_required",
         "recoverable": True,
-        "error": (
-            "CAO_SIDECAR_RECONNECT_REQUIRED: child retirement was not started; "
-            "reconnect/reinitialize before retrying"
+        "error": _runtime_reconnect_required_message(
+            "child retirement was not started; reconnect/reinitialize before retrying"
         ),
     }
 
@@ -251,9 +328,14 @@ def _finish_stale_retirement_boundary(
             if response.get("status") == "runtime_identity_unavailable"
             else "CAO_SIDECAR_RECONNECT_REQUIRED"
         )
-        response["error"] = (
-            f"{marker}: the durable retirement claim was retained for safe reconciliation"
-        )
+        if marker == "CAO_SIDECAR_RECONNECT_REQUIRED":
+            response["error"] = _runtime_reconnect_required_message(
+                "the durable retirement claim was retained for safe reconciliation"
+            )
+        else:
+            response["error"] = (
+                f"{marker}: the durable retirement claim was retained for safe reconciliation"
+            )
     return response
 
 
@@ -555,6 +637,7 @@ mcp = FastMCP(
     - Ensure you're running within a CAO terminal (CAO_TERMINAL_ID must be set)
     """,
 )
+mcp.add_middleware(_ProviderReconnectReadinessMiddleware())
 
 LOAD_SKILL_TOOL_DESCRIPTION = """Retrieve the full Markdown body of an available skill from cao-server.
 
@@ -937,9 +1020,8 @@ def _waiting_handoff_result(terminal_id: str, timeout: int, reason: str) -> Hand
 def _runtime_reconnect_handoff_result(terminal_id: Optional[str]) -> HandoffResult:
     return HandoffResult(
         success=False,
-        message=(
-            "CAO_SIDECAR_RECONNECT_REQUIRED: handoff lifecycle mutation was not started; "
-            "reconnect/reinitialize before retrying"
+        message=_runtime_reconnect_required_message(
+            "handoff lifecycle mutation was not started; reconnect/reinitialize before retrying"
         ),
         output=None,
         terminal_id=terminal_id,
@@ -985,9 +1067,14 @@ def _finish_claimed_handoff_runtime_fence(
         if "CAO_RUNTIME_GENERATION_UNAVAILABLE" in runtime_fence.message
         else "CAO_SIDECAR_RECONNECT_REQUIRED"
     )
+    message = f"{marker}: handoff retirement state release was not confirmed"
+    if marker == "CAO_SIDECAR_RECONNECT_REQUIRED":
+        message = _runtime_reconnect_required_message(
+            "handoff retirement state release was not confirmed"
+        )
     return HandoffResult(
         success=False,
-        message=f"{marker}: handoff retirement state release was not confirmed",
+        message=message,
         output=None,
         terminal_id=terminal_id,
         state=HandoffState.FAILED,

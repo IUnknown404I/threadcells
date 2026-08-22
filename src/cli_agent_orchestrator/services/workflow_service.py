@@ -15,6 +15,7 @@ from cli_agent_orchestrator.clients.database import (
     claim_workflow_provider_reconnect,
     claim_workflow_turn,
     complete_workflow_provider_reconnect,
+    fail_workflow_provider_reconnect_attempt,
     get_handoff_child_status,
     get_open_workflow_root_terminal_ids,
     get_parent_completion_barrier,
@@ -229,6 +230,8 @@ def reconcile_root_workflow(
         reconnect = claim_workflow_provider_reconnect(root_terminal_id, now=now)
         if reconnect is None:
             return False
+        if reconnect.get("exhausted"):
+            return False
         try:
             with _ProviderReconnectClaimHeartbeat(root_terminal_id, reconnect) as heartbeat:
 
@@ -258,6 +261,7 @@ def reconcile_root_workflow(
                         root_terminal_id,
                         reconnect["turn_id"],
                         reconnect["claim_token"],
+                        reconnect["attempt_token"],
                         resume_identity,
                     ):
                         raise RuntimeError("provider reconnect identity lost admission")
@@ -267,6 +271,8 @@ def reconcile_root_workflow(
                     resume_identity,
                     registry=registry,
                     claim_token=reconnect["claim_token"],
+                    attempt_token=reconnect["attempt_token"],
+                    attempt_state=reconnect["attempt_state"],
                     side_effect_guard=side_effect_guard,
                 )
             if heartbeat.lost:
@@ -275,12 +281,24 @@ def reconcile_root_workflow(
                 root_terminal_id,
                 reconnect["turn_id"],
                 reconnect["claim_token"],
+                reconnect["attempt_token"],
             ):
                 raise RuntimeError("provider reconnect completion lost admission")
         except Exception as exc:
-            logger.warning(
-                "Provider sidecar reconnect request failed for %s: %s",
+            outcome_code = getattr(exc, "reconnect_outcome_code", "reconnect_failed")
+            failed = fail_workflow_provider_reconnect_attempt(
                 root_terminal_id,
+                reconnect["turn_id"],
+                reconnect["claim_token"],
+                reconnect["attempt_token"],
+                outcome_code,
+                now=now,
+            )
+            logger.warning(
+                "Provider sidecar reconnect request failed for %s (outcome=%s, persisted=%s): %s",
+                root_terminal_id,
+                outcome_code,
+                failed,
                 exc,
             )
             return False

@@ -47,13 +47,16 @@ from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
     get_terminal_workflow_projection,
     get_workflow_notification_context,
+    get_workflow_provider_reconnect_runtime_ready,
     list_all_terminals,
     mark_handoff_child_input_received,
     mark_terminal_runtime_exited,
     mark_terminal_runtime_running,
+    mark_workflow_provider_reconnect_launch_dispatched,
     persist_terminal_result_snapshot,
     promote_terminal_context_role_to_supervisor,
     reconcile_legacy_terminal_runtime_identity,
+    record_workflow_provider_reconnect_output_boundary,
     release_provider_execution,
     release_terminal_runtime_operation,
     replace_starting_terminal_runtime_identity,
@@ -1094,16 +1097,46 @@ def request_provider_runtime_sidecar_reconnect(
     registry: PluginRegistry | None = None,
     *,
     claim_token: str | None = None,
+    attempt_token: str | None = None,
+    attempt_state: str | None = None,
     side_effect_guard: Callable[[], bool] = lambda: True,
 ) -> None:
     """Restart a stale MCP client while resuming the exact provider context."""
     provider = provider_manager.get_provider(terminal_id)
     reconnect = getattr(provider, "reconnect_runtime_sidecar", None)
     if reconnect:
-        if claim_token is None:
-            reconnect(resume_identity)
-        else:
-            reconnect(resume_identity, side_effect_guard=side_effect_guard)
+        if claim_token is None or attempt_token is None or attempt_state is None:
+            raise RuntimeError("exact provider reconnect requires a durable attempt")
+
+        def mark_launch_dispatched() -> bool:
+            if not side_effect_guard():
+                return False
+            return mark_workflow_provider_reconnect_launch_dispatched(
+                terminal_id,
+                logical_turn_id,
+                claim_token,
+                attempt_token,
+            )
+
+        reconnect(
+            resume_identity,
+            attempt_token=attempt_token,
+            attempt_state=attempt_state,
+            mark_launch_dispatched=mark_launch_dispatched,
+            runtime_ready=lambda: get_workflow_provider_reconnect_runtime_ready(
+                terminal_id, attempt_token
+            ),
+            record_output_boundary=lambda device, inode, offset: (
+                record_workflow_provider_reconnect_output_boundary(
+                    terminal_id,
+                    attempt_token,
+                    device,
+                    inode,
+                    offset,
+                )
+            ),
+            side_effect_guard=side_effect_guard,
+        )
         return
     reconnect_input = getattr(provider, "runtime_sidecar_reconnect_input", None)
     if not reconnect_input:

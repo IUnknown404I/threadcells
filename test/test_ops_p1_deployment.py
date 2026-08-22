@@ -102,11 +102,13 @@ def test_stage_ops_p1_is_dry_run_capable_and_idempotent(tmp_path):
     assert config["max_work_contexts"] == 2
     assert config["max_heavy_execution_slots"] == 1
     assert config["root"] == str(agent_root.resolve())
-    assert config["release_roots"] == [str((agent_root / "releases").resolve())]
-    assert config["release_metadata"] == str(
-        (agent_root / "state/cao/release-metadata.json").resolve()
-    )
+    release_state_root = system_root / "var/lib/threadcells"
+    assert config["release_roots"] == [str(release_state_root / "releases")]
+    assert config["release_metadata"] == str(release_state_root / "release-metadata.json")
+    assert config["release_staging_lock"] == str(release_state_root / "release-staging.lock")
+    assert config["active_release_link"] == str(release_state_root / "active")
     assert config["release_admin_group"] == "threadcells-release-admin"
+    assert config["release_control_uid"] == os.getuid()
     staged_policy = policy.read_text()
     assert staged_policy.count("<!-- CAO.OPS.P1 BEGIN -->") == 1
     assert staged_policy.count("<!-- CAO.OPS.P1 END -->") == 1
@@ -132,6 +134,17 @@ def test_stage_ops_p1_is_dry_run_capable_and_idempotent(tmp_path):
             "SupplementaryGroups=docker threadcells-release-admin"
             in (system_root / "etc/systemd/system" / unit).read_text()
         )
+        assert (
+            "ExecStart=/var/lib/threadcells/active/runtime/bin/cao-housekeeping"
+            in (system_root / "etc/systemd/system" / unit).read_text()
+        )
+    runtime_dropin = (
+        system_root / "etc/systemd/system/agent-control-cao.service.d/threadcells-runtime.conf"
+    )
+    assert runtime_dropin.is_file()
+    assert (
+        "ExecStart=/var/lib/threadcells/active/runtime/bin/cao-server" in runtime_dropin.read_text()
+    )
 
 
 def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tmp_path):
@@ -173,9 +186,11 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
     commit = subprocess.run(
         ["git", "-C", str(SOURCE), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
     ).stdout.strip()
-    candidate_root = agent_root / "releases/candidate"
-    release_lock = agent_root / "state/cao/locks/release-staging.lock"
-    release_metadata = agent_root / "state/cao/release-metadata.json"
+    release_state_root = tmp_path / "var/lib/threadcells"
+    release_root = release_state_root / "releases"
+    candidate_root = release_root / "candidate"
+    release_lock = release_state_root / "release-staging.lock"
+    release_metadata = release_state_root / "release-metadata.json"
     command = [
         sys.executable,
         str(SOURCE / "deployment/stage-ops-p1.py"),
@@ -200,7 +215,17 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
         commit,
     ]
 
-    rejected_root = agent_root / "releases/rejected-candidate"
+    release_state_root.parent.mkdir(parents=True)
+    outside_control_root = tmp_path / "outside-control-root"
+    outside_control_root.mkdir()
+    release_state_root.symlink_to(outside_control_root, target_is_directory=True)
+    control_symlink = subprocess.run(command, capture_output=True, text=True)
+    assert control_symlink.returncode != 0
+    assert "reason_code=RELEASE_CONTROL_ROOT_INVALID" in control_symlink.stderr
+    assert list(outside_control_root.iterdir()) == []
+    release_state_root.unlink()
+
+    rejected_root = release_root / "rejected-candidate"
     rejected_command = [
         str(rejected_root) if value == str(candidate_root) else value for value in command
     ]
@@ -230,7 +255,7 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
     assert "reason_code=CANDIDATE_TARGET_INVALID" in misplaced.stderr
     assert not misplaced_root.exists()
 
-    replacement_root = agent_root / "releases/existing-candidate"
+    replacement_root = release_root / "existing-candidate"
     replacement_root.mkdir()
     replacement_sentinel = replacement_root / "existing-state"
     replacement_sentinel.write_text("preserve", encoding="utf-8")
@@ -242,7 +267,7 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
     assert "reason_code=CANDIDATE_TARGET_INVALID" in replacement.stderr
     assert replacement_sentinel.read_text(encoding="utf-8") == "preserve"
 
-    dangling_root = agent_root / "releases/dangling-candidate"
+    dangling_root = release_root / "dangling-candidate"
     outside_dangling_target = tmp_path / "outside-dangling-target"
     dangling_root.symlink_to(outside_dangling_target, target_is_directory=True)
     dangling_command = [
@@ -257,7 +282,7 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
     outside_lock = tmp_path / "outside-release-lock"
     release_lock.unlink()
     release_lock.symlink_to(outside_lock)
-    lock_candidate = agent_root / "releases/lock-symlink-candidate"
+    lock_candidate = release_root / "lock-symlink-candidate"
     lock_command = [
         str(lock_candidate) if value == str(candidate_root) else value for value in command
     ]
@@ -269,7 +294,7 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
 
     outside_metadata = tmp_path / "outside-release-metadata"
     release_metadata.symlink_to(outside_metadata)
-    metadata_candidate = agent_root / "releases/metadata-symlink-candidate"
+    metadata_candidate = release_root / "metadata-symlink-candidate"
     metadata_command = [
         str(metadata_candidate) if value == str(candidate_root) else value for value in command
     ]
@@ -301,16 +326,24 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
     assert metadata["candidate_releases"] == [str(candidate_root.resolve())]
     candidate_runtime = candidate_root / "runtime"
     candidate_python = candidate_runtime / "bin/python"
+    assert release_state_root.stat().st_mode & 0o777 == 0o755
+    assert release_root.stat().st_mode & 0o777 == 0o775
     assert candidate_root.stat().st_mode & 0o777 == 0o775
     assert candidate_runtime.stat().st_mode & 0o777 == 0o775
     assert (candidate_runtime / "bin").stat().st_mode & 0o777 == 0o775
     assert (candidate_runtime / "pyvenv.cfg").stat().st_mode & 0o777 == 0o644
     assert (candidate_runtime / "bin/cao").stat().st_mode & 0o777 == 0o755
     assert (candidate_root / ".threadcells-release.json").stat().st_mode & 0o777 == 0o644
-    assert release_lock.parent.stat().st_mode & 0o777 == 0o700
-    assert release_lock.stat().st_mode & 0o777 == 0o600
-    assert release_metadata.parent.stat().st_mode & 0o777 == 0o700
-    assert release_metadata.stat().st_mode & 0o777 == 0o600
+    assert release_lock.parent.stat().st_mode & 0o777 == 0o755
+    assert release_lock.stat().st_mode & 0o777 == 0o660
+    assert release_metadata.parent.stat().st_mode & 0o777 == 0o755
+    assert release_metadata.stat().st_mode & 0o777 == 0o644
+    assert (release_state_root.stat().st_uid, release_state_root.stat().st_gid) == (
+        os.geteuid(),
+        os.getegid(),
+    )
+    for path in (release_root, candidate_root, release_lock, release_metadata):
+        assert (path.stat().st_uid, path.stat().st_gid) == (os.geteuid(), os.getegid())
     assert (candidate_runtime / "bin/cao").read_text(encoding="utf-8").splitlines()[
         0
     ] == f"#!{candidate_python}"
@@ -341,3 +374,48 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
     }
     assert installed_web_assets == wheel_web_assets
     assert _tree_hash(base_runtime) == base_hash
+
+    promote_command = [
+        sys.executable,
+        str(SOURCE / "deployment/promote-ops-p1.py"),
+        "--system-root",
+        str(tmp_path),
+        "--candidate-root",
+        str(candidate_root),
+        "--expected-commit",
+        commit,
+        "--test-unprivileged-promotion",
+    ]
+    active_link = release_state_root / "active"
+    outside_active = tmp_path / "outside-active"
+    outside_active.mkdir()
+    active_link.symlink_to(outside_active, target_is_directory=True)
+    unsafe_active = subprocess.run(promote_command, capture_output=True, text=True)
+    assert unsafe_active.returncode != 0
+    assert "reason_code=ACTIVE_RELEASE_LINK_INVALID" in unsafe_active.stderr
+    assert list(outside_active.iterdir()) == []
+    active_link.unlink()
+
+    dry_promotion = subprocess.run([*promote_command, "--dry-run"], capture_output=True, text=True)
+    assert dry_promotion.returncode == 0, dry_promotion.stderr
+    assert "OPS_P1_PROMOTE_DRY_RUN" in dry_promotion.stdout
+    assert not active_link.exists()
+
+    promoted = subprocess.run(promote_command, capture_output=True, text=True)
+    assert promoted.returncode == 0, promoted.stderr
+    assert "OPS_P1_PROMOTED" in promoted.stdout
+    assert active_link.is_symlink()
+    assert active_link.resolve() == candidate_root.resolve()
+    assert (active_link.lstat().st_uid, active_link.lstat().st_gid) == (
+        os.geteuid(),
+        os.getegid(),
+    )
+    promoted_marker = json.loads((candidate_root / ".threadcells-release.json").read_text())
+    promoted_metadata = json.loads(release_metadata.read_text())
+    assert promoted_marker["state"] == "active"
+    assert promoted_metadata["active_release"] == str(candidate_root)
+    assert promoted_metadata["candidate_releases"] == []
+
+    repeated = subprocess.run(promote_command, capture_output=True, text=True)
+    assert repeated.returncode == 0, repeated.stderr
+    assert json.loads(release_metadata.read_text()) == promoted_metadata

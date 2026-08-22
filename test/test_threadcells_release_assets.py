@@ -245,6 +245,7 @@ def test_public_candidate_scope_has_no_publication_workflow_or_source_pack() -> 
     assert not (ROOT / ".github" / "workflows" / "publish-to-pypi.yml").exists()
     assert not (ROOT / "brand" / "threadcells" / "source-pack").exists()
     assert (ROOT / "scripts" / "build_local_candidate.py").exists()
+    assert (ROOT / "deployment" / "promote-ops-p1.py").exists()
 
 
 def test_candidate_pruning_keeps_public_website_assets_only(tmp_path: Path) -> None:
@@ -285,7 +286,11 @@ def test_release_builder_and_public_config_are_host_neutral_and_offline() -> Non
     config_path = ROOT / "src/cli_agent_orchestrator/config/cao-operations.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     assert config["release_roots"] == ["/var/lib/threadcells/releases"]
+    assert config["release_staging_lock"] == "/var/lib/threadcells/release-staging.lock"
+    assert config["release_metadata"] == "/var/lib/threadcells/release-metadata.json"
+    assert config["active_release_link"] == "/var/lib/threadcells/active"
     assert config["release_admin_group"] == "threadcells-release-admin"
+    assert config["release_control_uid"] == 0
     audit = _public_audit_module()
     assert config_path.relative_to(ROOT).as_posix() in audit.PUBLIC_FILES
     assert (

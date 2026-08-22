@@ -20,7 +20,7 @@ Host staging uses a dedicated release-maintenance group so the running control p
 sudo groupadd --system threadcells-release-admin
 ```
 
-The staging command fails closed if this group is unavailable. It accepts production candidate paths only as direct children of the configured ThreadCells release root and refuses symbolic-link or alternate lock/metadata targets.
+The staging command fails closed if this group is unavailable. It keeps release candidates, the atomic active pointer, the staging lock, and release-protection metadata beneath a root-owned `/var/lib/threadcells` anchor, outside runtime-owned state. Production services execute through `/var/lib/threadcells/active`, not a runtime-writable command link. Candidate paths must be direct children of `/var/lib/threadcells/releases`; symbolic-link and alternate lock/metadata targets are refused.
 
 ## Safe promotion sequence
 
@@ -34,6 +34,17 @@ The staging command fails closed if this group is unavailable. It accepts produc
 8. Perform production acceptance on loopback or through the existing protected access path.
 
 Do not overwrite the active directory in place. A release pointer/symlink or equivalent canonical mechanism should identify active, rollback, and staged candidates unambiguously.
+
+After staging has recorded the exact candidate, promote it through the canonical locked operation:
+
+```bash
+sudo python3 deployment/promote-ops-p1.py \
+  --system-root / \
+  --candidate-root /var/lib/threadcells/releases/RELEASE_ID \
+  --expected-commit EXACT_PUBLIC_SHA
+```
+
+Use `--rollback-root` when a verified canonical rollback release is already present. The operation is idempotent: a retry completes an interrupted pointer/metadata transition without inventing a new release identity.
 
 ## Acceptance
 

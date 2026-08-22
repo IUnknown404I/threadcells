@@ -23,12 +23,14 @@
   "cache_prune_threshold_gib": 5,
   "root": "/var/lib/threadcells",
   "lock_dir": "/var/lock/threadcells",
-  "release_staging_lock": "/var/lock/threadcells/release-staging.lock",
-  "release_metadata": "/var/lib/threadcells/state/cao/release-metadata.json",
+  "release_staging_lock": "/var/lib/threadcells/release-staging.lock",
+  "release_metadata": "/var/lib/threadcells/release-metadata.json",
+  "active_release_link": "/var/lib/threadcells/active",
   "release_roots": [
     "/var/lib/threadcells/releases"
   ],
   "release_admin_group": "threadcells-release-admin",
+  "release_control_uid": 0,
   "runtime_user": "threadcells",
   "playwright_manifest_roots": [
     "/var/lib/threadcells/sources",

@@ -43,6 +43,10 @@ def empty_retirement_cleanup_inventory(monkeypatch):
 
 
 def _config(root: Path):
+    release_lock = root / "locks/release-staging.lock"
+    release_lock.parent.mkdir(parents=True, exist_ok=True)
+    release_lock.touch(exist_ok=True)
+    release_lock.chmod(0o660)
     return {
         "root": str(root),
         "lock_dir": str(root / "locks"),
@@ -50,8 +54,9 @@ def _config(root: Path):
         "retention_minutes": 120,
         "release_roots": [str(root / "tools")],
         "release_metadata": str(root / "state/cao/release-metadata.json"),
-        "release_staging_lock": str(root / "locks/release-staging.lock"),
+        "release_staging_lock": str(release_lock),
         "release_admin_group": grp.getgrgid(os.getgid()).gr_name,
+        "release_control_uid": os.getuid(),
     }
 
 
@@ -734,6 +739,41 @@ def test_unknown_release_metadata_fails_closed(tmp_path, monkeypatch):
     assert stale.exists()
 
 
+def test_release_metadata_with_untrusted_owner_identity_fails_closed(tmp_path, monkeypatch):
+    stale = _release(tmp_path, "stale", minutes=302)
+    config = _config(tmp_path)
+    metadata = Path(config["release_metadata"])
+    metadata.parent.mkdir(parents=True, exist_ok=True)
+    metadata.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "active_release": None,
+                "rollback_releases": [],
+                "candidate_releases": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config["release_control_uid"] = os.getuid() + 1
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.list_all_terminals", lambda: [])
+
+    plan = build_plan(
+        root=tmp_path,
+        config=config,
+        settings=default_settings(config),
+        mode="weekly",
+        now=NOW,
+        open_inventory=lambda: (set(), True),
+    )
+    candidate = next(item for item in plan.candidates if Path(item.path).name == "stale")
+
+    assert candidate.action == "preserve"
+    assert candidate.protection_reason == "RELEASE_METADATA_UNKNOWN"
+    assert "release_metadata_inventory_uncertain" in plan.warnings
+    assert stale.exists()
+
+
 def test_release_gc_accepts_only_configured_release_roots_outside_state_root(tmp_path, monkeypatch):
     state_root = tmp_path / "state-root"
     external = tmp_path / "release-store"
@@ -817,6 +857,53 @@ def test_busy_release_staging_lock_does_not_block_independent_log_cleanup(tmp_pa
     assert any(item["reason_code"] == "RELEASE_STAGING_BUSY" for item in report.failures)
 
 
+def test_replaced_release_lock_is_rejected_without_blocking_log_cleanup(tmp_path, monkeypatch):
+    log = tmp_path / "state/cao/logs/cao_stale.log"
+    log.parent.mkdir(parents=True)
+    log.write_bytes(b"stale log")
+    _age(log, 300)
+    _release(tmp_path, "newest", minutes=200)
+    stale = _release(tmp_path, "stale", minutes=300)
+    config = _config(tmp_path)
+    metadata = Path(config["release_metadata"])
+    metadata.parent.mkdir(parents=True, exist_ok=True)
+    metadata.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "active_release": None,
+                "rollback_releases": [],
+                "candidate_releases": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.list_all_terminals", lambda: [])
+    settings = default_settings(config)
+    settings["policy"]["releases"]["retain_count"] = 1
+    plan = build_plan(
+        root=tmp_path,
+        config=config,
+        settings=settings,
+        mode="weekly",
+        now=NOW,
+        open_inventory=lambda: (set(), True),
+    )
+    lock = Path(config["release_staging_lock"])
+    outside = tmp_path / "outside-release-lock"
+    outside.write_text("do not mutate", encoding="utf-8")
+    lock.unlink()
+    lock.symlink_to(outside)
+
+    report = execute_plan(plan, config=config, open_inventory=lambda: (set(), True))
+
+    assert report.ok is False
+    assert not log.exists()
+    assert stale.exists()
+    assert outside.read_text(encoding="utf-8") == "do not mutate"
+    assert any(item["reason_code"] == "RELEASE_STAGING_LOCK_INVALID" for item in report.failures)
+
+
 def test_missing_release_authority_preserves_releases_without_blocking_log_cleanup(
     tmp_path, monkeypatch
 ):
@@ -841,10 +928,6 @@ def test_missing_release_authority_preserves_releases_without_blocking_log_clean
         encoding="utf-8",
     )
     monkeypatch.setattr("cli_agent_orchestrator.clients.database.list_all_terminals", lambda: [])
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.housekeeping.executor.grp.getgrnam",
-        lambda _name: SimpleNamespace(gr_gid=max({os.getegid(), *os.getgroups()}) + 1),
-    )
     settings = default_settings(config)
     settings["policy"]["releases"]["retain_count"] = 1
     plan = build_plan(
@@ -854,6 +937,10 @@ def test_missing_release_authority_preserves_releases_without_blocking_log_clean
         mode="weekly",
         now=NOW,
         open_inventory=lambda: (set(), True),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping.executor.grp.getgrnam",
+        lambda _name: SimpleNamespace(gr_gid=max({os.getegid(), *os.getgroups()}) + 1),
     )
 
     report = execute_plan(plan, config=config, open_inventory=lambda: (set(), True))

@@ -8,6 +8,7 @@ import gzip
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import time
@@ -302,19 +303,26 @@ def execute_plan(
     release_lock_acquired = not release_actions
     release_authorized = True
     release_authority_reason = "RELEASE_STAGING_BUSY"
-    if release_actions and os.geteuid() != 0:
+    release_group = None
+    release_control_uid = None
+    if release_actions:
         try:
             release_group = grp.getgrnam(str(config["release_admin_group"]))
-            release_authorized = release_group.gr_gid in {
-                os.getegid(),
-                *os.getgroups(),
-            }
-        except (KeyError, TypeError):
+            release_control_uid = int(config["release_control_uid"])
+        except (KeyError, TypeError, ValueError):
             release_authorized = False
-        if not release_authorized:
+            release_authority_reason = "RELEASE_CONTROL_CONFIG_INVALID"
+        if (
+            release_authorized
+            and os.geteuid() != 0
+            and release_group is not None
+            and release_group.gr_gid not in {os.getegid(), *os.getgroups()}
+        ):
+            release_authorized = False
             release_authority_reason = "RELEASE_ADMIN_GROUP_REQUIRED"
     try:
         if release_actions and release_authorized:
+            assert release_group is not None and release_control_uid is not None
             lock_path = Path(
                 str(
                     config.get(
@@ -323,16 +331,41 @@ def execute_plan(
                     )
                 )
             )
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            release_handle = lock_path.open("a+")
+            lock_descriptor = -1
             try:
-                fcntl.flock(release_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                release_lock_acquired = True
-            except BlockingIOError:
+                lock_descriptor = os.open(
+                    lock_path,
+                    os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    0o660,
+                )
+                lock_stat = os.fstat(lock_descriptor)
+                if (
+                    not stat.S_ISREG(lock_stat.st_mode)
+                    or lock_stat.st_uid != release_control_uid
+                    or lock_stat.st_gid != release_group.gr_gid
+                    or lock_stat.st_mode & 0o007
+                ):
+                    raise OSError("release staging lock ownership is invalid")
+                release_handle = os.fdopen(lock_descriptor, "a+")
+                lock_descriptor = -1
+                try:
+                    fcntl.flock(release_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    release_lock_acquired = True
+                except BlockingIOError:
+                    release_authority_reason = "RELEASE_STAGING_BUSY"
+                    report.ok = False
+                    report.failures.append(
+                        {"candidate": "releases", "reason_code": release_authority_reason}
+                    )
+            except OSError:
+                release_authority_reason = "RELEASE_STAGING_LOCK_INVALID"
                 report.ok = False
                 report.failures.append(
-                    {"candidate": "releases", "reason_code": "RELEASE_STAGING_BUSY"}
+                    {"candidate": "releases", "reason_code": release_authority_reason}
                 )
+            finally:
+                if lock_descriptor >= 0:
+                    os.close(lock_descriptor)
         elif release_actions:
             report.ok = False
             report.failures.append(

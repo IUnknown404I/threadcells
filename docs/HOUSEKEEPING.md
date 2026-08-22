@@ -91,6 +91,8 @@ Backups are inventory-only. Retention decisions for backup media belong to the o
 
 Release and candidate cleanup shares the canonical staging lock and requires trusted reference metadata. The active and rollback runtimes remain protected. See [Upgrading](UPGRADING.md).
 
+Installed scheduled Housekeeping services receive the narrow release-maintenance group needed to reclaim an eligible immutable release. The main control plane and ordinary agent processes do not. A manual/API run without that authority skips release deletion with `RELEASE_ADMIN_GROUP_REQUIRED`, continues independent safe cleanup, and leaves the scheduled service to reclaim the release later through the same plan/execute engine.
+
 ## Common mistakes
 
 - Deleting a worktree directory directly to recover space.

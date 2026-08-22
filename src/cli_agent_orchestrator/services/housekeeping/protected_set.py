@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import grp
 import json
+import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -85,9 +88,26 @@ def _release_metadata(
     )
     warnings: list[str] = []
     try:
-        if metadata_path.is_symlink() or not metadata_path.is_file():
+        if metadata_path.is_symlink():
             raise ValueError("missing release metadata")
-        raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+        release_group = grp.getgrnam(str(config["release_admin_group"]))
+        release_control_uid = int(config["release_control_uid"])
+        descriptor = os.open(metadata_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            metadata_stat = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata_stat.st_mode)
+                or metadata_stat.st_uid != release_control_uid
+                or metadata_stat.st_gid != release_group.gr_gid
+                or metadata_stat.st_mode & 0o022
+            ):
+                raise ValueError("release metadata ownership is invalid")
+            with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+                descriptor = -1
+                raw = json.load(handle)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
         if raw.get("schema_version") != 1:
             raise ValueError("unknown release metadata version")
         values = [
@@ -113,7 +133,7 @@ def _release_metadata(
                 raise ValueError("release reference is outside configured roots")
             protected.add(candidate)
         return release_roots, protected, True, warnings
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (KeyError, OSError, ValueError, TypeError, json.JSONDecodeError):
         warnings.append("release_metadata_inventory_uncertain")
         return release_roots, set(), False, warnings
 

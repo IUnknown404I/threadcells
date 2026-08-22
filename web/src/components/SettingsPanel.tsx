@@ -200,7 +200,7 @@ export function SettingsPanel() {
   }
 
   if (!settings) {
-    return <div className="text-gray-500 text-sm py-8 text-center">Loading settings...</div>
+    return <div className="text-gray-400 text-sm py-8 text-center">Loading settings...</div>
   }
 
   return (
@@ -230,7 +230,7 @@ export function SettingsPanel() {
             </span>
           )}<button type="button" onClick={openCapacity} className="min-h-11 rounded-lg border border-gray-700 px-3 text-xs text-gray-300 hover:border-emerald-600 hover:text-emerald-300">Configure</button></div>
         </div>
-        <p className="text-xs text-gray-500 mb-4">
+        <p className="text-xs text-gray-400 mb-4">
           Effective persisted limits and live utilization. The 5 / 3 / 2 / 1 values are a host recommendation, not hardcoded runtime authority; decreases drain and never terminate active work.
         </p>
         {capacity ? (
@@ -252,20 +252,20 @@ export function SettingsPanel() {
             </div>
           </div>
         ) : (
-          <p className="text-sm text-gray-500 py-3">Operational status is temporarily unavailable.</p>
+          <p className="text-sm text-gray-400 py-3">Operational status is temporarily unavailable.</p>
         )}
       </div>
 
       <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl p-5">
-        <div className="flex items-center justify-between gap-3 mb-2"><h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">Projects</h3><span className="text-xs text-gray-500">{projects.length} registered</span></div>
-        <p className="text-xs text-gray-500 mb-4">Projects provide the server-authoritative path and context for new agents and flows. Removing a project never deletes its directory or historical launch records.</p>
-        {projects.length === 0 ? <div role="alert" className="mb-4 rounded-lg border border-amber-700/40 bg-amber-950/20 px-3 py-3 text-sm text-amber-200">No projects are configured. New launches can still use a legacy working directory.</div> : <div className="space-y-2 mb-4">{projects.map(project => <div key={project.projectId} className="flex flex-col gap-2 rounded-lg border border-gray-700/40 bg-gray-900/50 px-3 py-3 sm:flex-row sm:items-center"><div className="min-w-0 flex-1"><div className="text-sm text-gray-200">{project.name} {project.isDefault && <span className="ml-1 text-xs text-emerald-400">Default</span>}</div><div className="truncate font-mono text-xs text-gray-500" title={project.path}>{project.path}</div>{project.description && <div className="text-xs text-gray-500 mt-1">{project.description}</div>}</div><div className="flex gap-1"><button type="button" aria-label={`Edit ${project.name}`} title="Edit project" onClick={() => setEditingProject({ ...project })} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-gray-300 transition-colors hover:bg-gray-700 hover:text-white"><Pencil size={16} aria-hidden="true" /></button><button type="button" aria-label={`Set ${project.name} as default`} title={project.isDefault ? 'Default project' : 'Set as default'} onClick={() => makeDefault(project)} disabled={project.isDefault} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-amber-300 transition-colors hover:bg-gray-700 disabled:cursor-default disabled:opacity-35"><Star size={16} aria-hidden="true" fill={project.isDefault ? 'currentColor' : 'none'} /></button><button type="button" aria-label={`Remove ${project.name}`} title="Remove project" onClick={() => setPendingProjectDelete(project)} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg text-red-300 transition-colors hover:bg-red-950/30 hover:text-red-200"><Trash2 size={16} aria-hidden="true" /></button></div></div>)}</div>}
+        <div className="flex items-center justify-between gap-3 mb-2"><h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">Projects</h3><span className="text-xs text-gray-400">{projects.length} registered</span></div>
+        <p className="text-xs text-gray-400 mb-4">Projects provide the server-authoritative path and context for new agents and flows. Removing a project never deletes its directory or historical launch records.</p>
+        {projects.length === 0 ? <div role="alert" className="mb-4 rounded-lg border border-amber-700/40 bg-amber-950/20 px-3 py-3 text-sm text-amber-200">No projects are configured. New launches can still use a legacy working directory.</div> : <div className="space-y-2 mb-4">{projects.map(project => <div key={project.projectId} className="flex flex-col gap-2 rounded-lg border border-gray-700/40 bg-gray-900/50 px-3 py-3 sm:flex-row sm:items-center"><div className="min-w-0 flex-1"><div className="text-sm text-gray-200">{project.name} {project.isDefault && <span className="ml-1 text-xs text-emerald-400">Default</span>}</div><div className="truncate font-mono text-xs text-gray-400" title={project.path}>{project.path}</div>{project.description && <div className="text-xs text-gray-400 mt-1">{project.description}</div>}</div><div className="flex gap-1"><button type="button" aria-label={`Edit ${project.name}`} title="Edit project" onClick={() => setEditingProject({ ...project })} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-gray-300 transition-colors hover:bg-gray-700 hover:text-white"><Pencil size={16} aria-hidden="true" /></button><button type="button" aria-label={`Set ${project.name} as default`} title={project.isDefault ? 'Default project' : 'Set as default'} onClick={() => makeDefault(project)} disabled={project.isDefault} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-amber-300 transition-colors hover:bg-gray-700 disabled:cursor-default disabled:opacity-35"><Star size={16} aria-hidden="true" fill={project.isDefault ? 'currentColor' : 'none'} /></button><button type="button" aria-label={`Remove ${project.name}`} title="Remove project" onClick={() => setPendingProjectDelete(project)} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg text-red-300 transition-colors hover:bg-red-950/30 hover:text-red-200"><Trash2 size={16} aria-hidden="true" /></button></div></div>)}</div>}
         <button type="button" onClick={() => setCreateProjectOpen(true)} className="min-h-11 inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-500"><Plus size={14} /> Register New Project</button>
       </div>
 
       <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl p-5">
         <div className="flex items-center justify-between gap-3 mb-2"><h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">Runtime Branding</h3>{branding && <img src={branding.logoUrl} alt="Runtime logo preview" className="h-9 w-9 rounded-lg object-cover" />}</div>
-        <p className="text-xs text-gray-500 mb-4">Update the live application title, subtitle, and PNG or WebP logo. Changes apply without a rebuild or restart.</p>
+        <p className="text-xs text-gray-400 mb-4">Update the live application title, subtitle, and PNG or WebP logo. Changes apply without a rebuild or restart.</p>
         <div className="grid gap-2 sm:grid-cols-2"><input aria-label="Runtime title" value={brandingTitle} onChange={e => setBrandingTitle(e.target.value)} className="bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5" /><input aria-label="Runtime subtitle" value={brandingSubtitle} onChange={e => setBrandingSubtitle(e.target.value)} className="bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5" /></div>
         <div className="mt-3 flex flex-wrap items-center gap-2"><button type="button" onClick={saveBranding} disabled={brandingBusy} className="min-h-11 inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-medium text-white disabled:opacity-40"><Save size={15} aria-hidden="true" /> Save branding</button><label className="min-h-11 cursor-pointer rounded-lg bg-gray-700 px-4 inline-flex items-center gap-2 text-sm text-gray-100"><Upload size={15} aria-hidden="true" /><span>Upload PNG or WebP</span><input aria-label="Upload runtime logo" type="file" accept="image/png,image/webp" className="sr-only" onChange={e => uploadLogo(e.target.files?.[0])} /></label><button type="button" onClick={resetLogo} disabled={!branding?.customLogo || brandingBusy} className="min-h-11 inline-flex items-center gap-2 rounded-lg px-3 text-sm text-gray-300 hover:bg-gray-700 disabled:opacity-40"><RotateCcw size={15} aria-hidden="true" /> Reset logo</button></div>
       </div>
@@ -277,10 +277,10 @@ export function SettingsPanel() {
             Agent Profile Directories
           </h3>
           {profileCount !== null && (
-            <span className="text-xs text-gray-500">{profileCount} profiles discovered</span>
+            <span className="text-xs text-gray-400">{profileCount} profiles discovered</span>
           )}
         </div>
-        <p className="text-xs text-gray-500 mb-2">
+        <p className="text-xs text-gray-400 mb-2">
           Add directories where your agent profile <code className="text-gray-400">.md</code> files are stored.
           ThreadCells scans all directories and makes profiles available to every provider.
         </p>
@@ -296,7 +296,7 @@ export function SettingsPanel() {
                 <span className="text-sm text-gray-300 font-mono flex-1 truncate" title={dir}>{dir}</span>
                 <button
                   onClick={() => removeDir(i)}
-                  className="min-w-11 min-h-11 -my-2 inline-flex items-center justify-center text-gray-500 hover:text-red-400 transition-colors shrink-0 rounded-lg hover:bg-gray-800"
+                  className="min-w-11 min-h-11 -my-2 inline-flex items-center justify-center text-gray-400 hover:text-red-400 transition-colors shrink-0 rounded-lg hover:bg-gray-800"
                   title="Remove directory"
                 >
                   <X size={14} />
@@ -308,9 +308,9 @@ export function SettingsPanel() {
 
         {dirs.length === 0 && (
           <div className="text-center py-6 mb-4 bg-gray-900/30 border border-dashed border-gray-700 rounded-lg">
-            <FolderOpen size={24} className="mx-auto text-gray-600 mb-2" />
-            <p className="text-gray-500 text-sm">No directories configured.</p>
-            <p className="text-gray-600 text-xs mt-1">Add a directory below to start discovering agent profiles.</p>
+            <FolderOpen size={24} className="mx-auto text-gray-400 mb-2" />
+            <p className="text-gray-400 text-sm">No directories configured.</p>
+            <p className="text-gray-400 text-xs mt-1">Add a directory below to start discovering agent profiles.</p>
           </div>
         )}
 
@@ -354,12 +354,12 @@ export function SettingsPanel() {
       {profilesOpen && <div className="fixed inset-0 z-[60] flex items-center justify-center p-3"><div className="absolute inset-0 bg-black/60" onClick={() => setProfilesOpen(false)} /><div role="dialog" aria-modal="true" aria-label="Profiles" className={`relative flex max-h-[90dvh] w-full flex-col overflow-hidden bg-gray-900 shadow-2xl ${profilesFullscreen ? 'fixed inset-0 max-w-none rounded-none' : 'max-w-2xl rounded-xl border border-gray-700/50'}`}><div className="flex items-center justify-between border-b border-gray-700/50 px-4 py-3"><h3 className="font-semibold text-white">Profiles ({profiles.length})</h3><div className="flex gap-1"><button aria-label={profilesFullscreen ? 'Exit fullscreen' : 'Fullscreen'} onClick={() => setProfilesFullscreen(v => !v)} className="min-h-11 min-w-11 text-gray-400">{profilesFullscreen ? <Minimize2 /> : <Maximize2 />}</button><button aria-label="Close" onClick={() => setProfilesOpen(false)} className="min-h-11 min-w-11 text-gray-400"><X /></button></div></div><div className="flex-1 overflow-auto p-4 space-y-2">{profiles.map(profile => <div key={`${profile.source}-${profile.name}`} className="rounded-lg border border-gray-700/40 bg-gray-800/60 p-3"><div className="font-mono text-sm text-emerald-300">{profile.name}</div><p className="mt-1 text-xs text-gray-400">{profile.description || 'No description provided'}</p></div>)}</div></div></div>}
       <ConfirmModal open={!!pendingProject} title="Register project" message={pendingProject?.createDirectory ? 'ThreadCells will create only the final directory component and then register this project.' : 'ThreadCells will register this existing directory as a project.'} details={pendingProject ? [{ label: 'Name', value: pendingProject.name }, { label: 'Path', value: pendingProject.path }] : []} confirmLabel="Register project" variant="warning" loading={projectBusy} onConfirm={confirmProjectCreate} onCancel={() => setPendingProject(null)} />
       <ConfirmModal open={!!pendingProjectDelete} title="Remove project" message="This removes only the registry entry. The project directory and historical launch context will remain." details={pendingProjectDelete ? [{ label: 'Project', value: pendingProjectDelete.name }, { label: 'Path', value: pendingProjectDelete.path }] : []} confirmLabel="Remove project" variant="danger" loading={projectBusy} onConfirm={confirmProjectDelete} onCancel={() => setPendingProjectDelete(null)} />
-      {createProjectOpen && <div className="fixed inset-0 z-[60] flex items-center justify-center p-3 sm:p-4"><div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setCreateProjectOpen(false)} /><div role="dialog" aria-modal="true" aria-labelledby="register-project-title" className="relative w-full max-w-lg max-h-[calc(100dvh-1.5rem)] overflow-y-auto rounded-xl border border-gray-700/50 bg-gray-900 shadow-2xl"><div className="flex items-start justify-between gap-3 border-b border-gray-700/50 p-4 sm:p-5"><div><h3 id="register-project-title" className="text-base font-semibold text-white">Register New Project</h3><p className="mt-1 text-sm text-gray-400">Add a server-authoritative project path and its operational context.</p></div><button type="button" aria-label="Close register new project" onClick={() => setCreateProjectOpen(false)} className="min-h-11 min-w-11 shrink-0 rounded-lg text-gray-500 hover:bg-gray-800 hover:text-white"><X size={16} /></button></div><div className="space-y-4 p-4 sm:p-5"><label className="block text-xs text-gray-400">Name<input aria-label="New project name" value={projectName} onChange={e => setProjectName(e.target.value)} placeholder="Project name" className="mt-1 min-h-11 w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2.5 text-sm text-gray-200 focus:border-emerald-500 focus:outline-none" /></label><label className="block text-xs text-gray-400">Path<input aria-label="New project path" value={projectPath} onChange={e => setProjectPath(e.target.value)} placeholder="/absolute/project/path" className="mt-1 min-h-11 w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2.5 font-mono text-sm text-gray-200 focus:border-emerald-500 focus:outline-none" /></label><label className="block text-xs text-gray-400">Description <span className="text-gray-600">(optional)</span><textarea aria-label="New project description" value={projectDescription} onChange={e => setProjectDescription(e.target.value)} placeholder="Description (optional)" className="mt-1 w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2.5 text-sm text-gray-200 focus:border-emerald-500 focus:outline-none" /></label><p className="-mt-2 text-xs text-gray-500">Used both as a human-readable description and as project-scoped operational guidance for agents and flows.</p><label className="flex items-center gap-2 text-xs text-gray-400"><input type="checkbox" checked={createProjectDirectory} onChange={e => setCreateProjectDirectory(e.target.checked)} /> Create the final directory if it does not exist</label></div><div className="flex flex-col-reverse gap-3 border-t border-gray-700/50 bg-gray-800/30 p-4 sm:flex-row sm:items-center sm:justify-end sm:p-5"><button type="button" onClick={() => setCreateProjectOpen(false)} className="min-h-11 rounded-lg bg-gray-800 px-4 text-sm font-medium text-gray-300 hover:bg-gray-700">Cancel</button><button type="button" onClick={requestProjectCreate} disabled={!projectName.trim() || !projectPath.trim()} className="min-h-11 inline-flex items-center justify-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-40"><Plus size={14} /> Register project</button></div></div></div>}
+      {createProjectOpen && <div className="fixed inset-0 z-[60] flex items-center justify-center p-3 sm:p-4"><div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setCreateProjectOpen(false)} /><div role="dialog" aria-modal="true" aria-labelledby="register-project-title" className="relative w-full max-w-lg max-h-[calc(100dvh-1.5rem)] overflow-y-auto rounded-xl border border-gray-700/50 bg-gray-900 shadow-2xl"><div className="flex items-start justify-between gap-3 border-b border-gray-700/50 p-4 sm:p-5"><div><h3 id="register-project-title" className="text-base font-semibold text-white">Register New Project</h3><p className="mt-1 text-sm text-gray-400">Add a server-authoritative project path and its operational context.</p></div><button type="button" aria-label="Close register new project" onClick={() => setCreateProjectOpen(false)} className="min-h-11 min-w-11 shrink-0 rounded-lg text-gray-400 hover:bg-gray-800 hover:text-white"><X size={16} /></button></div><div className="space-y-4 p-4 sm:p-5"><label className="block text-xs text-gray-400">Name<input aria-label="New project name" value={projectName} onChange={e => setProjectName(e.target.value)} placeholder="Project name" className="mt-1 min-h-11 w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2.5 text-sm text-gray-200 focus:border-emerald-500 focus:outline-none" /></label><label className="block text-xs text-gray-400">Path<input aria-label="New project path" value={projectPath} onChange={e => setProjectPath(e.target.value)} placeholder="/absolute/project/path" className="mt-1 min-h-11 w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2.5 font-mono text-sm text-gray-200 focus:border-emerald-500 focus:outline-none" /></label><label className="block text-xs text-gray-400">Description <span className="text-gray-400">(optional)</span><textarea aria-label="New project description" value={projectDescription} onChange={e => setProjectDescription(e.target.value)} placeholder="Description (optional)" className="mt-1 w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2.5 text-sm text-gray-200 focus:border-emerald-500 focus:outline-none" /></label><p className="-mt-2 text-xs text-gray-400">Used both as a human-readable description and as project-scoped operational guidance for agents and flows.</p><label className="flex items-center gap-2 text-xs text-gray-400"><input type="checkbox" checked={createProjectDirectory} onChange={e => setCreateProjectDirectory(e.target.checked)} /> Create the final directory if it does not exist</label></div><div className="flex flex-col-reverse gap-3 border-t border-gray-700/50 bg-gray-800/30 p-4 sm:flex-row sm:items-center sm:justify-end sm:p-5"><button type="button" onClick={() => setCreateProjectOpen(false)} className="min-h-11 rounded-lg bg-gray-800 px-4 text-sm font-medium text-gray-300 hover:bg-gray-700">Cancel</button><button type="button" onClick={requestProjectCreate} disabled={!projectName.trim() || !projectPath.trim()} className="min-h-11 inline-flex items-center justify-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-medium text-white hover:bg-emerald-500 disabled:opacity-40"><Plus size={14} /> Register project</button></div></div></div>}
       <ConfirmModal open={!!editingProject} title="Edit project" message="This updates only the registry metadata. Existing terminal and flow history remains unchanged." confirmLabel="Save project" variant="warning" loading={projectBusy} onConfirm={saveProjectEdit} onCancel={() => setEditingProject(null)}>
         <label className="block text-xs text-gray-400">Name<input aria-label="Project name" value={editingProject?.name || ''} onChange={e => setEditingProject(current => current ? { ...current, name: e.target.value } : current)} className="mt-1 w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2" /></label>
         <label className="block text-xs text-gray-400">Path<input aria-label="Project path" value={editingProject?.path || ''} onChange={e => setEditingProject(current => current ? { ...current, path: e.target.value } : current)} className="mt-1 w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2 font-mono" /></label>
         <label className="block text-xs text-gray-400">Description<textarea aria-label="Project description" value={editingProject?.description || ''} onChange={e => setEditingProject(current => current ? { ...current, description: e.target.value || null } : current)} className="mt-1 w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2" /></label>
-        <p className="text-xs text-gray-500">Used both as a human-readable description and as project-scoped operational guidance for agents and flows.</p>
+        <p className="text-xs text-gray-400">Used both as a human-readable description and as project-scoped operational guidance for agents and flows.</p>
       </ConfirmModal>
     </div>
   )
@@ -368,9 +368,9 @@ export function SettingsPanel() {
 function CapacityItem({ label, value, detail }: { label: string; value: string; detail: string }) {
   return (
     <div className="bg-gray-900/50 border border-gray-700/30 rounded-lg px-3 py-3">
-      <dt className="text-xs text-gray-500">{label}</dt>
+      <dt className="text-xs text-gray-400">{label}</dt>
       <dd className="text-sm text-gray-200 font-medium mt-1">{value}</dd>
-      <dd className="text-xs text-gray-600 mt-0.5">{detail}</dd>
+      <dd className="text-xs text-gray-400 mt-0.5">{detail}</dd>
     </div>
   )
 }
@@ -379,10 +379,10 @@ function ProfileCard({ count, onClick }: { count: number | null; onClick: () => 
   return (
     <button type="button" aria-label="Profiles" onClick={onClick} className="rounded-lg border border-gray-700/30 bg-gray-900/50 p-1 text-left transition-colors hover:border-emerald-700/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">
       <div className="h-full rounded-md border border-emerald-500/25 px-3 py-2">
-        <div className="text-xs text-gray-500">Profiles</div>
+        <div className="text-xs text-gray-400">Profiles</div>
         <div className="mt-1 text-sm font-medium text-gray-200">{count ?? '—'}</div>
-        <p className="mt-0.5 text-xs text-gray-600">Available agent profiles and their descriptions</p>
-        <p className="mt-2 text-[11px] text-gray-600">click me -&gt;</p>
+        <p className="mt-0.5 text-xs text-gray-400">Available agent profiles and their descriptions</p>
+        <p className="mt-2 text-[11px] text-gray-400">click me -&gt;</p>
       </div>
     </button>
   )

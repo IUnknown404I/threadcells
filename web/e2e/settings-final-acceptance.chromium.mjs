@@ -72,6 +72,11 @@ const report = {
   attachments_deleted: 0, ephemeral_resources_removed: 1, browser_revisions_removed: 0,
   cache_pruned: 1, skipped_open: 1, skipped_unknown: 0, execution_failures: [], warnings: [],
 }
+const telegram = {
+  schema_version: 1, enabled: false, chat_id: null, message_thread_id: null,
+  token_configured: false, token_state: 'missing', configuration_state: 'not_configured',
+  last_result: null, last_result_at: null, updated_at: null,
+}
 
 await mkdir(evidenceDir, { recursive: true })
 const vite = await createViteServer({
@@ -98,6 +103,7 @@ const server = http.createServer((request, response) => {
   if (request.method === 'GET' && url.pathname === '/api/v1/providers') return json(response, { api_version: '1.0', entry_point_group: 'threadcells.provider_adapters.v1', adapters: [], configurations: [], load_failures: [] })
   if (request.method === 'GET' && url.pathname === '/api/v1/housekeeping') return json(response, housekeeping)
   if (request.method === 'GET' && url.pathname === '/api/v1/housekeeping/report') return json(response, report)
+  if (request.method === 'GET' && url.pathname === '/api/v1/telegram') return json(response, telegram)
   vite.middlewares(request, response)
 })
 
@@ -112,22 +118,35 @@ try {
   browser = await chromium.launch({ headless: true })
   for (const viewport of viewports) {
     const context = await browser.newContext({ viewport, hasTouch: true, isMobile: viewport.width === 390 })
-    const page = await context.newPage()
     for (const surface of [
       { path: '/settings/general', heading: 'Orchestration Capacity', name: 'capacity' },
       { path: '/settings/profiles', heading: 'Profile Registry', name: 'profiles' },
+      { path: '/settings/providers', heading: 'Provider Adapters', name: 'providers' },
       { path: '/settings/housekeeping', heading: 'Housekeeping', name: 'housekeeping' },
+      { path: '/settings/telegram', heading: 'Telegram notifications', name: 'telegram' },
       { path: '/settings/about', heading: 'ThreadCells', name: 'about' },
     ]) {
+      const page = await context.newPage()
       await page.goto(`${origin}${surface.path}`)
       await page.getByRole('heading', { name: surface.heading, exact: true }).last().waitFor()
       await page.getByRole('link', { name: 'Telegram', exact: true }).waitFor()
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
       assert(overflow <= 0, `${surface.name} horizontal overflow at ${viewport.width}px: ${overflow}`)
       assert.equal(await page.getByRole('link', { name: 'Telegram', exact: true }).count(), 1)
+      const lowContrastText = await page.locator('main').evaluate(main => Array.from(main.querySelectorAll('.text-gray-500, .text-gray-600'))
+        .filter(node => {
+          const element = /** @type {HTMLElement} */ (node)
+          const style = getComputedStyle(element)
+          const rect = element.getBoundingClientRect()
+          return Boolean(element.textContent?.trim()) && style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0
+        })
+        .map(node => node.textContent?.trim().slice(0, 80)))
+      assert.deepEqual(lowContrastText, [], `${surface.name} has low-contrast operational text at ${viewport.width}px`)
       await page.screenshot({ path: `${evidenceDir}/${surface.name}-${viewport.width}.png`, fullPage: true })
-      evidence.push({ surface: surface.name, width: viewport.width, overflow })
+      evidence.push({ surface: surface.name, width: viewport.width, overflow, lowContrastText })
+      await page.close()
     }
+    const page = await context.newPage()
     await page.goto(`${origin}/settings/profiles`)
     await page.getByText('18 of 18', { exact: true }).waitFor()
     await page.getByLabel('Search profiles').fill('critical_sol_xhigh_owner')
@@ -155,7 +174,7 @@ try {
     assert.equal(await page.getByText('OWNER ONLY — exceptional direct critical architecture and implementation.', { exact: true }).count(), 1)
     await context.close()
   }
-  console.log(JSON.stringify({ evidenceDir, profileCount: profileIds.length, viewports, evidence, assertions: ['current Capacity and Telegram navigation', 'registry and Spawn inventory', 'operator-owned XHigh copy', 'Profiles keyboard access', 'Housekeeping human labels and structured report', 'About identity', 'touch navigation', 'no horizontal overflow'] }))
+  console.log(JSON.stringify({ evidenceDir, profileCount: profileIds.length, viewports, evidence, assertions: ['current Capacity and Telegram navigation', 'registry and Spawn inventory', 'operator-owned XHigh copy', 'Profiles keyboard access', 'Housekeeping human labels and structured report', 'About identity', 'touch navigation', 'WCAG-AA operational helper colors', 'no horizontal overflow'] }))
 } finally {
   await browser?.close()
   await new Promise(resolve => server.close(resolve))

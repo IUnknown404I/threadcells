@@ -4,7 +4,7 @@ Routine ThreadCells operation is mostly about preserving four kinds of truth: th
 
 ## Daily checks
 
-Use Home and Agents to answer:
+Use Home, Agents, Settings → General, and Settings → Housekeeping to answer:
 
 - Is the server healthy and is the expected build running?
 - Are disk and capacity GREEN, YELLOW, or RED?
@@ -27,7 +27,7 @@ curl -fsS http://127.0.0.1:9889/health
 
 ## Starting and stopping
 
-Run `threadcells-server` on loopback or use the canonical installed service. A browser disconnect does not stop tmux-backed agents.
+Run `threadcells-server` on loopback or use the canonical installed service. A browser disconnect does not stop tmux-backed agents. A supported server restart preserves legitimately active terminal runtimes and then rehydrates durable open-workflow and Inbox delivery state. Closed runtimes are retired by exact terminal/process identity; historical session and result records do not depend on a tmux pane remaining alive.
 
 Before a planned restart:
 
@@ -60,7 +60,7 @@ Avoid logging prompts or values that contain credentials. ThreadCells public/API
 
 ## Housekeeping
 
-Housekeeping is always plan-first. Inspect the dry-run candidate list and plan identity, then explicitly execute the exact plan. The executor rebuilds current protection and revalidates every candidate before mutation.
+Housekeeping is always plan-first. Inspect the dry-run candidate list and plan identity, then explicitly execute the exact plan. The executor rebuilds current protection and revalidates every candidate before mutation. It may retire proven closed terminal runtimes and acknowledged cleanup-pending worktrees without erasing durable history.
 
 Backups are inventory-only and never automatically deleted. Unknown or active resources remain protected. See [Housekeeping](HOUSEKEEPING.md).
 

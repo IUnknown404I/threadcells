@@ -1,6 +1,6 @@
 # Start here: What is ThreadCells?
 
-ThreadCells is a self-hosted operations console for running several coding agents on one Linux machine. It gives those agents real terminals and Git worktrees, while keeping the operator in control of capacity, write access, protected changes, and the final result.
+ThreadCells is a self-hosted system for running several coding agents as one coordinated workflow on a Linux machine. It gives agents real terminals and Git worktrees, keeps open missions moving across model turns, and keeps the operator in control of capacity, write access, protected changes, and the final result.
 
 If you can use Git, SSH, and a command-line coding agent, you have enough background to start. You do not need to understand ThreadCells's internal architecture before launching useful work.
 
@@ -8,13 +8,16 @@ If you can use Git, SSH, and a command-line coding agent, you have enough backgr
 
 A single coding-agent terminal is easy to understand. Multiple terminals become harder: two agents can edit the same branch, a build can exhaust memory, a supervisor can disappear before collecting a review, and a completed terminal does not necessarily mean the requested mission is complete.
 
-ThreadCells makes those relationships explicit. It is particularly useful when you want to:
+ThreadCells makes those relationships explicit and maintains its own operating environment. It is particularly useful when you want to:
 
 - keep long-running agents visible and reconnectable;
 - give parallel workers separate managed worktrees;
 - let a supervisor delegate implementation and review;
+- let results and Inbox messages return without manually copying between terminals;
+- continue one logical mission across provider turns and normal restarts;
 - limit model turns, active work, and heavy host tasks independently;
 - preserve results even after a terminal exits;
+- monitor host pressure and safely clean disposable ThreadCells runtime, log, cache, build, and release debris;
 - require an owner decision before a sensitive or ambiguous step.
 
 ThreadCells is designed for one trusted operator or a small trusted team on a host they control. It is not a hostile multi-tenant sandbox.
@@ -22,18 +25,18 @@ ThreadCells is designed for one trusted operator or a small trusted team on a ho
 ## The basic loop
 
 ```text
-Choose a project and profile
+Create a session and choose a project and agent
         ↓
-Launch an agent in a tmux terminal
+Give the agent or supervisor the job
         ↓
-Watch work, capacity, and results in the Web UI
+Watch the coordinated workflow and host state
         ↓
-Agent finishes a bounded task or requests an owner decision
+ThreadCells continues eligible work across model turns
         ↓
-Review the durable result and continue or close the workflow
+Step in only for an explicit owner decision or final review
 ```
 
-The agent still runs through its native provider CLI. ThreadCells coordinates the surrounding work; it does not replace the provider.
+The agent still runs through its native provider CLI. ThreadCells coordinates the surrounding work; it does not replace the provider. Housekeeping protects active work, durable state, backups, and current/recovery releases while reclaiming only candidates whose ownership and eligibility can be proven. That reduces manual babysitting of ThreadCells debris, but it is not a promise that the physical host can never fail.
 
 ## A useful first hour
 

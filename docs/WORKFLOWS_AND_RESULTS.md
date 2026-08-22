@@ -23,6 +23,8 @@ Each workflow has its own current logical input and completion state. A worker c
 
 Both forms preserve parent/child identity and a durable result. Neither gives a child broader owner authority than the parent explicitly delegated.
 
+A transient pre-launch admission denial, such as exhausted work-context capacity, is recorded as not admitted rather than as an executed assignment. The same logical effect can be retried once capacity is available; after a child launch is admitted or its outcome becomes uncertain, normal duplicate protection remains in force.
+
 ## Result lifecycle
 
 ```text
@@ -56,7 +58,7 @@ ThreadCells therefore keeps a top-level workflow open until one of these explici
 - the owner cancels it;
 - a real unrecoverable failure exhausts its bounded recovery path.
 
-Repeated ordinary provider finals use bounded continuation backoff. After the bounded automatic retries are exhausted, the workflow stays open but idle; a direct owner input or a real child result resumes it. Provider completion never becomes an owner gate or mission-complete signal by itself.
+Repeated ordinary provider finals use durable one-turn-at-a-time continuation with capped backoff. ThreadCells keeps admitting the next logical turn while the workflow is open. If a provider settles directly on Ready instead of exposing a repeatable completed frame, ThreadCells durably debounces that state across restart and advances the same open workflow; a later Processing observation cancels a transient Ready candidate. Direct owner input and durable child results reset the no-progress counter. As a paid-loop safeguard, 65 consecutive finals with no durable progress place the workflow in an explicit, owner-visible gate. Provider completion never becomes mission completion, and normal autonomous continuation does not require an owner wake.
 
 ## Owner gates
 

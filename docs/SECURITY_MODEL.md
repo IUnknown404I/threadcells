@@ -36,6 +36,8 @@ Provider adapters are executable trusted packages and require operator review. P
 
 Provider authentication stays in the provider's own supported mechanism. Registry exports omit secret values and one-use grants.
 
+Per-terminal control credentials are scoped to the terminal/provider process. ThreadCells starts the long-lived tmux server through a credential-free bootstrap, so its persistent process command line does not retain a terminal credential. Those credentials remain sensitive to processes running as the same trusted runtime account.
+
 ### Telegram notifications
 
 Telegram delivery is optional, disabled by default, installation-global, and independent of project configuration. Its bot token is a write-only Web setting stored outside SQLite in the private ThreadCells state root as a runtime-owned `0600` regular file. Read APIs expose only safe configuration state. Operator authorization protects updates and explicit connection/test actions.

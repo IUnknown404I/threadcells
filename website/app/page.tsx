@@ -9,14 +9,14 @@ const capabilities = [
   { icon: <Eye />, id: '01', title: 'Operational truth', copy: 'See what is resident, executing, waiting, draining, blocked, or actually complete—without inferring state from a terminal tab.' },
   { icon: <GitBranch />, id: '02', title: 'Worktree authority', copy: 'Anchor work to trusted projects and managed Git worktrees. Writer leases keep concurrent mutation explicit.' },
   { icon: <Layers />, id: '03', title: 'Durable results', copy: 'Delegated work returns a persisted result that can be delivered, acknowledged, accepted, and retired without losing history.' },
-  { icon: <Gauge />, id: '04', title: 'Resource-aware execution', copy: 'Resident, provider, work-context, and heavy-task limits remain separate—so capacity reflects what the host is really doing.' },
+  { icon: <Gauge />, id: '04', title: 'A healthy agent environment', copy: 'ThreadCells watches host pressure and safely cleans eligible runtime, log, cache, build, and release debris while protecting active work and durable history.' },
 ]
 
 const steps = [
-  ['01', 'Owner sets intent', 'Start a bounded workflow from a trusted local project and an explicit agent profile.'],
-  ['02', 'Supervisor routes work', 'The supervisor delegates coherent work to native CLI workers and reviewers.'],
-  ['03', 'ThreadCells holds the shape', 'Sessions, provider execution, work contexts, worktrees, and host-heavy work stay inspectable.'],
-  ['04', 'Results return durably', 'Completion evidence comes back through the workflow; owner gates stop only for decisions that need you.'],
+  ['01', 'Create a session', 'Choose a trusted local project and an agent or supervisor profile.'],
+  ['02', 'Give it the job', 'A supervisor can delegate coherent work to native CLI workers and reviewers.'],
+  ['03', 'Watch the system', 'ThreadCells keeps the workflow moving across model turns while sessions, worktrees, capacity, and host pressure stay visible.'],
+  ['04', 'Step in when asked', 'Results return durably. Owner gates pause only for decisions that genuinely need you.'],
 ]
 
 const jsonLd = {
@@ -35,6 +35,7 @@ const jsonLd = {
     'Durable delegated results',
     'Explicit workflow lifecycle and owner gates',
     'Independent execution capacity controls',
+    'Protected-set-aware Housekeeping and closed-runtime retirement',
     'Optional installation-global Telegram lifecycle notifications',
   ],
 }
@@ -49,19 +50,19 @@ export default function Home() {
           <div className="hero-ambient" aria-hidden="true" />
           <div className="hero-copy">
             <p className="eyebrow"><span>SELF-HOSTED</span> CODING-AGENT OPERATIONS</p>
-            <h1 id="hero-title">Run multiple coding agents.<br /><em>Keep control</em> of the machine and the result.</h1>
-            <p className="hero-lede">ThreadCells is the control plane around native CLI coding agents: persistent sessions, bounded work contexts, managed worktrees, resource-aware execution, and durable completion evidence—on your own Linux host.</p>
+            <h1 id="hero-title">Run coding agents as a system.<br /> <em>Not a pile</em> of terminals.</h1>
+            <p className="hero-lede">ThreadCells coordinates native CLI agents, keeps open workflows moving across model turns, and maintains the orchestration environment underneath them—on your own Linux host.</p>
             <div className="hero-actions">
               <a className="button button-primary" href={site.githubUrl} target="_blank" rel="noopener noreferrer"><Github /> View on GitHub <ArrowUpRight /></a>
               <a className="button button-secondary" href={site.docsUrl}><Book /> Read the docs <ArrowRight /></a>
-              <span className="hero-note"><i /> No cloud control plane required</span>
+              <span className="hero-note"><i /> Start the work. Watch the system. Step in only when it needs you.</span>
             </div>
           </div>
           <div className="hero-visual"><div className="hero-index" aria-hidden="true"><span>01</span><i /><small>CONTROL / RESULT</small></div><ExecutionMesh /></div>
         </section>
 
         <section className="signal-strip" aria-label="ThreadCells operating principles">
-          {['LOOPBACK FIRST', 'NATIVE CLI AGENTS', 'EXPLICIT CAPACITY', 'DURABLE RESULTS'].map((signal, index) => (
+          {['COORDINATED WORKFLOWS', 'PROTECTED HOUSEKEEPING', 'DURABLE HISTORY', 'LOOPBACK FIRST'].map((signal, index) => (
             <span key={signal}><small>0{index + 1}</small>{signal}<i /></span>
           ))}
         </section>

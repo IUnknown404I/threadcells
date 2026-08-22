@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "docs" / "DOCS_MANIFEST.json"
 PRIVATE_SEGMENTS = {"agents", "memory", "handoffs", ".git"}
 PRIVATE_MARKERS = ("private deployment path", "internal-only deployment")
+PUBLIC_REPOSITORY_BLOB = "https://github.com/IUnknown404I/threadcells/blob/main"
 
 
 def git_identity() -> str:
@@ -61,7 +62,12 @@ def rewrite_internal_links(markdown: str, source: Path, slugs: dict[Path, str]) 
         resolved = (source.parent / location).resolve()
         slug = slugs.get(resolved)
         if not slug:
-            return match.group(0)
+            try:
+                repository_path = resolved.relative_to(ROOT).as_posix()
+            except ValueError:
+                return match.group(0)
+            suffix = f"#{fragment}" if separator else ""
+            return f"]({PUBLIC_REPOSITORY_BLOB}/{repository_path}{suffix})"
         suffix = f"#{fragment}" if separator else ""
         return f"](/docs/{slug}{suffix})"
 

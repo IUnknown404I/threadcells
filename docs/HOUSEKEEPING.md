@@ -14,8 +14,10 @@ Depending on age and ownership evidence, a plan can include:
 - ThreadCells-labelled containers and volumes whose owner is dead and unreferenced;
 - trusted package caches with a measurable reclaim action;
 - inactive candidates/releases represented by canonical staging metadata.
+- exact closed-terminal runtime panes and process descendants whose durable terminal is already closed and whose process identity still matches;
+- cleanup-pending managed child worktrees after their durable result/retirement boundary is acknowledged and revalidated.
 
-Housekeeping does not blindly delete source repositories, active or unknown worktrees, running terminals, open files, current/rollback releases, staged candidates, or backups.
+Housekeeping does not blindly delete source repositories, active or unknown worktrees, running terminals, open files, current/rollback releases, staged candidates, or backups. Retiring a closed terminal runtime does not delete its durable session, agent, Inbox, result, or workflow history.
 
 ## Plan first, execute second
 
@@ -55,7 +57,7 @@ Do not script `plan_id` extraction and immediate execution until you understand 
 
 ## Protected-set philosophy
 
-The protected set combines active terminals and worktrees, writer/workflow ownership, current source/runtime lineage, active and rollback releases, staged candidates, referenced browser revisions, open files, live process start identity, container reference metadata, backups, and shared locks.
+The protected set combines active terminals and worktrees, writer/workflow ownership, current source/runtime lineage, active and rollback releases, staged candidates, referenced browser revisions, open files, live process start identity and terminal identity, container reference metadata, backups, and shared locks.
 
 The details matter to the implementation, but the operator rule is simple: **absence of evidence is not evidence that a resource is dead**. If protection cannot be established accurately, Housekeeping skips it and reports why.
 

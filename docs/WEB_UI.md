@@ -6,7 +6,7 @@ The Web UI is the operator's live view of ThreadCells. It is designed for a loop
 
 - **Home** summarizes current health, capacity, and recent activity.
 - **Agents** shows sessions, statuses, terminals, profile/provider identity, and durable results.
-- **Flows** shows supervisor/worker relationships and workflow progress.
+- **Flows** creates, enables, disables, inspects, and manually runs recurring agent schedules. The resulting agents and workflow lifecycle appear under Agents.
 - **Statistics** displays provider-reported usage without invented metrics.
 - **Settings** contains General, Orchestration Capacity, Profiles, Providers, Housekeeping, installation-global Telegram notifications, and About.
 - **Docs** serves the public allowlisted documentation packaged with the running build.
@@ -16,10 +16,10 @@ Direct URLs are supported. Browser history should preserve the selected Settings
 
 ## A normal operating loop
 
-1. Check Home for health, disk pressure, and available capacity.
+1. Check Home for current session/workflow activity and Settings for host health, disk pressure, and available capacity.
 2. Use Spawn Agent and confirm the selected provider is ready.
 3. Watch the new session under Agents.
-4. Use Flows when a supervisor delegates work.
+4. Use Flows for recurring schedules. Follow the agents they launch under Agents.
 5. Read and incorporate durable results before retiring children.
 6. Use Statistics to understand provider-reported usage.
 

@@ -2,9 +2,9 @@
 
 ![ThreadCells](docs/assets/threadcells-logo-horizontal.png)
 
-**Run multiple coding agents. Keep control of the machine and the result.**
+**Run coding agents as a system, not a pile of terminals.**
 
-ThreadCells is a self-hosted coding-agent operations console for a small fleet of native CLI coding agents. It keeps real tmux terminals, managed Git worktrees, writer and resource limits, durable completion evidence, and supervisor/reviewer workflows on one Linux host.
+ThreadCells coordinates native CLI coding agents, keeps open workflows moving across model turns, and takes care of the orchestration environment underneath them. It watches host pressure, safely reclaims disposable ThreadCells runtime debris, and preserves active work and durable history on your own Linux host.
 
 Public repository: [`IUnknown404I/threadcells`](https://github.com/IUnknown404I/threadcells)
 
@@ -12,18 +12,22 @@ Public repository: [`IUnknown404I/threadcells`](https://github.com/IUnknown404I/
 
 *A 12-second isolated synthetic run through the real ThreadCells UI. No production state is shown.*
 
-## In 20 seconds
+## In 30 seconds
 
-Pick a project, start a supervisor, and let it delegate bounded work into managed worktrees. ThreadCells records the result and keeps capacity and owner decisions visible. It is for advanced solo developers and trusted small teams, not hostile multi-tenancy or an autonomous software factory.
+Create a session → choose an agent or supervisor → give it the job → watch the workflow → step in only when ThreadCells asks for an owner decision.
+
+A supervisor can delegate to workers and reviewers, collect results through the Inbox, and continue the same logical mission across normal asynchronous and model-turn boundaries. You do not have to copy messages between terminals or treat a provider's final response as mission completion.
 
 ## Why ThreadCells
 
-- Native CLI agents remain in inspectable tmux terminals.
-- Managed worktrees and writer authority reduce accidental collisions.
-- Provider, Work, and Heavy capacity are admitted independently.
-- Durable results and owner gates preserve operational truth.
+- Agents coordinate under durable supervisor workflows instead of relying on manual copy-and-paste.
+- Native CLI agents remain in inspectable tmux terminals, with managed worktrees and explicit writer authority.
+- Host pressure and independent capacity limits stay visible while protected-set-aware Housekeeping cleans eligible logs, caches, releases, and closed runtime debris.
+- Active work, live state, recovery releases, backups, and durable session, workflow, Inbox, and result history are protected from routine cleanup.
+- Durable results and explicit owner gates preserve operational truth across restarts and terminal retirement.
 - Optional installation-global Telegram alerts surface top-level completion, failure, and owner attention without project-specific wiring.
-- Cleanup remains conservative: unknown state is not treated as dead.
+
+ThreadCells actively keeps its own agent environment healthy; it cannot guarantee that the physical host, provider, or network will never fail. Unknown or ambiguous state is protected rather than guessed safe to delete.
 
 Start with [What is ThreadCells?](docs/OVERVIEW.md), [Quick Setup](QUICK_SETUP.md), and [Your first project and agent](docs/FIRST_AGENT.md). The complete public guide covers [Installation](docs/INSTALLATION.md), [Core concepts](docs/CONCEPTS.md), [Telegram notifications](docs/TELEGRAM_NOTIFICATIONS.md), [Remote access](docs/REMOTE_ACCESS.md), [Security](SECURITY.md), and [Operations](docs/OPERATIONS.md). The in-product reader at `/docs` serves the same packaged allowlisted documentation corpus.
 

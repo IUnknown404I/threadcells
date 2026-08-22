@@ -57,6 +57,8 @@ Expected result: Home loads, Settings → About shows the running build identity
 
 Keep the host and port exactly loopback-only for this first run. For another computer, do not change the listener to `0.0.0.0`; use [Remote access](docs/REMOTE_ACCESS.md).
 
+The operating model is intentionally short: create a session, choose an agent or supervisor, give it the job, watch the workflow, and step in only for an explicit owner decision or final review. Provider completion alone does not close an open workflow.
+
 ## 6. Start useful work
 
 Follow [Your first project and agent](docs/FIRST_AGENT.md). The included [safe starter example](examples/threadcells-starter/README.md) is also a bounded supervisor/developer/reviewer exercise that does not publish or change services.
@@ -70,6 +72,7 @@ Stop the foreground server with `Ctrl-C`. Agent terminals are tmux-backed and ma
 - [Core concepts](docs/CONCEPTS.md)
 - [Providers](docs/PROVIDERS.md) and [Profiles](docs/PROFILES.md)
 - [Capacity and resource model](docs/RESOURCE_MODEL.md)
+- [Housekeeping](docs/HOUSEKEEPING.md)
 - [Telegram notifications](docs/TELEGRAM_NOTIFICATIONS.md)
 - [Backup and restore](docs/BACKUP_AND_RESTORE.md)
 - [Security model](docs/SECURITY_MODEL.md)

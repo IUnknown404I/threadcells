@@ -25,7 +25,7 @@ export const site = {
   name: 'ThreadCells',
   title: 'ThreadCells — Control plane for native CLI coding agents',
   description:
-    'Run multiple native CLI coding agents while keeping sessions, worktrees, capacity, durable results, and owner decisions visible on your own machine.',
+    'Run coding agents as a coordinated system. ThreadCells keeps workflows moving, protects durable history, and maintains its own orchestration environment on your Linux host.',
   siteUrl: optionalUrl('SITE_URL') || publicPagesUrl,
   githubUrl: publicRepositoryUrl,
   docsUrl: assetPath('/docs'),

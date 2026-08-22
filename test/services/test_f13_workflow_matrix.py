@@ -200,6 +200,8 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
     assert "provider_processing_observed_at" in columns
     assert "provider_ready_observed_at" in columns
     assert "provider_reconnect_requested_at" in columns
+    assert "provider_reconnect_claim_token" in columns
+    assert "provider_reconnect_resume_identity" in columns
 
 
 def _queue_inbox_workflow_turn(root: str, key: str = "inbox-result") -> tuple[int, int]:
@@ -1438,21 +1440,39 @@ def test_f13_stale_sidecar_requests_one_retryable_context_reinitialization(
         "status": TerminalStatus.COMPLETED.value,
         "lifecycle": "running",
     }
-    mock_terminal.provider_runtime_sidecar_reconnect_required.return_value = True
+    mock_terminal.provider_runtime_sidecar_reconnect_required.side_effect = [
+        True,
+        False,
+        False,
+        False,
+    ]
+    mock_terminal.provider_runtime_sidecar_resume_identity.return_value = "resume-exact"
+    mock_terminal.request_provider_runtime_sidecar_reconnect.side_effect = [
+        RuntimeError("service stopped after provider exit"),
+        None,
+    ]
 
     assert workflow_service.reconcile_root_workflow(root, now=now) is False
     assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=1)) is False
     mock_terminal.request_provider_runtime_sidecar_reconnect.assert_called_once_with(
-        root, reconnect_turn_id, registry=None
+        root, reconnect_turn_id, "resume-exact", registry=None
     )
 
-    # A process death after the durable claim cannot strand recovery forever.
+    # The retry is owned by durable state even after the volatile provider
+    # signal disappears across a service restart.
     assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=31)) is False
     assert mock_terminal.request_provider_runtime_sidecar_reconnect.call_count == 2
     mock_terminal.request_provider_runtime_sidecar_reconnect.assert_called_with(
-        root, reconnect_turn_id, registry=None
+        root, reconnect_turn_id, "resume-exact", registry=None
     )
+    mock_terminal.provider_runtime_sidecar_resume_identity.assert_called_once_with(root)
     assert get_workflow_status(root) == "open"
+
+    # Once the exact runtime is back, the same OPEN workflow advances normally
+    # without an owner wake or a duplicate reconnect.
+    assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=32)) is True
+    assert mock_terminal.request_provider_runtime_sidecar_reconnect.call_count == 2
+    assert mock_terminal.send_input.call_count == 1
 
 
 def test_f13_concurrent_sidecar_reconnect_claims_admit_one_control_input(workflow_db):
@@ -1469,7 +1489,58 @@ def test_f13_concurrent_sidecar_reconnect_claims_admit_one_control_input(workflo
         claims = list(executor.map(claim, range(2)))
 
     admitted = [claim for claim in claims if claim is not None]
-    assert admitted == [{"turn_id": reconnect_turn_id, "claimed_at": now}]
+    assert len(admitted) == 1
+    assert admitted[0]["turn_id"] == reconnect_turn_id
+    assert admitted[0]["claimed_at"] == now
+    assert admitted[0]["resume_identity"] is None
+    assert len(admitted[0]["claim_token"]) == 32
+
+
+def test_f13_reconnect_identity_is_durable_and_cannot_be_replaced(workflow_db):
+    root = "root-sidecar-resume-identity"
+    reconnect_turn_id = _start_admitted_input(root)
+    now = datetime(2026, 8, 22, 12, 45, 0)
+    claimed = database.claim_workflow_provider_reconnect(root, now=now)
+    assert claimed is not None
+    assert claimed["turn_id"] == reconnect_turn_id
+    assert claimed["claimed_at"] == now
+    assert claimed["resume_identity"] is None
+    original_token = claimed["claim_token"]
+    identity = "01234567-89ab-cdef-0123-456789abcdef"
+    assert database.persist_workflow_provider_reconnect_identity(
+        root, reconnect_turn_id, original_token, identity
+    )
+    assert not database.persist_workflow_provider_reconnect_identity(
+        root,
+        reconnect_turn_id,
+        original_token,
+        "fedcba98-7654-3210-fedc-ba9876543210",
+    )
+    assert database.renew_workflow_provider_reconnect(
+        root,
+        reconnect_turn_id,
+        original_token,
+        now=now + timedelta(seconds=10),
+    )
+    assert database.claim_workflow_provider_reconnect(root, now=now + timedelta(seconds=31)) is None
+    # A failed side effect leaves the lease and identity intact. Once its
+    # bounded lease expires, a service-restart retry reclaims the exact ID.
+    reclaimed = database.claim_workflow_provider_reconnect(root, now=now + timedelta(seconds=41))
+    assert reclaimed is not None
+    assert reclaimed["turn_id"] == reconnect_turn_id
+    assert reclaimed["claimed_at"] == now + timedelta(seconds=41)
+    assert reclaimed["resume_identity"] == identity
+    assert reclaimed["claim_token"] != original_token
+    assert not database.renew_workflow_provider_reconnect(
+        root,
+        reconnect_turn_id,
+        original_token,
+        now=now + timedelta(seconds=42),
+    )
+    assert database.complete_workflow_provider_reconnect(
+        root, reconnect_turn_id, reclaimed["claim_token"]
+    )
+    assert not database.workflow_provider_reconnect_pending(root)
 
 
 @patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")

@@ -1067,13 +1067,30 @@ def provider_runtime_sidecar_reconnect_required(terminal_id: str) -> bool:
     return bool(predicate and predicate())
 
 
+def provider_runtime_sidecar_resume_identity(terminal_id: str) -> str:
+    """Return the exact provider conversation identity before process exit."""
+    provider = provider_manager.get_provider(terminal_id)
+    resolver = getattr(provider, "runtime_sidecar_resume_identity", None)
+    if not resolver:
+        raise RuntimeError(f"Provider for terminal '{terminal_id}' cannot resume its sidecar")
+    identity = resolver()
+    if not isinstance(identity, str) or not identity:
+        raise RuntimeError(f"Provider for terminal '{terminal_id}' has no resume identity")
+    return identity
+
+
 def request_provider_runtime_sidecar_reconnect(
     terminal_id: str,
     logical_turn_id: int,
+    resume_identity: str,
     registry: PluginRegistry | None = None,
 ) -> None:
-    """Reinitialize a stale MCP client through the capacity-fenced input path."""
+    """Restart a stale MCP client while resuming the exact provider context."""
     provider = provider_manager.get_provider(terminal_id)
+    reconnect = getattr(provider, "reconnect_runtime_sidecar", None)
+    if reconnect:
+        reconnect(resume_identity)
+        return
     reconnect_input = getattr(provider, "runtime_sidecar_reconnect_input", None)
     if not reconnect_input:
         raise RuntimeError(f"Provider for terminal '{terminal_id}' cannot reconnect its sidecar")

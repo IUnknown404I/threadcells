@@ -675,9 +675,13 @@ class WorkflowTurnModel(Base):
     provider_ready_observed_at = Column(DateTime, nullable=True)
     # A stale MCP sidecar is recovered by one provider-native context
     # reinitialization. This durable timestamp is a short retry lease so two
-    # workflow reconcilers cannot paste duplicate /compact commands, while a
-    # crash before transport remains recoverable.
+    # workflow reconcilers cannot race the restart. The opaque provider resume
+    # identity is persisted before the old process exits, so a service crash in
+    # the exit/resume gap can restart the exact conversation instead of
+    # guessing from provider-global recency.
     provider_reconnect_requested_at = Column(DateTime, nullable=True)
+    provider_reconnect_claim_token = Column(String, nullable=True)
+    provider_reconnect_resume_identity = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now)
 
@@ -2153,6 +2157,14 @@ def _migrate_workflow_turn_columns() -> None:
         if "provider_reconnect_requested_at" not in columns:
             conn.execute(
                 "ALTER TABLE workflow_turns ADD COLUMN provider_reconnect_requested_at DATETIME"
+            )
+        if "provider_reconnect_claim_token" not in columns:
+            conn.execute(
+                "ALTER TABLE workflow_turns ADD COLUMN provider_reconnect_claim_token TEXT"
+            )
+        if "provider_reconnect_resume_identity" not in columns:
+            conn.execute(
+                "ALTER TABLE workflow_turns " "ADD COLUMN provider_reconnect_resume_identity TEXT"
             )
         conn.commit()
         conn.close()
@@ -5650,6 +5662,7 @@ def claim_workflow_provider_reconnect(
     stale_before = datetime.fromtimestamp(
         now.timestamp() - WORKFLOW_PROVIDER_RECONNECT_LEASE_SECONDS
     )
+    claim_token = uuid.uuid4().hex
     with SessionLocal() as db:
         workflow = _open_workflow(db, root_terminal_id, create=False)
         if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
@@ -5687,6 +5700,7 @@ def claim_workflow_provider_reconnect(
             .update(
                 {
                     WorkflowTurnModel.provider_reconnect_requested_at: now,
+                    WorkflowTurnModel.provider_reconnect_claim_token: claim_token,
                     WorkflowTurnModel.updated_at: now,
                 },
                 synchronize_session=False,
@@ -5696,20 +5710,110 @@ def claim_workflow_provider_reconnect(
             db.rollback()
             return None
         db.commit()
-        return {"turn_id": active_turn_id, "claimed_at": now}
+        resume_identity = (
+            db.query(WorkflowTurnModel.provider_reconnect_resume_identity)
+            .filter(
+                WorkflowTurnModel.id == active_turn_id,
+                WorkflowTurnModel.provider_reconnect_claim_token == claim_token,
+            )
+            .scalar()
+        )
+        return {
+            "turn_id": active_turn_id,
+            "claimed_at": now,
+            "claim_token": claim_token,
+            "resume_identity": resume_identity,
+        }
 
 
-def release_workflow_provider_reconnect(
-    root_terminal_id: str, turn_id: int, claimed_at: datetime
-) -> bool:
-    """Release a reconnect claim only when its provider control was not sent."""
+def workflow_provider_reconnect_pending(root_terminal_id: str) -> bool:
+    """Whether the active OPEN turn owns an unfinished provider reconnect."""
     _ensure_workflow_schema()
     with SessionLocal() as db:
-        released = (
+        return (
+            db.query(WorkflowTurnModel.id)
+            .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+            .filter(
+                WorkflowModel.root_terminal_id == root_terminal_id,
+                WorkflowModel.status == WORKFLOW_OPEN,
+                WorkflowModel.active_turn_id == WorkflowTurnModel.id,
+                WorkflowTurnModel.provider_reconnect_requested_at.is_not(None),
+            )
+            .first()
+            is not None
+        )
+
+
+def get_pending_workflow_provider_reconnect_root_terminal_ids() -> List[str]:
+    """Return OPEN roots with one unfinished reconnect in a single query."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        return [
+            root_terminal_id
+            for (root_terminal_id,) in (
+                db.query(WorkflowModel.root_terminal_id)
+                .join(
+                    WorkflowTurnModel,
+                    WorkflowTurnModel.id == WorkflowModel.active_turn_id,
+                )
+                .filter(
+                    WorkflowModel.status == WORKFLOW_OPEN,
+                    WorkflowTurnModel.provider_reconnect_requested_at.is_not(None),
+                )
+                .all()
+            )
+        ]
+
+
+def persist_workflow_provider_reconnect_identity(
+    root_terminal_id: str,
+    turn_id: int,
+    claim_token: str,
+    resume_identity: str,
+) -> bool:
+    """Persist one provider resume identity before any reconnect side effect."""
+    _ensure_workflow_schema()
+    if not resume_identity:
+        return False
+    with SessionLocal() as db:
+        turn = (
             db.query(WorkflowTurnModel)
             .filter(
                 WorkflowTurnModel.id == turn_id,
-                WorkflowTurnModel.provider_reconnect_requested_at == claimed_at,
+                WorkflowTurnModel.provider_reconnect_claim_token == claim_token,
+                WorkflowTurnModel.provider_reconnect_requested_at.is_not(None),
+                WorkflowTurnModel.workflow_id.in_(
+                    db.query(WorkflowModel.id).filter(
+                        WorkflowModel.root_terminal_id == root_terminal_id,
+                        WorkflowModel.status == WORKFLOW_OPEN,
+                        WorkflowModel.active_turn_id == turn_id,
+                    )
+                ),
+            )
+            .one_or_none()
+        )
+        if turn is None:
+            return False
+        if turn.provider_reconnect_resume_identity not in (None, resume_identity):
+            return False
+        turn.provider_reconnect_resume_identity = resume_identity
+        turn.updated_at = datetime.now()
+        db.commit()
+        return True
+
+
+def complete_workflow_provider_reconnect(
+    root_terminal_id: str, turn_id: int, claim_token: str
+) -> bool:
+    """Close the durable reconnect episode after the resumed TUI is ready."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        completed = (
+            db.query(WorkflowTurnModel)
+            .filter(
+                WorkflowTurnModel.id == turn_id,
+                WorkflowTurnModel.provider_reconnect_claim_token == claim_token,
+                WorkflowTurnModel.provider_reconnect_requested_at.is_not(None),
                 WorkflowTurnModel.workflow_id.in_(
                     db.query(WorkflowModel.id).filter(
                         WorkflowModel.root_terminal_id == root_terminal_id,
@@ -5721,12 +5825,53 @@ def release_workflow_provider_reconnect(
             .update(
                 {
                     WorkflowTurnModel.provider_reconnect_requested_at: None,
+                    WorkflowTurnModel.provider_reconnect_claim_token: None,
+                    WorkflowTurnModel.provider_reconnect_resume_identity: None,
                     WorkflowTurnModel.updated_at: datetime.now(),
                 },
                 synchronize_session=False,
             )
         )
-        if released != 1:
+        if completed != 1:
+            db.rollback()
+            return False
+        db.commit()
+        return True
+
+
+def renew_workflow_provider_reconnect(
+    root_terminal_id: str,
+    turn_id: int,
+    claim_token: str,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Renew one exact reconnect lease without changing its ownership token."""
+    _ensure_workflow_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        renewed = (
+            db.query(WorkflowTurnModel)
+            .filter(
+                WorkflowTurnModel.id == turn_id,
+                WorkflowTurnModel.provider_reconnect_claim_token == claim_token,
+                WorkflowTurnModel.provider_reconnect_requested_at.is_not(None),
+                WorkflowTurnModel.workflow_id.in_(
+                    db.query(WorkflowModel.id).filter(
+                        WorkflowModel.root_terminal_id == root_terminal_id,
+                        WorkflowModel.status == WORKFLOW_OPEN,
+                        WorkflowModel.active_turn_id == turn_id,
+                    )
+                ),
+            )
+            .update(
+                {
+                    WorkflowTurnModel.provider_reconnect_requested_at: now,
+                    WorkflowTurnModel.updated_at: now,
+                },
+                synchronize_session=False,
+            )
+        )
+        if renewed != 1:
             db.rollback()
             return False
         db.commit()

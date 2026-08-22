@@ -1747,9 +1747,11 @@ class TestSendInput:
     def test_sidecar_reconnect_uses_capacity_fenced_input(
         self, mock_provider_manager, mock_send_input
     ):
-        mock_provider_manager.get_provider.return_value.runtime_sidecar_reconnect_input = "/compact"
+        provider = mock_provider_manager.get_provider.return_value
+        provider.reconnect_runtime_sidecar = None
+        provider.runtime_sidecar_reconnect_input = "/compact"
 
-        request_provider_runtime_sidecar_reconnect("test1234", 42)
+        request_provider_runtime_sidecar_reconnect("test1234", 42, "resume-exact")
 
         mock_send_input.assert_called_once_with(
             "test1234",
@@ -1759,6 +1761,18 @@ class TestSendInput:
             orchestration_type=OrchestrationType.SEND_MESSAGE,
             logical_turn_id=42,
         )
+
+    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    def test_sidecar_reconnect_prefers_exact_provider_resume(
+        self, mock_provider_manager, mock_send_input
+    ):
+        provider = mock_provider_manager.get_provider.return_value
+
+        request_provider_runtime_sidecar_reconnect("test1234", 42, "resume-exact")
+
+        provider.reconnect_runtime_sidecar.assert_called_once_with("resume-exact")
+        mock_send_input.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")

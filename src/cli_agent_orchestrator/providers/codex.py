@@ -2,9 +2,11 @@
 
 import hashlib
 import logging
+import os
 import re
 import shlex
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
@@ -95,6 +97,10 @@ STARTUP_ERROR_PATTERN = (
     r"codex: command not found|command not found:)"
 )
 STARTUP_EVIDENCE_LIMIT = 12_000
+# Resuming a long conversation can redraw more than the ordinary 200-line
+# status window before the TUI becomes idle. Keep reconnect evidence bounded,
+# but large enough that the shell marker cannot disappear during that redraw.
+SIDECAR_RECONNECT_HISTORY_LINES = 2_000
 
 # Codex TUI footer indicators (status bar below the idle prompt).
 # Used to detect when the bottom lines contain TUI chrome rather than user input.
@@ -133,6 +139,7 @@ TUI_SEPARATOR_PATTERN = r"^[^\S\n]*─{3,}[^\S\n]*$"
 TUI_INFO_NOTICE_PREFIX_PATTERN = r"^[^\S\n]*ⓘ(?:[^\S\n]+|$)"
 SIDECAR_RECONNECT_REQUIRED_TEXT = "CAO_SIDECAR_RECONNECT_REQUIRED"
 CONTEXT_COMPACTED_TEXT = "Context compacted"
+SIDECAR_RECONNECTED_PREFIX = "__CAO_SIDECAR_RECONNECTED_"
 SIDECAR_RECONNECT_REQUIRED_LINE_PATTERN = re.compile(
     rf"^[^\S\n]*Error calling tool(?: '[^'\n]+')?:[^\n]*"
     rf"{SIDECAR_RECONNECT_REQUIRED_TEXT}(?::|\b)",
@@ -142,6 +149,16 @@ CONTEXT_COMPACTED_LINE_PATTERN = re.compile(
     rf"^[^\S\n]*•[^\S\n]+{CONTEXT_COMPACTED_TEXT}[^\S\n]*$",
     re.MULTILINE,
 )
+SIDECAR_RECONNECTED_LINE_PATTERN = re.compile(
+    rf"^[^\S\n]*{SIDECAR_RECONNECTED_PREFIX}(?P<generation>[0-9a-f]{{32}})__[^\S\n]*$",
+    re.MULTILINE,
+)
+CODEX_SESSION_ID_PATTERN = re.compile(
+    r"(?P<session>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})" r"\.jsonl$",
+    re.IGNORECASE,
+)
+CODEX_PANE_COMMAND_PATTERN = re.compile(r"^codex(?:[.-][A-Za-z0-9_-]+)?$")
+SHELL_PANE_COMMANDS = {"bash", "sh", "dash", "zsh", "fish"}
 # The active Codex interaction is rendered at the bottom of capture-pane. Keep
 # advisory recognition inside that bounded tail: a complete menu elsewhere is
 # transcript/history, not a prompt CAO may answer.
@@ -483,8 +500,124 @@ class CodexProvider(BaseProvider):
 
     @property
     def runtime_sidecar_reconnect_input(self) -> str:
-        """Reinitialize Codex's MCP client while preserving compacted context."""
+        """Compatibility input for runtimes without exact process resume support."""
         return "/compact"
+
+    def runtime_sidecar_resume_identity(self, proc_root: Path = Path("/proc")) -> str:
+        """Return the exact active Codex conversation from its open rollout file."""
+        pane_command = tmux_client.get_pane_current_command(self.session_name, self.window_name)
+        if pane_command is None or not CODEX_PANE_COMMAND_PATTERN.fullmatch(pane_command):
+            raise ProviderError("Codex resume identity is unavailable from an inactive pane")
+        pane_pid = tmux_client.get_pane_process_id(self.session_name, self.window_name)
+        if pane_pid is None or pane_pid <= 0:
+            raise ProviderError("Codex resume identity is unavailable from the pane process")
+        try:
+            children = {
+                int(value)
+                for value in (proc_root / str(pane_pid) / "task" / str(pane_pid) / "children")
+                .read_text(encoding="utf-8")
+                .split()
+            }
+        except (OSError, ValueError) as exc:
+            raise ProviderError("Codex resume identity process inventory is uncertain") from exc
+        if not children:
+            raise ProviderError("Codex resume identity has no active provider process")
+
+        codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).resolve()
+        session_root = (codex_home / "sessions").resolve()
+        identities: set[str] = set()
+        try:
+            for process_id in children:
+                for descriptor in (proc_root / str(process_id) / "fd").iterdir():
+                    try:
+                        target = descriptor.resolve(strict=True)
+                        target.relative_to(session_root)
+                    except (FileNotFoundError, OSError, ValueError):
+                        continue
+                    match = CODEX_SESSION_ID_PATTERN.search(target.name)
+                    if match:
+                        identities.add(match.group("session").lower())
+        except OSError as exc:
+            raise ProviderError("Codex resume identity descriptor inventory is uncertain") from exc
+        if len(identities) != 1:
+            raise ProviderError("Codex resume identity is ambiguous")
+        return identities.pop()
+
+    def _wait_for_reconnected_runtime(self, marker: str, timeout: float = 60.0) -> None:
+        """Wait for a new resumed TUI after the durable reconnect marker."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            output = tmux_client.get_history(
+                self.session_name,
+                self.window_name,
+                tail_lines=SIDECAR_RECONNECT_HISTORY_LINES,
+            )
+            clean_output = _strip_terminal_noise(output) if output else ""
+            self._startup_evidence = clean_output[-STARTUP_EVIDENCE_LIMIT:]
+            marker_at = clean_output.rfind(marker)
+            if marker_at >= 0:
+                resumed_output = clean_output[marker_at + len(marker) :]
+                self._raise_if_startup_failed(resumed_output)
+                pane_command = tmux_client.get_pane_current_command(
+                    self.session_name, self.window_name
+                )
+                if (
+                    pane_command
+                    and CODEX_PANE_COMMAND_PATTERN.fullmatch(pane_command)
+                    and (
+                        re.search(CODEX_WELCOME_PATTERN, resumed_output)
+                        or re.search(TUI_FOOTER_PATTERN, resumed_output)
+                    )
+                ):
+                    return
+            time.sleep(0.5)
+        raise CodexStartupNoReadyError(
+            f"Codex sidecar reconnect timed out after {int(timeout)} seconds",
+            self._startup_evidence,
+        )
+
+    def reconnect_runtime_sidecar(self, resume_identity: str) -> None:
+        """Restart Codex's MCP subprocess and resume the exact conversation."""
+        identity_match = CODEX_SESSION_ID_PATTERN.fullmatch(f"{resume_identity}.jsonl")
+        if not identity_match or identity_match.group("session") != resume_identity.lower():
+            raise ProviderError("Codex resume identity is invalid")
+        pane_command = tmux_client.get_pane_current_command(self.session_name, self.window_name)
+        if pane_command is None:
+            raise ProviderError("Codex pane command is unavailable during reconnect")
+        if pane_command not in SHELL_PANE_COMMANDS:
+            if not CODEX_PANE_COMMAND_PATTERN.fullmatch(pane_command):
+                raise ProviderError("Codex pane changed before sidecar reconnect")
+            tmux_client.send_keys(self.session_name, self.window_name, "/exit")
+            deadline = time.monotonic() + 20.0
+            while time.monotonic() < deadline:
+                pane_command = tmux_client.get_pane_current_command(
+                    self.session_name, self.window_name
+                )
+                if pane_command in SHELL_PANE_COMMANDS:
+                    break
+                if pane_command is None or not CODEX_PANE_COMMAND_PATTERN.fullmatch(pane_command):
+                    raise ProviderError("Codex pane changed while exiting for sidecar reconnect")
+                time.sleep(0.5)
+            else:
+                raise ProviderError("Codex did not exit for sidecar reconnect")
+
+        command = self._build_codex_command(resume_session_id=resume_identity)
+        marker = f"{SIDECAR_RECONNECTED_PREFIX}{ACTIVE_RUNTIME_GENERATION}__"
+        self._startup_attempt += 1
+        self._startup_evidence = ""
+        self._startup_exit_marker = (
+            f"__CAO_CODEX_STARTUP_EXIT_{self.terminal_id}_{self._startup_attempt}__"
+        )
+        self._process_exited = False
+        launch_command = (
+            f"printf '\\n%s\\n' {shlex.quote(marker)}; {command}; "
+            f"codex_startup_status=$?; printf '\\n{self._startup_exit_marker}:%s\\n' "
+            '"$codex_startup_status"'
+        )
+        tmux_client.send_keys(self.session_name, self.window_name, launch_command)
+        self._wait_for_reconnected_runtime(marker)
+        self._runtime_sidecar_reconnect_pending = False
+        self._initialized = True
 
     def _handle_rate_limit_model_switch_prompt(self, output: str, clean_output: str) -> bool:
         """Keep the pinned model for Codex's exact rate-limit switch menu.
@@ -562,13 +695,23 @@ class CodexProvider(BaseProvider):
         marker, but its terminal scrollback keeps the shell-level sentinel.
         Rehydrate only from a marker bound to this terminal id; never infer a
         process exit from another terminal's history or generic sentinel text.
+        A newer sidecar-reconnect marker proves that an exact resumed process
+        was launched after an older clean-exit sentinel, so that older marker
+        cannot retire the resumed runtime after a later service restart.
         """
         marker_pattern = (
             re.escape(self._startup_exit_marker)
             if self._startup_exit_marker
             else rf"__CAO_CODEX_STARTUP_EXIT_{re.escape(self.terminal_id)}_\d+__"
         )
-        return re.search(rf"^{marker_pattern}:(\d+)\s*$", output, re.MULTILINE)
+        matches = list(re.finditer(rf"^{marker_pattern}:(\d+)\s*$", output, re.MULTILINE))
+        if not matches:
+            return None
+        latest = matches[-1]
+        reconnect_markers = list(SIDECAR_RECONNECTED_LINE_PATTERN.finditer(output))
+        if reconnect_markers and reconnect_markers[-1].start() > latest.start():
+            return None
+        return latest
 
     def _has_clean_codex_exit_to_shell(self, clean_output: str) -> bool:
         """Whether this provider's Codex process ended normally at a shell prompt."""
@@ -610,7 +753,7 @@ class CodexProvider(BaseProvider):
             return TerminalStatus.COMPLETED
         return TerminalStatus.PROCESSING
 
-    def _build_codex_command(self) -> str:
+    def _build_codex_command(self, resume_session_id: str | None = None) -> str:
         """Build Codex command with agent profile if provided.
 
         Returns properly escaped shell command string that can be safely sent via tmux.
@@ -732,6 +875,8 @@ class CodexProvider(BaseProvider):
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
+        if resume_session_id is not None:
+            command_parts.extend(["resume", resume_session_id])
         return shlex.join(command_parts)
 
     def _record_startup_output(self, output: str) -> str:
@@ -864,12 +1009,12 @@ class CodexProvider(BaseProvider):
 
         clean_output = _strip_terminal_noise(output)
         reconnect_matches = list(SIDECAR_RECONNECT_REQUIRED_LINE_PATTERN.finditer(clean_output))
-        compacted_matches = list(CONTEXT_COMPACTED_LINE_PATTERN.finditer(clean_output))
+        reconnected_matches = list(SIDECAR_RECONNECTED_LINE_PATTERN.finditer(clean_output))
         reconnect = reconnect_matches[-1].start() if reconnect_matches else -1
-        compacted = compacted_matches[-1].start() if compacted_matches else -1
-        if reconnect >= 0 and reconnect > compacted:
+        reconnected = reconnected_matches[-1].start() if reconnected_matches else -1
+        if reconnect >= 0 and reconnect > reconnected:
             self._runtime_sidecar_reconnect_pending = True
-        elif compacted >= 0:
+        elif reconnected >= 0:
             self._runtime_sidecar_reconnect_pending = False
         normalized_output = _normalize_terminal_suffix_blank_rows(clean_output)
         tail_output = "\n".join(normalized_output.splitlines()[-25:])
@@ -891,6 +1036,13 @@ class CodexProvider(BaseProvider):
         # a normal shell prompt are stronger lifecycle evidence than the absent
         # TUI footer. Without this, the Web UI stays on Processing forever.
         if self._has_clean_codex_exit_to_shell(clean_output):
+            if self._runtime_sidecar_reconnect_pending:
+                # This is the intentional exit half of an exact-session
+                # reconnect. Keep runtime ownership live so concurrent status
+                # polling or a service restart cannot retire the pane before
+                # the persisted session identity is resumed.
+                self._reset_completion_candidate()
+                return TerminalStatus.COMPLETED
             self._process_exited = True
             self._reset_completion_candidate()
             return TerminalStatus.COMPLETED

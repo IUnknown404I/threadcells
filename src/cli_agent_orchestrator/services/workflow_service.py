@@ -14,21 +14,25 @@ from cli_agent_orchestrator.clients.database import (
     cancel_workflows_for_terminal,
     claim_workflow_provider_reconnect,
     claim_workflow_turn,
+    complete_workflow_provider_reconnect,
     get_handoff_child_status,
     get_open_workflow_root_terminal_ids,
     get_parent_completion_barrier,
     get_pending_message_receiver_ids,
+    get_pending_workflow_provider_reconnect_root_terminal_ids,
     get_queued_workflow_root_terminal_ids,
     mark_workflow_turn_sent,
     observe_workflow_final,
     observe_workflow_processing,
     observe_workflow_ready,
-    release_workflow_provider_reconnect,
+    persist_workflow_provider_reconnect_identity,
+    renew_workflow_provider_reconnect,
     renew_workflow_turn_claim,
     requeue_expired_workflow_turn_claims,
     requeue_workflow_turn,
     set_workflow_terminal_state,
     start_workflow_input,
+    workflow_provider_reconnect_pending,
 )
 from cli_agent_orchestrator.models.inbox import ChildAssignmentStatus, OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -64,6 +68,41 @@ class _WorkflowTurnClaimHeartbeat:
         while not self._stop.wait(interval):
             if not renew_workflow_turn_claim(
                 self._turn["id"], self._turn["claim_token"], self._turn["claim_generation"]
+            ):
+                self.lost = True
+                self._stop.set()
+                return
+
+
+class _ProviderReconnectClaimHeartbeat:
+    """Keep exact reconnect ownership while provider exit/resume is blocking."""
+
+    def __init__(self, root_terminal_id: str, reconnect: dict) -> None:
+        self._root_terminal_id = root_terminal_id
+        self._reconnect = reconnect
+        self._stop = threading.Event()
+        self.lost = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1)
+
+    def _run(self) -> None:
+        from cli_agent_orchestrator.clients.database import (
+            WORKFLOW_PROVIDER_RECONNECT_LEASE_SECONDS,
+        )
+
+        interval = max(1, WORKFLOW_PROVIDER_RECONNECT_LEASE_SECONDS // 3)
+        while not self._stop.wait(interval):
+            if not renew_workflow_provider_reconnect(
+                self._root_terminal_id,
+                self._reconnect["turn_id"],
+                self._reconnect["claim_token"],
             ):
                 self.lost = True
                 self._stop.set()
@@ -144,6 +183,7 @@ def reconcile_root_workflow(
     registry: PluginRegistry | None = None,
     now: datetime | None = None,
     pending_inbox: bool | None = None,
+    pending_reconnect: bool | None = None,
 ) -> bool:
     """Observe one root and submit at most one due, durable continuation."""
     try:
@@ -161,27 +201,48 @@ def reconcile_root_workflow(
         return False
 
     # A promoted API must never let its stale in-process MCP sidecar mutate
-    # current state. When Codex surfaces the exact generation fence, compact
-    # its existing conversation once: this preserves model context while
-    # reinitializing the MCP client for the next admitted turn. The durable
-    # lease prevents duplicate slash commands and permits retry after a crash
-    # before transport.
-    if terminal_service.provider_runtime_sidecar_reconnect_required(root_terminal_id) is True:
+    # current state. When Codex surfaces the exact generation fence, persist
+    # its conversation identity before exiting and resume that exact session
+    # with a fresh MCP client. The durable lease prevents concurrent restarts;
+    # the stored identity makes the exit/resume crash gap recoverable.
+    reconnect_signal = (
+        terminal_service.provider_runtime_sidecar_reconnect_required(root_terminal_id) is True
+    )
+    if pending_reconnect is None:
+        pending_reconnect = workflow_provider_reconnect_pending(root_terminal_id)
+    if reconnect_signal or pending_reconnect:
         reconnect = claim_workflow_provider_reconnect(root_terminal_id, now=now)
         if reconnect is None:
             return False
         try:
-            terminal_service.request_provider_runtime_sidecar_reconnect(
+            with _ProviderReconnectClaimHeartbeat(root_terminal_id, reconnect) as heartbeat:
+                resume_identity = reconnect["resume_identity"]
+                if resume_identity is None:
+                    resume_identity = terminal_service.provider_runtime_sidecar_resume_identity(
+                        root_terminal_id
+                    )
+                    if not persist_workflow_provider_reconnect_identity(
+                        root_terminal_id,
+                        reconnect["turn_id"],
+                        reconnect["claim_token"],
+                        resume_identity,
+                    ):
+                        raise RuntimeError("provider reconnect identity lost admission")
+                terminal_service.request_provider_runtime_sidecar_reconnect(
+                    root_terminal_id,
+                    reconnect["turn_id"],
+                    resume_identity,
+                    registry=registry,
+                )
+            if heartbeat.lost:
+                raise RuntimeError("provider reconnect claim expired during resume")
+            if not complete_workflow_provider_reconnect(
                 root_terminal_id,
                 reconnect["turn_id"],
-                registry=registry,
-            )
+                reconnect["claim_token"],
+            ):
+                raise RuntimeError("provider reconnect completion lost admission")
         except Exception as exc:
-            release_workflow_provider_reconnect(
-                root_terminal_id,
-                reconnect["turn_id"],
-                reconnect["claimed_at"],
-            )
             logger.warning(
                 "Provider sidecar reconnect request failed for %s: %s",
                 root_terminal_id,
@@ -312,6 +373,7 @@ def reconcile_open_workflows(
     if not roots:
         return 0
     pending_receivers = set(get_pending_message_receiver_ids())
+    pending_reconnects = set(get_pending_workflow_provider_reconnect_root_terminal_ids())
     for root_terminal_id in roots:
         sent += int(
             reconcile_root_workflow(
@@ -319,6 +381,7 @@ def reconcile_open_workflows(
                 registry=registry,
                 now=now,
                 pending_inbox=root_terminal_id in pending_receivers,
+                pending_reconnect=root_terminal_id in pending_reconnects,
             )
         )
     return sent

@@ -875,7 +875,7 @@ class TestCodexBulletFormatStatusDetection:
         assert_stably_completed(provider)
 
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
-    def test_runtime_sidecar_reconnect_signal_clears_only_after_compaction(self, mock_tmux):
+    def test_runtime_sidecar_reconnect_signal_clears_only_after_exact_resume(self, mock_tmux):
         provider = CodexProvider("test1234", "test-session", "window-0")
         mock_tmux.get_history.return_value = (
             "You test recovery\n"
@@ -891,8 +891,15 @@ class TestCodexBulletFormatStatusDetection:
             "• Context compacted\n› \n  ? for shortcuts  79% context left\n"
         )
         provider.get_status()
-        assert provider.runtime_sidecar_reconnect_required() is False
+        assert provider.runtime_sidecar_reconnect_required() is True
         assert mock_tmux.get_history.call_count == 2
+
+        mock_tmux.get_history.return_value += (
+            "__CAO_SIDECAR_RECONNECTED_0123456789abcdef0123456789abcdef__\n"
+            "OpenAI Codex\n› \n  ? for shortcuts  79% context left\n"
+        )
+        provider.get_status()
+        assert provider.runtime_sidecar_reconnect_required() is False
 
         # Owner prose quoting the words is not a provider-side compaction frame.
         mock_tmux.get_history.return_value = (
@@ -904,6 +911,153 @@ class TestCodexBulletFormatStatusDetection:
         assert provider.runtime_sidecar_reconnect_required() is True
 
         assert provider.runtime_sidecar_reconnect_input == "/compact"
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_runtime_sidecar_resume_identity_comes_from_active_rollout(
+        self, mock_tmux, tmp_path, monkeypatch
+    ):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        mock_tmux.get_pane_current_command.return_value = "codex.direct"
+        mock_tmux.get_pane_process_id.return_value = 100
+        proc_root = tmp_path / "proc"
+        children = proc_root / "100/task/100/children"
+        children.parent.mkdir(parents=True)
+        children.write_text("200", encoding="utf-8")
+        descriptors = proc_root / "200/fd"
+        descriptors.mkdir(parents=True)
+        codex_home = tmp_path / "codex"
+        rollout = (
+            codex_home / "sessions/2026/08/22/rollout-2026-08-22T12-00-00-"
+            "01234567-89ab-cdef-0123-456789abcdef.jsonl"
+        )
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text("{}\n", encoding="utf-8")
+        (descriptors / "9").symlink_to(rollout)
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        assert (
+            provider.runtime_sidecar_resume_identity(proc_root)
+            == "01234567-89ab-cdef-0123-456789abcdef"
+        )
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_runtime_sidecar_resume_identity_fails_closed_when_ambiguous(
+        self, mock_tmux, tmp_path, monkeypatch
+    ):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        mock_tmux.get_pane_current_command.return_value = "codex"
+        mock_tmux.get_pane_process_id.return_value = 100
+        proc_root = tmp_path / "proc"
+        children = proc_root / "100/task/100/children"
+        children.parent.mkdir(parents=True)
+        children.write_text("200", encoding="utf-8")
+        descriptors = proc_root / "200/fd"
+        descriptors.mkdir(parents=True)
+        codex_home = tmp_path / "codex"
+        for descriptor, session_id in (
+            ("8", "01234567-89ab-cdef-0123-456789abcdef"),
+            ("9", "fedcba98-7654-3210-fedc-ba9876543210"),
+        ):
+            rollout = codex_home / "sessions" / f"rollout-{session_id}.jsonl"
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text("{}\n", encoding="utf-8")
+            (descriptors / descriptor).symlink_to(rollout)
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        with pytest.raises(ProviderError, match="ambiguous"):
+            provider.runtime_sidecar_resume_identity(proc_root)
+
+    @patch("cli_agent_orchestrator.providers.codex.CodexProvider._wait_for_reconnected_runtime")
+    @patch("cli_agent_orchestrator.providers.codex.time.sleep")
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_runtime_sidecar_reconnect_exits_and_resumes_exact_session(
+        self, mock_tmux, _mock_sleep, mock_wait
+    ):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        mock_tmux.get_pane_current_command.side_effect = ["codex.direct", "bash"]
+        resume_identity = "01234567-89ab-cdef-0123-456789abcdef"
+
+        provider.reconnect_runtime_sidecar(resume_identity)
+
+        assert mock_tmux.send_keys.call_args_list[0] == call("test-session", "window-0", "/exit")
+        launch = mock_tmux.send_keys.call_args_list[1].args[2]
+        assert f"resume {resume_identity}" in launch
+        assert "__CAO_SIDECAR_RECONNECTED_" in launch
+        mock_wait.assert_called_once()
+        assert provider.runtime_sidecar_reconnect_required() is False
+
+    @patch("cli_agent_orchestrator.providers.codex.CodexProvider._wait_for_reconnected_runtime")
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_runtime_sidecar_reconnect_resumes_from_shell_after_exit_gap(
+        self, mock_tmux, mock_wait
+    ):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        mock_tmux.get_pane_current_command.return_value = "bash"
+        resume_identity = "01234567-89ab-cdef-0123-456789abcdef"
+
+        provider.reconnect_runtime_sidecar(resume_identity)
+
+        assert mock_tmux.send_keys.call_count == 1
+        launch = mock_tmux.send_keys.call_args.args[2]
+        assert f"resume {resume_identity}" in launch
+        assert "/exit" not in launch
+        mock_wait.assert_called_once()
+
+    @patch("cli_agent_orchestrator.providers.codex.time.sleep")
+    @patch("cli_agent_orchestrator.providers.codex.time.monotonic", side_effect=[0.0, 0.1])
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_reconnect_wait_uses_bounded_deep_history_and_exact_marker(
+        self, mock_tmux, _mock_monotonic, _mock_sleep
+    ):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        marker = "__CAO_SIDECAR_RECONNECTED_0123456789abcdef0123456789abcdef__"
+        mock_tmux.get_history.return_value = (
+            marker + "\n" + "restored transcript\n" * 300 + "OpenAI Codex\n? for shortcuts\n"
+        )
+        mock_tmux.get_pane_current_command.return_value = "codex"
+
+        provider._wait_for_reconnected_runtime(marker, timeout=1.0)
+
+        mock_tmux.get_history.assert_called_once_with("test-session", "window-0", tail_lines=2_000)
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_runtime_sidecar_reconnect_rejects_noncanonical_identity(self, mock_tmux):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        with pytest.raises(ProviderError, match="invalid"):
+            provider.reconnect_runtime_sidecar("--last")
+
+        mock_tmux.get_pane_current_command.assert_not_called()
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_reconstructed_provider_ignores_exit_before_newer_reconnect_marker(self, mock_tmux):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        mock_tmux.get_history.return_value = (
+            "__CAO_CODEX_STARTUP_EXIT_test1234_1__:0\n"
+            "operator@host:/workspace$\n"
+            "__CAO_SIDECAR_RECONNECTED_0123456789abcdef0123456789abcdef__\n"
+            "OpenAI Codex\n"
+            "› \n"
+            "  ? for shortcuts  79% context left\n"
+        )
+
+        assert provider.get_status() == TerminalStatus.IDLE
+        assert provider.is_process_alive() is True
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_reconnect_exit_gap_cannot_retire_runtime_during_status_poll(self, mock_tmux):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        mock_tmux.get_history.return_value = (
+            "You deliver the result\n"
+            "• Called a privileged tool\n"
+            "  Error calling tool 'send_message': CAO_SIDECAR_RECONNECT_REQUIRED: retry\n"
+            "__CAO_CODEX_STARTUP_EXIT_test1234_1__:0\n"
+            "operator@host:/workspace$\n"
+        )
+
+        assert provider.get_status() == TerminalStatus.COMPLETED
+        assert provider.runtime_sidecar_reconnect_required() is True
+        assert provider.is_process_alive() is True
 
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
     def test_runtime_identity_unavailable_retries_without_forcing_reconnect(self, mock_tmux):

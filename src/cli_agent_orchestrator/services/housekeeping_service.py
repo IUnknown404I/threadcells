@@ -68,9 +68,19 @@ def _tree_size(root: Path) -> int:
     return total
 
 
-def _open_paths_inventory(proc_root: Path = Path("/proc")) -> tuple[set[Path], bool]:
-    """Return live process paths and whether the complete inventory was readable."""
+def _open_paths_inventory(
+    proc_root: Path = Path("/proc"), *, runtime_uid: int | None = None
+) -> tuple[set[Path], bool]:
+    """Return paths opened by the ThreadCells runtime user's processes.
+
+    Disposable ThreadCells state is owned by the configured runtime account.
+    Processes owned by another host account cannot own that active state and
+    are outside this protected-set boundary. Requiring their private ``/proc``
+    entries to be readable would make an unprivileged production Housekeeping
+    service permanently preserve every candidate on a normal multi-user host.
+    """
     result: set[Path] = set()
+    owner_uid = os.geteuid() if runtime_uid is None else runtime_uid
     try:
         processes = list(proc_root.iterdir())
     except OSError:
@@ -78,6 +88,13 @@ def _open_paths_inventory(proc_root: Path = Path("/proc")) -> tuple[set[Path], b
     for process in processes:
         if not process.name.isdigit():
             continue
+        try:
+            if process.stat().st_uid != owner_uid:
+                continue
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return result, False
         fd_root = process / "fd"
         try:
             descriptors = list(fd_root.iterdir())

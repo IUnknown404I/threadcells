@@ -118,6 +118,61 @@ def test_log_and_attachment_cleanup_fails_closed_when_open_inventory_is_uncertai
     assert "log_attachment_process_inventory_uncertain" in summary.warnings
 
 
+def test_open_inventory_scopes_certainty_to_the_runtime_account(tmp_path, monkeypatch):
+    proc = tmp_path / "proc"
+    owned = proc / "100"
+    foreign = proc / "200"
+    (owned / "fd").mkdir(parents=True)
+    foreign.mkdir()
+    opened = tmp_path / "active.log"
+    opened.write_text("active", encoding="utf-8")
+    (owned / "fd/3").symlink_to(opened)
+    (owned / "exe").symlink_to(Path("/usr/bin/python3"))
+    (owned / "maps").write_text("", encoding="utf-8")
+    runtime_uid = os.getuid()
+    original_stat = Path.stat
+
+    def process_owner(path, *args, **kwargs):
+        if path == foreign:
+            return SimpleNamespace(st_uid=runtime_uid + 1)
+        return original_stat(path, *args, **kwargs)
+
+    original_iterdir = Path.iterdir
+
+    def unreadable_foreign_fd(path):
+        if path == foreign / "fd":
+            raise PermissionError("foreign process details are private")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "stat", process_owner)
+    monkeypatch.setattr(Path, "iterdir", unreadable_foreign_fd)
+
+    paths, certain = _open_paths_inventory(proc, runtime_uid=runtime_uid)
+
+    assert certain is True
+    assert opened.resolve() in paths
+
+
+def test_open_inventory_fails_closed_for_unreadable_runtime_process(tmp_path, monkeypatch):
+    proc = tmp_path / "proc"
+    owned = proc / "100"
+    owned.mkdir(parents=True)
+    runtime_uid = os.getuid()
+    original_iterdir = Path.iterdir
+
+    def unreadable_owned_fd(path):
+        if path == owned / "fd":
+            raise PermissionError("runtime process details are unreadable")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", unreadable_owned_fd)
+
+    paths, certain = _open_paths_inventory(proc, runtime_uid=runtime_uid)
+
+    assert paths == set()
+    assert certain is False
+
+
 def test_unknown_temp_is_preserved_and_expired_marked_temp_is_removed(tmp_path):
     now = 2_000_000_000.0
     unknown = tmp_path / "tmp/unknown"

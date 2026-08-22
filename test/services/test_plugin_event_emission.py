@@ -46,6 +46,14 @@ def isolate_operational_admission(monkeypatch):
             process_start_ticks=777,
         ),
     )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.acquire_terminal_runtime_transport",
+        lambda _terminal_id: "transport-token",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.release_terminal_runtime_operation",
+        lambda _terminal_id, _token: True,
+    )
 
 
 def _registry_mock() -> MagicMock:

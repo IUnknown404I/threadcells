@@ -182,6 +182,21 @@ class TestTerminalServiceWorkingDirectory:
 class TestSendSpecialKey:
     """Tests for send_special_key function."""
 
+    @pytest.fixture(autouse=True)
+    def isolate_runtime_transport(self):
+        """Keep unit transport tests independent from the durable terminal ledger."""
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.acquire_terminal_runtime_transport",
+                return_value="transport-token",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.release_terminal_runtime_operation",
+                return_value=True,
+            ),
+        ):
+            yield
+
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")

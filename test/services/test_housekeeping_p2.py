@@ -218,6 +218,34 @@ def test_exited_terminal_runtime_identity_mismatch_is_protected(tmp_path, monkey
     candidate = next(item for item in plan.candidates if item.resource_kind == "terminal_runtime")
     assert candidate.action == "preserve"
     assert candidate.protection_reason == "TERMINAL_RUNTIME_IDENTITY_MISMATCH"
+    assert candidate.estimated_reclaim_bytes == 0
+    assert plan.reclaimable_bytes == 0
+
+
+def test_marker_unknown_ephemeral_tree_is_shallow_and_not_reported_as_reclaimable(
+    tmp_path, monkeypatch
+):
+    unknown = tmp_path / "tmp/unmarked-build"
+    payload = unknown / "nested/payload.bin"
+    payload.parent.mkdir(parents=True)
+    payload.write_bytes(b"x" * 1024 * 1024)
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.list_all_terminals", lambda: [])
+
+    plan = build_plan(
+        root=tmp_path,
+        config=_config(tmp_path),
+        settings=default_settings(_config(tmp_path)),
+        mode="frequent",
+        now=NOW,
+        open_inventory=lambda: (set(), True),
+    )
+    candidate = next(item for item in plan.candidates if item.path == str(unknown.resolve()))
+
+    assert candidate.action == "preserve"
+    assert candidate.protection_reason == "EPHEMERAL_MARKER_UNKNOWN"
+    assert candidate.bytes == 0
+    assert candidate.estimated_reclaim_bytes == 0
+    assert plan.reclaimable_bytes == 0
 
 
 def test_pending_retirement_cleanup_uses_the_revalidated_plan_executor(tmp_path, monkeypatch):

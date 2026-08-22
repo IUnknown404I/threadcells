@@ -49,9 +49,22 @@ def _candidate(
     estimated_reclaim: int | None = None,
     forced_protection: str | None = None,
 ) -> HousekeepingCandidate:
-    fingerprint, size = candidate_fingerprint(path)
     protection_reason = forced_protection or protection.reason(path, category)
     resolved_action = "preserve" if protection_reason else action
+    if resolved_action == "preserve":
+        metadata = path.lstat()
+        fingerprint = resource_fingerprint(
+            {
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+                "mode": metadata.st_mode,
+                "size": metadata.st_size,
+                "mtime_ns": metadata.st_mtime_ns,
+            }
+        )
+        size = metadata.st_size if path.is_file() else 0
+    else:
+        fingerprint, size = candidate_fingerprint(path)
     return HousekeepingCandidate(
         category=category,
         path=str(path.resolve()),
@@ -81,14 +94,17 @@ def _resource_candidate(
     attributes: Mapping[str, str],
     protection_reason: str | None = None,
 ) -> HousekeepingCandidate:
+    resolved_action = "preserve" if protection_reason else action
     return HousekeepingCandidate(
         category=category,
         path=identity,
         canonical_identity=f"{category}:{identity}",
         fingerprint=resource_fingerprint(fingerprint_payload),
         bytes=size,
-        estimated_reclaim_bytes=size if action in {"delete", "terminate", "prune"} else 0,
-        action="preserve" if protection_reason else action,  # type: ignore[arg-type]
+        estimated_reclaim_bytes=(
+            size if resolved_action in {"delete", "terminate", "prune"} else 0
+        ),
+        action=resolved_action,  # type: ignore[arg-type]
         retention_reason=retention_reason,
         protection_reason=protection_reason,
         resource_kind=resource_kind,  # type: ignore[arg-type]
@@ -763,6 +779,7 @@ def _plan_logs(
                     )
                 )
             elif path.suffix == ".log" and _older_than(path, now, compress_after):
+                protection_reason = protection.reason(path, "logs")
                 result.append(
                     _candidate(
                         path,
@@ -770,7 +787,8 @@ def _plan_logs(
                         action="compress",
                         retention_reason=f"older_than_{compress_after}_minutes",
                         protection=protection,
-                        estimated_reclaim=_compression_reclaim(path),
+                        estimated_reclaim=(0 if protection_reason else _compression_reclaim(path)),
+                        forced_protection=protection_reason,
                     )
                 )
         except FileNotFoundError:

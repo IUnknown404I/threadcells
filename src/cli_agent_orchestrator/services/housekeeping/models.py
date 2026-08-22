@@ -68,7 +68,9 @@ class HousekeepingPlan:
 
     @property
     def reclaimable_bytes(self) -> int:
-        return sum(item.estimated_reclaim_bytes for item in self.candidates)
+        return sum(
+            item.estimated_reclaim_bytes for item in self.candidates if item.action != "preserve"
+        )
 
     def as_dict(self) -> dict[str, Any]:
         return {

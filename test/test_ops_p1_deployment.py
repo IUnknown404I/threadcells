@@ -452,3 +452,68 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
     repeated = subprocess.run(promote_command, capture_output=True, text=True)
     assert repeated.returncode == 0, repeated.stderr
     assert json.loads(release_metadata.read_text()) == promoted_metadata
+
+
+def test_stage_ops_p1_bootstraps_pip_only_inside_a_without_pip_candidate(tmp_path):
+    agent_root = tmp_path / "srv/agent-control"
+    policy = agent_root / "policy/ORCHESTRATION.md"
+    policy.parent.mkdir(parents=True)
+    policy.write_text("# Existing authority\n")
+    base_runtime = tmp_path / "without-pip-runtime"
+    subprocess.run(
+        [
+            str(Path(sys.executable).resolve()),
+            "-m",
+            "venv",
+            "--without-pip",
+            str(base_runtime),
+        ],
+        check=True,
+    )
+    wheel = _local_wheel(tmp_path / "wheel")
+    commit = subprocess.run(
+        ["git", "-C", str(SOURCE), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    candidate = tmp_path / "var/lib/threadcells/releases/candidate-without-pip"
+    command = [
+        sys.executable,
+        str(SOURCE / "deployment/stage-ops-p1.py"),
+        "--source-root",
+        str(SOURCE),
+        "--agent-control-root",
+        str(agent_root),
+        "--system-root",
+        str(tmp_path),
+        "--base-runtime",
+        str(base_runtime),
+        "--candidate-root",
+        str(candidate),
+        "--wheel",
+        str(wheel),
+        "--test-unprivileged-staging",
+        "--expected-commit",
+        commit,
+    ]
+
+    staged = subprocess.run(command, capture_output=True, text=True)
+
+    assert staged.returncode == 0, staged.stderr
+    assert (
+        subprocess.run(
+            [str(base_runtime / "bin/python"), "-c", "import pip"],
+            capture_output=True,
+            text=True,
+        ).returncode
+        != 0
+    )
+    assert (
+        subprocess.run(
+            [str(candidate / "runtime/bin/python"), "-c", "import pip"],
+            capture_output=True,
+            text=True,
+        ).returncode
+        == 0
+    )

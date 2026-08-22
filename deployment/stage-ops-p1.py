@@ -325,6 +325,21 @@ def _validate_candidate_runtime(
     payload = _wheel_package_payload(wheel)
     site_packages = _candidate_site_packages(candidate_python, candidate_runtime)
     _purge_candidate_package_payload(site_packages, payload)
+    pip_available = subprocess.run(
+        [str(candidate_python), "-c", "import pip"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if pip_available.returncode:
+        bootstrapped = subprocess.run(
+            [str(candidate_python), "-m", "ensurepip", "--upgrade"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if bootstrapped.returncode:
+            fail("CANDIDATE_PIP_BOOTSTRAP_FAILED")
     installed = subprocess.run(
         [
             str(candidate_python),
@@ -356,9 +371,14 @@ def _validate_candidate_runtime(
         fail("CANDIDATE_PACKAGE_IDENTITY_MISMATCH")
     _validate_candidate_package_payload(site_packages, payload)
     expected_shebang = f"#!{candidate_python}\n".encode("utf-8")
+    expected_shell_wrapper = (
+        b"#!/bin/sh\n'''exec' " + os.fsencode(candidate_python) + b" \"$0\" \"$@\"\n' '''\n"
+    )
     for script_name in script_names:
         script = candidate_runtime / "bin" / script_name
-        if not script.is_file() or not script.read_bytes().startswith(expected_shebang):
+        if not script.is_file() or not script.read_bytes().startswith(
+            (expected_shebang, expected_shell_wrapper)
+        ):
             fail("CANDIDATE_CONSOLE_SHEBANG_MISMATCH")
     package_init = _candidate_package_path(candidate_python)
     candidate_root = candidate_runtime.resolve()

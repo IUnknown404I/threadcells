@@ -199,11 +199,16 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
         == 0
     )
     base_hash = _tree_hash(base_runtime)
-    old_shebang = (base_runtime / "bin/cao").read_text(encoding="utf-8").splitlines()[0]
-    assert old_shebang == f"#!{base_python}"
+    old_launcher_header = "\n".join(
+        (base_runtime / "bin/cao").read_text(encoding="utf-8").splitlines()[:3]
+    )
+    assert str(base_python) in old_launcher_header
     legacy_runtime = tmp_path / "legacy-candidate" / "runtime"
     shutil.copytree(base_runtime, legacy_runtime, symlinks=True)
-    assert (legacy_runtime / "bin/cao").read_text(encoding="utf-8").splitlines()[0] == old_shebang
+    legacy_launcher_header = "\n".join(
+        (legacy_runtime / "bin/cao").read_text(encoding="utf-8").splitlines()[:3]
+    )
+    assert legacy_launcher_header == old_launcher_header
     commit = subprocess.run(
         ["git", "-C", str(SOURCE), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
     ).stdout.strip()
@@ -365,9 +370,14 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
     )
     for path in (release_root, candidate_root, release_lock, release_metadata):
         assert (path.stat().st_uid, path.stat().st_gid) == (os.geteuid(), os.getegid())
-    assert (candidate_runtime / "bin/cao").read_text(encoding="utf-8").splitlines()[
-        0
-    ] == f"#!{candidate_python}"
+    launcher_header = "\n".join(
+        (candidate_runtime / "bin/cao").read_text(encoding="utf-8").splitlines()[:3]
+    )
+    # pip uses a direct shebang when it fits and a valid /bin/sh exec
+    # trampoline for long installation paths. Both must name this candidate's
+    # interpreter and must not retain the base runtime's absolute path.
+    assert str(candidate_python) in launcher_header
+    assert str(base_python) not in launcher_header
     imported_path = subprocess.run(
         [
             str(candidate_python),

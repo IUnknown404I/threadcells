@@ -905,6 +905,21 @@ class TestCodexBulletFormatStatusDetection:
 
         assert provider.runtime_sidecar_reconnect_input == "/compact"
 
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_runtime_identity_unavailable_retries_without_forcing_reconnect(self, mock_tmux):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        mock_tmux.get_history.return_value = (
+            "You continue the workflow\n"
+            "• Called a privileged tool\n"
+            "  Error calling tool 'send_message': CAO_RUNTIME_GENERATION_UNAVAILABLE: retry\n"
+            "ⓘ The operation was not started.\n"
+            "› \n  ? for shortcuts  80% context left\n"
+        )
+
+        assert_stably_completed(provider)
+
+        assert provider.runtime_sidecar_reconnect_required() is False
+
 
 class TestCodexV0111FooterFormat:
     """Tests for Codex v0.111.0+ TUI footer format.

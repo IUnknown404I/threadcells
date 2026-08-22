@@ -534,6 +534,33 @@ def test_p1_stale_supervisor_sidecar_cannot_report_assigned_child_retired(
     finalize.assert_not_called()
 
 
+@pytest.mark.parametrize("failure", ["connection", "http", "malformed"])
+def test_p1_managed_sidecar_identity_failure_claims_no_privileged_effect(
+    monkeypatch, mocker, failure
+):
+    monkeypatch.setattr(mcp_server, "_SIDECAR_RUNTIME_GENERATION", "managed-build")
+    monkeypatch.setenv("CAO_TERMINAL_ID", "managed-parent")
+    get = mocker.patch.object(mcp_server.requests, "get")
+    if failure == "connection":
+        get.side_effect = mcp_server.requests.ConnectionError("API restarting")
+    elif failure == "http":
+        get.return_value.raise_for_status.side_effect = mcp_server.requests.HTTPError(
+            "generation endpoint unavailable"
+        )
+    else:
+        get.return_value.raise_for_status.return_value = None
+        get.return_value.json.return_value = {"generation": 7}
+    claim_effect = mocker.patch.object(mcp_server, "claim_workflow_effect")
+
+    with pytest.raises(
+        mcp_server.SidecarRuntimeIdentityUnavailable,
+        match="CAO_RUNTIME_GENERATION_UNAVAILABLE",
+    ):
+        mcp_server._claim_privileged_effect(41, "send_message", "receiver", "payload")
+
+    claim_effect.assert_not_called()
+
+
 def test_p1_current_supervisor_sidecar_runs_assigned_retirement_saga(
     resource_db, monkeypatch, mocker
 ):

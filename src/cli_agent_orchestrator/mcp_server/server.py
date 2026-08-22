@@ -101,6 +101,10 @@ class SidecarRuntimeRecoveryRequired(RuntimeError):
     """Tell the MCP client that stale privileged sidecar work was safely rejected."""
 
 
+class SidecarRuntimeIdentityUnavailable(RuntimeError):
+    """Fail closed until a managed sidecar can prove active-code compatibility."""
+
+
 def _suspend_provider_execution(logical_turn_id: int) -> tuple[str, bool]:
     """Release a parent's slot while a blocking handoff waits for its child."""
     terminal_id = os.environ.get("CAO_TERMINAL_ID", "")
@@ -140,9 +144,9 @@ async def _resume_provider_execution(
 def _active_runtime_generation() -> Optional[str]:
     """Read the generation of the API process serving this sidecar.
 
-    A missing/malformed response is intentionally non-actionable: the normal
-    handoff path retains its existing connection-error behaviour rather than
-    treating an unavailable observability endpoint as a new destructive action.
+    The caller distinguishes a positively proven identity from every transport,
+    HTTP, or schema failure. Managed sidecars must never treat unavailable
+    compatibility evidence as permission to mutate durable state.
     """
     try:
         response = requests.get(f"{API_BASE_URL}{_RUNTIME_GENERATION_PATH}", timeout=2)
@@ -165,7 +169,12 @@ def _fence_privileged_runtime() -> None:
     if not sidecar_generation:
         return
     active_generation = _active_runtime_generation()
-    if not active_generation or sidecar_generation == active_generation:
+    if not active_generation:
+        raise SidecarRuntimeIdentityUnavailable(
+            "CAO_RUNTIME_GENERATION_UNAVAILABLE: privileged operation was not started; "
+            "retry after the active runtime identity is available"
+        )
+    if sidecar_generation == active_generation:
         return
     logger.info(
         "Fenced stale cao-mcp-server sidecar generation %s; active generation is %s",

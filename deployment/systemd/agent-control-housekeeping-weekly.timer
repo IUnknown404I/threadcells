@@ -2,7 +2,7 @@
 Description=Poll the ThreadCells canonical weekly housekeeping schedule
 
 [Timer]
-OnBootSec=15min
+OnActiveSec=20min
 OnUnitActiveSec=15min
 Persistent=true
 AccuracySec=1min

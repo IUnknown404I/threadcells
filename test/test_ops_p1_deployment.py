@@ -138,6 +138,17 @@ def test_stage_ops_p1_is_dry_run_capable_and_idempotent(tmp_path):
             "ExecStart=/var/lib/threadcells/active/runtime/bin/cao-housekeeping"
             in (system_root / "etc/systemd/system" / unit).read_text()
         )
+    frequent_timer = (
+        system_root / "etc/systemd/system/agent-control-housekeeping.timer"
+    ).read_text()
+    weekly_timer = (
+        system_root / "etc/systemd/system/agent-control-housekeeping-weekly.timer"
+    ).read_text()
+    assert "OnActiveSec=15min" in frequent_timer
+    assert "OnActiveSec=20min" in weekly_timer
+    assert "OnBootSec=" not in frequent_timer + weekly_timer
+    assert "OnUnitActiveSec=15min" in frequent_timer
+    assert "OnUnitActiveSec=15min" in weekly_timer
     runtime_dropin = (
         system_root / "etc/systemd/system/agent-control-cao.service.d/threadcells-runtime.conf"
     )

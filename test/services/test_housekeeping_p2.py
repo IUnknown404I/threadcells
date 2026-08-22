@@ -323,6 +323,32 @@ def test_housekeeping_cli_forwards_the_inspected_plan_id(monkeypatch, capsys):
     assert "HOUSEKEEPING_OK" in capsys.readouterr().out
 
 
+def test_scheduled_housekeeping_treats_an_active_canonical_run_as_a_safe_skip(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service.run_housekeeping",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("HOUSEKEEPING_BUSY")),
+    )
+
+    assert housekeeping_main(["--mode", "weekly", "--scheduled"]) == 0
+    assert capsys.readouterr().out.strip() == "HOUSEKEEPING_SKIPPED reason=HOUSEKEEPING_BUSY"
+
+
+def test_manual_housekeeping_keeps_lock_contention_as_a_hard_failure(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service.run_housekeeping",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("HOUSEKEEPING_BUSY")),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service.load_operations_config",
+        lambda: (_ for _ in ()).throw(RuntimeError("config unavailable")),
+    )
+
+    assert housekeeping_main(["--mode", "weekly", "--plan-id", "a" * 64]) == 1
+    assert "HOUSEKEEPING_FAILED error=RuntimeError:HOUSEKEEPING_BUSY" in capsys.readouterr().out
+
+
 def test_plan_identity_is_content_addressed_not_timestamp_addressed(tmp_path):
     candidate = HousekeepingCandidate(
         category="logs",

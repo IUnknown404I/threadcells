@@ -69,7 +69,7 @@ Settings → Housekeeping separates policy, schedule, planning, execution, and r
 - a weekly UTC schedule, such as `Sun 04:00 UTC`;
 - disk-pressure cleanup using `on_red`.
 
-Installed timers may poll every 15 minutes. Durable receipts keep a schedule class from running twice before it is due. A scheduled run creates and executes its due plan under one service lock; it does not reuse a human-approved manual plan.
+Installed timers may poll every 15 minutes, with staggered initial activation so the frequent and weekly checks do not normally collide. Durable receipts keep a schedule class from running twice before it is due. A scheduled poll that finds the canonical Housekeeping engine already active exits successfully as skipped and tries again later; manual lock contention remains an error. A scheduled run creates and executes its due plan under one service lock; it does not reuse a human-approved manual plan.
 
 Housekeeping changes and manual execution are protected by [Operator authorization](OPERATOR_AUTHORIZATION.md).
 

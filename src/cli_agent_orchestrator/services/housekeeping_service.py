@@ -1138,6 +1138,9 @@ def housekeeping_main(argv: Sequence[str] | None = None) -> int:
             expected_plan_id=args.plan_id,
         )
     except Exception as exc:
+        if args.scheduled and str(exc) == "HOUSEKEEPING_BUSY":
+            print("HOUSEKEEPING_SKIPPED reason=HOUSEKEEPING_BUSY")
+            return 0
         try:
             config = load_operations_config()
             failed = HousekeepingSummary(ok=False, dry_run=args.dry_run, mode=args.mode)

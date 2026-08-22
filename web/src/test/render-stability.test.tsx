@@ -2,129 +2,190 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { DashboardHome } from '../components/DashboardHome'
 import { AgentPanel } from '../components/AgentPanel'
-import { api, TerminalMeta } from '../api'
+import { AgentSummary, AgentSummaryPage, PageResult, SessionSummary, api } from '../api'
 import { useStore } from '../store'
 
 vi.mock('../components/TerminalView', () => ({ TerminalView: () => null }))
 
-const session = (id: string) => ({ id, name: id, status: 'active', created_at: '1' })
-const terminal = (id: string, sessionName = 'session-0'): TerminalMeta => ({ id, tmux_session: sessionName, tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null })
-const status = (id: string, value = 'idle') => ({ id, name: id, provider: 'codex', session_name: 'session-0', agent_profile: 'developer', status: value, lifecycle: 'running' as const, workflow_state: 'active' as const, last_active: null })
+const overview = { sessions: 2, agents: 2, active: 2, waiting: 0, owner_gate: 0, cancelled: 0, completed: 0 }
+
+function session(id: string, agents = 1): SessionSummary {
+  return {
+    id,
+    name: id,
+    status: 'active',
+    created_at: '2026-08-22T00:00:00Z',
+    agent_count: agents,
+    active_agent_count: agents,
+    workflow_counts: { active: agents },
+    activity_counts: { idle: agents },
+    project_name: null,
+    last_active: '2026-08-22T00:00:00Z',
+    first_agent: { id: `${id}-agent-0`, activity: 'idle', execution_state: 'ready', lifecycle: 'running', workflow_state: 'active' },
+    last_agent: { id: `${id}-agent-${agents - 1}`, activity: 'idle', execution_state: 'ready', lifecycle: 'running', workflow_state: 'active' },
+  }
+}
+
+function agent(id: string, sessionId = 'session-0'): AgentSummary {
+  return {
+    id,
+    name: id,
+    provider: 'codex',
+    session_id: sessionId,
+    session_name: sessionId,
+    agent_profile: 'developer',
+    activity: 'idle',
+    execution_state: 'ready',
+    lifecycle: 'running',
+    workflow_state: 'active',
+    workflow_status: null,
+    assignment_status: null,
+    result_status: null,
+    delivery_status: null,
+    context_role: null,
+    launch_worktree: null,
+    managed_worktree_kind: null,
+    managed_worktree_commit: null,
+    managed_worktree_branch: null,
+    projectId: null,
+    project_name: null,
+    project_path: null,
+    creation_order: 1,
+    last_active: '2026-08-22T00:00:00Z',
+  }
+}
+
+function page<T>(items: T[], limit = 10, offset = 0): PageResult<T> {
+  const selected = items.slice(offset, offset + limit)
+  return {
+    items: selected,
+    total: items.length,
+    limit,
+    offset,
+    next_offset: offset + selected.length < items.length ? offset + selected.length : null,
+  }
+}
+
+function agentPage(items: AgentSummary[], limit = 40, offset = 0): AgentSummaryPage {
+  return {
+    ...page(items, limit, offset),
+    facets: { activities: ['idle'], workflow_states: ['active'], profiles: ['developer'] },
+  }
+}
 
 beforeEach(() => {
   vi.restoreAllMocks()
   useStore.setState({ sessions: [], activeSession: null, activeSessionDetail: null, terminalStatuses: {}, connected: true, snackbar: null })
+  vi.spyOn(api, 'getUiOverview').mockResolvedValue(overview)
   vi.spyOn(api, 'listProfiles').mockResolvedValue([])
   vi.spyOn(api, 'listProviders').mockResolvedValue([])
-  vi.spyOn(api, 'getTerminalStatus').mockImplementation(async id => status(id) as never)
+  vi.spyOn(api, 'listProjects').mockResolvedValue([])
+  vi.spyOn(api, 'getSession').mockRejectedValue(new Error('legacy session fan-out is forbidden'))
+  vi.spyOn(api, 'getTerminalStatus').mockRejectedValue(new Error('per-terminal polling is forbidden'))
 })
 
 describe('Home render stability', () => {
   it.each([
     { label: 'one session', names: ['session-0'] },
     { label: 'multiple sessions', names: ['session-0', 'session-1', 'session-2'] },
-  ])('expands only the canonical first Home session for $label', async ({ names }) => {
-    const sessions = names.map(session)
-    useStore.setState({ sessions, connected: true })
-    vi.spyOn(api, 'getSession').mockImplementation(async name => ({
-      session: session(name),
-      terminals: [terminal(`terminal-${name}`, name)],
-    }) as never)
+  ])('keeps session details collapsed until the operator expands one for $label', async ({ names }) => {
+    const sessions = names.map(name => session(name))
+    vi.spyOn(api, 'listSessionSummaries').mockResolvedValue(page(sessions))
+    const listAgents = vi.spyOn(api, 'listAgentSummaries').mockImplementation(async params => {
+      const resolved = params || {}
+      const sessionId = resolved.sessionId || 'session-0'
+      return agentPage([agent(`terminal-${sessionId}`, sessionId)])
+    })
 
     render(<DashboardHome onNavigate={() => {}} />)
 
-    expect(await screen.findByRole('button', { name: `Collapse ${names[0]}` })).toHaveAttribute('aria-expanded', 'true')
-    for (const name of names.slice(1)) {
-      expect(screen.getByRole('button', { name: `Expand ${name}` })).toHaveAttribute('aria-expanded', 'false')
-      expect(screen.queryByTestId(`agent-detail-card-terminal-${name}`)).not.toBeInTheDocument()
+    for (const name of names) {
+      expect(await screen.findByRole('button', { name: `Expand ${name}` })).toHaveAttribute('aria-expanded', 'false')
     }
+    expect(listAgents).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: `Expand ${names[0]}` }))
+    expect(await screen.findByTestId(`agent-detail-card-terminal-${names[0]}`)).toBeInTheDocument()
+    expect(listAgents).toHaveBeenCalledTimes(1)
+    expect(listAgents.mock.calls[0][0]).toMatchObject({ sessionId: names[0], limit: 40, offset: 0 })
+    expect(api.getSession).not.toHaveBeenCalled()
+    expect(api.getTerminalStatus).not.toHaveBeenCalled()
   })
 
-  it('keeps a successful empty Home visit empty and does not auto-open a later session', async () => {
-    useStore.setState({ sessions: [], connected: true })
-    vi.spyOn(api, 'getSession').mockImplementation(async name => ({
-      session: session(name),
-      terminals: [terminal(`terminal-${name}`, name)],
-    }) as never)
+  it('renders a successful empty durable snapshot without inventing a live session', async () => {
+    vi.spyOn(api, 'listSessionSummaries').mockResolvedValue(page([]))
+    const listAgents = vi.spyOn(api, 'listAgentSummaries').mockResolvedValue(agentPage([]))
 
     render(<DashboardHome onNavigate={() => {}} />)
-    expect(await screen.findByText('No active sessions.')).toBeInTheDocument()
 
-    act(() => useStore.setState({ sessions: [session('session-later')] }))
-    expect(await screen.findByRole('button', { name: 'Expand session-later' })).toHaveAttribute('aria-expanded', 'false')
-    expect(screen.queryByTestId('agent-detail-card-terminal-session-later')).not.toBeInTheDocument()
+    expect(await screen.findByText('No matching sessions.')).toBeInTheDocument()
+    expect(listAgents).not.toHaveBeenCalled()
   })
 
-  it('rerenders polling status changes without remounting unchanged expanded cards and retains owner collapse state through filtering', async () => {
-    const first = terminal('terminal-1')
-    const second = terminal('terminal-2')
-    useStore.setState({ sessions: [session('session-0')] })
-    vi.spyOn(api, 'getSession').mockResolvedValue({ session: session('session-0'), terminals: [first, second] })
+  it('bounds a 100 x 20 history snapshot and fetches agents only for an expanded session', async () => {
+    const sessions = Array.from({ length: 100 }, (_, index) => session(`session-${index}`, 20))
+    const listSessions = vi.spyOn(api, 'listSessionSummaries').mockImplementation(async params => {
+      const resolved = params || {}
+      return page(sessions, resolved.limit, resolved.offset)
+    })
+    const listAgents = vi.spyOn(api, 'listAgentSummaries').mockImplementation(async params => {
+      const resolved = params || {}
+      const sessionId = resolved.sessionId || 'session-0'
+      const agents = Array.from({ length: 20 }, (_, index) => agent(`terminal-${sessionId}-${index}`, sessionId))
+      return agentPage(agents, resolved.limit, resolved.offset)
+    })
 
     render(<DashboardHome onNavigate={() => {}} />)
-    const card = await screen.findByTestId('agent-detail-card-terminal-1')
-    fireEvent.click(screen.getAllByRole('button', { name: 'Collapse session-0' })[0])
-    expect(screen.queryByTestId('agent-detail-card-terminal-1')).not.toBeInTheDocument()
 
-    act(() => useStore.getState().setTerminalStatuses({ 'terminal-1': 'Processing' }))
-    expect(screen.getByRole('button', { name: 'Expand session-0' })).toBeInTheDocument()
-    const filter = screen.getByPlaceholderText('Filter sessions...')
-    fireEvent.change(filter, { target: { value: 'no-match' } })
-    expect(screen.getByText('No active sessions.')).toBeInTheDocument()
-    fireEvent.change(filter, { target: { value: '' } })
-    expect(screen.getByRole('button', { name: 'Expand session-0' })).toBeInTheDocument()
+    expect(await screen.findByTestId('home-session-session-9')).toBeInTheDocument()
+    expect(screen.queryByTestId('home-session-session-10')).not.toBeInTheDocument()
+    expect(listSessions).toHaveBeenCalledTimes(1)
+    expect(listAgents).not.toHaveBeenCalled()
 
-    fireEvent.click(screen.getAllByRole('button', { name: 'Expand session-0' })[0])
-    const reopened = await screen.findByTestId('agent-detail-card-terminal-1')
-    act(() => useStore.getState().setTerminalStatuses({ 'terminal-1': 'Ready' }))
-    expect(screen.getByTestId('agent-detail-card-terminal-1')).toBe(reopened)
-    expect(card).not.toBe(reopened)
-  }, 15000)
-
-  it('initially mounts only the first session detail subtree for a 100 x 20 fixture', async () => {
-    const sessions = Array.from({ length: 100 }, (_, index) => session(`session-${index}`))
-    const details = new Map(sessions.map((item, index) => [item.name, Array.from({ length: 20 }, (_, terminalIndex) => terminal(`terminal-${index}-${terminalIndex}`, item.name))]))
-    useStore.setState({ sessions })
-    vi.spyOn(api, 'getSession').mockImplementation(async name => ({ session: session(name), terminals: details.get(name) || [] }) as never)
-
-    render(<DashboardHome onNavigate={() => {}} />)
-    await screen.findByTestId('agent-detail-card-terminal-0-19')
+    fireEvent.click(screen.getByRole('button', { name: 'Expand session-0' }))
+    expect(await screen.findByTestId('agent-detail-card-terminal-session-0-19')).toBeInTheDocument()
     expect(screen.getAllByTestId(/agent-detail-card-/)).toHaveLength(20)
-    expect(screen.queryByTestId('agent-detail-card-terminal-1-0')).not.toBeInTheDocument()
+    expect(listAgents).toHaveBeenCalledTimes(1)
+    expect(api.getSession).not.toHaveBeenCalled()
+    expect(api.getTerminalStatus).not.toHaveBeenCalled()
 
-    const stableCard = screen.getByTestId('agent-detail-card-terminal-0-0')
-    act(() => useStore.getState().setTerminalStatuses({ 'terminal-0-0': 'Processing' }))
-    expect(screen.getByTestId('agent-detail-card-terminal-0-0')).toBe(stableCard)
-
-    fireEvent.change(screen.getByPlaceholderText('Filter sessions...'), { target: { value: 'session-1' } })
-    fireEvent.click(screen.getAllByRole('button', { name: 'Expand session-1' })[0])
-    await screen.findByTestId('agent-detail-card-terminal-1-19')
-    expect(screen.getAllByTestId(/agent-detail-card-/)).toHaveLength(20)
-  }, 15000)
+    fireEvent.click(screen.getByRole('button', { name: 'Expand session-1' }))
+    expect(await screen.findByTestId('agent-detail-card-terminal-session-1-19')).toBeInTheDocument()
+    expect(screen.queryByTestId('agent-detail-card-terminal-session-0-0')).not.toBeInTheDocument()
+    expect(listAgents).toHaveBeenCalledTimes(2)
+    expect(screen.getAllByTestId('session-agent-container')).toHaveLength(1)
+  })
 })
 
-describe('Agents polling stability', () => {
-  it('commits a batched status response once and ignores a late response from a replaced detail', async () => {
-    let resolveOlder!: (value: ReturnType<typeof status>) => void
-    const older = new Promise<ReturnType<typeof status>>(resolve => { resolveOlder = resolve })
-    useStore.setState({
-      sessions: [session('session-0'), session('session-1')],
-      activeSession: 'session-0',
-      activeSessionDetail: { session: session('session-0'), terminals: [terminal('old-terminal')] },
+describe('Agents batched read-model stability', () => {
+  it('ignores a late response from a replaced session and preserves the newer snapshot', async () => {
+    const sessions = [session('session-0'), session('session-1')]
+    vi.spyOn(api, 'listSessionSummaries').mockResolvedValue(page(sessions))
+    let resolveOlder!: (value: AgentSummaryPage) => void
+    const older = new Promise<AgentSummaryPage>(resolve => { resolveOlder = resolve })
+    let olderSignal: AbortSignal | undefined
+    vi.spyOn(api, 'listAgentSummaries').mockImplementation((params, signal) => {
+      if (params?.sessionId === 'session-0') {
+        olderSignal = signal
+        return older
+      }
+      return Promise.resolve(agentPage([agent('new-terminal', 'session-1')]))
     })
-    vi.spyOn(api, 'getTerminalStatus').mockImplementation(id => id === 'old-terminal' ? older as never : Promise.resolve(status(id)) as never)
-    const commits: Record<string, string>[] = []
-    const unsubscribe = useStore.subscribe(next => commits.push(next.terminalStatuses))
-    const view = render(<AgentPanel />)
 
-    await waitFor(() => expect(api.getTerminalStatus).toHaveBeenCalledWith('old-terminal'))
-    act(() => useStore.setState({ activeSession: 'session-1', activeSessionDetail: { session: session('session-1'), terminals: [terminal('new-terminal', 'session-1')] } }))
-    await waitFor(() => expect(api.getTerminalStatus).toHaveBeenCalledWith('new-terminal'))
-    await act(async () => resolveOlder(status('old-terminal', 'completed')))
-    await waitFor(() => expect(useStore.getState().terminalStatuses['new-terminal']).toBe('WORKFLOW_ACTIVE::Ready'))
-    expect(useStore.getState().terminalStatuses['old-terminal']).toBeUndefined()
-    expect(commits.filter(value => value['new-terminal'] === 'WORKFLOW_ACTIVE::Ready')).toHaveLength(1)
-    unsubscribe()
-    view.unmount()
+    render(<AgentPanel />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand session-0' }))
+    await waitFor(() => expect(api.listAgentSummaries).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 'session-0' }), expect.any(AbortSignal),
+    ))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Expand session-1' }))
+    expect(await screen.findByTestId('agent-detail-card-new-terminal')).toBeInTheDocument()
+    expect(olderSignal?.aborted).toBe(true)
+
+    await act(async () => resolveOlder(agentPage([agent('old-terminal', 'session-0')])))
+    expect(screen.queryByTestId('agent-detail-card-old-terminal')).not.toBeInTheDocument()
+    expect(screen.getByTestId('agent-detail-card-new-terminal')).toBeInTheDocument()
+    expect(api.getSession).not.toHaveBeenCalled()
+    expect(api.getTerminalStatus).not.toHaveBeenCalled()
   })
 })

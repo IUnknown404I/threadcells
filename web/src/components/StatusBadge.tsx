@@ -58,6 +58,24 @@ const STATUS_CONFIG: Record<string, StatusStyle> = {
     bgClass: 'bg-amber-400/10',
     textClass: 'text-amber-400',
   },
+  READY: {
+    label: 'Ready',
+    dotClass: 'bg-emerald-400',
+    bgClass: 'bg-emerald-400/10',
+    textClass: 'text-emerald-400',
+  },
+  EXITED: {
+    label: 'Exited',
+    dotClass: 'bg-purple-400',
+    bgClass: 'bg-purple-400/10',
+    textClass: 'text-purple-400',
+  },
+  WORKFLOW_UNTRACKED: {
+    label: 'Untracked',
+    dotClass: 'bg-gray-400',
+    bgClass: 'bg-gray-400/10',
+    textClass: 'text-gray-400',
+  },
   COMPLETED: {
     label: 'Provider Ready',
     dotClass: 'bg-purple-400',

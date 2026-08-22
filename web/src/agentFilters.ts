@@ -26,9 +26,9 @@ export const DEFAULT_AGENT_FILTER_STATE: AgentFilterState = {
 export const HOME_FILTER_LABELS: Record<HomeAgentFilter, string> = {
   all: 'All agents',
   active: 'Active agents',
-  waiting: 'Waiting',
+  waiting: 'Ready / waiting',
   owner_gate: 'Needs attention',
-  cancelled: 'Force-terminated',
+  cancelled: 'Cancelled',
   completed: 'Completed',
 }
 
@@ -73,7 +73,10 @@ export function matchesHomeAgentFilter(terminal: AgentStatusLike, filter: HomeAg
     case 'waiting':
       // This is the former Home `WORKFLOW_*::Ready` badge predicate, expressed
       // against the same raw values so it can also drive the Agents projection.
-      return Boolean(terminal.workflow_state) && terminal.lifecycle !== 'exited' && terminal.status !== 'processing'
+      return Boolean(terminal.workflow_state)
+        && !['owner_gate', 'cancelled', 'completed'].includes(terminal.workflow_state || '')
+        && terminal.lifecycle !== 'exited'
+        && terminal.status !== 'processing'
     case 'owner_gate':
     case 'cancelled':
     case 'completed':

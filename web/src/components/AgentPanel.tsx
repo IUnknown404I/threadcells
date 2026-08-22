@@ -1,19 +1,20 @@
-import { useState, useEffect, useRef } from 'react'
+import { lazy, Suspense, useState, useEffect, useRef } from 'react'
 import { useStore } from '../store'
-import { api, AgentProfileInfo, OwnerLaunchGrant, Project, ProviderInfo, Session, Terminal } from '../api'
+import { AgentSummary, AgentProfileInfo, OwnerLaunchGrant, Project, ProviderInfo, Session, SessionSummary, TerminalMeta, api } from '../api'
 import { Bot, Play, Trash2, ChevronRight, Terminal as TermIcon, Monitor, Package, FolderOpen, Search, Mail, Plus, LogOut, FileText, X, LoaderCircle, ShieldAlert } from 'lucide-react'
-import { TerminalView } from './TerminalView'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
 import { CustomSelect, SelectOption } from './CustomSelect'
-import { TerminalMeta } from '../api'
 import { StatusBadge, lifecycleBadgeStatus } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
 import { ProfilePicker } from './ProfilePicker'
 import { ProjectPicker } from './ProjectPicker'
-import { AgentViewMode, AgentFilterState, HOME_FILTER_LABELS, applyAgentFilterState, matchesStatusFilters, parseAgentFilterState } from '../agentFilters'
+import { AgentViewMode, AgentFilterState, HOME_FILTER_LABELS, applyAgentFilterState, parseAgentFilterState } from '../agentFilters'
 import { sessionDisplayName } from '../sessionDisplayName'
 import { providerIsAvailable, providerSelectOption } from '../providerAvailability'
+import { useAgentSummaryFeed, useNearViewport, useSessionSummaryFeed } from '../uiReadModels'
+
+const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })))
 
 const FALLBACK_PROVIDERS = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'kimi_cli', 'copilot_cli']
 
@@ -46,61 +47,45 @@ function XHighAuthorizationBlock({ confirmed, operatorSecret, onConfirmedChange,
   onConfirmedChange: (confirmed: boolean) => void
   onOperatorSecretChange: (secret: string) => void
 }) {
-  return (
-    <div role="alert" className="rounded-lg border border-amber-500/50 bg-amber-950/30 p-3 text-sm text-amber-100">
-      <div className="flex items-start gap-2">
-        <ShieldAlert size={18} className="mt-0.5 shrink-0 text-amber-300" aria-hidden="true" />
-        <div>
-          <p className="font-semibold">Exceptional XHigh owner-executor</p>
-          <p className="mt-1 text-xs text-amber-200/80">Highest-capability, high-cost profile for direct critical architecture and implementation. This authorization applies only to this one launch.</p>
-        </div>
-      </div>
-      <label className="mt-3 flex min-h-11 items-center gap-2 text-xs">
-        <input aria-label="Confirm exceptional XHigh launch" type="checkbox" checked={confirmed} onChange={event => onConfirmedChange(event.target.checked)} />
-        I explicitly authorize this XHigh owner launch
-      </label>
-      <label className="mt-2 block text-xs text-amber-200/80">Operator secret
-        <input aria-label="Operator secret" type="password" autoComplete="current-password" value={operatorSecret} onChange={event => onOperatorSecretChange(event.target.value)} className="mt-1 min-h-11 w-full rounded-lg border border-amber-700/60 bg-gray-950 px-3 text-sm text-gray-100 focus:border-amber-400 focus:outline-none" />
-      </label>
-    </div>
-  )
+  return <div role="alert" className="rounded-lg border border-amber-500/50 bg-amber-950/30 p-3 text-sm text-amber-100">
+    <div className="flex items-start gap-2"><ShieldAlert size={18} className="mt-0.5 shrink-0 text-amber-300"/><div><p className="font-semibold">Exceptional XHigh owner-executor</p><p className="mt-1 text-xs text-amber-200/80">Highest-capability profile for direct critical work. This authorization applies only to this one launch.</p></div></div>
+    <label className="mt-3 flex min-h-11 items-center gap-2 text-xs"><input aria-label="Confirm exceptional XHigh launch" type="checkbox" checked={confirmed} onChange={event => onConfirmedChange(event.target.checked)}/>I explicitly authorize this XHigh owner launch</label>
+    <label className="mt-2 block text-xs text-amber-200/80">Operator secret<input aria-label="Operator secret" type="password" autoComplete="current-password" value={operatorSecret} onChange={event => onOperatorSecretChange(event.target.value)} className="mt-1 min-h-11 w-full rounded-lg border border-amber-700/60 bg-gray-950 px-3 text-sm text-gray-100 focus:border-amber-400 focus:outline-none"/></label>
+  </div>
 }
 
-function authorizeOwnerLaunch({ selectedProfile, provider, workingDirectory, requestedSessionName, projectId, launchMode, confirmed, operatorSecret }: {
+function authorizeOwnerLaunch({ selectedProfile, provider, workingDirectory, requestedSessionName, projectId, confirmed, operatorSecret }: {
   selectedProfile: AgentProfileInfo | undefined
   provider: string
   workingDirectory?: string
   requestedSessionName?: string
   projectId?: string
-  launchMode: 'new_session' | 'existing_session'
   confirmed: boolean
   operatorSecret: string
 }): Promise<OwnerLaunchGrant> | undefined {
   if (!selectedProfile?.owner_authorization_required) return undefined
   if (!confirmed || !operatorSecret) throw new Error(XHIGH_AUTHORIZATION_ERROR)
   return api.createOperatorSession(operatorSecret).then(() => api.createXHighGrant({
-      agent_profile: selectedProfile.name,
-      provider,
-      working_directory: workingDirectory,
-      requested_session_name: requestedSessionName,
-      project_id: projectId,
-      launch_mode: launchMode,
-      confirmed: true,
-    }))
-}
-
-interface AgentProjection {
-  session: Session
-  terminal: TerminalMeta
-  status: Terminal | null
+    agent_profile: selectedProfile.name,
+    provider,
+    working_directory: workingDirectory,
+    requested_session_name: requestedSessionName,
+    project_id: projectId,
+    launch_mode: 'existing_session',
+    confirmed: true,
+  }))
 }
 
 function toggleFilter(values: string[], value: string): string[] {
   return values.includes(value) ? values.filter(item => item !== value) : [...values, value]
 }
 
-function terminalBadgeStatus(status: Terminal | null): string | null {
-  return status ? lifecycleBadgeStatus(status.workflow_state, status.status, status.lifecycle, status.execution_state) : null
+function terminalBadgeStatus(status: AgentSummary | null): string | null {
+  return status ? lifecycleBadgeStatus(status.workflow_state, status.activity, status.lifecycle, status.execution_state) : null
+}
+
+function toTerminalMeta(agent: AgentSummary): TerminalMeta {
+  return { id: agent.id, tmux_session: agent.session_name, tmux_window: agent.name, provider: agent.provider, agent_profile: agent.agent_profile, last_active: agent.last_active, project_id: agent.projectId, project_name: agent.project_name, project_path: agent.project_path }
 }
 
 export function AgentPanel({
@@ -112,7 +97,8 @@ export function AgentPanel({
   navigationIntent?: 'create-session' | null
   onNavigationIntentConsumed?: () => void
 }) {
-  const { sessions, fetchSessions, activeSession, activeSessionDetail, selectSession, createSession, deleteSession, terminalStatuses, setTerminalStatuses } = useStore()
+  const { createSession, deleteSession, showSnackbar } = useStore()
+  const [activeSession, setActiveSession] = useState<string | null>(null)
   const [provider, setProvider] = useState('codex')
   const [profile, setProfile] = useState('')
   const [creating, setCreating] = useState(false)
@@ -145,11 +131,8 @@ export function AgentPanel({
   const [workflowStatusFilters, setWorkflowStatusFilters] = useState<string[]>(initialFilters.workflowStates)
   const [profileFilters, setProfileFilters] = useState<string[]>(initialFilters.profiles)
   const [homeFilter, setHomeFilter] = useState(initialFilters.homeFilter)
-  const [agentProjection, setAgentProjection] = useState<AgentProjection[]>([])
-  const [loadingProjection, setLoadingProjection] = useState(false)
   const [inboxTerminalId, setInboxTerminalId] = useState<string | null>(null)
   const [projectId, setProjectId] = useState('')
-  const [terminalWorkDirs, setTerminalWorkDirs] = useState<Record<string, string | null>>({})
   const [sessionRootWorkDir, setSessionRootWorkDir] = useState<string | null>(null)
   const [showAddAgent, setShowAddAgent] = useState(false)
   const [addProvider, setAddProvider] = useState('codex')
@@ -161,7 +144,6 @@ export function AgentPanel({
   const [addingAgent, setAddingAgent] = useState(false)
   const [pendingExit, setPendingExit] = useState<TerminalMeta | null>(null)
   const [exitingTerminal, setExitingTerminal] = useState<string | null>(null)
-  const { showSnackbar } = useStore()
   const [outputTerminalId, setOutputTerminalId] = useState<string | null>(null)
   const [showSpawnModal, setShowSpawnModal] = useState(false)
   const [sessionName, setSessionName] = useState('')
@@ -169,6 +151,21 @@ export function AgentPanel({
   const [ownerConfirmed, setOwnerConfirmed] = useState(false)
   const [operatorSecret, setOperatorSecret] = useState('')
   const consumedNavigationIntent = useRef<'create-session' | null>(null)
+  const sessionFeed = useSessionSummaryFeed(sessionSearch, agentViewMode === 'sessions')
+  const activeSessionName = sessionFeed.items.find(session => session.id === activeSession)?.name || null
+  const activeSessionFeed = useAgentSummaryFeed(
+    { sessionId: activeSession || undefined },
+    agentViewMode === 'sessions' && activeSession !== null,
+  )
+  const filteredAgentFeed = useAgentSummaryFeed({
+    activities: providerStatusFilters,
+    workflowStates: workflowStatusFilters,
+    profiles: profileFilters,
+    homeFilter,
+  }, agentViewMode !== 'sessions')
+  const sessionSentinelRef = useNearViewport(sessionFeed.loadMore, sessionFeed.nextOffset !== null && !sessionFeed.loading)
+  const activeAgentSentinelRef = useNearViewport(activeSessionFeed.loadMore, activeSessionFeed.nextOffset !== null && !activeSessionFeed.loading)
+  const filteredAgentSentinelRef = useNearViewport(filteredAgentFeed.loadMore, filteredAgentFeed.nextOffset !== null && !filteredAgentFeed.loading)
 
   useEffect(() => {
     const filters = parseAgentFilterState(navigationSearch)
@@ -205,7 +202,9 @@ export function AgentPanel({
     try {
       await api.deleteTerminal(id)
       if (liveTerminal?.id === id) setLiveTerminal(null)
-      if (activeSession) await selectSession(activeSession)
+      activeSessionFeed.reload()
+      filteredAgentFeed.reload()
+      sessionFeed.reload()
       showSnackbar({ type: 'success', message: `Terminal ${id} closed — tmux window killed` })
     } catch (error: any) {
       showSnackbar({ type: 'error', message: error.message || `Failed to close terminal ${id}` })
@@ -220,7 +219,10 @@ export function AgentPanel({
     const id = pendingDeleteSession.id
     setDeletingSession(id)
     try {
-      await deleteSession(id)
+      await deleteSession(pendingDeleteSession.name)
+      if (activeSession === id) setActiveSession(null)
+      sessionFeed.reload()
+      filteredAgentFeed.reload()
       setPendingDeleteSession(null)
     } finally {
       deletingSessionRef.current = false
@@ -238,7 +240,9 @@ export function AgentPanel({
         showSnackbar({ type: 'error', message: result.message })
         return
       }
-      if (activeSession) await selectSession(activeSession)
+      activeSessionFeed.reload()
+      filteredAgentFeed.reload()
+      sessionFeed.reload()
       showSnackbar({ type: 'success', message: result.message })
       setPendingExit(null)
     } catch (error: any) {
@@ -256,75 +260,6 @@ export function AgentPanel({
 
   useEffect(() => { api.listProjects().then(setProjects).catch(() => setProjects([])) }, [])
 
-  useEffect(() => {
-    if (activeSession) {
-      selectSession(activeSession)
-      const interval = setInterval(() => selectSession(activeSession), 5000)
-      return () => clearInterval(interval)
-    }
-  }, [activeSession])
-
-  // Poll terminal statuses for visible terminals in the session detail
-  useEffect(() => {
-    if (!activeSessionDetail?.terminals.length) return
-    const terminalIds = activeSessionDetail.terminals.map(t => t.id)
-    let inFlight = false
-    let cancelled = false
-    const fetchStatuses = async () => {
-      if (inFlight) return
-      inFlight = true
-      const terminals = await Promise.all(terminalIds.map(id => api.getTerminalStatus(id).catch(() => null)))
-      if (!cancelled) {
-        setTerminalStatuses(Object.fromEntries(terminals.filter(terminal => Boolean(terminal?.status)).map(terminal => [terminal!.id, lifecycleBadgeStatus(terminal!.workflow_state, terminal!.status, terminal!.lifecycle, terminal!.execution_state)])))
-      }
-      inFlight = false
-    }
-    fetchStatuses()
-    const interval = setInterval(fetchStatuses, 3000)
-    return () => {
-      cancelled = true
-      clearInterval(interval)
-    }
-  }, [activeSessionDetail?.terminals.map(t => t.id).join(',')])
-
-  // Statuses and Profiles are deliberately client-side projections. The API has
-  // no search endpoint, so load the existing session details and their terminal
-  // lifecycle metadata only while one of those views is active.
-  useEffect(() => {
-    if (agentViewMode === 'sessions') return
-    let cancelled = false
-    let inFlight = false
-    const loadProjection = async () => {
-      if (inFlight) return
-      inFlight = true
-      setLoadingProjection(true)
-      const details = await Promise.all(sessions.map(async session => {
-        try {
-          const detail = await api.getSession(session.name)
-          const terminals = await Promise.all(detail.terminals.map(async terminal => ({
-            session,
-            terminal,
-            status: await api.getTerminalStatus(terminal.id).catch(() => null),
-          })))
-          return terminals
-        } catch {
-          return [] as AgentProjection[]
-        }
-      }))
-      if (!cancelled) {
-        setAgentProjection(details.flat())
-        setLoadingProjection(false)
-      }
-      inFlight = false
-    }
-    loadProjection()
-    const interval = setInterval(loadProjection, 5000)
-    return () => {
-      cancelled = true
-      clearInterval(interval)
-    }
-  }, [agentViewMode, sessions.map(session => `${session.id}:${session.name}`).join('|')])
-
   const handleCreate = async () => {
     if (!profile.trim() || creatingRef.current) return
     creatingRef.current = true
@@ -333,16 +268,21 @@ export function AgentPanel({
     try {
       const selectedSessionName = sessionName.trim().replace(/\./g, '_') || undefined
       const selectedProfile = profiles.find(item => item.name === profile.trim())
-      const ownerAuthorization = authorizeOwnerLaunch({
-        selectedProfile,
-        provider,
-        requestedSessionName: selectedSessionName,
-        projectId: projectId || undefined,
-        launchMode: 'new_session',
-        confirmed: ownerConfirmed,
-        operatorSecret,
-      })
-      const ownerGrant = ownerAuthorization ? await ownerAuthorization : undefined
+      let ownerGrant
+      if (selectedProfile?.owner_authorization_required) {
+        if (!ownerConfirmed || !operatorSecret) {
+          throw new Error('Confirm the exceptional XHigh launch and authenticate as operator.')
+        }
+        await api.createOperatorSession(operatorSecret)
+        ownerGrant = await api.createXHighGrant({
+          agent_profile: profile.trim(),
+          provider,
+          requested_session_name: selectedSessionName,
+          project_id: projectId || undefined,
+          launch_mode: 'new_session',
+          confirmed: true,
+        })
+      }
       if (ownerGrant) {
         await createSession(provider, profile.trim(), selectedSessionName, undefined, projectId, ownerGrant)
       } else if (projectId) {
@@ -355,6 +295,7 @@ export function AgentPanel({
       setSessionName('')
       setOwnerConfirmed(false)
       setOperatorSecret('')
+      sessionFeed.reload()
     } catch (e: any) {
       setSpawnError(e.message || 'Failed to create session')
     } finally {
@@ -390,10 +331,10 @@ export function AgentPanel({
   }
 
   const currentSessionWorkingDirectory = sessionRootWorkDir || ''
-  const selectedAddProject = projects.find(project => project.projectId === addProjectId)
   const selectedAddProfile = profiles.find(item => item.name === addProfile.trim())
-  const privilegedAdd = selectedAddProfile?.owner_authorization_required === true
+  const selectedAddProject = projects.find(item => item.projectId === addProjectId)
   const resolvedAddWorkingDirectory = selectedAddProject?.path || currentSessionWorkingDirectory
+  const privilegedAdd = selectedAddProfile?.owner_authorization_required === true
 
   const resetAddAuthorization = () => {
     setAddOwnerConfirmed(false)
@@ -412,67 +353,48 @@ export function AgentPanel({
     setShowAddAgent(true)
   }
 
-  const closeAddAgent = () => {
-    setShowAddAgent(false)
-    setAddProfile('')
-    setAddProjectId('')
-    resetAddAuthorization()
-  }
-
-  const changeAddProfile = (nextProfile: string) => {
-    setAddProfile(nextProfile)
-    resetAddAuthorization()
-  }
-
-  // Fetch working directories for terminals in session detail
   useEffect(() => {
-    if (!activeSessionDetail?.terminals.length) return
-    activeSessionDetail.terminals.forEach(t => {
-      if (terminalWorkDirs[t.id] === undefined) {
-        api.getWorkingDirectory(t.id)
-          .then(res => setTerminalWorkDirs(prev => ({ ...prev, [t.id]: res.working_directory })))
-          .catch(() => setTerminalWorkDirs(prev => ({ ...prev, [t.id]: null })))
-      }
-    })
-  }, [activeSessionDetail?.terminals.map(t => t.id).join(',')])
-
-  useEffect(() => {
-    if (!activeSession) {
+    if (!showAddAgent || !activeSessionName) {
       setSessionRootWorkDir(null)
       return
     }
+    let disposed = false
     setSessionRootWorkDir(null)
-    api.getSessionWorkingDirectory(activeSession)
-      .then(result => setSessionRootWorkDir(result.working_directory))
-      .catch(() => setSessionRootWorkDir(null))
-  }, [activeSession])
+    api.getSessionWorkingDirectory(activeSessionName)
+      .then(result => { if (!disposed) setSessionRootWorkDir(result.working_directory) })
+      .catch(() => { if (!disposed) setSessionRootWorkDir(null) })
+    return () => { disposed = true }
+  }, [showAddAgent, activeSessionName])
 
   const handleAddAgent = async () => {
-    if (!addProfile.trim() || !activeSession) return
-    setAddError(null)
+    if (!addProfile.trim() || !activeSessionName) return
     setAddingAgent(true)
+    setAddError(null)
     try {
-      const ownerAuthorization = authorizeOwnerLaunch({
+      const authorization = authorizeOwnerLaunch({
         selectedProfile: selectedAddProfile,
         provider: addProvider,
         workingDirectory: resolvedAddWorkingDirectory || undefined,
-        requestedSessionName: activeSession,
+        requestedSessionName: activeSessionName,
         projectId: addProjectId || undefined,
-        launchMode: 'existing_session',
         confirmed: addOwnerConfirmed,
         operatorSecret: addOperatorSecret,
       })
-      const ownerGrant = ownerAuthorization ? await ownerAuthorization : undefined
+      const ownerGrant = authorization ? await authorization : undefined
       if (ownerGrant) {
-        await api.addTerminalToSession(activeSession, addProvider, addProfile.trim(), resolvedAddWorkingDirectory || undefined, addProjectId || undefined, ownerGrant)
+        await api.addTerminalToSession(activeSessionName, addProvider, addProfile.trim(), resolvedAddWorkingDirectory || undefined, addProjectId || undefined, ownerGrant)
       } else if (addProjectId) {
-        await api.addTerminalToSession(activeSession, addProvider, addProfile.trim(), resolvedAddWorkingDirectory || undefined, addProjectId)
+        await api.addTerminalToSession(activeSessionName, addProvider, addProfile.trim(), resolvedAddWorkingDirectory || undefined, addProjectId)
       } else {
-        await api.addTerminalToSession(activeSession, addProvider, addProfile.trim(), resolvedAddWorkingDirectory || undefined)
+        await api.addTerminalToSession(activeSessionName, addProvider, addProfile.trim(), resolvedAddWorkingDirectory || undefined)
       }
       showSnackbar({ type: 'success', message: 'Agent added to session' })
-      closeAddAgent()
-      if (activeSession) await selectSession(activeSession)
+      setShowAddAgent(false)
+      setAddProfile('')
+      resetAddAuthorization()
+      activeSessionFeed.reload()
+      filteredAgentFeed.reload()
+      sessionFeed.reload()
     } catch (e: any) {
       const message = e.message || 'Failed to add agent'
       setAddError(message)
@@ -489,20 +411,11 @@ export function AgentPanel({
     return acc
   }, {})
 
-  const providerStatusChoices = Array.from(new Set(agentProjection.flatMap(item => item.status?.status ? [item.status.status] : []))).sort()
-  const workflowStatusChoices = Array.from(new Set(agentProjection.flatMap(item => item.status?.workflow_state ? [item.status.workflow_state] : []))).sort()
-  const canonicalProfileNames = profiles.map(item => item.name)
-  const totalProjectedAgents = agentProjection.length
-  const matchingAgents = agentProjection.filter(item => {
-    if (agentViewMode === 'statuses') {
-      return Boolean(item.status && matchesStatusFilters(item.status, { providerStatuses: providerStatusFilters, workflowStates: workflowStatusFilters, homeFilter }))
-    }
-    if (agentViewMode === 'profiles') {
-      return profileFilters.length === 0 || (item.terminal.agent_profile !== null && profileFilters.includes(item.terminal.agent_profile))
-    }
-    return false
-  })
-  const matchingSessionIds = new Set(matchingAgents.map(item => item.session.id))
+  const providerStatusChoices = filteredAgentFeed.latestPage?.facets.activities || []
+  const workflowStatusChoices = filteredAgentFeed.latestPage?.facets.workflow_states || []
+  const canonicalProfileNames = filteredAgentFeed.latestPage?.facets.profiles || profiles.map(item => item.name)
+  const matchingAgents = filteredAgentFeed.items
+  const matchingSessionIds = Array.from(new Set(matchingAgents.map(item => item.session_id)))
   const hasActiveFilters = agentViewMode === 'statuses'
     ? providerStatusFilters.length > 0 || workflowStatusFilters.length > 0 || homeFilter !== null
     : profileFilters.length > 0
@@ -519,13 +432,13 @@ export function AgentPanel({
     }
   }
 
-  const renderAgentCard = (terminal: TerminalMeta, status: Terminal | null = null, sessionName?: string) => (
+  const renderAgentCard = (terminal: AgentSummary, sessionName?: string) => (
     <div key={terminal.id} data-testid={`agent-detail-card-${terminal.id}`} className="bg-gray-900/50 border border-gray-700/30 rounded-lg p-3 space-y-2">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 min-w-0">
           <TermIcon size={14} className="text-gray-400" />
           <span className="text-sm font-mono text-gray-300 truncate min-w-0 max-w-full" title={terminal.id}>{terminal.id}</span>
-          <StatusBadge status={status ? terminalBadgeStatus(status) : terminalStatuses[terminal.id] || null} />
+          <StatusBadge status={terminalBadgeStatus(terminal)} />
           <span className="text-xs text-gray-500 truncate max-w-full" title={terminal.provider}>{terminal.provider}</span>
           {terminal.agent_profile && <span className="text-xs text-emerald-400 truncate max-w-full" title={terminal.agent_profile}>{terminal.agent_profile}</span>}
           {sessionName && <span className="text-xs text-gray-600 truncate max-w-full" title={sessionDisplayName(sessionName)}>Session: {sessionDisplayName(sessionName)}</span>}
@@ -534,16 +447,16 @@ export function AgentPanel({
           <button onClick={() => setInboxTerminalId(terminal.id)} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs font-medium rounded-lg transition-colors" title="View inbox"><Mail size={14} />Inbox</button>
           <button onClick={() => openTerminal(terminal.id, terminal.provider, terminal.agent_profile)} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium rounded-lg transition-colors" title="Open live terminal"><Monitor size={14} />Open Terminal</button>
           <button onClick={() => setOutputTerminalId(terminal.id)} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs font-medium rounded-lg transition-colors" title="View output"><FileText size={14} />Output</button>
-          <button onClick={() => setPendingExit(terminal)} disabled={exitingTerminal === terminal.id} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white text-xs font-medium rounded-lg transition-colors" title="Graceful exit"><LogOut size={14} />{exitingTerminal === terminal.id ? 'Exiting...' : 'Graceful Exit'}</button>
-          <button onClick={() => setPendingClose(terminal)} disabled={closingTerminal === terminal.id} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-red-600 hover:bg-red-500 disabled:opacity-40 text-white text-xs font-medium rounded-lg transition-colors" title="Close terminal"><Trash2 size={14} />{closingTerminal === terminal.id ? 'Closing...' : 'Close'}</button>
+          <button onClick={() => setPendingExit(toTerminalMeta(terminal))} disabled={exitingTerminal === terminal.id || terminal.lifecycle === 'exited'} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white text-xs font-medium rounded-lg transition-colors" title="Graceful exit"><LogOut size={14} />{exitingTerminal === terminal.id ? 'Exiting...' : 'Graceful Exit'}</button>
+          <button onClick={() => setPendingClose(toTerminalMeta(terminal))} disabled={closingTerminal === terminal.id} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-red-600 hover:bg-red-500 disabled:opacity-40 text-white text-xs font-medium rounded-lg transition-colors" title="Close terminal"><Trash2 size={14} />{closingTerminal === terminal.id ? 'Closing...' : 'Close'}</button>
         </div>
       </div>
-      {terminalWorkDirs[terminal.id] && <div className="flex items-center gap-1.5" title={terminalWorkDirs[terminal.id]!}><FolderOpen size={12} className="text-gray-600 shrink-0" /><span className="text-xs font-mono text-gray-500 truncate max-w-[400px]">{terminalWorkDirs[terminal.id]}</span></div>}
+      {terminal.launch_worktree && <div className="flex items-center gap-1.5" title={terminal.launch_worktree}><FolderOpen size={12} className="text-gray-600 shrink-0" /><span className="text-xs font-mono text-gray-500 truncate max-w-[400px]">{terminal.launch_worktree}</span></div>}
       <button onClick={() => openTerminal(terminal.id, terminal.provider, terminal.agent_profile)} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">Open Workflow Composer</button>
     </div>
   )
 
-  const renderSessionDetail = (session: Session) => (
+  const renderSessionDetail = (session: SessionSummary) => (
     <div
       id={`session-detail-${session.id}`}
       data-testid={`agent-session-detail-${session.id}`}
@@ -554,7 +467,7 @@ export function AgentPanel({
           Terminals in {sessionDisplayName(session.name)}
         </h3>
         <button
-          onClick={showAddAgent ? closeAddAgent : openAddAgent}
+          onClick={showAddAgent ? () => setShowAddAgent(false) : openAddAgent}
           className="min-h-11 self-start sm:self-auto flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-400 hover:text-emerald-400 bg-gray-900/50 hover:bg-gray-900 border border-gray-700/50 hover:border-emerald-700/50 rounded-lg transition-colors"
           title="Add another agent to this session so they can collaborate"
         >
@@ -584,14 +497,14 @@ export function AgentPanel({
               {profiles.length > 0 ? (
                 <ProfilePicker
                   value={addProfile}
-                  onChange={changeAddProfile}
+                  onChange={value => { setAddProfile(value); resetAddAuthorization() }}
                   profiles={profiles}
                 />
               ) : (
                 <input
                   type="text"
                   value={addProfile}
-                  onChange={e => changeAddProfile(e.target.value)}
+                  onChange={e => { setAddProfile(e.target.value); resetAddAuthorization() }}
                   placeholder="e.g. developer, reviewer"
                   className="w-full bg-gray-900 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 focus:border-emerald-500 focus:outline-none"
                 />
@@ -600,7 +513,6 @@ export function AgentPanel({
             <button
               onClick={handleAddAgent}
               disabled={!addProfile.trim() || addingAgent || (privilegedAdd && (!addOwnerConfirmed || !addOperatorSecret))}
-              aria-busy={addingAgent}
               className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-medium px-4 py-2 rounded-lg transition-colors"
             >
               <Plus size={14} />
@@ -608,37 +520,22 @@ export function AgentPanel({
             </button>
           </div>
           {privilegedAdd && (
-            <XHighAuthorizationBlock
-              confirmed={addOwnerConfirmed}
-              operatorSecret={addOperatorSecret}
-              onConfirmedChange={setAddOwnerConfirmed}
-              onOperatorSecretChange={setAddOperatorSecret}
-            />
+            <XHighAuthorizationBlock confirmed={addOwnerConfirmed} operatorSecret={addOperatorSecret} onConfirmedChange={setAddOwnerConfirmed} onOperatorSecretChange={setAddOperatorSecret}/>
           )}
           <div>
             <label className="block text-xs text-gray-500 mb-1">Project <span className="text-gray-600">(optional)</span></label>
             <ProjectPicker projects={projects} value={addProjectId} onChange={setAddProjectId} />
-            {resolvedAddWorkingDirectory && (
-              <p
-                data-testid="add-agent-resolved-working-directory"
-                aria-live="polite"
-                className="mt-1 min-w-0 break-all font-mono text-xs text-gray-500"
-                title={resolvedAddWorkingDirectory}
-              >
-                {resolvedAddWorkingDirectory}
-              </p>
-            )}
             {projects.length === 0 && <p aria-live="polite" className="mt-1 text-xs text-amber-400">No projects are configured. This agent will use the legacy working directory.</p>}
+            <p data-testid="add-agent-resolved-working-directory" className="mt-1 min-w-0 break-all font-mono text-xs text-gray-500">{resolvedAddWorkingDirectory || 'ThreadCells server default'}</p>
           </div>
-          {addError && (
-            <div role="alert" className="whitespace-pre-line rounded-lg border border-red-700/50 bg-red-950/40 px-3 py-2 text-sm text-red-300">
-              {addError}
-            </div>
-          )}
+          {addError && <div role="alert" className="whitespace-pre-line rounded-lg border border-red-700/50 bg-red-950/40 px-3 py-2 text-sm text-red-300">{addError}</div>}
         </div>
       )}
 
-      <div className="space-y-2">{activeSessionDetail?.terminals.map(terminal => renderAgentCard(terminal))}</div>
+      {activeSessionFeed.error && <p role="alert" className="text-xs text-red-300">Unable to refresh this session’s agent summary.</p>}
+      {activeSessionFeed.loading && activeSessionFeed.items.length === 0 ? <p className="text-sm text-gray-500">Loading agents…</p> : <div className="space-y-2">{activeSessionFeed.items.map(terminal => renderAgentCard(terminal))}</div>}
+      {activeSessionFeed.nextOffset !== null && <div ref={activeAgentSentinelRef} className="flex justify-center pt-3"><button type="button" onClick={activeSessionFeed.loadMore} disabled={activeSessionFeed.loading} className="min-h-10 rounded-lg border border-gray-700 px-4 text-xs text-gray-300 hover:border-emerald-700 disabled:opacity-40">{activeSessionFeed.loading ? 'Loading…' : `Load more agents (${activeSessionFeed.items.length} of ${activeSessionFeed.total})`}</button></div>}
+      {activeSessionFeed.limitReached && <p className="pt-3 text-center text-xs text-gray-500">Showing the 100 most recent agents in this session. Use the Status or Profile views to narrow older history.</p>}
     </div>
   )
 
@@ -664,10 +561,10 @@ export function AgentPanel({
       {agentViewMode === 'sessions' && <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl p-3 sm:p-5">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-1">
           <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">
-            Sessions ({sessions.length})
+            Sessions ({sessionFeed.total})
           </h3>
           <div className="flex flex-col sm:flex-row sm:items-center gap-2 w-full sm:w-auto">
-            {sessions.length > 3 && (
+            {(sessionFeed.total > 3 || sessionSearch) && (
               <div className="relative w-full sm:w-auto">
                 <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-500" />
                 <input
@@ -691,17 +588,17 @@ export function AgentPanel({
         <p className="text-xs text-gray-500 mb-4">
           A session is a workspace where agents collaborate. Each session can have multiple agents that communicate via messages. Click a session to see its agents.
         </p>
-        {sessions.length === 0 ? (
-          <p className="text-gray-500 text-sm">No active sessions. Create a session above to start an agent.</p>
+        {sessionFeed.error && <p role="alert" className="mb-3 text-xs text-red-300">Unable to refresh session summaries.</p>}
+        {sessionFeed.loading && sessionFeed.items.length === 0 ? (
+          <p className="text-gray-500 text-sm">Loading session summaries…</p>
+        ) : sessionFeed.items.length === 0 ? (
+          <p className="text-gray-500 text-sm">No matching sessions. Create a session above to start an agent.</p>
         ) : (
           <div className="space-y-2">
-            {sessions.filter(s => {
-              const query = sessionSearch.trim().toLowerCase()
-              return !query || s.id.toLowerCase().includes(query) || s.name.toLowerCase().includes(query) || sessionDisplayName(s.name).toLowerCase().includes(query)
-            }).map(s => {
+            {sessionFeed.items.map(s => {
               const expanded = activeSession === s.id
-              const hasDetail = expanded && activeSessionDetail?.session.id === s.id
-              const toggleSession = () => selectSession(expanded ? null : s.id)
+              const hasDetail = expanded
+              const toggleSession = () => { setActiveSession(expanded ? null : s.id); setShowAddAgent(false) }
               const displayName = sessionDisplayName(s.name)
               return (
                 <div
@@ -747,6 +644,8 @@ export function AgentPanel({
                 </div>
               )
             })}
+            {sessionFeed.nextOffset !== null && <div ref={sessionSentinelRef} className="flex justify-center pt-3"><button type="button" onClick={sessionFeed.loadMore} disabled={sessionFeed.loading} className="min-h-11 rounded-lg border border-gray-700 px-5 text-xs text-gray-300 hover:border-emerald-700 disabled:opacity-40">{sessionFeed.loading ? 'Loading…' : `Load more sessions (${sessionFeed.items.length} of ${sessionFeed.total})`}</button></div>}
+            {sessionFeed.limitReached && <p className="pt-3 text-center text-xs text-gray-500">Showing the 100 most recent matching sessions. Refine the search to inspect older history.</p>}
           </div>
         )}
       </div>}
@@ -757,7 +656,7 @@ export function AgentPanel({
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
               <div>
                 <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">{agentViewMode === 'statuses' ? 'Status filters' : 'Profile filters'}</h3>
-                <p className="text-xs text-gray-500 mt-1">{agentViewMode === 'statuses' ? 'Select any Provider status and any Workflow state. Values within a family match any selection; both families must match. Home shortcuts add one exact shared predicate.' : 'Select one or more profiles from the current profile metadata.'}</p>
+                <p className="text-xs text-gray-500 mt-1">{agentViewMode === 'statuses' ? 'Select any control-plane activity and any Workflow state. Summary activity comes from durable lifecycle, queue, and execution-lease state; open an agent for provider-native detail.' : 'Select one or more profiles from the current profile metadata.'}</p>
               </div>
               {hasActiveFilters && <button onClick={clearCurrentFilters} className="min-h-11 px-3 py-2 text-xs font-medium text-gray-300 border border-gray-700 rounded-lg hover:border-emerald-700 hover:text-emerald-400">Clear filters</button>}
             </div>
@@ -770,17 +669,17 @@ export function AgentPanel({
                   </div>
                 </fieldset>
                 <fieldset className="min-w-0">
-                  <legend className="text-xs font-medium text-gray-400 mb-2">Provider status</legend>
-                  <div className="flex flex-wrap gap-2" aria-label="Provider status filters">
+                  <legend className="text-xs font-medium text-gray-400 mb-2">Control-plane activity</legend>
+                  <div className="flex flex-wrap gap-2" aria-label="Control-plane activity filters">
                     {providerStatusChoices.map(value => <button key={value} aria-pressed={providerStatusFilters.includes(value)} onClick={() => { const next = toggleFilter(providerStatusFilters, value); setProviderStatusFilters(next); updateUrlFilters({ providerStatuses: next }) }} className={`min-h-9 rounded-lg border px-3 text-xs font-mono ${providerStatusFilters.includes(value) ? 'border-emerald-600 bg-emerald-900/30 text-emerald-300' : 'border-gray-700 bg-gray-900/50 text-gray-400 hover:text-gray-200'}`}>{value}</button>)}
-                    {!loadingProjection && providerStatusChoices.length === 0 && <span className="text-xs text-gray-500">No provider statuses available.</span>}
+                    {!filteredAgentFeed.loading && providerStatusChoices.length === 0 && <span className="text-xs text-gray-500">No activity states available.</span>}
                   </div>
                 </fieldset>
                 <fieldset className="min-w-0">
                   <legend className="text-xs font-medium text-gray-400 mb-2">Workflow state</legend>
                   <div className="flex flex-wrap gap-2" aria-label="Workflow state filters">
                     {workflowStatusChoices.map(value => <button key={value} aria-pressed={workflowStatusFilters.includes(value)} onClick={() => { const next = toggleFilter(workflowStatusFilters, value); setWorkflowStatusFilters(next); updateUrlFilters({ workflowStates: next }) }} className={`min-h-9 rounded-lg border px-3 text-xs font-mono ${workflowStatusFilters.includes(value) ? 'border-emerald-600 bg-emerald-900/30 text-emerald-300' : 'border-gray-700 bg-gray-900/50 text-gray-400 hover:text-gray-200'}`}>{value}</button>)}
-                    {!loadingProjection && workflowStatusChoices.length === 0 && <span className="text-xs text-gray-500">No workflow states available.</span>}
+                    {!filteredAgentFeed.loading && workflowStatusChoices.length === 0 && <span className="text-xs text-gray-500">No workflow states available.</span>}
                   </div>
                 </fieldset>
               </div>
@@ -797,19 +696,25 @@ export function AgentPanel({
 
           <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl p-3 sm:p-5">
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-4">
-              <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">Matching agents ({matchingAgents.length} of {totalProjectedAgents} agents)</h3>
-              <p className="text-xs text-gray-500">Found {matchingAgents.length} agents in {matchingSessionIds.size} sessions</p>
+              <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">Matching agents ({matchingAgents.length} of {filteredAgentFeed.total} agents)</h3>
+              <p className="text-xs text-gray-500">Loaded {matchingAgents.length} agents in {matchingSessionIds.length} sessions</p>
             </div>
-            {loadingProjection && totalProjectedAgents === 0 ? <p className="text-sm text-gray-500">Loading agents...</p> : matchingAgents.length === 0 ? (
+            {filteredAgentFeed.error && <p role="alert" className="mb-3 text-xs text-red-300">Unable to refresh agent summaries.</p>}
+            {filteredAgentFeed.loading && matchingAgents.length === 0 ? <p className="text-sm text-gray-500">Loading agents...</p> : matchingAgents.length === 0 ? (
               <div className="py-6 text-center"><p className="text-sm text-gray-400">{hasActiveFilters ? 'No agents match the selected filters.' : 'No agents are available in the current sessions.'}</p>{hasActiveFilters && <button onClick={clearCurrentFilters} className="mt-3 min-h-11 px-3 text-xs font-medium text-emerald-400 hover:text-emerald-300">Clear filters</button>}</div>
             ) : (
               <div className="space-y-4">
-                {sessions.filter(session => matchingSessionIds.has(session.id)).map(session => (
-                  <section key={session.id} className="space-y-2" aria-label={`Matching agents in ${sessionDisplayName(session.name)}`}>
-                    <h4 className="text-xs font-mono text-gray-500 truncate" title={sessionDisplayName(session.name)}>{sessionDisplayName(session.name)}</h4>
-                    {matchingAgents.filter(item => item.session.id === session.id).map(item => renderAgentCard(item.terminal, item.status, session.name))}
+                {matchingSessionIds.map(sessionId => {
+                  const sessionName = matchingAgents.find(item => item.session_id === sessionId)?.session_name || sessionId
+                  return (
+                  <section key={sessionId} className="space-y-2" aria-label={`Matching agents in ${sessionDisplayName(sessionName)}`}>
+                    <h4 className="text-xs font-mono text-gray-500 truncate" title={sessionDisplayName(sessionName)}>{sessionDisplayName(sessionName)}</h4>
+                    {matchingAgents.filter(item => item.session_id === sessionId).map(item => renderAgentCard(item, sessionName))}
                   </section>
-                ))}
+                  )
+                })}
+                {filteredAgentFeed.nextOffset !== null && <div ref={filteredAgentSentinelRef} className="flex justify-center pt-3"><button type="button" onClick={filteredAgentFeed.loadMore} disabled={filteredAgentFeed.loading} className="min-h-11 rounded-lg border border-gray-700 px-5 text-xs text-gray-300 hover:border-emerald-700 disabled:opacity-40">{filteredAgentFeed.loading ? 'Loading…' : `Load more agents (${matchingAgents.length} of ${filteredAgentFeed.total})`}</button></div>}
+                {filteredAgentFeed.limitReached && <p className="pt-3 text-center text-xs text-gray-500">Showing the 100 most recent matching agents. Refine the server-side filters to inspect older history.</p>}
               </div>
             )}
           </div>
@@ -822,14 +727,14 @@ export function AgentPanel({
       )}
 
       {/* Live Terminal */}
-      {liveTerminal && (
+      {liveTerminal && <Suspense fallback={null}>
         <TerminalView
           terminalId={liveTerminal.id}
           provider={liveTerminal.provider}
           agentProfile={liveTerminal.agentProfile}
           onClose={() => setLiveTerminal(null)}
         />
-      )}
+      </Suspense>}
 
       {/* Output Viewer Modal */}
       {outputTerminalId && (
@@ -945,12 +850,22 @@ export function AgentPanel({
               </div>
 
               {privilegedSpawn && (
-                <XHighAuthorizationBlock
-                  confirmed={ownerConfirmed}
-                  operatorSecret={operatorSecret}
-                  onConfirmedChange={setOwnerConfirmed}
-                  onOperatorSecretChange={setOperatorSecret}
-                />
+                <div role="alert" className="rounded-lg border border-amber-500/50 bg-amber-950/30 p-3 text-sm text-amber-100">
+                  <div className="flex items-start gap-2">
+                    <ShieldAlert size={18} className="mt-0.5 shrink-0 text-amber-300" aria-hidden="true" />
+                    <div>
+                      <p className="font-semibold">Exceptional XHigh owner-executor</p>
+                      <p className="mt-1 text-xs text-amber-200/80">Highest-capability, high-cost profile for direct critical architecture and implementation. This authorization applies only to this one launch.</p>
+                    </div>
+                  </div>
+                  <label className="mt-3 flex min-h-11 items-center gap-2 text-xs">
+                    <input aria-label="Confirm exceptional XHigh launch" type="checkbox" checked={ownerConfirmed} onChange={event => setOwnerConfirmed(event.target.checked)} />
+                    I explicitly authorize this XHigh owner launch
+                  </label>
+                  <label className="mt-2 block text-xs text-amber-200/80">Operator secret
+                    <input aria-label="Operator secret" type="password" autoComplete="current-password" value={operatorSecret} onChange={event => setOperatorSecret(event.target.value)} className="mt-1 min-h-11 w-full rounded-lg border border-amber-700/60 bg-gray-950 px-3 text-sm text-gray-100 focus:border-amber-400 focus:outline-none" />
+                  </label>
+                </div>
               )}
 
               <div>

@@ -1,7 +1,8 @@
-import { useState, useEffect, useLayoutEffect, useRef } from 'react'
+import { useCallback, useState, useEffect, useLayoutEffect, useRef } from 'react'
 import { api, DelegationResult, InboxMessage } from '../api'
 import { useStore } from '../store'
 import { X, Send, Mail, Loader2, Maximize2, Minimize2 } from 'lucide-react'
+import { ModalLoadingBody } from './ModalLoadingBody'
 
 interface InboxPanelProps {
   terminalId: string
@@ -85,32 +86,44 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
   const messagesRef = useRef<HTMLDivElement>(null)
   const scrollPositionRef = useRef<number | null>(null)
   const pinnedToBottomRef = useRef(true)
+  const scrollToLatestRef = useRef(false)
+  const fetchInFlightRef = useRef<number | null>(null)
+  const fetchGenerationRef = useRef(0)
+  const fetchControllerRef = useRef<AbortController | null>(null)
   const initialScrollRef = useRef(true)
   const messageIdsRef = useRef('')
 
-  const fetchMessages = async () => {
+  const fetchMessages = useCallback(async (supersede = false) => {
+    if (fetchInFlightRef.current !== null && !supersede) return
+    if (supersede) fetchControllerRef.current?.abort()
+    const generation = ++fetchGenerationRef.current
+    const controller = new AbortController()
+    fetchControllerRef.current = controller
+    fetchInFlightRef.current = generation
     try {
       const status = filter === 'all' ? undefined : filter
       const [data, history] = await Promise.all([
-        api.getInboxMessages(terminalId, 50, status),
-        api.listDelegationResults({ terminalId }),
+        api.getInboxMessages(terminalId, 50, status, controller.signal),
+        api.listDelegationResults({ terminalId }, controller.signal),
       ])
+      if (generation !== fetchGenerationRef.current) return
       const ids = data.map(message => message.id).join(',')
       const newMessages = ids !== messageIdsRef.current
       messageIdsRef.current = ids
       setMessages(previous => JSON.stringify(previous) === JSON.stringify(data) ? previous : data)
       setResultHistory(history)
-      if (newMessages && pinnedToBottomRef.current) {
-        const scrollLatest = () => messagesEndRef.current?.scrollIntoView?.()
-        if (typeof requestAnimationFrame === 'function') requestAnimationFrame(scrollLatest)
-        else scrollLatest()
-      }
-    } catch {
+      if (newMessages && pinnedToBottomRef.current) scrollToLatestRef.current = true
+    } catch (reason) {
+      if ((reason as { name?: string })?.name === 'AbortError') return
       // silently fail — will retry
     } finally {
-      setLoading(false)
+      if (generation === fetchGenerationRef.current) {
+        fetchInFlightRef.current = null
+        fetchControllerRef.current = null
+        setLoading(false)
+      }
     }
-  }
+  }, [filter, terminalId])
 
   const toggleFullscreen = () => {
     scrollPositionRef.current = messagesRef.current?.scrollTop ?? null
@@ -118,13 +131,39 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
   }
 
   useEffect(() => {
+    fetchGenerationRef.current += 1
+    fetchControllerRef.current?.abort()
+    fetchControllerRef.current = null
+    fetchInFlightRef.current = null
     setLoading(true)
-    fetchMessages()
-    const interval = setInterval(fetchMessages, 5000)
-    return () => clearInterval(interval)
-  }, [terminalId, filter])
+    setMessages([])
+    setResultHistory([])
+    setResultCache({})
+    setExpandedResults({})
+    messageIdsRef.current = ''
+    initialScrollRef.current = true
+    pinnedToBottomRef.current = true
+    scrollToLatestRef.current = false
+    void fetchMessages(true)
+    const interval = setInterval(() => {
+      if (document.visibilityState === 'visible') void fetchMessages()
+    }, 5000)
+    return () => {
+      fetchGenerationRef.current += 1
+      fetchControllerRef.current?.abort()
+      fetchControllerRef.current = null
+      fetchInFlightRef.current = null
+      clearInterval(interval)
+    }
+  }, [fetchMessages])
 
   useEffect(() => { if (initialScrollRef.current && !loading) { initialScrollRef.current = false; messagesEndRef.current?.scrollIntoView?.() } }, [loading])
+
+  useLayoutEffect(() => {
+    if (!scrollToLatestRef.current || !messagesRef.current) return
+    messagesRef.current.scrollTop = messagesRef.current.scrollHeight
+    scrollToLatestRef.current = false
+  }, [messages])
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -155,7 +194,7 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
     try {
       await api.sendInboxMessage(terminalId, 'ui', text)
       setDraft('')
-      await fetchMessages()
+      await fetchMessages(true)
     } catch (error: any) {
       showSnackbar({ type: 'error', message: error.message || 'Unable to send the Inbox message. Try again.' })
     }
@@ -253,11 +292,9 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
         )}
 
         {/* Messages */}
-        <div ref={messagesRef} data-testid="inbox-message-list" onScroll={() => { const node = messagesRef.current; if (node) pinnedToBottomRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 24 }} className="flex-1 overflow-y-auto px-4 sm:px-5 py-4 space-y-3 min-h-[200px]">
+        <div ref={messagesRef} data-testid="inbox-message-list" onScroll={() => { const node = messagesRef.current; if (node) pinnedToBottomRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 24 }} className={`flex-1 overflow-y-auto px-4 sm:px-5 py-4 min-h-[200px] ${loading && messages.length === 0 ? 'flex' : 'space-y-3'}`}>
           {loading && messages.length === 0 ? (
-            <div className="flex items-center justify-center py-12">
-              <Loader2 size={20} className="animate-spin text-gray-500" />
-            </div>
+            <ModalLoadingBody label="Loading inbox messages" />
           ) : messages.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-12 text-gray-500">
               <Mail size={32} className="mb-3 opacity-40" />

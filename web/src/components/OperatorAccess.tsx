@@ -37,7 +37,9 @@ export function useOperatorAccess(): OperatorAccess {
 
   useEffect(() => {
     void refresh()
-    const timer = window.setInterval(refresh, 15_000)
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void refresh()
+    }, 15_000)
     return () => window.clearInterval(timer)
   }, [])
 

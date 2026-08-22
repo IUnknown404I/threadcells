@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useCallback, useState, useEffect, useRef } from 'react'
 import { api, Flow, AgentProfileInfo, Project, ProviderInfo } from '../api'
 import { useStore } from '../store'
 import { ConfirmModal } from './ConfirmModal'
@@ -31,9 +31,11 @@ export function FlowsPanel() {
   // Flow list state
   const [flows, setFlows] = useState<Flow[]>([])
   const [loading, setLoading] = useState(true)
+  const [hasLoaded, setHasLoaded] = useState(false)
   const [expanded, setExpanded] = useState<string | null>(null)
   const [togglingFlow, setTogglingFlow] = useState<string | null>(null)
   const [runningFlow, setRunningFlow] = useState<string | null>(null)
+  const [loadError, setLoadError] = useState('')
 
   // Delete confirmation state
   const [pendingDelete, setPendingDelete] = useState<Flow | null>(null)
@@ -54,20 +56,43 @@ export function FlowsPanel() {
   const [profiles, setProfiles] = useState<AgentProfileInfo[]>([])
   const [providers, setProviders] = useState<ProviderInfo[]>([])
   const [projects, setProjects] = useState<Project[]>([])
+  const flowGenerationRef = useRef(0)
+  const flowInFlightRef = useRef<number | null>(null)
+  const flowControllerRef = useRef<AbortController | null>(null)
+  const createButtonRef = useRef<HTMLButtonElement>(null)
+  const dialogRef = useRef<HTMLDivElement>(null)
 
-  const fetchFlows = async () => {
+  const fetchFlows = useCallback(async (supersede = false) => {
+    if (flowInFlightRef.current !== null && !supersede) return
+    if (supersede) flowControllerRef.current?.abort()
+    const generation = ++flowGenerationRef.current
+    const controller = new AbortController()
+    flowControllerRef.current = controller
+    flowInFlightRef.current = generation
     try {
-      const data = await api.listFlows()
+      const data = await api.listFlows(controller.signal)
+      if (generation !== flowGenerationRef.current) return
       setFlows(data)
-    } catch {
-      setFlows([])
+      setLoadError('')
+      setHasLoaded(true)
+    } catch (reason) {
+      if (generation === flowGenerationRef.current && (reason as { name?: string })?.name !== 'AbortError') {
+        setLoadError(reason instanceof Error ? reason.message : 'Unable to refresh flows')
+      }
     } finally {
-      setLoading(false)
+      if (generation === flowGenerationRef.current) {
+        flowInFlightRef.current = null
+        flowControllerRef.current = null
+        setLoading(false)
+      }
     }
-  }
+  }, [])
 
   useEffect(() => {
-    fetchFlows()
+    void fetchFlows(true)
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void fetchFlows()
+    }, 5_000)
     api.listProfiles()
       .then(p => setProfiles(p))
       .catch(() => {})
@@ -77,7 +102,39 @@ export function FlowsPanel() {
     api.listProjects()
       .then(p => setProjects(p))
       .catch(() => setProjects([]))
-  }, [])
+    return () => {
+      flowGenerationRef.current += 1
+      flowControllerRef.current?.abort()
+      flowControllerRef.current = null
+      flowInFlightRef.current = null
+      window.clearInterval(timer)
+    }
+  }, [fetchFlows])
+
+  useEffect(() => {
+    if (!showCreateModal) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setShowCreateModal(false)
+        return
+      }
+      if (event.key !== 'Tab' || !dialogRef.current) return
+      const focusable = Array.from(dialogRef.current.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+      ))
+      if (!focusable.length) return
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus() }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus() }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      createButtonRef.current?.focus()
+    }
+  }, [showCreateModal])
 
   const resetForm = () => {
     setName('')
@@ -104,7 +161,7 @@ export function FlowsPanel() {
       showSnackbar({ type: 'success', message: `Flow "${name.trim()}" created` })
       resetForm()
       setShowCreateModal(false)
-      await fetchFlows()
+      await fetchFlows(true)
     } catch (e: any) {
       showSnackbar({ type: 'error', message: e.message || 'Failed to create flow' })
     } finally {
@@ -122,7 +179,7 @@ export function FlowsPanel() {
         await api.enableFlow(flow.name)
         showSnackbar({ type: 'success', message: `Flow "${flow.name}" enabled` })
       }
-      await fetchFlows()
+      await fetchFlows(true)
     } catch (e: any) {
       showSnackbar({ type: 'error', message: e.message || `Failed to toggle flow` })
     } finally {
@@ -133,9 +190,9 @@ export function FlowsPanel() {
   const handleRun = async (flow: Flow) => {
     setRunningFlow(flow.name)
     try {
-      await api.runFlow(flow.name)
-      showSnackbar({ type: 'success', message: `Flow "${flow.name}" executed` })
-      await fetchFlows()
+      const result = await api.runFlow(flow.name)
+      showSnackbar({ type: 'success', message: result.executed ? `Flow "${flow.name}" launched an agent` : `Flow "${flow.name}" completed without launching an agent` })
+      await fetchFlows(true)
     } catch (e: any) {
       showSnackbar({ type: 'error', message: e.message || `Failed to run flow` })
     } finally {
@@ -149,7 +206,7 @@ export function FlowsPanel() {
     try {
       await api.deleteFlow(pendingDelete.name)
       showSnackbar({ type: 'success', message: `Flow "${pendingDelete.name}" deleted` })
-      await fetchFlows()
+      await fetchFlows(true)
     } catch (e: any) {
       showSnackbar({ type: 'error', message: e.message || 'Failed to delete flow' })
     } finally {
@@ -159,7 +216,11 @@ export function FlowsPanel() {
   }
 
   if (loading) {
-    return <div className="text-gray-500 text-sm py-8 text-center">Loading flows...</div>
+    return <div className="text-gray-400 text-sm py-8 text-center">Loading flows...</div>
+  }
+
+  if (!hasLoaded && loadError) {
+    return <div role="alert" className="rounded-xl border border-amber-700/50 bg-amber-950/20 p-6 text-center text-sm text-amber-100"><p>Flows are temporarily unavailable. No empty-state claim is being made.</p><button type="button" onClick={() => { setLoading(true); void fetchFlows(true) }} className="mt-4 min-h-11 rounded-lg border border-amber-600 px-4 font-medium hover:bg-amber-900/30">Retry</button></div>
   }
 
   const scheduleSelectOptions = [
@@ -173,15 +234,17 @@ export function FlowsPanel() {
 
   return (
     <div className="space-y-6">
+      {loadError && <p role="alert" className="rounded-lg border border-amber-700/50 bg-amber-950/20 p-3 text-sm text-amber-200">Unable to refresh Flows. Existing durable state remains visible while ThreadCells retries.</p>}
       {/* Flow List */}
-      <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl p-5">
-        <div className="flex items-center justify-between mb-4">
+      <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl p-3 sm:p-5">
+        <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">
             Automated Flows ({flows.length})
           </h3>
           <button
+            ref={createButtonRef}
             onClick={() => { resetForm(); setShowCreateModal(true) }}
-            className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+            className="flex min-h-11 items-center justify-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-emerald-500"
           >
             <Plus size={14} />
             Create Flow
@@ -190,9 +253,9 @@ export function FlowsPanel() {
 
         {flows.length === 0 ? (
           <div className="text-center py-8">
-            <Clock size={32} className="mx-auto text-gray-600 mb-3" />
-            <p className="text-gray-500 text-sm">No flows configured.</p>
-            <p className="text-gray-600 text-xs mt-1">
+            <Clock size={32} className="mx-auto text-gray-400 mb-3" />
+            <p className="text-gray-400 text-sm">No flows configured.</p>
+            <p className="text-gray-400 text-xs mt-1">
               Click "Create Flow" above or use the CLI: <code className="text-emerald-400">cao flow add &lt;file.md&gt;</code>
             </p>
           </div>
@@ -201,31 +264,34 @@ export function FlowsPanel() {
             {flows.map(f => (
               <div key={f.name} className="bg-gray-900/50 border border-gray-700/30 rounded-lg">
                 {/* Row header */}
-                <div
-                  className="flex items-center justify-between p-3 cursor-pointer hover:bg-gray-800/50 transition-colors"
-                  onClick={() => setExpanded(expanded === f.name ? null : f.name)}
-                >
-                  <div className="flex items-center gap-3 min-w-0">
+                <div className="flex flex-col gap-3 p-3 transition-colors hover:bg-gray-800/50 sm:flex-row sm:items-center sm:justify-between">
+                  <button
+                    type="button"
+                    className="flex min-w-0 flex-1 flex-wrap items-center gap-3 rounded-lg text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+                    onClick={() => setExpanded(expanded === f.name ? null : f.name)}
+                    aria-expanded={expanded === f.name}
+                    aria-controls={`flow-details-${encodeURIComponent(f.name)}`}
+                  >
                     <Clock size={14} className="text-gray-400 shrink-0" />
                     <span className="text-sm text-gray-200 font-medium truncate">{f.name}</span>
-                    <span className="text-xs text-gray-500 shrink-0" title={f.schedule}>
+                    <span className="text-xs text-gray-400 shrink-0" title={f.schedule}>
                       {cronToLabel(f.schedule)}
                     </span>
-                    <span className="text-xs text-gray-500 shrink-0">{f.agent_profile}</span>
+                    <span className="text-xs text-gray-400 shrink-0">{f.agent_profile}</span>
                     {f.provider && (
-                      <span className="text-xs text-gray-600 shrink-0">{f.provider}</span>
+                      <span className="text-xs text-gray-400 shrink-0">{f.provider}</span>
                     )}
                     <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 ${f.enabled ? 'bg-emerald-900/50 text-emerald-400' : 'bg-gray-700 text-gray-400'}`}>
                       {f.enabled ? 'enabled' : 'disabled'}
                     </span>
-                  </div>
+                  </button>
 
-                  <div className="flex items-center gap-2 shrink-0 ml-3">
+                  <div className="grid w-full shrink-0 grid-cols-[44px_1fr_44px_24px] items-center gap-2 sm:ml-3 sm:flex sm:w-auto">
                     {/* Toggle enable/disable */}
                     <button
                       onClick={e => { e.stopPropagation(); handleToggle(f) }}
                       disabled={togglingFlow === f.name}
-                      className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                      className={`relative inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg transition-colors ${
                         f.enabled ? 'bg-emerald-600' : 'bg-gray-600'
                       } ${togglingFlow === f.name ? 'opacity-50' : ''}`}
                       title={f.enabled ? 'Disable flow' : 'Enable flow'}
@@ -233,9 +299,7 @@ export function FlowsPanel() {
                       {togglingFlow === f.name ? (
                         <Loader2 size={12} className="absolute left-1/2 -translate-x-1/2 animate-spin text-white" />
                       ) : (
-                        <span className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow transition-transform ${
-                          f.enabled ? 'translate-x-[18px]' : 'translate-x-[3px]'
-                        }`} />
+                        <span className={`inline-block h-4 w-4 rounded-full bg-white shadow ${f.enabled ? 'ring-2 ring-emerald-200' : ''}`} />
                       )}
                     </button>
 
@@ -243,7 +307,7 @@ export function FlowsPanel() {
                     <button
                       onClick={e => { e.stopPropagation(); handleRun(f) }}
                       disabled={runningFlow === f.name}
-                      className="flex items-center gap-1.5 px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-xs font-medium rounded-lg transition-colors"
+                      className="flex min-h-11 items-center justify-center gap-1.5 rounded-lg bg-emerald-600 px-2.5 py-1.5 text-xs font-medium text-white transition-colors hover:bg-emerald-500 disabled:opacity-40"
                       title="Run flow now"
                     >
                       {runningFlow === f.name ? (
@@ -257,39 +321,34 @@ export function FlowsPanel() {
                     {/* Delete */}
                     <button
                       onClick={e => { e.stopPropagation(); setPendingDelete(f) }}
-                      className="p-1.5 text-gray-500 hover:text-red-400 transition-colors rounded"
+                      className="inline-flex min-h-11 min-w-11 items-center justify-center rounded text-gray-400 transition-colors hover:text-red-400"
                       title="Delete flow"
                     >
                       <Trash2 size={14} />
                     </button>
 
-                    {/* Expand chevron */}
-                    {expanded === f.name ? (
-                      <ChevronDown size={14} className="text-gray-500" />
-                    ) : (
-                      <ChevronRight size={14} className="text-gray-500" />
-                    )}
+                    <button type="button" onClick={() => setExpanded(expanded === f.name ? null : f.name)} aria-expanded={expanded === f.name} aria-controls={`flow-details-${encodeURIComponent(f.name)}`} aria-label={`${expanded === f.name ? 'Collapse' : 'Expand'} ${f.name} details`} className="inline-flex min-h-11 min-w-6 items-center justify-center rounded text-gray-400 hover:text-gray-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">{expanded === f.name ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</button>
                   </div>
                 </div>
 
                 {/* Expanded details */}
                 {expanded === f.name && (
-                  <div className="px-3 pb-3 text-xs text-gray-400 space-y-3 border-t border-gray-700/30 pt-3">
-                    <div className="grid grid-cols-2 gap-x-6 gap-y-1">
+                  <div id={`flow-details-${encodeURIComponent(f.name)}`} className="px-3 pb-3 text-xs text-gray-300 space-y-3 border-t border-gray-700/30 pt-3">
+                    <div className="grid grid-cols-1 gap-x-6 gap-y-1 sm:grid-cols-2">
                       <div>Schedule: <span className="text-gray-300 font-mono">{f.schedule}</span></div>
                       <div>Provider: <span className="text-gray-300">{f.provider || 'default'}</span></div>
                       <div>Profile: <span className="text-gray-300">{f.agent_profile}</span></div>
                       {f.project_name && <div>Project: <span className="text-gray-300">{f.project_name}</span></div>}
-                      {f.project_path && <div className="col-span-2">Project path: <span className="text-gray-300 font-mono">{f.project_path}</span></div>}
+                      {f.project_path && <div className="break-all sm:col-span-2">Project path: <span className="text-gray-300 font-mono">{f.project_path}</span></div>}
                       <div>Last Run: <span className="text-gray-300">{f.last_run ? new Date(f.last_run).toLocaleString() : 'never'}</span></div>
                       <div>Next Run: <span className="text-gray-300">{f.next_run ? new Date(f.next_run).toLocaleString() : 'n/a'}</span></div>
                       {f.file_path && (
-                        <div className="col-span-2">File: <span className="text-gray-300 font-mono">{f.file_path}</span></div>
+                        <div className="break-all sm:col-span-2">File: <span className="text-gray-300 font-mono">{f.file_path}</span></div>
                       )}
                     </div>
                     {f.prompt_template && (
                       <div>
-                        <div className="text-[11px] text-gray-500 uppercase tracking-wider mb-1.5">Prompt</div>
+                        <div className="text-[11px] text-gray-400 uppercase tracking-wider mb-1.5">Prompt</div>
                         <div className="bg-gray-950/60 border border-gray-700/30 rounded-lg p-3 text-sm text-gray-300 font-mono whitespace-pre-wrap leading-relaxed max-h-48 overflow-y-auto">
                           {f.prompt_template}
                         </div>
@@ -307,18 +366,19 @@ export function FlowsPanel() {
       {showCreateModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center">
           <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setShowCreateModal(false)} />
-          <div className="relative bg-gray-800 border border-gray-700 rounded-2xl shadow-2xl shadow-black/50 w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto">
+          <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="create-flow-title" className="relative bg-gray-800 border border-gray-700 rounded-2xl shadow-2xl shadow-black/50 w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto">
             {/* Modal header */}
             <div className="flex items-center justify-between p-5 border-b border-gray-700/50">
               <div>
-                <h3 className="text-base font-semibold text-gray-200">Create Flow</h3>
-                <p className="text-xs text-gray-500 mt-1">
+                <h3 id="create-flow-title" className="text-base font-semibold text-gray-200">Create Flow</h3>
+                <p className="text-xs text-gray-400 mt-1">
                   Schedule an agent to run automatically on a recurring basis.
                 </p>
               </div>
               <button
                 onClick={() => setShowCreateModal(false)}
-                className="p-1.5 text-gray-500 hover:text-gray-300 transition-colors rounded-lg hover:bg-gray-700/50"
+                aria-label="Close Create Flow dialog"
+                className="p-1.5 text-gray-400 hover:text-gray-300 transition-colors rounded-lg hover:bg-gray-700/50"
               >
                 <X size={18} />
               </button>
@@ -327,7 +387,7 @@ export function FlowsPanel() {
             {/* Modal body */}
             <div className="p-5 space-y-4">
               <div>
-                <label className="block text-xs text-gray-500 mb-1">Name</label>
+                <label className="block text-xs text-gray-400 mb-1">Name</label>
                 <input
                   type="text"
                   value={name}
@@ -339,7 +399,7 @@ export function FlowsPanel() {
               </div>
 
               <div>
-                <label className="block text-xs text-gray-500 mb-1">Schedule</label>
+                <label className="block text-xs text-gray-400 mb-1">Schedule</label>
                 <CustomSelect
                   value={scheduleMode === 'custom' ? CUSTOM_CRON_VALUE : schedule}
                   onChange={val => {
@@ -373,11 +433,11 @@ export function FlowsPanel() {
 
               <div className="flex gap-3">
                 <div className="flex-1">
-                  <label className="block text-xs text-gray-500 mb-1">Agent Profile</label>
+                  <label className="block text-xs text-gray-400 mb-1">Agent Profile</label>
                   <ProfilePicker profiles={profiles} value={agentProfile} onChange={setAgentProfile} disabled={profiles.length === 0} />
                 </div>
                 <div className="flex-1">
-                  <label className="block text-xs text-gray-500 mb-1">Provider</label>
+                  <label className="block text-xs text-gray-400 mb-1">Provider</label>
                   <CustomSelect
                     value={provider}
                     onChange={setProvider}
@@ -388,13 +448,13 @@ export function FlowsPanel() {
               </div>
 
               <div>
-                <label className="block text-xs text-gray-500 mb-1">Project <span className="text-gray-600">(optional)</span></label>
+                <label className="block text-xs text-gray-400 mb-1">Project <span className="text-gray-400">(optional)</span></label>
                 <ProjectPicker projects={projects} value={projectId} onChange={setProjectId} />
                 {projects.length === 0 && <p aria-live="polite" className="mt-1 text-xs text-amber-400">No projects are configured. This flow will use the legacy server working directory.</p>}
               </div>
 
               <div>
-                <label className="block text-xs text-gray-500 mb-1">Prompt</label>
+                <label className="block text-xs text-gray-400 mb-1">Prompt</label>
                 <textarea
                   value={promptTemplate}
                   onChange={e => setPromptTemplate(e.target.value)}

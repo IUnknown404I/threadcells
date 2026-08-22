@@ -1,16 +1,19 @@
-import { useEffect, useState, Suspense } from 'react'
+import { lazy, useEffect, useState, Suspense } from 'react'
 import { useStore } from './store'
 import { api, RuntimeBranding } from './api'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { DashboardHome, HomeNavigation } from './components/DashboardHome'
-import { AgentPanel } from './components/AgentPanel'
-import { FlowsPanel } from './components/FlowsPanel'
-import { ControlPlaneSettings, type SettingsSection } from './components/ControlPlaneSettings'
-import { UsageStatistics } from './components/UsageStatistics'
+import type { SettingsSection } from './components/ControlPlaneSettings'
 import { BookOpen, CheckCircle, ExternalLink, Github, Info, Wifi, WifiOff, XCircle } from 'lucide-react'
-import { DocsPanel } from './components/DocsPanel'
 import { applyAgentFilterState, homeAgentFilterState } from './agentFilters'
 import { NAVIGATION_ITEMS, PrimaryNavigation, type TabKey } from './components/PrimaryNavigation'
+import { useUiOverview } from './uiReadModels'
+
+const AgentPanel = lazy(() => import('./components/AgentPanel').then(module => ({ default: module.AgentPanel })))
+const FlowsPanel = lazy(() => import('./components/FlowsPanel').then(module => ({ default: module.FlowsPanel })))
+const ControlPlaneSettings = lazy(() => import('./components/ControlPlaneSettings').then(module => ({ default: module.ControlPlaneSettings })))
+const UsageStatistics = lazy(() => import('./components/UsageStatistics').then(module => ({ default: module.UsageStatistics })))
+const DocsPanel = lazy(() => import('./components/DocsPanel').then(module => ({ default: module.DocsPanel })))
 
 const PRODUCT_LINKS = {
   github: 'https://github.com/IUnknown404I/threadcells',
@@ -63,14 +66,14 @@ export default function App() {
   }
   const [settingsSection, setSettingsSection] = useState<SettingsSection>(readSettingsSection)
   const [agentIntent, setAgentIntent] = useState<'create-session' | null>(null)
-  const { sessions, connected, fetchSessions } = useStore()
+  const { connected, setConnected } = useStore()
+  const overviewState = useUiOverview()
+  const sessionCount = overviewState.overview?.sessions || 0
   const [branding, setBranding] = useState<RuntimeBranding>({ title: 'ThreadCells', subtitle: 'Multi-agent control plane', logoUrl: '/threadcells-symbol.png', customLogo: false })
 
   useEffect(() => {
-    fetchSessions()
-    const interval = setInterval(fetchSessions, 10000)
-    return () => clearInterval(interval)
-  }, [])
+    if (overviewState.overview) setConnected(!overviewState.error)
+  }, [overviewState.overview, overviewState.error, setConnected])
 
   useEffect(() => {
     const onPopState = () => {
@@ -136,7 +139,9 @@ export default function App() {
     let active = true
     const refresh = () => api.getBranding().then(value => { if (active) setBranding(value) }).catch(() => {})
     refresh()
-    const timer = window.setInterval(refresh, 5000)
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') refresh()
+    }, 5000)
     return () => { active = false; window.clearInterval(timer) }
   }, [])
 
@@ -172,7 +177,7 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-3 shrink-0">
-            <span className="hidden sm:inline text-xs text-gray-500">{sessions.length} session{sessions.length !== 1 ? 's' : ''}</span>
+            <span className="hidden sm:inline text-xs text-gray-500">{sessionCount} session{sessionCount !== 1 ? 's' : ''}</span>
             <div className="flex items-center gap-1.5" title={connected ? 'Connected' : 'Disconnected'}>
               {connected ? (
                 <Wifi size={14} className="text-emerald-400" />
@@ -190,7 +195,7 @@ export default function App() {
       {/* Tab Bar */}
       <div className="border-b border-gray-800">
         <div className="max-w-7xl mx-auto px-3 sm:px-6">
-          <PrimaryNavigation tab={tab} sessions={sessions.length} navigate={navigate} />
+          <PrimaryNavigation tab={tab} sessions={sessionCount} navigate={navigate} />
         </div>
       </div>
 
@@ -198,7 +203,7 @@ export default function App() {
       <main className="mx-auto w-full max-w-7xl min-w-0 flex-1 px-4 py-4 sm:px-6 sm:py-6">
         <ErrorBoundary>
           <Suspense fallback={<div className="text-gray-500 text-sm py-12 text-center">Loading...</div>}>
-            {tab === 'home' && <DashboardHome onNavigate={navigateHome} />}
+            {tab === 'home' && <DashboardHome onNavigate={navigateHome} overviewState={overviewState} />}
             {tab === 'agents' && <AgentPanel navigationSearch={navigationSearch} navigationIntent={agentIntent} onNavigationIntentConsumed={() => setAgentIntent(null)} />}
             {tab === 'flows' && <FlowsPanel />}
             {tab === 'statistics' && <UsageStatistics />}

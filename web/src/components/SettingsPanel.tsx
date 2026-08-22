@@ -101,7 +101,9 @@ export function SettingsPanel() {
     refreshCapacity()
     refreshProjects()
     refreshBranding()
-    const timer = window.setInterval(refreshCapacity, 10000)
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void refreshCapacity()
+    }, 10000)
     return () => window.clearInterval(timer)
   }, [])
 

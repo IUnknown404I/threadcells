@@ -1,6 +1,7 @@
 import { useState, useEffect, useLayoutEffect, useRef } from 'react'
 import { api } from '../api'
-import { X, RefreshCw, Copy, Check, FileText, Loader2, Maximize2, Minimize2 } from 'lucide-react'
+import { X, RefreshCw, Copy, Check, FileText, Maximize2, Minimize2 } from 'lucide-react'
+import { ModalLoadingBody } from './ModalLoadingBody'
 
 function stripAnsi(text: string): string {
   return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '')
@@ -183,9 +184,7 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
         {/* Output Area */}
         <div className="flex min-h-0 min-w-0 w-full max-w-full flex-1 overflow-hidden px-3 py-3 sm:px-4">
           {loading ? (
-            <div className="flex items-center justify-center h-full min-h-[200px]">
-              <Loader2 size={24} className="animate-spin text-gray-500" />
-            </div>
+            <ModalLoadingBody label="Loading terminal output" />
           ) : cleanOutput ? (
             <pre
               ref={outputRef}

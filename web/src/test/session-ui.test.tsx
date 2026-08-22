@@ -5,6 +5,7 @@ import { AgentPanel } from '../components/AgentPanel'
 import { DashboardHome } from '../components/DashboardHome'
 import { useStore } from '../store'
 import { sessionDisplayName } from '../sessionDisplayName'
+import { installUiReadModelSpies } from './ui-read-model-mocks'
 
 vi.mock('../components/TerminalView', () => ({ TerminalView: () => null }))
 
@@ -24,6 +25,7 @@ describe('session creation and canonical ordering', () => {
     vi.spyOn(api, 'listProviders').mockResolvedValue([{ name: 'kiro_cli', binary: 'kiro', installed: true }])
     vi.spyOn(api, 'listProfiles').mockResolvedValue([{ name: 'developer', description: '', source: 'built-in' }])
     vi.spyOn(api, 'listProjects').mockResolvedValue([])
+    installUiReadModelSpies()
   })
 
   it('falls back to an installed provider when Codex is unavailable', async () => {
@@ -247,8 +249,10 @@ describe('session creation and canonical ordering', () => {
     })
     render(<AgentPanel />)
 
-    expect(screen.getByTestId('agent-session-cao-codex').querySelector('span.font-mono')).toHaveTextContent('codex')
-    expect(screen.getByRole('button', { name: 'Open Workflow Composer' })).toBeInTheDocument()
+    const card = await screen.findByTestId('agent-session-cao-codex')
+    expect(card.querySelector('span.font-mono')).toHaveTextContent('codex')
+    fireEvent.click(screen.getByRole('button', { name: 'Expand codex' }))
+    expect(await screen.findByRole('button', { name: 'Open Workflow Composer' })).toBeInTheDocument()
     expect(screen.queryByText('Message agent...')).not.toBeInTheDocument()
     expect(screen.queryByPlaceholderText('Type a message...')).not.toBeInTheDocument()
   })
@@ -265,7 +269,7 @@ describe('session creation and canonical ordering', () => {
     useStore.setState({ sessions: [sessionA, sessionB] })
     render(<AgentPanel />)
 
-    const aToggle = screen.getByRole('button', { name: `Expand ${sessionDisplayName(sessionA.name)}` })
+    const aToggle = await screen.findByRole('button', { name: `Expand ${sessionDisplayName(sessionA.name)}` })
     fireEvent.keyDown(aToggle, { key: 'Enter' })
     const aDetail = await screen.findByTestId(`agent-session-detail-${sessionA.id}`)
     expect(within(screen.getByTestId(`agent-session-${sessionA.id}`)).getByTestId(`agent-session-detail-${sessionA.id}`)).toBe(aDetail)
@@ -294,7 +298,8 @@ describe('session creation and canonical ordering', () => {
       activeSessionDetail: { session: session('cao-existing', '100'), terminals: [] },
     })
     render(<AgentPanel />)
-    fireEvent.click(screen.getByText('Add Agent'))
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand existing' }))
+    fireEvent.click(await screen.findByText('Add Agent'))
 
     expect(screen.queryByText('Session name')).not.toBeInTheDocument()
   })
@@ -307,7 +312,7 @@ describe('session creation and canonical ordering', () => {
       { name: 'codex', binary: 'codex', installed: true },
     ])
     vi.spyOn(api, 'getSession').mockResolvedValue({ session: session('cao-existing', '100'), terminals: [terminal] })
-    vi.spyOn(api, 'getSessionWorkingDirectory').mockResolvedValue({ working_directory: '/srv/session-root' })
+    const getSessionWorkingDirectory = vi.spyOn(api, 'getSessionWorkingDirectory').mockResolvedValue({ working_directory: '/srv/session-root' })
     vi.spyOn(api, 'getWorkingDirectory').mockResolvedValue({ working_directory: '/srv/child-terminal' })
     useStore.setState({
       sessions: [session('cao-existing', '100')],
@@ -315,8 +320,10 @@ describe('session creation and canonical ordering', () => {
       activeSessionDetail: { session: session('cao-existing', '100'), terminals: [terminal] },
     })
     render(<AgentPanel />)
-    await waitFor(() => expect(api.getSessionWorkingDirectory).toHaveBeenCalledWith('cao-existing'))
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand existing' }))
+    expect(getSessionWorkingDirectory).not.toHaveBeenCalled()
     fireEvent.click(screen.getByText('Add Agent'))
+    await waitFor(() => expect(getSessionWorkingDirectory).toHaveBeenCalledWith('cao-existing'))
 
     const resolvedPath = screen.getByTestId('add-agent-resolved-working-directory')
     expect(resolvedPath).toHaveTextContent('/srv/session-root')
@@ -343,7 +350,10 @@ describe('session creation and canonical ordering', () => {
     useStore.setState({ sessions: [session('cao-existing', '100')], activeSession: 'cao-existing', activeSessionDetail: { session: session('cao-existing', '100'), terminals: [terminal] } })
     render(<AgentPanel />)
     await waitFor(() => expect(api.listProjects).toHaveBeenCalled())
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand existing' }))
+    expect(api.getSessionWorkingDirectory).not.toHaveBeenCalled()
     fireEvent.click(screen.getByText('Add Agent'))
+    await waitFor(() => expect(api.getSessionWorkingDirectory).toHaveBeenCalledWith('cao-existing'))
     expect(screen.getByRole('button', { name: 'Select a project to work in…' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Default · A' })).not.toBeInTheDocument()
     expect(screen.getByTestId('add-agent-resolved-working-directory')).toHaveTextContent('/legacy/a')
@@ -376,8 +386,10 @@ describe('session creation and canonical ordering', () => {
     useStore.setState({ sessions: [existing], activeSession: existing.name, activeSessionDetail: { session: existing, terminals: [terminal] } })
 
     render(<AgentPanel />)
-    await waitFor(() => expect(api.getSessionWorkingDirectory).toHaveBeenCalledWith(existing.name))
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand owner-existing' }))
+    expect(api.getSessionWorkingDirectory).not.toHaveBeenCalled()
     fireEvent.click(screen.getByText('Add Agent'))
+    await waitFor(() => expect(api.getSessionWorkingDirectory).toHaveBeenCalledWith(existing.name))
     fireEvent.click(screen.getByText('Select a profile...'))
     fireEvent.click(screen.getAllByText('critical_sol_xhigh_owner')[0])
 
@@ -439,7 +451,7 @@ describe('session creation and canonical ordering', () => {
     }) as never)
     render(<DashboardHome onNavigate={onNavigate} />)
 
-    await waitFor(() => expect(screen.getByRole('button', { name: 'View all agents' })).toHaveTextContent('3'))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'View total agents' })).toHaveTextContent('3'))
     fireEvent.click(screen.getByRole('button', { name: 'View active agents' }))
     expect(onNavigate).toHaveBeenCalledWith({ tab: 'agents', filter: 'active' })
     fireEvent.click(screen.getByRole('button', { name: 'Create Session & Spawn Agent' }))
@@ -463,15 +475,15 @@ describe('session creation and canonical ordering', () => {
     render(<DashboardHome onNavigate={() => {}} />)
 
     const exactHeader = await screen.findByTestId(`session-header-${exact.id}`)
-    expect(within(exactHeader).getByTitle('Project: Project A')).toHaveTextContent('Project: Project A')
+    expect(within(exactHeader).getByText('Project: Project A')).toBeInTheDocument()
     expect(within(screen.getByTestId(`session-header-${noProject.id}`)).queryByText(/^Project:/)).not.toBeInTheDocument()
     expect(within(screen.getByTestId(`session-header-${unresolved.id}`)).queryByText(/^Project:/)).not.toBeInTheDocument()
     expect(within(screen.getByTestId(`session-header-${mixed.id}`)).queryByText(/^Project:/)).not.toBeInTheDocument()
-    expect(screen.getByText('Sessions')).toBeInTheDocument()
+    expect(screen.getAllByText('Sessions')).toHaveLength(2)
     expect(screen.getByText('Total agents')).toBeInTheDocument()
     expect(screen.getByText('Active agents')).toBeInTheDocument()
-    expect(screen.getByText('Waiting')).toBeInTheDocument()
-    expect(screen.getByPlaceholderText('Filter sessions...')).toBeInTheDocument()
+    expect(screen.getByText('Ready / waiting')).toBeInTheDocument()
+    expect(screen.getByPlaceholderText('Filter sessions…')).toBeInTheDocument()
   })
 
   it('keeps the backend-provided newest-first order on Home', async () => {
@@ -497,16 +509,19 @@ describe('session creation and canonical ordering', () => {
     const header = screen.getByTestId('session-header-cao-header')
     const card = screen.getByTestId('home-session-cao-header')
     expect(within(header).getByText('header')).not.toBeInstanceOf(HTMLButtonElement)
-    expect(card).toHaveClass('bg-emerald-900/30', 'border-emerald-700/50')
-
-    const titleSurface = within(header).getByRole('button', { name: 'Collapse header' })
-    fireEvent.click(titleSurface)
     expect(card).toHaveClass('bg-gray-800/60', 'border-gray-700/50')
-    expect(screen.queryByTestId('session-agent-container')).not.toBeInTheDocument()
+
+    const titleSurface = within(header).getByRole('button', { name: 'Expand header' })
+    fireEvent.click(titleSurface)
+    expect(card).toHaveClass('bg-emerald-900/30', 'border-emerald-700/50')
+    expect(await screen.findByTestId('session-agent-container')).toBeInTheDocument()
+
+    fireEvent.keyDown(within(header).getByRole('button', { name: 'Collapse header' }), { key: ' ' })
+    expect(card).toHaveClass('bg-gray-800/60', 'border-gray-700/50')
 
     fireEvent.keyDown(within(header).getByRole('button', { name: 'Expand header' }), { key: 'Enter' })
     expect(card).toHaveClass('bg-emerald-900/30', 'border-emerald-700/50')
-    fireEvent.keyDown(within(header).getByRole('button', { name: 'Collapse header' }), { key: ' ' })
+    fireEvent.click(within(header).getByRole('button', { name: 'Collapse header using chevron' }))
     expect(card).toHaveClass('bg-gray-800/60', 'border-gray-700/50')
 
     fireEvent.click(within(header).getByRole('button', { name: 'Expand header using chevron' }))
@@ -535,7 +550,8 @@ describe('session creation and canonical ordering', () => {
     const list = within(summary).getByRole('button', { name: 'List view' })
     const grid = within(summary).getByRole('button', { name: 'Grid view' })
 
-    expect(within(header).getByRole('button', { name: 'Collapse summary' })).toBeInTheDocument()
+    fireEvent.click(within(header).getByRole('button', { name: 'Expand summary' }))
+    expect(await within(header).findByRole('button', { name: 'Collapse summary' })).toBeInTheDocument()
     expect(list).toHaveAttribute('aria-pressed', 'true')
     expect(list.className).toContain('h-9')
     expect(list.className).toContain('w-9')
@@ -551,7 +567,7 @@ describe('session creation and canonical ordering', () => {
     expect(within(header).getByRole('button', { name: 'Collapse summary' })).toBeInTheDocument()
   })
 
-  it('shows First, Last, and Total for a one-agent session even when the session status differs', async () => {
+  it('shows one durable aggregate for a one-agent session even when the session status differs', async () => {
     const one = { ...session('one-agent', '100'), status: 'active' }
     const agent = { id: 'only-agent', tmux_session: one.name, tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: '999' }
     useStore.setState({ sessions: [one] })
@@ -560,20 +576,16 @@ describe('session creation and canonical ordering', () => {
 
     render(<DashboardHome onNavigate={() => {}} />)
 
-    const groups = await screen.findByTestId('session-status-groups-one-agent')
-    const first = within(groups).getByLabelText('First agent status')
-    const last = within(groups).getByLabelText('Last agent status')
-    const total = within(groups).getByLabelText('Total agent statuses')
-    await waitFor(() => expect(within(first).getByText('Completed')).toBeInTheDocument())
-
-    expect(first.querySelector('[data-terminal-id]')).toHaveAttribute('data-terminal-id', agent.id)
-    expect(last.querySelector('[data-terminal-id]')).toHaveAttribute('data-terminal-id', agent.id)
-    expect(Array.from(total.querySelectorAll<HTMLElement>('[data-terminal-id]')).map(badge => badge.dataset.terminalId)).toEqual([agent.id])
-    expect(within(last).getByText('Completed')).toBeInTheDocument()
-    expect(within(last).queryByText('Unknown')).not.toBeInTheDocument()
+    const badges = await screen.findByTestId('session-status-badges-one-agent')
+    expect(within(badges).getByText('Completed')).toBeInTheDocument()
+    expect(within(badges).queryByText('×1')).not.toBeInTheDocument()
+    expect(screen.getByTestId('session-status-first-one-agent')).toHaveAttribute('data-testid')
+    expect(screen.getByTestId('session-status-first-one-agent').querySelector('[data-terminal-id]')).toHaveAttribute('data-terminal-id', 'only-agent')
+    expect(screen.getByTestId('session-status-last-one-agent').querySelector('[data-terminal-id]')).toHaveAttribute('data-terminal-id', 'only-agent')
+    expect(badges.querySelectorAll('[data-terminal-id]')).toHaveLength(0)
   })
 
-  it('keeps equal agent statuses in canonical First/Last order and preserves every Total badge', async () => {
+  it('coalesces equal durable agent states into one truthful count', async () => {
     const equal = session('equal-statuses', '100')
     const agents = [
       { id: 'z-created-first', tmux_session: equal.name, tmux_window: 'first', provider: 'codex', agent_profile: 'developer', last_active: '100' },
@@ -586,21 +598,16 @@ describe('session creation and canonical ordering', () => {
 
     render(<DashboardHome onNavigate={() => {}} />)
 
-    const groups = await screen.findByTestId('session-status-groups-equal-statuses')
-    const first = within(groups).getByLabelText('First agent status')
-    const last = within(groups).getByLabelText('Last agent status')
-    const total = within(groups).getByLabelText('Total agent statuses')
-    const totalBadges = within(total).getByTestId('session-status-badges-equal-statuses')
-    await waitFor(() => expect(within(totalBadges).getAllByText('Waiting / Recoverable')).toHaveLength(agents.length))
-
-    expect(first.querySelector('[data-terminal-id]')).toHaveAttribute('data-terminal-id', 'z-created-first')
-    expect(last.querySelector('[data-terminal-id]')).toHaveAttribute('data-terminal-id', 'm-created-last')
-    expect(within(first).getByText('Waiting / Recoverable')).toBeInTheDocument()
-    expect(within(last).getByText('Waiting / Recoverable')).toBeInTheDocument()
-    expect(Array.from(total.querySelectorAll<HTMLElement>('[data-terminal-id]')).map(badge => badge.dataset.terminalId)).toEqual(agents.map(agent => agent.id))
+    const badges = await screen.findByTestId('session-status-badges-equal-statuses')
+    expect(within(badges).getByText('Waiting / Recoverable')).toBeInTheDocument()
+    expect(within(screen.getByTestId('session-status-agent-equal-statuses-idle')).getByText('×3')).toBeInTheDocument()
+    expect(within(screen.getByTestId('session-status-workflow-equal-statuses-waiting')).getByText('×3')).toBeInTheDocument()
+    expect(within(badges).getAllByText('Waiting / Recoverable')).toHaveLength(1)
+    expect(screen.getByTestId('session-status-first-equal-statuses').querySelector('[data-terminal-id]')).toHaveAttribute('data-terminal-id', 'z-created-first')
+    expect(screen.getByTestId('session-status-last-equal-statuses').querySelector('[data-terminal-id]')).toHaveAttribute('data-terminal-id', 'm-created-last')
   })
 
-  it('uses mixed agent statuses for First/Last and never the session or most recently changed status', async () => {
+  it('summarizes each mixed durable agent state without using the session status', async () => {
     const mixed = { ...session('mixed-statuses', '100'), status: 'detached' }
     const agents = [
       { id: 'z-first', tmux_session: mixed.name, tmux_window: 'first', provider: 'codex', agent_profile: 'developer', last_active: '100' },
@@ -620,62 +627,38 @@ describe('session creation and canonical ordering', () => {
 
     render(<DashboardHome onNavigate={() => {}} />)
 
-    const groups = await screen.findByTestId('session-status-groups-mixed-statuses')
-    const first = within(groups).getByLabelText('First agent status')
-    const last = within(groups).getByLabelText('Last agent status')
-    const total = within(groups).getByLabelText('Total agent statuses')
-    await waitFor(() => expect(within(last).getByText('Failed')).toBeInTheDocument())
-
-    expect(first.querySelector('[data-terminal-id]')).toHaveAttribute('data-terminal-id', 'z-first')
-    expect(last.querySelector('[data-terminal-id]')).toHaveAttribute('data-terminal-id', 'm-last')
-    expect(within(first).getByText('In progress / Active')).toBeInTheDocument()
-    expect(within(last).getByText('Failed')).toBeInTheDocument()
-    expect(within(last).queryByText('Unknown')).not.toBeInTheDocument()
-    expect(Array.from(total.querySelectorAll<HTMLElement>('[data-terminal-id]')).map(badge => badge.dataset.terminalId)).toEqual(agents.map(agent => agent.id))
+    const badges = await screen.findByTestId('session-status-badges-mixed-statuses')
+    expect(within(badges).getByText('In progress / Active')).toBeInTheDocument()
+    expect(within(badges).getByText('Needs owner decision')).toBeInTheDocument()
+    expect(within(badges).getByText('Waiting / Recoverable')).toBeInTheDocument()
+    expect(within(badges).getByText('Failed')).toBeInTheDocument()
+    expect(within(badges).queryByText('×1')).not.toBeInTheDocument()
+    expect(within(screen.getByTestId('session-status-agent-mixed-statuses-idle')).getByText('×3')).toBeInTheDocument()
+    expect(screen.getByTestId('session-status-first-mixed-statuses').querySelector('[data-terminal-id]')).toHaveAttribute('data-terminal-id', 'z-first')
+    expect(screen.getByTestId('session-status-last-mixed-statuses').querySelector('[data-terminal-id]')).toHaveAttribute('data-terminal-id', 'm-last')
 
     act(() => useStore.getState().setTerminalStatus('a-changes-latest', 'WORKFLOW_COMPLETED::Ready'))
-    expect(last.querySelector('[data-terminal-id]')).toHaveAttribute('data-terminal-id', 'm-last')
-    expect(within(last).getByText('Failed')).toBeInTheDocument()
+    expect(within(badges).getByText('Failed')).toBeInTheDocument()
   })
 
-  it('keeps two measured badge rows, summarizes the hidden agents, and restores canonical order locally', async () => {
+  it('keeps large session status rendering bounded to aggregate counts', async () => {
     const many = session('badge-many', '100')
     const few = session('badge-few', '99')
     const manyTerminals = Array.from({ length: 6 }, (_, index) => ({ id: `many-${index}`, tmux_session: many.name, tmux_window: String(index), provider: 'codex', agent_profile: 'developer', last_active: null }))
     const fewTerminals = Array.from({ length: 2 }, (_, index) => ({ id: `few-${index}`, tmux_session: few.name, tmux_window: String(index), provider: 'codex', agent_profile: 'developer', last_active: null }))
-    const originalRect = HTMLElement.prototype.getBoundingClientRect
-    const rect = (top: number, bottom: number) => ({ x: 0, y: top, top, bottom, left: 0, right: 120, width: 120, height: bottom - top, toJSON: () => ({}) } as DOMRect)
-    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
-      if (this.dataset.measureStatusBadge !== undefined) {
-        const index = Array.from(this.parentElement?.children || []).indexOf(this)
-        const columns = this.parentElement?.dataset.testid === 'session-status-badges-measure-badge-many' ? 2 : 8
-        const top = Math.floor(index / columns) * 24
-        return rect(top, top + 20)
-      }
-      if (this.dataset.testid?.startsWith('session-status-badges-measure-')) return rect(0, 140)
-      return originalRect.call(this)
-    })
     useStore.setState({ sessions: [many, few] })
     vi.spyOn(api, 'getSession').mockImplementation(async name => ({ session: name === many.name ? many : few, terminals: name === many.name ? manyTerminals : fewTerminals }) as never)
 
     render(<DashboardHome onNavigate={() => {}} />)
 
     const manyBadges = await screen.findByTestId('session-status-badges-badge-many')
-    const manySummary = manyBadges.closest('[aria-label="Session status"]')! as HTMLElement
-    const fewSummary = (await screen.findByTestId('session-status-badges-badge-few')).closest('[aria-label="Session status"]')! as HTMLElement
-    const toggle = within(manySummary).getByRole('button', { name: 'Show 2 collapsed agents' })
-
-    expect(Array.from(manyBadges.querySelectorAll<HTMLElement>('[data-terminal-id]')).map(badge => badge.dataset.terminalId)).toEqual(['many-0', 'many-1', 'many-2', 'many-3'])
-    expect(Array.from(within(manySummary).getByTestId('session-status-badge-summary-badge-many').querySelectorAll<HTMLElement>('[data-terminal-id]')).map(badge => badge.dataset.terminalId)).toEqual(['many-5'])
-    expect(toggle).toHaveAttribute('aria-expanded', 'false')
-    expect(within(fewSummary).queryByRole('button', { name: /Show \d+ collapsed agents/ })).not.toBeInTheDocument()
-
-    fireEvent.click(toggle)
-    expect(within(manySummary).getByRole('button', { name: '< Hide rows' })).toHaveAttribute('aria-expanded', 'true')
-    expect(Array.from(manyBadges.querySelectorAll<HTMLElement>('[data-terminal-id]')).map(badge => badge.dataset.terminalId)).toEqual(manyTerminals.map(terminal => terminal.id))
-
-    fireEvent.click(within(manySummary).getByRole('button', { name: '< Hide rows' }))
-    expect(within(manySummary).getByRole('button', { name: 'Show 2 collapsed agents' })).toHaveAttribute('aria-expanded', 'false')
+    const fewBadges = await screen.findByTestId('session-status-badges-badge-few')
+    expect(within(manyBadges).getByText('Idle')).toBeInTheDocument()
+    expect(within(screen.getByTestId('session-status-agent-badge-many-idle')).getByText('×6')).toBeInTheDocument()
+    expect(within(screen.getByTestId('session-status-workflow-badge-many-untracked')).getByText('×6')).toBeInTheDocument()
+    expect(within(screen.getByTestId('session-status-agent-badge-few-idle')).getByText('×2')).toBeInTheDocument()
+    expect(within(screen.getByTestId('session-status-workflow-badge-few-untracked')).getByText('×2')).toBeInTheDocument()
+    expect(manyBadges.querySelectorAll('[data-terminal-id]')).toHaveLength(0)
   })
 
   it('routes Home messaging to the multiline Inbox composer instead of query-based terminal input', async () => {
@@ -687,16 +670,18 @@ describe('session creation and canonical ordering', () => {
     vi.spyOn(api, 'listDelegationResults').mockResolvedValue([])
 
     render(<DashboardHome onNavigate={() => {}} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand inbox' }))
     await screen.findByRole('button', { name: 'Message via Inbox' })
     expect(screen.queryByText('Message agent...')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Message via Inbox' }))
     expect(await screen.findByRole('textbox', { name: 'Inbox draft' })).toBeInTheDocument()
   })
 
-  it('keeps the same backend-provided order on Agents', () => {
+  it('keeps the same backend-provided order on Agents', async () => {
     useStore.setState({ sessions: [session('cao-newest', '200'), session('cao-oldest', '100')] })
     const { container } = render(<AgentPanel />)
 
+    await screen.findByText('newest')
     expect(Array.from(container.querySelectorAll('span.font-mono')).map(node => node.textContent).slice(0, 2)).toEqual(['newest', 'oldest'])
   })
 })
@@ -714,13 +699,14 @@ describe('session deletion confirmation', () => {
     })
     vi.spyOn(api, 'listProviders').mockResolvedValue([{ name: 'kiro_cli', binary: 'kiro', installed: true }])
     vi.spyOn(api, 'listProfiles').mockResolvedValue([{ name: 'developer', description: '', source: 'built-in' }])
+    installUiReadModelSpies()
   })
 
   it('opens without deleting, cancels safely, then deletes once after reopening and confirming', async () => {
     const remove = vi.spyOn(useStore.getState(), 'deleteSession').mockResolvedValue()
     render(<AgentPanel />)
 
-    fireEvent.click(screen.getByTitle('Delete session'))
+    fireEvent.click(await screen.findByTitle('Delete session'))
     expect(screen.getByRole('heading', { name: 'Delete Session' })).toBeInTheDocument()
     expect(remove).not.toHaveBeenCalled()
 
@@ -739,7 +725,7 @@ describe('session deletion confirmation', () => {
     const remove = vi.spyOn(useStore.getState(), 'deleteSession').mockImplementation(() => new Promise<void>(resolve => { resolveDelete = resolve }))
     render(<AgentPanel />)
 
-    fireEvent.click(screen.getByTitle('Delete session'))
+    fireEvent.click(await screen.findByTitle('Delete session'))
     const confirm = screen.getByRole('button', { name: 'Delete Session' })
     fireEvent.click(confirm)
     fireEvent.click(confirm)
@@ -751,7 +737,7 @@ describe('session deletion confirmation', () => {
     await waitFor(() => expect(screen.queryByRole('heading', { name: 'Delete Session' })).not.toBeInTheDocument())
   })
 
-  it('keeps the existing agent close confirmation unchanged', () => {
+  it('keeps the existing agent close confirmation unchanged', async () => {
     const terminal = { id: 'codex-terminal', tmux_session: 'cao-delete-me', tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null }
     const closeTerminal = vi.spyOn(api, 'deleteTerminal').mockResolvedValue({} as never)
     useStore.setState({
@@ -760,7 +746,8 @@ describe('session deletion confirmation', () => {
     })
     render(<AgentPanel />)
 
-    fireEvent.click(screen.getByTitle('Close terminal'))
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand delete-me' }))
+    fireEvent.click(await screen.findByTitle('Close terminal'))
     expect(screen.getByRole('heading', { name: 'Close Terminal' })).toBeInTheDocument()
     expect(closeTerminal).not.toHaveBeenCalled()
 
@@ -795,13 +782,15 @@ describe('graceful exit authority feedback', () => {
     vi.spyOn(api, 'listProjects').mockResolvedValue([])
     vi.spyOn(api, 'getSession').mockResolvedValue({ session: session('cao-exit', '100'), terminals: [terminal] })
     vi.spyOn(api, 'getTerminalStatus').mockResolvedValue({ ...terminal, status: 'idle', lifecycle: 'running' } as never)
+    installUiReadModelSpies()
   })
 
   it('keeps AgentPanel confirmation open when exit is not confirmed', async () => {
     vi.spyOn(api, 'exitTerminal').mockResolvedValue(pending)
     render(<AgentPanel />)
 
-    fireEvent.click(screen.getByTitle('Graceful exit'))
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand exit' }))
+    fireEvent.click(await screen.findByTitle('Graceful exit'))
     fireEvent.click(screen.getByRole('button', { name: 'Send Exit' }))
 
     await waitFor(() => expect(useStore.getState().snackbar?.message).toBe(pending.message))
@@ -812,6 +801,7 @@ describe('graceful exit authority feedback', () => {
     vi.spyOn(api, 'exitTerminal').mockResolvedValue(pending)
     render(<DashboardHome onNavigate={() => {}} />)
 
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand exit' }))
     fireEvent.click(await screen.findByTitle('Graceful Exit'))
     fireEvent.click(screen.getByRole('button', { name: 'Send Exit' }))
 

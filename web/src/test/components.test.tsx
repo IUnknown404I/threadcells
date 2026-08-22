@@ -252,6 +252,16 @@ describe('OutputViewer fullscreen', () => {
     } as never)
   })
 
+  it('uses the shared body-centered modal loading state', () => {
+    vi.mocked(api.getTerminalOutput).mockReturnValue(new Promise(() => {}))
+    render(<OutputViewer terminalId="terminal-loading" onClose={() => {}} />)
+
+    const loader = screen.getByRole('status')
+    expect(loader).toHaveTextContent('Loading terminal output')
+    expect(loader).toHaveClass('w-full', 'flex-1', 'self-stretch', 'items-center', 'justify-center', 'min-h-48')
+    expect(loader.closest('[role="dialog"]')).toHaveAccessibleName('Terminal output')
+  })
+
   it('expands without refetching and Escape exits fullscreen before closing', async () => {
     const onClose = vi.fn()
     render(<OutputViewer terminalId="terminal-with-a-long-id" onClose={onClose} />)
@@ -298,6 +308,18 @@ describe('InboxPanel composer and fullscreen', () => {
     vi.restoreAllMocks()
     vi.spyOn(api, 'getInboxMessages').mockResolvedValue([])
     vi.spyOn(api, 'listDelegationResults').mockResolvedValue([])
+  })
+
+  it('uses the same body-centered loading state without moving its header or composer', () => {
+    vi.mocked(api.getInboxMessages).mockReturnValue(new Promise(() => {}))
+    vi.mocked(api.listDelegationResults).mockReturnValue(new Promise(() => {}))
+    render(<InboxPanel terminalId="terminal-loading" onClose={() => {}} />)
+
+    const loader = screen.getByRole('status')
+    expect(loader).toHaveTextContent('Loading inbox messages')
+    expect(loader).toHaveClass('w-full', 'flex-1', 'self-stretch', 'items-center', 'justify-center', 'min-h-48')
+    expect(screen.getByText('Agent Inbox')).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: 'Inbox draft' })).toBeInTheDocument()
   })
 
   it('keeps a multiline draft while entering fullscreen and exits fullscreen before closing', async () => {

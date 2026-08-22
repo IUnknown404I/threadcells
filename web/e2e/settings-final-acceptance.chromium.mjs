@@ -85,6 +85,7 @@ const json = (response, value) => {
 }
 const server = http.createServer((request, response) => {
   const url = new URL(request.url, 'http://localhost')
+  if (request.method === 'GET' && url.pathname === '/ui/overview') return json(response, { sessions: 2, agents: 4, active: 1, waiting: 0, owner_gate: 0, cancelled: 0, completed: 3 })
   if (request.method === 'GET' && url.pathname === '/sessions') return json(response, [])
   if (request.method === 'GET' && url.pathname === '/settings/branding') return json(response, { title: 'ThreadCells', subtitle: 'Multi-agent control plane', logoUrl: '/threadcells-symbol.png', customLogo: false })
   if (request.method === 'GET' && url.pathname === '/settings/agent-dirs') return json(response, { agent_dirs: {}, extra_dirs: [] })
@@ -113,14 +114,17 @@ try {
     const context = await browser.newContext({ viewport, hasTouch: true, isMobile: viewport.width === 390 })
     const page = await context.newPage()
     for (const surface of [
+      { path: '/settings/general', heading: 'Orchestration Capacity', name: 'capacity' },
       { path: '/settings/profiles', heading: 'Profile Registry', name: 'profiles' },
       { path: '/settings/housekeeping', heading: 'Housekeeping', name: 'housekeeping' },
       { path: '/settings/about', heading: 'ThreadCells', name: 'about' },
     ]) {
       await page.goto(`${origin}${surface.path}`)
       await page.getByRole('heading', { name: surface.heading, exact: true }).last().waitFor()
+      await page.getByRole('link', { name: 'Telegram', exact: true }).waitFor()
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
       assert(overflow <= 0, `${surface.name} horizontal overflow at ${viewport.width}px: ${overflow}`)
+      assert.equal(await page.getByRole('link', { name: 'Telegram', exact: true }).count(), 1)
       await page.screenshot({ path: `${evidenceDir}/${surface.name}-${viewport.width}.png`, fullPage: true })
       evidence.push({ surface: surface.name, width: viewport.width, overflow })
     }
@@ -151,7 +155,7 @@ try {
     assert.equal(await page.getByText('OWNER ONLY — exceptional direct critical architecture and implementation.', { exact: true }).count(), 1)
     await context.close()
   }
-  console.log(JSON.stringify({ evidenceDir, profileCount: profileIds.length, viewports, evidence, assertions: ['registry and Spawn inventory', 'operator-owned XHigh copy', 'Profiles keyboard access', 'Housekeeping human labels and structured report', 'About identity', 'touch navigation', 'no horizontal overflow'] }))
+  console.log(JSON.stringify({ evidenceDir, profileCount: profileIds.length, viewports, evidence, assertions: ['current Capacity and Telegram navigation', 'registry and Spawn inventory', 'operator-owned XHigh copy', 'Profiles keyboard access', 'Housekeeping human labels and structured report', 'About identity', 'touch navigation', 'no horizontal overflow'] }))
 } finally {
   await browser?.close()
   await new Promise(resolve => server.close(resolve))

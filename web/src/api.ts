@@ -56,6 +56,10 @@ export function normalizeApiError(status: number, body: ApiFailureBody | null, s
 
 async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: number | null }): Promise<T> {
   const controller = new AbortController()
+  const externalSignal = opts?.signal
+  const abortFromCaller = () => controller.abort(externalSignal?.reason)
+  if (externalSignal?.aborted) abortFromCaller()
+  else externalSignal?.addEventListener('abort', abortFromCaller, { once: true })
   const timeoutMs = opts?.timeoutMs === undefined ? 10000 : opts.timeoutMs
   const timeout = timeoutMs === null ? undefined : setTimeout(() => controller.abort(), timeoutMs)
   try {
@@ -66,6 +70,7 @@ async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: numb
     }
     return res.json()
   } finally {
+    externalSignal?.removeEventListener('abort', abortFromCaller)
     if (timeout !== undefined) clearTimeout(timeout)
   }
 }
@@ -75,6 +80,74 @@ export interface Session {
   name: string
   status: string
   created_at: string | null
+}
+
+export interface UiOverview {
+  sessions: number
+  agents: number
+  active: number
+  waiting: number
+  owner_gate: number
+  cancelled: number
+  completed: number
+}
+
+export interface SessionSummary extends Session {
+  agent_count: number
+  active_agent_count: number
+  workflow_counts: Record<string, number>
+  activity_counts: Record<string, number>
+  project_name: string | null
+  last_active: string | null
+  first_agent: SessionBoundaryAgent | null
+  last_agent: SessionBoundaryAgent | null
+}
+
+export interface SessionBoundaryAgent {
+  id: string
+  activity: string | null
+  execution_state: string | null
+  lifecycle: string | null
+  workflow_state: string | null
+}
+
+export interface AgentSummary {
+  id: string
+  name: string
+  provider: string
+  session_id: string
+  session_name: string
+  agent_profile: string | null
+  activity: string | null
+  execution_state: string | null
+  lifecycle: string | null
+  workflow_state: string | null
+  workflow_status: string | null
+  assignment_status: string | null
+  result_status: string | null
+  delivery_status: string | null
+  context_role: string | null
+  launch_worktree: string | null
+  managed_worktree_kind: string | null
+  managed_worktree_commit: string | null
+  managed_worktree_branch: string | null
+  projectId: string | null
+  project_name: string | null
+  project_path: string | null
+  creation_order: number
+  last_active: string | null
+}
+
+export interface PageResult<T> {
+  items: T[]
+  total: number
+  limit: number
+  offset: number
+  next_offset: number | null
+}
+
+export interface AgentSummaryPage extends PageResult<AgentSummary> {
+  facets: { activities: string[]; workflow_states: string[]; profiles: string[] }
 }
 
 export interface Terminal {
@@ -373,6 +446,26 @@ export const api = {
   resetBrandingLogo: () => fetchJSON<RuntimeBranding>('/settings/branding/logo/reset', { method: 'POST' }),
 
   // Sessions
+  getUiOverview: (signal?: AbortSignal) => fetchJSON<UiOverview>('/ui/overview', { signal }),
+  listSessionSummaries: (params: { limit?: number; offset?: number; query?: string } = {}, signal?: AbortSignal) => {
+    const search = new URLSearchParams()
+    if (params.limit !== undefined) search.set('limit', String(params.limit))
+    if (params.offset !== undefined) search.set('offset', String(params.offset))
+    if (params.query) search.set('query', params.query)
+    return fetchJSON<PageResult<SessionSummary>>(`/ui/sessions${search.size ? `?${search}` : ''}`, { signal })
+  },
+  listAgentSummaries: (params: { limit?: number; offset?: number; sessionId?: string; query?: string; activities?: string[]; workflowStates?: string[]; profiles?: string[]; homeFilter?: string | null } = {}, signal?: AbortSignal) => {
+    const search = new URLSearchParams()
+    if (params.limit !== undefined) search.set('limit', String(params.limit))
+    if (params.offset !== undefined) search.set('offset', String(params.offset))
+    if (params.sessionId) search.set('session_id', params.sessionId)
+    if (params.query) search.set('query', params.query)
+    if (params.activities?.length) search.set('activity', params.activities.join(','))
+    if (params.workflowStates?.length) search.set('workflow_state', params.workflowStates.join(','))
+    if (params.profiles?.length) search.set('profile', params.profiles.join(','))
+    if (params.homeFilter) search.set('home_filter', params.homeFilter)
+    return fetchJSON<AgentSummaryPage>(`/ui/agents${search.size ? `?${search}` : ''}`, { signal })
+  },
   listSessions: () => fetchJSON<Session[]>('/sessions'),
   getSession: (name: string) => fetchJSON<SessionDetail>(`/sessions/${encodeURIComponent(name)}`),
   getSessionWorkingDirectory: (name: string) =>
@@ -430,8 +523,8 @@ export const api = {
     fetchJSON<Project>(`/projects/${encodeURIComponent(projectId)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }),
 
   // Inbox
-  getInboxMessages: (terminalId: string, limit?: number, status?: string) =>
-    fetchJSON<InboxMessage[]>(`/terminals/${terminalId}/inbox/messages?limit=${limit || 50}${status ? `&status=${status}` : ''}`),
+  getInboxMessages: (terminalId: string, limit?: number, status?: string, signal?: AbortSignal) =>
+    fetchJSON<InboxMessage[]>(`/terminals/${terminalId}/inbox/messages?limit=${limit || 50}${status ? `&status=${status}` : ''}`, { signal }),
   sendInboxMessage: (receiverId: string, senderId: string, message: string) =>
     fetchJSON<{ success: boolean }>(`/terminals/${receiverId}/inbox/messages`, {
       method: 'POST',
@@ -439,16 +532,16 @@ export const api = {
       body: JSON.stringify({ sender_id: senderId, message }),
     }),
   getDelegationResult: (id: string) => fetchJSON<DelegationResult>(`/delegation-results/${encodeURIComponent(id)}`),
-  listDelegationResults: (params?: { terminalId?: string; sessionName?: string; status?: string }) => {
+  listDelegationResults: (params?: { terminalId?: string; sessionName?: string; status?: string }, signal?: AbortSignal) => {
     const search = new URLSearchParams()
     if (params?.terminalId) search.set('terminal_id', params.terminalId)
     if (params?.sessionName) search.set('session_name', params.sessionName)
     if (params?.status) search.set('status', params.status)
-    return fetchJSON<DelegationResult[]>(`/delegation-results${search.size ? `?${search}` : ''}`)
+    return fetchJSON<DelegationResult[]>(`/delegation-results${search.size ? `?${search}` : ''}`, { signal })
   },
 
   // Flows
-  listFlows: () => fetchJSON<Flow[]>('/flows'),
+  listFlows: (signal?: AbortSignal) => fetchJSON<Flow[]>('/flows', { signal }),
   createFlow: (data: { name: string; schedule: string; agent_profile: string; provider?: string; prompt_template: string; projectId?: string }) =>
     fetchJSON<Flow>('/flows', {
       method: 'POST',
@@ -456,8 +549,8 @@ export const api = {
       body: JSON.stringify(data),
       timeoutMs: 30000,
     }),
-  deleteFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${name}`, { method: 'DELETE' }),
-  enableFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${name}/enable`, { method: 'POST' }),
-  disableFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${name}/disable`, { method: 'POST' }),
-  runFlow: (name: string) => fetchJSON<{ executed: boolean }>(`/flows/${name}/run`, { method: 'POST', timeoutMs: 90000 }),
+  deleteFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  enableFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${encodeURIComponent(name)}/enable`, { method: 'POST' }),
+  disableFlow: (name: string) => fetchJSON<{ success: boolean }>(`/flows/${encodeURIComponent(name)}/disable`, { method: 'POST' }),
+  runFlow: (name: string) => fetchJSON<{ executed: boolean }>(`/flows/${encodeURIComponent(name)}/run`, { method: 'POST', timeoutMs: 90000 }),
 }

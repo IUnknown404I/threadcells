@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { api } from '../api'
 import { AgentPanel } from '../components/AgentPanel'
 import { useStore } from '../store'
+import { installUiReadModelSpies } from './ui-read-model-mocks'
 
 const sessions = [
   { id: 'session-a', name: 'session-a', status: 'active', created_at: '1' },
@@ -36,12 +37,13 @@ describe('Agents filters P1', () => {
     vi.spyOn(api, 'listProjects').mockResolvedValue([])
     vi.spyOn(api, 'getSession').mockImplementation(async name => ({ session: sessions.find(session => session.name === name)!, terminals: terminals[name as keyof typeof terminals] }) as never)
     vi.spyOn(api, 'getTerminalStatus').mockImplementation(async id => ({ id, name: id, provider: 'codex', session_name: '', agent_profile: null, lifecycle: 'running', last_active: null, ...statuses[id as keyof typeof statuses] }) as never)
+    installUiReadModelSpies()
   })
 
   it('preserves the Sessions view and projects exact provider/workflow OR-within, AND-across semantics', async () => {
     render(<AgentPanel />)
     expect(screen.getByRole('tab', { name: 'Sessions' })).toHaveAttribute('aria-selected', 'true')
-    expect(api.getSession).not.toHaveBeenCalled()
+    await waitFor(() => expect(api.listSessionSummaries).toHaveBeenCalledTimes(1))
 
     fireEvent.click(screen.getByRole('tab', { name: 'Statuses' }))
     await screen.findByRole('button', { name: 'idle' })
@@ -49,7 +51,7 @@ describe('Agents filters P1', () => {
     fireEvent.click(screen.getByRole('button', { name: 'processing' }))
     fireEvent.click(screen.getAllByRole('button', { name: 'active' })[0])
 
-    expect(screen.getByText('Found 2 agents in 1 sessions')).toBeInTheDocument()
+    expect(await screen.findByText('Matching agents (2 of 2 agents)')).toBeInTheDocument()
     expect(screen.getByTestId('agent-detail-card-agent-a')).toBeInTheDocument()
     expect(screen.getByTestId('agent-detail-card-agent-b')).toBeInTheDocument()
     expect(screen.queryByTestId('agent-detail-card-agent-c')).not.toBeInTheDocument()
@@ -57,13 +59,13 @@ describe('Agents filters P1', () => {
     fireEvent.click(screen.getByRole('button', { name: 'idle' }))
     fireEvent.click(screen.getAllByRole('button', { name: 'active' })[0])
     fireEvent.click(screen.getAllByRole('button', { name: 'waiting' })[0])
-    expect(screen.getByText('No agents match the selected filters.')).toBeInTheDocument()
+    expect(await screen.findByText('No agents match the selected filters.')).toBeInTheDocument()
     fireEvent.click(screen.getAllByRole('button', { name: 'Clear filters' })[0])
-    expect(screen.getByText('Found 3 agents in 2 sessions')).toBeInTheDocument()
+    expect(await screen.findByText('Matching agents (3 of 3 agents)')).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('tab', { name: 'Sessions' }))
     expect(screen.getByRole('tab', { name: 'Sessions' })).toHaveAttribute('aria-selected', 'true')
-    expect(screen.getByText('Sessions (2)')).toBeInTheDocument()
+    expect(await screen.findByText('Sessions (2)')).toBeInTheDocument()
   })
 
   it('keeps profile multi-select state per view and retains filtered action handlers', async () => {
@@ -72,9 +74,9 @@ describe('Agents filters P1', () => {
     fireEvent.click(screen.getByRole('tab', { name: 'Profiles' }))
     await screen.findByRole('button', { name: 'developer' })
     fireEvent.click(screen.getByRole('button', { name: 'developer' }))
-    expect(screen.getByText('Found 1 agents in 1 sessions')).toBeInTheDocument()
+    expect(await screen.findByText('Matching agents (1 of 1 agents)')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'reviewer' }))
-    expect(screen.getByText('Found 3 agents in 2 sessions')).toBeInTheDocument()
+    expect(await screen.findByText('Matching agents (3 of 3 agents)')).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('tab', { name: 'Statuses' }))
     await screen.findByRole('button', { name: 'idle' })
@@ -93,6 +95,6 @@ describe('Agents filters P1', () => {
     await screen.findByRole('button', { name: 'Active agents' })
     expect(screen.getByRole('tab', { name: 'Statuses' })).toHaveAttribute('aria-selected', 'true')
     expect(screen.getByRole('button', { name: 'Active agents' })).toHaveAttribute('aria-pressed', 'true')
-    expect(screen.getByText('Found 3 agents in 2 sessions')).toBeInTheDocument()
+    expect(await screen.findByText('Matching agents (3 of 3 agents)')).toBeInTheDocument()
   })
 })

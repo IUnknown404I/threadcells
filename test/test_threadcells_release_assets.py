@@ -285,6 +285,7 @@ def test_release_builder_and_public_config_are_host_neutral_and_offline() -> Non
     config_path = ROOT / "src/cli_agent_orchestrator/config/cao-operations.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     assert config["release_roots"] == ["/var/lib/threadcells/releases"]
+    assert config["release_admin_group"] == "threadcells-release-admin"
     audit = _public_audit_module()
     assert config_path.relative_to(ROOT).as_posix() in audit.PUBLIC_FILES
     assert (

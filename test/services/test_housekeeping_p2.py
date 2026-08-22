@@ -1,4 +1,5 @@
 import fcntl
+import grp
 import json
 import os
 import pwd
@@ -50,6 +51,7 @@ def _config(root: Path):
         "release_roots": [str(root / "tools")],
         "release_metadata": str(root / "state/cao/release-metadata.json"),
         "release_staging_lock": str(root / "locks/release-staging.lock"),
+        "release_admin_group": grp.getgrgid(os.getgid()).gr_name,
     }
 
 
@@ -813,3 +815,51 @@ def test_busy_release_staging_lock_does_not_block_independent_log_cleanup(tmp_pa
     assert not log.exists()
     assert stale.exists()
     assert any(item["reason_code"] == "RELEASE_STAGING_BUSY" for item in report.failures)
+
+
+def test_missing_release_authority_preserves_releases_without_blocking_log_cleanup(
+    tmp_path, monkeypatch
+):
+    log = tmp_path / "state/cao/logs/cao_stale.log"
+    log.parent.mkdir(parents=True)
+    log.write_bytes(b"stale log")
+    _age(log, 300)
+    _release(tmp_path, "newest", minutes=200)
+    stale = _release(tmp_path, "stale", minutes=300)
+    config = _config(tmp_path)
+    metadata = Path(config["release_metadata"])
+    metadata.parent.mkdir(parents=True, exist_ok=True)
+    metadata.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "active_release": None,
+                "rollback_releases": [],
+                "candidate_releases": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.list_all_terminals", lambda: [])
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping.executor.grp.getgrnam",
+        lambda _name: SimpleNamespace(gr_gid=max({os.getegid(), *os.getgroups()}) + 1),
+    )
+    settings = default_settings(config)
+    settings["policy"]["releases"]["retain_count"] = 1
+    plan = build_plan(
+        root=tmp_path,
+        config=config,
+        settings=settings,
+        mode="weekly",
+        now=NOW,
+        open_inventory=lambda: (set(), True),
+    )
+
+    report = execute_plan(plan, config=config, open_inventory=lambda: (set(), True))
+
+    assert report.ok is False
+    assert not log.exists()
+    assert stale.exists()
+    assert {item["reason_code"] for item in report.failures} == {"RELEASE_ADMIN_GROUP_REQUIRED"}
+    assert any(item["reason_code"] == "RELEASE_ADMIN_GROUP_REQUIRED" for item in report.skipped)

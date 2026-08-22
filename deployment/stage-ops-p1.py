@@ -5,17 +5,20 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import grp
 import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path, PurePosixPath
 from zipfile import BadZipFile, ZipFile
 
 BEGIN = "<!-- CAO.OPS.P1 BEGIN -->"
 END = "<!-- CAO.OPS.P1 END -->"
+RELEASE_ADMIN_GROUP = "threadcells-release-admin"
 CRITICAL_PACKAGE_FILES = (
     "cli_agent_orchestrator/__init__.py",
     "cli_agent_orchestrator/runtime_generation.py",
@@ -149,14 +152,16 @@ def _remove_candidate_path(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def _seal_candidate_tree(candidate_root: Path) -> None:
-    """Make a root-staged runtime traversable but immutable to the service user."""
-    candidate_root.chmod(0o755)
-    for path in candidate_root.rglob("*"):
+def _seal_candidate_tree(candidate_root: Path, owner: tuple[int, int]) -> None:
+    """Make a staged runtime immutable to the service user but removable by Housekeeping."""
+    paths = (candidate_root, *candidate_root.rglob("*"))
+    for path in paths:
         if path.is_symlink():
+            os.lchown(path, *owner)
             continue
+        os.chown(path, *owner)
         if path.is_dir():
-            path.chmod(0o755)
+            path.chmod(0o775)
             continue
         executable = bool(path.stat().st_mode & 0o111)
         path.chmod(0o755 if executable else 0o644)
@@ -182,6 +187,36 @@ def _ensure_owned_private_directory_tree(
         current_stat = current.stat()
         if (current_stat.st_uid, current_stat.st_gid) != owner:
             os.chown(current, *owner)
+
+
+def _ensure_release_root(root: Path, release_root: Path, owner: tuple[int, int]) -> None:
+    expected = root.resolve() / "releases"
+    destination = release_root.resolve()
+    if destination != expected or release_root.is_symlink():
+        fail("RELEASE_ROOT_INVALID")
+    release_root.mkdir(exist_ok=True)
+    if release_root.is_symlink() or not release_root.is_dir():
+        fail("RELEASE_ROOT_INVALID")
+    os.chown(release_root, *owner)
+    release_root.chmod(0o775)
+
+
+def _validate_candidate_location(root: Path, candidate_root: Path) -> Path:
+    release_root = root.resolve() / "releases"
+    if candidate_root.is_symlink() or candidate_root.name in {"", ".", ".."}:
+        fail("CANDIDATE_TARGET_INVALID")
+    parent = candidate_root.parent.resolve()
+    expected = release_root / candidate_root.name
+    if parent != release_root or candidate_root.resolve(strict=False) != expected:
+        fail("CANDIDATE_TARGET_INVALID")
+    return release_root
+
+
+def _validate_control_file(path: Path, expected: Path) -> None:
+    if path.is_symlink():
+        fail("CONTROL_FILE_PATH_INVALID")
+    if path.parent.resolve() != expected.parent.resolve() or path.name != expected.name:
+        fail("CONTROL_FILE_PATH_INVALID")
 
 
 def _purge_candidate_package_payload(
@@ -332,6 +367,7 @@ def _stage_candidate_runtime(
     candidate_root: Path,
     wheel: Path,
     expected_commit: str,
+    candidate_owner: tuple[int, int],
 ) -> None:
     base_runtime = base_runtime.resolve()
     candidate_root = candidate_root.resolve()
@@ -353,7 +389,7 @@ def _stage_candidate_runtime(
         candidate_created = True
         shutil.copytree(base_runtime, candidate_runtime, symlinks=True)
         _validate_candidate_runtime(source, candidate_runtime, wheel.resolve(), expected_commit)
-        _seal_candidate_tree(candidate_root)
+        _seal_candidate_tree(candidate_root, candidate_owner)
         if _tree_hash(base_runtime) != base_before:
             fail("BASE_RUNTIME_MUTATED")
     except BaseException:
@@ -372,14 +408,28 @@ def _atomic_json(
     owner: tuple[int, int] | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.chmod(mode)
-    if owner is not None:
-        current = temporary.stat()
-        if (current.st_uid, current.st_gid) != owner:
-            os.chown(temporary, *owner)
-    os.replace(temporary, path)
+    if path.is_symlink():
+        fail("CONTROL_FILE_PATH_INVALID")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.fchmod(handle.fileno(), mode)
+            if owner is not None:
+                current = os.fstat(handle.fileno())
+                if (current.st_uid, current.st_gid) != owner:
+                    os.fchown(handle.fileno(), *owner)
+        os.replace(temporary, path)
+        parent_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _record_staged_candidate(
@@ -388,6 +438,7 @@ def _record_staged_candidate(
     commit: str,
     *,
     metadata_owner: tuple[int, int],
+    release_owner: tuple[int, int],
 ) -> None:
     """Publish bounded release references only after an immutable stage validates."""
     if metadata_path.exists():
@@ -423,6 +474,7 @@ def _record_staged_candidate(
             "state": "candidate",
         },
         mode=0o644,
+        owner=release_owner,
     )
     metadata["candidate_releases"] = candidates[:2]
     _atomic_json(metadata_path, metadata, mode=0o600, owner=metadata_owner)
@@ -439,6 +491,7 @@ def main() -> int:
     parser.add_argument("--expected-commit")
     parser.add_argument("--release-lock", type=Path)
     parser.add_argument("--release-metadata", type=Path)
+    parser.add_argument("--test-unprivileged-staging", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     source = args.source_root
@@ -468,12 +521,32 @@ def main() -> int:
     root = args.agent_control_root.resolve()
     root_stat = root.stat()
     runtime_user = root.owner()
+    production_system_root = args.system_root.resolve() == Path("/")
+    if args.test_unprivileged_staging and production_system_root:
+        fail("TEST_STAGING_OVERRIDE_FORBIDDEN")
+    if (
+        all(value is not None for value in candidate_arguments)
+        and os.geteuid() != 0
+        and not args.test_unprivileged_staging
+    ):
+        fail("STAGING_PRIVILEGE_REQUIRED")
+    if production_system_root and os.geteuid() != 0:
+        fail("STAGING_PRIVILEGE_REQUIRED")
+    if production_system_root:
+        try:
+            release_admin_gid = grp.getgrnam(RELEASE_ADMIN_GROUP).gr_gid
+        except KeyError:
+            fail("RELEASE_ADMIN_GROUP_UNAVAILABLE")
+        release_owner = (0, release_admin_gid)
+    else:
+        release_owner = (os.geteuid(), os.getegid())
     config.update(
         root=str(root),
         lock_dir=str(root / "state/cao/locks"),
         release_staging_lock=str(root / "state/cao/locks/release-staging.lock"),
         release_metadata=str(root / "state/cao/release-metadata.json"),
         release_roots=[str(root / "releases")],
+        release_admin_group=RELEASE_ADMIN_GROUP,
         runtime_user=runtime_user,
         playwright_manifest_roots=[str(root / "sources"), str(root / "projects")],
         playwright_browser_cache=str(root / "cache/ms-playwright"),
@@ -520,10 +593,21 @@ def main() -> int:
         release_lock = args.release_lock or Path(str(config["release_staging_lock"]))
         release_metadata = args.release_metadata or Path(str(config["release_metadata"]))
         runtime_owner = (root_stat.st_uid, root_stat.st_gid)
-        _ensure_owned_private_directory_tree(root, args.candidate_root.parent, runtime_owner)
+        release_root = _validate_candidate_location(root, args.candidate_root)
+        _validate_control_file(release_lock, Path(str(config["release_staging_lock"])))
+        _validate_control_file(release_metadata, Path(str(config["release_metadata"])))
+        _ensure_release_root(root, release_root, release_owner)
         _ensure_owned_private_directory_tree(root, release_lock.parent, runtime_owner)
         _ensure_owned_private_directory_tree(root, release_metadata.parent, runtime_owner)
-        with release_lock.open("a+") as lock_handle:
+        try:
+            release_descriptor = os.open(
+                release_lock,
+                os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+            )
+        except OSError:
+            fail("RELEASE_LOCK_INVALID")
+        with os.fdopen(release_descriptor, "a+") as lock_handle:
             os.fchmod(lock_handle.fileno(), 0o600)
             lock_stat = os.fstat(lock_handle.fileno())
             if (lock_stat.st_uid, lock_stat.st_gid) != runtime_owner:
@@ -538,12 +622,14 @@ def main() -> int:
                 args.candidate_root,
                 args.wheel,
                 args.expected_commit,
+                release_owner,
             )
             _record_staged_candidate(
                 release_metadata,
                 args.candidate_root,
                 args.expected_commit,
                 metadata_owner=runtime_owner,
+                release_owner=release_owner,
             )
     targets[0].parent.mkdir(parents=True, exist_ok=True)
     targets[0].write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")

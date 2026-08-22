@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import grp
 import gzip
 import os
 import shutil
@@ -299,8 +300,21 @@ def execute_plan(
     )
     release_handle = None
     release_lock_acquired = not release_actions
+    release_authorized = True
+    release_authority_reason = "RELEASE_STAGING_BUSY"
+    if release_actions and os.geteuid() != 0:
+        try:
+            release_group = grp.getgrnam(str(config["release_admin_group"]))
+            release_authorized = release_group.gr_gid in {
+                os.getegid(),
+                *os.getgroups(),
+            }
+        except (KeyError, TypeError):
+            release_authorized = False
+        if not release_authorized:
+            release_authority_reason = "RELEASE_ADMIN_GROUP_REQUIRED"
     try:
-        if release_actions:
+        if release_actions and release_authorized:
             lock_path = Path(
                 str(
                     config.get(
@@ -319,6 +333,11 @@ def execute_plan(
                 report.failures.append(
                     {"candidate": "releases", "reason_code": "RELEASE_STAGING_BUSY"}
                 )
+        elif release_actions:
+            report.ok = False
+            report.failures.append(
+                {"candidate": "releases", "reason_code": release_authority_reason}
+            )
         for candidate in plan.candidates:
             if candidate.action == "preserve":
                 continue
@@ -326,7 +345,7 @@ def execute_plan(
                 report.skipped.append(
                     {
                         "candidate": candidate.canonical_identity,
-                        "reason_code": "RELEASE_STAGING_BUSY",
+                        "reason_code": release_authority_reason,
                     }
                 )
                 continue

@@ -6,7 +6,7 @@ After=agent-control-cao.service
 Type=oneshot
 User=agentctl
 Group=agentctl
-SupplementaryGroups=docker
+SupplementaryGroups=docker threadcells-release-admin
 Environment=HOME=/home/agentctl
 Environment=PATH=/srv/agent-control/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/srv/agent-control/bin/cao-housekeeping --mode frequent --scheduled

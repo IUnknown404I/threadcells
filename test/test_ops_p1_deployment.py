@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -105,6 +106,7 @@ def test_stage_ops_p1_is_dry_run_capable_and_idempotent(tmp_path):
     assert config["release_metadata"] == str(
         (agent_root / "state/cao/release-metadata.json").resolve()
     )
+    assert config["release_admin_group"] == "threadcells-release-admin"
     staged_policy = policy.read_text()
     assert staged_policy.count("<!-- CAO.OPS.P1 BEGIN -->") == 1
     assert staged_policy.count("<!-- CAO.OPS.P1 END -->") == 1
@@ -122,6 +124,14 @@ def test_stage_ops_p1_is_dry_run_capable_and_idempotent(tmp_path):
         "agent-control-housekeeping-weekly.timer",
     ):
         assert (system_root / "etc/systemd/system" / unit).is_file()
+    for unit in (
+        "agent-control-housekeeping.service",
+        "agent-control-housekeeping-weekly.service",
+    ):
+        assert (
+            "SupplementaryGroups=docker threadcells-release-admin"
+            in (system_root / "etc/systemd/system" / unit).read_text()
+        )
 
 
 def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tmp_path):
@@ -185,6 +195,7 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
         str(release_lock),
         "--release-metadata",
         str(release_metadata),
+        "--test-unprivileged-staging",
         "--expected-commit",
         commit,
     ]
@@ -207,8 +218,74 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
     ]
     outside = subprocess.run(outside_command, capture_output=True, text=True)
     assert outside.returncode != 0
-    assert "reason_code=RUNTIME_PATH_OUTSIDE_OWNERSHIP_ROOT" in outside.stderr
+    assert "reason_code=CANDIDATE_TARGET_INVALID" in outside.stderr
     assert not outside_root.exists()
+
+    misplaced_root = agent_root / "state/candidate"
+    misplaced_command = [
+        str(misplaced_root) if value == str(candidate_root) else value for value in command
+    ]
+    misplaced = subprocess.run(misplaced_command, capture_output=True, text=True)
+    assert misplaced.returncode != 0
+    assert "reason_code=CANDIDATE_TARGET_INVALID" in misplaced.stderr
+    assert not misplaced_root.exists()
+
+    replacement_root = agent_root / "releases/existing-candidate"
+    replacement_root.mkdir()
+    replacement_sentinel = replacement_root / "existing-state"
+    replacement_sentinel.write_text("preserve", encoding="utf-8")
+    replacement_command = [
+        str(replacement_root) if value == str(candidate_root) else value for value in command
+    ]
+    replacement = subprocess.run(replacement_command, capture_output=True, text=True)
+    assert replacement.returncode != 0
+    assert "reason_code=CANDIDATE_TARGET_INVALID" in replacement.stderr
+    assert replacement_sentinel.read_text(encoding="utf-8") == "preserve"
+
+    dangling_root = agent_root / "releases/dangling-candidate"
+    outside_dangling_target = tmp_path / "outside-dangling-target"
+    dangling_root.symlink_to(outside_dangling_target, target_is_directory=True)
+    dangling_command = [
+        str(dangling_root) if value == str(candidate_root) else value for value in command
+    ]
+    dangling = subprocess.run(dangling_command, capture_output=True, text=True)
+    assert dangling.returncode != 0
+    assert "reason_code=CANDIDATE_TARGET_INVALID" in dangling.stderr
+    assert not outside_dangling_target.exists()
+    dangling_root.unlink()
+
+    outside_lock = tmp_path / "outside-release-lock"
+    release_lock.unlink()
+    release_lock.symlink_to(outside_lock)
+    lock_candidate = agent_root / "releases/lock-symlink-candidate"
+    lock_command = [
+        str(lock_candidate) if value == str(candidate_root) else value for value in command
+    ]
+    locked = subprocess.run(lock_command, capture_output=True, text=True)
+    assert locked.returncode != 0
+    assert "reason_code=CONTROL_FILE_PATH_INVALID" in locked.stderr
+    assert not outside_lock.exists()
+    release_lock.unlink()
+
+    outside_metadata = tmp_path / "outside-release-metadata"
+    release_metadata.symlink_to(outside_metadata)
+    metadata_candidate = agent_root / "releases/metadata-symlink-candidate"
+    metadata_command = [
+        str(metadata_candidate) if value == str(candidate_root) else value for value in command
+    ]
+    metadata_result = subprocess.run(metadata_command, capture_output=True, text=True)
+    assert metadata_result.returncode != 0
+    assert "reason_code=CONTROL_FILE_PATH_INVALID" in metadata_result.stderr
+    assert not outside_metadata.exists()
+    release_metadata.unlink()
+
+    if os.geteuid() != 0:
+        production_command = [value for value in command if value != "--test-unprivileged-staging"]
+        system_root_index = production_command.index("--system-root") + 1
+        production_command[system_root_index] = "/"
+        production = subprocess.run(production_command, capture_output=True, text=True)
+        assert production.returncode != 0
+        assert "reason_code=STAGING_PRIVILEGE_REQUIRED" in production.stderr
 
     staged = subprocess.run(command, capture_output=True, text=True)
 
@@ -224,9 +301,9 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
     assert metadata["candidate_releases"] == [str(candidate_root.resolve())]
     candidate_runtime = candidate_root / "runtime"
     candidate_python = candidate_runtime / "bin/python"
-    assert candidate_root.stat().st_mode & 0o777 == 0o755
-    assert candidate_runtime.stat().st_mode & 0o777 == 0o755
-    assert (candidate_runtime / "bin").stat().st_mode & 0o777 == 0o755
+    assert candidate_root.stat().st_mode & 0o777 == 0o775
+    assert candidate_runtime.stat().st_mode & 0o777 == 0o775
+    assert (candidate_runtime / "bin").stat().st_mode & 0o777 == 0o775
     assert (candidate_runtime / "pyvenv.cfg").stat().st_mode & 0o777 == 0o644
     assert (candidate_runtime / "bin/cao").stat().st_mode & 0o777 == 0o755
     assert (candidate_root / ".threadcells-release.json").stat().st_mode & 0o777 == 0o644

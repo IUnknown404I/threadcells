@@ -28,6 +28,7 @@
   "release_roots": [
     "/var/lib/threadcells/releases"
   ],
+  "release_admin_group": "threadcells-release-admin",
   "runtime_user": "threadcells",
   "playwright_manifest_roots": [
     "/var/lib/threadcells/sources",

@@ -14,6 +14,14 @@ python3 scripts/verify_local_candidate.py \
 
 The candidate should contain Python code, packaged Web assets, the allowlisted Docs bundle, build identity, checksums, and release metadata from the same revision.
 
+Host staging uses a dedicated release-maintenance group so the running control plane can read but cannot replace an immutable candidate, while the Housekeeping services can remove an explicitly unprotected release. Create that system group once before the first host stage:
+
+```bash
+sudo groupadd --system threadcells-release-admin
+```
+
+The staging command fails closed if this group is unavailable. It accepts production candidate paths only as direct children of the configured ThreadCells release root and refuses symbolic-link or alternate lock/metadata targets.
+
 ## Safe promotion sequence
 
 1. Record the current active runtime and its health.

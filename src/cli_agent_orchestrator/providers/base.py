@@ -85,6 +85,16 @@ class BaseProvider(ABC):
         """
         return 2
 
+    @property
+    def runtime_sidecar_reconnect_input(self) -> str | None:
+        """Provider control input that reinitializes a stale MCP sidecar.
+
+        Most providers do not expose a context-preserving reconnect command.
+        Providers that do must return the exact input here so the terminal
+        service can transport it through the normal capacity-fenced path.
+        """
+        return None
+
     @abstractmethod
     def initialize(self) -> bool:
         """Initialize the provider (e.g., start CLI tool, send setup commands).

@@ -66,17 +66,26 @@ from cli_agent_orchestrator.mcp_server.models import HandoffResult, HandoffState
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.result import HandoffResultDocumentV1
 from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.runtime_generation import RUNTIME_GENERATION_ENV
+from cli_agent_orchestrator.runtime_generation import (
+    ACTIVE_RUNTIME_GENERATION,
+    RUNTIME_GENERATION_ENV,
+)
 from cli_agent_orchestrator.services import inbox_service, terminal_service
 from cli_agent_orchestrator.utils.terminal import generate_session_name, wait_until_terminal_status
 
 logger = logging.getLogger(__name__)
 
 _RUNTIME_GENERATION_PATH = "/_internal/runtime-generation"
-# Capture the launch-time identity once.  ``os.environ`` is mutable process
-# state, so it cannot prove that this sidecar was actually reinitialized with
-# the active runtime code after a promotion.
-_SIDECAR_RUNTIME_GENERATION = os.environ.get(RUNTIME_GENERATION_ENV)
+# Capture the imported-code identity once. ``os.environ`` is mutable process
+# state and a provider can retain its old launch environment across a supported
+# service restart. The launch-only generation setting identifies an actual
+# managed sidecar at import; its generation comes from the code, never the
+# inherited setting's value. A newly initialized sidecar therefore proves
+# ownership with the code it imported, while an old surviving process retains
+# its old identity.
+_SIDECAR_RUNTIME_GENERATION = (
+    ACTIVE_RUNTIME_GENERATION if os.environ.get(RUNTIME_GENERATION_ENV) else None
+)
 _SAFE_PRE_EFFECT_ADMISSION_REASONS = {
     "ADMISSION_FENCE_TIMEOUT",
     "CONTEXT_INVENTORY_UNAVAILABLE",
@@ -147,10 +156,10 @@ def _active_runtime_generation() -> Optional[str]:
 def _fence_privileged_runtime() -> None:
     """Reject local privileged work from a sidecar launched by an old runtime.
 
-    The immutable launch snapshot is the code-ownership proof.  In particular,
-    changing ``os.environ[CAO_RUNTIME_GENERATION]`` in a surviving process must
-    never bless old code to perform lifecycle, provider-exit, or worktree
-    cleanup mutations.
+    The immutable import-time compatibility identity is the code-ownership
+    proof. In particular, changing ``os.environ[CAO_RUNTIME_GENERATION]`` in a
+    surviving process must never bless old code to perform lifecycle,
+    provider-exit, or worktree cleanup mutations.
     """
     sidecar_generation = _SIDECAR_RUNTIME_GENERATION
     if not sidecar_generation:

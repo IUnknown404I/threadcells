@@ -199,6 +199,7 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
         columns = {row[1] for row in connection.execute("PRAGMA table_info(workflow_turns)")}
     assert "provider_processing_observed_at" in columns
     assert "provider_ready_observed_at" in columns
+    assert "provider_reconnect_requested_at" in columns
 
 
 def _queue_inbox_workflow_turn(root: str, key: str = "inbox-result") -> tuple[int, int]:
@@ -1392,6 +1393,110 @@ def test_f13_dispatches_once_only_after_ready_root(mock_terminal, workflow_db):
     assert workflow_service.reconcile_root_workflow("root-ready", now=now) is True
     assert workflow_service.reconcile_root_workflow("root-ready", now=now) is False
     assert mock_terminal.send_input.call_count == 1
+
+
+@patch("cli_agent_orchestrator.services.workflow_service.terminal_service")
+def test_f13_context_compaction_stale_receipt_open_workflow_gets_one_fresh_turn(
+    mock_terminal, workflow_db
+):
+    """A duplicate compacted delivery is inert, then Ready advances exactly once."""
+    root = "root-context-compaction-duplicate"
+    turn_id = _start_admitted_input(root)
+    now = datetime(2026, 8, 22, 12, 0, 0)
+    assert claim_workflow_turn_receipt(root, turn_id) is False
+    assert get_workflow_status(root) == "open"
+    mock_terminal.get_terminal.return_value = {
+        "status": TerminalStatus.COMPLETED.value,
+        "lifecycle": "running",
+    }
+    mock_terminal.provider_runtime_sidecar_reconnect_required.return_value = False
+
+    assert workflow_service.reconcile_root_workflow(root, now=now) is True
+    assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=1)) is False
+    assert mock_terminal.send_input.call_count == 1
+
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        assert workflow.status == "open"
+        successor = (
+            db.query(WorkflowTurnModel).filter_by(workflow_id=workflow.id, kind="open_final").one()
+        )
+        assert successor.state == "sent"
+        successor_id = successor.id
+    assert claim_workflow_turn_receipt(root, successor_id) is True
+    assert claim_workflow_turn_receipt(root, successor_id) is False
+
+
+@patch("cli_agent_orchestrator.services.workflow_service.terminal_service")
+def test_f13_stale_sidecar_requests_one_retryable_context_reinitialization(
+    mock_terminal, workflow_db
+):
+    root = "root-sidecar-reconnect"
+    reconnect_turn_id = _start_admitted_input(root)
+    now = datetime(2026, 8, 22, 12, 0, 0)
+    mock_terminal.get_terminal.return_value = {
+        "status": TerminalStatus.COMPLETED.value,
+        "lifecycle": "running",
+    }
+    mock_terminal.provider_runtime_sidecar_reconnect_required.return_value = True
+
+    assert workflow_service.reconcile_root_workflow(root, now=now) is False
+    assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=1)) is False
+    mock_terminal.request_provider_runtime_sidecar_reconnect.assert_called_once_with(
+        root, reconnect_turn_id, registry=None
+    )
+
+    # A process death after the durable claim cannot strand recovery forever.
+    assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=31)) is False
+    assert mock_terminal.request_provider_runtime_sidecar_reconnect.call_count == 2
+    mock_terminal.request_provider_runtime_sidecar_reconnect.assert_called_with(
+        root, reconnect_turn_id, registry=None
+    )
+    assert get_workflow_status(root) == "open"
+
+
+def test_f13_concurrent_sidecar_reconnect_claims_admit_one_control_input(workflow_db):
+    root = "root-sidecar-reconnect-concurrent"
+    reconnect_turn_id = _start_admitted_input(root)
+    now = datetime(2026, 8, 22, 12, 30, 0)
+    barrier = Barrier(2)
+
+    def claim(_attempt):
+        barrier.wait()
+        return database.claim_workflow_provider_reconnect(root, now=now)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        claims = list(executor.map(claim, range(2)))
+
+    admitted = [claim for claim in claims if claim is not None]
+    assert admitted == [{"turn_id": reconnect_turn_id, "claimed_at": now}]
+
+
+@patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")
+@patch("cli_agent_orchestrator.services.workflow_service.terminal_service")
+def test_f13_ready_workflow_prioritizes_existing_inbox_turn_over_open_final(
+    mock_terminal, mock_check_inbox, workflow_db
+):
+    root = "root-ready-pending-inbox"
+    _start_admitted_input(root)
+    _queue_inbox_workflow_turn(root, key="pending-after-provider-final")
+    mock_terminal.get_terminal.return_value = {
+        "status": TerminalStatus.COMPLETED.value,
+        "lifecycle": "running",
+    }
+    mock_terminal.provider_runtime_sidecar_reconnect_required.return_value = False
+
+    assert workflow_service.reconcile_root_workflow(root) is False
+    mock_check_inbox.assert_called_once_with(root, registry=None)
+    mock_terminal.send_input.assert_not_called()
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        assert (
+            db.query(WorkflowTurnModel)
+            .filter_by(workflow_id=workflow.id, kind="open_final")
+            .count()
+            == 0
+        )
 
 
 @patch("cli_agent_orchestrator.services.workflow_service.terminal_service")

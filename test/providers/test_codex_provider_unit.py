@@ -855,6 +855,56 @@ class TestCodexBulletFormatStatusDetection:
 
         assert status == TerminalStatus.PROCESSING
 
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_get_status_completes_stable_info_notice_after_tool_block(self, mock_tmux):
+        """A provider-final info frame must not strand an OPEN workflow."""
+        mock_tmux.get_history.return_value = (
+            "› Review the exact release candidate.\n"
+            "• Ran uv run pytest -q test/test_ops_p1_deployment.py\n"
+            "  └ 46 passed\n"
+            "\n"
+            "ⓘ This content can't be shown\n"
+            "  We take extra caution with cybersecurity requests.\n"
+            "\n"
+            "› Run /review on my current changes\n"
+            "  gpt-5.6-sol high · 80% left · /workspace\n"
+        )
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        assert_stably_completed(provider)
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_runtime_sidecar_reconnect_signal_clears_only_after_compaction(self, mock_tmux):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        mock_tmux.get_history.return_value = (
+            "You test recovery\n"
+            "• Ran a privileged tool\n"
+            "  Error calling tool 'send_message': CAO_SIDECAR_RECONNECT_REQUIRED: retry\n"
+            "› \n  ? for shortcuts  80% context left\n"
+        )
+        provider.get_status()
+        assert provider.runtime_sidecar_reconnect_required() is True
+        assert mock_tmux.get_history.call_count == 1
+
+        mock_tmux.get_history.return_value += (
+            "• Context compacted\n› \n  ? for shortcuts  79% context left\n"
+        )
+        provider.get_status()
+        assert provider.runtime_sidecar_reconnect_required() is False
+        assert mock_tmux.get_history.call_count == 2
+
+        # Owner prose quoting the words is not a provider-side compaction frame.
+        mock_tmux.get_history.return_value = (
+            "  Error calling tool 'send_message': CAO_SIDECAR_RECONNECT_REQUIRED: retry\n"
+            "You observed: Context compacted\n"
+            "› \n  ? for shortcuts  78% context left\n"
+        )
+        provider.get_status()
+        assert provider.runtime_sidecar_reconnect_required() is True
+
+        assert provider.runtime_sidecar_reconnect_input == "/compact"
+
 
 class TestCodexV0111FooterFormat:
     """Tests for Codex v0.111.0+ TUI footer format.

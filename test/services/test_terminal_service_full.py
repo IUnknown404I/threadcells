@@ -13,6 +13,7 @@ from cli_agent_orchestrator.clients.database import (
 )
 from cli_agent_orchestrator.clients.tmux import TmuxClient
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
+from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import (
@@ -33,6 +34,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     get_terminal,
     get_working_directory,
     reconcile_terminal_context_roles,
+    request_provider_runtime_sidecar_reconnect,
     send_input,
 )
 
@@ -1739,6 +1741,24 @@ class TestGetWorkingDirectory:
 
 class TestSendInput:
     """Tests for send_input function."""
+
+    @patch("cli_agent_orchestrator.services.terminal_service.send_input")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    def test_sidecar_reconnect_uses_capacity_fenced_input(
+        self, mock_provider_manager, mock_send_input
+    ):
+        mock_provider_manager.get_provider.return_value.runtime_sidecar_reconnect_input = "/compact"
+
+        request_provider_runtime_sidecar_reconnect("test1234", 42)
+
+        mock_send_input.assert_called_once_with(
+            "test1234",
+            "/compact",
+            registry=None,
+            sender_id="cao-workflow",
+            orchestration_type=OrchestrationType.SEND_MESSAGE,
+            logical_turn_id=42,
+        )
 
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")

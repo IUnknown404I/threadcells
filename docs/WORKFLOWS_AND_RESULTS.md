@@ -70,6 +70,8 @@ Do not use an owner gate merely because work is slow, a test failed, or one prov
 
 On restart, ThreadCells reconstructs workflow ownership from durable state. Delivered-but-unacknowledged results remain available. A waiting handoff can be resumed against the same child instead of launching a duplicate.
 
+A same-build service restart keeps the provider-side control connection compatible. After a promoted build changes privileged orchestration code, an old connection is fenced before it can create an effect. ThreadCells then asks the provider to reinitialize that control connection through its normal capacity-limited input path, preserves the conversation, and retries the already durable logical turn rather than creating a replacement workflow.
+
 If a terminal disappears, inspect the workflow and result records before retrying. A new terminal must not silently duplicate a mutation already completed by the old one.
 
 ## Concrete example

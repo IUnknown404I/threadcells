@@ -1,6 +1,7 @@
 import threading
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from sqlalchemy import create_engine, event
@@ -311,7 +312,7 @@ def test_committed_release_survives_immediate_wake_failure(monkeypatch):
 
 def test_provider_release_wakeup_prioritizes_existing_durable_queue(monkeypatch):
     """F: released capacity reaches older queued turns before new F13 work."""
-    order: list[str] = []
+    order: list[tuple[str, bool]] = []
     monkeypatch.setattr(workflow_service, "requeue_expired_workflow_turn_claims", lambda **_: 0)
     monkeypatch.setattr(
         workflow_service,
@@ -323,11 +324,23 @@ def test_provider_release_wakeup_prioritizes_existing_durable_queue(monkeypatch)
         "get_open_workflow_root_terminal_ids",
         lambda: ["hot-completing", "queued-next", "idle-open"],
     )
+    pending_receivers = MagicMock(return_value=["queued-next"])
+    monkeypatch.setattr(
+        workflow_service,
+        "get_pending_message_receiver_ids",
+        pending_receivers,
+    )
     monkeypatch.setattr(
         workflow_service,
         "reconcile_root_workflow",
-        lambda terminal_id, **_: order.append(terminal_id) or True,
+        lambda terminal_id, **kwargs: order.append((terminal_id, kwargs["pending_inbox"])) or True,
     )
 
     assert workflow_service.reconcile_open_workflows() == 4
-    assert order == ["queued-oldest", "queued-next", "hot-completing", "idle-open"]
+    assert order == [
+        ("queued-oldest", False),
+        ("queued-next", True),
+        ("hot-completing", False),
+        ("idle-open", False),
+    ]
+    pending_receivers.assert_called_once_with()

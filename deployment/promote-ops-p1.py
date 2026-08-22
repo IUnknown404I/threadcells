@@ -143,7 +143,7 @@ def _validate_release(
         or (expected_commit is not None and marker.get("source_commit") != expected_commit)
     ):
         fail("RELEASE_MARKER_INVALID")
-    for executable in ("cao-server", "cao-housekeeping"):
+    for executable in ("cao-server", "cao-housekeeping", "threadcells-mcp-server"):
         target = path / "runtime/bin" / executable
         if not target.is_file() or not os.access(target, os.X_OK):
             fail("RELEASE_RUNTIME_INVALID")

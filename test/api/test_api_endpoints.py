@@ -7,6 +7,8 @@ flow_daemon, lifespan, and the main() entry point.
 
 import asyncio
 import json
+import subprocess
+import sys
 import threading
 from datetime import datetime, timedelta
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -47,11 +49,27 @@ class TestHealthCheck:
         assert data["status"] == "ok"
         assert data["service"] == "cli-agent-orchestrator"
 
-    def test_runtime_generation_is_process_local_and_available_to_sidecars(self, client):
+    def test_runtime_compatibility_identity_is_available_to_sidecars(self, client):
         response = client.get("/_internal/runtime-generation")
 
         assert response.status_code == 200
         assert response.json() == {"generation": ACTIVE_RUNTIME_GENERATION}
+        assert len(ACTIVE_RUNTIME_GENERATION) == 64
+
+    def test_runtime_compatibility_identity_is_stable_across_process_restart(self):
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "from cli_agent_orchestrator.runtime_generation import "
+                "ACTIVE_RUNTIME_GENERATION; print(ACTIVE_RUNTIME_GENERATION)"
+            ),
+        ]
+
+        first = subprocess.check_output(command, text=True).strip()
+        second = subprocess.check_output(command, text=True).strip()
+
+        assert first == second == ACTIVE_RUNTIME_GENERATION
 
     def test_product_docs_and_internal_openapi_routes_do_not_conflict(self):
         assert app.docs_url == "/_internal/docs"

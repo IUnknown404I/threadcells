@@ -12,15 +12,18 @@ from datetime import datetime
 from cli_agent_orchestrator.clients.database import (
     activate_workflow_turn,
     cancel_workflows_for_terminal,
+    claim_workflow_provider_reconnect,
     claim_workflow_turn,
     get_handoff_child_status,
     get_open_workflow_root_terminal_ids,
     get_parent_completion_barrier,
+    get_pending_message_receiver_ids,
     get_queued_workflow_root_terminal_ids,
     mark_workflow_turn_sent,
     observe_workflow_final,
     observe_workflow_processing,
     observe_workflow_ready,
+    release_workflow_provider_reconnect,
     renew_workflow_turn_claim,
     requeue_expired_workflow_turn_claims,
     requeue_workflow_turn,
@@ -140,6 +143,7 @@ def reconcile_root_workflow(
     root_terminal_id: str,
     registry: PluginRegistry | None = None,
     now: datetime | None = None,
+    pending_inbox: bool | None = None,
 ) -> bool:
     """Observe one root and submit at most one due, durable continuation."""
     try:
@@ -154,6 +158,48 @@ def reconcile_root_workflow(
         observe_workflow_processing(root_terminal_id, now=now)
         return False
     if status not in (TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value):
+        return False
+
+    # A promoted API must never let its stale in-process MCP sidecar mutate
+    # current state. When Codex surfaces the exact generation fence, compact
+    # its existing conversation once: this preserves model context while
+    # reinitializing the MCP client for the next admitted turn. The durable
+    # lease prevents duplicate slash commands and permits retry after a crash
+    # before transport.
+    if terminal_service.provider_runtime_sidecar_reconnect_required(root_terminal_id) is True:
+        reconnect = claim_workflow_provider_reconnect(root_terminal_id, now=now)
+        if reconnect is None:
+            return False
+        try:
+            terminal_service.request_provider_runtime_sidecar_reconnect(
+                root_terminal_id,
+                reconnect["turn_id"],
+                registry=registry,
+            )
+        except Exception as exc:
+            release_workflow_provider_reconnect(
+                root_terminal_id,
+                reconnect["turn_id"],
+                reconnect["claimed_at"],
+            )
+            logger.warning(
+                "Provider sidecar reconnect request failed for %s: %s",
+                root_terminal_id,
+                exc,
+            )
+            return False
+        return False
+
+    # Inbox-backed provider inputs already own their exact logical turn and
+    # must win over a synthetic open-final successor. This also gives the
+    # workflow daemon durable retry ownership when a Ready transition occurs
+    # without a fresh terminal-log event.
+    if pending_inbox is None:
+        pending_inbox = root_terminal_id in set(get_pending_message_receiver_ids())
+    if pending_inbox:
+        from cli_agent_orchestrator.services.inbox_service import check_and_send_pending_messages
+
+        check_and_send_pending_messages(root_terminal_id, registry=registry)
         return False
 
     active_children, _failed_children = get_parent_completion_barrier(root_terminal_id)
@@ -263,6 +309,16 @@ def reconcile_open_workflows(
     roots = queued + [
         root for root in get_open_workflow_root_terminal_ids() if root not in queued_set
     ]
+    if not roots:
+        return 0
+    pending_receivers = set(get_pending_message_receiver_ids())
     for root_terminal_id in roots:
-        sent += int(reconcile_root_workflow(root_terminal_id, registry=registry, now=now))
+        sent += int(
+            reconcile_root_workflow(
+                root_terminal_id,
+                registry=registry,
+                now=now,
+                pending_inbox=root_terminal_id in pending_receivers,
+            )
+        )
     return sent

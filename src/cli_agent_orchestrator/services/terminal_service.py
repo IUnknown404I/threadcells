@@ -1060,6 +1060,33 @@ def create_terminal(
             raise
 
 
+def provider_runtime_sidecar_reconnect_required(terminal_id: str) -> bool:
+    """Read the provider-owned stale-sidecar signal without mutating runtime."""
+    provider = provider_manager.get_provider(terminal_id)
+    predicate = getattr(provider, "runtime_sidecar_reconnect_required", None)
+    return bool(predicate and predicate())
+
+
+def request_provider_runtime_sidecar_reconnect(
+    terminal_id: str,
+    logical_turn_id: int,
+    registry: PluginRegistry | None = None,
+) -> None:
+    """Reinitialize a stale MCP client through the capacity-fenced input path."""
+    provider = provider_manager.get_provider(terminal_id)
+    reconnect_input = getattr(provider, "runtime_sidecar_reconnect_input", None)
+    if not reconnect_input:
+        raise RuntimeError(f"Provider for terminal '{terminal_id}' cannot reconnect its sidecar")
+    send_input(
+        terminal_id,
+        reconnect_input,
+        registry=registry,
+        sender_id="cao-workflow",
+        orchestration_type=OrchestrationType.SEND_MESSAGE,
+        logical_turn_id=logical_turn_id,
+    )
+
+
 def get_terminal(terminal_id: str) -> Dict:
     """Get terminal data."""
     try:

@@ -125,6 +125,23 @@ TUI_TOOL_CHILD_PATTERN = r"^\s*(?:[└├│]|\$\s)"
 # Codex inserts this full-width rule between tool activity and a compact
 # assistant report in the real inline capture.
 TUI_SEPARATOR_PATTERN = r"^[^\S\n]*─{3,}[^\S\n]*$"
+# Codex can finish a provider turn with an informational frame rather than an
+# assistant bullet (for example, the policy/safety notice rendered after a
+# tool block). With an idle footer this is a stable semantic final, not live
+# tool progress. Keep it status-only so handoff result extraction never treats
+# the notice itself as a successful worker result.
+TUI_INFO_NOTICE_PREFIX_PATTERN = r"^[^\S\n]*ⓘ(?:[^\S\n]+|$)"
+SIDECAR_RECONNECT_REQUIRED_TEXT = "CAO_SIDECAR_RECONNECT_REQUIRED"
+CONTEXT_COMPACTED_TEXT = "Context compacted"
+SIDECAR_RECONNECT_REQUIRED_LINE_PATTERN = re.compile(
+    rf"^[^\S\n]*Error calling tool(?: '[^'\n]+')?:[^\n]*"
+    rf"{SIDECAR_RECONNECT_REQUIRED_TEXT}(?::|\b)",
+    re.MULTILINE,
+)
+CONTEXT_COMPACTED_LINE_PATTERN = re.compile(
+    rf"^[^\S\n]*•[^\S\n]+{CONTEXT_COMPACTED_TEXT}[^\S\n]*$",
+    re.MULTILINE,
+)
 # The active Codex interaction is rendered at the bottom of capture-pane. Keep
 # advisory recognition inside that bounded tail: a complete menu elsewhere is
 # transcript/history, not a prompt CAO may answer.
@@ -446,6 +463,7 @@ class CodexProvider(BaseProvider):
         self._startup_exit_marker: Optional[str] = None
         self._startup_attempt = 0
         self._process_exited = False
+        self._runtime_sidecar_reconnect_pending = False
 
     def _reset_completion_candidate(self) -> None:
         """Forget a pending completion candidate after terminal activity."""
@@ -458,6 +476,15 @@ class CodexProvider(BaseProvider):
         self._reset_completion_candidate()
         self._handled_advisory_fingerprints.clear()
         self._input_received = True
+
+    def runtime_sidecar_reconnect_required(self) -> bool:
+        """Return the signal cached by the normal provider status capture."""
+        return self._runtime_sidecar_reconnect_pending
+
+    @property
+    def runtime_sidecar_reconnect_input(self) -> str:
+        """Reinitialize Codex's MCP client while preserving compacted context."""
+        return "/compact"
 
     def _handle_rate_limit_model_switch_prompt(self, output: str, clean_output: str) -> bool:
         """Keep the pinned model for Codex's exact rate-limit switch menu.
@@ -836,6 +863,14 @@ class CodexProvider(BaseProvider):
             return TerminalStatus.ERROR
 
         clean_output = _strip_terminal_noise(output)
+        reconnect_matches = list(SIDECAR_RECONNECT_REQUIRED_LINE_PATTERN.finditer(clean_output))
+        compacted_matches = list(CONTEXT_COMPACTED_LINE_PATTERN.finditer(clean_output))
+        reconnect = reconnect_matches[-1].start() if reconnect_matches else -1
+        compacted = compacted_matches[-1].start() if compacted_matches else -1
+        if reconnect >= 0 and reconnect > compacted:
+            self._runtime_sidecar_reconnect_pending = True
+        elif compacted >= 0:
+            self._runtime_sidecar_reconnect_pending = False
         normalized_output = _normalize_terminal_suffix_blank_rows(clean_output)
         tail_output = "\n".join(normalized_output.splitlines()[-25:])
 
@@ -966,6 +1001,28 @@ class CodexProvider(BaseProvider):
                             re.IGNORECASE | re.MULTILINE,
                         )
                     )
+                    notice_markers = list(
+                        re.finditer(
+                            TUI_INFO_NOTICE_PREFIX_PATTERN,
+                            assistant_text,
+                            re.IGNORECASE | re.MULTILINE,
+                        )
+                    )
+                    if notice_markers and (
+                        not assistant_markers
+                        or notice_markers[-1].start() > assistant_markers[-1].start()
+                    ):
+                        notice_start = assistant_start + notice_markers[-1].start()
+                        candidate = _semantic_completion_candidate(
+                            normalized_output[notice_start:cutoff_pos]
+                        )
+                        user_line_end = normalized_output.find("\n", last_user.start())
+                        if user_line_end == -1:
+                            user_line_end = len(normalized_output)
+                        user_candidate = _semantic_completion_candidate(
+                            normalized_output[last_user.start() : user_line_end]
+                        )
+                        return self._debounce_completion_candidate(candidate, user_candidate)
                     # A terminal can briefly render an idle footer directly
                     # after a structural tool frame.  It is not a final
                     # assistant answer until a later assistant block appears.
@@ -1011,6 +1068,22 @@ class CodexProvider(BaseProvider):
                         re.IGNORECASE | re.MULTILINE,
                     )
                 )
+                notice_markers = list(
+                    re.finditer(
+                        TUI_INFO_NOTICE_PREFIX_PATTERN,
+                        assistant_text,
+                        re.IGNORECASE | re.MULTILINE,
+                    )
+                )
+                if notice_markers and (
+                    not assistant_markers
+                    or notice_markers[-1].start() > assistant_markers[-1].start()
+                ):
+                    candidate = _semantic_completion_candidate(
+                        assistant_text[notice_markers[-1].start() :]
+                    )
+                    if candidate:
+                        return self._debounce_completion_candidate(candidate, None)
                 if assistant_markers:
                     if _is_structural_tool_block(
                         assistant_text, assistant_markers, len(assistant_markers) - 1

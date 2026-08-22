@@ -6,6 +6,8 @@ from pathlib import Path
 from cli_agent_orchestrator.mcp_server import server
 from cli_agent_orchestrator.mcp_server.models import HandoffResult, HandoffState
 
+server._SIDECAR_RUNTIME_GENERATION = os.environ["CAO_TEST_SIDECAR_RUNTIME_GENERATION"]
+
 
 def _record(event: str) -> None:
     with Path(os.environ["CAO_STDIO_RUNTIME_FENCE_TRACE"]).open("a", encoding="utf-8") as trace:

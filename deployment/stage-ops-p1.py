@@ -467,6 +467,35 @@ def _atomic_json(
         temporary.unlink(missing_ok=True)
 
 
+def _atomic_runtime_launcher(path: Path, target: Path, *, owner: tuple[int, int]) -> None:
+    """Point the compatibility launcher at the canonical active runtime."""
+    if not path.parent.exists():
+        path.parent.mkdir(mode=0o750, parents=True)
+        os.chown(path.parent, *owner)
+        path.parent.chmod(0o750)
+    if path.parent.is_symlink() or not path.parent.is_dir():
+        fail("MCP_RUNTIME_LAUNCHER_INVALID")
+    parent_stat = path.parent.stat()
+    if (parent_stat.st_uid, parent_stat.st_gid) != owner or parent_stat.st_mode & 0o022:
+        fail("MCP_RUNTIME_LAUNCHER_UNTRUSTED")
+    if path.exists() and not path.is_symlink():
+        fail("MCP_RUNTIME_LAUNCHER_INVALID")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}")
+    if temporary.exists() or temporary.is_symlink():
+        fail("MCP_RUNTIME_LAUNCHER_TEMPORARY_EXISTS")
+    try:
+        temporary.symlink_to(target)
+        os.lchown(temporary, *owner)
+        os.replace(temporary, path)
+        parent_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _record_staged_candidate(
     metadata_path: Path,
     candidate_root: Path,
@@ -585,6 +614,8 @@ def main() -> int:
     canonical_release_lock = release_state_root / "release-staging.lock"
     canonical_release_metadata = release_state_root / "release-metadata.json"
     canonical_active_release = release_state_root / "active"
+    mcp_runtime_launcher = root / "bin/threadcells-mcp-server"
+    mcp_runtime_target = canonical_active_release / "runtime/bin/threadcells-mcp-server"
     config.update(
         root=str(root),
         lock_dir=str(root / "state/cao/locks"),
@@ -633,7 +664,13 @@ def main() -> int:
     runtime_dropin_target = (
         args.system_root / "etc/systemd/system/agent-control-cao.service.d/threadcells-runtime.conf"
     )
-    targets = [config_target, *unit_targets, runtime_dropin_target, policy_target]
+    targets = [
+        config_target,
+        *unit_targets,
+        runtime_dropin_target,
+        mcp_runtime_launcher,
+        policy_target,
+    ]
     if args.dry_run:
         print("OPS_P1_STAGE_DRY_RUN " + " ".join(str(path) for path in targets))
         return 0
@@ -694,6 +731,11 @@ def main() -> int:
     runtime_dropin_target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(runtime_dropin_source, runtime_dropin_target)
     runtime_dropin_target.chmod(0o644)
+    _atomic_runtime_launcher(
+        mcp_runtime_launcher,
+        mcp_runtime_target,
+        owner=(root.stat().st_uid, root.stat().st_gid),
+    )
     policy_target.write_text(policy, encoding="utf-8")
     print("OPS_P1_STAGED")
     return 0

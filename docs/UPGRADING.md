@@ -41,6 +41,7 @@ Expected result: Settings → About, the Docs footer, and release metadata ident
 8. Check terminal streaming/reconnect.
 9. Verify the PWA manifest and service worker do not cache dynamic requests.
 10. Open Settings → Telegram and confirm its safe configuration state; if native credentials were already configured, run the explicit connection and test-message checks.
+11. For an open agent that crosses the promotion, confirm any control-connection reinitialization completes once and its same durable workflow continues without an owner wake or duplicate child/effect.
 
 ## Historical repairs
 

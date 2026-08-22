@@ -286,6 +286,7 @@ def test_stale_stdio_handoff_reconnects_reinitializes_then_creates_one_child_and
                     "CAO_API_HOST": "127.0.0.1",
                     "CAO_API_PORT": str(port),
                     RUNTIME_GENERATION_ENV: sidecar_generation,
+                    "CAO_TEST_SIDECAR_RUNTIME_GENERATION": sidecar_generation,
                 },
             )
 

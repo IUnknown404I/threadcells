@@ -156,6 +156,16 @@ def test_stage_ops_p1_is_dry_run_capable_and_idempotent(tmp_path):
     assert (
         "ExecStart=/var/lib/threadcells/active/runtime/bin/cao-server" in runtime_dropin.read_text()
     )
+    assert (
+        "THREADCELLS_MCP_SERVER_COMMAND="
+        "/var/lib/threadcells/active/runtime/bin/threadcells-mcp-server"
+        in runtime_dropin.read_text()
+    )
+    mcp_launcher = agent_root / "bin/threadcells-mcp-server"
+    assert mcp_launcher.is_symlink()
+    assert mcp_launcher.readlink() == (
+        release_state_root / "active/runtime/bin/threadcells-mcp-server"
+    )
 
 
 def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tmp_path):

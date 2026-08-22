@@ -29,6 +29,18 @@ from cli_agent_orchestrator.services.housekeeping_service import (
 NOW = 2_000_000_000.0
 
 
+@pytest.fixture(autouse=True)
+def empty_retirement_cleanup_inventory(monkeypatch):
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.list_legacy_child_retirements_for_cleanup",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.list_pending_child_retirement_cleanups",
+        lambda: [],
+    )
+
+
 def _config(root: Path):
     return {
         "root": str(root),
@@ -102,6 +114,150 @@ def test_manual_execution_requires_an_inspected_plan_before_loading_config(monke
         run_housekeeping(dry_run=False, mode="frequent")
 
     assert config_loaded is False
+
+
+def test_exited_terminal_runtime_is_planned_revalidated_and_retired_without_history_deletion(
+    tmp_path, monkeypatch
+):
+    terminal = {
+        "id": "closed001",
+        "tmux_session": "cao-history",
+        "tmux_window": "reviewer",
+        "runtime_lifecycle": "exited",
+        "runtime_pane_id": "%41",
+        "runtime_pane_pid": 4242,
+        "runtime_generation": "gen-1",
+        "runtime_generation_origin": "launch",
+        "runtime_process_start_ticks": 777,
+    }
+    target = SimpleNamespace(
+        pane_id="%41",
+        pane_pid=4242,
+        current_command="bash",
+        terminal_id="closed001",
+        runtime_generation="gen-1",
+        process_start_ticks=777,
+        generation_inherited=True,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.list_all_terminals", lambda: [terminal]
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.tmux.tmux_client.exact_runtime_target",
+        lambda *_args, **_kwargs: target,
+    )
+    retired = []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.retire_exited_terminal_runtime",
+        lambda terminal_id, **_kwargs: retired.append(terminal_id) or True,
+    )
+    config = _config(tmp_path)
+    plan = build_plan(
+        root=tmp_path,
+        config=config,
+        settings=default_settings(config),
+        mode="frequent",
+        now=NOW,
+        open_inventory=lambda: (set(), True),
+    )
+    candidate = next(item for item in plan.candidates if item.resource_kind == "terminal_runtime")
+
+    assert candidate.action == "terminate"
+    assert candidate.estimated_reclaim_bytes == 0
+    report = execute_plan(plan, config=config, open_inventory=lambda: (set(), True))
+    assert report.ok is True
+    assert retired == ["closed001"]
+    assert terminal["runtime_lifecycle"] == "exited"
+
+
+def test_exited_terminal_runtime_identity_mismatch_is_protected(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.list_all_terminals",
+        lambda: [
+            {
+                "id": "historical",
+                "tmux_session": "cao-reused",
+                "tmux_window": "agent",
+                "runtime_lifecycle": "exited",
+                "runtime_pane_id": "%42",
+                "runtime_pane_pid": 4343,
+                "runtime_generation": "old-gen",
+                "runtime_generation_origin": "launch",
+                "runtime_process_start_ticks": 700,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.tmux.tmux_client.exact_runtime_target",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            pane_id="%42",
+            pane_pid=4343,
+            current_command="bash",
+            terminal_id="new-owner",
+            runtime_generation="new-gen",
+            process_start_ticks=800,
+            generation_inherited=True,
+        ),
+    )
+    plan = build_plan(
+        root=tmp_path,
+        config=_config(tmp_path),
+        settings=default_settings(_config(tmp_path)),
+        mode="frequent",
+        now=NOW,
+        open_inventory=lambda: (set(), True),
+    )
+    candidate = next(item for item in plan.candidates if item.resource_kind == "terminal_runtime")
+    assert candidate.action == "preserve"
+    assert candidate.protection_reason == "TERMINAL_RUNTIME_IDENTITY_MISMATCH"
+
+
+def test_pending_retirement_cleanup_uses_the_revalidated_plan_executor(tmp_path, monkeypatch):
+    intent = {"version": 1, "terminal_id": "child001", "managed": False}
+    pending = {
+        "child_terminal_id": "child001",
+        "claim_token": "claim-token",
+        "intent": intent,
+        "delegation_kind": "assign",
+    }
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.list_pending_child_retirement_cleanups",
+        lambda: [pending],
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.list_all_terminals", lambda: [])
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_child_retirement_cleanup_intent",
+        lambda child, token: (
+            {
+                "intent": intent,
+                "cleanup_completed": False,
+                "claim_token": token,
+            }
+            if child == "child001"
+            else None
+        ),
+    )
+    completed = []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.complete_child_retirement",
+        lambda child, token, current, kind: completed.append((child, token, current, kind)) or True,
+    )
+    config = _config(tmp_path)
+    plan = build_plan(
+        root=tmp_path,
+        config=config,
+        settings=default_settings(config),
+        mode="frequent",
+        now=NOW,
+        open_inventory=lambda: (set(), True),
+    )
+    candidate = next(item for item in plan.candidates if item.resource_kind == "retirement_cleanup")
+
+    assert candidate.action == "prune"
+    report = execute_plan(plan, config=config, open_inventory=lambda: (set(), True))
+    assert report.ok is True
+    assert report.executed == [candidate.canonical_identity]
+    assert completed == [("child001", "claim-token", intent, "assign")]
 
 
 def test_housekeeping_cli_forwards_the_inspected_plan_id(monkeypatch, capsys):

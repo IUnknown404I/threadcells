@@ -26,7 +26,7 @@ from cli_agent_orchestrator.clients.database import (
     mark_terminal_runtime_running,
     register_handoff_child,
 )
-from cli_agent_orchestrator.clients.tmux import PaneDeliveryTarget
+from cli_agent_orchestrator.clients.tmux import PaneDeliveryTarget, RuntimePaneTarget
 from cli_agent_orchestrator.services import operations_service, terminal_service
 from cli_agent_orchestrator.services.housekeeping_service import (
     HousekeepingSummary,
@@ -118,6 +118,143 @@ def test_positive_death_releases_runtime_ownership_but_preserves_history(lifecyc
     )
     _reconcile_writer_leases(summary)
     assert get_terminal_metadata("writer00") is not None
+
+
+def test_exited_runtime_retirement_requires_exact_terminal_identity(monkeypatch):
+    metadata = {
+        "id": "closed00",
+        "tmux_session": "cao-history",
+        "tmux_window": "agent",
+        "runtime_lifecycle": "exited",
+        "runtime_pane_id": "%41",
+        "runtime_pane_pid": 4242,
+        "runtime_generation": "gen-1",
+        "runtime_generation_origin": "launch",
+        "runtime_process_start_ticks": 777,
+    }
+    monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda *_: metadata)
+    monkeypatch.setattr(
+        terminal_service.tmux_client,
+        "exact_runtime_target",
+        lambda *_args, **_kwargs: RuntimePaneTarget("%41", 4242, "bash", "closed00", "gen-1", 777),
+    )
+    retired = []
+    monkeypatch.setattr(
+        terminal_service.tmux_client,
+        "retire_runtime_pane",
+        lambda target, **_kwargs: retired.append(target) or True,
+    )
+    assert terminal_service.retire_exited_terminal_runtime("closed00") is True
+    assert retired[0].pane_pid == 4242
+
+    monkeypatch.setattr(
+        terminal_service.tmux_client,
+        "exact_runtime_target",
+        lambda *_args, **_kwargs: RuntimePaneTarget(
+            "%42", 4343, "bash", "replacement", "gen-2", 888
+        ),
+    )
+    assert terminal_service.retire_exited_terminal_runtime("closed00") is None
+    assert len(retired) == 1
+
+
+def test_startup_reconciles_intact_legacy_runtime_identity_once(lifecycle_db, monkeypatch):
+    _terminal("legacy00", "cao-legacy", "/worktree-legacy", write_enabled=False)
+    target = RuntimePaneTarget("%71", 7171, "codex", "legacy00", "reconciled-gen", 999, False)
+    bind = MagicMock(return_value=target)
+    monkeypatch.setattr(terminal_service.tmux_client, "bind_legacy_runtime_generation", bind)
+
+    assert terminal_service.reconcile_legacy_runtime_identities() == 1
+    metadata = get_terminal_metadata("legacy00")
+    assert metadata is not None
+    assert metadata["runtime_pane_id"] == "%71"
+    assert metadata["runtime_pane_pid"] == 7171
+    assert metadata["runtime_generation"] == "reconciled-gen"
+    assert metadata["runtime_generation_origin"] == "reconciled"
+    assert metadata["runtime_process_start_ticks"] == 999
+
+    assert terminal_service.reconcile_legacy_runtime_identities() == 0
+    assert bind.call_count == 1
+
+
+def test_startup_runtime_reconciliation_never_polls_durable_history(monkeypatch):
+    bind = MagicMock()
+    monkeypatch.setattr(
+        terminal_service,
+        "list_all_terminals",
+        lambda: [
+            {
+                "id": "historical00",
+                "tmux_session": "cao-history",
+                "tmux_window": "agent",
+                "runtime_lifecycle": "exited",
+                "runtime_generation": None,
+            }
+        ],
+    )
+    monkeypatch.setattr(terminal_service.tmux_client, "bind_legacy_runtime_generation", bind)
+
+    assert terminal_service.reconcile_legacy_runtime_identities() == 0
+    bind.assert_not_called()
+
+
+def test_new_terminal_persists_launch_generation_and_process_start(lifecycle_db):
+    create_terminal(
+        "launch00",
+        "cao-launch",
+        "agent",
+        "codex",
+        runtime_pane_id="%81",
+        runtime_pane_pid=8181,
+        runtime_generation="launch-gen",
+        runtime_process_start_ticks=1234,
+    )
+    metadata = get_terminal_metadata("launch00")
+    assert metadata is not None
+    assert metadata["runtime_pane_id"] == "%81"
+    assert metadata["runtime_pane_pid"] == 8181
+    assert metadata["runtime_generation"] == "launch-gen"
+    assert metadata["runtime_generation_origin"] == "launch"
+    assert metadata["runtime_process_start_ticks"] == 1234
+
+
+def test_exited_terminal_output_falls_back_to_durable_log(tmp_path, monkeypatch):
+    metadata = {
+        "id": "closed00",
+        "tmux_session": "cao-history",
+        "tmux_window": "agent",
+        "runtime_lifecycle": "exited",
+    }
+    (tmp_path / "closed00.log").write_text("durable output", encoding="utf-8")
+    monkeypatch.setattr(terminal_service, "TERMINAL_LOG_DIR", tmp_path)
+    monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda *_: metadata)
+    monkeypatch.setattr(
+        terminal_service.tmux_client,
+        "get_history",
+        MagicMock(side_effect=ValueError("pane retired")),
+    )
+    assert terminal_service.get_output("closed00") == "durable output"
+
+
+def test_exited_terminal_output_reads_housekeeping_compressed_log(tmp_path, monkeypatch):
+    import gzip
+
+    metadata = {
+        "id": "closed00",
+        "tmux_session": "cao-history",
+        "tmux_window": "agent",
+        "runtime_lifecycle": "exited",
+    }
+    with gzip.open(tmp_path / "closed00.log.gz", "wt", encoding="utf-8") as stream:
+        stream.write("compressed durable output")
+    monkeypatch.setattr(terminal_service, "TERMINAL_LOG_DIR", tmp_path)
+    monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda *_: metadata)
+    monkeypatch.setattr(
+        terminal_service.tmux_client,
+        "get_history",
+        MagicMock(side_effect=ValueError("pane retired")),
+    )
+    assert terminal_service.get_output("closed00") == "compressed durable output"
 
 
 def test_housekeeping_restart_recovery_releases_only_positive_death(lifecycle_db, monkeypatch):
@@ -314,6 +451,7 @@ def test_codex_exit_uses_one_tmux_submit_and_pending_retry_only_observes(lifecyc
             ["tmux", "load-buffer", "-b", "cao_abcd1234", "-"],
             input=b"/exit",
             check=True,
+            timeout=10.0,
         ),
         call(
             [
@@ -326,12 +464,18 @@ def test_codex_exit_uses_one_tmux_submit_and_pending_retry_only_observes(lifecyc
                 "%41",
             ],
             check=True,
+            timeout=10.0,
         ),
         call(
             ["tmux", "send-keys", "-t", "%41", "Enter"],
             check=True,
+            timeout=10.0,
         ),
-        call(["tmux", "delete-buffer", "-b", "cao_abcd1234"], check=False),
+        call(
+            ["tmux", "delete-buffer", "-b", "cao_abcd1234"],
+            check=False,
+            timeout=10.0,
+        ),
     ]
     assert get_terminal_metadata("writer00")["runtime_lifecycle"] == "exit_pending"
     assert list_worktree_writer_leases()[0]["terminal_id"] == "writer00"

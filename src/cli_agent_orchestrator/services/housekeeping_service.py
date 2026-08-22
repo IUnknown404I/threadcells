@@ -39,6 +39,7 @@ class HousekeepingSummary:
     browser_revision_candidates: int = 0
     writer_leases_reconciled: int = 0
     retirement_cleanups_reconciled: int = 0
+    terminal_runtimes_retired: int = 0
     legacy_authority_reconciled: int = 0
     supervisor_roles_reconciled: int = 0
     cache_pruned: int = 0
@@ -1017,6 +1018,12 @@ def run_housekeeping(
             summary.orphan_processes_closed += sum(
                 candidate.resource_kind == "browser_process_group" for candidate in actionable
             )
+            summary.terminal_runtimes_retired += sum(
+                candidate.resource_kind == "terminal_runtime" for candidate in actionable
+            )
+            summary.retirement_cleanups_reconciled += sum(
+                candidate.resource_kind == "retirement_cleanup" for candidate in actionable
+            )
             summary.ephemeral_resources_removed += sum(
                 candidate.category == "ephemeral"
                 and candidate.resource_kind != "browser_process_group"
@@ -1067,6 +1074,16 @@ def run_housekeeping(
                 and candidate.resource_kind == "browser_process_group"
                 for candidate in actionable
             )
+            summary.terminal_runtimes_retired += sum(
+                candidate.canonical_identity in executed
+                and candidate.resource_kind == "terminal_runtime"
+                for candidate in actionable
+            )
+            summary.retirement_cleanups_reconciled += sum(
+                candidate.canonical_identity in executed
+                and candidate.resource_kind == "retirement_cleanup"
+                for candidate in actionable
+            )
             summary.ephemeral_resources_removed += sum(
                 candidate.canonical_identity in executed
                 and candidate.category == "ephemeral"
@@ -1084,10 +1101,10 @@ def run_housekeeping(
                 candidate.canonical_identity in executed and candidate.category == "package_cache"
                 for candidate in actionable
             )
-        _reconcile_supervisor_context_roles(summary)
-        _reconcile_writer_leases(summary)
-        _reconcile_retirement_cleanups(summary)
-        _reconcile_legacy_terminal_authority(summary)
+        if not dry_run:
+            _reconcile_supervisor_context_roles(summary)
+            _reconcile_writer_leases(summary)
+            _reconcile_legacy_terminal_authority(summary)
         _inventory_warnings(root, cfg, summary)
         summary.disk_after = shutil.disk_usage("/").free
         summary.freed_bytes = max(summary.freed_bytes, summary.disk_after - summary.disk_before, 0)

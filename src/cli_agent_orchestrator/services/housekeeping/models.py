@@ -17,6 +17,8 @@ CandidateKind = Literal[
     "docker_container",
     "docker_volume",
     "package_cache",
+    "terminal_runtime",
+    "retirement_cleanup",
 ]
 
 DEFAULT_POLICY: dict[str, dict[str, Any]] = {

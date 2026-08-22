@@ -15,7 +15,12 @@ import httpx
 import pytest
 
 from cli_agent_orchestrator.api import main as api_main
-from cli_agent_orchestrator.api.main import app, flow_daemon, workflow_daemon
+from cli_agent_orchestrator.api.main import (
+    _workflow_reconciliation_tick,
+    app,
+    flow_daemon,
+    workflow_daemon,
+)
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
@@ -1891,12 +1896,12 @@ class TestWorkflowDaemon:
         """One failed reconciliation cannot suppress the other in the same one-second tick."""
         calls = []
 
-        def reconcile_handoffs():
+        def reconcile_handoffs(_registry=None):
             calls.append("handoff")
             if failed_reconciliation == "handoff":
                 raise RuntimeError("handoff failure")
 
-        def reconcile_root():
+        def reconcile_root(_registry=None):
             calls.append("root")
             if failed_reconciliation == "root":
                 raise RuntimeError("root failure")
@@ -1910,14 +1915,12 @@ class TestWorkflowDaemon:
                 "cli_agent_orchestrator.api.main.workflow_service.reconcile_open_workflows",
                 side_effect=reconcile_root,
             ) as root,
-            patch("asyncio.sleep", side_effect=asyncio.CancelledError),
         ):
-            with pytest.raises(asyncio.CancelledError):
-                await workflow_daemon()
+            assert await _workflow_reconciliation_tick(None, False) is False
 
         assert calls == ["handoff", "root"]
-        handoffs.assert_called_once_with()
-        root.assert_called_once_with()
+        handoffs.assert_called_once_with(None)
+        root.assert_called_once_with(None)
 
 
 # ── lifespan ─────────────────────────────────────────────────────────
@@ -1933,13 +1936,12 @@ class TestLifespan:
 
         mock_observer = MagicMock()
 
-        async def completed_daemon():
+        async def completed_daemon(*_args, **_kwargs):
             return None
 
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
-            patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
             patch(
                 "cli_agent_orchestrator.api.main.PollingObserver",
                 return_value=mock_observer,
@@ -1950,6 +1952,10 @@ class TestLifespan:
             ),
             patch(
                 "cli_agent_orchestrator.api.main.workflow_daemon",
+                side_effect=completed_daemon,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.runtime_recovery_daemon",
                 side_effect=completed_daemon,
             ),
         ):

@@ -19,6 +19,8 @@ from cli_agent_orchestrator.clients.database import (
     get_queued_workflow_root_terminal_ids,
     mark_workflow_turn_sent,
     observe_workflow_final,
+    observe_workflow_processing,
+    observe_workflow_ready,
     renew_workflow_turn_claim,
     requeue_expired_workflow_turn_claims,
     requeue_workflow_turn,
@@ -148,6 +150,9 @@ def reconcile_root_workflow(
     if terminal.get("lifecycle") != "running":
         return False
     status = terminal.get("status")
+    if status == TerminalStatus.PROCESSING.value:
+        observe_workflow_processing(root_terminal_id, now=now)
+        return False
     if status not in (TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value):
         return False
 
@@ -200,6 +205,8 @@ def reconcile_root_workflow(
 
     if status == TerminalStatus.COMPLETED.value:
         observe_workflow_final(root_terminal_id, now=now)
+    else:
+        observe_workflow_ready(root_terminal_id, now=now)
 
     turn = claim_workflow_turn(root_terminal_id, now=now)
     if turn is None:

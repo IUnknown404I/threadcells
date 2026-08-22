@@ -4,7 +4,7 @@ from unittest.mock import call, patch
 
 import pytest
 
-from cli_agent_orchestrator.clients.tmux import TmuxClient
+from cli_agent_orchestrator.clients.tmux import TMUX_COMMAND_TIMEOUT_SECONDS, TmuxClient
 
 
 @pytest.fixture
@@ -42,21 +42,25 @@ class TestSendKeys:
             ["tmux", "load-buffer", "-b", "cao_abcd1234", "-"],
             input=b"hello",
             check=True,
+            timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
         )
         # paste-buffer with -p (bracketed paste)
         assert calls[1] == call(
             ["tmux", "paste-buffer", "-p", "-b", "cao_abcd1234", "-t", "sess:win"],
             check=True,
+            timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
         )
         # send Enter
         assert calls[2] == call(
             ["tmux", "send-keys", "-t", "sess:win", "Enter"],
             check=True,
+            timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
         )
         # delete-buffer (best-effort)
         assert calls[3] == call(
             ["tmux", "delete-buffer", "-b", "cao_abcd1234"],
             check=False,
+            timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
         )
 
     def test_multiline_message(self, client, mock_subprocess, mock_uuid):
@@ -69,6 +73,7 @@ class TestSendKeys:
             ["tmux", "load-buffer", "-b", "cao_abcd1234", "-"],
             input=msg.encode(),
             check=True,
+            timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
         )
 
     def test_special_characters(self, client, mock_subprocess, mock_uuid):
@@ -103,6 +108,7 @@ class TestSendKeys:
         assert last_call == call(
             ["tmux", "delete-buffer", "-b", "cao_abcd1234"],
             check=False,
+            timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
         )
 
     def test_unique_buffer_per_call(self, client, mock_subprocess):
@@ -130,10 +136,12 @@ class TestSendKeys:
         assert calls[2] == call(
             ["tmux", "send-keys", "-t", "sess:win", "Enter"],
             check=True,
+            timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
         )
         assert calls[3] == call(
             ["tmux", "send-keys", "-t", "sess:win", "Enter"],
             check=True,
+            timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
         )
 
     def test_large_message(self, client, mock_subprocess, mock_uuid):

@@ -138,7 +138,7 @@ class TestCreateFlow:
                     "__truediv__": lambda self, x: type(
                         "FakeFile",
                         (),
-                        {"write_text": lambda self, t: None},
+                        {"write_text": lambda self, t, **kw: None},
                     )(),
                 },
             )()
@@ -177,7 +177,7 @@ class TestCreateFlow:
                         "__truediv__": lambda self, x: type(
                             "FakeFile",
                             (),
-                            {"write_text": lambda self, t: None},
+                            {"write_text": lambda self, t, **kw: None},
                         )(),
                     },
                 )()
@@ -224,7 +224,7 @@ class TestCreateFlow:
                     "__truediv__": lambda self, x: type(
                         "FakeFile",
                         (),
-                        {"write_text": lambda self, t: None},
+                        {"write_text": lambda self, t, **kw: None},
                     )(),
                 },
             )()

@@ -5,6 +5,12 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from cli_agent_orchestrator.clients.tmux import (
+    TMUX_COMMAND_TIMEOUT_SECONDS,
+    TmuxCommandTimeout,
+    _BoundedTmuxServer,
+)
+
 
 @pytest.fixture
 def tmux():
@@ -17,7 +23,22 @@ def tmux():
 
         client = TmuxClient()
         client.server = mock_server
+        client._start_credential_free_bootstrap = MagicMock(return_value="cao-bootstrap-test")
         yield client
+
+
+def test_tmux_server_control_commands_have_a_secret_safe_deadline():
+    server = _BoundedTmuxServer(socket_name="bounded-test", config_file="/dev/null")
+    expired = __import__("subprocess").TimeoutExpired(["tmux"], 10)
+    with (
+        patch("cli_agent_orchestrator.clients.tmux.shutil.which", return_value="/usr/bin/tmux"),
+        patch("cli_agent_orchestrator.clients.tmux.subprocess.run", side_effect=expired) as run,
+        pytest.raises(TmuxCommandTimeout, match="exceeded 10 seconds") as raised,
+    ):
+        server.cmd("list-sessions")
+
+    assert "list-sessions" not in str(raised.value)
+    assert run.call_args.kwargs["timeout"] == TMUX_COMMAND_TIMEOUT_SECONDS
 
 
 # ── _resolve_and_validate_working_directory ──────────────────────────
@@ -60,7 +81,63 @@ class TestCreateSession:
         result = tmux.create_session("ses", "my-window", "tid1", str(tmp_path))
 
         assert result == "my-window"
+        tmux._start_credential_free_bootstrap.assert_called_once_with(str(tmp_path))
         tmux.server.new_session.assert_called_once()
+        assert tmux.server.new_session.call_args.kwargs["session_name"] == "ses"
+        tmux.server.cmd.assert_called_once_with("kill-session", "-t", "cao-bootstrap-test")
+
+    def test_create_session_bootstraps_tmux_without_terminal_credentials(
+        self, tmux, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("CAO_TERMINAL_AUTH_TOKEN", "parent-secret")
+        mock_window = MagicMock(name="window")
+        mock_window.name = "my-window"
+        mock_session = MagicMock(windows=[mock_window])
+        tmux.server.new_session.return_value = mock_session
+
+        tmux.create_session(
+            "ses",
+            "my-window",
+            "tid1",
+            str(tmp_path),
+            terminal_auth_token="child-secret",
+            runtime_generation="generation-1",
+        )
+
+        tmux._start_credential_free_bootstrap.assert_called_once_with(str(tmp_path))
+        environment = tmux.server.new_session.call_args.kwargs["environment"]
+        assert environment["CAO_TERMINAL_AUTH_TOKEN"] == "child-secret"
+
+    def test_bootstrap_client_uses_a_minimal_environment(self, tmux, tmp_path, monkeypatch):
+        monkeypatch.setenv("CAO_TERMINAL_AUTH_TOKEN", "parent-secret")
+        monkeypatch.setenv("CAO_TERMINAL_ID", "parent-terminal")
+        monkeypatch.setenv("CAO_RUNTIME_GENERATION", "parent-generation")
+        monkeypatch.setenv("PROVIDER_SECRET", "provider-secret")
+        tmux.server.socket_path = None
+        tmux.server.socket_name = "safe-bootstrap"
+        tmux.server.config_file = "/dev/null"
+
+        with patch("cli_agent_orchestrator.clients.tmux.subprocess.run") as run:
+            from cli_agent_orchestrator.clients.tmux import TmuxClient
+
+            bootstrap = TmuxClient._start_credential_free_bootstrap(tmux, str(tmp_path))
+
+        command = run.call_args.args[0]
+        environment = run.call_args.kwargs["env"]
+        assert bootstrap.startswith("cao-bootstrap-")
+        assert command[1:5] == ["-L", "safe-bootstrap", "-f", "/dev/null"]
+        assert bootstrap in command
+        assert environment
+        assert not any(key.startswith("CAO_") for key in environment)
+        assert "PROVIDER_SECRET" not in environment
+
+    def test_bootstrap_failure_creates_no_real_session(self, tmux, tmp_path):
+        tmux._start_credential_free_bootstrap.side_effect = RuntimeError("bootstrap failed")
+
+        with pytest.raises(RuntimeError, match="bootstrap failed"):
+            tmux.create_session("ses", "w", "tid1", str(tmp_path))
+
+        tmux.server.new_session.assert_not_called()
 
     def test_create_session_never_injects_operator_secret_reference(
         self, tmux, tmp_path, monkeypatch
@@ -269,6 +346,198 @@ class TestExactPaneTarget:
         with pytest.raises(PaneTargetError) as raised:
             tmux.exact_pane_target("ses", "win")
         assert raised.value.reason_code == "EXIT_INVENTORY_UNCERTAIN"
+
+    def test_runtime_target_binds_exact_pane_pid_and_terminal_identity(self, tmux, tmp_path):
+        pane = MagicMock()
+        pane.pane_id = "%7"
+        pane.cmd.return_value.stdout = ["0 bash"]
+        self._target(tmux, [pane])
+        process = tmp_path / "4242"
+        process.mkdir()
+        (process / "environ").write_bytes(
+            b"PATH=/bin\0CAO_TERMINAL_ID=closed00\0CAO_RUNTIME_GENERATION=gen-1\0"
+        )
+        (process / "stat").write_text(
+            "4242 (bash) " + " ".join(["S", *(["0"] * 18), "777"]),
+            encoding="utf-8",
+        )
+        completed = MagicMock(stdout="4242\tgen-1\n")
+
+        with patch("cli_agent_orchestrator.clients.tmux.subprocess.run", return_value=completed):
+            target = tmux.exact_runtime_target("ses", "win", proc_root=tmp_path)
+
+        assert target.pane_id == "%7"
+        assert target.pane_pid == 4242
+        assert target.current_command == "bash"
+        assert target.terminal_id == "closed00"
+        assert target.runtime_generation == "gen-1"
+        assert target.process_start_ticks == 777
+
+    def test_runtime_target_fails_closed_without_terminal_identity(self, tmux, tmp_path):
+        from cli_agent_orchestrator.clients.tmux import PaneTargetError
+
+        pane = MagicMock()
+        pane.pane_id = "%7"
+        pane.cmd.return_value.stdout = ["0 bash"]
+        self._target(tmux, [pane])
+        process = tmp_path / "4242"
+        process.mkdir()
+        (process / "environ").write_bytes(b"PATH=/bin\0CAO_RUNTIME_GENERATION=gen-1\0")
+        (process / "stat").write_text(
+            "4242 (bash) " + " ".join(["S", *(["0"] * 18), "777"]),
+            encoding="utf-8",
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.clients.tmux.subprocess.run",
+                return_value=MagicMock(stdout="4242\tgen-1\n"),
+            ),
+            pytest.raises(PaneTargetError) as raised,
+        ):
+            tmux.exact_runtime_target("ses", "win", proc_root=tmp_path)
+        assert raised.value.reason_code == "RUNTIME_IDENTITY_UNKNOWN"
+
+    def test_legacy_runtime_generation_is_bound_to_same_process_identity(self, tmux, tmp_path):
+        pane = MagicMock()
+        pane.pane_id = "%7"
+        pane.cmd.return_value.stdout = ["0 codex"]
+        self._target(tmux, [pane])
+        process = tmp_path / "4242"
+        process.mkdir()
+        (process / "environ").write_bytes(b"CAO_TERMINAL_ID=legacy00\0")
+        (process / "stat").write_text(
+            "4242 (bash) " + " ".join(["S", *(["0"] * 18), "777"]),
+            encoding="utf-8",
+        )
+        results = [
+            MagicMock(stdout="4242\n"),
+            MagicMock(returncode=0),
+            MagicMock(stdout="4242\tgen-legacy\n"),
+        ]
+        with patch(
+            "cli_agent_orchestrator.clients.tmux.subprocess.run", side_effect=results
+        ) as run:
+            target = tmux.bind_legacy_runtime_generation(
+                "ses", "win", "legacy00", "gen-legacy", proc_root=tmp_path
+            )
+        assert target.runtime_generation == "gen-legacy"
+        assert target.process_start_ticks == 777
+        assert target.generation_inherited is False
+        assert run.call_args_list[1].args[0] == [
+            "tmux",
+            "if-shell",
+            "-F",
+            "-t",
+            "%7",
+            "#{==:#{pane_pid},4242}",
+            "set-option -p -t %7 @cao_runtime_generation gen-legacy",
+            "",
+        ]
+
+    def test_runtime_retirement_uses_generation_fence_and_confirms_pane_absent(
+        self, tmux, tmp_path
+    ):
+        from cli_agent_orchestrator.clients.tmux import RuntimePaneTarget
+
+        target = RuntimePaneTarget("%7", 4242, "bash", "closed00", "gen-1", 777)
+        process = tmp_path / "4242"
+        process.mkdir()
+        (process / "environ").write_bytes(
+            b"CAO_TERMINAL_ID=closed00\0CAO_RUNTIME_GENERATION=gen-1\0"
+        )
+        (process / "stat").write_text(
+            "4242 (bash) " + " ".join(["S", *(["0"] * 18), "777"]),
+            encoding="utf-8",
+        )
+        # Killing the pane can also destroy its last tmux session, in which
+        # case if-shell itself may report nonzero even though retirement won.
+        results = [
+            MagicMock(returncode=0, stdout="4242\tbash\tgen-1\n"),
+            MagicMock(returncode=1),
+            MagicMock(returncode=0, stdout="%8 4343\n"),
+        ]
+        with patch(
+            "cli_agent_orchestrator.clients.tmux.subprocess.run", side_effect=results
+        ) as run:
+            assert tmux.retire_runtime_pane(target, proc_root=tmp_path) is True
+
+        tmux.server.cmd.assert_not_called()
+        assert run.call_args_list[1].args[0] == [
+            "tmux",
+            "if-shell",
+            "-F",
+            "-t",
+            "%7",
+            "#{&&:#{&&:#{==:#{pane_pid},4242},#{==:#{pane_current_command},bash}},#{==:#{@cao_runtime_generation},gen-1}}",
+            "pipe-pane -t %7 ; kill-pane -t %7",
+            "",
+        ]
+        assert run.call_args_list[2].args[0] == [
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id} #{pane_pid}",
+        ]
+
+    @pytest.mark.parametrize(
+        "display,start_ticks",
+        [
+            ("4343\tbash\tgen-1\n", 777),
+            ("4242\tcodex\tgen-1\n", 777),
+            ("4242\tbash\tgen-2\n", 777),
+            ("4242\tbash\tgen-1\n", 778),
+        ],
+    )
+    def test_runtime_retirement_preserves_replacement_without_mutation(
+        self, tmux, tmp_path, display, start_ticks
+    ):
+        from cli_agent_orchestrator.clients.tmux import RuntimePaneTarget
+
+        target = RuntimePaneTarget("%7", 4242, "bash", "closed00", "gen-1", 777)
+        process = tmp_path / "4242"
+        process.mkdir()
+        (process / "environ").write_bytes(
+            b"CAO_TERMINAL_ID=closed00\0CAO_RUNTIME_GENERATION=gen-1\0"
+        )
+        (process / "stat").write_text(
+            "4242 (bash) " + " ".join(["S", *(["0"] * 18), str(start_ticks)]),
+            encoding="utf-8",
+        )
+        with patch(
+            "cli_agent_orchestrator.clients.tmux.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout=display),
+        ) as run:
+            assert tmux.retire_runtime_pane(target, proc_root=tmp_path) is False
+        assert run.call_count == 1
+        tmux.server.cmd.assert_not_called()
+
+    def test_runtime_retirement_predicate_failure_has_no_unconditional_side_effect(
+        self, tmux, tmp_path
+    ):
+        from cli_agent_orchestrator.clients.tmux import RuntimePaneTarget
+
+        target = RuntimePaneTarget("%7", 4242, "bash", "closed00", "gen-1", 777)
+        process = tmp_path / "4242"
+        process.mkdir()
+        (process / "environ").write_bytes(
+            b"CAO_TERMINAL_ID=closed00\0CAO_RUNTIME_GENERATION=gen-1\0"
+        )
+        (process / "stat").write_text(
+            "4242 (bash) " + " ".join(["S", *(["0"] * 18), "777"]),
+            encoding="utf-8",
+        )
+        results = [
+            MagicMock(returncode=0, stdout="4242\tbash\tgen-1\n"),
+            MagicMock(returncode=0),
+            MagicMock(returncode=0, stdout="%7 4343\n"),
+        ]
+        with patch(
+            "cli_agent_orchestrator.clients.tmux.subprocess.run", side_effect=results
+        ) as run:
+            assert tmux.retire_runtime_pane(target, proc_root=tmp_path) is False
+        assert run.call_args_list[1].args[0][-2] == ("pipe-pane -t %7 ; kill-pane -t %7")
+        tmux.server.cmd.assert_not_called()
 
 
 # ── get_history ──────────────────────────────────────────────────────

@@ -15,7 +15,14 @@ class TestTmuxClientWorkingDirectory:
     @pytest.fixture(autouse=True)
     def mock_tmux_server(self):
         """Mock libtmux.Server for all tests in this class."""
-        with patch("cli_agent_orchestrator.clients.tmux.libtmux.Server") as mock_server_class:
+        with (
+            patch("cli_agent_orchestrator.clients.tmux._BoundedTmuxServer") as mock_server_class,
+            patch.object(
+                TmuxClient,
+                "_start_credential_free_bootstrap",
+                return_value="cao-bootstrap-test",
+            ),
+        ):
             self.mock_server_class = mock_server_class
             self.mock_server = MagicMock()
             mock_server_class.return_value = self.mock_server

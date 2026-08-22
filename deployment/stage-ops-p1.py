@@ -408,6 +408,34 @@ def main() -> int:
     ):
         fail("CANDIDATE_ARGUMENTS_INCOMPLETE")
     config = json.loads(config_source.read_text(encoding="utf-8"))
+    # The packaged file is intentionally host-neutral. Staging binds the
+    # canonical ThreadCells ownership root atomically so Housekeeping cannot
+    # silently inspect an unrelated default tree.
+    root = args.agent_control_root.resolve()
+    runtime_user = root.owner()
+    config.update(
+        root=str(root),
+        lock_dir=str(root / "state/cao/locks"),
+        release_staging_lock=str(root / "state/cao/locks/release-staging.lock"),
+        release_metadata=str(root / "state/cao/release-metadata.json"),
+        release_roots=[str(root / "releases")],
+        runtime_user=runtime_user,
+        playwright_manifest_roots=[str(root / "sources"), str(root / "projects")],
+        playwright_browser_cache=str(root / "cache/ms-playwright"),
+        package_caches=[
+            {"name": "uv", "path": str(root / "cache/uv"), "command": ["uv", "cache", "prune"]},
+            {
+                "name": "pnpm",
+                "path": str(root / "cache/pnpm"),
+                "command": ["pnpm", "store", "prune"],
+            },
+            {
+                "name": "npm",
+                "path": str(root / "cache/npm"),
+                "command": ["npm", "cache", "clean", "--force"],
+            },
+        ],
+    )
     if (
         config.get("max_resident_supervisors") != 5
         or config.get("max_provider_executions") != 3
@@ -455,7 +483,7 @@ def main() -> int:
                 args.expected_commit,
             )
     targets[0].parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(config_source, targets[0])
+    targets[0].write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     targets[0].chmod(0o644)
     for name, target in zip(required_units, targets[1:5]):
         target.parent.mkdir(parents=True, exist_ok=True)

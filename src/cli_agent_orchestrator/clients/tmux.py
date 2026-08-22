@@ -2,11 +2,14 @@
 
 import logging
 import os
+import re
+import shutil
 import subprocess
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import libtmux
 from libtmux._internal.query_list import ObjectDoesNotExist
@@ -20,6 +23,93 @@ _OPERATOR_AUTH_REFERENCE_ENVS = {
     "THREADMESH_OPERATOR_SECRET_FILE",
     "THREADMESH_OPERATOR_VERIFIER_FILE",
 }
+_TMUX_BOOTSTRAP_ENV_VARS = {
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "TMPDIR",
+    "TMUX_TMPDIR",
+    "USER",
+    "XDG_RUNTIME_DIR",
+}
+TMUX_COMMAND_TIMEOUT_SECONDS = 10.0
+
+
+class TmuxCommandTimeout(RuntimeError):
+    """A local tmux control client exceeded its bounded response window."""
+
+
+@dataclass(frozen=True)
+class _TmuxCommandResult:
+    """Small libtmux-compatible result for one bounded client command."""
+
+    cmd: list[str]
+    returncode: int
+    stdout: list[str]
+    stderr: list[str]
+
+
+class _BoundedTmuxServer(libtmux.Server):
+    """libtmux server whose control clients cannot wait forever.
+
+    libtmux's default command runner calls ``Popen.communicate()`` without a
+    timeout. A wedged tmux server could therefore retain a request or recovery
+    worker indefinitely. Every Session/Window/Pane object delegates back to
+    this server method, so this boundary covers both direct and enriched-object
+    commands without changing libtmux's higher-level object model.
+    """
+
+    def cmd(self, cmd: str, *args: Any, target: str | int | None = None) -> _TmuxCommandResult:
+        executable = shutil.which("tmux")
+        if executable is None:
+            raise RuntimeError("tmux executable is unavailable")
+        command: list[str] = [executable]
+        if self.socket_name:
+            command.append(f"-L{self.socket_name}")
+        if self.socket_path:
+            command.append(f"-S{self.socket_path}")
+        if self.config_file:
+            command.append(f"-f{self.config_file}")
+        if self.colors == 256:
+            command.append("-2")
+        elif self.colors == 88:
+            command.append("-8")
+        elif self.colors is not None:
+            raise ValueError(f"Unsupported tmux color mode: {self.colors}")
+        command.append(cmd)
+        if target is not None:
+            command.extend(["-t", str(target)])
+        command.extend(str(argument) for argument in args)
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                errors="backslashreplace",
+                timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            # Do not include the command: transient new-session arguments can
+            # contain a terminal-scoped capability.
+            raise TmuxCommandTimeout(
+                f"tmux control command exceeded {TMUX_COMMAND_TIMEOUT_SECONDS:g} seconds"
+            ) from exc
+        stdout = completed.stdout.splitlines()
+        stderr = [line for line in completed.stderr.splitlines() if line]
+        if cmd == "has-session" and stderr and not stdout:
+            stdout = [stderr[0]]
+        return _TmuxCommandResult(
+            cmd=command,
+            returncode=completed.returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
 
 
 @dataclass(frozen=True)
@@ -28,6 +118,19 @@ class PaneDeliveryTarget:
 
     pane_id: str
     current_command: str
+
+
+@dataclass(frozen=True)
+class RuntimePaneTarget:
+    """Exact process-backed pane identity used only for runtime retirement."""
+
+    pane_id: str
+    pane_pid: int
+    current_command: str
+    terminal_id: str
+    runtime_generation: str
+    process_start_ticks: int
+    generation_inherited: bool = True
 
 
 class PaneTargetError(RuntimeError):
@@ -42,7 +145,7 @@ class TmuxClient:
     """Simplified tmux client for basic operations."""
 
     def __init__(self) -> None:
-        self.server = libtmux.Server()
+        self.server = _BoundedTmuxServer()
 
     # Directories that should never be used as working directories.
     # Prevents user-supplied paths from pointing at sensitive system locations.
@@ -138,6 +241,52 @@ class TmuxClient:
 
         return real_path
 
+    def _start_credential_free_bootstrap(self, working_directory: str) -> str:
+        """Start or join tmux through a client with a minimal safe environment.
+
+        The first tmux client becomes the long-lived server when none exists.
+        A libtmux session environment controls its child pane but does not
+        sanitize the client environment inherited by that server process.
+        """
+        bootstrap_session_name = f"cao-bootstrap-{uuid.uuid4().hex}"
+        bootstrap_environment = {
+            key: value for key, value in os.environ.items() if key in _TMUX_BOOTSTRAP_ENV_VARS
+        }
+        executable = shutil.which("tmux", path=bootstrap_environment.get("PATH"))
+        if executable is None:
+            raise RuntimeError("tmux executable is unavailable")
+        command = [executable]
+        socket_path = getattr(self.server, "socket_path", None)
+        socket_name = getattr(self.server, "socket_name", None)
+        config_file = getattr(self.server, "config_file", None)
+        if socket_path:
+            command.extend(["-S", str(socket_path)])
+        elif socket_name:
+            command.extend(["-L", str(socket_name)])
+        if config_file:
+            command.extend(["-f", str(config_file)])
+        command.extend(
+            [
+                "new-session",
+                "-d",
+                "-s",
+                bootstrap_session_name,
+                "-n",
+                "bootstrap",
+                "-c",
+                working_directory,
+            ]
+        )
+        subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=bootstrap_environment,
+            timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
+        )
+        return bootstrap_session_name
+
     def create_session(
         self,
         session_name: str,
@@ -145,8 +294,10 @@ class TmuxClient:
         terminal_id: str,
         working_directory: Optional[str] = None,
         terminal_auth_token: Optional[str] = None,
+        runtime_generation: Optional[str] = None,
     ) -> str:
         """Create detached tmux session with initial window and return window name."""
+        bootstrap_session_name: Optional[str] = None
         try:
             working_directory = self._resolve_and_validate_working_directory(working_directory)
 
@@ -170,9 +321,18 @@ class TmuxClient:
                 and (k in allowed_vars or not any(k.startswith(p) for p in blocked_prefixes))
             }
             environment["CAO_TERMINAL_ID"] = terminal_id
+            if runtime_generation:
+                environment["CAO_RUNTIME_GENERATION"] = runtime_generation
             if terminal_auth_token:
                 environment["CAO_TERMINAL_AUTH_TOKEN"] = terminal_auth_token
 
+            # When no tmux server exists, the first ``new-session`` client is
+            # also the long-lived server process. tmux retains that original
+            # command line, so passing a terminal credential with the first
+            # session would expose it in process inventory for the lifetime of
+            # the server. Create a short-lived credential-free session first;
+            # the real session is then created by an ordinary transient client.
+            bootstrap_session_name = self._start_credential_free_bootstrap(working_directory)
             session = self.server.new_session(
                 session_name=session_name,
                 window_name=window_name,
@@ -186,10 +346,32 @@ class TmuxClient:
             window_name_result = session.windows[0].name
             if window_name_result is None:
                 raise ValueError(f"Window name is None for session {session_name}")
+            pane = session.windows[0].active_pane
+            if runtime_generation:
+                if pane is None or not pane.pane_id:
+                    raise RuntimeError("Could not bind runtime generation to the initial pane")
+                self.server.cmd(
+                    "set-option",
+                    "-p",
+                    "-t",
+                    pane.pane_id,
+                    "@cao_runtime_generation",
+                    runtime_generation,
+                )
             return window_name_result
         except Exception as e:
             logger.error(f"Failed to create session {session_name}: {e}")
             raise
+        finally:
+            if bootstrap_session_name is not None:
+                try:
+                    self.server.cmd("kill-session", "-t", bootstrap_session_name)
+                except Exception:
+                    logger.warning(
+                        "Could not retire credential-free tmux bootstrap session %s",
+                        bootstrap_session_name,
+                        exc_info=True,
+                    )
 
     def create_window(
         self,
@@ -198,6 +380,7 @@ class TmuxClient:
         terminal_id: str,
         working_directory: Optional[str] = None,
         terminal_auth_token: Optional[str] = None,
+        runtime_generation: Optional[str] = None,
     ) -> str:
         """Create window in session and return window name."""
         try:
@@ -218,6 +401,9 @@ class TmuxClient:
                 environment={
                     "CAO_TERMINAL_ID": terminal_id,
                     **(
+                        {"CAO_RUNTIME_GENERATION": runtime_generation} if runtime_generation else {}
+                    ),
+                    **(
                         {"CAO_TERMINAL_AUTH_TOKEN": terminal_auth_token}
                         if terminal_auth_token
                         else {}
@@ -231,6 +417,18 @@ class TmuxClient:
             window_name_result = window.name
             if window_name_result is None:
                 raise ValueError(f"Window name is None for session {session_name}")
+            if runtime_generation:
+                pane = window.active_pane
+                if pane is None or not pane.pane_id:
+                    raise RuntimeError("Could not bind runtime generation to the new pane")
+                self.server.cmd(
+                    "set-option",
+                    "-p",
+                    "-t",
+                    pane.pane_id,
+                    "@cao_runtime_generation",
+                    runtime_generation,
+                )
             return window_name_result
         except Exception as e:
             logger.error(f"Failed to create window in session {session_name}: {e}")
@@ -264,14 +462,16 @@ class TmuxClient:
         buf_name = f"cao_{uuid.uuid4().hex[:8]}"
         try:
             logger.info(f"send_keys: {target} - keys: {keys}")
-            subprocess.run(
+            result = subprocess.run(
                 ["tmux", "load-buffer", "-b", buf_name, "-"],
                 input=keys.encode(),
                 check=True,
+                timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
             )
             subprocess.run(
                 ["tmux", "paste-buffer", "-p", "-b", buf_name, "-t", target],
                 check=True,
+                timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
             )
             # Brief delay to let the TUI process the bracketed paste end sequence
             # before sending Enter. Without this, some TUIs (e.g., Claude Code 2.x)
@@ -286,6 +486,7 @@ class TmuxClient:
                 subprocess.run(
                     ["tmux", "send-keys", "-t", target, "Enter"],
                     check=True,
+                    timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
                 )
             logger.debug(f"Sent keys to {target}")
         except Exception as e:
@@ -295,6 +496,7 @@ class TmuxClient:
             subprocess.run(
                 ["tmux", "delete-buffer", "-b", buf_name],
                 check=False,
+                timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
             )
 
     def send_keys_via_paste(self, session_name: str, window_name: str, text: str) -> None:
@@ -374,7 +576,11 @@ class TmuxClient:
             target = pane_id or f"{session_name}:{window_name}"
             logger.info(f"send_special_key: {target} - key: {key}")
             if pane_id is not None:
-                subprocess.run(["tmux", "send-keys", "-t", pane_id, key], check=True)
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", pane_id, key],
+                    check=True,
+                    timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
+                )
             else:
                 session = self.server.sessions.get(session_name=session_name)
                 if not session:
@@ -453,7 +659,7 @@ class TmuxClient:
             )
         pane = panes[0]
         pane_id = getattr(pane, "pane_id", None)
-        if not isinstance(pane_id, str) or not pane_id.startswith("%"):
+        if not isinstance(pane_id, str) or not re.fullmatch(r"%[0-9]+", pane_id):
             raise PaneTargetError(
                 "EXIT_INVENTORY_UNCERTAIN",
                 f"Could not establish an exact pane for '{session_name}:{window_name}'",
@@ -478,6 +684,235 @@ class TmuxClient:
                 "EXIT_INVENTORY_UNCERTAIN", f"Exact pane '{pane_id}' has no live command"
             )
         return PaneDeliveryTarget(pane_id=pane_id, current_command=command)
+
+    def exact_runtime_target(
+        self,
+        session_name: str,
+        window_name: str,
+        *,
+        proc_root: Path = Path("/proc"),
+    ) -> RuntimePaneTarget:
+        """Resolve a pane to its inherited durable terminal identity.
+
+        Window names are reusable and therefore are not retirement authority.
+        The exact tmux pane id, its current shell PID, and the launch-time
+        ``CAO_TERMINAL_ID`` inherited by that process must all agree.
+        """
+        target = self.exact_pane_target(session_name, window_name)
+        try:
+            result = subprocess.run(
+                [
+                    "tmux",
+                    "display-message",
+                    "-p",
+                    "-t",
+                    target.pane_id,
+                    "#{pane_pid}\t#{@cao_runtime_generation}",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
+            )
+            raw_pid, runtime_generation = result.stdout.rstrip("\n").split("\t", 1)
+            if not raw_pid.isdigit() or int(raw_pid) <= 1:
+                raise ValueError("invalid pane pid")
+            pane_pid = int(raw_pid)
+            environ = (proc_root / str(pane_pid) / "environ").read_bytes()
+            stat = (proc_root / str(pane_pid) / "stat").read_text(encoding="utf-8")
+            suffix = stat[stat.rfind(")") + 2 :].split()
+            process_start_ticks = int(suffix[19])
+            if process_start_ticks <= 0 or not runtime_generation:
+                raise ValueError("invalid launch generation")
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            raise PaneTargetError(
+                "RUNTIME_IDENTITY_UNCERTAIN",
+                f"Could not establish process identity for exact pane '{target.pane_id}'",
+            ) from exc
+        terminal_id = ""
+        inherited_generation = ""
+        for item in environ.split(b"\0"):
+            if item.startswith(b"CAO_TERMINAL_ID="):
+                terminal_id = item.partition(b"=")[2].decode("utf-8", errors="strict")
+            elif item.startswith(b"CAO_RUNTIME_GENERATION="):
+                inherited_generation = item.partition(b"=")[2].decode("utf-8", errors="strict")
+        if not terminal_id:
+            raise PaneTargetError(
+                "RUNTIME_IDENTITY_UNKNOWN",
+                f"Exact pane '{target.pane_id}' has no complete runtime identity",
+            )
+        if inherited_generation and inherited_generation != runtime_generation:
+            raise PaneTargetError(
+                "RUNTIME_GENERATION_MISMATCH",
+                f"Exact pane '{target.pane_id}' has inconsistent runtime generation",
+            )
+        return RuntimePaneTarget(
+            pane_id=target.pane_id,
+            pane_pid=pane_pid,
+            current_command=target.current_command,
+            terminal_id=terminal_id,
+            runtime_generation=runtime_generation,
+            process_start_ticks=process_start_ticks,
+            generation_inherited=bool(inherited_generation),
+        )
+
+    def bind_legacy_runtime_generation(
+        self,
+        session_name: str,
+        window_name: str,
+        expected_terminal_id: str,
+        runtime_generation: str,
+        *,
+        proc_root: Path = Path("/proc"),
+    ) -> RuntimePaneTarget:
+        """Bind an additive generation to one positively identified legacy pane.
+
+        Existing panes cannot have their process environment rewritten. The
+        exact process start identity and inherited terminal ID therefore fence
+        the one-time pane option, which is re-observed before it is persisted.
+        """
+        target = self.exact_pane_target(session_name, window_name)
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", target.pane_id, "#{pane_pid}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
+        )
+        raw_pid = result.stdout.strip()
+        if not raw_pid.isdigit() or int(raw_pid) <= 1:
+            raise PaneTargetError("RUNTIME_IDENTITY_UNCERTAIN", "Invalid legacy pane PID")
+        pane_pid = int(raw_pid)
+        try:
+            environ = (proc_root / str(pane_pid) / "environ").read_bytes().split(b"\0")
+            stat = (proc_root / str(pane_pid) / "stat").read_text(encoding="utf-8")
+            suffix = stat[stat.rfind(")") + 2 :].split()
+            process_start_ticks = int(suffix[19])
+        except (OSError, ValueError, IndexError) as exc:
+            raise PaneTargetError(
+                "RUNTIME_IDENTITY_UNCERTAIN", "Could not inspect legacy process identity"
+            ) from exc
+        expected = f"CAO_TERMINAL_ID={expected_terminal_id}".encode()
+        if expected not in environ:
+            raise PaneTargetError(
+                "RUNTIME_IDENTITY_UNKNOWN", "Legacy pane terminal identity does not match"
+            )
+        predicate = f"#{{==:#{{pane_pid}},{pane_pid}}}"
+        subprocess.run(
+            [
+                "tmux",
+                "if-shell",
+                "-F",
+                "-t",
+                target.pane_id,
+                predicate,
+                (
+                    f"set-option -p -t {target.pane_id} "
+                    f"@cao_runtime_generation {runtime_generation}"
+                ),
+                "",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
+        )
+        rebound = self.exact_runtime_target(session_name, window_name, proc_root=proc_root)
+        if (
+            rebound.pane_id != target.pane_id
+            or rebound.pane_pid != pane_pid
+            or rebound.process_start_ticks != process_start_ticks
+            or rebound.terminal_id != expected_terminal_id
+            or rebound.runtime_generation != runtime_generation
+        ):
+            raise PaneTargetError(
+                "RUNTIME_GENERATION_MISMATCH", "Legacy runtime changed during reconciliation"
+            )
+        return rebound
+
+    def retire_runtime_pane(
+        self, target: RuntimePaneTarget, *, proc_root: Path = Path("/proc")
+    ) -> bool:
+        """Retire only a still-matching launch generation at an idle shell.
+
+        Observation is repeated immediately before the conditional tmux
+        mutation. The tmux predicate rechecks pane PID, command, and the
+        pane-scoped immutable generation before either stopping capture or
+        killing the pane.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "tmux",
+                    "display-message",
+                    "-p",
+                    "-t",
+                    target.pane_id,
+                    "#{pane_pid}\t#{pane_current_command}\t#{@cao_runtime_generation}",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
+            )
+            raw_pid, command, runtime_generation = result.stdout.rstrip("\n").split("\t", 2)
+            if not raw_pid.isdigit():
+                return False
+            current_pid = int(raw_pid)
+            if (
+                current_pid != target.pane_pid
+                or command != target.current_command
+                or runtime_generation != target.runtime_generation
+            ):
+                return False
+            stat = (proc_root / str(current_pid) / "stat").read_text(encoding="utf-8")
+            suffix = stat[stat.rfind(")") + 2 :].split()
+            if int(suffix[19]) != target.process_start_ticks:
+                return False
+            environ = (proc_root / str(current_pid) / "environ").read_bytes().split(b"\0")
+            expected_terminal = f"CAO_TERMINAL_ID={target.terminal_id}".encode()
+            expected_generation = f"CAO_RUNTIME_GENERATION={target.runtime_generation}".encode()
+            if expected_terminal not in environ or (
+                target.generation_inherited and expected_generation not in environ
+            ):
+                return False
+            predicate = (
+                "#{&&:"
+                f"#{{&&:#{{==:#{{pane_pid}},{target.pane_pid}}},"
+                f"#{{==:#{{pane_current_command}},{target.current_command}}}}},"
+                f"#{{==:#{{@cao_runtime_generation}},{target.runtime_generation}}}}}"
+            )
+            subprocess.run(
+                [
+                    "tmux",
+                    "if-shell",
+                    "-F",
+                    "-t",
+                    target.pane_id,
+                    predicate,
+                    f"pipe-pane -t {target.pane_id} ; kill-pane -t {target.pane_id}",
+                    "",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
+            )
+            probe = subprocess.run(
+                ["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=TMUX_COMMAND_TIMEOUT_SECONDS,
+            )
+            if probe.returncode != 0:
+                return "no server running" in probe.stderr.lower()
+            return all(
+                line.split(maxsplit=1)[:1] != [target.pane_id] for line in probe.stdout.splitlines()
+            )
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError) as exc:
+            logger.warning("Failed to retire exact runtime pane %s: %s", target.pane_id, exc)
+            return False
 
     def get_history(
         self, session_name: str, window_name: str, tail_lines: Optional[int] = None

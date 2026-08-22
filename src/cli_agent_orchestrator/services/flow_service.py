@@ -16,6 +16,7 @@ from cli_agent_orchestrator.clients.database import get_flow as db_get_flow
 from cli_agent_orchestrator.clients.database import get_flows_to_run as db_get_flows_to_run
 from cli_agent_orchestrator.clients.database import list_flows as db_list_flows
 from cli_agent_orchestrator.clients.database import update_flow_enabled as db_update_flow_enabled
+from cli_agent_orchestrator.clients.database import update_flow_next_run as db_update_flow_next_run
 from cli_agent_orchestrator.clients.database import (
     update_flow_run_times as db_update_flow_run_times,
 )
@@ -216,13 +217,14 @@ def execute_flow(name: str) -> bool:
             if "output" not in output:
                 raise ValueError("Script output missing 'output' field")
 
-        # Update last_run and calculate next_run
+        # Calculate the next schedule now, but record last_run only after a
+        # skip decision or a successfully admitted agent launch.
         now = datetime.now()
         next_run = _get_next_run_time(flow.schedule)
-        db_update_flow_run_times(name, last_run=now, next_run=next_run)
 
         # Check if we should execute
         if not output["execute"]:
+            db_update_flow_run_times(name, last_run=now, next_run=next_run)
             logger.info(f"Flow {name}: skipped (execute=false)")
             return False
 
@@ -282,10 +284,19 @@ def execute_flow(name: str) -> bool:
             if not queue_workflow_input_for_provider(terminal.id, turn_id, rendered_prompt):
                 raise
 
+        db_update_flow_run_times(name, last_run=now, next_run=next_run)
+
         logger.info(f"Flow {name}: launched session {session_name}")
         return True
 
     except Exception as e:
+        # A scheduled failure must not hot-loop every daemon tick. Preserve the
+        # previous truthful last_run and advance only the next attempt.
+        try:
+            if "flow" in locals() and flow is not None:
+                db_update_flow_next_run(name, _get_next_run_time(flow.schedule))
+        except Exception:
+            logger.warning("Flow %s next-run recovery failed", name)
         logger.error(f"Flow {name} failed: {e}", exc_info=True)
         raise
 

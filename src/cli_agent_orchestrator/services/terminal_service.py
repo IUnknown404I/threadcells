@@ -17,11 +17,13 @@ Terminal Workflow:
 4. delete_terminal() → Cleans up provider, database record, and logging
 """
 
+import gzip
 import hashlib
 import logging
 import os
 import secrets
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -50,7 +52,9 @@ from cli_agent_orchestrator.clients.database import (
     mark_terminal_runtime_running,
     persist_terminal_result_snapshot,
     promote_terminal_context_role_to_supervisor,
+    reconcile_legacy_terminal_runtime_identity,
     release_provider_execution,
+    replace_starting_terminal_runtime_identity,
     terminal_has_queued_provider_turn,
     terminal_requires_result_snapshot,
     update_last_active,
@@ -80,6 +84,64 @@ from cli_agent_orchestrator.utils.terminal import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _capture_created_runtime_identity(
+    session_name: str, window_name: str, terminal_id: str, runtime_generation: str
+):
+    """Capture and validate the process identity created for one launch."""
+    target = tmux_client.exact_runtime_target(session_name, window_name)
+    if (
+        target.terminal_id != terminal_id
+        or target.runtime_generation != runtime_generation
+        or not target.generation_inherited
+    ):
+        raise RuntimeError("Created pane did not retain its launch identity")
+    return target
+
+
+def reconcile_legacy_runtime_identities() -> int:
+    """Add a restart-safe process fence to intact pre-generation runtimes."""
+    reconciled = 0
+    for metadata in list_all_terminals():
+        if metadata.get("runtime_lifecycle") not in {
+            TerminalLifecycle.STARTING.value,
+            TerminalLifecycle.RUNNING.value,
+        }:
+            continue
+        if metadata.get("runtime_generation"):
+            continue
+        legacy_fields = (
+            metadata.get("runtime_pane_id"),
+            metadata.get("runtime_pane_pid"),
+            metadata.get("runtime_process_start_ticks"),
+        )
+        if any(value not in (None, "") for value in legacy_fields):
+            logger.warning(
+                "Terminal %s has a partial legacy runtime identity; preserving it",
+                metadata.get("id"),
+            )
+            continue
+        generation = str(uuid.uuid4())
+        try:
+            target = tmux_client.bind_legacy_runtime_generation(
+                str(metadata["tmux_session"]),
+                str(metadata["tmux_window"]),
+                str(metadata["id"]),
+                generation,
+            )
+        except Exception:
+            # Missing historical panes are normal; uncertainty is preserved.
+            continue
+        if reconcile_legacy_terminal_runtime_identity(
+            str(metadata["id"]),
+            pane_id=target.pane_id,
+            pane_pid=target.pane_pid,
+            runtime_generation=target.runtime_generation,
+            process_start_ticks=target.process_start_ticks,
+        ):
+            reconciled += 1
+    return reconciled
 
 
 def _wake_queued_provider_execution(registry: PluginRegistry | None = None) -> None:
@@ -224,6 +286,7 @@ def reconcile_terminal_runtime(terminal_id: str, provider=None) -> bool | None:
     if not metadata:
         return None
     if metadata.get("runtime_lifecycle") == "exited":
+        _retire_exited_terminal_runtime(metadata)
         return True
     observation = _runtime_death_observation(metadata, provider)
     if observation is not True:
@@ -248,7 +311,92 @@ def reconcile_terminal_runtime(terminal_id: str, provider=None) -> bool | None:
         except Exception:
             # Never interpolate exceptions that may contain a bot-token URL.
             logger.warning("Telegram terminal-failure notification failed safely")
+    _retire_exited_terminal_runtime(metadata)
     return True
+
+
+def _retire_exited_terminal_runtime(
+    metadata: dict, *, proc_root: Path = Path("/proc")
+) -> bool | None:
+    """Retire an exited runtime without deleting its durable terminal history.
+
+    This is deliberately fail-closed. A reusable tmux name is never sufficient:
+    the exact pane's inherited terminal identity must match the exited DB row.
+    """
+    terminal_id = str(metadata.get("id") or "")
+    if not terminal_id:
+        return None
+    current = get_terminal_metadata(terminal_id)
+    if not current or current.get("runtime_lifecycle") != TerminalLifecycle.EXITED.value:
+        return None
+    try:
+        target = tmux_client.exact_runtime_target(
+            str(current["tmux_session"]), str(current["tmux_window"]), proc_root=proc_root
+        )
+    except PaneTargetError as exc:
+        if exc.reason_code in {
+            "EXIT_SESSION_MISSING",
+            "EXIT_WINDOW_MISSING",
+            "EXIT_PANE_MISSING",
+            "EXIT_PANE_DEAD",
+        }:
+            return True
+        logger.warning("Exited runtime %s was preserved: %s", terminal_id, exc.reason_code)
+        return None
+    except Exception:
+        logger.warning("Exited runtime %s inventory failed safely", terminal_id)
+        return None
+    if target.terminal_id != terminal_id:
+        logger.warning("Exited runtime %s identity mismatch; pane preserved", terminal_id)
+        return None
+    durable_identity = (
+        current.get("runtime_pane_id"),
+        current.get("runtime_pane_pid"),
+        current.get("runtime_generation"),
+        current.get("runtime_process_start_ticks"),
+    )
+    observed_identity = (
+        target.pane_id,
+        target.pane_pid,
+        target.runtime_generation,
+        target.process_start_ticks,
+    )
+    if any(value in (None, "") for value in durable_identity):
+        logger.warning(
+            "Exited runtime %s has no persisted launch identity; pane preserved", terminal_id
+        )
+        return None
+    origin = current.get("runtime_generation_origin")
+    if origin not in {"launch", "reconciled"} or (
+        (origin == "launch") != bool(target.generation_inherited)
+    ):
+        logger.warning(
+            "Exited runtime %s generation provenance mismatch; pane preserved", terminal_id
+        )
+        return None
+    if durable_identity != observed_identity:
+        logger.warning("Exited runtime %s launch generation mismatch; pane preserved", terminal_id)
+        return None
+    if target.current_command not in SHELL_COMMANDS:
+        logger.warning("Exited runtime %s is not at a shell; pane preserved", terminal_id)
+        return None
+    if not tmux_client.retire_runtime_pane(target, proc_root=proc_root):
+        logger.warning("Exited runtime %s could not be retired", terminal_id)
+        return False
+    logger.info(
+        "Retired exited runtime pane for terminal %s; durable history retained", terminal_id
+    )
+    return True
+
+
+def retire_exited_terminal_runtime(
+    terminal_id: str, *, proc_root: Path = Path("/proc")
+) -> bool | None:
+    """Public idempotent retirement entry point for Housekeeping/recovery."""
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        return None
+    return _retire_exited_terminal_runtime(metadata, proc_root=proc_root)
 
 
 def _canonical_worktree(working_directory: Optional[str]) -> str:
@@ -377,10 +525,13 @@ def _create_terminal_after_admission(
     persisted_metadata: Dict | None = None
     terminal_id: str | None = None
     window_name: str | None = None
+    runtime_generation = str(uuid.uuid4())
+    runtime_target = None
     terminal_auth_token = secrets.token_urlsafe(32)
     terminal_auth_token_sha256 = hashlib.sha256(
         terminal_auth_token.encode("utf-8", "strict")
     ).hexdigest()
+    session_lifetime_id = str(uuid.uuid4()) if new_session else None
     if structured_owner_authorized is None:
         structured_owner_authorized = privileged_launch
     try:
@@ -415,6 +566,7 @@ def _create_terminal_after_admission(
                 terminal_id,
                 working_directory,
                 terminal_auth_token,
+                runtime_generation,
             )
             if isinstance(created_window_name, str) and created_window_name:
                 window_name = created_window_name
@@ -433,7 +585,12 @@ def _create_terminal_after_admission(
                 terminal_id,
                 working_directory,
                 terminal_auth_token,
+                runtime_generation,
             )
+
+        runtime_target = _capture_created_runtime_identity(
+            session_name, window_name, terminal_id, runtime_generation
+        )
 
         # Step 3: Persist terminal metadata to database
         try:
@@ -465,6 +622,11 @@ def _create_terminal_after_admission(
                 provider_config_revision_id=provider_config_revision_id,
                 launch_snapshot=launch_snapshot,
                 owner_grant_canonical_worktree=owner_grant_canonical_worktree,
+                session_lifetime_id=session_lifetime_id,
+                runtime_pane_id=runtime_target.pane_id,
+                runtime_pane_pid=runtime_target.pane_pid,
+                runtime_generation=runtime_target.runtime_generation,
+                runtime_process_start_ticks=runtime_target.process_start_ticks,
             )
             metadata_persisted = True
         except (
@@ -565,6 +727,7 @@ def _create_terminal_after_admission(
                 first_error,
             )
             provider_manager.cleanup_provider(terminal_id)
+            runtime_generation = str(uuid.uuid4())
             if session_created:
                 if not tmux_client.kill_session(session_name):
                     raise RuntimeError("Failed to clean tmux session before Codex startup retry")
@@ -574,6 +737,7 @@ def _create_terminal_after_admission(
                     terminal_id,
                     working_directory,
                     terminal_auth_token,
+                    runtime_generation,
                 )
             else:
                 if not tmux_client.kill_window(session_name, window_name):
@@ -584,7 +748,19 @@ def _create_terminal_after_admission(
                     terminal_id,
                     working_directory,
                     terminal_auth_token,
+                    runtime_generation,
                 )
+            runtime_target = _capture_created_runtime_identity(
+                session_name, window_name, terminal_id, runtime_generation
+            )
+            if not replace_starting_terminal_runtime_identity(
+                terminal_id,
+                pane_id=runtime_target.pane_id,
+                pane_pid=runtime_target.pane_pid,
+                runtime_generation=runtime_target.runtime_generation,
+                process_start_ticks=runtime_target.process_start_ticks,
+            ):
+                raise RuntimeError("Could not publish the retry pane launch identity")
             tmux_client.pipe_pane(session_name, window_name, str(log_path))
             try:
                 start_provider()
@@ -1401,21 +1577,39 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
 
+        def durable_output() -> str:
+            log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
+            if log_path.is_file() and not log_path.is_symlink():
+                return log_path.read_text(encoding="utf-8", errors="replace")
+            compressed = log_path.with_suffix(log_path.suffix + ".gz")
+            if compressed.is_file() and not compressed.is_symlink():
+                with gzip.open(compressed, "rt", encoding="utf-8", errors="replace") as stream:
+                    return stream.read()
+            raise ValueError(f"Durable output is unavailable for terminal {terminal_id}")
+
+        def capture_output(*, tail_lines: int | None = None) -> str:
+            try:
+                return tmux_client.get_history(
+                    metadata["tmux_session"], metadata["tmux_window"], tail_lines=tail_lines
+                )
+            except Exception:
+                if metadata.get("runtime_lifecycle") == TerminalLifecycle.EXITED.value:
+                    return durable_output()
+                raise
+
         if mode == OutputMode.FULL:
-            return tmux_client.get_history(metadata["tmux_session"], metadata["tmux_window"])
+            return capture_output()
         elif mode == OutputMode.LAST:
             provider = provider_manager.get_provider(terminal_id)
             if provider is None:
+                if metadata.get("runtime_lifecycle") == TerminalLifecycle.EXITED.value:
+                    return durable_output()
                 raise ValueError(f"Provider not found for terminal {terminal_id}")
 
             # Capability check: providers that need deeper scrollback for extraction
             # opt in by defining ``extraction_tail_lines``. Base providers don't.
             extract_lines = getattr(provider, "extraction_tail_lines", None)
-            full_output = tmux_client.get_history(
-                metadata["tmux_session"],
-                metadata["tmux_window"],
-                tail_lines=extract_lines,
-            )
+            full_output = capture_output(tail_lines=extract_lines)
 
             retries = provider.extraction_retries
             last_err: Exception | None = None
@@ -1423,11 +1617,7 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                 try:
                     if attempt > 0:
                         time.sleep(10.0)
-                        full_output = tmux_client.get_history(
-                            metadata["tmux_session"],
-                            metadata["tmux_window"],
-                            tail_lines=extract_lines,
-                        )
+                        full_output = capture_output(tail_lines=extract_lines)
                     return provider.extract_last_message_from_script(full_output)
                 except ValueError as exc:
                     last_err = exc

@@ -13,10 +13,12 @@ import subprocess
 import termios
 from contextlib import asynccontextmanager
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional, cast
 from urllib.parse import unquote, urlsplit
 
+from anyio import CapacityLimiter, to_thread
 from fastapi import (
     FastAPI,
     Header,
@@ -33,6 +35,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from starlette.concurrency import run_in_threadpool
 from watchdog.observers.polling import PollingObserver
 
 from cli_agent_orchestrator.clients.database import (
@@ -79,10 +82,10 @@ from cli_agent_orchestrator.services import (
     telegram_notification_service,
     terminal_attachments,
     terminal_service,
+    ui_read_model_service,
     usage_service,
     workflow_service,
 )
-from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
 from cli_agent_orchestrator.services.inbox_service import LogFileHandler
 from cli_agent_orchestrator.services.operations_service import (
     AdmissionDenied,
@@ -102,6 +105,60 @@ from cli_agent_orchestrator.utils.skills import (
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 logger = logging.getLogger(__name__)
+
+# Home and Agents use only durable read models, while legacy operational routes
+# may still invoke tmux, provider status parsing, /proc inventory, or log I/O.
+# Keep both classes off the event loop and independently bounded so a burst of
+# historical/compatibility requests cannot consume AnyIO's entire process-wide
+# worker pool. Four concurrent reads cover the normal UI maximum without making
+# server resource use proportional to historical terminal count.
+UI_READ_MAX_CONCURRENCY = 4
+OPERATIONAL_IO_MAX_CONCURRENCY = 4
+WORKFLOW_IO_MAX_CONCURRENCY = 1
+_ui_read_limiter = CapacityLimiter(UI_READ_MAX_CONCURRENCY)
+_operational_io_limiter = CapacityLimiter(OPERATIONAL_IO_MAX_CONCURRENCY)
+_workflow_io_limiter = CapacityLimiter(WORKFLOW_IO_MAX_CONCURRENCY)
+_blocking_runner_tasks: set[asyncio.Task[Any]] = set()
+
+
+def _finish_blocking_runner(task: asyncio.Task[Any]) -> None:
+    """Retain and observe detached runners until their worker really exits."""
+    _blocking_runner_tasks.discard(task)
+    if not task.cancelled():
+        task.exception()
+
+
+async def _run_bounded_blocking(function, *args, limiter: CapacityLimiter, **kwargs):
+    # A raw asyncio Task.cancel() can cancel an AnyIO host task even when its
+    # synchronous worker cannot be stopped. If run_sync() were awaited here
+    # directly, the limiter token could be released while that worker remained
+    # alive, allowing disconnect storms to grow beyond the advertised lane
+    # capacity. The nested runner owns the token and is shielded from caller
+    # cancellation; a cancelled request stops waiting, while the completion-
+    # owned runner remains retained until the worker exits and releases it.
+    runner = asyncio.create_task(
+        to_thread.run_sync(
+            partial(function, *args, **kwargs),
+            abandon_on_cancel=False,
+            limiter=limiter,
+        )
+    )
+    _blocking_runner_tasks.add(runner)
+    runner.add_done_callback(_finish_blocking_runner)
+    return await asyncio.shield(runner)
+
+
+async def _run_ui_read(function, *args, **kwargs):
+    return await _run_bounded_blocking(function, *args, limiter=_ui_read_limiter, **kwargs)
+
+
+async def _run_operational_io(function, *args, **kwargs):
+    return await _run_bounded_blocking(function, *args, limiter=_operational_io_limiter, **kwargs)
+
+
+async def _run_workflow_io(function, *args, **kwargs):
+    """Reserve one bounded worker for durable continuation reconciliation."""
+    return await _run_bounded_blocking(function, *args, limiter=_workflow_io_limiter, **kwargs)
 
 
 class WorkflowInputRequest(BaseModel):
@@ -215,10 +272,10 @@ async def flow_daemon():
     logger.info("Flow daemon started")
     while True:
         try:
-            flows = flow_service.get_flows_to_run()
+            flows = await _run_operational_io(flow_service.get_flows_to_run)
             for flow in flows:
                 try:
-                    executed = flow_service.execute_flow(flow.name)
+                    executed = await _run_operational_io(flow_service.execute_flow, flow.name)
                     if executed:
                         logger.info(f"Flow '{flow.name}' executed successfully")
                     else:
@@ -231,18 +288,50 @@ async def flow_daemon():
         await asyncio.sleep(60)
 
 
-async def workflow_daemon():
+async def runtime_recovery_daemon():
+    """Reconcile legacy live pane identities after health is available."""
+    try:
+        reconciled = await _run_operational_io(terminal_service.reconcile_legacy_runtime_identities)
+        if reconciled:
+            logger.info("Reconciled %s legacy runtime launch identities", reconciled)
+    except Exception as exc:
+        logger.warning("Runtime identity recovery deferred: %s", exc)
+
+
+async def _workflow_daemon_pause() -> None:
+    await asyncio.sleep(1)
+
+
+async def _workflow_reconciliation_tick(
+    registry: PluginRegistry | None, startup_recovery_pending: bool
+) -> bool:
+    """Run one isolated recovery tick and return whether startup replay remains due."""
+    performed_full_recovery = False
+    try:
+        if startup_recovery_pending:
+            await _run_workflow_io(inbox_service.reconcile_pending_messages, registry)
+            startup_recovery_pending = False
+            performed_full_recovery = True
+        else:
+            await _run_workflow_io(inbox_service.reconcile_handoff_continuations, registry)
+    except Exception as exc:
+        logger.warning("Workflow daemon Inbox reconciliation failed: %s", exc)
+    try:
+        if not startup_recovery_pending and not performed_full_recovery:
+            await _run_workflow_io(workflow_service.reconcile_open_workflows, registry)
+    except Exception as exc:
+        logger.warning("Workflow daemon reconciliation failed: %s", exc)
+    return startup_recovery_pending
+
+
+async def workflow_daemon(registry: PluginRegistry | None = None, *, recover_startup: bool = False):
     """Recover direct handoff completions before advancing durable workflow turns."""
+    startup_recovery_pending = recover_startup
     while True:
-        try:
-            inbox_service.reconcile_handoff_continuations()
-        except Exception as exc:
-            logger.warning("Workflow daemon handoff reconciliation failed: %s", exc)
-        try:
-            workflow_service.reconcile_open_workflows()
-        except Exception as exc:
-            logger.warning("Workflow daemon reconciliation failed: %s", exc)
-        await asyncio.sleep(1)
+        startup_recovery_pending = await _workflow_reconciliation_tick(
+            registry, startup_recovery_pending
+        )
+        await _workflow_daemon_pause()
 
 
 # Response Models
@@ -342,20 +431,16 @@ async def lifespan(app: FastAPI):
     await registry.load()
     app.state.plugin_registry = registry
 
-    # Run cleanup in background
-    asyncio.create_task(asyncio.to_thread(cleanup_old_data))
-
     # Start flow daemon as background task
     daemon_task = asyncio.create_task(flow_daemon())
-    workflow_task = asyncio.create_task(workflow_daemon())
+    workflow_task = asyncio.create_task(workflow_daemon(registry, recover_startup=True))
+    runtime_recovery_task = asyncio.create_task(runtime_recovery_daemon())
 
     # Start inbox watcher
     inbox_observer = PollingObserver(timeout=INBOX_POLLING_INTERVAL)
     inbox_observer.schedule(LogFileHandler(registry), str(TERMINAL_LOG_DIR), recursive=False)
     inbox_observer.start()
     logger.info("Inbox watcher started (PollingObserver)")
-    inbox_service.reconcile_pending_messages(registry)
-    workflow_service.reconcile_open_workflows(registry)
 
     yield
 
@@ -373,6 +458,11 @@ async def lifespan(app: FastAPI):
     workflow_task.cancel()
     try:
         await workflow_task
+    except asyncio.CancelledError:
+        pass
+    runtime_recovery_task.cancel()
+    try:
+        await runtime_recovery_task
     except asyncio.CancelledError:
         pass
 
@@ -450,7 +540,7 @@ async def list_agent_profiles_endpoint() -> List[Dict]:
     try:
         from cli_agent_orchestrator.utils.agent_profiles import list_agent_profiles
 
-        return list_agent_profiles()
+        return await _run_operational_io(list_agent_profiles)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -461,6 +551,11 @@ async def list_agent_profiles_endpoint() -> List[Dict]:
 @app.get("/agents/providers")
 async def list_providers_endpoint() -> List[Dict]:
     """Compatibility projection sourced from the canonical adapter registry."""
+    return await _run_operational_io(_list_providers)
+
+
+def _list_providers() -> List[Dict]:
+    """Run provider executable/config preflight away from the ASGI event loop."""
     legacy_binaries = {
         "kiro_cli": "kiro-cli",
         "claude_code": "claude",
@@ -510,7 +605,7 @@ async def get_agent_dirs_endpoint() -> Dict:
 @app.get("/settings/orchestration-capacity")
 async def get_orchestration_capacity_endpoint() -> Dict:
     """Expose effective read-only policy and live utilization from one backend truth."""
-    return get_resource_status()
+    return await _run_operational_io(get_resource_status)
 
 
 @app.put("/settings/orchestration-capacity")
@@ -1249,7 +1344,7 @@ async def set_agent_dirs_endpoint(body: AgentDirsUpdate) -> Dict:
 
 @app.get("/settings/branding")
 async def get_runtime_branding() -> Dict:
-    return branding_service.get_branding()
+    return await _run_operational_io(branding_service.get_branding)
 
 
 @app.patch("/settings/branding")
@@ -1321,7 +1416,7 @@ async def get_skill_content(name: str) -> SkillContentResponse:
 async def list_projects() -> List[Project]:
     """List server-authoritative launch projects, default first."""
     try:
-        return project_service.list_projects()
+        return await _run_operational_io(project_service.list_projects)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
@@ -1330,7 +1425,7 @@ async def list_projects() -> List[Project]:
 async def usage_statistics() -> Dict:
     """Read-only approximate operational usage, not a billing surface."""
     try:
-        return usage_service.statistics()
+        return await _run_operational_io(usage_service.statistics)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
 
@@ -1472,10 +1567,60 @@ async def _cleanup_session_created_after_cancellation(
         )
 
 
+def _csv_query_values(value: Optional[str]) -> List[str]:
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
+
+
+@app.get("/ui/overview")
+async def get_ui_overview() -> Dict:
+    return await _run_ui_read(ui_read_model_service.get_overview)
+
+
+@app.get("/ui/sessions")
+async def list_ui_session_summaries(
+    limit: int = Query(default=10, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    query: str = Query(default="", max_length=200),
+) -> Dict:
+    return await _run_ui_read(
+        ui_read_model_service.list_session_summaries,
+        limit=limit,
+        offset=offset,
+        query=query,
+    )
+
+
+@app.get("/ui/agents")
+async def list_ui_agent_summaries(
+    limit: int = Query(default=40, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    session_id: Optional[str] = Query(default=None, max_length=200),
+    query: str = Query(default="", max_length=200),
+    activity: Optional[str] = Query(default=None, max_length=500),
+    workflow_state: Optional[str] = Query(default=None, max_length=500),
+    profile: Optional[str] = Query(default=None, max_length=1000),
+    home_filter: Optional[str] = Query(default=None, max_length=50),
+) -> Dict:
+    try:
+        return await _run_ui_read(
+            ui_read_model_service.list_agent_summaries,
+            limit=limit,
+            offset=offset,
+            session_id=session_id,
+            query=query,
+            activities=_csv_query_values(activity),
+            workflow_states=_csv_query_values(workflow_state),
+            profiles=_csv_query_values(profile),
+            home_filter=home_filter,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
 @app.get("/sessions")
 async def list_sessions() -> List[Dict]:
     try:
-        return session_service.list_sessions()
+        return await _run_operational_io(session_service.list_sessions)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1486,7 +1631,7 @@ async def list_sessions() -> List[Dict]:
 @app.get("/sessions/{session_name}")
 async def get_session(session_name: str) -> Dict:
     try:
-        return session_service.get_session(session_name)
+        return await _run_operational_io(session_service.get_session, session_name)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -1500,9 +1645,10 @@ async def get_session(session_name: str) -> Dict:
 async def get_session_root_working_directory(session_name: str) -> WorkingDirectoryResponse:
     """Return the original tmux session root directory, when available."""
     try:
-        return WorkingDirectoryResponse(
-            working_directory=session_service.get_session_root_working_directory(session_name)
+        working_directory = await _run_operational_io(
+            session_service.get_session_root_working_directory, session_name
         )
+        return WorkingDirectoryResponse(working_directory=working_directory)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -1515,7 +1661,11 @@ async def get_session_root_working_directory(session_name: str) -> WorkingDirect
 @app.delete("/sessions/{session_name}")
 async def delete_session(request: Request, session_name: str) -> Dict:
     try:
-        result = session_service.delete_session(session_name, registry=get_plugin_registry(request))
+        result = await run_in_threadpool(
+            session_service.delete_session,
+            session_name,
+            registry=get_plugin_registry(request),
+        )
         return {"success": True, **result}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1550,10 +1700,14 @@ async def create_terminal_in_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
-        launch_directory, project_context = project_service.resolve_add_agent_context(
-            session_name, project_id, working_directory
+        launch_directory, project_context = await run_in_threadpool(
+            project_service.resolve_add_agent_context,
+            session_name,
+            project_id,
+            working_directory,
         )
-        result = terminal_service.create_terminal(
+        result = await run_in_threadpool(
+            terminal_service.create_terminal,
             provider=resolved_provider,
             agent_profile=agent_profile,
             session_name=session_name,
@@ -1586,7 +1740,7 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
     try:
         from cli_agent_orchestrator.clients.database import list_terminals_by_session
 
-        return list_terminals_by_session(session_name)
+        return await _run_ui_read(list_terminals_by_session, session_name)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1597,7 +1751,7 @@ async def list_terminals_in_session(session_name: str) -> List[Dict]:
 @app.get("/terminals/{terminal_id}", response_model=Terminal)
 async def get_terminal(terminal_id: TerminalId) -> Terminal:
     try:
-        terminal = terminal_service.get_terminal(terminal_id)
+        terminal = await _run_operational_io(terminal_service.get_terminal, terminal_id)
         return Terminal(**terminal)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1612,7 +1766,9 @@ async def get_terminal(terminal_id: TerminalId) -> Terminal:
 async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDirectoryResponse:
     """Get the current working directory of a terminal's pane."""
     try:
-        working_directory = terminal_service.get_working_directory(terminal_id)
+        working_directory = await _run_operational_io(
+            terminal_service.get_working_directory, terminal_id
+        )
         return WorkingDirectoryResponse(working_directory=working_directory)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1636,7 +1792,7 @@ async def send_terminal_input(
     allowing a caller to provide them previously let a public request suppress
     the admission which fences an older model invocation.
     """
-    return _send_server_bound_input(request, terminal_id, message)
+    return await run_in_threadpool(_send_server_bound_input, request, terminal_id, message)
 
 
 @app.post("/terminals/{terminal_id}/workflow-input")
@@ -1656,7 +1812,7 @@ async def send_terminal_workflow_input(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="message is empty"
         )
-    return _send_server_bound_input(request, terminal_id, body.message)
+    return await run_in_threadpool(_send_server_bound_input, request, terminal_id, body.message)
 
 
 def _send_server_bound_input(
@@ -1723,7 +1879,8 @@ async def send_orchestrated_terminal_input(
     turn_id = resolve_workflow_input_binding(terminal_id, binding)
     if turn_id is None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="input binding is stale")
-    return _send_server_bound_input(
+    return await run_in_threadpool(
+        _send_server_bound_input,
         request,
         terminal_id,
         message,
@@ -1863,7 +2020,7 @@ async def get_terminal_output(
     terminal_id: TerminalId, mode: OutputMode = OutputMode.FULL
 ) -> TerminalOutputResponse:
     try:
-        output = terminal_service.get_output(terminal_id, mode)
+        output = await _run_operational_io(terminal_service.get_output, terminal_id, mode)
         return TerminalOutputResponse(output=output, mode=mode)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -1878,7 +2035,7 @@ async def get_terminal_output(
 async def exit_terminal(terminal_id: TerminalId) -> Dict:
     """Gracefully exit a provider without overstating command delivery."""
     try:
-        result = terminal_service.exit_terminal(terminal_id)
+        result = await run_in_threadpool(terminal_service.exit_terminal, terminal_id)
         return {
             "success": result.success,
             "lifecycle": result.lifecycle,
@@ -1908,8 +2065,10 @@ async def exit_terminal(terminal_id: TerminalId) -> Dict:
 async def delete_terminal(request: Request, terminal_id: TerminalId) -> Dict:
     """Delete a terminal."""
     try:
-        success = terminal_service.delete_terminal(
-            terminal_id, registry=get_plugin_registry(request)
+        success = await run_in_threadpool(
+            terminal_service.delete_terminal,
+            terminal_id,
+            registry=get_plugin_registry(request),
         )
         return {"success": success}
     except ValueError as e:
@@ -1933,7 +2092,9 @@ async def create_inbox_message_endpoint(
         # sender_id is not a capability to finalize a registered child result;
         # authoritative callbacks are persisted directly by MCP send_message
         # after its admitted durable effect is claimed.
-        inbox_msg = create_inbox_message(payload.sender_id, receiver_id, payload.message)
+        inbox_msg = await _run_operational_io(
+            create_inbox_message, payload.sender_id, receiver_id, payload.message
+        )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -1947,8 +2108,10 @@ async def create_inbox_message_endpoint(
     # the terminal becomes idle. Delivery failures must not cause the API
     # to report an error — the message was already persisted above.
     try:
-        inbox_service.check_and_send_pending_messages(
-            receiver_id, registry=get_plugin_registry(request)
+        await _run_operational_io(
+            inbox_service.check_and_send_pending_messages,
+            receiver_id,
+            registry=get_plugin_registry(request),
         )
     except Exception as e:
         logger.warning(f"Immediate delivery attempt failed for {receiver_id}: {e}")
@@ -1966,7 +2129,7 @@ async def create_inbox_message_endpoint(
 @app.get("/delegation-results/{result_id}")
 async def get_delegation_result_endpoint(result_id: str) -> Dict:
     """Read one immutable local-operator delegation result artifact."""
-    result = result_service.read_result(result_id)
+    result = await _run_operational_io(result_service.read_result, result_id)
     if result is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Delegation result not found"
@@ -1987,7 +2150,14 @@ async def list_delegation_results_endpoint(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid result status"
         )
-    return result_service.list_results(terminal_id, session_name, status_param, limit, cursor)
+    return await _run_operational_io(
+        result_service.list_results,
+        terminal_id,
+        session_name,
+        status_param,
+        limit,
+        cursor,
+    )
 
 
 @app.get("/terminals/{terminal_id}/inbox/messages")
@@ -2021,7 +2191,9 @@ async def get_inbox_messages_endpoint(
                 )
 
         # Get messages using existing database function
-        messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
+        messages = await _run_ui_read(
+            get_inbox_messages, terminal_id, limit=limit, status=status_filter
+        )
 
         # Convert to response format
         result = []
@@ -2196,11 +2368,33 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
 # ── Flow management endpoints ────────────────────────────────────────
 
 
+def _create_flow(body: CreateFlowRequest) -> Flow:
+    """Persist and register one flow without blocking the request event loop."""
+    flows_dir = CAO_HOME_DIR / "flows"
+    flows_dir.mkdir(parents=True, exist_ok=True)
+    file_path = flows_dir / f"{body.name}.flow.md"
+    _launch_directory, project_context = _resolve_launch_project(body.project_id, None)
+    frontmatter_lines = [
+        "---",
+        f"name: {body.name}",
+        f'schedule: "{body.schedule}"',
+        f"agent_profile: {body.agent_profile}",
+        f"provider: {body.provider}",
+        *([f"project_id: {body.project_id}"] if body.project_id else []),
+        "---",
+    ]
+    file_path.write_text(
+        "\n".join(frontmatter_lines) + "\n" + body.prompt_template,
+        encoding="utf-8",
+    )
+    return flow_service.add_flow(str(file_path), project_context=project_context)
+
+
 @app.get("/flows", response_model=List[Flow])
 async def list_flows() -> List[Flow]:
     """List all flows."""
     try:
-        return flow_service.list_flows()
+        return await _run_operational_io(flow_service.list_flows)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -2212,7 +2406,7 @@ async def list_flows() -> List[Flow]:
 async def get_flow(name: str) -> Flow:
     """Get a specific flow by name."""
     try:
-        return flow_service.get_flow(name)
+        return await _run_operational_io(flow_service.get_flow, name)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -2230,28 +2424,7 @@ async def create_flow(body: CreateFlowRequest) -> Flow:
     registers it via flow_service.add_flow().
     """
     try:
-        flows_dir = CAO_HOME_DIR / "flows"
-        flows_dir.mkdir(parents=True, exist_ok=True)
-
-        file_path = flows_dir / f"{body.name}.flow.md"
-
-        launch_directory, project_context = _resolve_launch_project(body.project_id, None)
-
-        # Build YAML frontmatter content
-        frontmatter_lines = [
-            "---",
-            f"name: {body.name}",
-            f'schedule: "{body.schedule}"',
-            f"agent_profile: {body.agent_profile}",
-            f"provider: {body.provider}",
-            *([f"project_id: {body.project_id}"] if body.project_id else []),
-            "---",
-        ]
-        file_content = "\n".join(frontmatter_lines) + "\n" + body.prompt_template
-
-        file_path.write_text(file_content)
-
-        return flow_service.add_flow(str(file_path), project_context=project_context)
+        return await _run_operational_io(_create_flow, body)
     except ProjectResolutionError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except ValueError as e:
@@ -2267,7 +2440,7 @@ async def create_flow(body: CreateFlowRequest) -> Flow:
 async def remove_flow(name: str) -> Dict:
     """Remove a flow."""
     try:
-        flow_service.remove_flow(name)
+        await _run_operational_io(flow_service.remove_flow, name)
         return {"success": True}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -2282,7 +2455,7 @@ async def remove_flow(name: str) -> Dict:
 async def enable_flow(name: str) -> Dict:
     """Enable a flow."""
     try:
-        flow_service.enable_flow(name)
+        await _run_operational_io(flow_service.enable_flow, name)
         return {"success": True}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -2297,7 +2470,7 @@ async def enable_flow(name: str) -> Dict:
 async def disable_flow(name: str) -> Dict:
     """Disable a flow."""
     try:
-        flow_service.disable_flow(name)
+        await _run_operational_io(flow_service.disable_flow, name)
         return {"success": True}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -2312,7 +2485,7 @@ async def disable_flow(name: str) -> Dict:
 async def run_flow(name: str) -> Dict:
     """Manually execute a flow."""
     try:
-        executed = flow_service.execute_flow(name)
+        executed = await _run_operational_io(flow_service.execute_flow, name)
         return {"executed": executed}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))

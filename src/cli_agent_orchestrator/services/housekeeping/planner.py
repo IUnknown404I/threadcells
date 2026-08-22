@@ -545,7 +545,192 @@ def discover_runtime_candidates(
     )
     candidates.extend(browsers)
     candidates.extend(docker)
-    return candidates, [*browser_warnings, *docker_warnings]
+    terminal_runtimes, terminal_warnings = _plan_closed_terminal_runtimes(proc_root=proc_root)
+    candidates.extend(terminal_runtimes)
+    retirement_cleanups, retirement_warnings = _plan_retirement_cleanups(protection=protection)
+    candidates.extend(retirement_cleanups)
+    return candidates, [
+        *browser_warnings,
+        *docker_warnings,
+        *terminal_warnings,
+        *retirement_warnings,
+    ]
+
+
+def _plan_retirement_cleanups(
+    *, protection: ProtectedSet
+) -> tuple[list[HousekeepingCandidate], list[str]]:
+    """Plan exact durable child-cleanup intents without inferring authority."""
+    from cli_agent_orchestrator.clients.database import (
+        list_legacy_child_retirements_for_cleanup,
+        list_pending_child_retirement_cleanups,
+    )
+    from cli_agent_orchestrator.services.terminal_service import (
+        validate_managed_worktree_cleanup,
+    )
+
+    candidates: list[HousekeepingCandidate] = []
+    warnings: list[str] = []
+    try:
+        legacy = list_legacy_child_retirements_for_cleanup()
+        pending = list_pending_child_retirement_cleanups()
+    except Exception:
+        return [], ["retirement_cleanup_inventory_uncertain"]
+
+    rows = [
+        *(dict(item, stage="legacy") for item in legacy),
+        *(dict(item, stage="pending") for item in pending),
+    ]
+    for item in rows:
+        child = str(item.get("child_terminal_id") or "")
+        intent = item.get("intent")
+        stage = str(item["stage"])
+        if not child:
+            warnings.append("retirement_cleanup_identity_unknown")
+            continue
+        if stage == "legacy" and not item.get("identity_proven"):
+            warnings.append(f"retirement_cleanup_identity_unproven:{child}")
+            continue
+        if not isinstance(intent, dict) or intent.get("terminal_id") != child:
+            warnings.append(f"retirement_cleanup_intent_invalid:{child}")
+            continue
+        token = item.get("claim_token")
+        if stage == "pending" and (not isinstance(token, str) or not token):
+            warnings.append(f"retirement_cleanup_claim_unknown:{child}")
+            continue
+
+        protection_reason = None
+        if intent.get("managed"):
+            launch_worktree = intent.get("launch_worktree")
+            if not isinstance(launch_worktree, str) or not launch_worktree.startswith("/"):
+                protection_reason = "RETIREMENT_CLEANUP_IDENTITY_UNPROVEN"
+            else:
+                worktree = Path(launch_worktree)
+                protection_reason = protection.reason(worktree, "ephemeral")
+                if protection_reason is None:
+                    try:
+                        validate_managed_worktree_cleanup(intent)
+                    except Exception:
+                        protection_reason = "MANAGED_WORKTREE_CLEANUP_UNSAFE"
+        payload = {
+            "stage": stage,
+            "parent_terminal_id": str(item.get("parent_terminal_id") or ""),
+            "child_terminal_id": child,
+            "delegation_kind": str(item.get("delegation_kind") or ""),
+            "claim_token": str(token or ""),
+            "intent": json.dumps(intent, sort_keys=True, separators=(",", ":")),
+        }
+        size = 0
+        launch_worktree = intent.get("launch_worktree")
+        if (
+            intent.get("managed")
+            and isinstance(launch_worktree, str)
+            and Path(launch_worktree).is_dir()
+            and not Path(launch_worktree).is_symlink()
+        ):
+            size = _tree_size(Path(launch_worktree))
+        candidates.append(
+            _resource_candidate(
+                category="retirement_cleanup",
+                resource_kind="retirement_cleanup",
+                identity=f"retirement-cleanup:{child}",
+                fingerprint_payload=payload,
+                size=size,
+                action="prune",
+                retention_reason="durably_completed_child_cleanup",
+                protection_reason=protection_reason,
+                attributes=payload,
+            )
+        )
+    return candidates, warnings
+
+
+def _plan_closed_terminal_runtimes(
+    *, proc_root: Path
+) -> tuple[list[HousekeepingCandidate], list[str]]:
+    """Plan exact exited-terminal panes while preserving durable history."""
+    from cli_agent_orchestrator.clients.database import list_all_terminals
+    from cli_agent_orchestrator.clients.tmux import PaneTargetError, tmux_client
+
+    try:
+        terminals = list_all_terminals()
+    except Exception:
+        return [], ["terminal_runtime_inventory_uncertain"]
+    candidates: list[HousekeepingCandidate] = []
+    warnings: list[str] = []
+    absent = {"EXIT_SESSION_MISSING", "EXIT_WINDOW_MISSING", "EXIT_PANE_MISSING", "EXIT_PANE_DEAD"}
+    for terminal in terminals:
+        if terminal.get("runtime_lifecycle") != "exited":
+            continue
+        terminal_id = str(terminal.get("id") or "")
+        if not terminal_id:
+            continue
+        try:
+            target = tmux_client.exact_runtime_target(
+                str(terminal["tmux_session"]), str(terminal["tmux_window"]), proc_root=proc_root
+            )
+        except PaneTargetError as exc:
+            if exc.reason_code not in absent:
+                warnings.append(f"terminal_runtime_preserved:{terminal_id}:{exc.reason_code}")
+            continue
+        except Exception:
+            warnings.append(f"terminal_runtime_preserved:{terminal_id}:INVENTORY_UNCERTAIN")
+            continue
+        protection_reason = None
+        action = "terminate"
+        durable_identity = (
+            terminal.get("runtime_pane_id"),
+            terminal.get("runtime_pane_pid"),
+            terminal.get("runtime_generation"),
+            terminal.get("runtime_process_start_ticks"),
+        )
+        observed_identity = (
+            target.pane_id,
+            target.pane_pid,
+            target.runtime_generation,
+            target.process_start_ticks,
+        )
+        if target.terminal_id != terminal_id:
+            protection_reason = "TERMINAL_RUNTIME_IDENTITY_MISMATCH"
+            action = "preserve"
+        elif any(value in (None, "") for value in durable_identity):
+            protection_reason = "TERMINAL_RUNTIME_GENERATION_UNRECORDED"
+            action = "preserve"
+        elif durable_identity != observed_identity:
+            protection_reason = "TERMINAL_RUNTIME_GENERATION_MISMATCH"
+            action = "preserve"
+        elif terminal.get("runtime_generation_origin") not in {"launch", "reconciled"} or (
+            (terminal.get("runtime_generation_origin") == "launch")
+            != bool(target.generation_inherited)
+        ):
+            protection_reason = "TERMINAL_RUNTIME_GENERATION_PROVENANCE_MISMATCH"
+            action = "preserve"
+        elif target.current_command not in {"bash", "sh", "dash", "zsh", "fish"}:
+            protection_reason = "TERMINAL_RUNTIME_NOT_IDLE_SHELL"
+            action = "preserve"
+        payload = {
+            "terminal_id": terminal_id,
+            "pane_id": target.pane_id,
+            "pane_pid": target.pane_pid,
+            "current_command": target.current_command,
+            "runtime_generation": target.runtime_generation,
+            "process_start_ticks": target.process_start_ticks,
+            "runtime_lifecycle": "exited",
+        }
+        candidates.append(
+            _resource_candidate(
+                category="terminal_runtime",
+                resource_kind="terminal_runtime",
+                identity=f"terminal-runtime:{terminal_id}",
+                fingerprint_payload=payload,
+                size=0,
+                action=action,
+                retention_reason="durably_exited_runtime",
+                protection_reason=protection_reason,
+                attributes={key: str(value) for key, value in payload.items()},
+            )
+        )
+    return candidates, warnings
 
 
 def _plan_logs(

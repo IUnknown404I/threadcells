@@ -113,7 +113,6 @@ test/
 │   ├── test_provider_manager_unit.py
 │   └── test_q_cli_unit.py
 ├── services/                 # Service tests
-│   ├── test_cleanup_service.py
 │   ├── test_flow_service.py
 │   ├── test_inbox_service.py
 │   ├── test_session_service.py
@@ -154,7 +153,6 @@ Some files have limited test coverage due to their nature:
 | **mcp_server/server.py** | 0% | Requires MCP protocol runtime environment. The MCP server runs as a separate process and communicates via the MCP protocol. Testing requires mocking the entire MCP communication layer, which is better handled by integration tests with actual MCP clients. |
 | **clients/tmux.py** | ~30% | Requires real tmux sessions for full coverage. Core `send_keys` behavior (literal mode, chunking) is unit-tested via `test_tmux_send_keys.py`. Operations like session creation and history capture are better covered by integration tests. |
 | **api/main.py** | 44% | FastAPI endpoints require async testing setup with TestClient and running event loops. Endpoints interact with the database, tmux sessions, and providers simultaneously. Better tested via end-to-end integration tests. |
-| **services/cleanup_service.py** | 20% | Background cleanup service that runs in a separate thread, monitoring and cleaning up stale sessions. Requires running processes and real session state to test cleanup logic. |
 | **services/flow_service.py** | 25% | Flow orchestration service that manages complex multi-step agent interactions. Requires complex runtime state including active sessions, message queues, and provider instances. |
 | **clients/database.py** | 80% | Database operations with some edge cases (transaction rollbacks, concurrent access) difficult to test without full database integration. Core CRUD operations are tested. |
 | **providers/base.py** | 81% | Abstract base class with abstract methods that must be implemented by subclasses. The abstract methods themselves cannot be tested directly. All concrete implementations are at 100%. |

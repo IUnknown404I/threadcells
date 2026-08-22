@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import os
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from threading import Barrier
@@ -16,8 +17,10 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 import cli_agent_orchestrator.clients.database as database
+from cli_agent_orchestrator import constants
 from cli_agent_orchestrator.api import main as api_main
 from cli_agent_orchestrator.clients.database import (
+    DEFER_STABLE_READY,
     DEFER_UNADMITTED,
     Base,
     InboxModel,
@@ -51,6 +54,8 @@ from cli_agent_orchestrator.clients.database import (
     mark_workflow_turn_sent,
     materialize_deferred_handoff_result_turn_for_inbox,
     observe_workflow_final,
+    observe_workflow_processing,
+    observe_workflow_ready,
     queue_workflow_turn,
     register_child_assignment,
     register_handoff_child,
@@ -174,6 +179,25 @@ def _workflow_state_bytes(root: str) -> bytes:
             ],
         }
     return json.dumps(image, sort_keys=True, separators=(",", ":")).encode()
+
+
+def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch):
+    database_file = tmp_path / "legacy-workflow.db"
+    with sqlite3.connect(database_file) as connection:
+        connection.execute("CREATE TABLE workflows (id INTEGER PRIMARY KEY)")
+        connection.execute(
+            "CREATE TABLE workflow_turns ("
+            "id INTEGER PRIMARY KEY, claim_generation INTEGER NOT NULL DEFAULT 0, "
+            "claim_token TEXT, claim_expires_at DATETIME, transport_binding TEXT)"
+        )
+    monkeypatch.setattr(constants, "DATABASE_FILE", database_file)
+
+    database._migrate_workflow_turn_columns()
+
+    with sqlite3.connect(database_file) as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(workflow_turns)")}
+    assert "provider_processing_observed_at" in columns
+    assert "provider_ready_observed_at" in columns
 
 
 def _queue_inbox_workflow_turn(root: str, key: str = "inbox-result") -> tuple[int, int]:
@@ -1816,6 +1840,129 @@ def test_f13_effect_ledger_requires_admitted_logical_turn_and_dedupes_restart(wo
         assert effect.workflow_turn_id == turn_id
 
 
+def test_f13_not_admitted_effect_is_retryable_but_completed_effect_is_not(workflow_db):
+    root = "root-effect-not-admitted"
+    turn_id = _start_admitted_input(root)
+
+    first = claim_workflow_effect(root, turn_id, "assign", "review-scope")
+    assert first is not None
+    assert finish_workflow_effect(root, first["id"], first["claim_token"], "not_admitted")
+
+    # A fresh DB session models retry after restart/capacity release. The same
+    # durable row is reclaimed with a new token; a concurrent/late first token
+    # cannot finish the second attempt.
+    second = claim_workflow_effect(root, turn_id, "assign", "review-scope")
+    assert second is not None
+    assert second["id"] == first["id"]
+    assert second["claim_token"] != first["claim_token"]
+    assert not finish_workflow_effect(root, first["id"], first["claim_token"], "completed")
+    assert finish_workflow_effect(root, second["id"], second["claim_token"], "completed")
+    assert claim_workflow_effect(root, turn_id, "assign", "review-scope") is None
+
+
+def test_f13_concurrent_not_admitted_retries_admit_exactly_one_effect(workflow_db):
+    root = "root-effect-not-admitted-race"
+    turn_id = _start_admitted_input(root)
+    first = claim_workflow_effect(root, turn_id, "assign", "same-review")
+    assert first is not None
+    assert finish_workflow_effect(root, first["id"], first["claim_token"], "not_admitted")
+    barrier = Barrier(2)
+
+    def retry():
+        barrier.wait()
+        return claim_workflow_effect(root, turn_id, "assign", "same-review")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _attempt: retry(), range(2)))
+    admitted = [result for result in results if result is not None]
+    assert len(admitted) == 1
+    assert admitted[0]["id"] == first["id"]
+
+
+def test_f13_capacity_retry_ready_final_and_open_successor_are_autonomous(workflow_db, monkeypatch):
+    """Reproduce the 2524 overnight stranding sequence end to end."""
+    root = "root-capacity-ready-continuation"
+    turn_id = start_workflow_input(root)
+    assert turn_id is not None
+    monkeypatch.setenv("CAO_TERMINAL_ID", root)
+    assert asyncio.run(mcp_server.claim_workflow_turn_receipt(turn_id))["accepted"] is True
+
+    capacity_rejection = {
+        "success": False,
+        "terminal_id": None,
+        "message": "terminal admission denied",
+        "reason_code": "WORK_CONTEXT_CAPACITY_EXHAUSTED",
+    }
+    admitted_child = {
+        "success": True,
+        "terminal_id": "reviewer-after-capacity",
+        "message": "assigned",
+    }
+    with patch.object(
+        mcp_server, "_assign_impl", side_effect=[capacity_rejection, admitted_child]
+    ) as assign_impl:
+        rejected = asyncio.run(mcp_server.assign(turn_id, "reviewer_sol_high", "rereview"))
+        retried = asyncio.run(mcp_server.assign(turn_id, "reviewer_sol_high", "rereview"))
+        duplicate = asyncio.run(mcp_server.assign(turn_id, "reviewer_sol_high", "rereview"))
+
+    assert rejected["reason_code"] == "WORK_CONTEXT_CAPACITY_EXHAUSTED"
+    assert retried["success"] is True
+    assert duplicate["reason_code"] == "DUPLICATE_EFFECT"
+    assert assign_impl.call_count == 2
+    with database.SessionLocal() as db:
+        effect = db.query(WorkflowEffectModel).one()
+        assert effect.state == "completed"
+
+    now = datetime(2026, 8, 22, 3, 0, 0)
+    mock_terminal = MagicMock()
+    mock_terminal.get_terminal.return_value = {
+        "status": TerminalStatus.IDLE.value,
+        "lifecycle": "running",
+    }
+    with patch.object(workflow_service, "terminal_service", mock_terminal):
+        # First Ready observation is durable but conservative when PROCESSING
+        # was not sampled. A restart and later watchdog tick own the same turn.
+        assert workflow_service.reconcile_root_workflow(root, now=now) is False
+        with database.SessionLocal() as db:
+            active = db.query(WorkflowTurnModel).filter_by(id=turn_id).one()
+            assert active.provider_ready_observed_at == now
+            assert active.state == "sent"
+
+        assert (
+            workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=31)) is True
+        )
+
+    assert mock_terminal.send_input.call_count == 1
+    sent_message = mock_terminal.send_input.call_args.args[1]
+    assert "The workflow is durably OPEN" in sent_message
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        successor = db.query(WorkflowTurnModel).filter_by(id=workflow.active_turn_id).one()
+        assert successor.kind == "open_final"
+        assert successor.state == "sent"
+        assert workflow.status == "open"
+
+
+def test_f13_processing_cancels_transient_ready_and_shortens_later_final_debounce(
+    workflow_db,
+):
+    root = "root-ready-processing-ready"
+    turn_id = _start_admitted_input(root)
+    now = datetime(2026, 8, 22, 4, 0, 0)
+
+    assert observe_workflow_ready(root, now=now) == DEFER_STABLE_READY
+    assert observe_workflow_processing(root, now=now + timedelta(seconds=1)) is True
+    with database.SessionLocal() as db:
+        turn = db.query(WorkflowTurnModel).filter_by(id=turn_id).one()
+        assert turn.provider_processing_observed_at == now + timedelta(seconds=1)
+        assert turn.provider_ready_observed_at is None
+
+    assert observe_workflow_ready(root, now=now + timedelta(seconds=2)) == DEFER_STABLE_READY
+    assert observe_workflow_ready(root, now=now + timedelta(seconds=4)) == DEFER_STABLE_READY
+    successor = observe_workflow_ready(root, now=now + timedelta(seconds=5))
+    assert isinstance(successor, int)
+
+
 def test_f13_normal_top_level_input_envelope_admits_its_first_delegation(workflow_db, monkeypatch):
     """The first non-continuation input is as capable as a later wake."""
     root = "root-normal-input"
@@ -2380,12 +2527,16 @@ def test_f13_provider_final_does_not_close_active_top_level_mission(workflow_db)
         )
 
 
-def test_f13_provider_final_continuations_pause_open_and_direct_input_resumes(workflow_db):
-    root = "root-bounded-no-progress"
+def test_f13_provider_final_continuations_cross_old_ceiling_until_explicit_transition(
+    workflow_db,
+):
+    root = "root-autonomous-no-progress"
     _start_admitted_input(root)
     now = datetime(2026, 8, 9, 12, 0, 0)
 
-    for step in range(5):
+    # Cross the former five-final ceiling and prove the same OPEN workflow
+    # continues one admitted logical turn at a time without an owner wake.
+    for step in range(12):
         current = now + timedelta(seconds=60 * step)
         successor = observe_workflow_final(root, now=current)
         assert successor is not None
@@ -2393,17 +2544,64 @@ def test_f13_provider_final_continuations_pause_open_and_direct_input_resumes(wo
         assert turn is not None and turn["id"] == successor
         _admit_sent_continuation(root, turn, current + timedelta(seconds=40))
 
-    # A sixth provider-only final exhausts automatic wakes without inventing a
-    # terminal/owner-gate state or another queued paid turn.
-    assert observe_workflow_final(root, now=now + timedelta(seconds=300)) is None
-    assert claim_workflow_turn(root, now=now + timedelta(seconds=600)) is None
     assert get_workflow_status(root) == "open"
-
-    direct_turn = start_workflow_input(root)
-    assert direct_turn is not None
-    assert claim_workflow_turn_receipt(root, direct_turn) is True
     with database.SessionLocal() as db:
         workflow = db.query(WorkflowModel).filter(WorkflowModel.root_terminal_id == root).one()
         assert workflow.status == "open"
-        assert workflow.active_turn_id == direct_turn
-        assert workflow.no_progress_count == 0
+        assert workflow.no_progress_count == 12
+
+    assert set_workflow_terminal_state(root, "terminal", "accepted") is True
+    assert observe_workflow_final(root, now=now + timedelta(seconds=720)) is None
+
+
+def test_f13_repeated_no_progress_final_hits_durable_owner_visible_circuit_breaker(
+    workflow_db, monkeypatch
+):
+    root = "root-provider-loop"
+    _start_admitted_input(root)
+    now = datetime(2026, 8, 9, 12, 0, 0)
+    monkeypatch.setattr(database, "MAX_AUTOMATIC_OPEN_FINAL_NO_PROGRESS", 2)
+    notified = []
+    monkeypatch.setattr(
+        database,
+        "_dispatch_workflow_notification_fail_open",
+        lambda terminal_id, event, workflow_id: notified.append((terminal_id, event, workflow_id)),
+    )
+
+    for step in range(2):
+        current = now + timedelta(seconds=60 * step)
+        successor = observe_workflow_final(root, now=current)
+        assert successor is not None
+        turn = claim_workflow_turn(root, now=current + timedelta(seconds=40))
+        assert turn is not None and turn["id"] == successor
+        _admit_sent_continuation(root, turn, current + timedelta(seconds=40))
+
+    # A fresh DB session models restart recovery: the third no-progress final
+    # atomically finishes the paid turn and enters a visible terminal state.
+    assert observe_workflow_final(root, now=now + timedelta(seconds=120)) is None
+    assert get_workflow_status(root) == "owner_gate"
+    assert claim_workflow_turn(root, now=now + timedelta(seconds=180)) is None
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        assert workflow.no_progress_count == 3
+        assert workflow.terminal_reason == database.OPEN_FINAL_CIRCUIT_BREAKER_REASON
+        assert (
+            db.query(WorkflowTurnModel).filter_by(workflow_id=workflow.id, state="queued").count()
+            == 0
+        )
+    assert len(notified) == 1 and notified[0][:2] == (root, "owner_attention")
+
+    # Deliberate owner input starts a new workflow instead of reviving the
+    # exhausted paid loop, and the new workflow gets a fresh durable budget.
+    resumed = start_workflow_input(root)
+    assert resumed is not None
+    assert claim_workflow_turn_receipt(root, resumed)
+    assert get_workflow_status(root) == "open"
+    with database.SessionLocal() as db:
+        current = (
+            db.query(WorkflowModel)
+            .filter_by(root_terminal_id=root)
+            .order_by(WorkflowModel.id.desc())
+            .first()
+        )
+        assert current is not None and current.no_progress_count == 0

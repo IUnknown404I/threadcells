@@ -77,6 +77,15 @@ _RUNTIME_GENERATION_PATH = "/_internal/runtime-generation"
 # state, so it cannot prove that this sidecar was actually reinitialized with
 # the active runtime code after a promotion.
 _SIDECAR_RUNTIME_GENERATION = os.environ.get(RUNTIME_GENERATION_ENV)
+_SAFE_PRE_EFFECT_ADMISSION_REASONS = {
+    "ADMISSION_FENCE_TIMEOUT",
+    "CONTEXT_INVENTORY_UNAVAILABLE",
+    "PROVIDER_EXECUTION_CAPACITY_EXHAUSTED",
+    "RESIDENT_SUPERVISOR_CAPACITY_EXHAUSTED",
+    "RESOURCE_HEALTH_REJECTED",
+    "TOTAL_PROVIDER_CAPACITY_EXHAUSTED",
+    "WORK_CONTEXT_CAPACITY_EXHAUSTED",
+}
 
 
 class SidecarRuntimeRecoveryRequired(RuntimeError):
@@ -243,6 +252,25 @@ def _finish_privileged_effect(effect: Dict[str, Any], outcome: str) -> None:
     terminal_id = os.environ.get("CAO_TERMINAL_ID")
     if terminal_id:
         finish_workflow_effect(terminal_id, effect["id"], effect["claim_token"], outcome)
+
+
+def _delegation_effect_outcome(result: Any) -> str:
+    """Classify delegation truth at the non-transactional launch boundary."""
+    if isinstance(result, dict):
+        success = bool(result.get("success"))
+        terminal_id = result.get("terminal_id")
+        reason_code = result.get("reason_code")
+    else:
+        success = bool(getattr(result, "success", False))
+        terminal_id = getattr(result, "terminal_id", None)
+        reason_code = getattr(result, "reason_code", None)
+    if success:
+        return "completed"
+    if terminal_id is None and reason_code in _SAFE_PRE_EFFECT_ADMISSION_REASONS:
+        # The API rejected admission before creating a child terminal. Keep the
+        # attempt visible but safely reclaimable under this same logical turn.
+        return "not_admitted"
+    return "indeterminate"
 
 
 def _finish_retired_child(
@@ -1370,7 +1398,7 @@ if ENABLE_WORKING_DIRECTORY:
             await _resume_provider_execution(
                 execution_terminal, logical_turn_id, execution_suspended
             )
-        _finish_privileged_effect(effect, "completed" if result.success else "indeterminate")
+        _finish_privileged_effect(effect, _delegation_effect_outcome(result))
         return result
 
 else:
@@ -1443,7 +1471,7 @@ else:
             await _resume_provider_execution(
                 execution_terminal, logical_turn_id, execution_suspended
             )
-        _finish_privileged_effect(effect, "completed" if result.success else "indeterminate")
+        _finish_privileged_effect(effect, _delegation_effect_outcome(result))
         return result
 
 
@@ -1674,7 +1702,7 @@ if ENABLE_WORKING_DIRECTORY:
         except Exception:
             _finish_privileged_effect(effect, "indeterminate")
             raise
-        _finish_privileged_effect(effect, "completed" if result.get("success") else "indeterminate")
+        _finish_privileged_effect(effect, _delegation_effect_outcome(result))
         return result
 
 else:
@@ -1697,7 +1725,7 @@ else:
         except Exception:
             _finish_privileged_effect(effect, "indeterminate")
             raise
-        _finish_privileged_effect(effect, "completed" if result.get("success") else "indeterminate")
+        _finish_privileged_effect(effect, _delegation_effect_outcome(result))
         return result
 
 

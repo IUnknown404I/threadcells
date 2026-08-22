@@ -81,6 +81,7 @@ class TestTerminalOperations:
             }
         assert {
             "id",
+            "creation_order",
             "launch_worktree",
             "write_enabled",
             "runtime_lifecycle",
@@ -88,6 +89,40 @@ class TestTerminalOperations:
             "runtime_exited_at",
         } <= columns
         assert {"canonical_worktree", "terminal_id", "created_at"} <= lease_columns
+
+    def test_worktree_authority_migration_backfills_stable_creation_order(
+        self, tmp_path, monkeypatch
+    ):
+        database_file = tmp_path / "legacy-creation-order.db"
+        with sqlite3.connect(database_file) as connection:
+            connection.execute("CREATE TABLE terminals (id TEXT PRIMARY KEY)")
+            connection.executemany(
+                "INSERT INTO terminals (id) VALUES (?)",
+                [("z-created-first",), ("a-created-second",), ("m-created-last",)],
+            )
+        monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", database_file)
+
+        assert _migrate_terminal_worktree_authority_columns()
+        with sqlite3.connect(database_file) as connection:
+            first_pass = list(
+                connection.execute(
+                    "SELECT id, creation_order FROM terminals ORDER BY creation_order, id"
+                )
+            )
+        assert [row[0] for row in first_pass] == [
+            "z-created-first",
+            "a-created-second",
+            "m-created-last",
+        ]
+
+        assert _migrate_terminal_worktree_authority_columns()
+        with sqlite3.connect(database_file) as connection:
+            second_pass = list(
+                connection.execute(
+                    "SELECT id, creation_order FROM terminals ORDER BY creation_order, id"
+                )
+            )
+        assert second_pass == first_pass
 
     def test_worktree_authority_migration_backfills_one_deterministic_partial_p1_owner(
         self, tmp_path, monkeypatch

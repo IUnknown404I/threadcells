@@ -24,6 +24,7 @@ from sqlalchemy import (
     func,
     inspect,
     or_,
+    text,
 )
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
@@ -90,6 +91,17 @@ class TerminalModel(Base):
     runtime_lifecycle = Column(String, nullable=True)
     runtime_exit_requested_at = Column(DateTime, nullable=True)
     runtime_exited_at = Column(DateTime, nullable=True)
+    # Exact launch identity for destructive runtime retirement. Names and PIDs
+    # are reusable; the opaque generation is present in both pane metadata and
+    # the inherited shell environment, while process start ticks fence PID reuse.
+    runtime_pane_id = Column(String, nullable=True)
+    runtime_pane_pid = Column(Integer, nullable=True)
+    runtime_generation = Column(String, nullable=True)
+    runtime_generation_origin = Column(String, nullable=True)
+    runtime_process_start_ticks = Column(Integer, nullable=True)
+    # Immutable durable insertion order. IDs, activity timestamps, runtime
+    # presence, and provider response order are not creation-order facts.
+    creation_order = Column(Integer, nullable=True)
     # Revocable child-only capability for the hidden structured handoff submit
     # endpoint.  The plaintext token exists only in the terminal environment.
     auth_token_sha256 = Column(String, nullable=True)
@@ -655,6 +667,12 @@ class WorkflowTurnModel(Base):
     # Opaque capability used only between CAO's MCP transport and API. Unlike a
     # logical turn ID it is not model-selected or publicly enumerable.
     transport_binding = Column(String, nullable=True)
+    # Provider status can move straight from a fast final to Ready/IDLE, and
+    # that observation must survive a server restart. A short durable debounce
+    # prevents a transient pre-processing idle frame from manufacturing a
+    # successor while guaranteeing that a stable Ready OPEN workflow advances.
+    provider_processing_observed_at = Column(DateTime, nullable=True)
+    provider_ready_observed_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now)
 
@@ -688,8 +706,10 @@ class WorkflowEffectModel(Base):
     does *not* pretend that a provider invocation is exactly once.  It does
     make the CAO-owned operation behind an admitted logical turn explicit: a
     duplicate delivery observes the same row and cannot enter the operation
-    again.  A process death while it owns a row is intentionally
-    ``indeterminate`` rather than replayed blindly.
+    again. A process death while it owns a row is intentionally
+    ``indeterminate`` rather than replayed blindly. ``not_admitted`` is
+    different: it records a proven pre-effect rejection and is the only state
+    that may be claimed again after the transient admission condition changes.
     """
 
     __tablename__ = "workflow_effects"
@@ -735,6 +755,9 @@ _telegram_settings_schema_engine_identity: Optional[int] = None
 _control_plane_schema_lock = threading.Lock()
 _control_plane_schema_ready = False
 _control_plane_schema_engine_identity: Optional[int] = None
+_terminal_ui_projection_schema_lock = threading.Lock()
+_terminal_ui_projection_schema_ready = False
+_terminal_ui_projection_schema_engine_identity: Optional[int] = None
 
 CONTROL_PLANE_SCHEMA_VERSION = 1
 # Durable compatibility identifier: deployed databases already use this key.
@@ -757,6 +780,7 @@ def init_db() -> None:
     _ensure_usage_schema()
     _ensure_control_plane_schema()
     _ensure_telegram_settings_schema()
+    _ensure_terminal_ui_projection_schema()
     from cli_agent_orchestrator.services.operations_service import _load_legacy_operations_config
 
     ensure_capacity_settings(_load_legacy_operations_config())
@@ -2113,6 +2137,14 @@ def _migrate_workflow_turn_columns() -> None:
             conn.execute("ALTER TABLE workflow_turns ADD COLUMN claim_expires_at DATETIME")
         if "transport_binding" not in columns:
             conn.execute("ALTER TABLE workflow_turns ADD COLUMN transport_binding TEXT")
+        if "provider_processing_observed_at" not in columns:
+            conn.execute(
+                "ALTER TABLE workflow_turns " "ADD COLUMN provider_processing_observed_at DATETIME"
+            )
+        if "provider_ready_observed_at" not in columns:
+            conn.execute(
+                "ALTER TABLE workflow_turns ADD COLUMN provider_ready_observed_at DATETIME"
+            )
         conn.commit()
         conn.close()
     except Exception as exc:
@@ -2618,12 +2650,28 @@ def _migrate_terminal_worktree_authority_columns() -> bool:
             "managed_worktree_commit",
             "runtime_lifecycle",
             "owner_grant_id",
+            "runtime_pane_id",
+            "runtime_generation",
+            "runtime_generation_origin",
         ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE terminals ADD COLUMN {name} TEXT")
         for name in ("runtime_exit_requested_at", "runtime_exited_at"):
             if name not in columns:
                 conn.execute(f"ALTER TABLE terminals ADD COLUMN {name} DATETIME")
+        for name in ("runtime_pane_pid", "runtime_process_start_ticks"):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE terminals ADD COLUMN {name} INTEGER")
+        if "creation_order" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN creation_order INTEGER")
+        # SQLite rowid is an accurate insertion order at migration/insert time,
+        # but it can be reassigned by table rebuilds. Copy it into a durable
+        # column once and use only that explicit value thereafter.
+        conn.execute("UPDATE terminals SET creation_order = rowid WHERE creation_order IS NULL")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_terminals_session_creation_order "
+            "ON terminals (session_id, creation_order, id)"
+        )
         conn.execute(
             "CREATE TABLE IF NOT EXISTS worktree_writer_leases ("
             "canonical_worktree TEXT PRIMARY KEY, "
@@ -2688,6 +2736,12 @@ def create_terminal(
     provider_config_revision_id: Optional[str] = None,
     launch_snapshot: Optional[Mapping[str, Any]] = None,
     owner_grant_canonical_worktree: Optional[str] = None,
+    session_lifetime_id: Optional[str] = None,
+    runtime_pane_id: Optional[str] = None,
+    runtime_pane_pid: Optional[int] = None,
+    runtime_generation: Optional[str] = None,
+    runtime_generation_origin: Optional[str] = None,
+    runtime_process_start_ticks: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Create metadata and atomically acquire any required writer lease."""
     import json as _json
@@ -2712,11 +2766,17 @@ def create_terminal(
             .filter(
                 TerminalModel.tmux_session == tmux_session,
                 TerminalModel.session_id.is_not(None),
+                (TerminalModel.runtime_lifecycle.is_(None))
+                | (TerminalModel.runtime_lifecycle != "exited"),
             )
-            .order_by(TerminalModel.id.asc())
+            .order_by(TerminalModel.last_active.desc(), TerminalModel.id.desc())
             .first()
         )
-        session_id = str(existing_session[0]) if existing_session else str(uuid.uuid4())
+        session_id = (
+            str(session_lifetime_id)
+            if session_lifetime_id
+            else str(existing_session[0]) if existing_session else str(uuid.uuid4())
+        )
         if write_enabled is True:
             unresolved = (
                 db.query(TerminalModel.id)
@@ -2807,6 +2867,13 @@ def create_terminal(
             project_path=project_path,
             project_description=project_description,
             runtime_lifecycle="starting",
+            runtime_pane_id=runtime_pane_id,
+            runtime_pane_pid=runtime_pane_pid,
+            runtime_generation=runtime_generation,
+            runtime_generation_origin=(
+                runtime_generation_origin or ("launch" if runtime_generation is not None else None)
+            ),
+            runtime_process_start_ticks=runtime_process_start_ticks,
         )
         db.add(terminal)
         if write_enabled is True:
@@ -2817,6 +2884,13 @@ def create_terminal(
                 )
             )
         try:
+            db.flush()
+            terminal.creation_order = int(
+                db.execute(
+                    text("SELECT rowid FROM terminals WHERE id = :terminal_id"),
+                    {"terminal_id": terminal_id},
+                ).scalar_one()
+            )
             db.commit()
         except IntegrityError as exc:
             db.rollback()
@@ -2854,6 +2928,12 @@ def create_terminal(
             "runtime_lifecycle": terminal.runtime_lifecycle,
             "runtime_exit_requested_at": terminal.runtime_exit_requested_at,
             "runtime_exited_at": terminal.runtime_exited_at,
+            "runtime_pane_id": terminal.runtime_pane_id,
+            "runtime_pane_pid": terminal.runtime_pane_pid,
+            "runtime_generation": terminal.runtime_generation,
+            "runtime_generation_origin": terminal.runtime_generation_origin,
+            "runtime_process_start_ticks": terminal.runtime_process_start_ticks,
+            "creation_order": terminal.creation_order,
         }
 
 
@@ -2903,6 +2983,11 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "runtime_lifecycle": terminal.runtime_lifecycle,
             "runtime_exit_requested_at": terminal.runtime_exit_requested_at,
             "runtime_exited_at": terminal.runtime_exited_at,
+            "runtime_pane_id": terminal.runtime_pane_id,
+            "runtime_pane_pid": terminal.runtime_pane_pid,
+            "runtime_generation": terminal.runtime_generation,
+            "runtime_generation_origin": terminal.runtime_generation_origin,
+            "runtime_process_start_ticks": terminal.runtime_process_start_ticks,
             "last_active": terminal.last_active,
         }
 
@@ -2938,6 +3023,11 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "runtime_lifecycle": t.runtime_lifecycle,
                 "runtime_exit_requested_at": t.runtime_exit_requested_at,
                 "runtime_exited_at": t.runtime_exited_at,
+                "runtime_pane_id": t.runtime_pane_id,
+                "runtime_pane_pid": t.runtime_pane_pid,
+                "runtime_generation": t.runtime_generation,
+                "runtime_generation_origin": t.runtime_generation_origin,
+                "runtime_process_start_ticks": t.runtime_process_start_ticks,
                 "last_active": t.last_active,
             }
             for t in terminals
@@ -2986,10 +3076,399 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "runtime_lifecycle": t.runtime_lifecycle,
                 "runtime_exit_requested_at": t.runtime_exit_requested_at,
                 "runtime_exited_at": t.runtime_exited_at,
+                "runtime_pane_id": t.runtime_pane_id,
+                "runtime_pane_pid": t.runtime_pane_pid,
+                "runtime_generation": t.runtime_generation,
+                "runtime_generation_origin": t.runtime_generation_origin,
+                "runtime_process_start_ticks": t.runtime_process_start_ticks,
                 "last_active": t.last_active,
             }
             for t in terminals
         ]
+
+
+def _terminal_ui_projection_cte(
+    *, session_ids: Optional[List[str]] = None
+) -> tuple[str, Dict[str, Any]]:
+    """Build one durable, lightweight UI projection without live polling."""
+    parameters: Dict[str, Any] = {}
+    selected_where = ""
+    if session_ids is not None:
+        if not session_ids:
+            selected_where = " WHERE 1 = 0"
+        else:
+            placeholders = []
+            for index, value in enumerate(session_ids):
+                name = f"projection_session_{index}"
+                parameters[name] = value
+                placeholders.append(f":{name}")
+            selected_where = (
+                " WHERE COALESCE(session_id, 'legacy:' || tmux_session) "
+                f"IN ({', '.join(placeholders)})"
+            )
+    return (
+        """
+WITH selected_terminals AS MATERIALIZED (
+    SELECT id, tmux_window, provider, tmux_session,
+           COALESCE(session_id, 'legacy:' || tmux_session) AS stable_session_id,
+           agent_profile, runtime_lifecycle, context_role, launch_worktree,
+           managed_worktree_kind, managed_worktree_commit, managed_worktree_branch,
+           project_id, project_name, project_path,
+           COALESCE(creation_order, rowid) AS creation_order, last_active
+    FROM terminals
+"""
+        + selected_where
+        + """
+), workflow_ranked AS (
+    SELECT w.root_terminal_id, w.status,
+           ROW_NUMBER() OVER (PARTITION BY w.root_terminal_id ORDER BY w.id DESC) AS rank
+    FROM workflows w JOIN selected_terminals st ON st.id = w.root_terminal_id
+), latest_workflow AS (
+    SELECT root_terminal_id, status FROM workflow_ranked WHERE rank = 1
+), assignment_relations AS (
+    SELECT ca.id AS assignment_id, ca.parent_terminal_id AS terminal_id,
+           0 AS is_child, ca.status, ca.updated_at
+    FROM child_assignments ca JOIN selected_terminals st ON st.id = ca.parent_terminal_id
+    UNION ALL
+    SELECT ca.id, ca.child_terminal_id, 1, ca.status, ca.updated_at
+    FROM child_assignments ca JOIN selected_terminals st ON st.id = ca.child_terminal_id
+), relation_states AS (
+    SELECT ar.*, dr.status AS result_status,
+           CASE
+             WHEN dr.status = 'incomplete' THEN 'incomplete'
+             WHEN ar.status IN ('result_failed', 'handoff_result_failed') THEN 'failed'
+             WHEN ar.is_child = 1 AND dr.status = 'cancelled' THEN 'cancelled'
+             WHEN ar.status = 'handoff_recovery_awaiting_result' THEN 'recoverable'
+             WHEN ar.status IN ('awaiting_result', 'handoff_awaiting_result') THEN 'waiting'
+             WHEN ar.status IN ('handoff_direct_result_claimed', 'result_queued',
+                                'result_delivered', 'handoff_result_queued',
+                                'handoff_result_delivered') AND dr.status = 'complete'
+                  THEN 'result_ready'
+             ELSE NULL
+           END AS relation_state,
+           CASE
+             WHEN ar.is_child = 1 AND dr.status = 'cancelled' THEN 6
+             WHEN dr.status = 'incomplete' THEN 5
+             WHEN ar.status IN ('result_failed', 'handoff_result_failed') THEN 4
+             WHEN ar.status IN ('handoff_direct_result_claimed', 'result_queued',
+                                'result_delivered', 'handoff_result_queued',
+                                'handoff_result_delivered') AND dr.status = 'complete' THEN 3
+             WHEN ar.status = 'handoff_recovery_awaiting_result' THEN 2
+             WHEN ar.status IN ('awaiting_result', 'handoff_awaiting_result') THEN 1
+             ELSE 0
+           END AS relation_priority
+    FROM assignment_relations ar
+    LEFT JOIN delegation_results dr ON dr.child_assignment_id = ar.assignment_id
+), latest_relations AS (
+    SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY terminal_id ORDER BY updated_at DESC, assignment_id DESC
+    ) AS latest_rank FROM relation_states
+), best_relations AS (
+    SELECT *, ROW_NUMBER() OVER (
+        PARTITION BY terminal_id
+        ORDER BY relation_priority DESC, updated_at DESC, assignment_id DESC
+    ) AS state_rank FROM relation_states WHERE relation_state IS NOT NULL
+), projected AS MATERIALIZED (
+    SELECT t.id, t.tmux_window AS name, t.provider,
+           t.tmux_session AS session_name, t.stable_session_id AS session_id,
+           t.agent_profile,
+           CASE
+             WHEN COALESCE(t.runtime_lifecycle, 'starting') = 'exited' THEN 'exited'
+             WHEN pel.terminal_id IS NOT NULL THEN 'processing'
+             WHEN EXISTS (
+               SELECT 1 FROM workflows qw JOIN workflow_turns qt ON qt.workflow_id = qw.id
+               WHERE qw.root_terminal_id = t.id AND qw.status = 'open' AND qt.state = 'queued'
+             ) THEN 'queued'
+             ELSE 'ready'
+           END AS activity,
+           CASE
+             WHEN COALESCE(t.runtime_lifecycle, 'starting') = 'exited' THEN 'exited'
+             WHEN pel.terminal_id IS NOT NULL THEN 'processing'
+             WHEN EXISTS (
+               SELECT 1 FROM workflows qw JOIN workflow_turns qt ON qt.workflow_id = qw.id
+               WHERE qw.root_terminal_id = t.id AND qw.status = 'open' AND qt.state = 'queued'
+             ) THEN 'queued_provider_execution'
+             ELSE 'ready'
+           END AS execution_state,
+           COALESCE(t.runtime_lifecycle, 'starting') AS lifecycle,
+           CASE
+             WHEN lw.status = 'owner_gate' THEN 'owner_gate'
+             WHEN lw.status = 'terminal' THEN 'completed'
+             WHEN lw.status = 'cancelled' THEN 'cancelled'
+             ELSE COALESCE(br.relation_state, CASE WHEN lw.status = 'open' THEN 'active' END)
+           END AS workflow_state,
+           lw.status AS workflow_status, lr.status AS assignment_status,
+           lr.result_status, lr.status AS delivery_status,
+           t.context_role, t.launch_worktree, t.managed_worktree_kind,
+           t.managed_worktree_commit, t.managed_worktree_branch,
+           t.project_id AS projectId, t.project_name, t.project_path,
+           t.creation_order, t.last_active
+    FROM selected_terminals t
+    LEFT JOIN latest_workflow lw ON lw.root_terminal_id = t.id
+    LEFT JOIN latest_relations lr ON lr.terminal_id = t.id AND lr.latest_rank = 1
+    LEFT JOIN best_relations br ON br.terminal_id = t.id AND br.state_rank = 1
+    LEFT JOIN provider_execution_leases pel ON pel.terminal_id = t.id
+)
+""",
+        parameters,
+    )
+
+
+def _ensure_terminal_ui_projection_schema() -> None:
+    global _terminal_ui_projection_schema_engine_identity
+    global _terminal_ui_projection_schema_ready
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_provider_execution_schema()
+    _ensure_workflow_schema()
+    _ensure_child_assignment_schema()
+    _ensure_delegation_result_schema()
+    engine_identity = id(engine)
+    if (
+        _terminal_ui_projection_schema_ready
+        and _terminal_ui_projection_schema_engine_identity == engine_identity
+    ):
+        return
+    with _terminal_ui_projection_schema_lock:
+        if (
+            _terminal_ui_projection_schema_ready
+            and _terminal_ui_projection_schema_engine_identity == engine_identity
+        ):
+            return
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_terminals_session_lifetime_activity "
+                "ON terminals (session_id, last_active DESC, id DESC)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_terminals_session_creation_order "
+                "ON terminals (session_id, creation_order, id)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_workflows_root_terminal_id "
+                "ON workflows (root_terminal_id)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_workflow_turns_workflow_state "
+                "ON workflow_turns (workflow_id, state)"
+            )
+        _terminal_ui_projection_schema_engine_identity = engine_identity
+        _terminal_ui_projection_schema_ready = True
+
+
+def _ui_projection_filters(
+    *,
+    session_id: Optional[str] = None,
+    query: str = "",
+    activities: Optional[List[str]] = None,
+    workflow_states: Optional[List[str]] = None,
+    profiles: Optional[List[str]] = None,
+    home_filter: Optional[str] = None,
+) -> tuple[str, Dict[str, Any]]:
+    clauses: List[str] = []
+    parameters: Dict[str, Any] = {}
+
+    def add_values(column: str, values: Optional[List[str]], prefix: str) -> None:
+        normalized = [value for value in values or [] if value]
+        if not normalized:
+            return
+        names = []
+        for index, value in enumerate(normalized):
+            name = f"{prefix}_{index}"
+            parameters[name] = value
+            names.append(f":{name}")
+        clauses.append(f"{column} IN ({', '.join(names)})")
+
+    if session_id:
+        clauses.append("session_id = :session_id")
+        parameters["session_id"] = session_id
+    normalized_query = query.strip().lower()
+    if normalized_query:
+        clauses.append(
+            "(LOWER(id) LIKE :query OR LOWER(name) LIKE :query OR "
+            "LOWER(session_name) LIKE :query OR LOWER(provider) LIKE :query OR "
+            "LOWER(COALESCE(agent_profile, '')) LIKE :query OR "
+            "LOWER(COALESCE(project_name, '')) LIKE :query)"
+        )
+        parameters["query"] = f"%{normalized_query}%"
+    add_values("activity", activities, "activity")
+    add_values("workflow_state", workflow_states, "workflow")
+    add_values("agent_profile", profiles, "profile")
+    if home_filter and home_filter != "all":
+        if home_filter == "active":
+            clauses.append("lifecycle != 'exited' AND COALESCE(workflow_state, '') != 'completed'")
+        elif home_filter == "waiting":
+            clauses.append(
+                "workflow_state IS NOT NULL "
+                "AND workflow_state NOT IN ('owner_gate', 'cancelled', 'completed') "
+                "AND lifecycle != 'exited' AND activity != 'processing'"
+            )
+        elif home_filter in {"owner_gate", "cancelled", "completed"}:
+            clauses.append("workflow_state = :home_filter")
+            parameters["home_filter"] = home_filter
+        else:
+            raise ValueError("home_filter is invalid")
+    return (" WHERE " + " AND ".join(clauses) if clauses else ""), parameters
+
+
+def list_terminal_ui_summary_page(
+    *,
+    limit: int,
+    offset: int = 0,
+    session_id: Optional[str] = None,
+    query: str = "",
+    activities: Optional[List[str]] = None,
+    workflow_states: Optional[List[str]] = None,
+    profiles: Optional[List[str]] = None,
+    home_filter: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Filter and page the durable terminal projection inside SQLite."""
+    _ensure_terminal_ui_projection_schema()
+    projection_cte, parameters = _terminal_ui_projection_cte(
+        session_ids=[session_id] if session_id else None
+    )
+    where, filters = _ui_projection_filters(
+        session_id=session_id,
+        query=query,
+        activities=activities,
+        workflow_states=workflow_states,
+        profiles=profiles,
+        home_filter=home_filter,
+    )
+    parameters.update(filters)
+    parameters.update({"limit": limit, "offset": offset})
+    order_by = (
+        "creation_order ASC, id ASC"
+        if session_id
+        else "last_active DESC, creation_order DESC, id DESC"
+    )
+    sql = projection_cte + ", filtered AS MATERIALIZED (SELECT * FROM projected" + where + f"""),
+    page AS (SELECT * FROM filtered ORDER BY {order_by} LIMIT :limit OFFSET :offset),
+    meta AS (
+      SELECT (SELECT COUNT(*) FROM filtered) AS total_count,
+             (SELECT json_group_array(activity) FROM
+                (SELECT activity FROM projected GROUP BY activity ORDER BY activity)) AS activities_json,
+             (SELECT json_group_array(workflow_state) FROM
+                (SELECT workflow_state FROM projected WHERE workflow_state IS NOT NULL
+                 GROUP BY workflow_state ORDER BY workflow_state)) AS workflows_json,
+             (SELECT json_group_array(agent_profile) FROM
+                (SELECT agent_profile FROM projected WHERE agent_profile IS NOT NULL
+                 GROUP BY agent_profile ORDER BY agent_profile)) AS profiles_json
+    )
+    SELECT page.*, meta.total_count, meta.activities_json, meta.workflows_json, meta.profiles_json
+    FROM meta LEFT JOIN page ON 1 = 1 ORDER BY page.{order_by}
+    """
+    with SessionLocal() as db:
+        rows = db.execute(text(sql), parameters).mappings().all()
+    meta = rows[0]
+    page_rows = [row for row in rows if row["id"] is not None]
+    ignored = {"total_count", "activities_json", "workflows_json", "profiles_json"}
+    return {
+        "items": [
+            {key: value for key, value in row.items() if key not in ignored} for row in page_rows
+        ],
+        "total": int(meta["total_count"] or 0),
+        "facets": {
+            "activities": json.loads(meta["activities_json"] or "[]"),
+            "workflow_states": json.loads(meta["workflows_json"] or "[]"),
+            "profiles": json.loads(meta["profiles_json"] or "[]"),
+        },
+    }
+
+
+def get_terminal_ui_overview_counts() -> Dict[str, int]:
+    """Aggregate Home counters and durable session lifetimes in SQLite."""
+    _ensure_terminal_ui_projection_schema()
+    projection_cte, parameters = _terminal_ui_projection_cte()
+    sql = projection_cte + """
+        SELECT COUNT(DISTINCT session_id) AS sessions, COUNT(*) AS agents,
+               SUM(CASE WHEN lifecycle != 'exited'
+                         AND COALESCE(workflow_state, '') != 'completed' THEN 1 ELSE 0 END) AS active,
+               SUM(CASE WHEN workflow_state IS NOT NULL
+                         AND workflow_state NOT IN ('owner_gate', 'cancelled', 'completed')
+                         AND lifecycle != 'exited'
+                         AND activity != 'processing' THEN 1 ELSE 0 END) AS waiting,
+               SUM(CASE WHEN workflow_state = 'owner_gate' THEN 1 ELSE 0 END) AS owner_gate,
+               SUM(CASE WHEN workflow_state = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
+               SUM(CASE WHEN workflow_state = 'completed' THEN 1 ELSE 0 END) AS completed
+        FROM projected
+    """
+    with SessionLocal() as db:
+        row = db.execute(text(sql), parameters).mappings().one()
+    return {key: int(row[key] or 0) for key in row.keys()}
+
+
+def list_terminal_ui_session_page(*, limit: int, offset: int, query: str = "") -> Dict[str, Any]:
+    """Page stable session lifetimes; runtime retirement cannot erase them."""
+    _ensure_terminal_ui_projection_schema()
+    projection_cte, parameters = _terminal_ui_projection_cte()
+    normalized = query.strip().lower()
+    search = ""
+    if normalized:
+        parameters["query"] = f"%{normalized}%"
+        search = (
+            " WHERE LOWER(session_id) LIKE :query OR LOWER(session_name) LIKE :query "
+            "OR LOWER(COALESCE(project_name, '')) LIKE :query"
+        )
+    parameters.update({"limit": limit, "offset": offset})
+    sql = (
+        projection_cte
+        + """, aggregates AS MATERIALIZED (
+      SELECT session_id AS id, MAX(session_name) AS name,
+             CASE WHEN SUM(CASE WHEN lifecycle != 'exited' THEN 1 ELSE 0 END) > 0
+                  THEN 'active' ELSE 'history' END AS status,
+             MIN(last_active) AS created_at, COUNT(*) AS agent_count,
+             SUM(CASE WHEN lifecycle != 'exited'
+                       AND COALESCE(workflow_state, '') != 'completed' THEN 1 ELSE 0 END)
+                  AS active_agent_count,
+             CASE WHEN COUNT(projectId) = COUNT(*) AND COUNT(project_name) = COUNT(*)
+                       AND COUNT(project_path) = COUNT(*)
+                       AND COUNT(DISTINCT projectId || char(31) || project_name
+                                                || char(31) || project_path) = 1
+                  THEN MAX(project_name) ELSE NULL END AS project_name,
+             MAX(last_active) AS last_active
+      FROM projected GROUP BY session_id
+    ), filtered AS MATERIALIZED (SELECT * FROM aggregates"""
+        + search
+        + """),
+    page AS (SELECT * FROM filtered ORDER BY last_active DESC, id DESC LIMIT :limit OFFSET :offset),
+    meta AS (SELECT COUNT(*) AS total_count FROM filtered)
+    SELECT page.*, meta.total_count,
+           COALESCE((SELECT json_group_object(state, amount) FROM (
+             SELECT COALESCE(workflow_state, 'untracked') AS state, COUNT(*) AS amount
+             FROM projected WHERE projected.session_id = page.id
+             GROUP BY COALESCE(workflow_state, 'untracked'))), '{}') AS workflow_counts_json,
+           COALESCE((SELECT json_group_object(state, amount) FROM (
+             SELECT activity AS state, COUNT(*) AS amount
+             FROM projected WHERE projected.session_id = page.id GROUP BY activity)), '{}')
+             AS activity_counts_json,
+           (SELECT json_object(
+               'id', id, 'activity', activity, 'execution_state', execution_state,
+               'lifecycle', lifecycle, 'workflow_state', workflow_state
+             ) FROM projected WHERE projected.session_id = page.id
+             ORDER BY creation_order ASC, id ASC LIMIT 1) AS first_agent_json,
+           (SELECT json_object(
+               'id', id, 'activity', activity, 'execution_state', execution_state,
+               'lifecycle', lifecycle, 'workflow_state', workflow_state
+             ) FROM projected WHERE projected.session_id = page.id
+             ORDER BY creation_order DESC, id DESC LIMIT 1) AS last_agent_json
+    FROM meta LEFT JOIN page ON 1 = 1 ORDER BY page.last_active DESC, page.id DESC
+    """
+    )
+    with SessionLocal() as db:
+        rows = db.execute(text(sql), parameters).mappings().all()
+    meta = rows[0]
+    items = []
+    for row in rows:
+        if row["id"] is None:
+            continue
+        item = dict(row)
+        item.pop("total_count", None)
+        item["workflow_counts"] = json.loads(item.pop("workflow_counts_json") or "{}")
+        item["activity_counts"] = json.loads(item.pop("activity_counts_json") or "{}")
+        item["first_agent"] = json.loads(item.pop("first_agent_json") or "null")
+        item["last_agent"] = json.loads(item.pop("last_agent_json") or "null")
+        items.append(item)
+    return {"items": items, "total": int(meta["total_count"] or 0)}
 
 
 def _release_or_transfer_worktree_writer_lease(
@@ -3274,6 +3753,93 @@ def mark_terminal_runtime_running(terminal_id: str) -> bool:
         terminal.runtime_exit_requested_at = None
         db.commit()
         return True
+
+
+def replace_starting_terminal_runtime_identity(
+    terminal_id: str,
+    *,
+    pane_id: str,
+    pane_pid: int,
+    runtime_generation: str,
+    process_start_ticks: int,
+) -> bool:
+    """Replace launch identity only while startup still owns the DB row.
+
+    Codex may recreate its pane once during the bounded startup retry. This CAS
+    publishes that new generation before provider initialization resumes; a
+    stale retry can never rewrite a running, pending-exit, or exited runtime.
+    """
+    _ensure_terminal_worktree_authority_schema()
+    if (
+        not re.fullmatch(r"%[0-9]+", pane_id)
+        or pane_pid <= 1
+        or process_start_ticks <= 0
+        or not runtime_generation
+    ):
+        return False
+    with SessionLocal() as db:
+        changed = (
+            db.query(TerminalModel)
+            .filter(
+                TerminalModel.id == terminal_id,
+                TerminalModel.runtime_lifecycle == "starting",
+            )
+            .update(
+                {
+                    TerminalModel.runtime_pane_id: pane_id,
+                    TerminalModel.runtime_pane_pid: pane_pid,
+                    TerminalModel.runtime_generation: runtime_generation,
+                    TerminalModel.runtime_generation_origin: "launch",
+                    TerminalModel.runtime_process_start_ticks: process_start_ticks,
+                    TerminalModel.last_active: datetime.now(),
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return changed == 1
+
+
+def reconcile_legacy_terminal_runtime_identity(
+    terminal_id: str,
+    *,
+    pane_id: str,
+    pane_pid: int,
+    runtime_generation: str,
+    process_start_ticks: int,
+) -> bool:
+    """Persist a one-time exact-process fence for a pre-generation runtime."""
+    _ensure_terminal_worktree_authority_schema()
+    if (
+        not re.fullmatch(r"%[0-9]+", pane_id)
+        or pane_pid <= 1
+        or process_start_ticks <= 0
+        or not runtime_generation
+    ):
+        return False
+    with SessionLocal() as db:
+        changed = (
+            db.query(TerminalModel)
+            .filter(
+                TerminalModel.id == terminal_id,
+                TerminalModel.runtime_generation.is_(None),
+                TerminalModel.runtime_pane_id.is_(None),
+                TerminalModel.runtime_pane_pid.is_(None),
+                TerminalModel.runtime_process_start_ticks.is_(None),
+            )
+            .update(
+                {
+                    TerminalModel.runtime_pane_id: pane_id,
+                    TerminalModel.runtime_pane_pid: pane_pid,
+                    TerminalModel.runtime_generation: runtime_generation,
+                    TerminalModel.runtime_generation_origin: "reconciled",
+                    TerminalModel.runtime_process_start_ticks: process_start_ticks,
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return changed == 1
 
 
 def mark_terminal_runtime_exit_pending(terminal_id: str) -> bool:
@@ -3796,11 +4362,22 @@ TURN_CANCELLED = "cancelled"
 # no sendable turn) so callers and deterministic tests can prove that the
 # durable state was deliberately left untouched.
 DEFER_UNADMITTED = "DEFER_UNADMITTED"
+DEFER_STABLE_READY = "DEFER_STABLE_READY"
 WORKFLOW_TURN_CLAIM_LEASE_SECONDS = 30
+WORKFLOW_READY_AFTER_PROCESSING_GRACE_SECONDS = 3
+WORKFLOW_READY_WITHOUT_PROCESSING_GRACE_SECONDS = 30
 # Provider finals are transport observations, not semantic mission outcomes.
-# Automatically wake a bounded number of additional turns, then leave the
-# workflow OPEN and idle until real progress or a direct owner/user input.
-MAX_AUTOMATIC_OPEN_FINAL_CONTINUATIONS = 5
+# Keep exactly one durable successor moving until the workflow reaches an
+# explicit terminal state. The capped delay prevents a tight paid loop. A
+# separate, durable no-progress circuit breaker stops a malfunctioning provider
+# from purchasing work forever: ordinary child results or direct owner input
+# reset this counter, so productive multi-hour workflows are unaffected.
+MAX_OPEN_FINAL_CONTINUATION_DELAY_SECONDS = 30
+MAX_AUTOMATIC_OPEN_FINAL_NO_PROGRESS = 64
+OPEN_FINAL_CIRCUIT_BREAKER_REASON = (
+    "Automatic continuation paused when 65 consecutive provider finals produced no "
+    "durable workflow progress. Review the provider/runtime before resuming."
+)
 
 
 def _dispatch_workflow_notification_fail_open(
@@ -4828,9 +5405,11 @@ def claim_workflow_effect(
     """Open the sole runtime gate for one privileged logical effect.
 
     Only a receiver-side admitted turn can obtain an effect capability.  The
-    unique key is stable across duplicate physical deliveries.  An existing
+    unique key is stable across duplicate physical deliveries. An existing
     ``claimed`` row is deliberately not reclaimed after restart: the process
-    may have crossed a non-transactional CAO boundary before it died.
+    may have crossed a non-transactional CAO boundary before it died. A proven
+    ``not_admitted`` row did not cross that boundary and is safely claimable
+    again under the same current turn.
     """
     _ensure_workflow_schema()
     now = now or datetime.now()
@@ -4872,9 +5451,38 @@ def claim_workflow_effect(
             )
             .first()
         )
-        if existing is not None:
-            return None
         token = uuid.uuid4().hex
+        if existing is not None:
+            if existing.state != "not_admitted":
+                return None
+            reclaimed = (
+                db.query(WorkflowEffectModel)
+                .filter(
+                    WorkflowEffectModel.id == existing.id,
+                    WorkflowEffectModel.state == "not_admitted",
+                    WorkflowEffectModel.workflow_id.in_(
+                        db.query(WorkflowModel.id).filter(
+                            WorkflowModel.id == workflow.id,
+                            WorkflowModel.root_terminal_id == receiver_terminal_id,
+                            WorkflowModel.status == WORKFLOW_OPEN,
+                            WorkflowModel.active_turn_id == logical_turn_id,
+                        )
+                    ),
+                )
+                .update(
+                    {
+                        WorkflowEffectModel.state: "claimed",
+                        WorkflowEffectModel.claim_token: token,
+                        WorkflowEffectModel.updated_at: now,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if reclaimed != 1:
+                db.rollback()
+                return None
+            db.commit()
+            return {"id": existing.id, "claim_token": token}
         effect = WorkflowEffectModel(
             workflow_id=workflow.id,
             workflow_turn_id=logical_turn_id,
@@ -4907,7 +5515,7 @@ def finish_workflow_effect(
     latter is used for exceptions after an external boundary has been entered;
     it preserves truthfulness over an unsafe replay.
     """
-    if outcome not in {"completed", "indeterminate", "rejected"}:
+    if outcome not in {"completed", "indeterminate", "rejected", "not_admitted"}:
         raise ValueError(f"Invalid workflow effect outcome: {outcome}")
     _ensure_workflow_schema()
     now = now or datetime.now()
@@ -4943,8 +5551,9 @@ def describe_workflow_effect_rejection(
 
     The old ``None`` result from :func:`claim_workflow_effect` was safe but
     operationally opaque: a duplicate, a stale turn, and an owner gate were
-    indistinguishable to a recovering child.  Keep claim semantics unchanged
-    and expose a stable diagnostic projection for MCP callers.
+    indistinguishable to a recovering child. Expose a stable diagnostic
+    projection for terminal rows; a ``not_admitted`` row is reclaimed by the
+    claim path before this diagnostic is needed.
     """
     if not receiver_terminal_id:
         return {
@@ -5020,6 +5629,148 @@ def mark_workflow_turn_sent_for_inbox(message_id: int) -> bool:
             workflow.updated_at = turn.updated_at
         db.commit()
         return True
+
+
+def observe_workflow_processing(root_terminal_id: str, now: Optional[datetime] = None) -> bool:
+    """Persist processing evidence and clear any transient Ready debounce."""
+    _ensure_workflow_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        workflow = _open_workflow(db, root_terminal_id, create=False)
+        if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
+            return False
+        active_turn_id = cast(int, workflow.active_turn_id)
+        admitted = (
+            db.query(WorkflowTurnReceiptModel)
+            .filter_by(
+                workflow_turn_id=active_turn_id,
+                receiver_terminal_id=root_terminal_id,
+            )
+            .first()
+        )
+        if admitted is None:
+            return False
+        changed = (
+            db.query(WorkflowTurnModel)
+            .filter(
+                WorkflowTurnModel.id == active_turn_id,
+                WorkflowTurnModel.workflow_id == workflow.id,
+                WorkflowTurnModel.state == TURN_SENT,
+                or_(
+                    WorkflowTurnModel.provider_processing_observed_at.is_(None),
+                    WorkflowTurnModel.provider_ready_observed_at.is_not(None),
+                ),
+                WorkflowTurnModel.workflow_id.in_(
+                    db.query(WorkflowModel.id).filter(
+                        WorkflowModel.id == workflow.id,
+                        WorkflowModel.root_terminal_id == root_terminal_id,
+                        WorkflowModel.status == WORKFLOW_OPEN,
+                        WorkflowModel.active_turn_id == active_turn_id,
+                    )
+                ),
+            )
+            .update(
+                {
+                    WorkflowTurnModel.provider_processing_observed_at: func.coalesce(
+                        WorkflowTurnModel.provider_processing_observed_at, now
+                    ),
+                    WorkflowTurnModel.provider_ready_observed_at: None,
+                    WorkflowTurnModel.updated_at: now,
+                },
+                synchronize_session=False,
+            )
+        )
+        if changed != 1:
+            db.rollback()
+            return False
+        db.commit()
+        return True
+
+
+def observe_workflow_ready(
+    root_terminal_id: str, now: Optional[datetime] = None
+) -> Optional[int] | str:
+    """Advance a durably OPEN turn after the provider remains stably Ready.
+
+    Some provider finals settle directly on IDLE/Ready and never expose a
+    repeatable COMPLETED frame. The first Ready observation is persisted. A
+    later observation of the same active admitted turn finalizes it only after
+    a debounce that survives restart. Previously observed PROCESSING permits a
+    short grace; a turn never seen processing gets a conservative longer one.
+    """
+    _ensure_workflow_schema()
+    now = now or datetime.now()
+    should_finalize = False
+    with SessionLocal() as db:
+        workflow = _open_workflow(db, root_terminal_id, create=False)
+        if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
+            return None
+        active_turn_id = cast(int, workflow.active_turn_id)
+        turn = (
+            db.query(WorkflowTurnModel)
+            .filter(
+                WorkflowTurnModel.id == active_turn_id,
+                WorkflowTurnModel.workflow_id == workflow.id,
+            )
+            .first()
+        )
+        if turn is None:
+            return None
+        if turn.state == TURN_FINISHED:
+            should_finalize = True
+        elif turn.state != TURN_SENT:
+            return None
+        else:
+            admitted = (
+                db.query(WorkflowTurnReceiptModel)
+                .filter_by(
+                    workflow_turn_id=active_turn_id,
+                    receiver_terminal_id=root_terminal_id,
+                )
+                .first()
+            )
+            if admitted is None:
+                return DEFER_UNADMITTED
+            if turn.provider_ready_observed_at is None:
+                marked = (
+                    db.query(WorkflowTurnModel)
+                    .filter(
+                        WorkflowTurnModel.id == active_turn_id,
+                        WorkflowTurnModel.workflow_id == workflow.id,
+                        WorkflowTurnModel.state == TURN_SENT,
+                        WorkflowTurnModel.provider_ready_observed_at.is_(None),
+                        WorkflowTurnModel.workflow_id.in_(
+                            db.query(WorkflowModel.id).filter(
+                                WorkflowModel.id == workflow.id,
+                                WorkflowModel.root_terminal_id == root_terminal_id,
+                                WorkflowModel.status == WORKFLOW_OPEN,
+                                WorkflowModel.active_turn_id == active_turn_id,
+                            )
+                        ),
+                    )
+                    .update(
+                        {
+                            WorkflowTurnModel.provider_ready_observed_at: now,
+                            WorkflowTurnModel.updated_at: now,
+                        },
+                        synchronize_session=False,
+                    )
+                )
+                if marked != 1:
+                    db.rollback()
+                    return None
+                db.commit()
+                return DEFER_STABLE_READY
+            grace_seconds = (
+                WORKFLOW_READY_AFTER_PROCESSING_GRACE_SECONDS
+                if turn.provider_processing_observed_at is not None
+                else WORKFLOW_READY_WITHOUT_PROCESSING_GRACE_SECONDS
+            )
+            ready_seconds = now.timestamp() - turn.provider_ready_observed_at.timestamp()
+            if ready_seconds < grace_seconds:
+                return DEFER_STABLE_READY
+            should_finalize = True
+    return observe_workflow_final(root_terminal_id, now=now) if should_finalize else None
 
 
 def observe_workflow_final(
@@ -5121,12 +5872,39 @@ def observe_workflow_final(
             if advanced != 1:
                 db.rollback()
                 return None
-            if no_progress_count > MAX_AUTOMATIC_OPEN_FINAL_CONTINUATIONS:
-                # Do not turn ordinary provider completion into mission
-                # completion or an owner gate, and do not create an unbounded
-                # paid wake loop. The explicit next input can resume this OPEN
-                # workflow and resets the no-progress counter.
+            if no_progress_count > MAX_AUTOMATIC_OPEN_FINAL_NO_PROGRESS:
+                # This is an explicit, owner-visible terminal workflow state,
+                # never a silent OPEN idle. Keep the transition in the same
+                # write transaction as the final observation so restart cannot
+                # strand the workflow between its last paid turn and its gate.
+                workflow.status = WORKFLOW_OWNER_GATE
+                workflow.terminal_reason = OPEN_FINAL_CIRCUIT_BREAKER_REASON
+                workflow.updated_at = now
+                (
+                    db.query(WorkflowTurnModel)
+                    .filter(
+                        WorkflowTurnModel.workflow_id == workflow.id,
+                        WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+                    )
+                    .update(
+                        {
+                            WorkflowTurnModel.state: TURN_CANCELLED,
+                            WorkflowTurnModel.claim_token: None,
+                            WorkflowTurnModel.claim_expires_at: None,
+                            WorkflowTurnModel.updated_at: now,
+                        },
+                        synchronize_session=False,
+                    )
+                )
+                _cancel_parent_assignments(db, root_terminal_id, now)
+                db.query(ProviderExecutionLeaseModel).filter(
+                    ProviderExecutionLeaseModel.terminal_id == root_terminal_id
+                ).delete(synchronize_session=False)
+                workflow_id = int(workflow.id)
                 db.commit()
+                _dispatch_workflow_notification_fail_open(
+                    root_terminal_id, "owner_attention", workflow_id
+                )
                 return None
             # The CAS above means only one observer can create this successor.
             # Still retain the durable dedupe lookup for recovery from a
@@ -5145,7 +5923,12 @@ def observe_workflow_final(
                 # them into an owner gate: only an explicit semantic transition
                 # may close a still-eligible top-level mission.
                 delay_seconds = (
-                    0 if no_progress_count == 1 else min(30, 2 ** (no_progress_count - 2))
+                    0
+                    if no_progress_count == 1
+                    else min(
+                        MAX_OPEN_FINAL_CONTINUATION_DELAY_SECONDS,
+                        2 ** min(no_progress_count - 2, 30),
+                    )
                 )
                 successor = WorkflowTurnModel(
                     workflow_id=workflow.id,
@@ -6063,8 +6846,8 @@ def list_pending_child_retirement_cleanups() -> List[Dict[str, Any]]:
                     {
                         "child_terminal_id": assignment.child_terminal_id,
                         "claim_token": assignment.retirement_claim_token,
-                        "intent": intent,
                         "delegation_kind": delegation_kind,
+                        "intent": intent,
                     }
                 )
         return pending
@@ -6109,6 +6892,7 @@ def list_legacy_child_retirements_for_cleanup() -> List[Dict[str, Any]]:
                         isinstance(decoded_intent, dict)
                         and (delegation_kind != "handoff" or decoded_intent.get("managed") is True)
                     ),
+                    "intent": decoded_intent,
                 }
             )
         return candidates
@@ -9080,6 +9864,17 @@ def update_flow_run_times(name: str, last_run: datetime, next_run: datetime) -> 
         flow = db.query(FlowModel).filter(FlowModel.name == name).first()
         if flow:
             flow.last_run = last_run
+            flow.next_run = next_run
+            db.commit()
+            return True
+        return False
+
+
+def update_flow_next_run(name: str, next_run: datetime) -> bool:
+    """Advance scheduling after a failed attempt without inventing a successful run."""
+    with SessionLocal() as db:
+        flow = db.query(FlowModel).filter(FlowModel.name == name).first()
+        if flow:
             flow.next_run = next_run
             db.commit()
             return True

@@ -231,6 +231,51 @@ def _execute_resource(
         path = Path(candidate.path)
         after = candidate_fingerprint(path)[1] if path.exists() else 0
         return max(0, before - after)
+    if candidate.resource_kind == "terminal_runtime":
+        from cli_agent_orchestrator.services.terminal_service import (
+            retire_exited_terminal_runtime,
+        )
+
+        terminal_id = attributes["terminal_id"]
+        if retire_exited_terminal_runtime(terminal_id, proc_root=proc_root) is not True:
+            raise RuntimeError("terminal runtime retirement was not confirmed")
+        return 0
+    if candidate.resource_kind == "retirement_cleanup":
+        import json
+
+        from cli_agent_orchestrator.clients.database import (
+            claim_completed_child_retirement,
+            complete_child_retirement,
+            get_child_retirement_cleanup_intent,
+        )
+        from cli_agent_orchestrator.services.terminal_service import (
+            cleanup_managed_worktree,
+            validate_managed_worktree_cleanup,
+        )
+
+        child = attributes["child_terminal_id"]
+        delegation_kind = attributes["delegation_kind"]
+        planned_intent = json.loads(attributes["intent"])
+        token = attributes.get("claim_token") or None
+        if attributes["stage"] == "legacy":
+            claimed = claim_completed_child_retirement(
+                attributes["parent_terminal_id"], child, delegation_kind
+            )
+            if not claimed.get("eligible"):
+                raise RuntimeError("legacy retirement cleanup claim was rejected")
+            token = claimed.get("claim_token")
+        if not isinstance(token, str) or not token:
+            raise RuntimeError("retirement cleanup claim identity is unavailable")
+        current = get_child_retirement_cleanup_intent(child, token)
+        if current is None or current.get("cleanup_completed"):
+            raise RuntimeError("retirement cleanup intent is no longer pending")
+        if current.get("intent") != planned_intent:
+            raise RuntimeError("retirement cleanup intent changed")
+        validate_managed_worktree_cleanup(planned_intent)
+        cleanup_managed_worktree(planned_intent)
+        if not complete_child_retirement(child, token, planned_intent, delegation_kind):
+            raise RuntimeError("retirement cleanup finalization raced")
+        return candidate.bytes
     raise RuntimeError("unsupported housekeeping resource kind")
 
 
@@ -286,7 +331,13 @@ def execute_plan(
                 )
                 continue
             try:
-                if candidate.category in {"ephemeral", "browser_cache", "package_cache"}:
+                if candidate.category in {
+                    "ephemeral",
+                    "browser_cache",
+                    "package_cache",
+                    "terminal_runtime",
+                    "retirement_cleanup",
+                }:
                     refreshed = build_plan(
                         root=root,
                         config=config,

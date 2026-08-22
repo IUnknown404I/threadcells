@@ -5,6 +5,7 @@ and the SESSION_PREFIX branch.
 """
 
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -22,6 +23,16 @@ def isolate_operational_admission(monkeypatch):
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.control_plane_registry.registry_is_initialized",
         lambda: False,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service._capture_created_runtime_identity",
+        lambda _session, _window, terminal_id, generation: SimpleNamespace(
+            pane_id="%41",
+            pane_pid=4242,
+            terminal_id=terminal_id,
+            runtime_generation=generation,
+            process_start_ticks=777,
+        ),
     )
 
 

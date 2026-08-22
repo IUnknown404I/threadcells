@@ -36,7 +36,6 @@ class TestPluginRegistryLifespan:
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
-            patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
             patch(
                 "cli_agent_orchestrator.api.main.PollingObserver",
                 return_value=mock_observer,
@@ -71,7 +70,6 @@ class TestPluginRegistryLifespan:
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
-            patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
             patch(
                 "cli_agent_orchestrator.api.main.PollingObserver",
                 return_value=mock_observer,
@@ -103,7 +101,6 @@ class TestPluginRegistryLifespan:
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
-            patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
             patch(
                 "cli_agent_orchestrator.api.main.PollingObserver",
                 return_value=mock_observer,

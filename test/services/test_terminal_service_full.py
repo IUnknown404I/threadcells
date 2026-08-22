@@ -2,6 +2,7 @@
 
 from contextlib import nullcontext
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -42,6 +43,20 @@ def _legacy_profile_resolution_for_service_unit_tests(monkeypatch):
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.control_plane_registry.registry_is_initialized",
         lambda: False,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service._capture_created_runtime_identity",
+        lambda _session, _window, terminal_id, generation: SimpleNamespace(
+            pane_id="%41",
+            pane_pid=4242,
+            terminal_id=terminal_id,
+            runtime_generation=generation,
+            process_start_ticks=777,
+        ),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.replace_starting_terminal_runtime_identity",
+        lambda *_args, **_kwargs: True,
     )
 
 

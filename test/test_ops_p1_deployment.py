@@ -100,6 +100,11 @@ def test_stage_ops_p1_is_dry_run_capable_and_idempotent(tmp_path):
     assert config["max_provider_executions"] == 3
     assert config["max_work_contexts"] == 2
     assert config["max_heavy_execution_slots"] == 1
+    assert config["root"] == str(agent_root.resolve())
+    assert config["release_roots"] == [str((agent_root / "releases").resolve())]
+    assert config["release_metadata"] == str(
+        (agent_root / "state/cao/release-metadata.json").resolve()
+    )
     staged_policy = policy.read_text()
     assert staged_policy.count("<!-- CAO.OPS.P1 BEGIN -->") == 1
     assert staged_policy.count("<!-- CAO.OPS.P1 END -->") == 1

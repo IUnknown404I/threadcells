@@ -24,6 +24,7 @@ from cli_agent_orchestrator.services.housekeeping_service import (
     _scheduled_mode_due,
     _write_schedule_receipt,
     housekeeping_main,
+    plan_housekeeping,
     run_housekeeping,
 )
 
@@ -122,6 +123,93 @@ def test_manual_execution_requires_an_inspected_plan_before_loading_config(monke
         run_housekeeping(dry_run=False, mode="frequent")
 
     assert config_loaded is False
+
+
+def test_plan_inventory_uses_the_configured_runtime_owner(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    config["runtime_user"] = "agentctl"
+    expected = ({tmp_path.resolve()}, True)
+    observed = []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service.get_housekeeping_settings",
+        lambda _config: default_settings(config),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service._runtime_open_paths_inventory",
+        lambda supplied, proc_root: observed.append((supplied, proc_root)) or expected,
+    )
+
+    def fake_build_plan(**kwargs):
+        assert kwargs["open_inventory"]() == expected
+        return SimpleNamespace(plan_id="a" * 64)
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping.planner.build_plan", fake_build_plan
+    )
+
+    plan = plan_housekeeping(config=config, mode="frequent", proc_root=tmp_path / "proc")
+
+    assert plan.plan_id == "a" * 64
+    assert observed == [(config, tmp_path / "proc")]
+
+
+def test_execution_revalidation_uses_the_configured_runtime_owner(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    config["runtime_user"] = "agentctl"
+    config["log_tree_warning_gib"] = 5
+    config["backup_tree_warning_gib"] = 5
+    plan = SimpleNamespace(
+        plan_id="a" * 64,
+        candidates=(),
+        reclaimable_bytes=0,
+        warnings=(),
+    )
+    expected = ({tmp_path.resolve()}, True)
+    observed = []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service.get_housekeeping_settings",
+        lambda _config: default_settings(config),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service.plan_housekeeping",
+        lambda **_kwargs: plan,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service._runtime_open_paths_inventory",
+        lambda supplied, proc_root: observed.append((supplied, proc_root)) or expected,
+    )
+
+    def fake_execute_plan(_plan, *, open_inventory, **_kwargs):
+        assert open_inventory() == expected
+        return SimpleNamespace(ok=True, freed_bytes=0, failures=[], executed=[])
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping.executor.execute_plan",
+        fake_execute_plan,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service._reconcile_supervisor_context_roles",
+        lambda _summary: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service._reconcile_writer_leases",
+        lambda _summary: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service._reconcile_legacy_terminal_authority",
+        lambda _summary: None,
+    )
+
+    summary = run_housekeeping(
+        config=config,
+        dry_run=False,
+        mode="frequent",
+        proc_root=tmp_path / "proc",
+        expected_plan_id=plan.plan_id,
+    )
+
+    assert summary.ok is True
+    assert observed == [(config, tmp_path / "proc")]
 
 
 def test_exited_terminal_runtime_is_planned_revalidated_and_retired_without_history_deletion(

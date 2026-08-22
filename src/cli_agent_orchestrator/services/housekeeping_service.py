@@ -131,6 +131,17 @@ def _open_paths_inventory(
     return result, True
 
 
+def _runtime_open_paths_inventory(
+    config: Mapping[str, Any], proc_root: Path = Path("/proc")
+) -> tuple[set[Path], bool]:
+    """Inventory the configured runtime owner, independent of caller identity."""
+    try:
+        runtime_uid = pwd.getpwnam(str(config["runtime_user"])).pw_uid
+    except (KeyError, TypeError):
+        return set(), False
+    return _open_paths_inventory(proc_root, runtime_uid=runtime_uid)
+
+
 def _open_paths(proc_root: Path = Path("/proc")) -> set[Path]:
     """Compatibility projection for non-destructive callers."""
     return _open_paths_inventory(proc_root)[0]
@@ -955,7 +966,7 @@ def plan_housekeeping(
         settings=settings,
         mode=cast(HousekeepingMode, mode),
         now=current,
-        open_inventory=lambda: _open_paths_inventory(proc_root),
+        open_inventory=lambda: _runtime_open_paths_inventory(cfg, proc_root),
         proc_root=proc_root,
     )
 
@@ -1059,7 +1070,7 @@ def run_housekeeping(
             report = execute_plan(
                 plan,
                 config=cfg,
-                open_inventory=lambda: _open_paths_inventory(proc_root),
+                open_inventory=lambda: _runtime_open_paths_inventory(cfg, proc_root),
                 settings=settings,
                 proc_root=proc_root,
             )

@@ -93,7 +93,7 @@ Release and candidate cleanup shares the canonical staging lock and requires tru
 
 Installed scheduled Housekeeping services receive the narrow release-maintenance group needed to reclaim an eligible immutable release. The main control plane and ordinary agent processes do not. A manual/API run without that authority skips release deletion with `RELEASE_ADMIN_GROUP_REQUIRED`, continues independent safe cleanup, and leaves the scheduled service to reclaim the release later through the same plan/execute engine.
 
-Open-path protection inventories every process owned by the ThreadCells runtime account. Other host accounts are outside the ownership boundary for disposable ThreadCells state; unreadable private `/proc` entries from those accounts do not disable cleanup for the whole host. Any uncertainty while inspecting a runtime-account process still fails closed.
+Open-path protection inventories every process owned by the configured ThreadCells runtime account, regardless of which authorized account invokes a manual plan. Other host accounts are outside the ownership boundary for disposable ThreadCells state; unreadable private `/proc` entries from those accounts do not disable cleanup for the whole host. An unknown runtime identity or any uncertainty while inspecting a runtime-account process still fails closed.
 
 ## Common mistakes
 

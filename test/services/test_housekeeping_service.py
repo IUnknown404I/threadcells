@@ -18,6 +18,7 @@ from cli_agent_orchestrator.services.housekeeping_service import (
     _reconcile_legacy_terminal_authority,
     _reconcile_supervisor_context_roles,
     _reconcile_writer_leases,
+    _runtime_open_paths_inventory,
 )
 
 
@@ -168,6 +169,35 @@ def test_open_inventory_fails_closed_for_unreadable_runtime_process(tmp_path, mo
     monkeypatch.setattr(Path, "iterdir", unreadable_owned_fd)
 
     paths, certain = _open_paths_inventory(proc, runtime_uid=runtime_uid)
+
+    assert paths == set()
+    assert certain is False
+
+
+def test_runtime_inventory_uses_configured_owner_instead_of_caller(monkeypatch, tmp_path):
+    observed = []
+    monkeypatch.setattr(
+        pwd,
+        "getpwnam",
+        lambda name: SimpleNamespace(pw_uid=314) if name == "agentctl" else None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service._open_paths_inventory",
+        lambda proc_root, *, runtime_uid: observed.append((proc_root, runtime_uid))
+        or ({tmp_path.resolve()}, True),
+    )
+
+    paths, certain = _runtime_open_paths_inventory({"runtime_user": "agentctl"}, tmp_path / "proc")
+
+    assert certain is True
+    assert paths == {tmp_path.resolve()}
+    assert observed == [(tmp_path / "proc", 314)]
+
+
+def test_runtime_inventory_fails_closed_when_owner_is_unknown(monkeypatch, tmp_path):
+    monkeypatch.setattr(pwd, "getpwnam", lambda _name: (_ for _ in ()).throw(KeyError()))
+
+    paths, certain = _runtime_open_paths_inventory({"runtime_user": "missing"}, tmp_path / "proc")
 
     assert paths == set()
     assert certain is False

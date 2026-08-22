@@ -8,6 +8,7 @@ User=agentctl
 Group=agentctl
 SupplementaryGroups=docker threadcells-release-admin
 Environment=HOME=/home/agentctl
+Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PATH=/var/lib/threadcells/active/runtime/bin:/srv/agent-control/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/var/lib/threadcells/active/runtime/bin/cao-housekeeping --mode weekly --scheduled
 Nice=10

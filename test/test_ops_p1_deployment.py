@@ -130,14 +130,10 @@ def test_stage_ops_p1_is_dry_run_capable_and_idempotent(tmp_path):
         "agent-control-housekeeping.service",
         "agent-control-housekeeping-weekly.service",
     ):
-        assert (
-            "SupplementaryGroups=docker threadcells-release-admin"
-            in (system_root / "etc/systemd/system" / unit).read_text()
-        )
-        assert (
-            "ExecStart=/var/lib/threadcells/active/runtime/bin/cao-housekeeping"
-            in (system_root / "etc/systemd/system" / unit).read_text()
-        )
+        unit_text = (system_root / "etc/systemd/system" / unit).read_text()
+        assert "SupplementaryGroups=docker threadcells-release-admin" in unit_text
+        assert "Environment=PYTHONDONTWRITEBYTECODE=1" in unit_text
+        assert "ExecStart=/var/lib/threadcells/active/runtime/bin/cao-housekeeping" in unit_text
     frequent_timer = (
         system_root / "etc/systemd/system/agent-control-housekeeping.timer"
     ).read_text()
@@ -153,6 +149,7 @@ def test_stage_ops_p1_is_dry_run_capable_and_idempotent(tmp_path):
         system_root / "etc/systemd/system/agent-control-cao.service.d/threadcells-runtime.conf"
     )
     assert runtime_dropin.is_file()
+    assert "Environment=PYTHONDONTWRITEBYTECODE=1" in runtime_dropin.read_text()
     assert (
         "ExecStart=/var/lib/threadcells/active/runtime/bin/cao-server" in runtime_dropin.read_text()
     )

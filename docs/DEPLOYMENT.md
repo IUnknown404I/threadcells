@@ -20,6 +20,8 @@ Host staging uses a dedicated release-maintenance group so the running control p
 sudo groupadd --system threadcells-release-admin
 ```
 
+The installed control-plane and Housekeeping units disable Python bytecode writes. This keeps routine imports from changing ownership or contents inside an immutable release, including while the narrowly scoped release-maintenance group is active.
+
 The staging command fails closed if this group is unavailable. It keeps release candidates, the atomic active pointer, the staging lock, and release-protection metadata beneath a root-owned `/var/lib/threadcells` anchor, outside runtime-owned state. Production services execute through `/var/lib/threadcells/active`, not a runtime-writable command link. Candidate paths must be direct children of `/var/lib/threadcells/releases`; symbolic-link and alternate lock/metadata targets are refused.
 
 ## Safe promotion sequence

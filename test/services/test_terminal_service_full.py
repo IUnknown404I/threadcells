@@ -1787,7 +1787,17 @@ class TestSendInput:
         mock_provider = mock_pm.get_provider.return_value
         mock_provider.paste_enter_count = 2
 
-        result = send_input("test1234", "test message")
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.acquire_terminal_runtime_transport",
+                return_value="transport-token",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.release_terminal_runtime_operation",
+                return_value=True,
+            ),
+        ):
+            result = send_input("test1234", "test message")
 
         assert result is True
         mock_tmux.send_keys.assert_called_once_with(
@@ -1813,6 +1823,14 @@ class TestSendInput:
         mock_release.return_value = True
 
         with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.acquire_terminal_runtime_transport",
+                return_value="transport-token",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.release_terminal_runtime_operation",
+                return_value=True,
+            ),
             patch(
                 "cli_agent_orchestrator.services.terminal_service._wake_queued_provider_execution"
             ) as wake,
@@ -1841,9 +1859,21 @@ class TestSendInput:
         }
         mock_pm.get_provider.return_value.paste_enter_count = 1
 
-        assert send_input(
-            "handoff-child", "complete the task", orchestration_type=OrchestrationType.HANDOFF
-        )
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.acquire_terminal_runtime_transport",
+                return_value="transport-token",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.release_terminal_runtime_operation",
+                return_value=True,
+            ),
+        ):
+            assert send_input(
+                "handoff-child",
+                "complete the task",
+                orchestration_type=OrchestrationType.HANDOFF,
+            )
 
         mock_marker.assert_called_once_with("handoff-child")
         mock_update.assert_called_once_with("handoff-child")
@@ -1946,7 +1976,17 @@ class TestCodexProviderLifecycleThroughTerminalService:
 
         provider._completion_candidate = "stale prior task"
         provider._completion_candidate_polls = 2
-        send_input("codex-lifecycle", "Produce the final report.")
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.acquire_terminal_runtime_transport",
+                return_value="transport-token",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.release_terminal_runtime_operation",
+                return_value=True,
+            ),
+        ):
+            send_input("codex-lifecycle", "Produce the final report.")
         assert provider._completion_candidate is None
         assert provider._completion_candidate_polls == 0
 

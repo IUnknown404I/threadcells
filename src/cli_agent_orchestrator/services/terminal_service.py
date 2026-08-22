@@ -28,12 +28,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from cli_agent_orchestrator.clients.database import (
     OwnerGrantRejected,
     UnreconciledTerminalAuthority,
     WorktreeWriterLeaseConflict,
+    acquire_terminal_runtime_transport,
     cancel_child_assignments_for_terminal,
     cancel_workflows_for_terminal,
     cancel_workflows_for_terminal_with_ids,
@@ -54,9 +55,11 @@ from cli_agent_orchestrator.clients.database import (
     promote_terminal_context_role_to_supervisor,
     reconcile_legacy_terminal_runtime_identity,
     release_provider_execution,
+    release_terminal_runtime_operation,
     replace_starting_terminal_runtime_identity,
     terminal_has_queued_provider_turn,
     terminal_requires_result_snapshot,
+    terminal_runtime_operation_owned,
     update_last_active,
     validate_owner_launch_grant,
 )
@@ -288,6 +291,11 @@ def reconcile_terminal_runtime(terminal_id: str, provider=None) -> bool | None:
     if metadata.get("runtime_lifecycle") == "exited":
         _retire_exited_terminal_runtime(metadata)
         return True
+    if metadata.get("runtime_operation_kind") == "reconnect":
+        # The exact-session recovery intentionally crosses a shell gap.  That
+        # shell is not provider-death evidence while durable reconnect state
+        # owns the pane, including after a service crash and lease expiry.
+        return False
     observation = _runtime_death_observation(metadata, provider)
     if observation is not True:
         return observation
@@ -1084,16 +1092,27 @@ def request_provider_runtime_sidecar_reconnect(
     logical_turn_id: int,
     resume_identity: str,
     registry: PluginRegistry | None = None,
+    *,
+    claim_token: str | None = None,
+    side_effect_guard: Callable[[], bool] = lambda: True,
 ) -> None:
     """Restart a stale MCP client while resuming the exact provider context."""
     provider = provider_manager.get_provider(terminal_id)
     reconnect = getattr(provider, "reconnect_runtime_sidecar", None)
     if reconnect:
-        reconnect(resume_identity)
+        if claim_token is None:
+            reconnect(resume_identity)
+        else:
+            reconnect(resume_identity, side_effect_guard=side_effect_guard)
         return
     reconnect_input = getattr(provider, "runtime_sidecar_reconnect_input", None)
     if not reconnect_input:
         raise RuntimeError(f"Provider for terminal '{terminal_id}' cannot reconnect its sidecar")
+    if not side_effect_guard():
+        raise RuntimeError("provider reconnect lost runtime-operation ownership")
+    reconnect_kwargs: Dict[str, Any] = {}
+    if claim_token is not None:
+        reconnect_kwargs["runtime_operation_claim_token"] = claim_token
     send_input(
         terminal_id,
         reconnect_input,
@@ -1101,6 +1120,7 @@ def request_provider_runtime_sidecar_reconnect(
         sender_id="cao-workflow",
         orchestration_type=OrchestrationType.SEND_MESSAGE,
         logical_turn_id=logical_turn_id,
+        **reconnect_kwargs,
     )
 
 
@@ -1231,6 +1251,7 @@ def send_input(
     sender_id: str | None = None,
     orchestration_type: OrchestrationType | None = None,
     logical_turn_id: int | None = None,
+    runtime_operation_claim_token: str | None = None,
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
 
@@ -1239,6 +1260,7 @@ def send_input(
     ``paste_enter_count`` property (e.g., some TUIs need 2 Enters because
     bracketed paste triggers multi-line mode).
     """
+    runtime_operation_token: str | None = None
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
@@ -1252,13 +1274,27 @@ def send_input(
 
         execution_acquired = False
         transport_accepted = False
-        if logical_turn_id is not None:
+        if runtime_operation_claim_token is not None:
+            if not terminal_runtime_operation_owned(
+                terminal_id, runtime_operation_claim_token, "reconnect"
+            ):
+                raise RuntimeError("provider reconnect lost runtime-operation ownership")
+            runtime_operation_token = runtime_operation_claim_token
+        elif logical_turn_id is not None:
             from cli_agent_orchestrator.services.operations_service import (
                 acquire_provider_execution_slot,
             )
 
             acquire_provider_execution_slot(terminal_id, logical_turn_id)
             execution_acquired = True
+        if runtime_operation_token is None:
+            runtime_operation_token = acquire_terminal_runtime_transport(terminal_id)
+        if runtime_operation_token is None:
+            from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+            if execution_acquired and release_provider_execution(terminal_id, logical_turn_id):
+                _wake_queued_provider_execution(registry)
+            raise AdmissionDenied("TERMINAL_RUNTIME_OPERATION_BUSY", {})
         try:
             tmux_client.send_keys(
                 metadata["tmux_session"],
@@ -1326,6 +1362,9 @@ def send_input(
     except Exception as e:
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
         raise
+    finally:
+        if runtime_operation_token is not None and runtime_operation_claim_token is None:
+            release_terminal_runtime_operation(terminal_id, runtime_operation_token)
 
 
 def send_special_key(terminal_id: str, key: str) -> bool:
@@ -1344,12 +1383,19 @@ def send_special_key(terminal_id: str, key: str) -> bool:
     Raises:
         ValueError: If terminal not found
     """
+    runtime_operation_token: str | None = None
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
         if metadata.get("runtime_lifecycle") in {"exit_pending", "exited"}:
             raise RuntimeError(f"Terminal '{terminal_id}' runtime is not writable")
+
+        runtime_operation_token = acquire_terminal_runtime_transport(terminal_id)
+        if runtime_operation_token is None:
+            from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+            raise AdmissionDenied("TERMINAL_RUNTIME_OPERATION_BUSY", {})
 
         tmux_client.send_special_key(metadata["tmux_session"], metadata["tmux_window"], key)
 
@@ -1360,6 +1406,9 @@ def send_special_key(terminal_id: str, key: str) -> bool:
     except Exception as e:
         logger.error(f"Failed to send special key to terminal {terminal_id}: {e}")
         raise
+    finally:
+        if runtime_operation_token is not None:
+            release_terminal_runtime_operation(terminal_id, runtime_operation_token)
 
 
 def prepare_terminal_for_destruction(terminal_id: str) -> None:
@@ -1507,9 +1556,44 @@ def exit_terminal(terminal_id: str) -> ExitTerminalResult:
                 inventory_uncertain=exc.reason_code == "EXIT_INVENTORY_UNCERTAIN",
             ) from exc
         if target.current_command in SHELL_COMMANDS:
+            current = get_terminal_metadata(terminal_id)
+            if not current or current.get("runtime_operation_kind") != "reconnect":
+                raise ExitAuthorityError(
+                    "EXIT_PROVIDER_NOT_LIVE",
+                    "The exact pane is at a shell, not a live provider process",
+                )
+            # A crashed reconnect may have durably exited the provider before
+            # its lease expired. Retirement first competes for the same
+            # terminal operation; if it wins, the shell is positive death
+            # evidence and the stale reconnect token can never relaunch.
+            prepare_terminal_for_destruction(terminal_id)
+            shell_gap_claim = claim_terminal_runtime_exit(terminal_id)
+            if shell_gap_claim == "busy":
+                raise ExitAuthorityError(
+                    "EXIT_RUNTIME_OPERATION_BUSY",
+                    "Terminal recovery is in progress; retry exit safely",
+                    inventory_uncertain=True,
+                )
+            if shell_gap_claim == "exited":
+                return _already_exited_result(
+                    terminal_id, "Terminal exited before command delivery; no command sent"
+                )
+            if shell_gap_claim == "dispatch":
+                cancel_child_assignments_for_terminal(terminal_id)
+                cancel_workflows_for_terminal(terminal_id)
+                _wake_queued_provider_execution()
+                if reconcile_terminal_runtime(terminal_id, provider) is True:
+                    return ExitTerminalResult(
+                        success=True,
+                        lifecycle=TerminalLifecycle.EXITED.value,
+                        outcome="already_exited",
+                        message="Reconnect shell gap retired safely; no command sent",
+                        command_delivered=False,
+                    )
             raise ExitAuthorityError(
-                "EXIT_PROVIDER_NOT_LIVE",
-                "The exact pane is at a shell, not a live provider process",
+                "EXIT_DEATH_RECONCILIATION_FAILED",
+                "Reconnect shell gap could not be reconciled safely",
+                inventory_uncertain=True,
             )
 
         # Fence a stale provider/window observation before the irreversible
@@ -1533,6 +1617,12 @@ def exit_terminal(terminal_id: str) -> ExitTerminalResult:
     if claim == "exited":
         return _already_exited_result(
             terminal_id, "Terminal exited before command delivery; no command sent"
+        )
+    if claim == "busy":
+        raise ExitAuthorityError(
+            "EXIT_RUNTIME_OPERATION_BUSY",
+            "Terminal recovery or input transport is in progress; retry exit safely",
+            inventory_uncertain=True,
         )
     command_delivered = False
     if claim == "dispatch":

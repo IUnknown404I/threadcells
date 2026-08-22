@@ -26,6 +26,7 @@ from cli_agent_orchestrator.clients.database import (
     observe_workflow_processing,
     observe_workflow_ready,
     persist_workflow_provider_reconnect_identity,
+    prepare_workflow_input,
     renew_workflow_provider_reconnect,
     renew_workflow_turn_claim,
     requeue_expired_workflow_turn_claims,
@@ -82,6 +83,7 @@ class _ProviderReconnectClaimHeartbeat:
         self._reconnect = reconnect
         self._stop = threading.Event()
         self.lost = False
+        self.error: Exception | None = None
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def __enter__(self):
@@ -99,11 +101,16 @@ class _ProviderReconnectClaimHeartbeat:
 
         interval = max(1, WORKFLOW_PROVIDER_RECONNECT_LEASE_SECONDS // 3)
         while not self._stop.wait(interval):
-            if not renew_workflow_provider_reconnect(
-                self._root_terminal_id,
-                self._reconnect["turn_id"],
-                self._reconnect["claim_token"],
-            ):
+            try:
+                renewed = renew_workflow_provider_reconnect(
+                    self._root_terminal_id,
+                    self._reconnect["turn_id"],
+                    self._reconnect["claim_token"],
+                )
+            except Exception as exc:
+                self.error = exc
+                renewed = False
+            if not renewed:
                 self.lost = True
                 self._stop.set()
                 return
@@ -115,6 +122,14 @@ def record_external_input(root_terminal_id: str) -> int:
     if turn_id is None:
         raise RuntimeError(f"Could not create workflow turn for {root_terminal_id}")
     return turn_id
+
+
+def prepare_external_input(root_terminal_id: str, payload: str) -> dict:
+    """Persist a user/scheduled input, deferring behind runtime recovery."""
+    prepared = prepare_workflow_input(root_terminal_id, payload)
+    if prepared is None:
+        raise RuntimeError(f"Could not create workflow turn for {root_terminal_id}")
+    return prepared
 
 
 def complete_workflow(root_terminal_id: str, reason: str = "") -> bool:
@@ -216,6 +231,24 @@ def reconcile_root_workflow(
             return False
         try:
             with _ProviderReconnectClaimHeartbeat(root_terminal_id, reconnect) as heartbeat:
+
+                def side_effect_guard() -> bool:
+                    if heartbeat.lost:
+                        return False
+                    try:
+                        renewed = renew_workflow_provider_reconnect(
+                            root_terminal_id,
+                            reconnect["turn_id"],
+                            reconnect["claim_token"],
+                            now=now,
+                        )
+                    except Exception as exc:
+                        heartbeat.error = exc
+                        renewed = False
+                    if not renewed:
+                        heartbeat.lost = True
+                    return renewed
+
                 resume_identity = reconnect["resume_identity"]
                 if resume_identity is None:
                     resume_identity = terminal_service.provider_runtime_sidecar_resume_identity(
@@ -233,6 +266,8 @@ def reconcile_root_workflow(
                     reconnect["turn_id"],
                     resume_identity,
                     registry=registry,
+                    claim_token=reconnect["claim_token"],
+                    side_effect_guard=side_effect_guard,
                 )
             if heartbeat.lost:
                 raise RuntimeError("provider reconnect claim expired during resume")

@@ -40,12 +40,14 @@ from watchdog.observers.polling import PollingObserver
 
 from cli_agent_orchestrator.clients.database import (
     HandoffResultSubmissionError,
+    acquire_terminal_runtime_transport,
     cancel_child_assignments_for_terminal,
     create_inbox_message,
     get_inbox_messages,
     get_terminal_metadata,
     init_db,
     queue_workflow_input_for_provider,
+    release_terminal_runtime_operation,
     resolve_workflow_input_binding,
     submit_handoff_result_v1,
 )
@@ -115,6 +117,7 @@ logger = logging.getLogger(__name__)
 UI_READ_MAX_CONCURRENCY = 4
 OPERATIONAL_IO_MAX_CONCURRENCY = 4
 WORKFLOW_IO_MAX_CONCURRENCY = 1
+MAX_TERMINAL_WS_INPUT_BYTES = 1024 * 1024
 _ui_read_limiter = CapacityLimiter(UI_READ_MAX_CONCURRENCY)
 _operational_io_limiter = CapacityLimiter(OPERATIONAL_IO_MAX_CONCURRENCY)
 _workflow_io_limiter = CapacityLimiter(WORKFLOW_IO_MAX_CONCURRENCY)
@@ -1830,7 +1833,15 @@ def _send_server_bound_input(
         # The caller cannot select the logical turn. The public endpoint gets a
         # fresh one here; the internal route supplies an opaque, current binding.
         if turn_id is None:
-            turn_id = workflow_service.record_external_input(terminal_id)
+            prepared = workflow_service.prepare_external_input(terminal_id, raw_message)
+            turn_id = prepared["turn_id"]
+            if prepared["queued"]:
+                return {
+                    "success": True,
+                    "queued": True,
+                    "status": "queued_runtime_recovery",
+                    "reason_code": "TERMINAL_RUNTIME_OPERATION_BUSY",
+                }
         message = workflow_service.admission_message(message, turn_id)
         success = terminal_service.send_input(
             terminal_id,
@@ -2317,12 +2328,33 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
                 payload = json.loads(msg)
                 if payload.get("type") == "input":
                     raw = payload["data"].encode()
-                    # Write in chunks to avoid overflowing the PTY buffer
-                    chunk_size = 1024
-                    for i in range(0, len(raw), chunk_size):
-                        os.write(master_fd, raw[i : i + chunk_size])
-                        if i + chunk_size < len(raw):
-                            await asyncio.sleep(0.01)
+                    if len(raw) > MAX_TERMINAL_WS_INPUT_BYTES:
+                        await websocket.close(code=1009, reason="Terminal input frame is too large")
+                        break
+                    operation_token = await _run_operational_io(
+                        acquire_terminal_runtime_transport, terminal_id
+                    )
+                    if operation_token is None:
+                        await websocket.close(
+                            code=4011,
+                            reason="Terminal runtime is temporarily owned by recovery or exit",
+                        )
+                        break
+                    try:
+                        # Hold the durable pane-operation claim across every
+                        # chunk so reconnect/retirement cannot expose a shell
+                        # halfway through an operator paste.
+                        chunk_size = 1024
+                        for i in range(0, len(raw), chunk_size):
+                            os.write(master_fd, raw[i : i + chunk_size])
+                            if i + chunk_size < len(raw):
+                                await asyncio.sleep(0.01)
+                    finally:
+                        await _run_operational_io(
+                            release_terminal_runtime_operation,
+                            terminal_id,
+                            operation_token,
+                        )
                 elif payload.get("type") == "resize":
                     rows = payload.get("rows", 24)
                     cols = payload.get("cols", 80)

@@ -7,7 +7,7 @@ import re
 import shlex
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -150,7 +150,8 @@ CONTEXT_COMPACTED_LINE_PATTERN = re.compile(
     re.MULTILINE,
 )
 SIDECAR_RECONNECTED_LINE_PATTERN = re.compile(
-    rf"^[^\S\n]*{SIDECAR_RECONNECTED_PREFIX}(?P<generation>[0-9a-f]{{32}})__[^\S\n]*$",
+    rf"^[^\S\n]*{SIDECAR_RECONNECTED_PREFIX}"
+    rf"(?P<generation>[0-9a-f]{{{len(ACTIVE_RUNTIME_GENERATION)}}})__[^\S\n]*$",
     re.MULTILINE,
 )
 CODEX_SESSION_ID_PATTERN = re.compile(
@@ -576,7 +577,12 @@ class CodexProvider(BaseProvider):
             self._startup_evidence,
         )
 
-    def reconnect_runtime_sidecar(self, resume_identity: str) -> None:
+    def reconnect_runtime_sidecar(
+        self,
+        resume_identity: str,
+        *,
+        side_effect_guard: Callable[[], bool] = lambda: True,
+    ) -> None:
         """Restart Codex's MCP subprocess and resume the exact conversation."""
         identity_match = CODEX_SESSION_ID_PATTERN.fullmatch(f"{resume_identity}.jsonl")
         if not identity_match or identity_match.group("session") != resume_identity.lower():
@@ -587,6 +593,8 @@ class CodexProvider(BaseProvider):
         if pane_command not in SHELL_PANE_COMMANDS:
             if not CODEX_PANE_COMMAND_PATTERN.fullmatch(pane_command):
                 raise ProviderError("Codex pane changed before sidecar reconnect")
+            if not side_effect_guard():
+                raise ProviderError("Codex sidecar reconnect lost ownership before exit")
             tmux_client.send_keys(self.session_name, self.window_name, "/exit")
             deadline = time.monotonic() + 20.0
             while time.monotonic() < deadline:
@@ -601,6 +609,8 @@ class CodexProvider(BaseProvider):
             else:
                 raise ProviderError("Codex did not exit for sidecar reconnect")
 
+        if not side_effect_guard():
+            raise ProviderError("Codex sidecar reconnect lost ownership before resume")
         command = self._build_codex_command(resume_session_id=resume_identity)
         marker = f"{SIDECAR_RECONNECTED_PREFIX}{ACTIVE_RUNTIME_GENERATION}__"
         self._startup_attempt += 1
@@ -1021,14 +1031,19 @@ class CodexProvider(BaseProvider):
 
         # Codex owns this persisted reminder choice. Handle only the complete,
         # selected rate-limit model menu before generic prompt classification.
-        if self._handle_rate_limit_model_switch_prompt(output, clean_output):
+        if (
+            not self._runtime_sidecar_reconnect_pending
+            and self._handle_rate_limit_model_switch_prompt(output, clean_output)
+        ):
             self._reset_completion_candidate()
             return TerminalStatus.PROCESSING
 
         # The long-running-task retry suggestion is likewise advisory, but it
         # has no observed persistent "never show again" action. Dismiss only
         # this complete known menu and keep the already configured speed mode.
-        if self._handle_fast_mode_advisory_prompt(output, clean_output):
+        if not self._runtime_sidecar_reconnect_pending and self._handle_fast_mode_advisory_prompt(
+            output, clean_output
+        ):
             self._reset_completion_candidate()
             return TerminalStatus.PROCESSING
 

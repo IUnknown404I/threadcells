@@ -8,7 +8,7 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from threading import Barrier
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -23,6 +23,7 @@ from cli_agent_orchestrator.clients.database import (
     DEFER_UNADMITTED,
     Base,
     InboxModel,
+    TerminalModel,
     WorkflowEffectModel,
     WorkflowModel,
     WorkflowTurnModel,
@@ -117,6 +118,18 @@ def _confirmed_exit_result() -> ExitTerminalResult:
 
 def _start_admitted_input(root: str) -> int:
     """Create the initial provider turn and model its mandatory receipt."""
+    with database.SessionLocal() as db:
+        if db.get(TerminalModel, root) is None:
+            db.add(
+                TerminalModel(
+                    id=root,
+                    tmux_session=f"cao-{root}",
+                    tmux_window="owner-0000",
+                    provider="codex",
+                    runtime_lifecycle="running",
+                )
+            )
+            db.commit()
     turn_id = start_workflow_input(root)
     assert turn_id is not None
     assert claim_workflow_turn_receipt(root, turn_id)
@@ -230,6 +243,32 @@ def test_f13_no_child_open_final_queues_one_safe_continuation(workflow_db):
     assert claimed is not None and claimed["kind"] == "open_final"
     with database.SessionLocal() as db:
         assert db.query(WorkflowTurnModel).count() == 2
+
+
+def test_f13_stale_compacted_turn_rejection_keeps_open_workflow_moving_once(workflow_db):
+    """A compacted provider replay is inert; CAO owns the one fresh successor."""
+    root = "root-compacted-stale-turn"
+    stale_turn_id = _start_admitted_input(root)
+    now = datetime(2026, 8, 22, 18, 0, 0)
+
+    assert claim_workflow_turn_receipt(root, stale_turn_id, now=now) is False
+    assert get_workflow_status(root) == "open"
+    successor_id = observe_workflow_final(root, now=now)
+    claimed = claim_workflow_turn(root, now=now)
+
+    assert successor_id is not None
+    assert claimed is not None and claimed["id"] == successor_id
+    _admit_sent_continuation(root, claimed, now)
+    assert claim_workflow_turn_receipt(root, successor_id, now=now) is False
+    assert get_workflow_status(root) == "open"
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        assert (
+            db.query(WorkflowTurnModel)
+            .filter_by(workflow_id=workflow.id, kind="open_final")
+            .count()
+            == 1
+        )
 
 
 def test_f13_unadmitted_active_final_is_byte_stable_and_cannot_cascade(workflow_db):
@@ -1455,7 +1494,12 @@ def test_f13_stale_sidecar_requests_one_retryable_context_reinitialization(
     assert workflow_service.reconcile_root_workflow(root, now=now) is False
     assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=1)) is False
     mock_terminal.request_provider_runtime_sidecar_reconnect.assert_called_once_with(
-        root, reconnect_turn_id, "resume-exact", registry=None
+        root,
+        reconnect_turn_id,
+        "resume-exact",
+        registry=None,
+        claim_token=ANY,
+        side_effect_guard=ANY,
     )
 
     # The retry is owned by durable state even after the volatile provider
@@ -1463,7 +1507,12 @@ def test_f13_stale_sidecar_requests_one_retryable_context_reinitialization(
     assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=31)) is False
     assert mock_terminal.request_provider_runtime_sidecar_reconnect.call_count == 2
     mock_terminal.request_provider_runtime_sidecar_reconnect.assert_called_with(
-        root, reconnect_turn_id, "resume-exact", registry=None
+        root,
+        reconnect_turn_id,
+        "resume-exact",
+        registry=None,
+        claim_token=ANY,
+        side_effect_guard=ANY,
     )
     mock_terminal.provider_runtime_sidecar_resume_identity.assert_called_once_with(root)
     assert get_workflow_status(root) == "open"
@@ -1541,6 +1590,97 @@ def test_f13_reconnect_identity_is_durable_and_cannot_be_replaced(workflow_db):
         root, reconnect_turn_id, reclaimed["claim_token"]
     )
     assert not database.workflow_provider_reconnect_pending(root)
+
+
+def test_f13_reconnect_and_input_transport_have_one_terminal_mutation_owner(workflow_db):
+    root = "root-sidecar-input-race"
+    _start_admitted_input(root)
+    now = datetime.now()
+    barrier = Barrier(2)
+
+    def claim_reconnect():
+        barrier.wait()
+        return database.claim_workflow_provider_reconnect(root, now=now)
+
+    def claim_transport():
+        barrier.wait()
+        return database.acquire_terminal_runtime_transport(root, now=now)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        reconnect_future = executor.submit(claim_reconnect)
+        transport_future = executor.submit(claim_transport)
+        reconnect = reconnect_future.result()
+        transport = transport_future.result()
+
+    assert (reconnect is None) != (transport is None)
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, root)
+        assert terminal is not None
+        assert terminal.runtime_operation_kind in {"reconnect", "transport"}
+
+
+def test_f13_external_input_queues_without_replacing_reconnect_owned_turn(workflow_db):
+    root = "root-sidecar-queued-input"
+    active_turn_id = _start_admitted_input(root)
+    reconnect = database.claim_workflow_provider_reconnect(root, now=datetime.now())
+    assert reconnect is not None
+
+    prepared = database.prepare_workflow_input(root, "continue after recovery")
+
+    assert prepared is not None and prepared["queued"] is True
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        queued = db.get(WorkflowTurnModel, prepared["turn_id"])
+        assert workflow.active_turn_id == active_turn_id
+        assert queued is not None
+        assert queued.state == "queued"
+        assert queued.payload == "continue after recovery"
+    assert database.complete_workflow_provider_reconnect(
+        root, active_turn_id, reconnect["claim_token"]
+    )
+    claimed = claim_workflow_turn(root)
+    assert claimed is not None and claimed["id"] == prepared["turn_id"]
+
+
+def test_f13_retirement_fences_stale_reconnect_before_resume(workflow_db):
+    root = "root-sidecar-retirement-race"
+    turn_id = _start_admitted_input(root)
+    reconnect = database.claim_workflow_provider_reconnect(root, now=datetime.now())
+    assert reconnect is not None
+    assert database.claim_terminal_runtime_exit(root) == "busy"
+
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, root)
+        turn = db.get(WorkflowTurnModel, turn_id)
+        assert terminal is not None and turn is not None
+        terminal.runtime_operation_expires_at = datetime(2000, 1, 1)
+        turn.provider_reconnect_requested_at = datetime(2000, 1, 1)
+        db.commit()
+
+    assert database.claim_terminal_runtime_exit(root) == "dispatch"
+    assert not database.renew_workflow_provider_reconnect(root, turn_id, reconnect["claim_token"])
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, root)
+        assert terminal is not None
+        assert terminal.runtime_lifecycle == "exit_pending"
+        assert terminal.runtime_operation_kind == "retire"
+
+
+def test_f13_reconnect_heartbeat_exception_is_observable_and_loses_claim(monkeypatch):
+    reconnect = {"turn_id": 7, "claim_token": "claim-token"}
+    heartbeat = workflow_service._ProviderReconnectClaimHeartbeat("root-heartbeat", reconnect)
+    monkeypatch.setattr(
+        workflow_service,
+        "renew_workflow_provider_reconnect",
+        MagicMock(side_effect=RuntimeError("database unavailable")),
+    )
+    heartbeat._stop = MagicMock()
+    heartbeat._stop.wait.return_value = False
+
+    heartbeat._run()
+
+    assert heartbeat.lost is True
+    assert isinstance(heartbeat.error, RuntimeError)
 
 
 @patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")

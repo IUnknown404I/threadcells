@@ -13,6 +13,7 @@ from cli_agent_orchestrator.providers.codex import (
     CodexStartupNoReadyError,
     ProviderError,
 )
+from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -895,7 +896,7 @@ class TestCodexBulletFormatStatusDetection:
         assert mock_tmux.get_history.call_count == 2
 
         mock_tmux.get_history.return_value += (
-            "__CAO_SIDECAR_RECONNECTED_0123456789abcdef0123456789abcdef__\n"
+            f"__CAO_SIDECAR_RECONNECTED_{ACTIVE_RUNTIME_GENERATION}__\n"
             "OpenAI Codex\n› \n  ? for shortcuts  79% context left\n"
         )
         provider.get_status()
@@ -1003,6 +1004,25 @@ class TestCodexBulletFormatStatusDetection:
         assert "/exit" not in launch
         mock_wait.assert_called_once()
 
+    @patch("cli_agent_orchestrator.providers.codex.CodexProvider._wait_for_reconnected_runtime")
+    @patch("cli_agent_orchestrator.providers.codex.time.sleep")
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_runtime_sidecar_reconnect_does_not_resume_after_claim_loss(
+        self, mock_tmux, _mock_sleep, mock_wait
+    ):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        mock_tmux.get_pane_current_command.side_effect = ["codex.direct", "bash"]
+        guard = MagicMock(side_effect=[True, False])
+
+        with pytest.raises(ProviderError, match="lost ownership before resume"):
+            provider.reconnect_runtime_sidecar(
+                "01234567-89ab-cdef-0123-456789abcdef",
+                side_effect_guard=guard,
+            )
+
+        mock_tmux.send_keys.assert_called_once_with("test-session", "window-0", "/exit")
+        mock_wait.assert_not_called()
+
     @patch("cli_agent_orchestrator.providers.codex.time.sleep")
     @patch("cli_agent_orchestrator.providers.codex.time.monotonic", side_effect=[0.0, 0.1])
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
@@ -1010,7 +1030,7 @@ class TestCodexBulletFormatStatusDetection:
         self, mock_tmux, _mock_monotonic, _mock_sleep
     ):
         provider = CodexProvider("test1234", "test-session", "window-0")
-        marker = "__CAO_SIDECAR_RECONNECTED_0123456789abcdef0123456789abcdef__"
+        marker = f"__CAO_SIDECAR_RECONNECTED_{ACTIVE_RUNTIME_GENERATION}__"
         mock_tmux.get_history.return_value = (
             marker + "\n" + "restored transcript\n" * 300 + "OpenAI Codex\n? for shortcuts\n"
         )
@@ -1035,7 +1055,7 @@ class TestCodexBulletFormatStatusDetection:
         mock_tmux.get_history.return_value = (
             "__CAO_CODEX_STARTUP_EXIT_test1234_1__:0\n"
             "operator@host:/workspace$\n"
-            "__CAO_SIDECAR_RECONNECTED_0123456789abcdef0123456789abcdef__\n"
+            f"__CAO_SIDECAR_RECONNECTED_{ACTIVE_RUNTIME_GENERATION}__\n"
             "OpenAI Codex\n"
             "› \n"
             "  ? for shortcuts  79% context left\n"

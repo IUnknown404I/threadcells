@@ -1512,8 +1512,8 @@ class TestSendTerminalInput:
         with (
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
             patch(
-                "cli_agent_orchestrator.api.main.workflow_service.record_external_input",
-                return_value=73,
+                "cli_agent_orchestrator.api.main.workflow_service.prepare_external_input",
+                return_value={"turn_id": 73, "queued": False},
             ) as record,
         ):
             mock_svc.send_input.return_value = True
@@ -1526,7 +1526,7 @@ class TestSendTerminalInput:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        record.assert_called_once_with("abcd1234")
+        record.assert_called_once_with("abcd1234", "hello world")
         mock_svc.send_input.assert_called_once_with(
             "abcd1234",
             "[CAO workflow input: logical-turn=73]\n"
@@ -1549,8 +1549,8 @@ class TestSendTerminalInput:
         with (
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
             patch(
-                "cli_agent_orchestrator.api.main.workflow_service.record_external_input",
-                return_value=76,
+                "cli_agent_orchestrator.api.main.workflow_service.prepare_external_input",
+                return_value={"turn_id": 76, "queued": False},
             ),
             patch(
                 "cli_agent_orchestrator.api.main.queue_workflow_input_for_provider",
@@ -1571,13 +1571,35 @@ class TestSendTerminalInput:
         }
         queue.assert_called_once_with("abcd1234", 76, "durable task")
 
+    def test_runtime_recovery_queues_external_input_without_physical_send(self, client):
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.workflow_service.prepare_external_input",
+                return_value={"turn_id": 77, "queued": True},
+            ) as prepare,
+        ):
+            response = client.post(
+                "/terminals/abcd1234/input", params={"message": "after reconnect"}
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": True,
+            "queued": True,
+            "status": "queued_runtime_recovery",
+            "reason_code": "TERMINAL_RUNTIME_OPERATION_BUSY",
+        }
+        prepare.assert_called_once_with("abcd1234", "after reconnect")
+        mock_svc.send_input.assert_not_called()
+
     def test_public_orchestration_metadata_cannot_suppress_admission(self, client):
         """Public sender/type query values are ignored and cannot retain an old turn."""
         with (
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
             patch(
-                "cli_agent_orchestrator.api.main.workflow_service.record_external_input",
-                return_value=74,
+                "cli_agent_orchestrator.api.main.workflow_service.prepare_external_input",
+                return_value={"turn_id": 74, "queued": False},
             ) as record,
         ):
             mock_svc.send_input.return_value = True
@@ -1592,7 +1614,7 @@ class TestSendTerminalInput:
             )
 
         assert response.status_code == 200
-        record.assert_called_once_with("abcd1234")
+        record.assert_called_once_with("abcd1234", "hello world")
         mock_svc.send_input.assert_called_once_with(
             "abcd1234",
             "[CAO workflow input: logical-turn=74]\n"
@@ -1681,8 +1703,8 @@ class TestSendTerminalInput:
         with (
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
             patch(
-                "cli_agent_orchestrator.api.main.workflow_service.record_external_input",
-                return_value=76,
+                "cli_agent_orchestrator.api.main.workflow_service.prepare_external_input",
+                return_value={"turn_id": 76, "queued": False},
             ) as record,
         ):
             mock_svc.send_input.return_value = True
@@ -1694,7 +1716,7 @@ class TestSendTerminalInput:
 
         assert response.status_code == 200
         assert response.json() == {"success": True}
-        record.assert_called_once_with("abcd1234")
+        record.assert_called_once_with("abcd1234", message)
         delivered = mock_svc.send_input.call_args.args[1]
         assert "logical-turn=76" in delivered
         assert delivered.endswith(message)
@@ -1704,8 +1726,8 @@ class TestSendTerminalInput:
         with (
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
             patch(
-                "cli_agent_orchestrator.api.main.workflow_service.record_external_input",
-                return_value=77,
+                "cli_agent_orchestrator.api.main.workflow_service.prepare_external_input",
+                return_value={"turn_id": 77, "queued": False},
             ) as record,
         ):
             mock_svc.send_input.return_value = True
@@ -1716,12 +1738,12 @@ class TestSendTerminalInput:
             )
 
         assert response.status_code == 200
-        record.assert_called_once_with("abcd1234")
+        record.assert_called_once_with("abcd1234", message)
         assert mock_svc.send_input.call_args.args[1].endswith(message)
 
     def test_workflow_composer_rejects_empty_input_before_admission(self, client):
         with patch(
-            "cli_agent_orchestrator.api.main.workflow_service.record_external_input"
+            "cli_agent_orchestrator.api.main.workflow_service.prepare_external_input"
         ) as record:
             response = client.post(
                 "/terminals/abcd1234/workflow-input",

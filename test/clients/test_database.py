@@ -87,6 +87,10 @@ class TestTerminalOperations:
             "runtime_lifecycle",
             "runtime_exit_requested_at",
             "runtime_exited_at",
+            "runtime_operation_kind",
+            "runtime_operation_token",
+            "runtime_operation_claimed_at",
+            "runtime_operation_expires_at",
         } <= columns
         assert {"canonical_worktree", "terminal_id", "created_at"} <= lease_columns
 

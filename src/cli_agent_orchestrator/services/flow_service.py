@@ -273,7 +273,12 @@ def execute_flow(name: str) -> bool:
         from cli_agent_orchestrator.services import workflow_service
         from cli_agent_orchestrator.services.operations_service import AdmissionDenied
 
-        turn_id = workflow_service.record_external_input(terminal.id)
+        prepared = workflow_service.prepare_external_input(terminal.id, rendered_prompt)
+        turn_id = prepared["turn_id"]
+        if prepared["queued"]:
+            db_update_flow_run_times(name, last_run=now, next_run=next_run)
+            logger.info("Flow %s: launch input queued behind runtime recovery", name)
+            return True
         try:
             send_input(
                 terminal.id,

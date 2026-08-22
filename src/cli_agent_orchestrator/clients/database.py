@@ -99,6 +99,13 @@ class TerminalModel(Base):
     runtime_generation = Column(String, nullable=True)
     runtime_generation_origin = Column(String, nullable=True)
     runtime_process_start_ticks = Column(Integer, nullable=True)
+    # Exactly one operation may mutate a live pane at a time.  Provider
+    # execution capacity is deliberately separate: status observation may
+    # release that capacity while a physical paste is still completing.
+    runtime_operation_kind = Column(String, nullable=True)
+    runtime_operation_token = Column(String, nullable=True)
+    runtime_operation_claimed_at = Column(DateTime, nullable=True)
+    runtime_operation_expires_at = Column(DateTime, nullable=True)
     # Immutable durable insertion order. IDs, activity timestamps, runtime
     # presence, and provider response order are not creation-order facts.
     creation_order = Column(Integer, nullable=True)
@@ -2674,10 +2681,17 @@ def _migrate_terminal_worktree_authority_columns() -> bool:
             "runtime_pane_id",
             "runtime_generation",
             "runtime_generation_origin",
+            "runtime_operation_kind",
+            "runtime_operation_token",
         ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE terminals ADD COLUMN {name} TEXT")
-        for name in ("runtime_exit_requested_at", "runtime_exited_at"):
+        for name in (
+            "runtime_exit_requested_at",
+            "runtime_exited_at",
+            "runtime_operation_claimed_at",
+            "runtime_operation_expires_at",
+        ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE terminals ADD COLUMN {name} DATETIME")
         for name in ("runtime_pane_pid", "runtime_process_start_ticks"):
@@ -2954,6 +2968,10 @@ def create_terminal(
             "runtime_generation": terminal.runtime_generation,
             "runtime_generation_origin": terminal.runtime_generation_origin,
             "runtime_process_start_ticks": terminal.runtime_process_start_ticks,
+            "runtime_operation_kind": terminal.runtime_operation_kind,
+            "runtime_operation_token": terminal.runtime_operation_token,
+            "runtime_operation_claimed_at": terminal.runtime_operation_claimed_at,
+            "runtime_operation_expires_at": terminal.runtime_operation_expires_at,
             "creation_order": terminal.creation_order,
         }
 
@@ -3009,6 +3027,10 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "runtime_generation": terminal.runtime_generation,
             "runtime_generation_origin": terminal.runtime_generation_origin,
             "runtime_process_start_ticks": terminal.runtime_process_start_ticks,
+            "runtime_operation_kind": terminal.runtime_operation_kind,
+            "runtime_operation_token": terminal.runtime_operation_token,
+            "runtime_operation_claimed_at": terminal.runtime_operation_claimed_at,
+            "runtime_operation_expires_at": terminal.runtime_operation_expires_at,
             "last_active": terminal.last_active,
         }
 
@@ -3682,6 +3704,9 @@ def acquire_provider_execution(
         if terminal is None or terminal.runtime_lifecycle in ("exit_pending", "exited"):
             db.commit()
             return False
+        if _terminal_runtime_mutation_blocked(db, terminal_id, datetime.now()):
+            db.commit()
+            return False
         workflow_exists = (
             db.query(WorkflowModel.id).filter(WorkflowModel.root_terminal_id == terminal_id).first()
             is not None
@@ -3889,6 +3914,7 @@ def claim_terminal_runtime_exit(terminal_id: str) -> str:
     """
     _ensure_terminal_worktree_authority_schema()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal is None:
             return "missing"
@@ -3896,6 +3922,14 @@ def claim_terminal_runtime_exit(terminal_id: str) -> str:
             return "exited"
         if terminal.runtime_lifecycle == "exit_pending":
             return "observe"
+        now = datetime.now()
+        if (
+            terminal.runtime_operation_token is not None
+            and terminal.runtime_operation_expires_at is not None
+            and terminal.runtime_operation_expires_at > now
+        ):
+            db.commit()
+            return "busy"
         updated = (
             db.query(TerminalModel)
             .filter(
@@ -3908,7 +3942,13 @@ def claim_terminal_runtime_exit(terminal_id: str) -> str:
             .update(
                 {
                     TerminalModel.runtime_lifecycle: "exit_pending",
-                    TerminalModel.runtime_exit_requested_at: datetime.now(),
+                    TerminalModel.runtime_exit_requested_at: now,
+                    TerminalModel.runtime_operation_kind: "retire",
+                    TerminalModel.runtime_operation_token: uuid.uuid4().hex,
+                    TerminalModel.runtime_operation_claimed_at: now,
+                    # An exit claim is irreversible and is reconciled by
+                    # lifecycle observation, never by a second mutator.
+                    TerminalModel.runtime_operation_expires_at: None,
                 },
                 synchronize_session=False,
             )
@@ -3920,6 +3960,125 @@ def claim_terminal_runtime_exit(terminal_id: str) -> str:
         if refreshed is None:
             return "missing"
         return "exited" if refreshed.runtime_lifecycle == "exited" else "observe"
+
+
+RUNTIME_OPERATION_LEASE_SECONDS = 30
+
+
+def _terminal_has_pending_provider_reconnect(db, terminal_id: str) -> bool:
+    return (
+        db.query(WorkflowTurnModel.id)
+        .join(WorkflowModel, WorkflowModel.active_turn_id == WorkflowTurnModel.id)
+        .filter(
+            WorkflowModel.root_terminal_id == terminal_id,
+            WorkflowModel.status == WORKFLOW_OPEN,
+            WorkflowTurnModel.provider_reconnect_requested_at.is_not(None),
+        )
+        .first()
+        is not None
+    )
+
+
+def _terminal_runtime_mutation_blocked(db, terminal_id: str, now: datetime) -> bool:
+    terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+    if terminal is None:
+        return False
+    if terminal.runtime_lifecycle in ("exit_pending", "exited"):
+        return True
+    if _terminal_has_pending_provider_reconnect(db, terminal_id):
+        return True
+    return bool(
+        terminal.runtime_operation_token is not None
+        and (
+            terminal.runtime_operation_expires_at is None
+            or terminal.runtime_operation_expires_at > now
+        )
+    )
+
+
+def acquire_terminal_runtime_transport(
+    terminal_id: str, *, now: Optional[datetime] = None
+) -> Optional[str]:
+    """Claim the exact live pane for one bounded input/write operation.
+
+    A pending reconnect is authoritative even after its short operation lease
+    expires: only the reconnect recovery path may reclaim that crash gap.
+    """
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_workflow_schema()
+    now = now or datetime.now()
+    token = uuid.uuid4().hex
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal is None or terminal.runtime_lifecycle not in (None, "running"):
+            db.commit()
+            return None
+        if _terminal_has_pending_provider_reconnect(db, terminal_id):
+            db.commit()
+            return None
+        operation_live = terminal.runtime_operation_token is not None and (
+            terminal.runtime_operation_expires_at is None
+            or terminal.runtime_operation_expires_at > now
+        )
+        if operation_live:
+            db.commit()
+            return None
+        terminal.runtime_operation_kind = "transport"
+        terminal.runtime_operation_token = token
+        terminal.runtime_operation_claimed_at = now
+        terminal.runtime_operation_expires_at = now + timedelta(
+            seconds=RUNTIME_OPERATION_LEASE_SECONDS
+        )
+        db.commit()
+        return token
+
+
+def release_terminal_runtime_operation(terminal_id: str, claim_token: str) -> bool:
+    """Release only the exact short-lived pane-operation claim."""
+    _ensure_terminal_worktree_authority_schema()
+    with SessionLocal() as db:
+        released = (
+            db.query(TerminalModel)
+            .filter(
+                TerminalModel.id == terminal_id,
+                TerminalModel.runtime_operation_token == claim_token,
+                TerminalModel.runtime_operation_kind == "transport",
+            )
+            .update(
+                {
+                    TerminalModel.runtime_operation_kind: None,
+                    TerminalModel.runtime_operation_token: None,
+                    TerminalModel.runtime_operation_claimed_at: None,
+                    TerminalModel.runtime_operation_expires_at: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return released == 1
+
+
+def terminal_runtime_operation_owned(
+    terminal_id: str, claim_token: str, operation_kind: str
+) -> bool:
+    """Check an internal long-lived runtime mutation capability."""
+    _ensure_terminal_worktree_authority_schema()
+    with SessionLocal() as db:
+        return (
+            db.query(TerminalModel.id)
+            .filter(
+                TerminalModel.id == terminal_id,
+                or_(
+                    TerminalModel.runtime_lifecycle.is_(None),
+                    TerminalModel.runtime_lifecycle == "running",
+                ),
+                TerminalModel.runtime_operation_kind == operation_kind,
+                TerminalModel.runtime_operation_token == claim_token,
+            )
+            .first()
+            is not None
+        )
 
 
 def promote_terminal_context_role_to_supervisor(terminal_id: str, agent_profile: str) -> bool:
@@ -4012,6 +4171,10 @@ def mark_terminal_runtime_exited(terminal_id: str) -> bool:
             return False
         terminal.runtime_lifecycle = "exited"
         terminal.runtime_exited_at = terminal.runtime_exited_at or datetime.now()
+        terminal.runtime_operation_kind = None
+        terminal.runtime_operation_token = None
+        terminal.runtime_operation_claimed_at = None
+        terminal.runtime_operation_expires_at = None
         lease = (
             db.query(WorktreeWriterLeaseModel)
             .filter(WorktreeWriterLeaseModel.terminal_id == terminal_id)
@@ -4575,13 +4738,18 @@ def _retirement_quiescence_allows_commit(db, terminal_id: str) -> bool:
     )
 
 
-def _start_workflow_input(
-    root_terminal_id: str, transport_binding: Optional[str] = None
-) -> Optional[int]:
-    """Persist one input and optionally bind it to CAO's internal transport."""
+def _prepare_workflow_input(
+    root_terminal_id: str,
+    *,
+    payload: Optional[str] = None,
+    transport_binding: Optional[str] = None,
+    defer_while_runtime_owned: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Persist one input without replacing a reconnect-owned active turn."""
     _ensure_workflow_schema()
     _ensure_child_assignment_schema()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         if not _retirement_quiescence_allows_commit(db, root_terminal_id):
             return None
         workflow = _open_workflow(db, root_terminal_id, create=True)
@@ -4592,11 +4760,23 @@ def _start_workflow_input(
             workflow = WorkflowModel(root_terminal_id=root_terminal_id, status=WORKFLOW_OPEN)
             db.add(workflow)
             db.flush()
+        runtime_owned = False
+        if defer_while_runtime_owned:
+            terminal = db.query(TerminalModel).filter(TerminalModel.id == root_terminal_id).first()
+            runtime_owned = bool(
+                terminal
+                and (
+                    terminal.runtime_lifecycle in ("exit_pending", "exited")
+                    or terminal.runtime_operation_kind in ("reconnect", "retire")
+                    or _terminal_has_pending_provider_reconnect(db, root_terminal_id)
+                )
+            )
         turn = WorkflowTurnModel(
             workflow_id=workflow.id,
             kind="external_input",
             dedupe_key=f"external:{datetime.now().isoformat()}:{id(workflow)}",
-            state=TURN_SENT,
+            payload=payload if runtime_owned else None,
+            state=TURN_QUEUED if runtime_owned else TURN_SENT,
             transport_binding=transport_binding,
         )
         db.add(turn)
@@ -4604,7 +4784,8 @@ def _start_workflow_input(
         # The direct input about to reach the provider is the only turn whose
         # public MCP calls may be admitted.  A later input replaces this
         # binding, so an old prompt cannot borrow its retained receipt.
-        workflow.active_turn_id = turn.id
+        if not runtime_owned:
+            workflow.active_turn_id = turn.id
         # A direct owner/user input is genuine progress and re-arms the bounded
         # automatic continuation path for this still-open mission.
         workflow.no_progress_count = 0
@@ -4613,7 +4794,24 @@ def _start_workflow_input(
             db.rollback()
             return None
         db.commit()
-        return cast(int, turn.id)
+        return {"turn_id": cast(int, turn.id), "queued": runtime_owned}
+
+
+def _start_workflow_input(
+    root_terminal_id: str, transport_binding: Optional[str] = None
+) -> Optional[int]:
+    """Persist one input and optionally bind it to CAO's internal transport."""
+    prepared = _prepare_workflow_input(root_terminal_id, transport_binding=transport_binding)
+    return cast(int, prepared["turn_id"]) if prepared is not None else None
+
+
+def prepare_workflow_input(root_terminal_id: str, payload: str) -> Optional[Dict[str, Any]]:
+    """Prepare a public/scheduled input, queueing behind runtime recovery."""
+    return _prepare_workflow_input(
+        root_terminal_id,
+        payload=payload,
+        defer_while_runtime_owned=True,
+    )
 
 
 def start_workflow_input(root_terminal_id: str) -> Optional[int]:
@@ -4691,6 +4889,10 @@ def activate_workflow_turn(root_terminal_id: str, logical_turn_id: int) -> bool:
     """
     _ensure_workflow_schema()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        if _terminal_runtime_mutation_blocked(db, root_terminal_id, datetime.now()):
+            db.rollback()
+            return False
         workflow = _open_workflow(db, root_terminal_id, create=False)
         if workflow is None or workflow.status != WORKFLOW_OPEN:
             return False
@@ -4721,6 +4923,7 @@ def activate_workflow_turn_for_inbox(message_id: int) -> Optional[int] | str:
     """
     _ensure_workflow_schema()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         turn = (
             db.query(WorkflowTurnModel)
             .filter(WorkflowTurnModel.inbox_message_id == message_id)
@@ -4731,6 +4934,11 @@ def activate_workflow_turn_for_inbox(message_id: int) -> Optional[int] | str:
         workflow = db.query(WorkflowModel).filter(WorkflowModel.id == turn.workflow_id).first()
         if workflow is None or workflow.status != WORKFLOW_OPEN:
             return None
+        if _terminal_runtime_mutation_blocked(
+            db, cast(str, workflow.root_terminal_id), datetime.now()
+        ):
+            db.rollback()
+            return DEFER_UNADMITTED
 
         active_turn_id = workflow.active_turn_id
         if active_turn_id != turn.id and _workflow_has_unadmitted_active_turn(db, workflow):
@@ -5664,8 +5872,24 @@ def claim_workflow_provider_reconnect(
     )
     claim_token = uuid.uuid4().hex
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         workflow = _open_workflow(db, root_terminal_id, create=False)
         if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
+            db.rollback()
+            return None
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == root_terminal_id).first()
+        if terminal is None or terminal.runtime_lifecycle not in (None, "running"):
+            db.rollback()
+            return None
+        operation_live = terminal.runtime_operation_token is not None and (
+            terminal.runtime_operation_expires_at is None
+            or terminal.runtime_operation_expires_at > now
+        )
+        if operation_live:
+            db.rollback()
+            return None
+        if db.get(ProviderExecutionLeaseModel, root_terminal_id) is not None:
+            db.rollback()
             return None
         active_turn_id = cast(int, workflow.active_turn_id)
         admitted = (
@@ -5677,6 +5901,7 @@ def claim_workflow_provider_reconnect(
             .first()
         )
         if admitted is None:
+            db.rollback()
             return None
         claimed = (
             db.query(WorkflowTurnModel)
@@ -5709,6 +5934,12 @@ def claim_workflow_provider_reconnect(
         if claimed != 1:
             db.rollback()
             return None
+        terminal.runtime_operation_kind = "reconnect"
+        terminal.runtime_operation_token = claim_token
+        terminal.runtime_operation_claimed_at = now
+        terminal.runtime_operation_expires_at = now + timedelta(
+            seconds=WORKFLOW_PROVIDER_RECONNECT_LEASE_SECONDS
+        )
         db.commit()
         resume_identity = (
             db.query(WorkflowTurnModel.provider_reconnect_resume_identity)
@@ -5776,6 +6007,16 @@ def persist_workflow_provider_reconnect_identity(
     if not resume_identity:
         return False
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == root_terminal_id).first()
+        if (
+            terminal is None
+            or terminal.runtime_lifecycle not in (None, "running")
+            or terminal.runtime_operation_kind != "reconnect"
+            or terminal.runtime_operation_token != claim_token
+        ):
+            db.rollback()
+            return False
         turn = (
             db.query(WorkflowTurnModel)
             .filter(
@@ -5808,6 +6049,16 @@ def complete_workflow_provider_reconnect(
     """Close the durable reconnect episode after the resumed TUI is ready."""
     _ensure_workflow_schema()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == root_terminal_id).first()
+        if (
+            terminal is None
+            or terminal.runtime_lifecycle not in (None, "running")
+            or terminal.runtime_operation_kind != "reconnect"
+            or terminal.runtime_operation_token != claim_token
+        ):
+            db.rollback()
+            return False
         completed = (
             db.query(WorkflowTurnModel)
             .filter(
@@ -5835,6 +6086,10 @@ def complete_workflow_provider_reconnect(
         if completed != 1:
             db.rollback()
             return False
+        terminal.runtime_operation_kind = None
+        terminal.runtime_operation_token = None
+        terminal.runtime_operation_claimed_at = None
+        terminal.runtime_operation_expires_at = None
         db.commit()
         return True
 
@@ -5849,6 +6104,16 @@ def renew_workflow_provider_reconnect(
     _ensure_workflow_schema()
     now = now or datetime.now()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == root_terminal_id).first()
+        if (
+            terminal is None
+            or terminal.runtime_lifecycle not in (None, "running")
+            or terminal.runtime_operation_kind != "reconnect"
+            or terminal.runtime_operation_token != claim_token
+        ):
+            db.rollback()
+            return False
         renewed = (
             db.query(WorkflowTurnModel)
             .filter(
@@ -5874,6 +6139,9 @@ def renew_workflow_provider_reconnect(
         if renewed != 1:
             db.rollback()
             return False
+        terminal.runtime_operation_expires_at = now + timedelta(
+            seconds=WORKFLOW_PROVIDER_RECONNECT_LEASE_SECONDS
+        )
         db.commit()
         return True
 

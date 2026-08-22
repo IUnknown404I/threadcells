@@ -179,3 +179,42 @@ def test_pending_retry_never_reports_success_without_delivery(monkeypatch):
     assert result.outcome == "exit_pending"
     assert result.command_delivered is False
     send.assert_not_called()
+
+
+def test_reconnect_shell_gap_exit_defers_while_recovery_owns_pane(monkeypatch):
+    metadata = {**_metadata(), "runtime_operation_kind": "reconnect"}
+    _wire(monkeypatch, metadata=metadata, claim="busy")
+    monkeypatch.setattr(
+        terminal_service.tmux_client,
+        "exact_pane_target",
+        lambda *_: PaneDeliveryTarget("%41", "bash"),
+    )
+    reconcile = MagicMock()
+    monkeypatch.setattr(terminal_service, "reconcile_terminal_runtime", reconcile)
+
+    with pytest.raises(terminal_service.ExitAuthorityError) as raised:
+        terminal_service.exit_terminal("abcd1234")
+
+    assert raised.value.reason_code == "EXIT_RUNTIME_OPERATION_BUSY"
+    assert raised.value.inventory_uncertain is True
+    reconcile.assert_not_called()
+
+
+def test_reconnect_shell_gap_retirement_wins_without_relaunch_or_exit_send(monkeypatch):
+    metadata = {**_metadata(), "runtime_operation_kind": "reconnect"}
+    _wire(monkeypatch, metadata=metadata, claim="dispatch")
+    monkeypatch.setattr(
+        terminal_service.tmux_client,
+        "exact_pane_target",
+        lambda *_: PaneDeliveryTarget("%41", "bash"),
+    )
+    monkeypatch.setattr(terminal_service, "reconcile_terminal_runtime", lambda *_: True)
+    send = MagicMock()
+    monkeypatch.setattr(terminal_service.tmux_client, "send_keys", send)
+
+    result = terminal_service.exit_terminal("abcd1234")
+
+    assert result.success is True
+    assert result.outcome == "already_exited"
+    assert result.command_delivered is False
+    send.assert_not_called()

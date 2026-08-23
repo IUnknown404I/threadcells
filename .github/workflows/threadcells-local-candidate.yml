@@ -20,6 +20,7 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - run: npm ci --ignore-scripts
         working-directory: web
+      - run: uv sync --locked --all-extras --dev
       - run: python scripts/build_local_candidate.py --output "$RUNNER_TEMP/threadcells-candidate"
       - run: |
           candidate="$RUNNER_TEMP/threadcells-candidate/threadcells-0.1.0a1-local"

@@ -59,6 +59,8 @@ flowchart LR
 
 The `0.1.0-alpha.2` technical preview supports a single Ubuntu/Debian Linux host, loopback-first access, and a Codex-first setup. Native agents can execute powerful commands; worktrees are not a security sandbox. See [limitations](docs/LIMITATIONS.md) before evaluation.
 
+The public `ghcr.io/iunknown404i/threadcells-release-bundle` OCI package carries verified release archives and evidence. It is a distribution artifact, not a Docker image or a supported container deployment mode; see the [release process](docs/RELEASE_PROCESS.md).
+
 ## FAQ
 
 **Does ThreadCells publish or expose anything during setup?** No. The supported setup builds a local candidate, verifies it, and starts only a loopback listener when you run the server command.

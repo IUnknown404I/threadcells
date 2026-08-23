@@ -1,0 +1,176 @@
+name: Publish ThreadCells release bundle
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing immutable ThreadCells alpha release tag to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || (startsWith(github.event.release.tag_name, 'v0.1.') && contains(github.event.release.tag_name, '-alpha.'))
+    runs-on: ubuntu-latest
+    env:
+      PACKAGE: ghcr.io/iunknown404i/threadcells-release-bundle
+    steps:
+      - name: Select release tag
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            release_tag="$EVENT_TAG"
+          else
+            release_tag="$INPUT_TAG"
+          fi
+          if [[ ! "$release_tag" =~ ^v0\.1\.(0|[1-9][0-9]*)-alpha\.([1-9][0-9]*)$ ]]; then
+            echo "release tag must match v0.1.X-alpha.N" >&2
+            exit 1
+          fi
+          release_state="$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,tagName)"
+          test "$(jq -r .tagName <<<"$release_state")" = "$release_tag"
+          test "$(jq -r .isDraft <<<"$release_state")" = "false"
+          test "$(jq -r .isPrerelease <<<"$release_state")" = "true"
+          echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check out publication control
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: publication-control
+
+      - name: Check out immutable release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+          fetch-depth: 0
+          path: release-source
+
+      - name: Verify immutable release identity
+        id: identity
+        working-directory: release-source
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = "tag"
+          source_sha="$(git rev-parse "$RELEASE_TAG^{commit}")"
+          test "$(git rev-parse HEAD)" = "$source_sha"
+          version="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          expected="$(sed -E 's/^v//; s/-alpha\.([0-9]+)$/a\1/' <<<"$RELEASE_TAG")"
+          test "$version" = "$expected"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: astral-sh/setup-uv@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: release-source/web/package-lock.json
+      - uses: oras-project/setup-oras@v1
+        with:
+          version: 1.3.3
+
+      - name: Populate locked Web build cache
+        run: npm ci --ignore-scripts
+        working-directory: release-source/web
+
+      - name: Populate locked Python build cache
+        run: uv sync --locked --all-extras --dev
+        working-directory: release-source
+
+      - name: Build and verify release candidate
+        id: bundle
+        working-directory: release-source
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.identity.outputs.version }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/threadcells-candidate"
+          candidate="$output/threadcells-$VERSION-local"
+          archive="$output/threadcells-$VERSION-local.tar.gz"
+          python scripts/build_local_candidate.py --output "$output"
+          wheel="$(find "$candidate/packages" -maxdepth 1 -name 'threadcells-*.whl' -print -quit)"
+          python scripts/verify_local_candidate.py --candidate "$candidate"
+          python scripts/audit_public_surface.py --candidate "$candidate" --wheel "$wheel"
+          python ../publication-control/scripts/prepare_release_bundle.py \
+            --candidate "$candidate" \
+            --archive "$archive" \
+            --release-tag "$RELEASE_TAG" \
+            --expected-source-revision "$SOURCE_SHA" \
+            --output "$RUNNER_TEMP/threadcells-release-bundle"
+          (cd "$RUNNER_TEMP/threadcells-release-bundle" && sha256sum -c BUNDLE-SHA256SUMS)
+          echo "directory=$RUNNER_TEMP/threadcells-release-bundle" >> "$GITHUB_OUTPUT"
+
+      - name: Publish immutable OCI bundle
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          SOURCE_SHA: ${{ steps.identity.outputs.source_sha }}
+          BUNDLE_DIR: ${{ steps.bundle.outputs.directory }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | oras login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          source_url="https://github.com/$GITHUB_REPOSITORY"
+          if existing_digest="$(oras resolve "$PACKAGE:$RELEASE_TAG" 2>/dev/null)"; then
+            manifest="$(oras manifest fetch "$PACKAGE:$RELEASE_TAG")"
+            test "$(jq -r .artifactType <<<"$manifest")" = "application/vnd.threadcells.release.bundle.v1"
+            test "$(jq -r '.annotations["org.opencontainers.image.revision"]' <<<"$manifest")" = "$SOURCE_SHA"
+            test "$(jq -r '.annotations["org.opencontainers.image.version"]' <<<"$manifest")" = "$RELEASE_TAG"
+            test "$(jq -r '.annotations["org.opencontainers.image.source"]' <<<"$manifest")" = "$source_url"
+            existing="$RUNNER_TEMP/existing-threadcells-release-bundle"
+            oras pull "$PACKAGE@$existing_digest" --output "$existing"
+            diff --recursive --brief "$BUNDLE_DIR" "$existing"
+            digest="$existing_digest"
+          else
+            cd "$BUNDLE_DIR"
+            archive="$(find . -maxdepth 1 -name '*.tar.gz' -printf '%f\n')"
+            archive_checksum="$(find . -maxdepth 1 -name '*.tar.gz.sha256' -printf '%f\n')"
+            wheel="$(find . -maxdepth 1 -name '*.whl' -printf '%f\n')"
+            test -n "$archive" && test -n "$archive_checksum" && test -n "$wheel"
+            oras push "$PACKAGE:$RELEASE_TAG" \
+              --artifact-type application/vnd.threadcells.release.bundle.v1 \
+              --annotation "org.opencontainers.image.title=ThreadCells release bundle $RELEASE_TAG" \
+              --annotation "org.opencontainers.image.description=Immutable ThreadCells release distribution; not a container runtime image" \
+              --annotation "org.opencontainers.image.source=$source_url" \
+              --annotation "org.opencontainers.image.revision=$SOURCE_SHA" \
+              --annotation "org.opencontainers.image.version=$RELEASE_TAG" \
+              "$archive:application/vnd.threadcells.release.archive.v1+gzip" \
+              "$archive_checksum:text/plain" \
+              "$wheel:application/vnd.pypa.wheel" \
+              "SHA256SUMS:text/plain" \
+              "BUNDLE-SHA256SUMS:text/plain" \
+              "candidate-manifest.json:application/vnd.threadcells.candidate.manifest.v2+json" \
+              "release-bundle.json:application/vnd.threadcells.release.bundle.metadata.v1+json" \
+              "sbom.cdx.json:application/vnd.cyclonedx+json" \
+              "README.md:text/markdown"
+            digest="$(oras resolve "$PACKAGE:$RELEASE_TAG")"
+          fi
+          oras tag "$PACKAGE@$digest" latest-alpha
+          if oras resolve "$PACKAGE:latest" >/dev/null 2>&1; then
+            echo "refusing an unqualified latest tag during alpha" >&2
+            exit 1
+          fi
+          test "$(oras resolve "$PACKAGE:latest-alpha")" = "$digest"
+          {
+            echo "### ThreadCells release bundle"
+            echo "- Package: \`$PACKAGE\`"
+            echo "- Tag: \`$RELEASE_TAG\`"
+            echo "- Source: \`$SOURCE_SHA\`"
+            echo "- Digest: \`$digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"

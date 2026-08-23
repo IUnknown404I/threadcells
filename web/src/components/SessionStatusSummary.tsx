@@ -59,7 +59,7 @@ function BoundaryStatus({
             agent.activity,
             agent.lifecycle,
             agent.execution_state,
-          )} workflowReason={agent.workflow_reason} />
+          )} />
         </span>
       ) : <span className="text-xs text-gray-400">—</span>}
     </div>

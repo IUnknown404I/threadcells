@@ -109,7 +109,7 @@ const UNKNOWN_CONFIG: StatusStyle = {
   textClass: 'text-gray-500',
 }
 
-export function StatusBadge({ status, workflowState, workflowReason }: { status: TerminalStatus, workflowState?: string | null, workflowReason?: string | null }) {
+export function StatusBadge({ status, workflowState }: { status: TerminalStatus, workflowState?: string | null }) {
   const [storedPrimary, providerDiagnostic] = typeof status === 'string' ? status.split('::', 2) : [status, undefined]
   const normalized = workflowState ? `WORKFLOW_${workflowState.toUpperCase()}` : (storedPrimary ? storedPrimary.toUpperCase() : null)
   const config = (normalized && STATUS_CONFIG[normalized]) || UNKNOWN_CONFIG
@@ -117,14 +117,13 @@ export function StatusBadge({ status, workflowState, workflowReason }: { status:
   if (normalized?.startsWith('WORKFLOW_') && providerDiagnostic) {
     const activity = providerDiagnostic.toUpperCase()
     const activityConfig = activity === 'PROCESSING' ? STATUS_CONFIG.PROCESSING : activity === 'QUEUED' ? STATUS_CONFIG.QUEUED : activity === 'EXITED' ? { ...STATUS_CONFIG.COMPLETED, label: 'Exited' } : STATUS_CONFIG[activity] || { ...STATUS_CONFIG.IDLE, label: 'Ready' }
-    return <span className="inline-flex flex-wrap items-center gap-1.5"><span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full ${activityConfig.bgClass}`}><span className={`w-2 h-2 rounded-full ${activityConfig.dotClass} ${activityConfig.pulse ? 'animate-pulse' : ''}`} /><span className={`text-xs font-medium ${activityConfig.textClass}`}>{activityConfig.label}</span></span><span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full ${config.bgClass} ${config.textClass}`}><span className="text-[10px]">Workflow ·</span><span className="text-xs font-medium">{config.label}</span>{normalized === 'WORKFLOW_OWNER_GATE' && workflowReason && <span className="max-w-xl text-xs">· {workflowReason}</span>}</span></span>
+    return <span data-status-badge className="inline-flex flex-wrap items-center gap-1.5"><span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full ${activityConfig.bgClass}`}><span className={`w-2 h-2 rounded-full ${activityConfig.dotClass} ${activityConfig.pulse ? 'animate-pulse' : ''}`} /><span className={`text-xs font-medium ${activityConfig.textClass}`}>{activityConfig.label}</span></span><span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full ${config.bgClass} ${config.textClass}`}><span className="text-[10px]">Workflow ·</span><span className="text-xs font-medium">{config.label}</span></span></span>
   }
 
   return (
-    <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full ${config.bgClass}`}>
+    <span data-status-badge className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full ${config.bgClass}`}>
       <span className={`w-2 h-2 rounded-full ${config.dotClass} ${config.pulse ? 'animate-pulse' : ''}`} />
       <span className={`text-xs font-medium ${config.textClass}`}>{config.label}</span>
-      {normalized === 'WORKFLOW_OWNER_GATE' && workflowReason && <span className={`max-w-xl text-xs ${config.textClass}`}>· {workflowReason}</span>}
       {providerDiagnostic && <span className="text-[10px] text-gray-500">Provider {providerDiagnostic}</span>}
     </span>
   )

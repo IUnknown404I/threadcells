@@ -86,14 +86,20 @@ describe('StatusBadge', () => {
     expect(screen.getByText(label)).toBeInTheDocument()
   })
 
-  it('renders the concrete durable owner-gate reason', () => {
-    render(
-      <StatusBadge
-        status="WORKFLOW_OWNER_GATE::Ready"
-        workflowReason="provider reconnect recovery exhausted after 3 attempts"
-      />
+  it('keeps owner-gate badges categorical and leaves the durable reason to detail surfaces', () => {
+    const reason = `Owner approval is required. ${'This intentionally long durable explanation belongs outside every status badge. '.repeat(12)}`
+    const { container } = render(
+      <div>
+        <StatusBadge status="WORKFLOW_OWNER_GATE::Ready" />
+        <p>{reason}</p>
+      </div>
     )
-    expect(screen.getByText(/provider reconnect recovery exhausted after 3 attempts/)).toBeInTheDocument()
+    const badge = container.querySelector('[data-status-badge]')
+    expect(badge).toHaveTextContent('ReadyWorkflow ·Needs owner decision')
+    expect(badge).not.toHaveTextContent(reason)
+    expect(badge).not.toHaveAttribute('title')
+    expect(badge).not.toHaveAttribute('aria-label')
+    expect(screen.getByText((_, element) => element?.tagName === 'P' && element.textContent === reason)).toBeInTheDocument()
   })
 
   it('uses an active durable turn to override a momentary provider Ready observation', () => {

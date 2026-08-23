@@ -1076,11 +1076,13 @@ def create_terminal(
             raise
 
 
-def provider_runtime_sidecar_reconnect_required(terminal_id: str) -> bool:
+def provider_runtime_sidecar_reconnect_required(terminal_id: str, provider: Any = None) -> bool:
     """Read the provider-owned stale-sidecar signal without mutating runtime."""
-    provider = provider_manager.get_provider(terminal_id)
-    predicate = getattr(provider, "runtime_sidecar_reconnect_required", None)
-    return bool(predicate and predicate())
+    runtime_provider = (
+        provider if provider is not None else provider_manager.get_provider(terminal_id)
+    )
+    predicate = getattr(runtime_provider, "runtime_sidecar_reconnect_required", None)
+    return bool(predicate and predicate() is True)
 
 
 def provider_runtime_sidecar_resume_identity(terminal_id: str) -> str:

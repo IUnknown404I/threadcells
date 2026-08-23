@@ -22,7 +22,7 @@ def _hook_payload():
 def _hook_env(monkeypatch, token="terminal-secret"):
     monkeypatch.setenv("CAO_TERMINAL_ID", "abcdef12")
     monkeypatch.setenv("CAO_TERMINAL_AUTH_TOKEN", token)
-    monkeypatch.setenv("CAO_RUNTIME_GENERATION", "a" * 64)
+    monkeypatch.setenv("CAO_RUNTIME_GENERATION", "11111111-2222-4333-8444-555555555555")
 
 
 def test_hook_binds_exact_identity_without_printing_capability(monkeypatch, capsys):
@@ -37,7 +37,7 @@ def test_hook_binds_exact_identity_without_printing_capability(monkeypatch, caps
     assert codex_session_hook.main() == 0
     assert capsys.readouterr().out == ""
     _, kwargs = post.call_args
-    assert kwargs["json"]["runtime_generation"] == "a" * 64
+    assert kwargs["json"]["runtime_generation"] == "11111111-2222-4333-8444-555555555555"
     assert kwargs["headers"]["Authorization"] == f"Bearer {token}"
     assert kwargs["headers"][RUNTIME_GENERATION_HEADER] == ACTIVE_RUNTIME_GENERATION
 

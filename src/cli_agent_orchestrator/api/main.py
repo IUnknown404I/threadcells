@@ -387,7 +387,7 @@ class CodexSessionIdentityRequest(BaseModel):
     transcript_path: str
     cwd: str
     source: Literal["startup", "resume"]
-    runtime_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
+    runtime_generation: str = Field(pattern=r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 
 
 class CreateFlowRequest(BaseModel):

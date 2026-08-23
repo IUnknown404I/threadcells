@@ -85,7 +85,7 @@ from cli_agent_orchestrator.services.inbox_service import (
 from cli_agent_orchestrator.services.terminal_service import ExitTerminalResult
 
 TEST_CODEX_RESUME_IDENTITY = "01234567-89ab-cdef-0123-456789abcdef"
-TEST_TERMINAL_RUNTIME_GENERATION = "terminal-runtime-generation"
+TEST_TERMINAL_RUNTIME_GENERATION = "11111111-2222-4333-8444-555555555555"
 
 
 @pytest.fixture
@@ -1564,6 +1564,112 @@ def test_f13_stale_sidecar_requests_one_retryable_context_reinitialization(
     assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=3)) is False
     assert mock_terminal.request_provider_runtime_sidecar_reconnect.call_count == 2
     assert mock_terminal.send_input.call_count == 1
+
+
+@patch("cli_agent_orchestrator.services.workflow_service.terminal_service")
+def test_f13_processing_sidecar_fence_persists_intent_before_any_new_transport(
+    mock_terminal, workflow_db
+):
+    """A tool-time fence survives the PROCESSING early return and restart."""
+    root = "root-sidecar-processing-intent"
+    active_turn_id = _start_admitted_input(root)
+    now = datetime(2026, 8, 23, 12, 0, 0)
+    mock_terminal.get_terminal.return_value = {
+        "status": TerminalStatus.PROCESSING.value,
+        "lifecycle": "running",
+    }
+    mock_terminal.provider_runtime_sidecar_reconnect_required.return_value = True
+
+    assert workflow_service.reconcile_root_workflow(root, now=now) is False
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, active_turn_id)
+        assert turn is not None
+        assert turn.provider_reconnect_requested_at == now
+        assert turn.provider_reconnect_claim_token is None
+        assert db.query(WorkflowProviderReconnectAttemptModel).count() == 0
+        assert db.query(WorkflowEffectModel).count() == 0
+
+    workflow_db.dispose()
+    assert database.workflow_provider_reconnect_pending(root) is True
+
+
+def test_f13_restart_repairs_backward_open_final_and_admits_new_input_once(workflow_db):
+    """2687-like stale authority cannot replay after a newer admitted turn."""
+    root = "root-backward-compaction-repair"
+    original = _start_admitted_input(root)
+    stale_open_final = observe_workflow_final(root)
+    assert isinstance(stale_open_final, int) and stale_open_final > original
+
+    newer = start_workflow_input(root)
+    assert newer is not None and newer > stale_open_final
+    assert claim_workflow_turn_receipt(root, newer)
+    assert isinstance(observe_workflow_final(root), int)
+    pending = create_inbox_message("owner", root, "newest owner continuation")
+    newest = database.ensure_workflow_turn_for_inbox(pending.id)
+    assert newest is not None and newest > newer
+
+    # Recreate the exact historical corruption observed after compaction: an
+    # older synthetic turn is SENT without a receipt and owns active_turn_id
+    # even though a newer turn already has a durable receiver receipt.
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        stale = db.get(WorkflowTurnModel, stale_open_final)
+        assert stale is not None
+        stale.state = "sent"
+        workflow.active_turn_id = stale_open_final
+        db.commit()
+
+    repaired = database.reconcile_superseded_workflow_turns_for_restart()
+    assert repaired >= 1
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        assert workflow.active_turn_id == newer
+        assert db.get(WorkflowTurnModel, stale_open_final).state == "cancelled"
+
+    assert activate_workflow_turn(root, stale_open_final) is False
+    assert activate_workflow_turn_for_inbox(pending.id) == newest
+    claim = claim_workflow_turn(root, inbox_message_id=pending.id)
+    assert claim is not None and claim["id"] == newest
+    assert mark_workflow_turn_sent(newest, claim["claim_token"], claim["claim_generation"])
+    assert claim_workflow_turn_receipt(root, newest)
+    assert not claim_workflow_turn_receipt(root, newest)
+
+    effect = claim_workflow_effect(root, newest, "handoff", "one-live-child")
+    assert effect is not None
+    assert claim_workflow_effect(root, newest, "handoff", "one-live-child") is None
+    assert register_handoff_child(root, "one-live-child")
+    first, duplicate = create_handoff_child_result_message("one-live-child", "accepted once")
+    replay, replay_duplicate = create_handoff_child_result_message(
+        "one-live-child", "duplicate callback"
+    )
+    assert first is not None and duplicate is False
+    assert replay is not None and replay.id == first.id and replay_duplicate is True
+    with database.SessionLocal() as db:
+        assert db.query(WorkflowEffectModel).filter_by(effect_kind="handoff").count() == 1
+        assert db.query(database.DelegationResultModel).count() == 1
+
+
+def test_f13_new_inbox_fences_claimed_synthetic_turn_before_receiver_admission(workflow_db):
+    """An irreversible late paste cannot restore superseded old authority."""
+    root = "root-claimed-open-final-race"
+    admitted = _start_admitted_input(root)
+    stale = observe_workflow_final(root)
+    assert isinstance(stale, int) and stale > admitted
+    claim = claim_workflow_turn(root)
+    assert claim is not None and claim["id"] == stale
+    assert activate_workflow_turn(root, stale)
+
+    pending = create_inbox_message("owner", root, "new semantic authority")
+    newest = database.ensure_workflow_turn_for_inbox(pending.id)
+    assert newest is not None and newest > stale
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        assert workflow.active_turn_id == newest
+        assert db.get(WorkflowTurnModel, stale).state == "cancelled"
+
+    assert not claim_workflow_turn_receipt(root, stale)
+    assert not mark_workflow_turn_sent(stale, claim["claim_token"], claim["claim_generation"])
+    assert activate_workflow_turn_for_inbox(pending.id) == newest
 
 
 def test_f13_concurrent_sidecar_reconnect_claims_admit_one_control_input(workflow_db):

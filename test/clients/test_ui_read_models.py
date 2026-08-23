@@ -11,6 +11,7 @@ from cli_agent_orchestrator.clients.database import (
     TerminalModel,
     WorkflowModel,
     WorkflowTurnModel,
+    WorkflowTurnReceiptModel,
 )
 from cli_agent_orchestrator.services import ui_read_model_service
 
@@ -169,6 +170,7 @@ def test_home_lifecycle_counts_and_filters_are_mutually_truthful(monkeypatch):
                 )
                 db.add(turn)
                 db.flush()
+                workflow.active_turn_id = turn.id
                 db.add(
                     ProviderExecutionLeaseModel(
                         terminal_id=terminal_id,
@@ -292,6 +294,113 @@ def test_execution_wait_labels_and_owner_reason_are_exact_durable_mappings(monke
         turn = db.query(WorkflowTurnModel).filter_by(workflow_id=workflow.id).one()
         turn.state = "sent"
         workflow.active_turn_id = turn.id
+        db.add(
+            WorkflowTurnReceiptModel(
+                workflow_turn_id=turn.id,
+                receiver_terminal_id="continuation",
+            )
+        )
+        db.commit()
+    items = {
+        item["id"]: item for item in ui_read_model_service.list_agent_summaries(limit=20)["items"]
+    }
+    assert items["continuation"]["activity"] == "processing"
+    assert items["continuation"]["execution_state"] == "processing"
+
+    # New semantic input can advance the receiver capability during the
+    # narrow post-paste/pre-ack race. The old provider lease still means a
+    # model invocation is active, while receipt/effect authority remains with
+    # the newer turn.
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id="continuation").one()
+        old_turn = db.get(WorkflowTurnModel, workflow.active_turn_id)
+        assert old_turn is not None
+        db.add(
+            ProviderExecutionLeaseModel(
+                terminal_id="continuation",
+                workflow_turn_id=old_turn.id,
+            )
+        )
+        newer = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="inbox_message",
+            dedupe_key="newer-during-old-execution",
+            state="queued",
+        )
+        db.add(newer)
+        db.flush()
+        workflow.active_turn_id = newer.id
+        db.commit()
+    items = {
+        item["id"]: item for item in ui_read_model_service.list_agent_summaries(limit=20)["items"]
+    }
+    assert items["continuation"]["activity"] == "processing"
+    assert items["continuation"]["execution_state"] == "processing"
+    assert database.get_terminal_execution_projection("continuation")["active_turn"] is True
+
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id="continuation").one()
+        old_turn = (
+            db.query(WorkflowTurnModel)
+            .filter_by(workflow_id=workflow.id, dedupe_key="continuation-turn")
+            .one()
+        )
+        newer = (
+            db.query(WorkflowTurnModel)
+            .filter_by(workflow_id=workflow.id, dedupe_key="newer-during-old-execution")
+            .one()
+        )
+        db.query(ProviderExecutionLeaseModel).filter_by(terminal_id="continuation").delete()
+        workflow.active_turn_id = old_turn.id
+        db.delete(newer)
+        db.commit()
+
+    # A physically sent turn that never reached SessionStart/model admission
+    # is not Processing once its execution lease is gone. It remains an
+    # explicit continuation wait until restart recovery retries or supersedes
+    # that same logical turn.
+    with database.SessionLocal() as db:
+        db.query(WorkflowTurnReceiptModel).filter_by(receiver_terminal_id="continuation").delete()
+        db.commit()
+    items = {
+        item["id"]: item for item in ui_read_model_service.list_agent_summaries(limit=20)["items"]
+    }
+    assert items["continuation"]["activity"] == "queued"
+    assert items["continuation"]["execution_state"] == "waiting_workflow_continuation"
+
+    # A stale-sidecar fence is itself durable continuation work. Even with a
+    # receiver receipt, it is Queued once no exact execution lease exists;
+    # reacquiring that same turn's lease makes it Processing again.
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id="continuation").one()
+        turn = db.query(WorkflowTurnModel).filter_by(workflow_id=workflow.id).one()
+        turn.provider_reconnect_requested_at = now
+        db.add(
+            WorkflowTurnReceiptModel(
+                workflow_turn_id=turn.id,
+                receiver_terminal_id="continuation",
+            )
+        )
+        db.commit()
+    items = {
+        item["id"]: item for item in ui_read_model_service.list_agent_summaries(limit=20)["items"]
+    }
+    assert items["continuation"]["activity"] == "queued"
+    assert items["continuation"]["execution_state"] == "waiting_workflow_continuation"
+
+    with database.SessionLocal() as db:
+        turn = (
+            db.query(WorkflowTurnModel)
+            .join(WorkflowModel, WorkflowTurnModel.workflow_id == WorkflowModel.id)
+            .filter(WorkflowModel.root_terminal_id == "continuation")
+            .one()
+        )
+        db.add(
+            ProviderExecutionLeaseModel(
+                terminal_id="continuation",
+                workflow_turn_id=turn.id,
+            )
+        )
         db.commit()
     items = {
         item["id"]: item for item in ui_read_model_service.list_agent_summaries(limit=20)["items"]

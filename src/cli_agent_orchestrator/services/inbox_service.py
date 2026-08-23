@@ -57,6 +57,8 @@ from cli_agent_orchestrator.clients.database import (
     mark_workflow_turn_sent,
     mark_workflow_turn_sent_for_inbox,
     materialize_deferred_handoff_result_turn_for_inbox,
+    reconcile_superseded_workflow_turns_for_restart,
+    request_workflow_provider_reconnect,
     requeue_unacknowledged_child_assignment_results,
     requeue_unadmitted_workflow_turns_for_restart,
     requeue_workflow_turn,
@@ -235,6 +237,23 @@ def _dispatch_pending_messages_with_admission(
     # the idle prompt was never found, so messages stayed PENDING forever.
     status = provider.get_status()
 
+    # A stale privileged sidecar can report its generation fence while an
+    # Inbox row is already eligible for the fast path. Persist the reconnect
+    # barrier before any activation/claim so this path cannot overtake runtime
+    # replacement merely because the provider footer is Ready.
+    if (
+        terminal_service.provider_runtime_sidecar_reconnect_required(terminal_id, provider=provider)
+        is True
+    ):
+        persisted = request_workflow_provider_reconnect(terminal_id)
+        if not persisted:
+            logger.warning(
+                "Provider reconnect signal for %s had no admitted active turn",
+                terminal_id,
+            )
+        logger.info("Deferring Inbox wake %s behind provider reconnect", message.id)
+        return False
+
     # Codex discovers a persisted exit sentinel during get_status(). Refresh
     # before reading liveness so a stale provider instance cannot paste Inbox
     # text into the shell after its CLI exited. Keep only the managed
@@ -385,6 +404,7 @@ def reconcile_pending_messages(registry: PluginRegistry | None = None) -> int:
     """
     terminalize_missing_terminal_assignments_for_restart()
     arm_handoff_continuations_for_restart()
+    reconcile_superseded_workflow_turns_for_restart()
     requeue_unadmitted_workflow_turns_for_restart()
     requeue_unacknowledged_child_assignment_results()
     reconcile_handoff_continuations(registry)

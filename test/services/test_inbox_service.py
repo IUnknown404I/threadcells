@@ -147,6 +147,37 @@ class TestCheckAndSendPendingMessages:
 
         assert result is False
 
+    def test_stale_sidecar_fast_path_persists_before_activation_or_transport(self, monkeypatch):
+        """Inbox input cannot overtake a provider reconnect fence."""
+        message = MagicMock(id=42, message="new owner input", kind="message")
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.IDLE
+        provider.is_process_alive.return_value = True
+        reconnect_signal = MagicMock(return_value=True)
+        persist_reconnect = MagicMock(return_value=True)
+        activate = MagicMock(return_value=71)
+        send = MagicMock(return_value=True)
+        monkeypatch.setattr(inbox_service, "get_pending_messages", lambda *_args, **_kw: [message])
+        monkeypatch.setattr(inbox_service.provider_manager, "get_provider", lambda *_: provider)
+        monkeypatch.setattr(
+            inbox_service.terminal_service,
+            "provider_runtime_sidecar_reconnect_required",
+            reconnect_signal,
+        )
+        monkeypatch.setattr(
+            inbox_service,
+            "request_workflow_provider_reconnect",
+            persist_reconnect,
+        )
+        monkeypatch.setattr(inbox_service, "activate_workflow_turn_for_inbox", activate)
+        monkeypatch.setattr(inbox_service.terminal_service, "send_input", send)
+
+        assert _dispatch_pending_messages_with_admission("test-terminal") is False
+        reconnect_signal.assert_called_once_with("test-terminal", provider=provider)
+        persist_reconnect.assert_called_once_with("test-terminal")
+        activate.assert_not_called()
+        send.assert_not_called()
+
     @patch("cli_agent_orchestrator.services.inbox_service.mark_child_assignment_result_failed")
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service.send_input")

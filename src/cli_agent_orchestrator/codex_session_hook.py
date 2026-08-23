@@ -20,7 +20,11 @@ from cli_agent_orchestrator.runtime_generation import (
 
 _TERMINAL_ID_PATTERN = re.compile(r"^[a-f0-9]{8}$")
 _SESSION_ID_PATTERN = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
-_RUNTIME_GENERATION_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+# The hook runs inside the managed tmux pane and therefore inherits the
+# terminal launch generation, not the installed service compatibility hash
+# used by the HTTP header below. Terminal generations are UUIDs minted at the
+# exact pane/process launch boundary.
+_TERMINAL_RUNTIME_GENERATION_PATTERN = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 _MAX_INPUT_BYTES = 64 * 1024
 _STOP_OUTPUT = {
     "continue": False,
@@ -57,7 +61,7 @@ def _validated_request(value: dict[str, Any]) -> tuple[str, str, dict[str, str]]
         or not Path(cwd).is_absolute()
         or _TERMINAL_ID_PATTERN.fullmatch(terminal_id) is None
         or not token
-        or _RUNTIME_GENERATION_PATTERN.fullmatch(runtime_generation) is None
+        or _TERMINAL_RUNTIME_GENERATION_PATTERN.fullmatch(runtime_generation) is None
     ):
         raise ValueError("hook identity is malformed")
     body = {

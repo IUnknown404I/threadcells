@@ -14,7 +14,7 @@ def _payload():
         "transcript_path": "/tmp/codex/sessions/rollout.jsonl",
         "cwd": "/tmp/project",
         "source": "startup",
-        "runtime_generation": "a" * 64,
+        "runtime_generation": "11111111-2222-4333-8444-555555555555",
     }
 
 
@@ -76,7 +76,7 @@ def test_codex_session_identity_binds_only_server_proven_identity(client):
         "transcript_path": "/tmp/codex/sessions/rollout.jsonl",
         "working_directory": "/tmp/project",
         "source": "startup",
-        "runtime_generation": "a" * 64,
+        "runtime_generation": "11111111-2222-4333-8444-555555555555",
     }
 
 

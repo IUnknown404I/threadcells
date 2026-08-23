@@ -1,0 +1,41 @@
+name: Feature request
+description: Propose an outcome that belongs in ThreadCells
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: Who is affected, and what is difficult or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe the behavior or result, without assuming one implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: fit
+    attributes:
+      label: Why this belongs in ThreadCells
+      description: Explain its relationship to coding-agent orchestration, durable workflows, or operations.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and non-goals
+      description: Optional. Note workarounds, rejected approaches, or intentionally excluded scope.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched open and closed Issues for this request.
+          required: true
+        - label: This request is safe to discuss publicly and contains no secrets or private data.
+          required: true

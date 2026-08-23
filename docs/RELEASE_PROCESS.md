@@ -14,3 +14,14 @@ Build an isolated local candidate from a clean committed tree with `scripts/buil
 8. Treat any public push, tag, package, image, or release as a separate owner-approved action.
 
 Release evidence proves what was tested and packaged; it does not itself approve publication or certify every dependency license/security property.
+
+## Version-line convention
+
+ThreadCells follows normal SemVer prerelease ordering. During the alpha preview, `0.1.X` identifies a meaningful product, reliability, or documentation iteration; `alpha.N` identifies additional publications within that same iteration when they are genuinely required.
+
+- `v0.1.0-alpha.1` was the first public alpha.
+- `v0.1.0-alpha.2` is the immutable current published technical preview.
+- The next meaningful release line is `v0.1.1-alpha.1`.
+- Use `v0.1.1-alpha.2` only if another publication is required within the same `0.1.1` iteration; the next meaningful iteration after that is `v0.1.2-alpha.1`.
+
+Do not continue the `v0.1.0-alpha.N` sequence or move an existing tag without explicit owner direction. Repository-governance changes alone do not trigger a version bump or release. Update all canonical version-bearing surfaces together only when the next meaningful implementation contour is ready for publication.

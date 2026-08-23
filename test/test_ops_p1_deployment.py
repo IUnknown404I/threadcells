@@ -24,8 +24,8 @@ def _tree_hash(root: Path) -> str:
 def _local_wheel(destination: Path, *, web_assets: dict[str, bytes] | None = None) -> Path:
     """Make a deterministic wheel with the ThreadCells distribution identity."""
     destination.mkdir(parents=True, exist_ok=True)
-    wheel = destination / "threadcells-0.1.0a1-py3-none-any.whl"
-    dist_info = "threadcells-0.1.0a1.dist-info"
+    wheel = destination / "threadcells-0.1.0a2-py3-none-any.whl"
+    dist_info = "threadcells-0.1.0a2.dist-info"
     scripts = (
         "cao",
         "cao-server",
@@ -59,7 +59,7 @@ def _local_wheel(destination: Path, *, web_assets: dict[str, bytes] | None = Non
             archive.writestr(f"cli_agent_orchestrator/web_ui/{relative}", content)
         archive.writestr(
             f"{dist_info}/METADATA",
-            "Metadata-Version: 2.1\nName: threadcells\nVersion: 0.1.0a1\n",
+            "Metadata-Version: 2.1\nName: threadcells\nVersion: 0.1.0a2\n",
         )
         archive.writestr(
             f"{dist_info}/WHEEL",

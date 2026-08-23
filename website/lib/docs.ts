@@ -75,6 +75,11 @@ function safeSource(source: string) {
 function rewriteLinks(markdown: string, source: string, slugs: Map<string, string>) {
   return markdown.replace(/\]\(([^)]+)\)/g, (whole, target: string) => {
     if (/^(?:https?:\/\/|mailto:|#)/.test(target)) return whole
+    if (target.startsWith('/media/screenshots/')) {
+      const media = path.join(productRoot, 'website', 'public', target.replace(/^\/+/, ''))
+      if (!fs.existsSync(media)) throw new Error('Missing public documentation media: ' + target)
+      return whole
+    }
     const [location, fragment] = target.split('#', 2)
     const resolved = path.resolve(path.dirname(source), location)
     const slug = slugs.get(resolved)

@@ -547,8 +547,15 @@ describe('session creation and canonical ordering', () => {
 
     const header = await screen.findByTestId('session-header-cao-summary')
     const summary = screen.getByLabelText('Session status')
+    const layoutControls = within(summary).getByRole('group', { name: 'Agent layout' })
     const list = within(summary).getByRole('button', { name: 'List view' })
     const grid = within(summary).getByRole('button', { name: 'Grid view' })
+
+    expect(header).toHaveClass('grid', 'grid-cols-[minmax(0,1fr)_auto]', 'sm:grid-cols-[minmax(0,1fr)_auto_auto]')
+    expect(within(header).getByTestId('session-title-row-cao-summary')).toHaveClass('col-span-2', 'sm:col-span-1')
+    expect(within(header).getByTestId('session-metadata-cao-summary')).toContainElement(within(header).getByText('2 agents'))
+    expect(within(header).getByTestId('session-actions-cao-summary')).toContainElement(within(header).getByRole('button', { name: 'Delete summary' }))
+    expect(layoutControls).toHaveClass('hidden', 'sm:inline-flex')
 
     fireEvent.click(within(header).getByRole('button', { name: 'Expand summary' }))
     expect(await within(header).findByRole('button', { name: 'Collapse summary' })).toBeInTheDocument()
@@ -560,7 +567,7 @@ describe('session creation and canonical ordering', () => {
 
     fireEvent.click(grid)
     expect(grid).toHaveAttribute('aria-pressed', 'true')
-    expect(screen.getByTestId('session-agent-container')).toHaveClass('grid')
+    expect(screen.getByTestId('session-agent-container')).toHaveClass('space-y-2', 'sm:grid', 'lg:grid-cols-2')
 
     fireEvent.click(within(header).getByRole('button', { name: 'Delete summary' }))
     expect(screen.getByRole('heading', { name: 'Delete Session' })).toBeInTheDocument()
@@ -639,6 +646,59 @@ describe('session creation and canonical ordering', () => {
 
     act(() => useStore.getState().setTerminalStatus('a-changes-latest', 'WORKFLOW_COMPLETED::Ready'))
     expect(within(badges).getByText('Failed')).toBeInTheDocument()
+  })
+
+  it('keeps long owner reasons out of every shared badge while preserving the Owner Decision panel', async () => {
+    const ownerSession = session('cao-owner-badges', '100')
+    const ownerTerminal = { id: 'owner-terminal', tmux_session: ownerSession.name, tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null }
+    const reason = `Owner approval is required. ${'This intentionally very long durable explanation must stay in the dedicated Owner Decision panel. '.repeat(16)}`
+    useStore.setState({ sessions: [ownerSession] })
+    vi.spyOn(api, 'getSession').mockResolvedValue({ session: ownerSession, terminals: [ownerTerminal] })
+    vi.spyOn(api, 'getTerminalStatus').mockResolvedValue({
+      ...ownerTerminal,
+      status: 'idle',
+      execution_state: 'ready',
+      lifecycle: 'running',
+      workflow_state: 'owner_gate',
+      workflow_status: 'owner_gate',
+      workflow_reason: reason,
+    } as never)
+
+    const assertCategoricalBadges = (root: HTMLElement) => {
+      const badges = Array.from(root.querySelectorAll<HTMLElement>('[data-status-badge]'))
+      expect(badges.length).toBeGreaterThan(0)
+      for (const badge of badges) {
+        expect(badge).not.toHaveTextContent(reason)
+        expect(badge.getAttribute('title') || '').not.toContain(reason)
+        expect(badge.getAttribute('aria-label') || '').not.toContain(reason)
+        for (const node of Array.from(badge.querySelectorAll<HTMLElement>('[title], [aria-label]'))) {
+          expect(node.getAttribute('title') || '').not.toContain(reason)
+          expect(node.getAttribute('aria-label') || '').not.toContain(reason)
+        }
+      }
+    }
+
+    const home = render(<DashboardHome onNavigate={() => {}} />)
+    const first = await screen.findByTestId(`session-status-first-${ownerSession.id}`)
+    const last = screen.getByTestId(`session-status-last-${ownerSession.id}`)
+    const total = screen.getByTestId(`session-status-total-${ownerSession.id}`)
+    for (const surface of [first, last, total]) {
+      expect(within(surface).getByText('Needs owner decision')).toBeInTheDocument()
+      assertCategoricalBadges(surface)
+    }
+    expect(screen.queryByText(reason)).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Expand owner-badges' }))
+    const detail = await screen.findByTestId(`agent-detail-card-${ownerTerminal.id}`)
+    assertCategoricalBadges(detail)
+    expect(within(screen.getByTestId(`owner-decision-${ownerTerminal.id}`)).getByText(reason, { exact: false })).toBeInTheDocument()
+    home.unmount()
+
+    render(<AgentPanel navigationSearch="?tab=agents&agentView=statuses" />)
+    const agentCard = await screen.findByTestId(`agent-detail-card-${ownerTerminal.id}`)
+    expect(within(agentCard).getByText('Needs owner decision')).toBeInTheDocument()
+    assertCategoricalBadges(agentCard)
+    expect(screen.queryByText(reason)).not.toBeInTheDocument()
   })
 
   it('keeps large session status rendering bounded to aggregate counts', async () => {

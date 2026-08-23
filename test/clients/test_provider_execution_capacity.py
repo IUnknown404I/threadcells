@@ -201,6 +201,31 @@ def test_provider_admission_queue_merges_sources_by_durable_age(capacity_db):
     ]
 
 
+def test_provider_admission_queue_prefers_explicit_inbox_for_same_resident(capacity_db):
+    """A stale synthetic continuation never outranks newer semantic input."""
+    terminal_id = "term-0"
+    active = database.start_workflow_input(terminal_id)
+    assert active is not None
+    assert database.claim_workflow_turn_receipt(terminal_id, active)
+    stale = database.observe_workflow_final(terminal_id)
+    assert isinstance(stale, int)
+    message = database.create_inbox_message("owner", terminal_id, "new owner input")
+
+    candidates = [
+        item
+        for item in database.get_provider_execution_admission_queue()
+        if item["terminal_id"] == terminal_id
+    ]
+    assert candidates == [
+        {
+            "source": "inbox",
+            "terminal_id": terminal_id,
+            "created_at": message.created_at,
+            "source_id": message.id,
+        }
+    ]
+
+
 def test_provider_release_wakeup_dispatches_merged_sources_without_starvation(monkeypatch):
     order: list[tuple[str, str]] = []
     monkeypatch.setattr(

@@ -2,10 +2,12 @@
 
 The Web UI is the operator's live view of ThreadCells. It is designed for a loopback listener and works normally in a browser or as an installed basic PWA. Installing it does not add offline operational behavior or a new authentication boundary.
 
+![Live ThreadCells Home with dense session, agent, and workflow summaries](/media/screenshots/threadcells-home.webp)
+
 ## Main areas
 
-- **Home** summarizes current health, capacity, and recent activity.
-- **Agents** shows sessions, statuses, terminals, profile/provider identity, and durable results.
+- **Home** summarizes durable session and agent history, current activity, owner attention, and First/Last/Total status counts without loading every terminal.
+- **Agents** provides Sessions, Statuses, and Profiles views over terminals, profile/provider identity, execution state, workflow state, and durable results.
 - **Flows** creates, enables, disables, inspects, and manually runs recurring agent schedules. The resulting agents and workflow lifecycle appear under Agents.
 - **Statistics** displays provider-reported usage without invented metrics.
 - **Settings** contains General, Orchestration Capacity, Profiles, Providers, Housekeeping, installation-global Telegram notifications, and About.
@@ -22,6 +24,10 @@ Direct URLs are supported. Browser history should preserve the selected Settings
 4. Use Flows for recurring schedules. Follow the agents they launch under Agents.
 5. Read and incorporate durable results before retiring children.
 6. Use Statistics to understand provider-reported usage.
+
+Status labels come from durable control-plane truth. **Processing** means a turn is active; **Ready** means the provider runtime is alive and genuinely idle. Queued labels distinguish provider-capacity exhaustion, child-retirement barriers, and general workflow continuation. An owner-gated badge remains categorical, while the expanded Owner Decision panel shows the concrete durable reason.
+
+![Live Agents status view with local worktree paths removed from the public capture](/media/screenshots/threadcells-agents.webp)
 
 ## Protected settings
 
@@ -60,6 +66,8 @@ A new immutable build replaces old fingerprinted assets through the normal brows
 ## Responsive and keyboard use
 
 Primary navigation, Docs, Settings, tables, and terminal controls support phone, tablet, and desktop widths. Wide operational tables scroll horizontally on narrow screens rather than shrinking values into unreadable text.
+
+On phones, each Home session header uses a dedicated name row and a separate metadata/action row. Agent cards always use the canonical one-column list; the List/Grid selector is hidden. Tablet and desktop layouts preserve their List/Grid choice.
 
 Use normal Tab/Shift-Tab navigation and visible focus indicators. Code blocks in Docs scroll horizontally and provide a copy control. Terminal keyboard behavior remains provider-native; touch scrolling should not inject terminal input.
 

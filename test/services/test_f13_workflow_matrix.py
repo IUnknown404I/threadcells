@@ -84,6 +84,9 @@ from cli_agent_orchestrator.services.inbox_service import (
 )
 from cli_agent_orchestrator.services.terminal_service import ExitTerminalResult
 
+TEST_CODEX_RESUME_IDENTITY = "01234567-89ab-cdef-0123-456789abcdef"
+TEST_TERMINAL_RUNTIME_GENERATION = "11111111-2222-4333-8444-555555555555"
+
 
 @pytest.fixture
 def workflow_db(monkeypatch, tmp_path):
@@ -95,7 +98,7 @@ def workflow_db(monkeypatch, tmp_path):
     Base.metadata.create_all(bind=engine)
     monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
     monkeypatch.setattr(database, "_child_assignment_schema_ready", True)
-    yield
+    yield engine
     engine.dispose()
 
 
@@ -129,6 +132,9 @@ def _start_admitted_input(root: str) -> int:
                     tmux_window="owner-0000",
                     provider="codex",
                     runtime_lifecycle="running",
+                    runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
+                    provider_resume_identity=TEST_CODEX_RESUME_IDENTITY,
+                    provider_resume_runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
                 )
             )
             db.commit()
@@ -1487,8 +1493,6 @@ def test_f13_stale_sidecar_requests_one_retryable_context_reinitialization(
         False,
         False,
     ]
-    mock_terminal.provider_runtime_sidecar_resume_identity.return_value = "resume-exact"
-
     request_attempts = []
 
     def reconnect_request(
@@ -1505,7 +1509,7 @@ def test_f13_stale_sidecar_requests_one_retryable_context_reinitialization(
         request_attempts.append(attempt_token)
         assert terminal_id == root
         assert turn_id == reconnect_turn_id
-        assert resume_identity == "resume-exact"
+        assert resume_identity == TEST_CODEX_RESUME_IDENTITY
         assert registry is None
         assert attempt_state == "reserved"
         if len(request_attempts) == 1:
@@ -1538,7 +1542,10 @@ def test_f13_stale_sidecar_requests_one_retryable_context_reinitialization(
     assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=1)) is False
     assert mock_terminal.request_provider_runtime_sidecar_reconnect.call_count == 2
     assert request_attempts[0] != request_attempts[1]
-    mock_terminal.provider_runtime_sidecar_resume_identity.assert_called_once_with(root)
+    assert mock_terminal.verify_provider_runtime_sidecar_resume_identity.call_count == 2
+    mock_terminal.verify_provider_runtime_sidecar_resume_identity.assert_called_with(
+        root, TEST_CODEX_RESUME_IDENTITY
+    )
     assert get_workflow_status(root) == "open"
     with database.SessionLocal() as db:
         attempts = (
@@ -1559,6 +1566,193 @@ def test_f13_stale_sidecar_requests_one_retryable_context_reinitialization(
     assert mock_terminal.send_input.call_count == 1
 
 
+@patch("cli_agent_orchestrator.services.workflow_service.terminal_service")
+def test_f13_processing_sidecar_fence_persists_intent_before_any_new_transport(
+    mock_terminal, workflow_db
+):
+    """A tool-time fence survives the PROCESSING early return and restart."""
+    root = "root-sidecar-processing-intent"
+    active_turn_id = _start_admitted_input(root)
+    now = datetime(2026, 8, 23, 12, 0, 0)
+    mock_terminal.get_terminal.return_value = {
+        "status": TerminalStatus.PROCESSING.value,
+        "lifecycle": "running",
+    }
+    mock_terminal.provider_runtime_sidecar_reconnect_required.return_value = True
+
+    assert workflow_service.reconcile_root_workflow(root, now=now) is False
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, active_turn_id)
+        assert turn is not None
+        assert turn.provider_reconnect_requested_at == now
+        assert turn.provider_reconnect_claim_token is None
+        assert db.query(WorkflowProviderReconnectAttemptModel).count() == 0
+        assert db.query(WorkflowEffectModel).count() == 0
+
+    workflow_db.dispose()
+    assert database.workflow_provider_reconnect_pending(root) is True
+
+
+@patch("cli_agent_orchestrator.services.workflow_service.terminal_service")
+def test_f13_restart_recovers_fence_after_final_before_successor_admission(
+    mock_terminal, workflow_db
+):
+    """A parser reload cannot deadlock behind its queued OPEN successor."""
+    root = "root-sidecar-post-final-restart"
+    reconnect_turn_id = _start_admitted_input(root)
+    now = datetime(2026, 8, 23, 12, 30, 0)
+    successor_id = observe_workflow_final(root, now=now)
+    assert isinstance(successor_id, int)
+    with database.SessionLocal() as db:
+        reconnect_turn = db.get(WorkflowTurnModel, reconnect_turn_id)
+        successor = db.get(WorkflowTurnModel, successor_id)
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        assert reconnect_turn is not None and reconnect_turn.state == "finished"
+        assert successor is not None and successor.state == "queued"
+        assert workflow.active_turn_id == reconnect_turn_id
+
+    mock_terminal.get_terminal.return_value = {
+        "status": TerminalStatus.COMPLETED.value,
+        "lifecycle": "running",
+    }
+    mock_terminal.provider_runtime_sidecar_reconnect_required.side_effect = [True, False]
+
+    def reconnect_request(
+        terminal_id,
+        turn_id,
+        resume_identity,
+        *,
+        registry,
+        claim_token,
+        attempt_token,
+        attempt_state,
+        side_effect_guard,
+    ):
+        assert terminal_id == root
+        assert turn_id == reconnect_turn_id
+        assert resume_identity == TEST_CODEX_RESUME_IDENTITY
+        assert registry is None
+        assert attempt_state == "reserved"
+        assert database.mark_workflow_provider_reconnect_launch_dispatched(
+            root, turn_id, claim_token, attempt_token, now=now
+        )
+        assert database.record_workflow_provider_reconnect_runtime_ready(
+            root,
+            attempt_token,
+            ACTIVE_RUNTIME_GENERATION,
+            4321,
+            987654,
+            now=now,
+        )
+        assert database.record_workflow_provider_reconnect_output_boundary(
+            root,
+            attempt_token,
+            11,
+            22,
+            333,
+            now=now,
+        )
+
+    mock_terminal.request_provider_runtime_sidecar_reconnect.side_effect = reconnect_request
+
+    assert workflow_service.reconcile_root_workflow(root, now=now) is False
+    with database.SessionLocal() as db:
+        reconnect_turn = db.get(WorkflowTurnModel, reconnect_turn_id)
+        successor = db.get(WorkflowTurnModel, successor_id)
+        attempt = db.query(WorkflowProviderReconnectAttemptModel).one()
+        assert reconnect_turn is not None
+        assert reconnect_turn.provider_reconnect_requested_at is None
+        assert successor is not None and successor.state == "queued"
+        assert attempt.workflow_turn_id == reconnect_turn_id
+        assert attempt.state == "succeeded"
+
+    assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=1)) is True
+    assert mock_terminal.request_provider_runtime_sidecar_reconnect.call_count == 1
+    assert mock_terminal.send_input.call_count == 1
+    with database.SessionLocal() as db:
+        successor = db.get(WorkflowTurnModel, successor_id)
+        assert successor is not None and successor.state == "sent"
+
+
+def test_f13_restart_repairs_backward_open_final_and_admits_new_input_once(workflow_db):
+    """2687-like stale authority cannot replay after a newer admitted turn."""
+    root = "root-backward-compaction-repair"
+    original = _start_admitted_input(root)
+    stale_open_final = observe_workflow_final(root)
+    assert isinstance(stale_open_final, int) and stale_open_final > original
+
+    newer = start_workflow_input(root)
+    assert newer is not None and newer > stale_open_final
+    assert claim_workflow_turn_receipt(root, newer)
+    assert isinstance(observe_workflow_final(root), int)
+    pending = create_inbox_message("owner", root, "newest owner continuation")
+    newest = database.ensure_workflow_turn_for_inbox(pending.id)
+    assert newest is not None and newest > newer
+
+    # Recreate the exact historical corruption observed after compaction: an
+    # older synthetic turn is SENT without a receipt and owns active_turn_id
+    # even though a newer turn already has a durable receiver receipt.
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        stale = db.get(WorkflowTurnModel, stale_open_final)
+        assert stale is not None
+        stale.state = "sent"
+        workflow.active_turn_id = stale_open_final
+        db.commit()
+
+    repaired = database.reconcile_superseded_workflow_turns_for_restart()
+    assert repaired >= 1
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        assert workflow.active_turn_id == newer
+        assert db.get(WorkflowTurnModel, stale_open_final).state == "cancelled"
+
+    assert activate_workflow_turn(root, stale_open_final) is False
+    assert activate_workflow_turn_for_inbox(pending.id) == newest
+    claim = claim_workflow_turn(root, inbox_message_id=pending.id)
+    assert claim is not None and claim["id"] == newest
+    assert mark_workflow_turn_sent(newest, claim["claim_token"], claim["claim_generation"])
+    assert claim_workflow_turn_receipt(root, newest)
+    assert not claim_workflow_turn_receipt(root, newest)
+
+    effect = claim_workflow_effect(root, newest, "handoff", "one-live-child")
+    assert effect is not None
+    assert claim_workflow_effect(root, newest, "handoff", "one-live-child") is None
+    assert register_handoff_child(root, "one-live-child")
+    first, duplicate = create_handoff_child_result_message("one-live-child", "accepted once")
+    replay, replay_duplicate = create_handoff_child_result_message(
+        "one-live-child", "duplicate callback"
+    )
+    assert first is not None and duplicate is False
+    assert replay is not None and replay.id == first.id and replay_duplicate is True
+    with database.SessionLocal() as db:
+        assert db.query(WorkflowEffectModel).filter_by(effect_kind="handoff").count() == 1
+        assert db.query(database.DelegationResultModel).count() == 1
+
+
+def test_f13_new_inbox_fences_claimed_synthetic_turn_before_receiver_admission(workflow_db):
+    """An irreversible late paste cannot restore superseded old authority."""
+    root = "root-claimed-open-final-race"
+    admitted = _start_admitted_input(root)
+    stale = observe_workflow_final(root)
+    assert isinstance(stale, int) and stale > admitted
+    claim = claim_workflow_turn(root)
+    assert claim is not None and claim["id"] == stale
+    assert activate_workflow_turn(root, stale)
+
+    pending = create_inbox_message("owner", root, "new semantic authority")
+    newest = database.ensure_workflow_turn_for_inbox(pending.id)
+    assert newest is not None and newest > stale
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        assert workflow.active_turn_id == newest
+        assert db.get(WorkflowTurnModel, stale).state == "cancelled"
+
+    assert not claim_workflow_turn_receipt(root, stale)
+    assert not mark_workflow_turn_sent(stale, claim["claim_token"], claim["claim_generation"])
+    assert activate_workflow_turn_for_inbox(pending.id) == newest
+
+
 def test_f13_concurrent_sidecar_reconnect_claims_admit_one_control_input(workflow_db):
     root = "root-sidecar-reconnect-concurrent"
     reconnect_turn_id = _start_admitted_input(root)
@@ -1576,14 +1770,15 @@ def test_f13_concurrent_sidecar_reconnect_claims_admit_one_control_input(workflo
     assert len(admitted) == 1
     assert admitted[0]["turn_id"] == reconnect_turn_id
     assert admitted[0]["claimed_at"] == now
-    assert admitted[0]["resume_identity"] is None
+    assert admitted[0]["resume_identity"] == TEST_CODEX_RESUME_IDENTITY
+    assert admitted[0]["resume_identity_authoritative"] is True
     assert len(admitted[0]["claim_token"]) == 32
     assert len(admitted[0]["attempt_token"]) == 32
     assert admitted[0]["attempt_number"] == 1
     assert admitted[0]["attempt_state"] == "reserved"
 
 
-def test_f13_reconnect_identity_is_durable_and_cannot_be_replaced(workflow_db):
+def test_f13_service_restart_preserves_authoritative_reconnect_identity(workflow_db):
     root = "root-sidecar-resume-identity"
     reconnect_turn_id = _start_admitted_input(root)
     now = datetime(2026, 8, 22, 12, 45, 0)
@@ -1591,10 +1786,11 @@ def test_f13_reconnect_identity_is_durable_and_cannot_be_replaced(workflow_db):
     assert claimed is not None
     assert claimed["turn_id"] == reconnect_turn_id
     assert claimed["claimed_at"] == now
-    assert claimed["resume_identity"] is None
+    assert claimed["resume_identity"] == TEST_CODEX_RESUME_IDENTITY
+    assert claimed["resume_identity_authoritative"] is True
     original_token = claimed["claim_token"]
     attempt_token = claimed["attempt_token"]
-    identity = "01234567-89ab-cdef-0123-456789abcdef"
+    identity = TEST_CODEX_RESUME_IDENTITY
     assert database.persist_workflow_provider_reconnect_identity(
         root, reconnect_turn_id, original_token, attempt_token, identity
     )
@@ -1613,7 +1809,9 @@ def test_f13_reconnect_identity_is_durable_and_cannot_be_replaced(workflow_db):
     )
     assert database.claim_workflow_provider_reconnect(root, now=now + timedelta(seconds=31)) is None
     # A failed side effect leaves the lease and identity intact. Once its
-    # bounded lease expires, a service-restart retry reclaims the exact ID.
+    # bounded lease expires, a service restart opens a fresh DB connection and
+    # reclaims the exact launch-bound ID.
+    workflow_db.dispose()
     reclaimed = database.claim_workflow_provider_reconnect(root, now=now + timedelta(seconds=41))
     assert reclaimed is not None
     assert reclaimed["turn_id"] == reconnect_turn_id
@@ -1667,6 +1865,72 @@ def test_f13_reconnect_identity_is_durable_and_cannot_be_replaced(workflow_db):
         root, reconnect_turn_id, reclaimed["claim_token"], attempt_token
     )
     assert not database.workflow_provider_reconnect_pending(root)
+
+
+@patch("cli_agent_orchestrator.services.workflow_service.terminal_service")
+def test_f13_wrong_persisted_resume_identity_fails_before_provider_dispatch(
+    mock_terminal, workflow_db
+):
+    root = "root-sidecar-wrong-persisted-identity"
+    _start_admitted_input(root)
+    wrong_identity = "fedcba98-7654-3210-fedc-ba9876543210"
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, root)
+        terminal.provider_resume_identity = wrong_identity
+        db.commit()
+    mock_terminal.get_terminal.return_value = {
+        "status": TerminalStatus.COMPLETED.value,
+        "lifecycle": "running",
+    }
+    mock_terminal.provider_runtime_sidecar_reconnect_required.return_value = True
+    mock_terminal.verify_provider_runtime_sidecar_resume_identity.side_effect = RuntimeError(
+        "persisted identity is not owned by the foreground runtime"
+    )
+
+    assert workflow_service.reconcile_root_workflow(root) is False
+
+    mock_terminal.verify_provider_runtime_sidecar_resume_identity.assert_called_once_with(
+        root, wrong_identity
+    )
+    mock_terminal.request_provider_runtime_sidecar_reconnect.assert_not_called()
+    with database.SessionLocal() as db:
+        attempt = db.query(WorkflowProviderReconnectAttemptModel).one()
+        assert attempt.resume_identity == wrong_identity
+        assert attempt.state == "failed"
+        assert attempt.launched_at is None
+
+
+@patch("cli_agent_orchestrator.services.workflow_service.terminal_service")
+def test_f13_missing_launch_identity_exhausts_without_any_provider_launch(
+    mock_terminal, workflow_db
+):
+    root = "root-sidecar-missing-launch-identity"
+    _start_admitted_input(root)
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, root)
+        terminal.provider_resume_identity = None
+        terminal.provider_resume_runtime_generation = None
+        db.commit()
+    mock_terminal.get_terminal.return_value = {
+        "status": TerminalStatus.COMPLETED.value,
+        "lifecycle": "running",
+    }
+    mock_terminal.provider_runtime_sidecar_reconnect_required.return_value = True
+
+    for offset in range(3):
+        assert (
+            workflow_service.reconcile_root_workflow(root, now=datetime(2026, 8, 22, 13, 0, offset))
+            is False
+        )
+
+    assert get_workflow_status(root) == "owner_gate"
+    mock_terminal.verify_provider_runtime_sidecar_resume_identity.assert_not_called()
+    mock_terminal.request_provider_runtime_sidecar_reconnect.assert_not_called()
+    with database.SessionLocal() as db:
+        attempts = db.query(WorkflowProviderReconnectAttemptModel).all()
+        assert len(attempts) == 3
+        assert all(attempt.state == "failed" for attempt in attempts)
+        assert all(attempt.launched_at is None for attempt in attempts)
 
 
 def test_f13_reconnect_runtime_generation_mismatch_fails_closed(workflow_db):

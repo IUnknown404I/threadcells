@@ -20,6 +20,7 @@ from cli_agent_orchestrator.providers.codex import (
     CodexProvider,
     CodexStartupError,
     CodexStartupNoReadyError,
+    ProviderError,
 )
 from cli_agent_orchestrator.services.terminal_service import (
     OutputMode,
@@ -28,6 +29,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     _create_terminal_after_admission,
     _resolve_context_role,
     _write_enabled_lane,
+    bind_provider_runtime_session_identity,
     create_terminal,
     delete_terminal,
     get_output,
@@ -37,6 +39,122 @@ from cli_agent_orchestrator.services.terminal_service import (
     request_provider_runtime_sidecar_reconnect,
     send_input,
 )
+
+
+def test_bind_provider_runtime_session_identity_proves_exact_hook_path(monkeypatch, tmp_path):
+    identity = "01234567-89ab-cdef-0123-456789abcdef"
+    generation = "a" * 64
+    working_directory = tmp_path / "project"
+    working_directory.mkdir()
+    transcript = tmp_path / "codex/sessions/rollout.jsonl"
+    provider = MagicMock()
+    provider.runtime_sidecar_resume_identity.return_value = identity
+    manager = MagicMock()
+    manager.get_provider.return_value = provider
+    tmux = MagicMock()
+    tmux.get_pane_working_directory.return_value = str(working_directory)
+    bind = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+        lambda _terminal_id: {
+            "provider": "codex",
+            "runtime_lifecycle": "running",
+            "runtime_generation": generation,
+            "tmux_session": "cao-managed",
+            "tmux_window": "managed",
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.provider_manager", manager
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.services.terminal_service.tmux_client", tmux)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.bind_terminal_provider_resume_identity",
+        bind,
+    )
+
+    assert (
+        bind_provider_runtime_session_identity(
+            "abcdef12",
+            resume_identity=identity,
+            transcript_path=str(transcript),
+            working_directory=str(working_directory),
+            source="startup",
+            runtime_generation=generation,
+        )
+        == identity
+    )
+    provider.runtime_sidecar_resume_identity.assert_called_once_with(
+        expected_identity=identity,
+        expected_rollout_path=str(transcript),
+    )
+    bind.assert_called_once_with(
+        "abcdef12",
+        provider="codex",
+        resume_identity=identity,
+        runtime_generation=generation,
+    )
+
+
+def test_bind_provider_runtime_session_identity_fails_closed_for_stale_generation(
+    monkeypatch, tmp_path
+):
+    manager = MagicMock()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+        lambda _terminal_id: {
+            "provider": "codex",
+            "runtime_lifecycle": "running",
+            "runtime_generation": "a" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.provider_manager", manager
+    )
+
+    with pytest.raises(RuntimeError, match="stale or malformed"):
+        bind_provider_runtime_session_identity(
+            "abcdef12",
+            resume_identity="01234567-89ab-cdef-0123-456789abcdef",
+            transcript_path=str(tmp_path / "rollout.jsonl"),
+            working_directory=str(tmp_path),
+            source="startup",
+            runtime_generation="b" * 64,
+        )
+    manager.get_provider.assert_not_called()
+
+
+def test_bind_provider_runtime_session_identity_fails_closed_for_wrong_identity(
+    monkeypatch, tmp_path
+):
+    generation = "a" * 64
+    provider = MagicMock()
+    provider.runtime_sidecar_resume_identity.side_effect = ProviderError("wrong rollout")
+    manager = MagicMock()
+    manager.get_provider.return_value = provider
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+        lambda _terminal_id: {
+            "provider": "codex",
+            "runtime_lifecycle": "running",
+            "runtime_generation": generation,
+            "tmux_session": "cao-managed",
+            "tmux_window": "managed",
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.provider_manager", manager
+    )
+
+    with pytest.raises(RuntimeError, match="does not own"):
+        bind_provider_runtime_session_identity(
+            "abcdef12",
+            resume_identity="01234567-89ab-cdef-0123-456789abcdef",
+            transcript_path=str(tmp_path / "rollout.jsonl"),
+            working_directory=str(tmp_path),
+            source="resume",
+            runtime_generation=generation,
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -1120,6 +1238,9 @@ class TestCodexStartupReliability:
         first_provider = MagicMock()
         first_provider.initialize.side_effect = CodexStartupNoReadyError("no ready", "attempt one")
         second_provider = MagicMock()
+        second_provider.runtime_sidecar_resume_identity.return_value = (
+            "01234567-89ab-cdef-0123-456789abcdef"
+        )
         mock_provider_manager.create_provider.side_effect = [first_provider, second_provider]
         mock_log_path = MagicMock()
         mock_log_dir.__truediv__.return_value = mock_log_path
@@ -1131,7 +1252,11 @@ class TestCodexStartupReliability:
         )[1]
         second_provider.initialize.side_effect = lambda: call_order.append("second_initialize")
 
-        result = create_terminal("codex", "supervisor", new_session=True)
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service.bind_terminal_provider_resume_identity",
+            return_value=True,
+        ) as bind_identity:
+            result = create_terminal("codex", "supervisor", new_session=True)
 
         assert result.name == "supervisor-retry"
         assert call_order == ["pipe", "first_initialize", "pipe", "second_initialize"]
@@ -1139,6 +1264,7 @@ class TestCodexStartupReliability:
         mock_tmux.kill_session.assert_called_once_with("cao-retry")
         assert mock_tmux.kill_window.call_count == 0
         assert mock_provider_manager.create_provider.call_count == 2
+        bind_identity.assert_not_called()
         mock_log_path.touch.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
@@ -1302,6 +1428,10 @@ class TestCodexStartupReliability:
         with pytest.raises(ValueError, match="already exists"):
             create_terminal("kiro_cli", "developer", session_name="cao-existing", new_session=True)
 
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.bind_terminal_provider_resume_identity",
+        return_value=True,
+    )
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
@@ -1322,6 +1452,7 @@ class TestCodexStartupReliability:
         mock_db_create,
         mock_provider_manager,
         mock_log_dir,
+        mock_bind_resume_identity,
     ):
         """Providers that consume runtime prompts should receive the global skill catalog."""
         mock_gen_id.return_value = "test1234"
@@ -1343,6 +1474,9 @@ class TestCodexStartupReliability:
             "- **python-testing**: Pytest conventions"
         )
         mock_provider = MagicMock()
+        mock_provider.runtime_sidecar_resume_identity.return_value = (
+            "01234567-89ab-cdef-0123-456789abcdef"
+        )
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_log_path = MagicMock()
         mock_log_dir.__truediv__.return_value = mock_log_path
@@ -1359,7 +1493,12 @@ class TestCodexStartupReliability:
             "- **cao-worker-protocols**: Worker communication\n"
             "- **python-testing**: Pytest conventions"
         )
+        mock_bind_resume_identity.assert_not_called()
 
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.bind_terminal_provider_resume_identity",
+        return_value=True,
+    )
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
@@ -1380,6 +1519,7 @@ class TestCodexStartupReliability:
         mock_db_create,
         mock_provider_manager,
         mock_log_dir,
+        _mock_bind_resume_identity,
     ):
         """Providers should receive an empty skill prompt when no skills are installed."""
         mock_gen_id.return_value = "test1234"
@@ -1393,6 +1533,9 @@ class TestCodexStartupReliability:
         )
         mock_build_skill_catalog.return_value = ""
         mock_provider = MagicMock()
+        mock_provider.runtime_sidecar_resume_identity.return_value = (
+            "01234567-89ab-cdef-0123-456789abcdef"
+        )
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_log_path = MagicMock()
         mock_log_dir.__truediv__.return_value = mock_log_path
@@ -1656,6 +1799,58 @@ class TestGetTerminal:
 
         release.assert_called_once_with("test1234", 77)
         wake.assert_called_once_with()
+
+    def test_get_terminal_reports_processing_for_active_turn_when_provider_is_ready(self):
+        metadata = {
+            "id": "11a094aa",
+            "tmux_window": "conductor",
+            "provider": "codex",
+            "tmux_session": "cao-session",
+            "agent_profile": "supervisor",
+            "last_active": datetime.now(),
+        }
+        projection = {
+            "state": "active",
+            "workflow_status": "open",
+            "workflow_reason": None,
+            "assignment_status": None,
+            "result_status": None,
+            "delivery_status": None,
+        }
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.IDLE
+        provider.is_process_alive.return_value = True
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_workflow_projection",
+                return_value=projection,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_execution_projection",
+                return_value={"active_turn": True, "wait_reason": None},
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_provider_execution_turn",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.reconcile_terminal_runtime",
+                return_value=False,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.provider_manager.get_provider",
+                return_value=provider,
+            ),
+        ):
+            terminal = get_terminal("11a094aa")
+
+        assert terminal["status"] == TerminalStatus.IDLE.value
+        assert terminal["execution_state"] == "processing"
+        assert terminal["execution_wait_reason"] is None
 
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_workflow_projection")

@@ -1,39 +1,48 @@
-# ThreadCells launch media
+# ThreadCells release media
 
-Product captures use an isolated in-memory fixture and the real `web/` application. The fixture contains only synthetic project, session, terminal, provider, and capacity data.
+The canonical public capture set comes from the real loopback production
+instance. It preserves authentic session, agent, workflow, capacity, and host
+scale while the capture tool removes local filesystem paths and replaces
+Telegram destination and credential fields with explicit public-redaction
+labels.
 
-`output/screenshots/threadcells-home.png` is the owner-authorized isolated synthetic product image. It is the master for `website/public/media/screenshots/threadcells-home.webp`; the normal synthetic capture run preserves it.
+The capture tool refuses non-loopback origins and fails if the rendered DOM
+contains credential-shaped values, private workflow/Inbox copy, or common
+private host paths.
 
-`capture-product.mjs` derives the rendered build identity from the selected product worktree. Point `THREADCELLS_PRODUCT_ROOT` at the exact accepted production source revision when launch media is reconciled from a separate website worktree.
+Generate the complete screenshot set and WebM tour:
 
-Regenerate the four synthetic product screenshots and the short WebM master from the repository root:
+~~~bash
+cao-heavy-run node launch-media/capture-product.mjs
+~~~
 
-```bash
-cao-heavy-run -- node launch-media/capture-product.mjs
-```
+The default source is `http://127.0.0.1:9889`. A different loopback listener
+may be selected explicitly:
 
-To refresh only surfaces changed by a later product contour, provide a comma-separated selection. For example:
+~~~bash
+THREADCELLS_LIVE_URL=http://127.0.0.1:4173 \
+cao-heavy-run node launch-media/capture-product.mjs
+~~~
 
-```bash
-THREADCELLS_PRODUCT_ROOT=/path/to/threadcells \
-THREADCELLS_CAPTURE_SET=agents,demo \
-cao-heavy-run -- node launch-media/capture-product.mjs
-```
+To refresh only selected surfaces, set a comma-separated capture set. Valid
+values are `home`, `session`, `agents`, `housekeeping`, `telegram`, `capacity`,
+and `demo`.
 
-Valid selections are `home`, `agents`, `capacity`, `docs`, `spawn`, and `demo`. Unselected masters and website derivatives remain byte-for-byte unchanged.
+~~~bash
+THREADCELLS_CAPTURE_SET=home,session,housekeeping \
+cao-heavy-run node launch-media/capture-product.mjs
+~~~
 
-Replacing the owner-authoritative Home master is deliberately opt-in. Only do this when a newer owner-approved image supersedes it:
+PNG screenshot masters and the WebM master live under `launch-media/output/`.
+The script writes optimized WebP screenshot derivatives directly to
+`website/public/media/screenshots/` and the runtime Docs asset directory.
 
-```bash
-THREADCELLS_CAPTURE_SET=home \
-THREADCELLS_ALLOW_HOME_REPLACE=1 \
-cao-heavy-run -- node launch-media/capture-product.mjs
-```
+Generate the compressed MP4 fallback and synchronize both video formats to the
+website:
 
-Generate MP4 and README GIF derivatives when `ffmpeg` is installed:
+~~~bash
+cao-heavy-run bash launch-media/encode-demo.sh
+~~~
 
-```bash
-cao-heavy-run -- bash launch-media/encode-demo.sh
-```
-
-The website consumes optimized WebP copies from `website/public/media/screenshots/`. PNG masters and video derivatives live under `launch-media/output/`.
+Before committing captures, inspect every frame/screenshot for accidental
+private content and confirm that real operational metrics remain truthful.

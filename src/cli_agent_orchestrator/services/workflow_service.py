@@ -26,10 +26,10 @@ from cli_agent_orchestrator.clients.database import (
     observe_workflow_final,
     observe_workflow_processing,
     observe_workflow_ready,
-    persist_workflow_provider_reconnect_identity,
     prepare_workflow_input,
     renew_workflow_provider_reconnect,
     renew_workflow_turn_claim,
+    request_workflow_provider_reconnect,
     requeue_expired_workflow_turn_claims,
     requeue_workflow_turn,
     set_workflow_terminal_state,
@@ -42,6 +42,12 @@ from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.services import terminal_service
 
 logger = logging.getLogger(__name__)
+
+
+class ProviderResumeIdentityUnavailable(RuntimeError):
+    """Reconnect has no launch-bound identity it can safely resume."""
+
+    reconnect_outcome_code = "resume_identity_unavailable_or_unproven"
 
 
 class _WorkflowTurnClaimHeartbeat:
@@ -210,6 +216,22 @@ def reconcile_root_workflow(
     if terminal.get("lifecycle") != "running":
         return False
     status = terminal.get("status")
+
+    # Capture the stale-sidecar fence before any status-specific early return.
+    # The marker commonly appears during a still-PROCESSING model turn; the
+    # reconnect itself must wait for that turn's provider lease, but Inbox or
+    # service-restart transport must already observe a durable barrier.
+    reconnect_signal = (
+        terminal_service.provider_runtime_sidecar_reconnect_required(root_terminal_id) is True
+    )
+    if reconnect_signal:
+        if not request_workflow_provider_reconnect(root_terminal_id, now=now):
+            logger.warning(
+                "Provider reconnect signal for %s had no admitted active turn",
+                root_terminal_id,
+            )
+            return False
+        pending_reconnect = True
     if status == TerminalStatus.PROCESSING.value:
         observe_workflow_processing(root_terminal_id, now=now)
         return False
@@ -221,12 +243,9 @@ def reconcile_root_workflow(
     # its conversation identity before exiting and resume that exact session
     # with a fresh MCP client. The durable lease prevents concurrent restarts;
     # the stored identity makes the exit/resume crash gap recoverable.
-    reconnect_signal = (
-        terminal_service.provider_runtime_sidecar_reconnect_required(root_terminal_id) is True
-    )
     if pending_reconnect is None:
         pending_reconnect = workflow_provider_reconnect_pending(root_terminal_id)
-    if reconnect_signal or pending_reconnect:
+    if pending_reconnect:
         reconnect = claim_workflow_provider_reconnect(root_terminal_id, now=now)
         if reconnect is None:
             return False
@@ -253,18 +272,17 @@ def reconcile_root_workflow(
                     return renewed
 
                 resume_identity = reconnect["resume_identity"]
-                if resume_identity is None:
-                    resume_identity = terminal_service.provider_runtime_sidecar_resume_identity(
-                        root_terminal_id
+                if (
+                    not resume_identity
+                    or reconnect.get("resume_identity_authoritative") is not True
+                ):
+                    raise ProviderResumeIdentityUnavailable(
+                        "provider reconnect has no authoritative launch-bound identity"
                     )
-                    if not persist_workflow_provider_reconnect_identity(
-                        root_terminal_id,
-                        reconnect["turn_id"],
-                        reconnect["claim_token"],
-                        reconnect["attempt_token"],
-                        resume_identity,
-                    ):
-                        raise RuntimeError("provider reconnect identity lost admission")
+                if reconnect["attempt_state"] == "reserved":
+                    terminal_service.verify_provider_runtime_sidecar_resume_identity(
+                        root_terminal_id, resume_identity
+                    )
                 terminal_service.request_provider_runtime_sidecar_reconnect(
                     root_terminal_id,
                     reconnect["turn_id"],

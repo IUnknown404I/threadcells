@@ -21,8 +21,8 @@ function session(id: string, agents = 1): SessionSummary {
     activity_counts: { idle: agents },
     project_name: null,
     last_active: '2026-08-22T00:00:00Z',
-    first_agent: { id: `${id}-agent-0`, activity: 'idle', execution_state: 'ready', lifecycle: 'running', workflow_state: 'active' },
-    last_agent: { id: `${id}-agent-${agents - 1}`, activity: 'idle', execution_state: 'ready', lifecycle: 'running', workflow_state: 'active' },
+    first_agent: { id: `${id}-agent-0`, activity: 'idle', execution_state: 'ready', lifecycle: 'running', workflow_state: 'active', workflow_reason: null },
+    last_agent: { id: `${id}-agent-${agents - 1}`, activity: 'idle', execution_state: 'ready', lifecycle: 'running', workflow_state: 'active', workflow_reason: null },
   }
 }
 
@@ -39,6 +39,7 @@ function agent(id: string, sessionId = 'session-0'): AgentSummary {
     lifecycle: 'running',
     workflow_state: 'active',
     workflow_status: null,
+    workflow_reason: null,
     assignment_status: null,
     result_status: null,
     delivery_status: null,

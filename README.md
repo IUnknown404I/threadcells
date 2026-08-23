@@ -6,11 +6,14 @@
 
 ThreadCells coordinates native CLI coding agents, keeps open workflows moving across model turns, and takes care of the orchestration environment underneath them. It watches host pressure, safely reclaims disposable ThreadCells runtime debris, and preserves active work and durable history on your own Linux host.
 
-Public repository: [`IUnknown404I/threadcells`](https://github.com/IUnknown404I/threadcells)
+**[Website](https://iunknown404i.github.io/threadcells/)** ·
+**[Documentation](https://iunknown404i.github.io/threadcells/docs/)** ·
+**[GitHub](https://github.com/IUnknown404I/threadcells)** ·
+**[Quick Setup](QUICK_SETUP.md)**
 
-![ThreadCells workflow resolving from active work to durable completion](launch-media/output/demo/threadcells-demo.gif)
+![ThreadCells Home showing a dense live release system with real sessions, agents, workflow states, and aggregate status](launch-media/output/screenshots/threadcells-home.png)
 
-*A 12-second isolated synthetic run through the real ThreadCells UI. No production state is shown.*
+*The real release system at operational scale. Local paths, destinations, credentials, and private messages are excluded from public captures.*
 
 ## In 30 seconds
 
@@ -28,6 +31,12 @@ A supervisor can delegate to workers and reviewers, collect results through the 
 - Optional installation-global Telegram alerts surface top-level completion, failure, and owner attention without project-specific wiring.
 
 ThreadCells actively keeps its own agent environment healthy; it cannot guarantee that the physical host, provider, or network will never fail. Unknown or ambiguous state is protected rather than guessed safe to delete.
+
+| Durable multi-agent workflow | Protected Housekeeping |
+| --- | --- |
+| ![Expanded live ThreadCells session with one active owner and two completed reviewers](launch-media/output/screenshots/threadcells-session-workflow.png) | ![ThreadCells Housekeeping showing disk health, protected backups, schedules, and cleanup policy](launch-media/output/screenshots/threadcells-housekeeping.png) |
+
+Telegram notifications provide one low-noise, installation-global route for top-level completion, failure, and owner attention. Sensitive destination and credential fields are intentionally redacted in [the public Telegram capture](launch-media/output/screenshots/threadcells-telegram.png).
 
 Start with [What is ThreadCells?](docs/OVERVIEW.md), [Quick Setup](QUICK_SETUP.md), and [Your first project and agent](docs/FIRST_AGENT.md). The complete public guide covers [Installation](docs/INSTALLATION.md), [Core concepts](docs/CONCEPTS.md), [Telegram notifications](docs/TELEGRAM_NOTIFICATIONS.md), [Remote access](docs/REMOTE_ACCESS.md), [Security](SECURITY.md), and [Operations](docs/OPERATIONS.md). The in-product reader at `/docs` serves the same packaged allowlisted documentation corpus.
 
@@ -48,7 +57,7 @@ flowchart LR
 
 ## Safety and preview status
 
-The `0.1.0-alpha.1` technical preview supports a single Ubuntu/Debian Linux host, loopback-first access, and a Codex-first setup. Native agents can execute powerful commands; worktrees are not a security sandbox. See [limitations](docs/LIMITATIONS.md) before evaluation.
+The `0.1.0-alpha.2` technical preview supports a single Ubuntu/Debian Linux host, loopback-first access, and a Codex-first setup. Native agents can execute powerful commands; worktrees are not a security sandbox. See [limitations](docs/LIMITATIONS.md) before evaluation.
 
 ## FAQ
 

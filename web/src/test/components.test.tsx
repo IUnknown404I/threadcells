@@ -75,6 +75,44 @@ describe('StatusBadge', () => {
   })
 
   it.each([
+    ['waiting_child_retirement', 'Queued · Waiting for child retirement'],
+    ['waiting_workflow_continuation', 'Queued · Waiting for workflow continuation'],
+  ])('renders the exact durable wait mapping %s', (executionState, label) => {
+    render(
+      <StatusBadge
+        status={lifecycleBadgeStatus('open', 'completed', 'running', executionState)}
+      />
+    )
+    expect(screen.getByText(label)).toBeInTheDocument()
+  })
+
+  it('keeps owner-gate badges categorical and leaves the durable reason to detail surfaces', () => {
+    const reason = `Owner approval is required. ${'This intentionally long durable explanation belongs outside every status badge. '.repeat(12)}`
+    const { container } = render(
+      <div>
+        <StatusBadge status="WORKFLOW_OWNER_GATE::Ready" />
+        <p>{reason}</p>
+      </div>
+    )
+    const badge = container.querySelector('[data-status-badge]')
+    expect(badge).toHaveTextContent('ReadyWorkflow ·Needs owner decision')
+    expect(badge).not.toHaveTextContent(reason)
+    expect(badge).not.toHaveAttribute('title')
+    expect(badge).not.toHaveAttribute('aria-label')
+    expect(screen.getByText((_, element) => element?.tagName === 'P' && element.textContent === reason)).toBeInTheDocument()
+  })
+
+  it('uses an active durable turn to override a momentary provider Ready observation', () => {
+    render(
+      <StatusBadge
+        status={lifecycleBadgeStatus('open', 'completed', 'running', 'processing')}
+      />
+    )
+    expect(screen.getByText('Processing')).toBeInTheDocument()
+    expect(screen.queryByText('Ready')).not.toBeInTheDocument()
+  })
+
+  it.each([
     [{ status: 'completed', lifecycle: 'running', workflow_state: 'open' }, 'Ready', 'Open'],
     [{ status: 'processing', lifecycle: 'running', workflow_state: 'open' }, 'Processing', 'Open'],
     [{ status: 'completed', lifecycle: 'running', workflow_state: 'owner_gate' }, 'Ready', 'Needs owner decision'],

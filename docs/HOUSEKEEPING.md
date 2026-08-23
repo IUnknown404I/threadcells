@@ -2,6 +2,8 @@
 
 Housekeeping reclaims runtime artifacts only when ThreadCells can prove they are eligible. It is intentionally conservative: an unknown, unreadable, active, referenced, or changed resource is protected rather than guessed safe to delete.
 
+![Live ThreadCells Housekeeping with disk health, protected backups, schedules, and cleanup policy](/media/screenshots/threadcells-housekeeping.webp)
+
 ## What can be cleaned
 
 Depending on age and ownership evidence, a plan can include:

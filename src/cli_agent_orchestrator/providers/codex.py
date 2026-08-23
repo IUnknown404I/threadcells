@@ -1,11 +1,14 @@
 """Codex CLI provider implementation."""
 
 import hashlib
+import json
 import logging
 import os
 import re
 import shlex
+import shutil
 import stat
+import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -146,14 +149,14 @@ SIDECAR_RECONNECTED_PREFIX = "__CAO_SIDECAR_RECONNECTED_"
 SIDECAR_RECONNECT_LAUNCH_PREFIX = "__CAO_SIDECAR_RECONNECT_LAUNCH_"
 FRESH_RUNTIME_OUTPUT_BOUNDARY_PREFIX = "__CAO_FRESH_RUNTIME_OUTPUT_BOUNDARY_"
 SIDECAR_RECONNECT_REQUIRED_BLOCK_START_PATTERN = re.compile(
-    r"^[^\S\n]*(?:Error calling tool(?:[^\S\n]|$)|"
+    r"^[^\S\n]*(?:[└├│][^\S\n]*)?(?:Error calling tool(?:[^\S\n]|$)|"
     r"[^\n]*(?:[\"'](?:message|error)[\"'][^\S\n]*:|"
     r"\b(?:message|error)[^\S\n]*=))",
     re.IGNORECASE,
 )
 SIDECAR_RECONNECT_REQUIRED_BLOCK_LINES = 8
 SIDECAR_RECONNECT_REQUIRED_COMPACT_PATTERN = re.compile(
-    rf"(?:^Errorcallingtool(?:'[^']+')?:|"
+    rf"(?:^[└├│]?Errorcallingtool(?:'[^']+')?:|"
     rf"(?:[\"'](?:message|error)[\"']|(?:message|error))(?::|=)[\"']?)"
     rf"{SIDECAR_RECONNECT_REQUIRED_TEXT}"
     rf"(?:\[{PROVIDER_RECONNECT_ATTEMPT_ENV}=(?P<attempt>[0-9a-f]{{32}})\])?"
@@ -315,6 +318,44 @@ def _toml_override(key: str, value: Any) -> str:
     return f"{key}={_toml_scalar(value)}"
 
 
+def _codex_wrapper_preapplies_hook_trust() -> bool:
+    """Recognize a narrow exec wrapper that already supplies hook trust.
+
+    Ordinary Codex installations receive the flag from this provider. Some
+    managed hosts expose a same-purpose shell wrapper, while Codex rejects the
+    option when repeated. Only a small, readable ``exec <codex> <flag> "$@"``
+    wrapper is accepted as equivalent; uncertainty keeps the provider flag.
+    """
+    executable = shutil.which("codex")
+    if not executable:
+        return False
+    try:
+        wrapper = Path(executable).resolve(strict=True)
+        wrapper_stat = wrapper.stat()
+        if not stat.S_ISREG(wrapper_stat.st_mode) or wrapper_stat.st_size > 16 * 1024:
+            return False
+        content = wrapper.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    if not content.startswith("#!"):
+        return False
+    logical_lines = content.replace("\\\n", " ").splitlines()
+    for line in logical_lines:
+        try:
+            parts = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+        if (
+            len(parts) >= 4
+            and parts[0] == "exec"
+            and Path(parts[1]).name.startswith("codex")
+            and "--dangerously-bypass-hook-trust" in parts[2:-1]
+            and parts[-1] == "$@"
+        ):
+            return True
+    return False
+
+
 def _strip_terminal_noise(output: str) -> str:
     """Remove ANSI/control presentation noise while retaining text layout."""
     output = re.sub(ANSI_CONTROL_PATTERN, "", output)
@@ -335,6 +376,59 @@ def _process_start_ticks(process_id: int, proc_root: Path = Path("/proc")) -> Op
     except (OSError, ValueError, IndexError):
         return None
     return start_ticks if start_ticks > 0 else None
+
+
+def _process_job_identity(
+    process_id: int, proc_root: Path = Path("/proc")
+) -> Optional[dict[str, int]]:
+    """Read the job-control fields that bind a pane to its foreground child."""
+    if process_id <= 1:
+        return None
+    try:
+        stat_text = (proc_root / str(process_id) / "stat").read_text(encoding="utf-8")
+        suffix = stat_text[stat_text.rfind(")") + 2 :].split()
+        values = {
+            "parent_process_id": int(suffix[1]),
+            "process_group_id": int(suffix[2]),
+            "foreground_process_group_id": int(suffix[5]),
+            "start_ticks": int(suffix[19]),
+        }
+    except (OSError, ValueError, IndexError):
+        return None
+    return values if all(value >= 0 for value in values.values()) else None
+
+
+def _root_rollout_identity(path: Path, working_directory: Path) -> Optional[str]:
+    """Validate the bounded root ``session_meta`` row for one rollout."""
+    try:
+        with path.open("rb") as handle:
+            raw = handle.readline(4 * 1024 * 1024 + 1)
+        if not raw.endswith(b"\n") or len(raw) > 4 * 1024 * 1024:
+            return None
+        row = json.loads(raw)
+        if not isinstance(row, dict):
+            return None
+        payload = row.get("payload")
+        session_id = (
+            payload.get("id") or payload.get("session_id") if isinstance(payload, dict) else None
+        )
+        cwd = payload.get("cwd") if isinstance(payload, dict) else None
+        match = CODEX_SESSION_ID_PATTERN.search(path.name)
+        if (
+            row.get("type") != "session_meta"
+            or not isinstance(payload, dict)
+            or payload.get("source") != "cli"
+            or not isinstance(session_id, str)
+            or match is None
+            or match.group("session").lower() != session_id.lower()
+            or not isinstance(cwd, str)
+            or not os.path.isabs(cwd)
+            or Path(cwd).resolve(strict=False) != working_directory
+        ):
+            return None
+        return session_id.lower()
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return None
 
 
 def _durable_reconnect_output_boundary(terminal_id: str) -> Optional[dict[str, Any]]:
@@ -755,45 +849,120 @@ class CodexProvider(BaseProvider):
         """Compatibility input for runtimes without exact process resume support."""
         return "/compact"
 
-    def runtime_sidecar_resume_identity(self, proc_root: Path = Path("/proc")) -> str:
-        """Return the exact active Codex conversation from its open rollout file."""
+    def runtime_sidecar_resume_identity(
+        self,
+        proc_root: Path = Path("/proc"),
+        expected_identity: Optional[str] = None,
+        expected_rollout_path: Path | str | None = None,
+    ) -> str:
+        """Capture or verify the exact foreground Codex root conversation.
+
+        The initial ``SessionStart`` hook supplies both the provider-native
+        identity and transcript path before Codex dispatches its first model
+        request. Reconnect supplies the already-persisted identity and merely
+        proves that the exact foreground runtime still owns its writable root
+        rollout. Other Codex processes and read-only rollout descriptors are
+        irrelevant authority.
+        """
+        if expected_rollout_path is not None and expected_identity is None:
+            raise ProviderError("Codex resume identity path has no expected identity")
         pane_command = tmux_client.get_pane_current_command(self.session_name, self.window_name)
         if pane_command is None or not CODEX_PANE_COMMAND_PATTERN.fullmatch(pane_command):
             raise ProviderError("Codex resume identity is unavailable from an inactive pane")
         pane_pid = tmux_client.get_pane_process_id(self.session_name, self.window_name)
         if pane_pid is None or pane_pid <= 0:
             raise ProviderError("Codex resume identity is unavailable from the pane process")
-        try:
-            children = {
-                int(value)
-                for value in (proc_root / str(pane_pid) / "task" / str(pane_pid) / "children")
-                .read_text(encoding="utf-8")
-                .split()
-            }
-        except (OSError, ValueError) as exc:
-            raise ProviderError("Codex resume identity process inventory is uncertain") from exc
-        if not children:
-            raise ProviderError("Codex resume identity has no active provider process")
+        pane_job = _process_job_identity(pane_pid, proc_root)
+        provider_pid = pane_job and pane_job["foreground_process_group_id"]
+        provider_job = (
+            _process_job_identity(provider_pid, proc_root)
+            if isinstance(provider_pid, int) and provider_pid > 1
+            else None
+        )
+        if (
+            pane_job is None
+            or provider_job is None
+            or provider_pid == pane_pid
+            or provider_job["parent_process_id"] != pane_pid
+            or provider_job["process_group_id"] != provider_pid
+        ):
+            raise ProviderError("Codex resume identity process inventory is uncertain")
+
+        working_directory_value = tmux_client.get_pane_working_directory(
+            self.session_name, self.window_name
+        )
+        if not working_directory_value or not os.path.isabs(working_directory_value):
+            raise ProviderError("Codex resume identity working directory is uncertain")
+        working_directory = Path(working_directory_value).resolve(strict=False)
 
         codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).resolve()
         session_root = (codex_home / "sessions").resolve()
-        identities: set[str] = set()
+        expected_path: Path | None = None
+        if expected_rollout_path is not None:
+            try:
+                candidate = Path(expected_rollout_path)
+                if not candidate.is_absolute():
+                    raise ValueError
+                expected_path = candidate.resolve(strict=True)
+                expected_path.relative_to(session_root)
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                raise ProviderError(
+                    "Persisted Codex resume identity is stale or belongs elsewhere"
+                ) from exc
+        identities: dict[str, set[Path]] = {}
         try:
-            for process_id in children:
-                for descriptor in (proc_root / str(process_id) / "fd").iterdir():
-                    try:
-                        target = descriptor.resolve(strict=True)
-                        target.relative_to(session_root)
-                    except (FileNotFoundError, OSError, ValueError):
-                        continue
-                    match = CODEX_SESSION_ID_PATTERN.search(target.name)
-                    if match:
-                        identities.add(match.group("session").lower())
+            descriptors = list((proc_root / str(provider_pid) / "fd").iterdir())
         except OSError as exc:
             raise ProviderError("Codex resume identity descriptor inventory is uncertain") from exc
+        for descriptor in descriptors:
+            try:
+                target_value = os.readlink(descriptor)
+                if target_value.endswith(" (deleted)"):
+                    continue
+                target = Path(target_value).resolve(strict=True)
+                target.relative_to(session_root)
+            except (FileNotFoundError, OSError, ValueError):
+                continue
+            match = CODEX_SESSION_ID_PATTERN.search(target.name)
+            if match is None:
+                continue
+            try:
+                fdinfo = (proc_root / str(provider_pid) / "fdinfo" / descriptor.name).read_text(
+                    encoding="ascii"
+                )
+                flags_line = next(
+                    line.partition(":")[2].strip()
+                    for line in fdinfo.splitlines()
+                    if line.startswith("flags:")
+                )
+                flags = int(flags_line, 8)
+            except (OSError, StopIteration, ValueError) as exc:
+                raise ProviderError(
+                    "Codex resume identity descriptor inventory is uncertain"
+                ) from exc
+            if (flags & os.O_ACCMODE) not in {os.O_WRONLY, os.O_RDWR}:
+                continue
+            identity = _root_rollout_identity(target, working_directory)
+            if identity is not None:
+                identities.setdefault(identity, set()).add(target)
+
+        if expected_identity is not None:
+            expected_match = CODEX_SESSION_ID_PATTERN.fullmatch(f"{expected_identity}.jsonl")
+            matching_paths = identities.get(expected_identity.lower(), set())
+            if (
+                expected_match is None
+                or expected_match.group("session").lower() != expected_identity.lower()
+                or len(matching_paths) != 1
+                or (expected_path is not None and matching_paths != {expected_path})
+            ):
+                raise ProviderError("Persisted Codex resume identity is stale or belongs elsewhere")
+            return expected_identity.lower()
         if len(identities) != 1:
             raise ProviderError("Codex resume identity is ambiguous")
-        return identities.pop()
+        identity, paths = next(iter(identities.items()))
+        if len(paths) != 1:
+            raise ProviderError("Codex resume identity is ambiguous")
+        return identity
 
     def _registered_sidecar_is_live(
         self, registration: object, proc_root: Path = Path("/proc")
@@ -1107,10 +1276,10 @@ class CodexProvider(BaseProvider):
         command_parts = [
             "codex",
             "--yolo",
-            "--no-alt-screen",
-            "--disable",
-            "shell_snapshot",
         ]
+        if not _codex_wrapper_preapplies_hook_trust():
+            command_parts.append("--dangerously-bypass-hook-trust")
+        command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
 
         if self._agent_profile is not None:
             try:
@@ -1224,6 +1393,20 @@ class CodexProvider(BaseProvider):
 
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+
+        # Codex creates a root conversation lazily, only when it accepts the
+        # first prompt. A synchronous SessionStart hook is therefore the first
+        # boundary at which its exact native identity exists. Keep this CAO
+        # override last so an agent profile cannot replace the managed binding
+        # hook; failure returns ``continue: false`` before provider dispatch.
+        hook_command = shlex.join(
+            [sys.executable, "-m", "cli_agent_orchestrator.codex_session_hook"]
+        )
+        hook_config = (
+            'hooks.SessionStart=[{matcher="^(startup|resume)$",hooks=[{type="command",'
+            f"command={_toml_scalar(hook_command)},timeout=30}}]}}]"
+        )
+        command_parts.extend(["-c", hook_config])
 
         if resume_session_id is not None:
             command_parts.extend(["resume", resume_session_id])

@@ -2,6 +2,8 @@
 
 A workflow represents work that must remain coherent across several model turns, terminals, or delegated agents. It prevents a provider's final message from being mistaken for completion of the larger mission.
 
+![Expanded live ThreadCells session showing active and completed workflow participants](/media/screenshots/threadcells-session-workflow.webp)
+
 ## Top-level and delegated work
 
 The **top-level workflow** belongs to the agent or supervisor launched for the owner's mission. A **delegated workflow** belongs to a child assigned one bounded task.
@@ -68,9 +70,9 @@ Do not use an owner gate merely because work is slow, a test failed, or one prov
 
 ## Recovery
 
-On restart, ThreadCells reconstructs workflow ownership from durable state. Delivered-but-unacknowledged results remain available. A waiting handoff can be resumed against the same child instead of launching a duplicate.
+On restart, ThreadCells reconstructs workflow ownership from durable state. Delivered-but-unacknowledged results remain available. A waiting handoff can be resumed against the same child instead of launching a duplicate. Once a newer logical turn is admitted for an open workflow, an older pending continuation is durably superseded and cannot later replay as independent work after compaction or interruption.
 
-A same-build service restart keeps the provider-side control connection compatible. After a promoted build changes privileged orchestration code, an old connection is fenced before it can create an effect. If the active identity is temporarily unavailable during restart, the operation is rejected without an effect and retried after the service returns. For Codex, a proven mismatch first records the exact provider conversation, exits the stale process, and resumes that same conversation with a fresh MCP client. The durable resume identity makes a service restart safe even between exit and relaunch. Input transport, reconnect and retirement share one durable per-terminal mutation claim, so text cannot be pasted into the reconnect shell gap and a stale reconnect cannot relaunch after retirement wins. Ambiguous recovery fails closed instead of guessing, and the already durable logical turn is retried rather than replaced.
+A same-build service restart keeps the provider-side control connection compatible. After a promoted build changes privileged orchestration code, an old connection is fenced before it can create an effect. If the active identity is temporarily unavailable during restart, the operation is rejected without an effect and retried after the service returns. For Codex, ThreadCells binds the exact provider conversation to the managed terminal and runtime generation at launch readiness, then persists that identity as reconnect authority. Other open rollout files cannot make that managed terminal ambiguous. A missing, stale, wrong, or unprovable identity fails closed before provider dispatch. The durable resume identity makes a service restart safe even between exit and relaunch. Input transport, reconnect and retirement share one durable per-terminal mutation claim, so text cannot be pasted into the reconnect shell gap and a stale reconnect cannot relaunch after retirement wins. The already durable logical turn is retried rather than replaced.
 
 If a terminal disappears, inspect the workflow and result records before retrying. A new terminal must not silently duplicate a mutation already completed by the old one.
 

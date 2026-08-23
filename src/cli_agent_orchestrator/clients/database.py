@@ -99,6 +99,12 @@ class TerminalModel(Base):
     runtime_generation = Column(String, nullable=True)
     runtime_generation_origin = Column(String, nullable=True)
     runtime_process_start_ticks = Column(Integer, nullable=True)
+    # Provider-native continuation authority is captured from the exact
+    # foreground runtime only after its initial ready boundary.  Reconnect may
+    # copy this opaque value into an attempt, but may never rediscover or
+    # replace it from provider-global state.
+    provider_resume_identity = Column(String, nullable=True)
+    provider_resume_runtime_generation = Column(String, nullable=True)
     # Exactly one operation may mutate a live pane at a time.  Provider
     # execution capacity is deliberately separate: status observation may
     # release that capacity while a physical paste is still completing.
@@ -932,6 +938,7 @@ def _ensure_provider_execution_schema() -> None:
         if _provider_execution_schema_ready:
             return
         ProviderExecutionLeaseModel.__table__.create(bind=engine, checkfirst=True)
+        CapacitySettingsModel.__table__.create(bind=engine, checkfirst=True)
         _provider_execution_schema_ready = True
 
 
@@ -2728,6 +2735,8 @@ def _migrate_terminal_worktree_authority_columns() -> bool:
             "runtime_generation_origin",
             "runtime_operation_kind",
             "runtime_operation_token",
+            "provider_resume_identity",
+            "provider_resume_runtime_generation",
         ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE terminals ADD COLUMN {name} TEXT")
@@ -2770,6 +2779,27 @@ def _migrate_terminal_worktree_authority_columns() -> bool:
             "WHERE write_enabled = 1 AND launch_worktree IS NOT NULL "
             "AND (runtime_lifecycle IS NULL OR runtime_lifecycle != 'exited') ORDER BY id"
         )
+        # ``live_process_fd_v1`` was already an exact, process-owned Codex root
+        # binding.  Preserve that pre-column authority for live rolling-upgrade
+        # terminals only when there is exactly one such binding; historical or
+        # provider-global cardinality repair is deliberately not sufficient.
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+        if "provider_usage_bindings" in tables:
+            conn.execute(
+                "UPDATE terminals SET "
+                "provider_resume_identity = ("
+                "  SELECT MAX(pub.provider_session_id) FROM provider_usage_bindings pub "
+                "  WHERE pub.terminal_id = terminals.id AND pub.provider = 'codex' "
+                "    AND pub.source = 'live_process_fd_v1'"
+                "), provider_resume_runtime_generation = runtime_generation "
+                "WHERE provider = 'codex' AND runtime_lifecycle = 'running' "
+                "AND provider_resume_identity IS NULL "
+                "AND provider_resume_runtime_generation IS NULL "
+                "AND runtime_generation IS NOT NULL "
+                "AND (SELECT COUNT(*) FROM provider_usage_bindings pub "
+                "     WHERE pub.terminal_id = terminals.id AND pub.provider = 'codex' "
+                "       AND pub.source = 'live_process_fd_v1') = 1"
+            )
         conn.commit()
         conn.close()
         return True
@@ -3080,6 +3110,20 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
         }
 
 
+def terminal_auth_token_matches(terminal_id: str, token: str) -> bool:
+    """Validate one terminal bearer capability without exposing its digest."""
+    if not isinstance(token, str) or not token:
+        return False
+    token_digest = hashlib.sha256(token.encode("utf-8", "strict")).hexdigest()
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel.auth_token_sha256).filter_by(id=terminal_id).first()
+        return bool(
+            terminal is not None
+            and terminal[0]
+            and hmac.compare_digest(str(terminal[0]), token_digest)
+        )
+
+
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     """List all terminals in a tmux session."""
     _ensure_terminal_worktree_authority_schema()
@@ -3200,6 +3244,7 @@ WITH selected_terminals AS MATERIALIZED (
     SELECT id, tmux_window, provider, tmux_session,
            COALESCE(session_id, 'legacy:' || tmux_session) AS stable_session_id,
            agent_profile, runtime_lifecycle, context_role, launch_worktree,
+           runtime_operation_kind,
            managed_worktree_kind, managed_worktree_commit, managed_worktree_branch,
            project_id, project_name, project_path,
            COALESCE(creation_order, rowid) AS creation_order, last_active
@@ -3208,11 +3253,12 @@ WITH selected_terminals AS MATERIALIZED (
         + selected_where
         + """
 ), workflow_ranked AS (
-    SELECT w.root_terminal_id, w.status,
+    SELECT w.root_terminal_id, w.status, w.terminal_reason, w.active_turn_id,
            ROW_NUMBER() OVER (PARTITION BY w.root_terminal_id ORDER BY w.id DESC) AS rank
     FROM workflows w JOIN selected_terminals st ON st.id = w.root_terminal_id
 ), latest_workflow AS (
-    SELECT root_terminal_id, status FROM workflow_ranked WHERE rank = 1
+    SELECT root_terminal_id, status, terminal_reason, active_turn_id
+    FROM workflow_ranked WHERE rank = 1
 ), assignment_relations AS (
     SELECT ca.id AS assignment_id, ca.parent_terminal_id AS terminal_id,
            0 AS is_child, ca.status, ca.updated_at
@@ -3222,6 +3268,9 @@ WITH selected_terminals AS MATERIALIZED (
     FROM child_assignments ca JOIN selected_terminals st ON st.id = ca.child_terminal_id
 ), relation_states AS (
     SELECT ar.*, dr.status AS result_status,
+           CASE WHEN ca.retirement_claim_token IS NOT NULL
+                      AND ca.retirement_cleanup_completed_at IS NULL
+                THEN 1 ELSE 0 END AS retirement_pending,
            CASE
              WHEN dr.status = 'incomplete' THEN 'incomplete'
              WHEN ar.status IN ('result_failed', 'handoff_result_failed') THEN 'failed'
@@ -3246,6 +3295,7 @@ WITH selected_terminals AS MATERIALIZED (
              ELSE 0
            END AS relation_priority
     FROM assignment_relations ar
+    JOIN child_assignments ca ON ca.id = ar.assignment_id
     LEFT JOIN delegation_results dr ON dr.child_assignment_id = ar.assignment_id
 ), latest_relations AS (
     SELECT *, ROW_NUMBER() OVER (
@@ -3256,36 +3306,69 @@ WITH selected_terminals AS MATERIALIZED (
         PARTITION BY terminal_id
         ORDER BY relation_priority DESC, updated_at DESC, assignment_id DESC
     ) AS state_rank FROM relation_states WHERE relation_state IS NOT NULL
+), provider_capacity AS (
+    SELECT (SELECT COUNT(*) FROM provider_execution_leases) AS active_count,
+           COALESCE((SELECT max_provider_executions FROM capacity_settings WHERE id = 1),
+                    2147483647) AS execution_limit
 ), projected AS MATERIALIZED (
     SELECT t.id, t.tmux_window AS name, t.provider,
            t.tmux_session AS session_name, t.stable_session_id AS session_id,
            t.agent_profile,
            CASE
              WHEN COALESCE(t.runtime_lifecycle, 'starting') = 'exited' THEN 'exited'
-             WHEN pel.terminal_id IS NOT NULL THEN 'processing'
+             WHEN pel.terminal_id IS NOT NULL
+                  OR (lw.status = 'open' AND (
+                    awt.state = 'claimed'
+                    OR (awt.state = 'sent' AND awr.id IS NOT NULL
+                        AND awt.provider_reconnect_requested_at IS NULL)
+                  ))
+                  THEN 'processing'
              WHEN EXISTS (
                SELECT 1 FROM workflows qw JOIN workflow_turns qt ON qt.workflow_id = qw.id
                WHERE qw.root_terminal_id = t.id AND qw.status = 'open' AND qt.state = 'queued'
-             ) THEN 'queued'
+             ) OR (lw.status = 'open' AND awt.state = 'sent' AND (
+                    awr.id IS NULL OR awt.provider_reconnect_requested_at IS NOT NULL
+                  )) THEN 'queued'
              ELSE 'ready'
            END AS activity,
            CASE
              WHEN COALESCE(t.runtime_lifecycle, 'starting') = 'exited' THEN 'exited'
-             WHEN pel.terminal_id IS NOT NULL THEN 'processing'
+             WHEN pel.terminal_id IS NOT NULL
+                  OR (lw.status = 'open' AND (
+                    awt.state = 'claimed'
+                    OR (awt.state = 'sent' AND awr.id IS NOT NULL
+                        AND awt.provider_reconnect_requested_at IS NULL)
+                  ))
+                  THEN 'processing'
+             WHEN t.runtime_operation_kind = 'retire'
+                  OR EXISTS (SELECT 1 FROM relation_states rr
+                             WHERE rr.terminal_id = t.id AND rr.retirement_pending = 1)
+                  THEN 'waiting_child_retirement'
+             WHEN (EXISTS (
+               SELECT 1 FROM workflows qw JOIN workflow_turns qt ON qt.workflow_id = qw.id
+               WHERE qw.root_terminal_id = t.id AND qw.status = 'open' AND qt.state = 'queued'
+             ) OR (lw.status = 'open' AND awt.state = 'sent' AND (
+                    awr.id IS NULL OR awt.provider_reconnect_requested_at IS NOT NULL
+                  ))) AND pc.active_count >= pc.execution_limit
+                  THEN 'queued_provider_execution'
              WHEN EXISTS (
                SELECT 1 FROM workflows qw JOIN workflow_turns qt ON qt.workflow_id = qw.id
                WHERE qw.root_terminal_id = t.id AND qw.status = 'open' AND qt.state = 'queued'
-             ) THEN 'queued_provider_execution'
+             ) OR (lw.status = 'open' AND awt.state = 'sent' AND (
+                    awr.id IS NULL OR awt.provider_reconnect_requested_at IS NOT NULL
+                  )) THEN 'waiting_workflow_continuation'
              ELSE 'ready'
            END AS execution_state,
            COALESCE(t.runtime_lifecycle, 'starting') AS lifecycle,
            CASE
-             WHEN lw.status = 'owner_gate' THEN 'owner_gate'
+             WHEN lw.status = 'owner_gate'
+                  AND NULLIF(TRIM(lw.terminal_reason), '') IS NOT NULL THEN 'owner_gate'
              WHEN lw.status = 'terminal' THEN 'completed'
              WHEN lw.status = 'cancelled' THEN 'cancelled'
              ELSE COALESCE(br.relation_state, CASE WHEN lw.status = 'open' THEN 'active' END)
            END AS workflow_state,
-           lw.status AS workflow_status, lr.status AS assignment_status,
+           lw.status AS workflow_status, lw.terminal_reason AS workflow_reason,
+           lr.status AS assignment_status,
            lr.result_status, lr.status AS delivery_status,
            t.context_role, t.launch_worktree, t.managed_worktree_kind,
            t.managed_worktree_commit, t.managed_worktree_branch,
@@ -3293,9 +3376,13 @@ WITH selected_terminals AS MATERIALIZED (
            t.creation_order, t.last_active
     FROM selected_terminals t
     LEFT JOIN latest_workflow lw ON lw.root_terminal_id = t.id
+    LEFT JOIN workflow_turns awt ON awt.id = lw.active_turn_id
+    LEFT JOIN workflow_turn_receipts awr
+           ON awr.workflow_turn_id = awt.id AND awr.receiver_terminal_id = t.id
     LEFT JOIN latest_relations lr ON lr.terminal_id = t.id AND lr.latest_rank = 1
     LEFT JOIN best_relations br ON br.terminal_id = t.id AND br.state_rank = 1
     LEFT JOIN provider_execution_leases pel ON pel.terminal_id = t.id
+    CROSS JOIN provider_capacity pc
 )
 """,
         parameters,
@@ -3494,7 +3581,7 @@ def list_terminal_ui_session_page(*, limit: int, offset: int, query: str = "") -
     if normalized:
         parameters["query"] = f"%{normalized}%"
         search = (
-            " WHERE LOWER(session_id) LIKE :query OR LOWER(session_name) LIKE :query "
+            " WHERE LOWER(id) LIKE :query OR LOWER(name) LIKE :query "
             "OR LOWER(COALESCE(project_name, '')) LIKE :query"
         )
     parameters.update({"limit": limit, "offset": offset})
@@ -3531,12 +3618,14 @@ def list_terminal_ui_session_page(*, limit: int, offset: int, query: str = "") -
              AS activity_counts_json,
            (SELECT json_object(
                'id', id, 'activity', activity, 'execution_state', execution_state,
-               'lifecycle', lifecycle, 'workflow_state', workflow_state
+               'lifecycle', lifecycle, 'workflow_state', workflow_state,
+               'workflow_reason', workflow_reason
              ) FROM projected WHERE projected.session_id = page.id
              ORDER BY creation_order ASC, id ASC LIMIT 1) AS first_agent_json,
            (SELECT json_object(
                'id', id, 'activity', activity, 'execution_state', execution_state,
-               'lifecycle', lifecycle, 'workflow_state', workflow_state
+               'lifecycle', lifecycle, 'workflow_state', workflow_state,
+               'workflow_reason', workflow_reason
              ) FROM projected WHERE projected.session_id = page.id
              ORDER BY creation_order DESC, id DESC LIMIT 1) AS last_agent_json
     FROM meta LEFT JOIN page ON 1 = 1 ORDER BY page.last_active DESC, page.id DESC
@@ -3846,6 +3935,78 @@ def mark_terminal_runtime_running(terminal_id: str) -> bool:
         return True
 
 
+def bind_terminal_provider_resume_identity(
+    terminal_id: str,
+    *,
+    provider: str,
+    resume_identity: str,
+    runtime_generation: str,
+) -> bool:
+    """Bind one provider-native resume identity at the initial session boundary.
+
+    The terminal row and provider-session ownership row are committed together.
+    An existing exact live-process usage binding may be promoted into this
+    launch authority only for the same terminal; a provider session can never
+    be reassigned or replaced here.
+    """
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_usage_schema()
+    if not all(
+        isinstance(value, str) and value.strip()
+        for value in (terminal_id, provider, resume_identity, runtime_generation)
+    ):
+        return False
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if (
+            terminal is None
+            or terminal.runtime_lifecycle not in {"starting", "running"}
+            or terminal.provider != provider
+            or terminal.runtime_generation != runtime_generation
+        ):
+            db.rollback()
+            return False
+        current = (
+            terminal.provider_resume_identity,
+            terminal.provider_resume_runtime_generation,
+        )
+        expected = (resume_identity, runtime_generation)
+        if current not in {(None, None), expected}:
+            db.rollback()
+            return False
+        existing = (
+            db.query(ProviderUsageBindingModel)
+            .filter(
+                ProviderUsageBindingModel.provider == provider,
+                ProviderUsageBindingModel.provider_session_id == resume_identity,
+            )
+            .first()
+        )
+        if existing is not None and not hmac.compare_digest(str(existing.terminal_id), terminal_id):
+            db.rollback()
+            return False
+        if existing is None:
+            db.add(
+                ProviderUsageBindingModel(
+                    provider=provider,
+                    provider_session_id=resume_identity,
+                    terminal_id=terminal_id,
+                    source="managed_runtime_ready_v1",
+                    byte_offset=0,
+                )
+            )
+        terminal.provider_resume_identity = resume_identity
+        terminal.provider_resume_runtime_generation = runtime_generation
+        terminal.last_active = datetime.now()
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            return False
+        return True
+
+
 def replace_starting_terminal_runtime_identity(
     terminal_id: str,
     *,
@@ -3882,6 +4043,8 @@ def replace_starting_terminal_runtime_identity(
                     TerminalModel.runtime_generation: runtime_generation,
                     TerminalModel.runtime_generation_origin: "launch",
                     TerminalModel.runtime_process_start_ticks: process_start_ticks,
+                    TerminalModel.provider_resume_identity: None,
+                    TerminalModel.provider_resume_runtime_generation: None,
                     TerminalModel.last_active: datetime.now(),
                 },
                 synchronize_session=False,
@@ -4302,6 +4465,13 @@ def ensure_workflow_turn_for_inbox(message_id: int) -> Optional[int]:
             created_at=inbox.created_at,
         )
         db.add(turn)
+        db.flush()
+        _cancel_superseded_open_final_turns(
+            db,
+            int(workflow.id),
+            datetime.now(),
+            superseding_turn_id=cast(int, turn.id),
+        )
         workflow.updated_at = datetime.now()
         db.commit()
         return cast(int, turn.id)
@@ -4686,6 +4856,62 @@ def _workflow_has_unadmitted_active_continuation(db: Any, workflow: WorkflowMode
     return active_turn is not None and active_turn.kind != "external_input"
 
 
+def _cancel_superseded_open_final_turns(
+    db: Any,
+    workflow_id: int,
+    now: datetime,
+    *,
+    superseding_turn_id: Optional[int] = None,
+) -> int:
+    """Cancel synthetic continuations superseded by explicit durable input.
+
+    ``open_final`` turns contain no owner payload and exist only to keep an
+    otherwise idle OPEN workflow moving. Any Inbox or external input is newer
+    semantic authority and replaces every not-yet-sent synthetic turn. Claimed
+    rows are included so a transport claimant racing the explicit input loses
+    its later activation/ack compare-and-set instead of moving the workflow
+    binding backward.
+    """
+    workflow = db.get(WorkflowModel, workflow_id)
+    active_open_final = None
+    if workflow is not None and workflow.active_turn_id is not None:
+        active_open_final = (
+            db.query(WorkflowTurnModel.id)
+            .filter(
+                WorkflowTurnModel.id == workflow.active_turn_id,
+                WorkflowTurnModel.workflow_id == workflow_id,
+                WorkflowTurnModel.kind == "open_final",
+                WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+            )
+            .first()
+        )
+    cancelled = cast(
+        int,
+        db.query(WorkflowTurnModel)
+        .filter(
+            WorkflowTurnModel.workflow_id == workflow_id,
+            WorkflowTurnModel.kind == "open_final",
+            WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+        )
+        .update(
+            {
+                WorkflowTurnModel.state: TURN_CANCELLED,
+                WorkflowTurnModel.claim_token: None,
+                WorkflowTurnModel.claim_expires_at: None,
+                WorkflowTurnModel.updated_at: now,
+            },
+            synchronize_session=False,
+        ),
+    )
+    if cancelled and active_open_final is not None and superseding_turn_id is not None:
+        # Advance the receiver capability in the same write transaction. If
+        # the old claimant had already crossed into tmux, its later receipt is
+        # now rejected even though physical delivery cannot be taken back.
+        workflow.active_turn_id = superseding_turn_id
+        workflow.updated_at = now
+    return cancelled
+
+
 def _active_child_assignment_statuses() -> tuple[str, ...]:
     """Return relation states that can still affect a parent workflow."""
     return (
@@ -4836,6 +5062,7 @@ def _prepare_workflow_input(
         )
         db.add(turn)
         db.flush()
+        _cancel_superseded_open_final_turns(db, int(workflow.id), datetime.now())
         # The direct input about to reach the provider is the only turn whose
         # public MCP calls may be admitted.  A later input replaces this
         # binding, so an old prompt cannot borrow its retained receipt.
@@ -4961,6 +5188,15 @@ def activate_workflow_turn(root_terminal_id: str, logical_turn_id: int) -> bool:
         )
         if turn is None:
             return False
+        if (
+            workflow.active_turn_id is not None
+            and cast(int, workflow.active_turn_id) > logical_turn_id
+        ):
+            # Logical turn IDs are monotonically created within one workflow.
+            # A delayed claimant for an older continuation must never move the
+            # active capability backward after a newer turn took authority.
+            db.rollback()
+            return False
         workflow.active_turn_id = logical_turn_id
         workflow.updated_at = datetime.now()
         db.commit()
@@ -4996,11 +5232,19 @@ def activate_workflow_turn_for_inbox(message_id: int) -> Optional[int] | str:
             return DEFER_UNADMITTED
 
         active_turn_id = workflow.active_turn_id
+        if active_turn_id is not None and cast(int, active_turn_id) > cast(int, turn.id):
+            # The Inbox row is stale relative to an already newer active turn.
+            # Keep its transport inert; historical payload cannot reacquire
+            # the workflow capability by replaying after restart.
+            db.rollback()
+            return None
         if active_turn_id != turn.id and _workflow_has_unadmitted_active_turn(db, workflow):
             # Do not mutate the active binding, queued turn, or any
             # timestamps. A receipt racing this read wins on the next retry;
             # this observer remains a no-op.
             return DEFER_UNADMITTED
+
+        _cancel_superseded_open_final_turns(db, int(workflow.id), datetime.now())
 
         # The compare-and-set fences a concurrent terminal/cancel/new-input
         # transition. Inbox delivery then takes the normal turn claim before
@@ -5084,7 +5328,14 @@ def get_terminal_workflow_projection(terminal_id: str) -> Dict[str, Optional[str
         )
 
         # A durable workflow terminal transition is the strongest authority.
-        if raw_workflow == WORKFLOW_OWNER_GATE:
+        owner_reason = (
+            workflow.terminal_reason.strip()
+            if workflow is not None
+            and isinstance(workflow.terminal_reason, str)
+            and workflow.terminal_reason.strip()
+            else None
+        )
+        if raw_workflow == WORKFLOW_OWNER_GATE and owner_reason is not None:
             state = WORKFLOW_OWNER_GATE
         elif raw_workflow == WORKFLOW_TERMINAL:
             state = "completed"
@@ -5160,10 +5411,10 @@ def get_terminal_workflow_projection(terminal_id: str) -> Dict[str, Optional[str
 
         assignment_status = assignment.status if assignment is not None else None
         result_status = result.status if result is not None else None
-
         return {
             "state": state,
             "workflow_status": raw_workflow,
+            "workflow_reason": owner_reason,
             "assignment_status": assignment_status,
             "result_status": result_status,
             "delivery_status": assignment_status,
@@ -5270,7 +5521,10 @@ def get_provider_execution_admission_queue() -> List[Dict[str, Any]]:
         seen_workflow: set[str] = set()
         for turn, root_terminal_id in workflow_rows:
             terminal_id = str(root_terminal_id)
-            if terminal_id in seen_workflow:
+            # A resident's explicit Inbox payload is semantic authority over
+            # its synthetic OPEN-workflow continuation. Represent only that
+            # Inbox candidate; cross-resident ordering remains durable FIFO.
+            if terminal_id in seen_inbox or terminal_id in seen_workflow:
                 continue
             seen_workflow.add(terminal_id)
             candidates.append(
@@ -5307,6 +5561,95 @@ def terminal_has_queued_provider_turn(terminal_id: str) -> bool:
             )
             .first()
         )
+
+
+def get_terminal_execution_projection(terminal_id: str) -> Dict[str, Any]:
+    """Derive active-turn and wait truth from existing durable lifecycle state."""
+    _ensure_provider_execution_schema()
+    _ensure_workflow_schema()
+    _ensure_child_assignment_schema()
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal is None:
+            return {"active_turn": False, "wait_reason": None}
+        execution = db.get(ProviderExecutionLeaseModel, terminal_id)
+        if execution is not None:
+            # The active binding may already have advanced to newer semantic
+            # input while an older, irreversibly pasted provider invocation
+            # finishes its receipt fence. Its terminal-scoped lease remains
+            # authoritative Processing truth until exact release.
+            return {"active_turn": True, "wait_reason": None}
+        active_row = (
+            db.query(WorkflowTurnModel)
+            .join(WorkflowModel, WorkflowTurnModel.workflow_id == WorkflowModel.id)
+            .filter(
+                WorkflowModel.root_terminal_id == terminal_id,
+                WorkflowModel.status == WORKFLOW_OPEN,
+                WorkflowModel.active_turn_id == WorkflowTurnModel.id,
+                WorkflowTurnModel.state.in_((TURN_CLAIMED, TURN_SENT)),
+            )
+            .first()
+        )
+        unadmitted_waiting = False
+        active_turn = False
+        if active_row is not None:
+            if active_row.state == TURN_CLAIMED:
+                active_turn = True
+            else:
+                admitted = (
+                    db.query(WorkflowTurnReceiptModel.id)
+                    .filter_by(
+                        workflow_turn_id=active_row.id,
+                        receiver_terminal_id=terminal_id,
+                    )
+                    .first()
+                    is not None
+                )
+                active_turn = bool(admitted and active_row.provider_reconnect_requested_at is None)
+                unadmitted_waiting = not active_turn
+        if active_turn:
+            return {"active_turn": True, "wait_reason": None}
+        retirement_pending = terminal.runtime_operation_kind == "retire" or bool(
+            db.query(ChildAssignmentModel.id)
+            .filter(
+                (
+                    (ChildAssignmentModel.child_terminal_id == terminal_id)
+                    | (ChildAssignmentModel.parent_terminal_id == terminal_id)
+                ),
+                ChildAssignmentModel.retirement_claim_token.is_not(None),
+                ChildAssignmentModel.retirement_cleanup_completed_at.is_(None),
+            )
+            .first()
+        )
+        if retirement_pending:
+            return {"active_turn": False, "wait_reason": "child_retirement"}
+        queued = (
+            unadmitted_waiting
+            or _terminal_has_pending_provider_reconnect(db, terminal_id)
+            or bool(
+                db.query(WorkflowTurnModel.id)
+                .join(WorkflowModel, WorkflowTurnModel.workflow_id == WorkflowModel.id)
+                .filter(
+                    WorkflowModel.root_terminal_id == terminal_id,
+                    WorkflowModel.status == WORKFLOW_OPEN,
+                    WorkflowTurnModel.state == TURN_QUEUED,
+                )
+                .first()
+            )
+        )
+        if not queued:
+            return {"active_turn": False, "wait_reason": None}
+        settings = db.get(CapacitySettingsModel, 1)
+        if settings is not None and db.query(ProviderExecutionLeaseModel).count() >= int(
+            settings.max_provider_executions
+        ):
+            return {"active_turn": False, "wait_reason": "provider_capacity"}
+        return {"active_turn": False, "wait_reason": "workflow_continuation"}
+
+
+def get_terminal_execution_wait_reason(terminal_id: str) -> Optional[str]:
+    """Compatibility view of the exact durable wait reason."""
+    return cast(Optional[str], get_terminal_execution_projection(terminal_id)["wait_reason"])
 
 
 def queue_workflow_turn(
@@ -5916,6 +6259,54 @@ def mark_workflow_turn_sent_for_inbox(message_id: int) -> bool:
         return True
 
 
+def request_workflow_provider_reconnect(
+    root_terminal_id: str, now: Optional[datetime] = None
+) -> bool:
+    """Persist a stale-sidecar observation before any replacement transport.
+
+    The provider can surface the fence while its admitted model turn still
+    owns an execution lease, or just after that turn's final observation has
+    durably queued (but not admitted) its successor. Persisting intent on that
+    same admitted turn prevents a later Inbox fast path or service restart
+    from losing the ordering barrier. The existing turn columns remain the
+    sole durable authority; no provider launch occurs here.
+    """
+    _ensure_workflow_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        workflow = _open_workflow(db, root_terminal_id, create=False)
+        if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
+            db.rollback()
+            return False
+        turn = db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
+        if (
+            turn is None
+            or turn.workflow_id != workflow.id
+            or turn.state not in (TURN_SENT, TURN_FINISHED)
+        ):
+            db.rollback()
+            return False
+        admitted = (
+            db.query(WorkflowTurnReceiptModel.id)
+            .filter_by(
+                workflow_turn_id=turn.id,
+                receiver_terminal_id=root_terminal_id,
+            )
+            .first()
+        )
+        if admitted is None:
+            db.rollback()
+            return False
+        if turn.provider_reconnect_requested_at is None:
+            turn.provider_reconnect_requested_at = now
+            turn.provider_reconnect_claim_token = None
+            turn.updated_at = now
+            workflow.updated_at = now
+        db.commit()
+        return True
+
+
 def claim_workflow_provider_reconnect(
     root_terminal_id: str, now: Optional[datetime] = None
 ) -> Optional[Dict[str, Any]]:
@@ -5963,6 +6354,19 @@ def claim_workflow_provider_reconnect(
         if active_turn is None:
             db.rollback()
             return None
+        authoritative_identity = (
+            str(terminal.provider_resume_identity)
+            if terminal.provider_resume_identity
+            and terminal.provider_resume_runtime_generation
+            and terminal.provider_resume_runtime_generation == terminal.runtime_generation
+            else None
+        )
+        if active_turn.provider_reconnect_resume_identity is None:
+            active_turn.provider_reconnect_resume_identity = authoritative_identity
+        identity_authority_valid = bool(
+            authoritative_identity
+            and active_turn.provider_reconnect_resume_identity == authoritative_identity
+        )
         attempts = (
             db.query(WorkflowProviderReconnectAttemptModel)
             .filter_by(
@@ -6035,7 +6439,7 @@ def claim_workflow_provider_reconnect(
                 root_terminal_id=root_terminal_id,
                 attempt_number=len(attempts) + 1,
                 attempt_token=uuid.uuid4().hex,
-                resume_identity=active_turn.provider_reconnect_resume_identity,
+                resume_identity=(authoritative_identity if identity_authority_valid else None),
                 state=PROVIDER_RECONNECT_RESERVED,
                 created_at=now,
                 updated_at=now,
@@ -6047,9 +6451,10 @@ def claim_workflow_provider_reconnect(
             .filter(
                 WorkflowTurnModel.id == active_turn_id,
                 WorkflowTurnModel.workflow_id == workflow.id,
-                WorkflowTurnModel.state == TURN_SENT,
+                WorkflowTurnModel.state.in_((TURN_SENT, TURN_FINISHED)),
                 or_(
                     WorkflowTurnModel.provider_reconnect_requested_at.is_(None),
+                    WorkflowTurnModel.provider_reconnect_claim_token.is_(None),
                     WorkflowTurnModel.provider_reconnect_requested_at <= stale_before,
                 ),
                 WorkflowTurnModel.workflow_id.in_(
@@ -6080,19 +6485,16 @@ def claim_workflow_provider_reconnect(
             seconds=WORKFLOW_PROVIDER_RECONNECT_LEASE_SECONDS
         )
         db.commit()
-        resume_identity = (
-            db.query(WorkflowTurnModel.provider_reconnect_resume_identity)
-            .filter(
-                WorkflowTurnModel.id == active_turn_id,
-                WorkflowTurnModel.provider_reconnect_claim_token == claim_token,
-            )
-            .scalar()
+        resume_identity = str(attempt.resume_identity) if attempt.resume_identity else None
+        identity_authority_valid = bool(
+            identity_authority_valid and resume_identity == authoritative_identity
         )
         return {
             "turn_id": active_turn_id,
             "claimed_at": now,
             "claim_token": claim_token,
             "resume_identity": resume_identity,
+            "resume_identity_authoritative": identity_authority_valid,
             "attempt_token": str(attempt.attempt_token),
             "attempt_state": str(attempt.state),
             "attempt_number": int(attempt.attempt_number),
@@ -6146,7 +6548,12 @@ def persist_workflow_provider_reconnect_identity(
     attempt_token: str,
     resume_identity: str,
 ) -> bool:
-    """Persist one provider resume identity before any reconnect side effect."""
+    """Copy launch-bound provider authority into one reconnect attempt.
+
+    Kept as an idempotent compatibility entry point for an already-reserved
+    attempt. It can no longer discover or introduce an identity at reconnect
+    time: only the exact terminal launch binding is accepted.
+    """
     _ensure_workflow_schema()
     if not resume_identity:
         return False
@@ -6158,6 +6565,9 @@ def persist_workflow_provider_reconnect_identity(
             or terminal.runtime_lifecycle not in (None, "running")
             or terminal.runtime_operation_kind != "reconnect"
             or terminal.runtime_operation_token != claim_token
+            or terminal.provider_resume_identity != resume_identity
+            or not terminal.provider_resume_runtime_generation
+            or terminal.provider_resume_runtime_generation != terminal.runtime_generation
         ):
             db.rollback()
             return False
@@ -7065,18 +7475,17 @@ def claim_workflow_turn(
                 .first()
             )
         else:
-            turn = (
-                db.query(WorkflowTurnModel)
-                .filter(
-                    WorkflowTurnModel.workflow_id == workflow.id,
-                    WorkflowTurnModel.state == TURN_QUEUED,
-                    inbox_predicate,
-                    (WorkflowTurnModel.not_before.is_(None))
-                    | (WorkflowTurnModel.not_before <= now),
-                )
-                .order_by(WorkflowTurnModel.id.asc())
-                .first()
+            query = db.query(WorkflowTurnModel).filter(
+                WorkflowTurnModel.workflow_id == workflow.id,
+                WorkflowTurnModel.state == TURN_QUEUED,
+                inbox_predicate,
+                (WorkflowTurnModel.not_before.is_(None)) | (WorkflowTurnModel.not_before <= now),
             )
+            if workflow.active_turn_id is not None:
+                # Same-turn transport recovery remains eligible, but a queued
+                # predecessor can never roll authority back from a newer turn.
+                query = query.filter(WorkflowTurnModel.id >= cast(int, workflow.active_turn_id))
+            turn = query.order_by(WorkflowTurnModel.id.asc()).first()
         if turn is None:
             return None
         # Do not rely on the ORM identity-map assignment as a claim. Two
@@ -7175,7 +7584,13 @@ def mark_workflow_turn_sent(
         if turn is None or not _claim_matches(turn, claim_token, claim_generation, now):
             return False
         workflow = db.query(WorkflowModel).filter(WorkflowModel.id == turn.workflow_id).first()
-        if workflow is None or workflow.status != WORKFLOW_OPEN:
+        if (
+            workflow is None
+            or workflow.status != WORKFLOW_OPEN
+            or (
+                workflow.active_turn_id is not None and cast(int, workflow.active_turn_id) > turn_id
+            )
+        ):
             return False
         # Re-check ownership in the UPDATE itself.  Reading a matching ORM row
         # is not enough: it may be reclaimed between that read and commit.
@@ -7187,6 +7602,16 @@ def mark_workflow_turn_sent(
                 WorkflowTurnModel.claim_token == claim_token,
                 WorkflowTurnModel.claim_generation == claim_generation,
                 WorkflowTurnModel.claim_expires_at > now,
+                WorkflowTurnModel.workflow_id.in_(
+                    db.query(WorkflowModel.id).filter(
+                        WorkflowModel.id == workflow.id,
+                        WorkflowModel.status == WORKFLOW_OPEN,
+                        or_(
+                            WorkflowModel.active_turn_id.is_(None),
+                            WorkflowModel.active_turn_id <= turn_id,
+                        ),
+                    )
+                ),
             )
             .update(
                 {
@@ -7364,6 +7789,103 @@ def requeue_unadmitted_workflow_turns_for_restart(now: Optional[datetime] = None
         if unreceived:
             db.commit()
         return unreceived
+
+
+def reconcile_superseded_workflow_turns_for_restart(
+    now: Optional[datetime] = None,
+) -> int:
+    """Repair only provably stale synthetic authority after process restart.
+
+    A newer durable receiver receipt is definitive proof that an older
+    unreceipted ``open_final`` did not retain the workflow capability. This
+    bounded migration moves the active pointer forward and cancels that stale
+    synthetic row. Pending explicit Inbox/external input also cancels unsent
+    synthetic continuations, but never an uncertain SENT transport.
+    """
+    _ensure_workflow_schema()
+    now = now or datetime.now()
+    changed = 0
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        workflows = db.query(WorkflowModel).filter(WorkflowModel.status == WORKFLOW_OPEN).all()
+        for workflow in workflows:
+            newest_admitted = (
+                db.query(WorkflowTurnModel)
+                .join(
+                    WorkflowTurnReceiptModel,
+                    WorkflowTurnReceiptModel.workflow_turn_id == WorkflowTurnModel.id,
+                )
+                .filter(
+                    WorkflowTurnModel.workflow_id == workflow.id,
+                    WorkflowTurnReceiptModel.receiver_terminal_id == workflow.root_terminal_id,
+                )
+                .order_by(WorkflowTurnModel.id.desc())
+                .first()
+            )
+            active = (
+                db.get(WorkflowTurnModel, workflow.active_turn_id)
+                if workflow.active_turn_id is not None
+                else None
+            )
+            if (
+                newest_admitted is not None
+                and active is not None
+                and cast(int, newest_admitted.id) > cast(int, active.id)
+                and active.kind == "open_final"
+                and active.state in (TURN_QUEUED, TURN_CLAIMED, TURN_SENT)
+                and db.query(WorkflowTurnReceiptModel.id)
+                .filter_by(
+                    workflow_turn_id=active.id,
+                    receiver_terminal_id=workflow.root_terminal_id,
+                )
+                .first()
+                is None
+            ):
+                active.state = TURN_CANCELLED
+                active.claim_token = None
+                active.claim_expires_at = None
+                active.updated_at = now
+                workflow.active_turn_id = newest_admitted.id
+                workflow.updated_at = now
+                active = newest_admitted
+                changed += 1
+
+            explicit_queued = (
+                db.query(WorkflowTurnModel.id)
+                .filter(
+                    WorkflowTurnModel.workflow_id == workflow.id,
+                    WorkflowTurnModel.state == TURN_QUEUED,
+                    or_(
+                        WorkflowTurnModel.inbox_message_id.is_not(None),
+                        WorkflowTurnModel.kind == "external_input",
+                    ),
+                )
+                .first()
+            )
+            if explicit_queued is None:
+                continue
+            active_before_cancel = (
+                db.get(WorkflowTurnModel, workflow.active_turn_id)
+                if workflow.active_turn_id is not None
+                else None
+            )
+            cancelled = _cancel_superseded_open_final_turns(db, int(workflow.id), now)
+            changed += cancelled
+            if (
+                cancelled
+                and active_before_cancel is not None
+                and active_before_cancel.kind == "open_final"
+                and active_before_cancel.state in (TURN_QUEUED, TURN_CLAIMED)
+            ):
+                workflow.active_turn_id = (
+                    newest_admitted.id if newest_admitted is not None else None
+                )
+                workflow.updated_at = now
+        if changed:
+            db.commit()
+        else:
+            db.rollback()
+    return changed
 
 
 def set_workflow_terminal_state(

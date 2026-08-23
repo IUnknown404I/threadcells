@@ -2,6 +2,8 @@
 
 ThreadCells can send low-noise lifecycle notifications to one Telegram destination. This is an installation-global ThreadCells capability: it does not belong to, read configuration from, or depend on the currently selected project.
 
+![Live Telegram notification settings with destination and credential fields explicitly redacted](/media/screenshots/threadcells-telegram.webp)
+
 ## Configure the destination
 
 1. Create or choose a Telegram bot using Telegram's supported bot-management flow.

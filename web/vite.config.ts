@@ -6,7 +6,7 @@ export default defineConfig({
   plugins: [react()],
   define: {
     __THREADCELLS_REVISION__: JSON.stringify(process.env.THREADCELLS_SOURCE_REVISION || 'source'),
-    __THREADCELLS_VERSION__: JSON.stringify(process.env.npm_package_version || '0.1.0-alpha.1'),
+    __THREADCELLS_VERSION__: JSON.stringify(process.env.npm_package_version || '0.1.0-alpha.2'),
   },
   build: {
     outDir: '../src/cli_agent_orchestrator/web_ui',

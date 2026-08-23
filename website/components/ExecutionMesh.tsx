@@ -68,13 +68,13 @@ export function ExecutionMesh() {
             <span className="node-copy"><strong>{node.label}</strong><small>{node.state}</small></span>
           </div>
         ))}
-        <div className="mesh-readout" aria-label="Current synthetic workflow state">
+        <div className="mesh-readout" aria-label="Illustrative workflow state">
           <span>WORKFLOW SEQUENCED</span>
           <strong>SUPERVISOR</strong>
           <small>intent → workers → reviewer → durable result</small>
         </div>
       </div>
-      <div className="mesh-capacity" aria-label="Synthetic capacity telemetry">
+      <div className="mesh-capacity" aria-label="Illustrative capacity telemetry">
         <span><i className="fill-40" />RESIDENT <strong>2 / 5</strong></span>
         <span><i className="fill-66" />PROVIDER <strong>2 / 3</strong></span>
         <span><i className="fill-100" />WORK <strong>2 / 2</strong></span>

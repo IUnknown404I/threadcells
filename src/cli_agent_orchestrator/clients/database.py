@@ -3581,7 +3581,7 @@ def list_terminal_ui_session_page(*, limit: int, offset: int, query: str = "") -
     if normalized:
         parameters["query"] = f"%{normalized}%"
         search = (
-            " WHERE LOWER(session_id) LIKE :query OR LOWER(session_name) LIKE :query "
+            " WHERE LOWER(id) LIKE :query OR LOWER(name) LIKE :query "
             "OR LOWER(COALESCE(project_name, '')) LIKE :query"
         )
     parameters.update({"limit": limit, "offset": offset})

@@ -90,16 +90,16 @@ export default function Home() {
           </div>
           <ProductShot
             src="/media/screenshots/threadcells-home.webp"
-            alt="ThreadCells Home screen showing two synthetic sessions, five agents, and bounded session summaries"
+            alt="ThreadCells Home showing 21 real sessions, 166 agents, aggregate lifecycle counts, and dense session status summaries"
             label="HOME / EXECUTION OVERVIEW"
-            detail="Current interface · isolated synthetic fixture"
+            detail="Real release system · sensitive material excluded"
             className="product-shot-hero"
             eager
             width={1440}
             height={960}
           />
           <div className="product-annotation annotation-a"><span>01</span><p><strong>Session truth</strong>Provider, profile, lifecycle, project, and active work remain visible.</p></div>
-          <div className="product-annotation annotation-b"><span>02</span><p><strong>Independent capacity</strong>Host pressure and execution slots are not collapsed into one vague limit.</p></div>
+          <div className="product-annotation annotation-b"><span>02</span><p><strong>Operational scale</strong>First, Last, and Total summaries keep large durable histories readable.</p></div>
         </section>
 
         <section className="capabilities section-shell" aria-labelledby="capabilities-title">
@@ -135,13 +135,13 @@ export default function Home() {
 
         <section className="demo section-shell" aria-labelledby="demo-title">
           <div className="demo-copy">
-            <p className="eyebrow">SHORT RUN / SYNTHETIC</p>
-            <h2 id="demo-title">Watch a workflow resolve.</h2>
-            <p>A supervisor admits the work, a worker moves from queued to running, the reviewer returns evidence, and the workflow reaches a durable completed state.</p>
+            <p className="eyebrow">LIVE RELEASE TOUR</p>
+            <h2 id="demo-title">See the control plane in motion.</h2>
+            <p>A short tour through the real release system: dense Home state, an expanded multi-agent session, protected Housekeeping, and independent capacity.</p>
           </div>
           <div className="demo-frame">
-            <div className="shot-chrome" aria-hidden="true"><span className="window-dots"><i /><i /><i /></span><span>THREADCELLS / ATLAS CONTROL</span><span>00:12</span></div>
-            <video controls muted playsInline preload="metadata" poster={assetPath('/media/screenshots/threadcells-home.webp')} aria-label="Synthetic ThreadCells workflow demo">
+            <div className="shot-chrome" aria-hidden="true"><span className="window-dots"><i /><i /><i /></span><span>THREADCELLS / LIVE RELEASE SYSTEM</span><span>00:14</span></div>
+            <video autoPlay controls loop muted playsInline preload="metadata" poster={assetPath('/media/screenshots/threadcells-home.webp')} aria-label="Live ThreadCells release-system tour">
               <source src={assetPath('/media/demo/threadcells-demo.webm')} type="video/webm" />
               <source src={assetPath('/media/demo/threadcells-demo.mp4')} type="video/mp4" />
               The demo video is unavailable in this browser.
@@ -151,13 +151,13 @@ export default function Home() {
 
         <section className="experience section-shell" aria-labelledby="experience-title">
           <div className="section-heading product-heading">
-            <div><p className="eyebrow">PRODUCT EXPERIENCE / 06</p><h2 id="experience-title">Operational detail,<br />without terminal archaeology.</h2></div>
-            <p>Move from fleet state to agent profiles, capacity, Statistics, and packaged documentation without losing the current operating context.</p>
+            <div><p className="eyebrow">PRODUCT EXPERIENCE / 06</p><h2 id="experience-title">The workflow and the host,<br />in one operating view.</h2></div>
+            <p>Open the real session behind the summary, keep the runtime healthy, and route high-signal owner attention without losing durable context.</p>
           </div>
           <div className="shot-gallery">
-            <ProductShot src="/media/screenshots/threadcells-agents.webp" alt="ThreadCells Agents screen with searchable synthetic agent profiles" label="AGENTS / PROFILE DISCOVERY" detail="Search authority and execution roles" />
-            <ProductShot src="/media/screenshots/threadcells-capacity.webp" alt="ThreadCells Settings screen with locked Operator changes and separate resident, provider, work, and heavy limits" label="SETTINGS / AUTHORITY & CAPACITY" detail="Authorize changes and see independent host limits" />
-            <ProductShot src="/media/screenshots/threadcells-docs.webp" alt="ThreadCells in-product documentation reader showing the first-time user overview" label="DOCS / BUILD-BOUND CORPUS" detail="A practical guide matched to the running build" />
+            <ProductShot src="/media/screenshots/threadcells-session-workflow.webp" alt="Expanded live ThreadCells session with one active owner and two completed reviewers" label="SESSION / MULTI-AGENT WORKFLOW" detail="Real profiles, lifecycle, and durable completion" />
+            <ProductShot src="/media/screenshots/threadcells-housekeeping.webp" alt="ThreadCells Housekeeping showing disk health, protected backups, schedule, and cleanup policy" label="HOUSEKEEPING / SERVER CARE" detail="Plan, revalidate, protect active work" />
+            <ProductShot src="/media/screenshots/threadcells-telegram.webp" alt="ThreadCells Telegram notification settings with destination and credential fields visibly redacted" label="TELEGRAM / OWNER ATTENTION" detail="One low-noise installation-global route" stateLabel="LIVE SYSTEM · SENSITIVE FIELDS REDACTED" />
           </div>
         </section>
 

@@ -58,6 +58,8 @@ def rewrite_internal_links(markdown: str, source: Path, slugs: dict[Path, str]) 
         target = match.group(1)
         if re.match(r"^(?:https?://|mailto:|#)", target):
             return match.group(0)
+        if target.startswith("/media/screenshots/"):
+            return match.group(0)
         location, separator, fragment = target.partition("#")
         resolved = (source.parent / location).resolve()
         slug = slugs.get(resolved)
@@ -94,6 +96,11 @@ def build() -> dict:
             raise ValueError(f"non-English public document: {source}")
         for target in re.findall(r"\]\(([^)#]+)(?:#[^)]+)?\)", markdown):
             if not re.match(r"^(?:https?://|mailto:)", target):
+                if target.startswith("/media/screenshots/"):
+                    target_path = ROOT / "web" / "public" / target.removeprefix("/")
+                    if not target_path.is_file():
+                        raise ValueError(f"missing public documentation media: {target}")
+                    continue
                 target_path = (path.parent / target).resolve()
                 if not target_path.is_file() or ROOT not in target_path.parents:
                     raise ValueError(f"broken relative link in {source}: {target}")

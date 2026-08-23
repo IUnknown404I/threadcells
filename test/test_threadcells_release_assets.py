@@ -189,6 +189,11 @@ def test_docs_bundle_renders_canonical_navigation(tmp_path: Path) -> None:
     assert "owner-decisions" not in documents
     assert len(documents) == 30
     assert "](/docs/getting-started)" in documents["installation"]["markdown"]
+    assert "](/media/screenshots/threadcells-home.webp)" in documents["web-ui"]["markdown"]
+    assert (
+        "](/media/screenshots/threadcells-housekeeping.webp)"
+        in documents["housekeeping"]["markdown"]
+    )
 
 
 def test_docs_bundle_check_ignores_only_the_self_referential_commit() -> None:
@@ -280,6 +285,43 @@ def test_candidate_pruning_keeps_public_website_assets_only(tmp_path: Path) -> N
     assert (candidate / "website/public/media/threadcells-social.png").read_bytes() == b"social"
     assert not (candidate / "website/app").exists()
     assert not (candidate / "website/node_modules").exists()
+
+
+def test_public_media_inventory_is_live_bounded_and_shared_by_docs() -> None:
+    names = {
+        "threadcells-home",
+        "threadcells-session-workflow",
+        "threadcells-agents",
+        "threadcells-housekeeping",
+        "threadcells-telegram",
+        "threadcells-capacity",
+    }
+    masters = ROOT / "launch-media" / "output" / "screenshots"
+    website_media = ROOT / "website" / "public" / "media" / "screenshots"
+    runtime_media = ROOT / "web" / "public" / "media" / "screenshots"
+
+    assert {path.stem for path in masters.glob("*.png")} == names
+    assert {path.stem for path in website_media.glob("*.webp")} == names
+    assert {path.stem for path in runtime_media.glob("*.webp")} == names
+    for name in names:
+        master = masters / f"{name}.png"
+        website = website_media / f"{name}.webp"
+        runtime = runtime_media / f"{name}.webp"
+        assert master.stat().st_size < 300_000
+        assert website.stat().st_size < 150_000
+        assert website.read_bytes() == runtime.read_bytes()
+
+    demo_master = ROOT / "launch-media" / "output" / "demo" / "threadcells-demo.webm"
+    website_demo = ROOT / "website" / "public" / "media" / "demo"
+    assert demo_master.stat().st_size < 2_000_000
+    assert (website_demo / "threadcells-demo.webm").read_bytes() == demo_master.read_bytes()
+    assert (website_demo / "threadcells-demo.mp4").stat().st_size < 2_000_000
+    assert not (ROOT / "launch-media" / "output" / "demo" / "threadcells-demo.gif").exists()
+
+    capture = (ROOT / "launch-media" / "capture-product.mjs").read_text(encoding="utf-8")
+    assert "live-loopback-production" in capture
+    assert "createFixtureServer" not in capture
+    assert "Synthetic launch-media fixture" not in capture
 
 
 def test_release_builder_and_public_config_are_host_neutral_and_offline() -> None:

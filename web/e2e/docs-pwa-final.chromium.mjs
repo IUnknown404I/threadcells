@@ -13,7 +13,8 @@ const docsBundle = JSON.parse(await readFile(path.join(distRoot, 'docs-bundle.js
 const contentTypes = new Map([
   ['.css', 'text/css'], ['.html', 'text/html'], ['.ico', 'image/x-icon'],
   ['.js', 'text/javascript'], ['.json', 'application/json'],
-  ['.png', 'image/png'], ['.webmanifest', 'application/manifest+json'],
+  ['.png', 'image/png'], ['.webp', 'image/webp'],
+  ['.webmanifest', 'application/manifest+json'],
 ])
 let probeCount = 0
 
@@ -115,8 +116,10 @@ try {
 
   for (const viewport of viewports) {
     await page.setViewportSize(viewport)
-    await page.goto(`${origin}/docs/${viewport.width === 390 ? 'remote-access' : 'concepts'}`)
+    await page.goto(`${origin}/docs/web-ui`)
     await page.locator('article').waitFor()
+    const releaseImage = page.getByAltText('Live ThreadCells Home with dense session, agent, and workflow summaries')
+    assert.equal(await releaseImage.evaluate(image => image.complete && image.naturalWidth === 1440), true, `Docs release image at ${viewport.width}px`)
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
     assert(overflow <= 0, `Docs overflow at ${viewport.width}px: ${overflow}`)
     await page.screenshot({ path: path.join(screenshotDir, `docs-${viewport.width}.png`), fullPage: true })

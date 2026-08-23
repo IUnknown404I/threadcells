@@ -2,6 +2,8 @@
 
 ThreadCells separates capacity because coding-agent work can pressure different parts of a host at different times. A model turn consumes provider capacity; an assigned coding context can remain active while the model is idle; a build can saturate the machine after model output has stopped.
 
+![Live Orchestration Capacity showing independent resident, provider, work, and heavy limits](/media/screenshots/threadcells-capacity.webp)
+
 Increasing every number together is usually not faster. It can create model quota contention, memory pressure, disk churn, and several expensive builds competing for the same CPU.
 
 ## The four limits

@@ -14,7 +14,7 @@ type ProductShotProps = {
   stateLabel?: string
 }
 
-export function ProductShot({ src, alt, label, detail, className = '', eager = false, width = 1440, height = 960, stateLabel = 'ISOLATED SYNTHETIC STATE' }: ProductShotProps) {
+export function ProductShot({ src, alt, label, detail, className = '', eager = false, width = 1440, height = 960, stateLabel = 'LIVE RELEASE SYSTEM' }: ProductShotProps) {
   const resolvedSrc = assetPath(src)
   return (
     <figure className={`product-shot ${className}`}>

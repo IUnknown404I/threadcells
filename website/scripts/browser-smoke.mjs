@@ -33,8 +33,22 @@ try {
     const page = await context.newPage()
     await assertPage(page, '', viewport.name)
 
-    const productImage = page.locator('img[alt^="ThreadCells Home screen"]')
+    const productImage = page.locator('img[alt^="ThreadCells Home showing"]')
     assert.equal(await productImage.evaluate(image => image.complete && image.naturalWidth === 1440), true, `${viewport.name} current product image loads at its native capture width`)
+    const demo = page.getByLabel('Live ThreadCells release-system tour')
+    const demoState = await demo.evaluate(video => ({
+      autoplay: video.autoplay,
+      muted: video.muted,
+      loop: video.loop,
+      playsInline: video.playsInline,
+      sources: Array.from(video.querySelectorAll('source')).map(source => source.getAttribute('src')),
+    }))
+    assert.deepEqual(
+      { autoplay: demoState.autoplay, muted: demoState.muted, loop: demoState.loop, playsInline: demoState.playsInline },
+      { autoplay: true, muted: true, loop: true, playsInline: true },
+      `${viewport.name} live tour uses native autoplay, muted, loop, and playsinline behavior`,
+    )
+    assert.equal(demoState.sources.length, 2, `${viewport.name} live tour has WebM and MP4 sources`)
     assert.equal(await page.getByRole('link', { name: 'ThreadCells on GitHub' }).getAttribute('href'), 'https://github.com/IUnknown404I/threadcells', `${viewport.name} uses the official repository`)
     const footer = page.locator('footer')
     assert.equal(await footer.getByRole('link', { name: 'ThreadCells home' }).getAttribute('href'), `${basePath}/#top`, `${viewport.name} footer brand uses the Pages-aware landing root`)
@@ -49,10 +63,10 @@ try {
       assert.equal(await page.locator('.header-github-link').isVisible(), true, 'mobile keeps GitHub in the header')
     }
 
-    const screenshotTrigger = page.getByRole('button', { name: /Click to expand: ThreadCells Home screen/ })
+    const screenshotTrigger = page.getByRole('button', { name: /Click to expand: ThreadCells Home showing/ })
     await screenshotTrigger.scrollIntoViewIfNeeded()
     await screenshotTrigger.click()
-    const dialog = page.getByRole('dialog', { name: /Expanded screenshot: ThreadCells Home screen/ })
+    const dialog = page.getByRole('dialog', { name: /Expanded screenshot: ThreadCells Home showing/ })
     await dialog.waitFor({ state: 'visible' })
     assert.equal(await page.evaluate(() => document.body.style.overflow), 'hidden', `${viewport.name} lightbox locks background scrolling`)
     await page.keyboard.press('Escape')

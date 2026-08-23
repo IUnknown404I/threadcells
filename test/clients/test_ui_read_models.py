@@ -129,6 +129,22 @@ def test_history_sessions_survive_runtime_retirement(monkeypatch):
     assert any(item["status"] == "history" for item in sessions["items"])
 
 
+def test_session_summary_search_uses_aggregated_session_columns(monkeypatch):
+    _install_database(monkeypatch)
+    _seed_history(session_count=180, terminal_count=180)
+
+    by_name = ui_read_model_service.list_session_summaries(query="SESSION-007")
+    by_id = ui_read_model_service.list_session_summaries(query="lifetime-007")
+    by_project = ui_read_model_service.list_session_summaries(query="project 3")
+
+    assert by_name["total"] == 1
+    assert by_name["items"][0]["name"] == "cao-session-007"
+    assert by_id["total"] == 1
+    assert by_id["items"][0]["id"] == "lifetime-007"
+    assert by_project["total"] > 1
+    assert {item["project_name"] for item in by_project["items"]} == {"Project 3"}
+
+
 def test_home_lifecycle_counts_and_filters_are_mutually_truthful(monkeypatch):
     _install_database(monkeypatch)
     now = datetime(2026, 8, 21, 8, 0, 0)

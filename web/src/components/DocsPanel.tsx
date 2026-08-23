@@ -6,6 +6,7 @@ type Doc = { slug: string; group: string; order: number; title: string; markdown
 type Bundle = { product: string; version: string; commit: string; documents: Doc[] }
 
 const safeHref = (value: string) => /^(https?:\/\/|mailto:|#|\/docs(?:\/|$))/.test(value) ? value : '#'
+const safeImageSrc = (value: string) => /^\/media\/screenshots\/[a-z0-9-]+\.webp$/.test(value) ? value : ''
 const anchor = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
 
 function Inline({ value }: { value: string }) {
@@ -25,6 +26,8 @@ function Markdown({ markdown }: { markdown: string }) {
   while (i < lines.length) {
     const line = lines[i]
     if (line.startsWith('```')) { const code: string[] = []; const lang = line.slice(3); i++; while (i < lines.length && !lines[i].startsWith('```')) code.push(lines[i++]); i++; const text = code.join('\n'); out.push(<pre key={i} className="group relative my-4 max-w-full overflow-x-auto rounded-lg border border-gray-700 bg-[#101622] p-4 text-sm"><button className="absolute right-2 top-2 rounded bg-gray-700 px-2 py-1 text-xs opacity-70 hover:opacity-100" onClick={() => navigator.clipboard?.writeText(text)} aria-label="Copy code"><Copy size={13}/></button><code data-language={lang}>{text}</code></pre>); continue }
+    const image = /^!\[([^\]]+)\]\(([^)]+)\)$/.exec(line)
+    if (image) { const src = safeImageSrc(image[2]); if (src) out.push(<img key={i} src={src} alt={image[1]} loading="lazy" className="my-5 w-full rounded-xl border border-gray-700/70"/>); i++; continue }
     const heading = /^(#{1,4})\s+(.+)$/.exec(line)
     if (heading) { const level = heading[1].length; const id = anchor(heading[2]); const Tag = (`h${level}` as keyof JSX.IntrinsicElements); out.push(<Tag key={i} id={id} className={["text-2xl", "text-xl", "text-lg", "text-base"][level-1] + ' mt-7 mb-3 scroll-mt-28 font-semibold text-white'}><a href={'#'+id} className="hover:text-emerald-300">{heading[2]}</a></Tag>); i++; continue }
     if (/^[-*]\s+/.test(line)) { const items: string[]=[]; while(i<lines.length && /^[-*]\s+/.test(lines[i])) items.push(lines[i++].replace(/^[-*]\s+/,'')); out.push(<ul key={i} className="my-3 list-disc space-y-1 pl-6">{items.map((x,j)=><li key={j}><Inline value={x}/></li>)}</ul>); continue }

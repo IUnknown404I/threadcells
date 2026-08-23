@@ -23,7 +23,7 @@ jobs:
       - run: uv sync --locked --all-extras --dev
       - run: python scripts/build_local_candidate.py --output "$RUNNER_TEMP/threadcells-candidate"
       - run: |
-          candidate="$RUNNER_TEMP/threadcells-candidate/threadcells-0.1.0a1-local"
+          candidate="$RUNNER_TEMP/threadcells-candidate/threadcells-0.1.0a2-local"
           wheel="$(find "$candidate/packages" -maxdepth 1 -name 'threadcells-*.whl' -print -quit)"
           python scripts/verify_local_candidate.py --candidate "$candidate"
           python scripts/audit_public_surface.py --candidate "$candidate" --wheel "$wheel"

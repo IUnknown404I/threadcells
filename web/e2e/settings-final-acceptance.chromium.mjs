@@ -81,7 +81,7 @@ const telegram = {
 await mkdir(evidenceDir, { recursive: true })
 const vite = await createViteServer({
   root: webRoot, configFile: false, plugins: [(await import('@vitejs/plugin-react')).default()],
-  define: { __THREADCELLS_REVISION__: JSON.stringify('settings-evidence-revision'), __THREADCELLS_VERSION__: JSON.stringify('0.1.0-alpha.1') },
+  define: { __THREADCELLS_REVISION__: JSON.stringify('settings-evidence-revision'), __THREADCELLS_VERSION__: JSON.stringify('0.1.0-alpha.2') },
   appType: 'spa', server: { middlewareMode: true, hmr: false },
 })
 const json = (response, value) => {

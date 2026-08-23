@@ -13,7 +13,7 @@ let executionState = null
 let listFailurePending = false
 const requests = { lists: 0, creates: 0, runs: 0, toggles: 0 }
 
-const vite = await createViteServer({ root: webRoot, configFile: false, plugins: [(await import('@vitejs/plugin-react')).default()], define: { __THREADCELLS_REVISION__: JSON.stringify('flows-acceptance'), __THREADCELLS_VERSION__: JSON.stringify('0.1.0-alpha.1') }, appType: 'spa', server: { middlewareMode: true, hmr: false } })
+const vite = await createViteServer({ root: webRoot, configFile: false, plugins: [(await import('@vitejs/plugin-react')).default()], define: { __THREADCELLS_REVISION__: JSON.stringify('flows-acceptance'), __THREADCELLS_VERSION__: JSON.stringify('0.1.0-alpha.2') }, appType: 'spa', server: { middlewareMode: true, hmr: false } })
 function json(response, value, status = 200) { response.writeHead(status, { 'content-type': 'application/json' }); response.end(JSON.stringify(value)) }
 function readJson(request) { return new Promise((resolve, reject) => { const chunks = []; request.on('data', chunk => chunks.push(chunk)); request.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString())) } catch (error) { reject(error) } }); request.on('error', reject) }) }
 

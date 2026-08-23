@@ -46,7 +46,7 @@ function agentSummary(item) {
   return { id: item.id, name: item.tmux_window, provider: item.provider, session_id: sessionId, session_name: sessionId, agent_profile: item.agent_profile, activity: 'ready', execution_state: 'ready', lifecycle: 'running', workflow_state: 'active', workflow_status: null, assignment_status: null, result_status: null, delivery_status: null, context_role: null, launch_worktree: null, managed_worktree_kind: null, managed_worktree_commit: null, managed_worktree_branch: null, projectId: 'project-fixture', project_name: 'Fixture Project', project_path: '/srv/fixture-project', creation_order: Number(item.tmux_window) + 1, last_active: null }
 }
 
-const vite = await createViteServer({ root: webRoot, configFile: false, plugins: [(await import('@vitejs/plugin-react')).default()], define: { __THREADCELLS_REVISION__: JSON.stringify('render-stability-evidence'), __THREADCELLS_VERSION__: JSON.stringify('0.1.0-alpha.1') }, appType: 'spa', server: { middlewareMode: true, hmr: false } })
+const vite = await createViteServer({ root: webRoot, configFile: false, plugins: [(await import('@vitejs/plugin-react')).default()], define: { __THREADCELLS_REVISION__: JSON.stringify('render-stability-evidence'), __THREADCELLS_VERSION__: JSON.stringify('0.1.0-alpha.2') }, appType: 'spa', server: { middlewareMode: true, hmr: false } })
 function json(response, value) { response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify(value)) }
 const server = http.createServer((request, response) => {
   const url = new URL(request.url, 'http://localhost')

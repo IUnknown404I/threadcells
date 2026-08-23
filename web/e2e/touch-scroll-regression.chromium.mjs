@@ -15,7 +15,7 @@ const vite = await createViteServer({
   root: webRoot,
   configFile: false,
   plugins: servingBuiltCandidate ? [] : [react()],
-  define: servingBuiltCandidate ? undefined : { __THREADCELLS_REVISION__: JSON.stringify('touch-scroll-regression'), __THREADCELLS_VERSION__: JSON.stringify('0.1.0-alpha.1') },
+  define: servingBuiltCandidate ? undefined : { __THREADCELLS_REVISION__: JSON.stringify('touch-scroll-regression'), __THREADCELLS_VERSION__: JSON.stringify('0.1.0-alpha.2') },
   appType: 'spa',
   server: { middlewareMode: true, hmr: false },
 })

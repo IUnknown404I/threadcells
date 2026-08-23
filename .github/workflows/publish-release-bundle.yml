@@ -82,7 +82,7 @@ jobs:
           cache-dependency-path: release-source/web/package-lock.json
       - uses: oras-project/setup-oras@v1
         with:
-          version: 1.3.3
+          version: 1.3.0
 
       - name: Populate locked Web build cache
         run: npm ci --ignore-scripts

@@ -1,0 +1,27 @@
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Share a ThreadCells setup, workflow, integration, or useful lesson. Keep screenshots and links safe for public viewing and remove secrets, private messages, private paths, and private infrastructure details.
+  - type: textarea
+    id: project
+    attributes:
+      label: What did you build or use ThreadCells for?
+      description: A short introduction is enough.
+    validations:
+      required: true
+  - type: textarea
+    id: setup
+    attributes:
+      label: Setup or workflow
+      description: Optional. Describe the agents, workflow, integration, or operating pattern.
+  - type: textarea
+    id: media
+    attributes:
+      label: Screenshots, demo, or links
+      description: Optional. Share only material that is safe to publish.
+  - type: textarea
+    id: lessons
+    attributes:
+      label: Lessons or tips for others
+      description: Optional. What worked well, surprised you, or might help someone else?

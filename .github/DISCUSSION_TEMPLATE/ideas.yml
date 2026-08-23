@@ -1,0 +1,32 @@
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ideas are for early problem and use-case exploration. Confirmed, scoped work belongs in [Issues](https://github.com/IUnknown404I/threadcells/issues) under the [Issue policy](https://iunknown404i.github.io/threadcells/docs/issues). Never post security-sensitive information here.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to accomplish, and what makes it difficult today?
+      placeholder: When I use ThreadCells to...
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: What would a good result feel like? You do not need to design the implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: value
+    attributes:
+      label: Why this would help
+      description: Who would benefit, and how?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or current workaround
+      description: Optional. Share what you use today or what should remain out of scope.

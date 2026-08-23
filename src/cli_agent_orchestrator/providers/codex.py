@@ -141,20 +141,24 @@ TUI_SEPARATOR_PATTERN = r"^[^\S\n]*─{3,}[^\S\n]*$"
 # the notice itself as a successful worker result.
 TUI_INFO_NOTICE_PREFIX_PATTERN = r"^[^\S\n]*ⓘ(?:[^\S\n]+|$)"
 SIDECAR_RECONNECT_REQUIRED_TEXT = "CAO_SIDECAR_RECONNECT_REQUIRED"
-PROVIDER_RECONNECT_ATTEMPT_TAG_PREFIX = f"[{PROVIDER_RECONNECT_ATTEMPT_ENV}="
 CONTEXT_COMPACTED_TEXT = "Context compacted"
 SIDECAR_RECONNECTED_PREFIX = "__CAO_SIDECAR_RECONNECTED_"
 SIDECAR_RECONNECT_LAUNCH_PREFIX = "__CAO_SIDECAR_RECONNECT_LAUNCH_"
 FRESH_RUNTIME_OUTPUT_BOUNDARY_PREFIX = "__CAO_FRESH_RUNTIME_OUTPUT_BOUNDARY_"
-SIDECAR_RECONNECT_REQUIRED_LINE_PATTERN = re.compile(
-    rf"^(?:[^\S\n]*Error calling tool(?: '[^'\n]+')?:|"
-    rf"[^\n]*(?:[\"'](?:message|error)[\"'][^\S\n]*:|"
-    rf"\b(?:message|error)[^\S\n]*=))[^\n]*"
-    rf"{SIDECAR_RECONNECT_REQUIRED_TEXT}(?::|\b)[^\n]*$",
-    re.MULTILINE,
+SIDECAR_RECONNECT_REQUIRED_BLOCK_START_PATTERN = re.compile(
+    r"^[^\S\n]*(?:Error calling tool(?:[^\S\n]|$)|"
+    r"[^\n]*(?:[\"'](?:message|error)[\"'][^\S\n]*:|"
+    r"\b(?:message|error)[^\S\n]*=))",
+    re.IGNORECASE,
 )
-PROVIDER_RECONNECT_ATTEMPT_TAG_PATTERN = re.compile(
-    rf"\{PROVIDER_RECONNECT_ATTEMPT_TAG_PREFIX}(?P<attempt>[0-9a-f]{{32}})\]"
+SIDECAR_RECONNECT_REQUIRED_BLOCK_LINES = 8
+SIDECAR_RECONNECT_REQUIRED_COMPACT_PATTERN = re.compile(
+    rf"(?:^Errorcallingtool(?:'[^']+')?:|"
+    rf"(?:[\"'](?:message|error)[\"']|(?:message|error))(?::|=)[\"']?)"
+    rf"{SIDECAR_RECONNECT_REQUIRED_TEXT}"
+    rf"(?:\[{PROVIDER_RECONNECT_ATTEMPT_ENV}=(?P<attempt>[0-9a-f]{{32}})\])?"
+    rf"(?::|\b)",
+    re.IGNORECASE,
 )
 CONTEXT_COMPACTED_LINE_PATTERN = re.compile(
     rf"^[^\S\n]*•[^\S\n]+{CONTEXT_COMPACTED_TEXT}[^\S\n]*$",
@@ -344,14 +348,23 @@ def _durable_reconnect_output_boundary(terminal_id: str) -> Optional[dict[str, A
 
 def _has_runtime_reconnect_signal(output: str, attempt_token: Optional[str]) -> bool:
     """Recognize protocol errors and structured semantic failures for one runtime."""
-    matches = SIDECAR_RECONNECT_REQUIRED_LINE_PATTERN.finditer(output)
+    candidate_attempts: list[Optional[str]] = []
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
+        if not SIDECAR_RECONNECT_REQUIRED_BLOCK_START_PATTERN.match(line):
+            continue
+        block_lines: list[str] = []
+        for candidate_line in lines[index : index + SIDECAR_RECONNECT_REQUIRED_BLOCK_LINES]:
+            if block_lines and not candidate_line.strip():
+                break
+            block_lines.append(candidate_line)
+        compact_block = re.sub(r"\s+", "", "".join(block_lines))
+        compact_match = SIDECAR_RECONNECT_REQUIRED_COMPACT_PATTERN.search(compact_block)
+        if compact_match is not None:
+            candidate_attempts.append(compact_match.group("attempt"))
     if attempt_token is None:
-        return any(True for _ in matches)
-    return any(
-        (tagged := PROVIDER_RECONNECT_ATTEMPT_TAG_PATTERN.search(match.group(0))) is not None
-        and tagged.group("attempt") == attempt_token
-        for match in matches
-    )
+        return bool(candidate_attempts)
+    return attempt_token in candidate_attempts
 
 
 def _normalize_terminal_suffix_blank_rows(output: str) -> str:

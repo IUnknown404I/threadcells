@@ -997,6 +997,118 @@ class TestCodexBulletFormatStatusDetection:
 
         assert provider.runtime_sidecar_reconnect_required() is True
 
+    @patch("cli_agent_orchestrator.providers.codex._durable_reconnect_output_boundary")
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_wrapped_tool_failure_requests_initial_exact_resume(
+        self, mock_tmux, mock_boundary, tmp_path, monkeypatch
+    ):
+        log_dir = tmp_path / "terminal"
+        log_dir.mkdir()
+        monkeypatch.setattr("cli_agent_orchestrator.providers.codex.TERMINAL_LOG_DIR", log_dir)
+        mock_boundary.return_value = None
+        wrapped = (
+            "    Error calling tool\n"
+            "        'acknowledge_assigned_result':\n"
+            "        CAO_SIDECAR_RECONNECT_REQUIRED:\n"
+            "        privileged operation was not started\n"
+        )
+        (log_dir / "test1234.log").write_text(wrapped, encoding="utf-8")
+        mock_tmux.get_history.return_value = wrapped + "› \n? for shortcuts\n"
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        provider.get_status()
+
+        assert provider.runtime_sidecar_reconnect_required() is True
+
+    @patch("cli_agent_orchestrator.providers.codex._durable_reconnect_output_boundary")
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_nearby_transcript_rows_cannot_forge_initial_exact_resume(
+        self, mock_tmux, mock_boundary, tmp_path, monkeypatch
+    ):
+        log_dir = tmp_path / "terminal"
+        log_dir.mkdir()
+        monkeypatch.setattr("cli_agent_orchestrator.providers.codex.TERMINAL_LOG_DIR", log_dir)
+        mock_boundary.return_value = None
+        discussion = (
+            "    Error calling tool behavior is documented here\n"
+            "        this is unrelated transcript prose\n"
+            "        CAO_SIDECAR_RECONNECT_REQUIRED:\n"
+            '    {"message": "unrelated prose CAO_SIDECAR_RECONNECT_REQUIRED"}\n'
+        )
+        (log_dir / "test1234.log").write_text(discussion, encoding="utf-8")
+        mock_tmux.get_history.return_value = discussion + "› \n? for shortcuts\n"
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        provider.get_status()
+
+        assert provider.runtime_sidecar_reconnect_required() is False
+
+    @patch("cli_agent_orchestrator.providers.codex._durable_reconnect_output_boundary")
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_wrapped_tool_failure_after_boundary_requires_matching_attempt(
+        self, mock_tmux, mock_boundary, tmp_path, monkeypatch
+    ):
+        log_dir = tmp_path / "terminal"
+        log_dir.mkdir()
+        monkeypatch.setattr("cli_agent_orchestrator.providers.codex.TERMINAL_LOG_DIR", log_dir)
+        log_path = log_dir / "test1234.log"
+        historical = "historical transcript\n"
+        log_path.write_text(historical, encoding="utf-8")
+        log_stat = log_path.stat()
+        attempt_token = "e" * 32
+        mock_boundary.return_value = {
+            "attempt_token": attempt_token,
+            "output_log_device": log_stat.st_dev,
+            "output_log_inode": log_stat.st_ino,
+            "output_log_offset": len(historical.encode()),
+        }
+        provider = CodexProvider("test1234", "test-session", "window-0")
+
+        untagged = (
+            "    Error calling tool\n"
+            "        'send_message':\n"
+            "        CAO_SIDECAR_RECONNECT_REQUIRED: retry\n"
+        )
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(untagged)
+        mock_tmux.get_history.return_value = log_path.read_text(encoding="utf-8")
+        provider.get_status()
+        assert provider.runtime_sidecar_reconnect_required() is False
+
+        unrelated_same_line_tag = (
+            "    Error calling tool 'send_message': "
+            "CAO_SIDECAR_RECONNECT_REQUIRED: unrelated prose "
+            f"[{PROVIDER_RECONNECT_ATTEMPT_ENV}={attempt_token}]\n"
+        )
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(unrelated_same_line_tag)
+        mock_tmux.get_history.return_value = log_path.read_text(encoding="utf-8")
+        provider.get_status()
+        assert provider.runtime_sidecar_reconnect_required() is False
+
+        nearby_tag = (
+            "        ordinary transcript separates the marker and nonce\n"
+            f"        [{PROVIDER_RECONNECT_ATTEMPT_ENV}={attempt_token}]\n"
+        )
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(nearby_tag)
+        mock_tmux.get_history.return_value = log_path.read_text(encoding="utf-8")
+        provider.get_status()
+        assert provider.runtime_sidecar_reconnect_required() is False
+
+        tagged = (
+            "    Error calling tool\n"
+            "        'send_message':\n"
+            "        CAO_SIDECAR_RECONNECT_REQUIRED\n"
+            "        [CAO_PROVIDER_RECONNECT_\n"
+            f"         ATTEMPT={attempt_token}]: retry\n"
+        )
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(tagged)
+        mock_tmux.get_history.return_value = log_path.read_text(encoding="utf-8")
+        provider.get_status()
+        assert provider.runtime_sidecar_reconnect_required() is True
+
     @patch(
         "cli_agent_orchestrator.providers.codex._durable_reconnect_output_boundary",
         return_value=None,

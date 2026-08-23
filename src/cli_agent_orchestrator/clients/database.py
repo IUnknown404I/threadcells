@@ -6265,10 +6265,11 @@ def request_workflow_provider_reconnect(
     """Persist a stale-sidecar observation before any replacement transport.
 
     The provider can surface the fence while its admitted model turn still
-    owns an execution lease. Persisting intent separately from claiming the
-    reconnect prevents a later Inbox fast path or service restart from losing
-    that ordering barrier. The existing turn columns remain the sole durable
-    authority; no provider launch occurs here.
+    owns an execution lease, or just after that turn's final observation has
+    durably queued (but not admitted) its successor. Persisting intent on that
+    same admitted turn prevents a later Inbox fast path or service restart
+    from losing the ordering barrier. The existing turn columns remain the
+    sole durable authority; no provider launch occurs here.
     """
     _ensure_workflow_schema()
     now = now or datetime.now()
@@ -6279,7 +6280,11 @@ def request_workflow_provider_reconnect(
             db.rollback()
             return False
         turn = db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
-        if turn is None or turn.workflow_id != workflow.id or turn.state != TURN_SENT:
+        if (
+            turn is None
+            or turn.workflow_id != workflow.id
+            or turn.state not in (TURN_SENT, TURN_FINISHED)
+        ):
             db.rollback()
             return False
         admitted = (
@@ -6446,7 +6451,7 @@ def claim_workflow_provider_reconnect(
             .filter(
                 WorkflowTurnModel.id == active_turn_id,
                 WorkflowTurnModel.workflow_id == workflow.id,
-                WorkflowTurnModel.state == TURN_SENT,
+                WorkflowTurnModel.state.in_((TURN_SENT, TURN_FINISHED)),
                 or_(
                     WorkflowTurnModel.provider_reconnect_requested_at.is_(None),
                     WorkflowTurnModel.provider_reconnect_claim_token.is_(None),

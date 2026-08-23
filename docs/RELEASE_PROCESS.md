@@ -1,6 +1,6 @@
 # Release process
 
-Build an isolated local candidate from a clean committed tree with `scripts/build_local_candidate.py --output <new-directory>`. It packages the generated Docs/UI and a local wheel. Verify `SHA256SUMS`, inspect `candidate-manifest.json`, `sbom.cdx.json`, and `EVIDENCE.md`, then perform the documented clean install using a new prefix. Publication automation is intentionally absent. Publishing a tag, remote branch, package, image, or public release is never an ordinary implementation action.
+Build an isolated local candidate from a clean committed tree with `scripts/build_local_candidate.py --output <new-directory>`. It packages the generated Docs/UI and a local wheel. Verify `SHA256SUMS`, inspect `candidate-manifest.json`, `sbom.cdx.json`, and `EVIDENCE.md`, then perform the documented clean install using a new prefix. Publishing a tag, remote branch, package, image, or public release is never an ordinary implementation action.
 
 ## Release checklist
 
@@ -14,6 +14,14 @@ Build an isolated local candidate from a clean committed tree with `scripts/buil
 8. Treat any public push, tag, package, image, or release as a separate owner-approved action.
 
 Release evidence proves what was tested and packaged; it does not itself approve publication or certify every dependency license/security property.
+
+## OCI release distribution
+
+Approved published alpha releases also have a public OCI distribution artifact at `ghcr.io/iunknown404i/threadcells-release-bundle`. It contains the verified release archive, Python wheel, checksum inventories, candidate manifest, SBOM, and release-bundle metadata for one exact release tag and source revision.
+
+This package is a distribution bundle, not a Docker image or a supported container deployment environment. Use the normal candidate installation and deployment process after verifying its checksums; do not try to run the OCI artifact as a ThreadCells service.
+
+`.github/workflows/publish-release-bundle.yml` publishes on an approved GitHub Release or by an explicit backfill dispatch. It accepts only annotated `v0.1.X-alpha.N` tags with an existing non-draft prerelease, rebuilds and verifies the exact tagged source, refuses to replace a mismatched version tag, and updates only `latest-alpha`. ThreadCells does not publish an unqualified `latest` tag during the technical preview.
 
 ## Version-line convention
 

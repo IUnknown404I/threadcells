@@ -1,6 +1,7 @@
 """Unit tests for Codex provider."""
 
 import os
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -34,6 +35,67 @@ def assert_stably_completed(provider: CodexProvider) -> None:
     assert provider.get_status() == TerminalStatus.PROCESSING
     assert provider.get_status() == TerminalStatus.PROCESSING
     assert provider.get_status() == TerminalStatus.COMPLETED
+
+
+def _write_proc_stat(
+    proc_root: Path,
+    process_id: int,
+    *,
+    parent_process_id: int,
+    process_group_id: int,
+    foreground_process_group_id: int,
+    start_ticks: int,
+) -> None:
+    stat_path = proc_root / str(process_id) / "stat"
+    stat_path.parent.mkdir(parents=True, exist_ok=True)
+    suffix = [
+        "S",
+        str(parent_process_id),
+        str(process_group_id),
+        str(process_group_id),
+        "1",
+        str(foreground_process_group_id),
+        *(["0"] * 13),
+        str(start_ticks),
+    ]
+    stat_path.write_text(f"{process_id} (codex fixture) {' '.join(suffix)}\n", encoding="utf-8")
+
+
+def _open_rollout_fixture(
+    proc_root: Path,
+    codex_home: Path,
+    *,
+    process_id: int,
+    descriptor: str,
+    session_id: str,
+    working_directory: Path,
+    writable: bool = True,
+) -> None:
+    rollout = codex_home / "sessions/2026/08/22" / f"rollout-2026-08-22T12-00-00-{session_id}.jsonl"
+    rollout.parent.mkdir(parents=True, exist_ok=True)
+    rollout.write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "timestamp": "2026-08-22T12:00:00Z",
+                    "cwd": str(working_directory),
+                    "source": "cli",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    descriptors = proc_root / str(process_id) / "fd"
+    descriptor_info = proc_root / str(process_id) / "fdinfo"
+    descriptors.mkdir(parents=True, exist_ok=True)
+    descriptor_info.mkdir(parents=True, exist_ok=True)
+    (descriptors / descriptor).symlink_to(rollout)
+    (descriptor_info / descriptor).write_text(
+        f"flags:\t{'02102002' if writable else '02100000'}\n", encoding="ascii"
+    )
 
 
 class TestCodexProviderInitialization:
@@ -1198,20 +1260,53 @@ class TestCodexBulletFormatStatusDetection:
         provider = CodexProvider("test1234", "test-session", "window-0")
         mock_tmux.get_pane_current_command.return_value = "codex.direct"
         mock_tmux.get_pane_process_id.return_value = 100
+        working_directory = tmp_path / "project"
+        working_directory.mkdir()
+        mock_tmux.get_pane_working_directory.return_value = str(working_directory)
         proc_root = tmp_path / "proc"
-        children = proc_root / "100/task/100/children"
-        children.parent.mkdir(parents=True)
-        children.write_text("200", encoding="utf-8")
-        descriptors = proc_root / "200/fd"
-        descriptors.mkdir(parents=True)
-        codex_home = tmp_path / "codex"
-        rollout = (
-            codex_home / "sessions/2026/08/22/rollout-2026-08-22T12-00-00-"
-            "01234567-89ab-cdef-0123-456789abcdef.jsonl"
+        _write_proc_stat(
+            proc_root,
+            100,
+            parent_process_id=1,
+            process_group_id=100,
+            foreground_process_group_id=200,
+            start_ticks=1000,
         )
-        rollout.parent.mkdir(parents=True)
-        rollout.write_text("{}\n", encoding="utf-8")
-        (descriptors / "9").symlink_to(rollout)
+        _write_proc_stat(
+            proc_root,
+            200,
+            parent_process_id=100,
+            process_group_id=200,
+            foreground_process_group_id=200,
+            start_ticks=2000,
+        )
+        # Another simultaneously open Codex rollout belongs to a background
+        # sibling. It is not part of this pane's foreground provider runtime.
+        _write_proc_stat(
+            proc_root,
+            201,
+            parent_process_id=100,
+            process_group_id=201,
+            foreground_process_group_id=200,
+            start_ticks=2010,
+        )
+        codex_home = tmp_path / "codex"
+        _open_rollout_fixture(
+            proc_root,
+            codex_home,
+            process_id=200,
+            descriptor="9",
+            session_id="01234567-89ab-cdef-0123-456789abcdef",
+            working_directory=working_directory,
+        )
+        _open_rollout_fixture(
+            proc_root,
+            codex_home,
+            process_id=201,
+            descriptor="8",
+            session_id="fedcba98-7654-3210-fedc-ba9876543210",
+            working_directory=working_directory,
+        )
         monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
         assert (
@@ -1226,23 +1321,51 @@ class TestCodexBulletFormatStatusDetection:
         provider = CodexProvider("test1234", "test-session", "window-0")
         mock_tmux.get_pane_current_command.return_value = "codex"
         mock_tmux.get_pane_process_id.return_value = 100
+        working_directory = tmp_path / "project"
+        working_directory.mkdir()
+        mock_tmux.get_pane_working_directory.return_value = str(working_directory)
         proc_root = tmp_path / "proc"
-        children = proc_root / "100/task/100/children"
-        children.parent.mkdir(parents=True)
-        children.write_text("200", encoding="utf-8")
-        descriptors = proc_root / "200/fd"
-        descriptors.mkdir(parents=True)
+        _write_proc_stat(
+            proc_root,
+            100,
+            parent_process_id=1,
+            process_group_id=100,
+            foreground_process_group_id=200,
+            start_ticks=1000,
+        )
+        _write_proc_stat(
+            proc_root,
+            200,
+            parent_process_id=100,
+            process_group_id=200,
+            foreground_process_group_id=200,
+            start_ticks=2000,
+        )
         codex_home = tmp_path / "codex"
         for descriptor, session_id in (
             ("8", "01234567-89ab-cdef-0123-456789abcdef"),
             ("9", "fedcba98-7654-3210-fedc-ba9876543210"),
         ):
-            rollout = codex_home / "sessions" / f"rollout-{session_id}.jsonl"
-            rollout.parent.mkdir(parents=True, exist_ok=True)
-            rollout.write_text("{}\n", encoding="utf-8")
-            (descriptors / descriptor).symlink_to(rollout)
+            _open_rollout_fixture(
+                proc_root,
+                codex_home,
+                process_id=200,
+                descriptor=descriptor,
+                session_id=session_id,
+                working_directory=working_directory,
+            )
         monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
+        assert (
+            provider.runtime_sidecar_resume_identity(
+                proc_root, expected_identity="01234567-89ab-cdef-0123-456789abcdef"
+            )
+            == "01234567-89ab-cdef-0123-456789abcdef"
+        )
+        with pytest.raises(ProviderError, match="stale or belongs elsewhere"):
+            provider.runtime_sidecar_resume_identity(
+                proc_root, expected_identity="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            )
         with pytest.raises(ProviderError, match="ambiguous"):
             provider.runtime_sidecar_resume_identity(proc_root)
 

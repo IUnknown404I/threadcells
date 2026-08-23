@@ -17,11 +17,13 @@ from cli_agent_orchestrator.clients.database import (
     DelegationResultModel,
     FlowModel,
     InboxModel,
+    ProviderUsageBindingModel,
     TerminalModel,
     UnreconciledTerminalAuthority,
     WorktreeWriterLeaseConflict,
     WorktreeWriterLeaseModel,
     _migrate_terminal_worktree_authority_columns,
+    bind_terminal_provider_resume_identity,
     create_flow,
     create_inbox_message,
     create_terminal,
@@ -91,8 +93,106 @@ class TestTerminalOperations:
             "runtime_operation_token",
             "runtime_operation_claimed_at",
             "runtime_operation_expires_at",
+            "provider_resume_identity",
+            "provider_resume_runtime_generation",
         } <= columns
         assert {"canonical_worktree", "terminal_id", "created_at"} <= lease_columns
+
+    def test_runtime_identity_migration_preserves_one_exact_live_codex_binding(
+        self, tmp_path, monkeypatch
+    ):
+        database_file = tmp_path / "legacy-codex-resume.db"
+        identity = "01234567-89ab-cdef-0123-456789abcdef"
+        with sqlite3.connect(database_file) as connection:
+            connection.execute(
+                "CREATE TABLE terminals ("
+                "id TEXT PRIMARY KEY, provider TEXT, runtime_lifecycle TEXT, "
+                "runtime_generation TEXT)"
+            )
+            connection.execute(
+                "CREATE TABLE provider_usage_bindings ("
+                "provider TEXT, provider_session_id TEXT, terminal_id TEXT, source TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO terminals VALUES ('managed', 'codex', 'running', 'generation-1')"
+            )
+            connection.execute(
+                "INSERT INTO provider_usage_bindings VALUES (?, ?, ?, ?)",
+                ("codex", identity, "managed", "live_process_fd_v1"),
+            )
+        monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", database_file)
+
+        assert _migrate_terminal_worktree_authority_columns()
+
+        with sqlite3.connect(database_file) as connection:
+            bound = connection.execute(
+                "SELECT provider_resume_identity, provider_resume_runtime_generation "
+                "FROM terminals WHERE id = 'managed'"
+            ).fetchone()
+        assert bound == (identity, "generation-1")
+
+    def test_runtime_identity_migration_rejects_inexact_or_stale_bindings(
+        self, tmp_path, monkeypatch
+    ):
+        database_file = tmp_path / "legacy-codex-resume-rejected.db"
+        identities = {
+            "multiple": "01234567-89ab-cdef-0123-456789abcdef",
+            "wrong-source": "11234567-89ab-cdef-0123-456789abcdef",
+            "exited": "21234567-89ab-cdef-0123-456789abcdef",
+            "missing-generation": "31234567-89ab-cdef-0123-456789abcdef",
+        }
+        with sqlite3.connect(database_file) as connection:
+            connection.execute(
+                "CREATE TABLE terminals ("
+                "id TEXT PRIMARY KEY, provider TEXT, runtime_lifecycle TEXT, "
+                "runtime_generation TEXT)"
+            )
+            connection.execute(
+                "CREATE TABLE provider_usage_bindings ("
+                "provider TEXT, provider_session_id TEXT, terminal_id TEXT, source TEXT)"
+            )
+            connection.executemany(
+                "INSERT INTO terminals VALUES (?, 'codex', ?, ?)",
+                [
+                    ("multiple", "running", "generation-1"),
+                    ("wrong-source", "running", "generation-1"),
+                    ("exited", "exited", "generation-1"),
+                    ("missing-generation", "running", None),
+                ],
+            )
+            connection.executemany(
+                "INSERT INTO provider_usage_bindings VALUES ('codex', ?, ?, ?)",
+                [
+                    (identities["multiple"], "multiple", "live_process_fd_v1"),
+                    (
+                        "fedcba98-7654-3210-fedc-ba9876543210",
+                        "multiple",
+                        "live_process_fd_v1",
+                    ),
+                    (identities["wrong-source"], "wrong-source", "capture_birth_cwd_v1"),
+                    (identities["exited"], "exited", "live_process_fd_v1"),
+                    (
+                        identities["missing-generation"],
+                        "missing-generation",
+                        "live_process_fd_v1",
+                    ),
+                ],
+            )
+        monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", database_file)
+
+        assert _migrate_terminal_worktree_authority_columns()
+
+        with sqlite3.connect(database_file) as connection:
+            rows = connection.execute(
+                "SELECT id, provider_resume_identity, provider_resume_runtime_generation "
+                "FROM terminals ORDER BY id"
+            ).fetchall()
+        assert rows == [
+            ("exited", None, None),
+            ("missing-generation", None, None),
+            ("multiple", None, None),
+            ("wrong-source", None, None),
+        ]
 
     def test_worktree_authority_migration_backfills_stable_creation_order(
         self, tmp_path, monkeypatch
@@ -243,6 +343,60 @@ class TestTerminalOperations:
         assert lease.canonical_worktree == "/srv/worktree"
         assert lease.terminal_id == "test123"
         mock_session.commit.assert_called_once()
+
+    def test_provider_resume_identity_binds_once_at_exact_ready_generation(
+        self, test_db, monkeypatch
+    ):
+        identity = "01234567-89ab-cdef-0123-456789abcdef"
+        monkeypatch.setattr(database_client, "SessionLocal", test_db)
+        monkeypatch.setattr(database_client, "_terminal_authority_schema_ready", True)
+        monkeypatch.setattr(database_client, "_usage_schema_ready", True)
+        with test_db() as db:
+            db.add(
+                TerminalModel(
+                    id="managed",
+                    tmux_session="cao-managed",
+                    tmux_window="managed",
+                    provider="codex",
+                    runtime_lifecycle="starting",
+                    runtime_generation="generation-1",
+                )
+            )
+            db.commit()
+
+        assert bind_terminal_provider_resume_identity(
+            "managed",
+            provider="codex",
+            resume_identity=identity,
+            runtime_generation="generation-1",
+        )
+        assert bind_terminal_provider_resume_identity(
+            "managed",
+            provider="codex",
+            resume_identity=identity,
+            runtime_generation="generation-1",
+        )
+        assert not bind_terminal_provider_resume_identity(
+            "managed",
+            provider="codex",
+            resume_identity="fedcba98-7654-3210-fedc-ba9876543210",
+            runtime_generation="generation-1",
+        )
+        assert not bind_terminal_provider_resume_identity(
+            "managed",
+            provider="codex",
+            resume_identity=identity,
+            runtime_generation="generation-stale",
+        )
+
+        with test_db() as db:
+            terminal = db.get(TerminalModel, "managed")
+            assert terminal.provider_resume_identity == identity
+            assert terminal.provider_resume_runtime_generation == "generation-1"
+            bindings = db.query(ProviderUsageBindingModel).all()
+            assert [(row.provider_session_id, row.terminal_id, row.source) for row in bindings] == [
+                (identity, "managed", "managed_runtime_ready_v1")
+            ]
 
     def test_writer_lease_is_db_enforced_and_read_only_lane_remains_available(
         self, test_db, monkeypatch

@@ -73,10 +73,19 @@ def test_projection_prioritizes_durable_handoff_relation_for_parent_and_child(mo
 def test_projection_returns_terminal_workflow_authority_over_provider_or_relation(monkeypatch):
     _isolated_db(monkeypatch)
     assert ensure_open_workflow("owner") is not None
-    assert set_workflow_terminal_state("owner", "owner_gate")
+    reason = "Provider reconnect recovery exhausted after three exact attempts."
+    assert set_workflow_terminal_state("owner", "owner_gate", reason=reason)
     owner = get_terminal_workflow_projection("owner")
     assert owner["state"] == "owner_gate"
     assert owner["workflow_status"] == "owner_gate"
+    assert owner["workflow_reason"] == reason
+
+    assert ensure_open_workflow("unexplained-owner") is not None
+    assert set_workflow_terminal_state("unexplained-owner", "owner_gate")
+    unexplained = get_terminal_workflow_projection("unexplained-owner")
+    assert unexplained["state"] is None
+    assert unexplained["workflow_status"] == "owner_gate"
+    assert unexplained["workflow_reason"] is None
 
     assert ensure_open_workflow("completed") is not None
     assert set_workflow_terminal_state("completed", "terminal")

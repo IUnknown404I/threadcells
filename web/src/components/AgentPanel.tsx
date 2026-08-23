@@ -438,7 +438,7 @@ export function AgentPanel({
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 min-w-0">
           <TermIcon size={14} className="text-gray-400" />
           <span className="text-sm font-mono text-gray-300 truncate min-w-0 max-w-full" title={terminal.id}>{terminal.id}</span>
-          <StatusBadge status={terminalBadgeStatus(terminal)} />
+          <StatusBadge status={terminalBadgeStatus(terminal)} workflowReason={terminal.workflow_reason} />
           <span className="text-xs text-gray-500 truncate max-w-full" title={terminal.provider}>{terminal.provider}</span>
           {terminal.agent_profile && <span className="text-xs text-emerald-400 truncate max-w-full" title={terminal.agent_profile}>{terminal.agent_profile}</span>}
           {sessionName && <span className="text-xs text-gray-600 truncate max-w-full" title={sessionDisplayName(sessionName)}>Session: {sessionDisplayName(sessionName)}</span>}

@@ -67,6 +67,7 @@ async function allAgents(): Promise<AgentSummary[]> {
         lifecycle,
         workflow_state: state.workflow_state || null,
         workflow_status: state.workflow_status || null,
+        workflow_reason: state.workflow_reason || null,
         assignment_status: state.assignment_status || null,
         result_status: state.result_status || null,
         delivery_status: state.delivery_status || null,
@@ -116,6 +117,7 @@ async function sessionSummaries(): Promise<SessionSummary[]> {
         execution_state: members[0].execution_state,
         lifecycle: members[0].lifecycle,
         workflow_state: members[0].workflow_state,
+        workflow_reason: members[0].workflow_reason,
       } : null,
       last_agent: members.length ? {
         id: members[members.length - 1].id,
@@ -123,6 +125,7 @@ async function sessionSummaries(): Promise<SessionSummary[]> {
         execution_state: members[members.length - 1].execution_state,
         lifecycle: members[members.length - 1].lifecycle,
         workflow_state: members[members.length - 1].workflow_state,
+        workflow_reason: members[members.length - 1].workflow_reason,
       } : null,
     }
   })

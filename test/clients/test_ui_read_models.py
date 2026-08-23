@@ -6,6 +6,7 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import (
     Base,
+    CapacitySettingsModel,
     ProviderExecutionLeaseModel,
     TerminalModel,
     WorkflowModel,
@@ -153,6 +154,7 @@ def test_home_lifecycle_counts_and_filters_are_mutually_truthful(monkeypatch):
             workflow = WorkflowModel(
                 root_terminal_id=terminal_id,
                 status=workflow_status,
+                terminal_reason=("owner approval required" if terminal_id == "owner" else None),
                 created_at=now,
                 updated_at=now,
             )
@@ -189,6 +191,113 @@ def test_home_lifecycle_counts_and_filters_are_mutually_truthful(monkeypatch):
     assert [item["id"] for item in owner["items"]] == ["owner"]
     assert [item["id"] for item in cancelled["items"]] == ["cancelled"]
     assert [item["id"] for item in completed["items"]] == ["completed"]
+
+
+def test_execution_wait_labels_and_owner_reason_are_exact_durable_mappings(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 8, 21, 8, 0, 0)
+    with database.SessionLocal() as db:
+        db.add(
+            CapacitySettingsModel(
+                id=1,
+                max_resident_supervisors=1,
+                max_provider_executions=1,
+                max_work_contexts=1,
+                max_heavy_execution_slots=1,
+            )
+        )
+        for terminal_id, operation in (
+            ("capacity-holder", None),
+            ("provider-slot", None),
+            ("continuation", None),
+            ("retirement", "retire"),
+            ("owner", None),
+        ):
+            db.add(
+                TerminalModel(
+                    id=terminal_id,
+                    tmux_session="cao-waits",
+                    session_id="lifetime-waits",
+                    tmux_window=terminal_id,
+                    provider="codex",
+                    runtime_lifecycle="running",
+                    runtime_operation_kind=operation,
+                    last_active=now,
+                )
+            )
+            workflow = WorkflowModel(
+                root_terminal_id=terminal_id,
+                status="owner_gate" if terminal_id == "owner" else "open",
+                terminal_reason=(
+                    "provider reconnect recovery exhausted after 3 attempts"
+                    if terminal_id == "owner"
+                    else None
+                ),
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(workflow)
+            db.flush()
+            if terminal_id in {"provider-slot", "continuation"}:
+                db.add(
+                    WorkflowTurnModel(
+                        workflow_id=workflow.id,
+                        kind="continuation",
+                        dedupe_key=f"{terminal_id}-turn",
+                        state="queued",
+                    )
+                )
+            if terminal_id == "capacity-holder":
+                turn = WorkflowTurnModel(
+                    workflow_id=workflow.id,
+                    kind="continuation",
+                    dedupe_key="holder-turn",
+                    state="claimed",
+                )
+                db.add(turn)
+                db.flush()
+                db.add(
+                    ProviderExecutionLeaseModel(
+                        terminal_id=terminal_id,
+                        workflow_turn_id=turn.id,
+                    )
+                )
+        db.commit()
+
+    # Capacity is full for the first snapshot.
+    items = {
+        item["id"]: item for item in ui_read_model_service.list_agent_summaries(limit=20)["items"]
+    }
+    assert items["provider-slot"]["execution_state"] == "queued_provider_execution"
+    assert items["retirement"]["execution_state"] == "waiting_child_retirement"
+    assert items["owner"]["workflow_reason"] == (
+        "provider reconnect recovery exhausted after 3 attempts"
+    )
+
+    # Once the exact provider-capacity barrier clears, queued work is waiting
+    # for workflow continuation, not a provider slot.
+    with database.SessionLocal() as db:
+        db.query(ProviderExecutionLeaseModel).delete()
+        db.commit()
+    items = {
+        item["id"]: item for item in ui_read_model_service.list_agent_summaries(limit=20)["items"]
+    }
+    assert items["provider-slot"]["execution_state"] == "waiting_workflow_continuation"
+    assert items["continuation"]["execution_state"] == "waiting_workflow_continuation"
+
+    # An admitted in-flight workflow turn remains Processing even if a live
+    # provider observation is momentarily Ready while it performs MCP work.
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id="continuation").one()
+        turn = db.query(WorkflowTurnModel).filter_by(workflow_id=workflow.id).one()
+        turn.state = "sent"
+        workflow.active_turn_id = turn.id
+        db.commit()
+    items = {
+        item["id"]: item for item in ui_read_model_service.list_agent_summaries(limit=20)["items"]
+    }
+    assert items["continuation"]["activity"] == "processing"
+    assert items["continuation"]["execution_state"] == "processing"
 
 
 def test_session_lifetime_filter_never_coalesces_reused_tmux_name(monkeypatch):

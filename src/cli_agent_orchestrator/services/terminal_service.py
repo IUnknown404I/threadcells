@@ -19,6 +19,7 @@ Terminal Workflow:
 
 import gzip
 import hashlib
+import hmac
 import logging
 import os
 import secrets
@@ -35,6 +36,7 @@ from cli_agent_orchestrator.clients.database import (
     UnreconciledTerminalAuthority,
     WorktreeWriterLeaseConflict,
     acquire_terminal_runtime_transport,
+    bind_terminal_provider_resume_identity,
     cancel_child_assignments_for_terminal,
     cancel_workflows_for_terminal,
     cancel_workflows_for_terminal_with_ids,
@@ -44,6 +46,7 @@ from cli_agent_orchestrator.clients.database import create_terminal as db_create
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
     get_provider_execution_turn,
+    get_terminal_execution_projection,
     get_terminal_metadata,
     get_terminal_workflow_projection,
     get_workflow_notification_context,
@@ -60,7 +63,6 @@ from cli_agent_orchestrator.clients.database import (
     release_provider_execution,
     release_terminal_runtime_operation,
     replace_starting_terminal_runtime_identity,
-    terminal_has_queued_provider_turn,
     terminal_requires_result_snapshot,
     terminal_runtime_operation_owned,
     update_last_active,
@@ -728,7 +730,7 @@ def _create_terminal_after_admission(
             return instance
 
         try:
-            start_provider()
+            provider_instance = start_provider()
         except CodexStartupNoReadyError as first_error:
             if provider != ProviderType.CODEX.value:
                 raise
@@ -774,12 +776,25 @@ def _create_terminal_after_admission(
                 raise RuntimeError("Could not publish the retry pane launch identity")
             tmux_client.pipe_pane(session_name, window_name, str(log_path))
             try:
-                start_provider()
+                provider_instance = start_provider()
             except Exception as second_error:
                 raise RuntimeError(
                     "Codex startup retry failed; startup output retained at "
                     f"{log_path}: {second_error}"
                 ) from second_error
+
+        if provider == ProviderType.CODEX.value:
+            resolver = getattr(provider_instance, "runtime_sidecar_resume_identity", None)
+            if resolver is None:
+                raise RuntimeError("Codex provider has no launch-time resume identity resolver")
+            resume_identity = resolver()
+            if not bind_terminal_provider_resume_identity(
+                terminal_id,
+                provider=provider,
+                resume_identity=resume_identity,
+                runtime_generation=runtime_generation,
+            ):
+                raise RuntimeError("Could not bind Codex resume identity at readiness")
 
         lifecycle_published = mark_terminal_runtime_running(terminal_id)
         if isinstance(persisted_metadata, dict) and not lifecycle_published:
@@ -1079,7 +1094,7 @@ def provider_runtime_sidecar_reconnect_required(terminal_id: str) -> bool:
 
 
 def provider_runtime_sidecar_resume_identity(terminal_id: str) -> str:
-    """Return the exact provider conversation identity before process exit."""
+    """Capture the exact provider identity at a managed readiness boundary."""
     provider = provider_manager.get_provider(terminal_id)
     resolver = getattr(provider, "runtime_sidecar_resume_identity", None)
     if not resolver:
@@ -1088,6 +1103,17 @@ def provider_runtime_sidecar_resume_identity(terminal_id: str) -> str:
     if not isinstance(identity, str) or not identity:
         raise RuntimeError(f"Provider for terminal '{terminal_id}' has no resume identity")
     return identity
+
+
+def verify_provider_runtime_sidecar_resume_identity(terminal_id: str, resume_identity: str) -> None:
+    """Prove the persisted identity still belongs to the foreground runtime."""
+    provider = provider_manager.get_provider(terminal_id)
+    resolver = getattr(provider, "runtime_sidecar_resume_identity", None)
+    if not resolver:
+        raise RuntimeError(f"Provider for terminal '{terminal_id}' cannot prove resume identity")
+    verified = resolver(expected_identity=resume_identity)
+    if not isinstance(verified, str) or not hmac.compare_digest(verified, resume_identity):
+        raise RuntimeError(f"Provider for terminal '{terminal_id}' has stale resume identity")
 
 
 def request_provider_runtime_sidecar_reconnect(
@@ -1212,6 +1238,29 @@ def get_terminal(terminal_id: str) -> Dict:
             ):
                 _wake_queued_provider_execution()
         workflow = get_terminal_workflow_projection(terminal_id)
+        execution = get_terminal_execution_projection(terminal_id)
+        wait_reason = execution["wait_reason"]
+        execution_state = (
+            "exited"
+            if lifecycle == "exited"
+            else (
+                "processing"
+                if status == TerminalStatus.PROCESSING.value or execution["active_turn"]
+                else (
+                    "queued_provider_execution"
+                    if wait_reason == "provider_capacity"
+                    else (
+                        "waiting_child_retirement"
+                        if wait_reason == "child_retirement"
+                        else (
+                            "waiting_workflow_continuation"
+                            if wait_reason == "workflow_continuation"
+                            else "ready"
+                        )
+                    )
+                )
+            )
+        )
 
         return {
             "id": metadata["id"],
@@ -1221,14 +1270,12 @@ def get_terminal(terminal_id: str) -> Dict:
             "agent_profile": metadata["agent_profile"],
             "allowed_tools": metadata.get("allowed_tools"),
             "status": status,
-            "execution_state": (
-                "queued_provider_execution"
-                if terminal_has_queued_provider_turn(terminal_id)
-                else ("processing" if status == TerminalStatus.PROCESSING.value else "ready")
-            ),
+            "execution_state": execution_state,
+            "execution_wait_reason": wait_reason,
             "lifecycle": lifecycle,
             "workflow_state": workflow["state"],
             "workflow_status": workflow["workflow_status"],
+            "workflow_reason": workflow.get("workflow_reason"),
             "assignment_status": workflow["assignment_status"],
             "result_status": workflow["result_status"],
             "delivery_status": workflow["delivery_status"],

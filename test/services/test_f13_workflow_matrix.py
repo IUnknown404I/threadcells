@@ -84,6 +84,9 @@ from cli_agent_orchestrator.services.inbox_service import (
 )
 from cli_agent_orchestrator.services.terminal_service import ExitTerminalResult
 
+TEST_CODEX_RESUME_IDENTITY = "01234567-89ab-cdef-0123-456789abcdef"
+TEST_TERMINAL_RUNTIME_GENERATION = "terminal-runtime-generation"
+
 
 @pytest.fixture
 def workflow_db(monkeypatch, tmp_path):
@@ -95,7 +98,7 @@ def workflow_db(monkeypatch, tmp_path):
     Base.metadata.create_all(bind=engine)
     monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
     monkeypatch.setattr(database, "_child_assignment_schema_ready", True)
-    yield
+    yield engine
     engine.dispose()
 
 
@@ -129,6 +132,9 @@ def _start_admitted_input(root: str) -> int:
                     tmux_window="owner-0000",
                     provider="codex",
                     runtime_lifecycle="running",
+                    runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
+                    provider_resume_identity=TEST_CODEX_RESUME_IDENTITY,
+                    provider_resume_runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
                 )
             )
             db.commit()
@@ -1487,8 +1493,6 @@ def test_f13_stale_sidecar_requests_one_retryable_context_reinitialization(
         False,
         False,
     ]
-    mock_terminal.provider_runtime_sidecar_resume_identity.return_value = "resume-exact"
-
     request_attempts = []
 
     def reconnect_request(
@@ -1505,7 +1509,7 @@ def test_f13_stale_sidecar_requests_one_retryable_context_reinitialization(
         request_attempts.append(attempt_token)
         assert terminal_id == root
         assert turn_id == reconnect_turn_id
-        assert resume_identity == "resume-exact"
+        assert resume_identity == TEST_CODEX_RESUME_IDENTITY
         assert registry is None
         assert attempt_state == "reserved"
         if len(request_attempts) == 1:
@@ -1538,7 +1542,10 @@ def test_f13_stale_sidecar_requests_one_retryable_context_reinitialization(
     assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=1)) is False
     assert mock_terminal.request_provider_runtime_sidecar_reconnect.call_count == 2
     assert request_attempts[0] != request_attempts[1]
-    mock_terminal.provider_runtime_sidecar_resume_identity.assert_called_once_with(root)
+    assert mock_terminal.verify_provider_runtime_sidecar_resume_identity.call_count == 2
+    mock_terminal.verify_provider_runtime_sidecar_resume_identity.assert_called_with(
+        root, TEST_CODEX_RESUME_IDENTITY
+    )
     assert get_workflow_status(root) == "open"
     with database.SessionLocal() as db:
         attempts = (
@@ -1576,14 +1583,15 @@ def test_f13_concurrent_sidecar_reconnect_claims_admit_one_control_input(workflo
     assert len(admitted) == 1
     assert admitted[0]["turn_id"] == reconnect_turn_id
     assert admitted[0]["claimed_at"] == now
-    assert admitted[0]["resume_identity"] is None
+    assert admitted[0]["resume_identity"] == TEST_CODEX_RESUME_IDENTITY
+    assert admitted[0]["resume_identity_authoritative"] is True
     assert len(admitted[0]["claim_token"]) == 32
     assert len(admitted[0]["attempt_token"]) == 32
     assert admitted[0]["attempt_number"] == 1
     assert admitted[0]["attempt_state"] == "reserved"
 
 
-def test_f13_reconnect_identity_is_durable_and_cannot_be_replaced(workflow_db):
+def test_f13_service_restart_preserves_authoritative_reconnect_identity(workflow_db):
     root = "root-sidecar-resume-identity"
     reconnect_turn_id = _start_admitted_input(root)
     now = datetime(2026, 8, 22, 12, 45, 0)
@@ -1591,10 +1599,11 @@ def test_f13_reconnect_identity_is_durable_and_cannot_be_replaced(workflow_db):
     assert claimed is not None
     assert claimed["turn_id"] == reconnect_turn_id
     assert claimed["claimed_at"] == now
-    assert claimed["resume_identity"] is None
+    assert claimed["resume_identity"] == TEST_CODEX_RESUME_IDENTITY
+    assert claimed["resume_identity_authoritative"] is True
     original_token = claimed["claim_token"]
     attempt_token = claimed["attempt_token"]
-    identity = "01234567-89ab-cdef-0123-456789abcdef"
+    identity = TEST_CODEX_RESUME_IDENTITY
     assert database.persist_workflow_provider_reconnect_identity(
         root, reconnect_turn_id, original_token, attempt_token, identity
     )
@@ -1613,7 +1622,9 @@ def test_f13_reconnect_identity_is_durable_and_cannot_be_replaced(workflow_db):
     )
     assert database.claim_workflow_provider_reconnect(root, now=now + timedelta(seconds=31)) is None
     # A failed side effect leaves the lease and identity intact. Once its
-    # bounded lease expires, a service-restart retry reclaims the exact ID.
+    # bounded lease expires, a service restart opens a fresh DB connection and
+    # reclaims the exact launch-bound ID.
+    workflow_db.dispose()
     reclaimed = database.claim_workflow_provider_reconnect(root, now=now + timedelta(seconds=41))
     assert reclaimed is not None
     assert reclaimed["turn_id"] == reconnect_turn_id
@@ -1667,6 +1678,72 @@ def test_f13_reconnect_identity_is_durable_and_cannot_be_replaced(workflow_db):
         root, reconnect_turn_id, reclaimed["claim_token"], attempt_token
     )
     assert not database.workflow_provider_reconnect_pending(root)
+
+
+@patch("cli_agent_orchestrator.services.workflow_service.terminal_service")
+def test_f13_wrong_persisted_resume_identity_fails_before_provider_dispatch(
+    mock_terminal, workflow_db
+):
+    root = "root-sidecar-wrong-persisted-identity"
+    _start_admitted_input(root)
+    wrong_identity = "fedcba98-7654-3210-fedc-ba9876543210"
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, root)
+        terminal.provider_resume_identity = wrong_identity
+        db.commit()
+    mock_terminal.get_terminal.return_value = {
+        "status": TerminalStatus.COMPLETED.value,
+        "lifecycle": "running",
+    }
+    mock_terminal.provider_runtime_sidecar_reconnect_required.return_value = True
+    mock_terminal.verify_provider_runtime_sidecar_resume_identity.side_effect = RuntimeError(
+        "persisted identity is not owned by the foreground runtime"
+    )
+
+    assert workflow_service.reconcile_root_workflow(root) is False
+
+    mock_terminal.verify_provider_runtime_sidecar_resume_identity.assert_called_once_with(
+        root, wrong_identity
+    )
+    mock_terminal.request_provider_runtime_sidecar_reconnect.assert_not_called()
+    with database.SessionLocal() as db:
+        attempt = db.query(WorkflowProviderReconnectAttemptModel).one()
+        assert attempt.resume_identity == wrong_identity
+        assert attempt.state == "failed"
+        assert attempt.launched_at is None
+
+
+@patch("cli_agent_orchestrator.services.workflow_service.terminal_service")
+def test_f13_missing_launch_identity_exhausts_without_any_provider_launch(
+    mock_terminal, workflow_db
+):
+    root = "root-sidecar-missing-launch-identity"
+    _start_admitted_input(root)
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, root)
+        terminal.provider_resume_identity = None
+        terminal.provider_resume_runtime_generation = None
+        db.commit()
+    mock_terminal.get_terminal.return_value = {
+        "status": TerminalStatus.COMPLETED.value,
+        "lifecycle": "running",
+    }
+    mock_terminal.provider_runtime_sidecar_reconnect_required.return_value = True
+
+    for offset in range(3):
+        assert (
+            workflow_service.reconcile_root_workflow(root, now=datetime(2026, 8, 22, 13, 0, offset))
+            is False
+        )
+
+    assert get_workflow_status(root) == "owner_gate"
+    mock_terminal.verify_provider_runtime_sidecar_resume_identity.assert_not_called()
+    mock_terminal.request_provider_runtime_sidecar_reconnect.assert_not_called()
+    with database.SessionLocal() as db:
+        attempts = db.query(WorkflowProviderReconnectAttemptModel).all()
+        assert len(attempts) == 3
+        assert all(attempt.state == "failed" for attempt in attempts)
+        assert all(attempt.launched_at is None for attempt in attempts)
 
 
 def test_f13_reconnect_runtime_generation_mismatch_fails_closed(workflow_db):

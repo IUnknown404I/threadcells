@@ -547,8 +547,15 @@ describe('session creation and canonical ordering', () => {
 
     const header = await screen.findByTestId('session-header-cao-summary')
     const summary = screen.getByLabelText('Session status')
+    const layoutControls = within(summary).getByRole('group', { name: 'Agent layout' })
     const list = within(summary).getByRole('button', { name: 'List view' })
     const grid = within(summary).getByRole('button', { name: 'Grid view' })
+
+    expect(header).toHaveClass('grid', 'grid-cols-[minmax(0,1fr)_auto]', 'sm:grid-cols-[minmax(0,1fr)_auto_auto]')
+    expect(within(header).getByTestId('session-title-row-cao-summary')).toHaveClass('col-span-2', 'sm:col-span-1')
+    expect(within(header).getByTestId('session-metadata-cao-summary')).toContainElement(within(header).getByText('2 agents'))
+    expect(within(header).getByTestId('session-actions-cao-summary')).toContainElement(within(header).getByRole('button', { name: 'Delete summary' }))
+    expect(layoutControls).toHaveClass('hidden', 'sm:inline-flex')
 
     fireEvent.click(within(header).getByRole('button', { name: 'Expand summary' }))
     expect(await within(header).findByRole('button', { name: 'Collapse summary' })).toBeInTheDocument()
@@ -560,7 +567,7 @@ describe('session creation and canonical ordering', () => {
 
     fireEvent.click(grid)
     expect(grid).toHaveAttribute('aria-pressed', 'true')
-    expect(screen.getByTestId('session-agent-container')).toHaveClass('grid')
+    expect(screen.getByTestId('session-agent-container')).toHaveClass('space-y-2', 'sm:grid', 'lg:grid-cols-2')
 
     fireEvent.click(within(header).getByRole('button', { name: 'Delete summary' }))
     expect(screen.getByRole('heading', { name: 'Delete Session' })).toBeInTheDocument()

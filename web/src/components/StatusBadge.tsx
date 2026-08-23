@@ -10,7 +10,10 @@ export function lifecycleBadgeStatus(
   if (!workflowState) return providerStatus || 'unknown'
   const provider = providerLifecycle === 'exited'
     ? 'Exited'
-    : executionState === 'queued_provider_execution' ? 'Queued'
+    : executionState === 'processing' ? 'Processing'
+    : executionState === 'queued_provider_execution' ? 'WaitingProviderSlot'
+    : executionState === 'waiting_child_retirement' ? 'WaitingChildRetirement'
+    : executionState === 'waiting_workflow_continuation' ? 'WaitingWorkflowContinuation'
     : providerStatus === 'processing' ? 'Processing' : 'Ready'
   return `WORKFLOW_${workflowState.toUpperCase()}::${provider}`
 }
@@ -53,11 +56,14 @@ const STATUS_CONFIG: Record<string, StatusStyle> = {
     pulse: true,
   },
   QUEUED: {
-    label: 'Queued · Waiting for provider slot',
+    label: 'Queued',
     dotClass: 'bg-amber-400',
     bgClass: 'bg-amber-400/10',
     textClass: 'text-amber-400',
   },
+  WAITINGPROVIDERSLOT: { label: 'Queued · Waiting for provider slot', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
+  WAITINGCHILDRETIREMENT: { label: 'Queued · Waiting for child retirement', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
+  WAITINGWORKFLOWCONTINUATION: { label: 'Queued · Waiting for workflow continuation', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
   READY: {
     label: 'Ready',
     dotClass: 'bg-emerald-400',
@@ -103,21 +109,22 @@ const UNKNOWN_CONFIG: StatusStyle = {
   textClass: 'text-gray-500',
 }
 
-export function StatusBadge({ status, workflowState }: { status: TerminalStatus, workflowState?: string | null }) {
+export function StatusBadge({ status, workflowState, workflowReason }: { status: TerminalStatus, workflowState?: string | null, workflowReason?: string | null }) {
   const [storedPrimary, providerDiagnostic] = typeof status === 'string' ? status.split('::', 2) : [status, undefined]
   const normalized = workflowState ? `WORKFLOW_${workflowState.toUpperCase()}` : (storedPrimary ? storedPrimary.toUpperCase() : null)
   const config = (normalized && STATUS_CONFIG[normalized]) || UNKNOWN_CONFIG
 
   if (normalized?.startsWith('WORKFLOW_') && providerDiagnostic) {
     const activity = providerDiagnostic.toUpperCase()
-    const activityConfig = activity === 'PROCESSING' ? STATUS_CONFIG.PROCESSING : activity === 'QUEUED' ? STATUS_CONFIG.QUEUED : activity === 'EXITED' ? { ...STATUS_CONFIG.COMPLETED, label: 'Exited' } : { ...STATUS_CONFIG.IDLE, label: 'Ready' }
-    return <span className="inline-flex flex-wrap items-center gap-1.5"><span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full ${activityConfig.bgClass}`}><span className={`w-2 h-2 rounded-full ${activityConfig.dotClass} ${activityConfig.pulse ? 'animate-pulse' : ''}`} /><span className={`text-xs font-medium ${activityConfig.textClass}`}>{activityConfig.label}</span></span><span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full ${config.bgClass} ${config.textClass}`}><span className="text-[10px]">Workflow ·</span><span className="text-xs font-medium">{config.label}</span></span></span>
+    const activityConfig = activity === 'PROCESSING' ? STATUS_CONFIG.PROCESSING : activity === 'QUEUED' ? STATUS_CONFIG.QUEUED : activity === 'EXITED' ? { ...STATUS_CONFIG.COMPLETED, label: 'Exited' } : STATUS_CONFIG[activity] || { ...STATUS_CONFIG.IDLE, label: 'Ready' }
+    return <span className="inline-flex flex-wrap items-center gap-1.5"><span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full ${activityConfig.bgClass}`}><span className={`w-2 h-2 rounded-full ${activityConfig.dotClass} ${activityConfig.pulse ? 'animate-pulse' : ''}`} /><span className={`text-xs font-medium ${activityConfig.textClass}`}>{activityConfig.label}</span></span><span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full ${config.bgClass} ${config.textClass}`}><span className="text-[10px]">Workflow ·</span><span className="text-xs font-medium">{config.label}</span>{normalized === 'WORKFLOW_OWNER_GATE' && workflowReason && <span className="max-w-xl text-xs">· {workflowReason}</span>}</span></span>
   }
 
   return (
     <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full ${config.bgClass}`}>
       <span className={`w-2 h-2 rounded-full ${config.dotClass} ${config.pulse ? 'animate-pulse' : ''}`} />
       <span className={`text-xs font-medium ${config.textClass}`}>{config.label}</span>
+      {normalized === 'WORKFLOW_OWNER_GATE' && workflowReason && <span className={`max-w-xl text-xs ${config.textClass}`}>· {workflowReason}</span>}
       {providerDiagnostic && <span className="text-[10px] text-gray-500">Provider {providerDiagnostic}</span>}
     </span>
   )

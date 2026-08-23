@@ -26,7 +26,6 @@ from cli_agent_orchestrator.clients.database import (
     observe_workflow_final,
     observe_workflow_processing,
     observe_workflow_ready,
-    persist_workflow_provider_reconnect_identity,
     prepare_workflow_input,
     renew_workflow_provider_reconnect,
     renew_workflow_turn_claim,
@@ -42,6 +41,12 @@ from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.services import terminal_service
 
 logger = logging.getLogger(__name__)
+
+
+class ProviderResumeIdentityUnavailable(RuntimeError):
+    """Reconnect has no launch-bound identity it can safely resume."""
+
+    reconnect_outcome_code = "resume_identity_unavailable_or_unproven"
 
 
 class _WorkflowTurnClaimHeartbeat:
@@ -253,18 +258,17 @@ def reconcile_root_workflow(
                     return renewed
 
                 resume_identity = reconnect["resume_identity"]
-                if resume_identity is None:
-                    resume_identity = terminal_service.provider_runtime_sidecar_resume_identity(
-                        root_terminal_id
+                if (
+                    not resume_identity
+                    or reconnect.get("resume_identity_authoritative") is not True
+                ):
+                    raise ProviderResumeIdentityUnavailable(
+                        "provider reconnect has no authoritative launch-bound identity"
                     )
-                    if not persist_workflow_provider_reconnect_identity(
-                        root_terminal_id,
-                        reconnect["turn_id"],
-                        reconnect["claim_token"],
-                        reconnect["attempt_token"],
-                        resume_identity,
-                    ):
-                        raise RuntimeError("provider reconnect identity lost admission")
+                if reconnect["attempt_state"] == "reserved":
+                    terminal_service.verify_provider_runtime_sidecar_resume_identity(
+                        root_terminal_id, resume_identity
+                    )
                 terminal_service.request_provider_runtime_sidecar_reconnect(
                     root_terminal_id,
                     reconnect["turn_id"],

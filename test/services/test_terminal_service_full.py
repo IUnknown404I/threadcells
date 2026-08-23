@@ -1120,6 +1120,9 @@ class TestCodexStartupReliability:
         first_provider = MagicMock()
         first_provider.initialize.side_effect = CodexStartupNoReadyError("no ready", "attempt one")
         second_provider = MagicMock()
+        second_provider.runtime_sidecar_resume_identity.return_value = (
+            "01234567-89ab-cdef-0123-456789abcdef"
+        )
         mock_provider_manager.create_provider.side_effect = [first_provider, second_provider]
         mock_log_path = MagicMock()
         mock_log_dir.__truediv__.return_value = mock_log_path
@@ -1131,7 +1134,11 @@ class TestCodexStartupReliability:
         )[1]
         second_provider.initialize.side_effect = lambda: call_order.append("second_initialize")
 
-        result = create_terminal("codex", "supervisor", new_session=True)
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service.bind_terminal_provider_resume_identity",
+            return_value=True,
+        ) as bind_identity:
+            result = create_terminal("codex", "supervisor", new_session=True)
 
         assert result.name == "supervisor-retry"
         assert call_order == ["pipe", "first_initialize", "pipe", "second_initialize"]
@@ -1139,6 +1146,7 @@ class TestCodexStartupReliability:
         mock_tmux.kill_session.assert_called_once_with("cao-retry")
         assert mock_tmux.kill_window.call_count == 0
         assert mock_provider_manager.create_provider.call_count == 2
+        bind_identity.assert_called_once()
         mock_log_path.touch.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
@@ -1302,6 +1310,10 @@ class TestCodexStartupReliability:
         with pytest.raises(ValueError, match="already exists"):
             create_terminal("kiro_cli", "developer", session_name="cao-existing", new_session=True)
 
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.bind_terminal_provider_resume_identity",
+        return_value=True,
+    )
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
@@ -1322,6 +1334,7 @@ class TestCodexStartupReliability:
         mock_db_create,
         mock_provider_manager,
         mock_log_dir,
+        mock_bind_resume_identity,
     ):
         """Providers that consume runtime prompts should receive the global skill catalog."""
         mock_gen_id.return_value = "test1234"
@@ -1343,6 +1356,9 @@ class TestCodexStartupReliability:
             "- **python-testing**: Pytest conventions"
         )
         mock_provider = MagicMock()
+        mock_provider.runtime_sidecar_resume_identity.return_value = (
+            "01234567-89ab-cdef-0123-456789abcdef"
+        )
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_log_path = MagicMock()
         mock_log_dir.__truediv__.return_value = mock_log_path
@@ -1359,7 +1375,12 @@ class TestCodexStartupReliability:
             "- **cao-worker-protocols**: Worker communication\n"
             "- **python-testing**: Pytest conventions"
         )
+        mock_bind_resume_identity.assert_called_once()
 
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.bind_terminal_provider_resume_identity",
+        return_value=True,
+    )
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.db_create_terminal")
@@ -1380,6 +1401,7 @@ class TestCodexStartupReliability:
         mock_db_create,
         mock_provider_manager,
         mock_log_dir,
+        _mock_bind_resume_identity,
     ):
         """Providers should receive an empty skill prompt when no skills are installed."""
         mock_gen_id.return_value = "test1234"
@@ -1393,6 +1415,9 @@ class TestCodexStartupReliability:
         )
         mock_build_skill_catalog.return_value = ""
         mock_provider = MagicMock()
+        mock_provider.runtime_sidecar_resume_identity.return_value = (
+            "01234567-89ab-cdef-0123-456789abcdef"
+        )
         mock_provider_manager.create_provider.return_value = mock_provider
         mock_log_path = MagicMock()
         mock_log_dir.__truediv__.return_value = mock_log_path
@@ -1656,6 +1681,58 @@ class TestGetTerminal:
 
         release.assert_called_once_with("test1234", 77)
         wake.assert_called_once_with()
+
+    def test_get_terminal_reports_processing_for_active_turn_when_provider_is_ready(self):
+        metadata = {
+            "id": "11a094aa",
+            "tmux_window": "conductor",
+            "provider": "codex",
+            "tmux_session": "cao-session",
+            "agent_profile": "supervisor",
+            "last_active": datetime.now(),
+        }
+        projection = {
+            "state": "active",
+            "workflow_status": "open",
+            "workflow_reason": None,
+            "assignment_status": None,
+            "result_status": None,
+            "delivery_status": None,
+        }
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.IDLE
+        provider.is_process_alive.return_value = True
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_workflow_projection",
+                return_value=projection,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_execution_projection",
+                return_value={"active_turn": True, "wait_reason": None},
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_provider_execution_turn",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.reconcile_terminal_runtime",
+                return_value=False,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.provider_manager.get_provider",
+                return_value=provider,
+            ),
+        ):
+            terminal = get_terminal("11a094aa")
+
+        assert terminal["status"] == TerminalStatus.IDLE.value
+        assert terminal["execution_state"] == "processing"
+        assert terminal["execution_wait_reason"] is None
 
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_workflow_projection")

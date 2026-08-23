@@ -77,6 +77,7 @@ def _public_agent_summary(terminal: Dict[str, Any]) -> Dict[str, Any]:
         "lifecycle",
         "workflow_state",
         "workflow_status",
+        "workflow_reason",
         "assignment_status",
         "result_status",
         "delivery_status",

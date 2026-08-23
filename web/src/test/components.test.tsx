@@ -75,6 +75,38 @@ describe('StatusBadge', () => {
   })
 
   it.each([
+    ['waiting_child_retirement', 'Queued · Waiting for child retirement'],
+    ['waiting_workflow_continuation', 'Queued · Waiting for workflow continuation'],
+  ])('renders the exact durable wait mapping %s', (executionState, label) => {
+    render(
+      <StatusBadge
+        status={lifecycleBadgeStatus('open', 'completed', 'running', executionState)}
+      />
+    )
+    expect(screen.getByText(label)).toBeInTheDocument()
+  })
+
+  it('renders the concrete durable owner-gate reason', () => {
+    render(
+      <StatusBadge
+        status="WORKFLOW_OWNER_GATE::Ready"
+        workflowReason="provider reconnect recovery exhausted after 3 attempts"
+      />
+    )
+    expect(screen.getByText(/provider reconnect recovery exhausted after 3 attempts/)).toBeInTheDocument()
+  })
+
+  it('uses an active durable turn to override a momentary provider Ready observation', () => {
+    render(
+      <StatusBadge
+        status={lifecycleBadgeStatus('open', 'completed', 'running', 'processing')}
+      />
+    )
+    expect(screen.getByText('Processing')).toBeInTheDocument()
+    expect(screen.queryByText('Ready')).not.toBeInTheDocument()
+  })
+
+  it.each([
     [{ status: 'completed', lifecycle: 'running', workflow_state: 'open' }, 'Ready', 'Open'],
     [{ status: 'processing', lifecycle: 'running', workflow_state: 'open' }, 'Processing', 'Open'],
     [{ status: 'completed', lifecycle: 'running', workflow_state: 'owner_gate' }, 'Ready', 'Needs owner decision'],

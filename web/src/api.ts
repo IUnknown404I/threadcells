@@ -109,6 +109,7 @@ export interface SessionBoundaryAgent {
   execution_state: string | null
   lifecycle: string | null
   workflow_state: string | null
+  workflow_reason: string | null
 }
 
 export interface AgentSummary {
@@ -123,6 +124,7 @@ export interface AgentSummary {
   lifecycle: string | null
   workflow_state: string | null
   workflow_status: string | null
+  workflow_reason: string | null
   assignment_status: string | null
   result_status: string | null
   delivery_status: string | null
@@ -157,10 +159,12 @@ export interface Terminal {
   session_name: string
   agent_profile: string | null
   status: string | null
-  execution_state?: 'ready' | 'processing' | 'queued_provider_execution' | null
+  execution_state?: 'ready' | 'processing' | 'queued_provider_execution' | 'waiting_child_retirement' | 'waiting_workflow_continuation' | 'exited' | null
+  execution_wait_reason?: 'provider_capacity' | 'child_retirement' | 'workflow_continuation' | null
   lifecycle?: 'running' | 'exited' | null
   workflow_state?: 'open' | 'active' | 'waiting' | 'recoverable' | 'result_ready' | 'owner_gate' | 'completed' | 'incomplete' | 'failed' | 'cancelled' | null
   workflow_status?: string | null
+  workflow_reason?: string | null
   assignment_status?: string | null
   result_status?: string | null
   delivery_status?: string | null

@@ -71,6 +71,10 @@ The `0.1.0-alpha.2` technical preview supports a single Ubuntu/Debian Linux host
 
 **What should I review before distribution?** Treat the candidate manifest, checksums, SBOM, dependency review, branding provenance, security policy, and release evidence as review inputs—not publication approval.
 
+## Issues & contributing
+
+Use the curated [GitHub Issues](https://github.com/IUnknown404I/threadcells/issues) backlog for actionable public project work. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the quick routes, [the canonical Issue policy](docs/ISSUES.md) for eligibility and triage, and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
+
 ## Maintainer
 
 Created and maintained by [Subaev Ruslan](https://github.com/IUnknown404I), with contributions from the ThreadCells community.

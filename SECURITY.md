@@ -4,11 +4,13 @@
 
 ThreadCells is a technical preview for one trusted Linux host. Keep it bound to loopback and use an SSH tunnel for remote access. Native coding agents can execute powerful commands. Profiles, worktrees, and local controls are operational safeguards, not a security sandbox or a hostile multi-tenant boundary.
 
-The ordinary web UI and its Docs reader do not implement user authentication or authorization. Do not expose either beyond loopback. Designing an authorization boundary, configuring a reverse proxy, or enabling non-loopback access requires an explicit owner decision.
+The ordinary Web UI and Docs reader do not implement user authentication or authorization. Do not expose either beyond loopback. Designing an authorization boundary, configuring a reverse proxy, or enabling non-loopback access requires an explicit owner decision.
 
-## Reporting
+## Report vulnerabilities privately
 
-There is no owner-approved public vulnerability-reporting contact for this preview. Do not post vulnerabilities, credentials, private paths, state databases, or terminal transcripts in public issues. A private reporting channel and response policy must be approved before publication.
+Do not file vulnerabilities or security-sensitive reports as ordinary public Issues. Use GitHub's [private vulnerability reporting form](https://github.com/IUnknown404I/threadcells/security/advisories/new) for this repository.
+
+Include only the information needed to understand and reproduce the problem. Do not put credentials, private infrastructure details, operational secrets, personal data, state databases, or unrelated exploit material in public comments, pull requests, screenshots, or logs. If a credential may have been disclosed, rotate it through its owning service rather than attaching it to a report.
 
 ## Evidence and review
 

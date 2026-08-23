@@ -1,59 +1,26 @@
-# Contributing Guidelines
+# Contributing to ThreadCells
 
-Thank you for your interest in contributing to our project. Whether it's a bug report, new feature, correction, or additional
-documentation, we greatly value feedback and contributions from our community.
+Thanks for helping improve ThreadCells. Reports and pull requests are welcome when they are focused, actionable, and safe to discuss publicly.
 
-Please read through this document before submitting any issues or pull requests to ensure we have all the necessary
-information to effectively respond to your bug report or contribution.
+## Choose the right route
 
+- **Bug:** use the [bug report form](https://github.com/IUnknown404I/threadcells/issues/new?template=bug.yml) with reproduction steps or durable evidence.
+- **Enhancement:** use the [feature request form](https://github.com/IUnknown404I/threadcells/issues/new?template=feature.yml) and start with the problem or use case.
+- **Documentation:** use the [documentation report form](https://github.com/IUnknown404I/threadcells/issues/new?template=docs.yml) for missing, stale, or unclear public guidance.
+- **General questions:** check the [documentation](https://iunknown404i.github.io/threadcells/docs/) and [Troubleshooting](docs/TROUBLESHOOTING.md) first. This preview does not currently have a general-support forum; open an Issue only when the question identifies an actionable product or documentation problem.
+- **Security:** do not open a public Issue. Follow [SECURITY.md](SECURITY.md) and report privately.
 
-## Reporting Bugs/Feature Requests
+Search both open and closed [Issues](https://github.com/IUnknown404I/threadcells/issues) before submitting a report. The detailed eligibility, evidence, triage, and disclosure rules are in the canonical [Issue policy](docs/ISSUES.md).
 
-We welcome you to use the GitHub issue tracker to report bugs or suggest features.
+## Pull requests
 
-When filing an issue, please check existing open, or recently closed, issues to make sure somebody else hasn't already
-reported the issue. Please try to include as much information as you can. Details like these are incredibly useful:
+Before opening a pull request:
 
-* A reproducible test case or series of steps
-* The version of our code being used
-* Any modifications you've made relevant to the bug
-* Anything unusual about your environment or deployment
+1. Start from the latest `main` and check for overlapping Issues and pull requests.
+2. Keep the change bounded; discuss significant work in an Issue first.
+3. Add or update focused tests and documentation where behavior changes.
+4. Run the relevant local checks and list their outcomes in the pull request.
+5. Do not include credentials, private paths, personal data, production state, or terminal transcripts.
+6. Use a clear commit message and respond to review and CI feedback.
 
-
-## Contributing via Pull Requests
-Contributions via pull requests are much appreciated. Before sending us a pull request, please ensure that:
-
-1. You are working against the latest source on the *main* branch.
-2. You check existing open, and recently merged, pull requests to make sure someone else hasn't addressed the problem already.
-3. You open an issue to discuss any significant work - we would hate for your time to be wasted.
-
-To send us a pull request, please:
-
-1. Fork the repository.
-2. Modify the source; please focus on the specific change you are contributing. If you also reformat all the code, it will be hard for us to focus on your change.
-3. Ensure local tests pass.
-4. Commit to your fork using clear commit messages.
-5. Send us a pull request, answering any default questions in the pull request interface.
-6. Pay attention to any automated CI failures reported in the pull request, and stay involved in the conversation.
-
-GitHub provides additional document on [forking a repository](https://help.github.com/articles/fork-a-repo/) and
-[creating a pull request](https://help.github.com/articles/creating-a-pull-request/).
-
-
-## Finding contributions to work on
-Looking at the existing issues is a great way to find something to contribute on. As our projects, by default, use the default GitHub issue labels (enhancement/bug/duplicate/help wanted/invalid/question/wontfix), looking at any 'help wanted' issues is a great place to start.
-
-
-## Code of Conduct
-
-ThreadCells is an independent technical preview. Please keep discussions respectful and limit public reports to information that is safe to disclose. The retained [Amazon Open Source Code of Conduct](https://aws.github.io/code-of-conduct) is upstream attribution only; it is not a ThreadCells conduct, support, or reporting contact.
-
-
-## Security issue notifications
-
-There is no public vulnerability-reporting contact for this ThreadCells technical preview. Do not disclose vulnerabilities, credentials, personal data, private paths, state databases, or terminal transcripts in public issues or pull requests. Publishing a private security contact and response process is owner-gated; do not infer or substitute a contact from upstream materials.
-
-
-## Licensing
-
-See the [LICENSE](LICENSE) file for our project's licensing. We will ask you to confirm the licensing of your contribution.
+ThreadCells is an independent technical preview. Keep public collaboration respectful and limited to information that is safe to disclose. See [LICENSE](LICENSE) for contribution licensing.

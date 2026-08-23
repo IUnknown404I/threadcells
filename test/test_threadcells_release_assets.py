@@ -185,9 +185,10 @@ def test_docs_bundle_renders_canonical_navigation(tmp_path: Path) -> None:
         "statistics",
         "deployment",
         "release-process",
+        "issues",
     } <= documents.keys()
     assert "owner-decisions" not in documents
-    assert len(documents) == 30
+    assert len(documents) == 31
     assert "](/docs/getting-started)" in documents["installation"]["markdown"]
     assert "](/media/screenshots/threadcells-home.webp)" in documents["web-ui"]["markdown"]
     assert (

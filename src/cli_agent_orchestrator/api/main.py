@@ -2,6 +2,7 @@
 
 import asyncio
 import fcntl
+import hmac
 import json
 import logging
 import os
@@ -50,6 +51,7 @@ from cli_agent_orchestrator.clients.database import (
     release_terminal_runtime_operation,
     resolve_workflow_input_binding,
     submit_handoff_result_v1,
+    terminal_auth_token_matches,
 )
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
@@ -73,7 +75,10 @@ from cli_agent_orchestrator.providers.contracts import (
     provider_preflight_is_launchable,
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
-from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
+from cli_agent_orchestrator.runtime_generation import (
+    ACTIVE_RUNTIME_GENERATION,
+    RUNTIME_GENERATION_HEADER,
+)
 from cli_agent_orchestrator.services import (
     branding_service,
     flow_service,
@@ -371,6 +376,18 @@ class HandoffResultV1SubmitRequest(BaseModel):
 
     logical_turn_id: int
     document: HandoffResultDocumentV1
+
+
+class CodexSessionIdentityRequest(BaseModel):
+    """Exact provider-native identity emitted by managed Codex SessionStart."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    session_id: str = Field(pattern=r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
+    transcript_path: str
+    cwd: str
+    source: Literal["startup", "resume"]
+    runtime_generation: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class CreateFlowRequest(BaseModel):
@@ -1916,6 +1933,48 @@ async def submit_handoff_result_v1_endpoint(
         return submit_handoff_result_v1(token, body.logical_turn_id, body.document)
     except HandoffResultSubmissionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+
+
+@app.post(
+    "/_internal/terminals/{terminal_id}/codex-session-identity",
+    include_in_schema=False,
+)
+async def bind_codex_session_identity_endpoint(
+    terminal_id: TerminalId,
+    request: Request,
+    body: CodexSessionIdentityRequest,
+) -> Dict[str, str]:
+    """Bind the exact foreground Codex root before its first model request."""
+    authorization = request.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if (
+        scheme.lower() != "bearer"
+        or not token
+        or not terminal_auth_token_matches(terminal_id, token)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_terminal_auth"
+        )
+    caller_generation = request.headers.get(RUNTIME_GENERATION_HEADER, "")
+    if not hmac.compare_digest(caller_generation, ACTIVE_RUNTIME_GENERATION):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="stale_runtime_generation")
+    try:
+        identity = await run_in_threadpool(
+            partial(
+                terminal_service.bind_provider_runtime_session_identity,
+                terminal_id,
+                resume_identity=body.session_id,
+                transcript_path=body.transcript_path,
+                working_directory=body.cwd,
+                source=body.source,
+                runtime_generation=body.runtime_generation,
+            )
+        )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="identity_not_proven"
+        ) from exc
+    return {"session_id": identity}
 
 
 @app.post(

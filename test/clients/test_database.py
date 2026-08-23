@@ -37,6 +37,7 @@ from cli_agent_orchestrator.clients.database import (
     init_db,
     list_flows,
     list_terminals_by_session,
+    terminal_auth_token_matches,
     update_flow_enabled,
     update_flow_run_times,
     update_last_active,
@@ -388,7 +389,6 @@ class TestTerminalOperations:
             resume_identity=identity,
             runtime_generation="generation-stale",
         )
-
         with test_db() as db:
             terminal = db.get(TerminalModel, "managed")
             assert terminal.provider_resume_identity == identity
@@ -397,6 +397,58 @@ class TestTerminalOperations:
             assert [(row.provider_session_id, row.terminal_id, row.source) for row in bindings] == [
                 (identity, "managed", "managed_runtime_ready_v1")
             ]
+
+    def test_provider_resume_identity_binds_after_idle_runtime_is_running(
+        self, test_db, monkeypatch
+    ):
+        identity = "01234567-89ab-cdef-0123-456789abcdef"
+        monkeypatch.setattr(database_client, "SessionLocal", test_db)
+        monkeypatch.setattr(database_client, "_terminal_authority_schema_ready", True)
+        monkeypatch.setattr(database_client, "_usage_schema_ready", True)
+        with test_db() as db:
+            db.add(
+                TerminalModel(
+                    id="managed-running",
+                    tmux_session="cao-managed",
+                    tmux_window="managed",
+                    provider="codex",
+                    runtime_lifecycle="running",
+                    runtime_generation="generation-1",
+                )
+            )
+            db.commit()
+
+        assert bind_terminal_provider_resume_identity(
+            "managed-running",
+            provider="codex",
+            resume_identity=identity,
+            runtime_generation="generation-1",
+        )
+        with test_db() as db:
+            terminal = db.get(TerminalModel, "managed-running")
+            assert terminal.provider_resume_identity == identity
+            assert terminal.provider_resume_runtime_generation == "generation-1"
+
+    def test_terminal_auth_token_matches_exact_terminal_capability(self, test_db, monkeypatch):
+        import hashlib
+
+        token = "terminal-capability"
+        monkeypatch.setattr(database_client, "SessionLocal", test_db)
+        with test_db() as db:
+            db.add(
+                TerminalModel(
+                    id="auth-test",
+                    tmux_session="cao-managed",
+                    tmux_window="managed",
+                    provider="codex",
+                    auth_token_sha256=hashlib.sha256(token.encode()).hexdigest(),
+                )
+            )
+            db.commit()
+
+        assert terminal_auth_token_matches("auth-test", token)
+        assert not terminal_auth_token_matches("auth-test", "wrong")
+        assert not terminal_auth_token_matches("missing", token)
 
     def test_writer_lease_is_db_enforced_and_read_only_lane_remains_available(
         self, test_db, monkeypatch

@@ -1,7 +1,9 @@
 """Unit tests for Codex provider."""
 
-import os
 import json
+import os
+import shlex
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -16,6 +18,7 @@ from cli_agent_orchestrator.providers.codex import (
     CodexStartupError,
     CodexStartupNoReadyError,
     ProviderError,
+    _codex_wrapper_preapplies_hook_trust,
 )
 from cli_agent_orchestrator.runtime_generation import (
     ACTIVE_RUNTIME_GENERATION,
@@ -23,6 +26,29 @@ from cli_agent_orchestrator.runtime_generation import (
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+def _assert_managed_session_hook(command: str) -> list[str]:
+    parts = shlex.split(command)
+    expected = ["codex", "--yolo"]
+    if not _codex_wrapper_preapplies_hook_trust():
+        expected.append("--dangerously-bypass-hook-trust")
+    expected.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
+    assert parts[: len(expected)] == expected
+    hook_values = [
+        parts[index + 1]
+        for index, part in enumerate(parts[:-1])
+        if part == "-c" and parts[index + 1].startswith("hooks.SessionStart=")
+    ]
+    assert len(hook_values) == 1
+    assert "^(startup|resume)$" in hook_values[0]
+    assert (
+        shlex.join([sys.executable, "-m", "cli_agent_orchestrator.codex_session_hook"])
+        in hook_values[0]
+    )
+    assert "timeout=30" in hook_values[0]
+    assert "CAO_TERMINAL_AUTH_TOKEN" not in command
+    return parts
 
 
 def load_fixture(filename: str) -> str:
@@ -70,7 +96,8 @@ def _open_rollout_fixture(
     session_id: str,
     working_directory: Path,
     writable: bool = True,
-) -> None:
+    source: object = "cli",
+) -> Path:
     rollout = codex_home / "sessions/2026/08/22" / f"rollout-2026-08-22T12-00-00-{session_id}.jsonl"
     rollout.parent.mkdir(parents=True, exist_ok=True)
     rollout.write_text(
@@ -81,7 +108,7 @@ def _open_rollout_fixture(
                     "id": session_id,
                     "timestamp": "2026-08-22T12:00:00Z",
                     "cwd": str(working_directory),
-                    "source": "cli",
+                    "source": source,
                 },
             }
         )
@@ -96,6 +123,7 @@ def _open_rollout_fixture(
     (descriptor_info / descriptor).write_text(
         f"flags:\t{'02102002' if writable else '02100000'}\n", encoding="ascii"
     )
+    return rollout
 
 
 class TestCodexProviderInitialization:
@@ -118,7 +146,8 @@ class TestCodexProviderInitialization:
         assert mock_tmux.send_keys.call_count == 2
         mock_tmux.send_keys.assert_any_call("test-session", "window-0", "echo ready")
         launch = mock_tmux.send_keys.call_args_list[1].args[2]
-        assert launch.startswith("codex --yolo --no-alt-screen --disable shell_snapshot")
+        assert launch.startswith("codex --yolo")
+        _assert_managed_session_hook(launch.partition("; codex_startup_status=")[0])
         assert "__CAO_CODEX_STARTUP_EXIT_test1234_1__" in launch
         mock_trust.assert_called_once_with(timeout=20.0)
         mock_wait_ready.assert_called_once_with(timeout=60.0)
@@ -190,10 +219,36 @@ class TestCodexProviderInitialization:
 
 
 class TestCodexBuildCommand:
+    def test_managed_wrapper_hook_trust_detection_is_exact(self, tmp_path):
+        direct = tmp_path / "codex.direct"
+        direct.write_bytes(b"\x7fELF")
+        wrapper = tmp_path / "codex"
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n"
+            "exec \\\n"
+            f"  {direct} \\\n"
+            "  --dangerously-bypass-hook-trust \\\n"
+            '  "$@"\n',
+            encoding="utf-8",
+        )
+        with patch(
+            "cli_agent_orchestrator.providers.codex.shutil.which", return_value=str(wrapper)
+        ):
+            assert _codex_wrapper_preapplies_hook_trust()
+
+        wrapper.write_text(
+            "#!/usr/bin/env bash\n# --dangerously-bypass-hook-trust\nexec " f'{direct} "$@"\n',
+            encoding="utf-8",
+        )
+        with patch(
+            "cli_agent_orchestrator.providers.codex.shutil.which", return_value=str(wrapper)
+        ):
+            assert not _codex_wrapper_preapplies_hook_trust()
+
     def test_build_command_no_profile(self):
         provider = CodexProvider("test1234", "test-session", "window-0", None)
         command = provider._build_codex_command()
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        _assert_managed_session_hook(command)
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_structured_owner_attestation_uses_snapshotted_profile_without_secret(
@@ -255,7 +310,7 @@ class TestCodexBuildCommand:
         command = provider._build_codex_command()
 
         mock_load_profile.assert_called_once_with("code_supervisor")
-        assert "codex --yolo --no-alt-screen --disable shell_snapshot" in command
+        _assert_managed_session_hook(command)
         assert "-c" in command
         assert "developer_instructions=" in command
         assert "You are a code supervisor agent." in command
@@ -453,7 +508,7 @@ class TestCodexBuildCommand:
         provider = CodexProvider("test1234", "test-session", "window-0", "empty_agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        _assert_managed_session_hook(command)
         assert "developer_instructions" not in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
@@ -467,7 +522,7 @@ class TestCodexBuildCommand:
         provider = CodexProvider("test1234", "test-session", "window-0", "none_agent")
         command = provider._build_codex_command()
 
-        assert command == "codex --yolo --no-alt-screen --disable shell_snapshot"
+        _assert_managed_session_hook(command)
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_profile_load_failure(self, mock_load_profile):
@@ -1342,11 +1397,12 @@ class TestCodexBulletFormatStatusDetection:
             start_ticks=2000,
         )
         codex_home = tmp_path / "codex"
+        rollout_paths = {}
         for descriptor, session_id in (
             ("8", "01234567-89ab-cdef-0123-456789abcdef"),
             ("9", "fedcba98-7654-3210-fedc-ba9876543210"),
         ):
-            _open_rollout_fixture(
+            rollout_paths[session_id] = _open_rollout_fixture(
                 proc_root,
                 codex_home,
                 process_id=200,
@@ -1358,16 +1414,81 @@ class TestCodexBulletFormatStatusDetection:
 
         assert (
             provider.runtime_sidecar_resume_identity(
-                proc_root, expected_identity="01234567-89ab-cdef-0123-456789abcdef"
+                proc_root,
+                expected_identity="01234567-89ab-cdef-0123-456789abcdef",
+                expected_rollout_path=rollout_paths["01234567-89ab-cdef-0123-456789abcdef"],
             )
             == "01234567-89ab-cdef-0123-456789abcdef"
         )
+        with pytest.raises(ProviderError, match="stale or belongs elsewhere"):
+            provider.runtime_sidecar_resume_identity(
+                proc_root,
+                expected_identity="01234567-89ab-cdef-0123-456789abcdef",
+                expected_rollout_path=rollout_paths["fedcba98-7654-3210-fedc-ba9876543210"],
+            )
         with pytest.raises(ProviderError, match="stale or belongs elsewhere"):
             provider.runtime_sidecar_resume_identity(
                 proc_root, expected_identity="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
             )
         with pytest.raises(ProviderError, match="ambiguous"):
             provider.runtime_sidecar_resume_identity(proc_root)
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_exact_root_identity_ignores_open_subagent_rollout(
+        self, mock_tmux, tmp_path, monkeypatch
+    ):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        mock_tmux.get_pane_current_command.return_value = "codex"
+        mock_tmux.get_pane_process_id.return_value = 100
+        working_directory = tmp_path / "project"
+        working_directory.mkdir()
+        mock_tmux.get_pane_working_directory.return_value = str(working_directory)
+        proc_root = tmp_path / "proc"
+        _write_proc_stat(
+            proc_root,
+            100,
+            parent_process_id=1,
+            process_group_id=100,
+            foreground_process_group_id=200,
+            start_ticks=1000,
+        )
+        _write_proc_stat(
+            proc_root,
+            200,
+            parent_process_id=100,
+            process_group_id=200,
+            foreground_process_group_id=200,
+            start_ticks=2000,
+        )
+        codex_home = tmp_path / "codex"
+        root_identity = "01234567-89ab-cdef-0123-456789abcdef"
+        root_rollout = _open_rollout_fixture(
+            proc_root,
+            codex_home,
+            process_id=200,
+            descriptor="8",
+            session_id=root_identity,
+            working_directory=working_directory,
+        )
+        _open_rollout_fixture(
+            proc_root,
+            codex_home,
+            process_id=200,
+            descriptor="9",
+            session_id="fedcba98-7654-3210-fedc-ba9876543210",
+            working_directory=working_directory,
+            source={"subagent": {"thread_spawn": {"parent_thread_id": root_identity}}},
+        )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        assert (
+            provider.runtime_sidecar_resume_identity(
+                proc_root,
+                expected_identity=root_identity,
+                expected_rollout_path=root_rollout,
+            )
+            == root_identity
+        )
 
     @patch(
         "cli_agent_orchestrator.providers.codex.CodexProvider._publish_fresh_runtime_output_boundary"

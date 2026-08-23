@@ -79,7 +79,10 @@ from cli_agent_orchestrator.plugins import (
     PostKillTerminalEvent,
     PostSendMessageEvent,
 )
-from cli_agent_orchestrator.providers.codex import CodexStartupNoReadyError
+from cli_agent_orchestrator.providers.codex import (
+    CodexStartupNoReadyError,
+)
+from cli_agent_orchestrator.providers.codex import ProviderError as CodexProviderError
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
@@ -783,19 +786,6 @@ def _create_terminal_after_admission(
                     f"{log_path}: {second_error}"
                 ) from second_error
 
-        if provider == ProviderType.CODEX.value:
-            resolver = getattr(provider_instance, "runtime_sidecar_resume_identity", None)
-            if resolver is None:
-                raise RuntimeError("Codex provider has no launch-time resume identity resolver")
-            resume_identity = resolver()
-            if not bind_terminal_provider_resume_identity(
-                terminal_id,
-                provider=provider,
-                resume_identity=resume_identity,
-                runtime_generation=runtime_generation,
-            ):
-                raise RuntimeError("Could not bind Codex resume identity at readiness")
-
         lifecycle_published = mark_terminal_runtime_running(terminal_id)
         if isinstance(persisted_metadata, dict) and not lifecycle_published:
             raise RuntimeError(f"Could not publish running lifecycle for {terminal_id}")
@@ -1103,6 +1093,71 @@ def provider_runtime_sidecar_resume_identity(terminal_id: str) -> str:
     if not isinstance(identity, str) or not identity:
         raise RuntimeError(f"Provider for terminal '{terminal_id}' has no resume identity")
     return identity
+
+
+def bind_provider_runtime_session_identity(
+    terminal_id: str,
+    *,
+    resume_identity: str,
+    transcript_path: str,
+    working_directory: str,
+    source: str,
+    runtime_generation: str,
+) -> str:
+    """Prove and bind Codex's exact root session at its synchronous start hook.
+
+    A fresh Codex TUI has no conversation while idle. The provider-native
+    identity first exists at ``SessionStart``, before the first model request;
+    this method fences that callback to the managed terminal generation and
+    exact foreground writable transcript.
+    """
+    metadata = get_terminal_metadata(terminal_id)
+    if (
+        metadata is None
+        or metadata.get("provider") != ProviderType.CODEX.value
+        or metadata.get("runtime_lifecycle") not in {"starting", "running"}
+        or source not in {"startup", "resume"}
+        or not isinstance(runtime_generation, str)
+        or not hmac.compare_digest(
+            str(metadata.get("runtime_generation") or ""), runtime_generation
+        )
+        or not os.path.isabs(working_directory)
+        or not os.path.isabs(transcript_path)
+    ):
+        raise RuntimeError("Codex session identity callback is stale or malformed")
+
+    provider = provider_manager.get_provider(terminal_id)
+    resolver = getattr(provider, "runtime_sidecar_resume_identity", None)
+    if resolver is None:
+        raise RuntimeError(f"Provider for terminal '{terminal_id}' cannot prove resume identity")
+    try:
+        verified = resolver(
+            expected_identity=resume_identity,
+            expected_rollout_path=transcript_path,
+        )
+    except CodexProviderError as exc:
+        raise RuntimeError("Codex session identity does not own the foreground runtime") from exc
+    if not isinstance(verified, str) or not hmac.compare_digest(verified, resume_identity):
+        raise RuntimeError(f"Provider for terminal '{terminal_id}' has stale resume identity")
+
+    pane_working_directory = tmux_client.get_pane_working_directory(
+        str(metadata["tmux_session"]), str(metadata["tmux_window"])
+    )
+    if (
+        not pane_working_directory
+        or not os.path.isabs(pane_working_directory)
+        or Path(pane_working_directory).resolve(strict=False)
+        != Path(working_directory).resolve(strict=False)
+    ):
+        raise RuntimeError("Codex session identity working directory is stale")
+    if not bind_terminal_provider_resume_identity(
+        terminal_id,
+        provider=ProviderType.CODEX.value,
+        resume_identity=verified,
+        runtime_generation=runtime_generation,
+    ):
+        raise RuntimeError("Could not durably bind Codex session identity")
+    return verified
 
 
 def verify_provider_runtime_sidecar_resume_identity(terminal_id: str, resume_identity: str) -> None:

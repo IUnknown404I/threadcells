@@ -3110,6 +3110,20 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
         }
 
 
+def terminal_auth_token_matches(terminal_id: str, token: str) -> bool:
+    """Validate one terminal bearer capability without exposing its digest."""
+    if not isinstance(token, str) or not token:
+        return False
+    token_digest = hashlib.sha256(token.encode("utf-8", "strict")).hexdigest()
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel.auth_token_sha256).filter_by(id=terminal_id).first()
+        return bool(
+            terminal is not None
+            and terminal[0]
+            and hmac.compare_digest(str(terminal[0]), token_digest)
+        )
+
+
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
     """List all terminals in a tmux session."""
     _ensure_terminal_worktree_authority_schema()
@@ -3911,7 +3925,7 @@ def bind_terminal_provider_resume_identity(
     resume_identity: str,
     runtime_generation: str,
 ) -> bool:
-    """Bind one provider-native resume identity at the initial ready boundary.
+    """Bind one provider-native resume identity at the initial session boundary.
 
     The terminal row and provider-session ownership row are committed together.
     An existing exact live-process usage binding may be promoted into this
@@ -3930,7 +3944,7 @@ def bind_terminal_provider_resume_identity(
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if (
             terminal is None
-            or terminal.runtime_lifecycle != "starting"
+            or terminal.runtime_lifecycle not in {"starting", "running"}
             or terminal.provider != provider
             or terminal.runtime_generation != runtime_generation
         ):

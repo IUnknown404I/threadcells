@@ -149,14 +149,14 @@ SIDECAR_RECONNECTED_PREFIX = "__CAO_SIDECAR_RECONNECTED_"
 SIDECAR_RECONNECT_LAUNCH_PREFIX = "__CAO_SIDECAR_RECONNECT_LAUNCH_"
 FRESH_RUNTIME_OUTPUT_BOUNDARY_PREFIX = "__CAO_FRESH_RUNTIME_OUTPUT_BOUNDARY_"
 SIDECAR_RECONNECT_REQUIRED_BLOCK_START_PATTERN = re.compile(
-    r"^[^\S\n]*(?:Error calling tool(?:[^\S\n]|$)|"
+    r"^[^\S\n]*(?:[└├│][^\S\n]*)?(?:Error calling tool(?:[^\S\n]|$)|"
     r"[^\n]*(?:[\"'](?:message|error)[\"'][^\S\n]*:|"
     r"\b(?:message|error)[^\S\n]*=))",
     re.IGNORECASE,
 )
 SIDECAR_RECONNECT_REQUIRED_BLOCK_LINES = 8
 SIDECAR_RECONNECT_REQUIRED_COMPACT_PATTERN = re.compile(
-    rf"(?:^Errorcallingtool(?:'[^']+')?:|"
+    rf"(?:^[└├│]?Errorcallingtool(?:'[^']+')?:|"
     rf"(?:[\"'](?:message|error)[\"']|(?:message|error))(?::|=)[\"']?)"
     rf"{SIDECAR_RECONNECT_REQUIRED_TEXT}"
     rf"(?:\[{PROVIDER_RECONNECT_ATTEMPT_ENV}=(?P<attempt>[0-9a-f]{{32}})\])?"

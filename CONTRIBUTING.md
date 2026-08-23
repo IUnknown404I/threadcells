@@ -7,10 +7,12 @@ Thanks for helping improve ThreadCells. Reports and pull requests are welcome wh
 - **Bug:** use the [bug report form](https://github.com/IUnknown404I/threadcells/issues/new?template=bug.yml) with reproduction steps or durable evidence.
 - **Enhancement:** use the [feature request form](https://github.com/IUnknown404I/threadcells/issues/new?template=feature.yml) and start with the problem or use case.
 - **Documentation:** use the [documentation report form](https://github.com/IUnknown404I/threadcells/issues/new?template=docs.yml) for missing, stale, or unclear public guidance.
-- **General questions:** check the [documentation](https://iunknown404i.github.io/threadcells/docs/) and [Troubleshooting](docs/TROUBLESHOOTING.md) first. This preview does not currently have a general-support forum; open an Issue only when the question identifies an actionable product or documentation problem.
+- **Questions and troubleshooting:** check the [documentation](https://iunknown404i.github.io/threadcells/docs/) and [Troubleshooting](docs/TROUBLESHOOTING.md), then ask in [Discussions Q&A](https://github.com/IUnknown404I/threadcells/discussions/categories/q-a).
+- **Early ideas:** start with the problem or use case in [Discussions Ideas](https://github.com/IUnknown404I/threadcells/discussions/categories/ideas). Move to an Issue only when the outcome is concrete and actionable under the Issue policy.
+- **Setups and use cases:** share workflows, integrations, screenshots, and lessons in [Show and tell](https://github.com/IUnknown404I/threadcells/discussions/categories/show-and-tell).
 - **Security:** do not open a public Issue. Follow [SECURITY.md](SECURITY.md) and report privately.
 
-Search both open and closed [Issues](https://github.com/IUnknown404I/threadcells/issues) before submitting a report. The detailed eligibility, evidence, triage, and disclosure rules are in the canonical [Issue policy](docs/ISSUES.md).
+Search existing [Discussions](https://github.com/IUnknown404I/threadcells/discussions) or open and closed [Issues](https://github.com/IUnknown404I/threadcells/issues) before starting a new thread or report. The detailed Issue eligibility, evidence, triage, and disclosure rules are in the canonical [Issue policy](docs/ISSUES.md).
 
 ## Pull requests
 

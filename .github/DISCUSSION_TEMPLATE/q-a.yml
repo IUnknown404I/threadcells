@@ -1,0 +1,46 @@
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for asking. Search the [documentation](https://iunknown404i.github.io/threadcells/docs/) and existing discussions first. Do not paste credentials, tokens, private infrastructure details, private messages, state databases, or unrelated logs. Report security-sensitive findings through [private vulnerability reporting](https://github.com/IUnknown404I/threadcells/security/advisories/new).
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      description: Describe the result you want from ThreadCells.
+      placeholder: I am trying to...
+    validations:
+      required: true
+  - type: textarea
+    id: stuck
+    attributes:
+      label: Where are you stuck?
+      description: Explain what happened and what you expected instead.
+      placeholder: I expected... but instead...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: ThreadCells version or revision
+      description: Include this when known.
+      placeholder: v0.1.0-alpha.2 or a commit SHA
+  - type: textarea
+    id: environment
+    attributes:
+      label: Relevant environment
+      description: Optional. Include OS, provider, browser, or installation details only when they affect the question.
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted logs or screenshots
+      description: Optional. Include only the smallest useful evidence after removing secrets, private data, private paths, and private messages.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before posting
+      options:
+        - label: I checked the documentation and searched existing discussions.
+          required: true
+        - label: This discussion contains no secrets, private data, or security-sensitive disclosure.
+          required: true

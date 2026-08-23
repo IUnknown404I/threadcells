@@ -75,7 +75,7 @@ The public `ghcr.io/iunknown404i/threadcells-release-bundle` OCI package carries
 
 ## Issues & contributing
 
-Use the curated [GitHub Issues](https://github.com/IUnknown404I/threadcells/issues) backlog for actionable public project work. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the quick routes, [the canonical Issue policy](docs/ISSUES.md) for eligibility and triage, and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
+Use [GitHub Discussions](https://github.com/IUnknown404I/threadcells/discussions) for questions, early ideas, and community setups. Use the curated [GitHub Issues](https://github.com/IUnknown404I/threadcells/issues) backlog for confirmed actionable public project work. Read [CONTRIBUTING.md](CONTRIBUTING.md) for the quick routes, [the canonical Issue policy](docs/ISSUES.md) for eligibility and triage, and [SECURITY.md](SECURITY.md) for private vulnerability reporting.
 
 ## Maintainer
 

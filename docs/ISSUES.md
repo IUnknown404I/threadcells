@@ -16,6 +16,8 @@ A public Issue should normally satisfy all of these conditions:
 
 Durable technical evidence may replace reproduction steps when deterministic reproduction is impractical.
 
+Questions, troubleshooting, and open conversation belong in [Discussions Q&A](https://github.com/IUnknown404I/threadcells/discussions/categories/q-a). Explore early problem- and use-case-first proposals in [Discussions Ideas](https://github.com/IUnknown404I/threadcells/discussions/categories/ideas). Move a finding or proposal to Issues only after it becomes confirmed, concrete, publicly safe, and actionable under this policy.
+
 ## What does not belong in public Issues
 
 Do not create a public Issue merely for:

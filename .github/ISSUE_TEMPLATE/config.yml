@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Ask a question in Discussions
+    url: https://github.com/IUnknown404I/threadcells/discussions/categories/q-a
+    about: Get help with installation, setup, configuration, usage, or troubleshooting.
   - name: Report a security vulnerability privately
     url: https://github.com/IUnknown404I/threadcells/security/advisories/new
     about: Do not disclose vulnerabilities or security-sensitive details in a public Issue.

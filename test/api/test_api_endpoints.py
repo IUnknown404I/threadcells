@@ -287,17 +287,22 @@ class TestOperatorGrantBoundary:
         secret = self._configure_secret(tmp_path, monkeypatch)
         assert client.post("/operator/session", json={"secret": secret}).status_code == 200
 
-        grant = client.post(
-            "/operator/xhigh-grants",
-            json={
-                "agent_profile": "critical_sol_xhigh_owner",
-                "provider": "codex",
-                "working_directory": str(tmp_path),
-                "requested_session_name": "cao-existing",
-                "launch_mode": "existing_session",
-                "confirmed": True,
-            },
-        )
+        with patch.object(
+            api_main.session_service,
+            "resolve_session_authority",
+            return_value=MagicMock(session_id="stable-session", session_name="cao-existing"),
+        ):
+            grant = client.post(
+                "/operator/xhigh-grants",
+                json={
+                    "agent_profile": "critical_sol_xhigh_owner",
+                    "provider": "codex",
+                    "working_directory": str(tmp_path),
+                    "requested_session_name": "stable-session",
+                    "launch_mode": "existing_session",
+                    "confirmed": True,
+                },
+            )
 
         assert grant.status_code == 200
         assert set(grant.json()) == {"grant", "launch_id", "expires_in_seconds"}
@@ -1323,6 +1328,18 @@ class TestDeleteSession:
         assert response.status_code == 404
         assert "not found" in response.json()["detail"]
 
+    def test_delete_session_ambiguous_identity_returns_truthful_conflict(self, client):
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.delete_session.side_effect = api_main.SessionLifecycleError(
+                "SESSION_IDENTITY_AMBIGUOUS",
+                "Session identity is ambiguous; use the stable session ID",
+            )
+
+            response = client.delete("/sessions/cao-reused")
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["reason_code"] == "SESSION_IDENTITY_AMBIGUOUS"
+
     def test_delete_session_server_error(self, client):
         """DELETE /sessions/{name} returns 500 on internal error."""
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
@@ -1349,7 +1366,14 @@ class TestCreateTerminalInSession:
             provider="claude_code",
             agent_profile="reviewer",
         )
-        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch.object(
+                api_main.session_service,
+                "resolve_session_authority",
+                return_value=MagicMock(session_id="stable-session", session_name="test-session"),
+            ),
+        ):
             mock_svc.create_terminal.return_value = mock_terminal
 
             response = client.post(
@@ -1366,12 +1390,16 @@ class TestCreateTerminalInSession:
         assert data["session_name"] == "test-session"
         call_kwargs = mock_svc.create_terminal.call_args.kwargs
         assert call_kwargs["session_name"] == "test-session"
+        assert call_kwargs["session_lifetime_id"] == "stable-session"
         assert call_kwargs["new_session"] is False
 
     def test_create_terminal_session_not_found(self, client):
         """POST /sessions/{name}/terminals returns 404 for nonexistent session."""
-        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.create_terminal.side_effect = ValueError("Session 'nonexistent' not found")
+        with patch.object(
+            api_main.session_service,
+            "resolve_session_authority",
+            side_effect=ValueError("Session 'nonexistent' not found"),
+        ):
 
             response = client.post(
                 "/sessions/nonexistent/terminals",
@@ -1384,9 +1412,54 @@ class TestCreateTerminalInSession:
         assert response.status_code == 404
         assert "not found" in response.json()["detail"]
 
+    def test_create_terminal_history_is_ineligible_not_false_not_found(self, client):
+        with patch.object(
+            api_main.session_service,
+            "resolve_session_authority",
+            side_effect=api_main.SessionLifecycleError(
+                "SESSION_HISTORY_INELIGIBLE",
+                "This session is historical",
+            ),
+        ):
+            response = client.post(
+                "/sessions/stable-history/terminals",
+                params={"provider": "codex", "agent_profile": "developer"},
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == {
+            "reason_code": "SESSION_HISTORY_INELIGIBLE",
+            "message": "This session is historical",
+        }
+
+    def test_create_terminal_runtime_uncertainty_returns_retryable_503(self, client):
+        with patch.object(
+            api_main.session_service,
+            "resolve_session_authority",
+            side_effect=api_main.SessionLifecycleError(
+                "SESSION_RUNTIME_INVENTORY_UNCERTAIN",
+                "Runtime inventory is uncertain",
+                inventory_uncertain=True,
+            ),
+        ):
+            response = client.post(
+                "/sessions/stable-live/terminals",
+                params={"provider": "codex", "agent_profile": "developer"},
+            )
+
+        assert response.status_code == 503
+        assert response.json()["detail"]["reason_code"] == "SESSION_RUNTIME_INVENTORY_UNCERTAIN"
+
     def test_create_terminal_server_error(self, client):
         """POST /sessions/{name}/terminals returns 500 on error."""
-        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch.object(
+                api_main.session_service,
+                "resolve_session_authority",
+                return_value=MagicMock(session_id="stable-session", session_name="test-session"),
+            ),
+        ):
             mock_svc.create_terminal.side_effect = Exception("TMux error")
 
             response = client.post(
@@ -1410,9 +1483,10 @@ class TestListTerminalsInSession:
             {"id": "abcd1234", "tmux_session": "s1", "provider": "kiro_cli"},
             {"id": "abcd5678", "tmux_session": "s1", "provider": "claude_code"},
         ]
-        with patch(
-            "cli_agent_orchestrator.clients.database.list_terminals_by_session",
-            return_value=mock_terminals,
+        with patch.object(
+            api_main.session_service,
+            "resolve_session_authority",
+            return_value=MagicMock(terminals=mock_terminals),
         ):
             response = client.get("/sessions/s1/terminals")
 
@@ -1422,9 +1496,10 @@ class TestListTerminalsInSession:
 
     def test_list_terminals_empty(self, client):
         """GET /sessions/{name}/terminals returns empty list."""
-        with patch(
-            "cli_agent_orchestrator.clients.database.list_terminals_by_session",
-            return_value=[],
+        with patch.object(
+            api_main.session_service,
+            "resolve_session_authority",
+            return_value=MagicMock(terminals=[]),
         ):
             response = client.get("/sessions/empty-session/terminals")
 
@@ -1433,8 +1508,9 @@ class TestListTerminalsInSession:
 
     def test_list_terminals_server_error(self, client):
         """GET /sessions/{name}/terminals returns 500 on error."""
-        with patch(
-            "cli_agent_orchestrator.clients.database.list_terminals_by_session",
+        with patch.object(
+            api_main.session_service,
+            "resolve_session_authority",
             side_effect=Exception("DB error"),
         ):
             response = client.get("/sessions/s1/terminals")

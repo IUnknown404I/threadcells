@@ -9,7 +9,7 @@ import { installUiReadModelSpies } from './ui-read-model-mocks'
 
 vi.mock('../components/TerminalView', () => ({ TerminalView: () => null }))
 
-const session = (id: string, created_at: string) => ({ id, name: id, status: 'detached', created_at })
+const session = (id: string, created_at: string) => ({ id, name: id, status: 'active', created_at })
 
 describe('session creation and canonical ordering', () => {
   beforeEach(() => {
@@ -304,6 +304,21 @@ describe('session creation and canonical ordering', () => {
     expect(screen.queryByText('Session name')).not.toBeInTheDocument()
   })
 
+  it('blocks Add Agent truthfully for a historical session', async () => {
+    const history = {
+      ...session('lifetime-history', '100'),
+      name: 'cao-history',
+      status: 'history',
+    }
+    useStore.setState({ sessions: [history] })
+    render(<AgentPanel />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand history' }))
+    const add = screen.getByRole('button', { name: 'Add Agent' })
+    expect(add).toBeDisabled()
+    expect(add).toHaveAttribute('title', 'Historical sessions cannot accept new agents')
+  })
+
   it('keeps ordinary Add Agent authorization-free and shows the inherited path as muted information', async () => {
     const terminal = { id: 'codex-terminal', tmux_session: 'cao-existing', tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null }
     const addTerminal = vi.spyOn(api, 'addTerminalToSession').mockResolvedValue({} as never)
@@ -367,7 +382,7 @@ describe('session creation and canonical ordering', () => {
   })
 
   it('authorizes an XHigh Add Agent with the shared one-use existing-session grant and clears the secret', async () => {
-    const existing = session('cao-owner-existing', '100')
+    const existing = { ...session('lifetime-owner-existing', '100'), name: 'cao-owner-existing' }
     const terminal = { id: 'existing-agent', tmux_session: existing.name, tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null }
     const grant = { launch_id: 'add-launch-1', grant: 'one-use-add-token', expires_in_seconds: 60 }
     const login = vi.spyOn(api, 'createOperatorSession')
@@ -383,13 +398,13 @@ describe('session creation and canonical ordering', () => {
     vi.spyOn(api, 'getSession').mockResolvedValue({ session: existing, terminals: [terminal] })
     vi.spyOn(api, 'getSessionWorkingDirectory').mockResolvedValue({ working_directory: '/srv/session-owner-root' })
     vi.spyOn(api, 'getWorkingDirectory').mockResolvedValue({ working_directory: '/srv/session-owner-root' })
-    useStore.setState({ sessions: [existing], activeSession: existing.name, activeSessionDetail: { session: existing, terminals: [terminal] } })
+    useStore.setState({ sessions: [existing], activeSession: existing.id, activeSessionDetail: { session: existing, terminals: [terminal] } })
 
     render(<AgentPanel />)
     fireEvent.click(await screen.findByRole('button', { name: 'Expand owner-existing' }))
     expect(api.getSessionWorkingDirectory).not.toHaveBeenCalled()
     fireEvent.click(screen.getByText('Add Agent'))
-    await waitFor(() => expect(api.getSessionWorkingDirectory).toHaveBeenCalledWith(existing.name))
+    await waitFor(() => expect(api.getSessionWorkingDirectory).toHaveBeenCalledWith(existing.id))
     fireEvent.click(screen.getByText('Select a profile...'))
     fireEvent.click(screen.getAllByText('critical_sol_xhigh_owner')[0])
 
@@ -409,7 +424,7 @@ describe('session creation and canonical ordering', () => {
     fireEvent.change(screen.getByLabelText('Operator secret'), { target: { value: 'correct-operator-secret' } })
     fireEvent.click(submit)
     await waitFor(() => expect(addTerminal).toHaveBeenCalledWith(
-      existing.name,
+      existing.id,
       'codex',
       'critical_sol_xhigh_owner',
       '/srv/session-owner-root',
@@ -420,7 +435,7 @@ describe('session creation and canonical ordering', () => {
       agent_profile: 'critical_sol_xhigh_owner',
       provider: 'codex',
       working_directory: '/srv/session-owner-root',
-      requested_session_name: existing.name,
+      requested_session_name: existing.id,
       project_id: undefined,
       launch_mode: 'existing_session',
       confirmed: true,
@@ -772,7 +787,7 @@ describe('session deletion confirmation', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
     useStore.setState({
-      sessions: [session('cao-delete-me', '100')],
+      sessions: [{ ...session('lifetime-delete-me', '100'), name: 'cao-delete-me' }],
       activeSession: null,
       activeSessionDetail: null,
       terminalStatuses: {},
@@ -799,7 +814,7 @@ describe('session deletion confirmation', () => {
     fireEvent.click(screen.getByTitle('Delete session'))
     fireEvent.click(screen.getByRole('button', { name: 'Delete Session' }))
     await waitFor(() => expect(remove).toHaveBeenCalledTimes(1))
-    expect(remove).toHaveBeenCalledWith('cao-delete-me')
+    expect(remove).toHaveBeenCalledWith('lifetime-delete-me')
   })
 
   it('prevents duplicate delete confirmations while the request is pending', async () => {
@@ -823,8 +838,8 @@ describe('session deletion confirmation', () => {
     const terminal = { id: 'codex-terminal', tmux_session: 'cao-delete-me', tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null }
     const closeTerminal = vi.spyOn(api, 'deleteTerminal').mockResolvedValue({} as never)
     useStore.setState({
-      activeSession: 'cao-delete-me',
-      activeSessionDetail: { session: session('cao-delete-me', '100'), terminals: [terminal] },
+      activeSession: 'lifetime-delete-me',
+      activeSessionDetail: { session: { ...session('lifetime-delete-me', '100'), name: 'cao-delete-me' }, terminals: [terminal] },
     })
     render(<AgentPanel />)
 

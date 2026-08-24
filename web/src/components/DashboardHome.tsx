@@ -155,8 +155,8 @@ export function DashboardHome({ onNavigate, overviewState }: { onNavigate: (dest
   const handleDeleteSession = async () => {
     if (!pendingDeleteSession || deletingSessionRef.current) return
     deletingSessionRef.current = true
-    setDeletingSession(pendingDeleteSession.name)
-    try { await deleteSession(pendingDeleteSession.name); sessionFeed.reload(); setPendingDeleteSession(null) } finally { deletingSessionRef.current = false; setDeletingSession(null) }
+    setDeletingSession(pendingDeleteSession.id)
+    try { await deleteSession(pendingDeleteSession.id); sessionFeed.reload(); setPendingDeleteSession(null) } finally { deletingSessionRef.current = false; setDeletingSession(null) }
   }
 
   const summaryValue = (key: 'sessions' | 'agents' | 'active' | 'waiting' | 'owner_gate' | 'cancelled' | 'completed') => overview ? overview[key] : '—'

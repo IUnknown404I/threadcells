@@ -34,6 +34,28 @@ def isolate_operational_admission(monkeypatch):
             process_start_ticks=777,
         ),
     )
+    resolved_session_name: dict[str, str | None] = {"value": None}
+
+    def resolve_session(identifier):
+        if identifier != "stable-existing-session":
+            resolved_session_name["value"] = identifier
+        return {
+            "session_id": "stable-existing-session",
+            "session_name": resolved_session_name["value"] or identifier,
+            "deleted": False,
+            "terminals": [{"id": "resident", "runtime_lifecycle": "running"}],
+        }
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.resolve_session_lifetime",
+        resolve_session,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.prove_live_session_runtime_authority",
+        lambda _name, _terminals, **_kwargs: SimpleNamespace(
+            proven=True, reason_code=None, inventory_uncertain=False
+        ),
+    )
 
 
 class TestCreateTerminalCleanup:

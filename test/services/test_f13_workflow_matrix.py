@@ -144,6 +144,14 @@ def _start_admitted_input(root: str) -> int:
     return turn_id
 
 
+def _pending_inbox_turn(root: str, message: str) -> tuple[database.InboxMessage, int]:
+    """Bind one ordinary PENDING transport to the root's current OPEN workflow."""
+    inbox = create_inbox_message("synthetic-sender", root, message)
+    turn_id = database.ensure_workflow_turn_for_inbox(inbox.id)
+    assert turn_id is not None
+    return inbox, turn_id
+
+
 def _admit_sent_continuation(root: str, turn: dict, now: datetime) -> None:
     """Model transport activation, receiver admission, and sender ack in order."""
     assert activate_workflow_turn(root, turn["id"])
@@ -736,6 +744,200 @@ def test_f13_restart_resumes_two_results_before_queued_owner_input_once(workflow
             .all()
         )
         assert len([turn for turn in owner_turns if turn.payload == owner_payload]) == 1
+
+
+def test_f13_closed_ordinary_inbox_is_not_a_new_owner_input_predecessor(workflow_db):
+    """A terminal workflow's transport row cannot defer a new semantic workflow."""
+    parent = "parent-closed-inbox-submit"
+    _start_admitted_input(parent)
+    stale = create_inbox_message("sender", parent, "stale closed-workflow input")
+    stale_turn = database.ensure_workflow_turn_for_inbox(stale.id)
+    assert stale_turn is not None
+    assert set_workflow_terminal_state(parent, "terminal", "completed before Inbox send")
+    with database.SessionLocal() as db:
+        assert db.get(InboxModel, stale.id).status == "failed"
+        # Model a row persisted by a pre-fix runtime before the owner submits
+        # the deliberate replacement workflow.
+        db.get(InboxModel, stale.id).status = "pending"
+        db.commit()
+
+    owner_payload = "begin the deliberate replacement workflow"
+    prepared = database.prepare_workflow_input(parent, owner_payload)
+    assert prepared == {
+        "turn_id": prepared["turn_id"],
+        "queued": False,
+        "queue_reason": None,
+    }
+
+    with database.SessionLocal() as db:
+        assert db.get(InboxModel, stale.id).status == "failed"
+        assert db.get(WorkflowTurnModel, stale_turn).state == "cancelled"
+        owner_turn = db.get(WorkflowTurnModel, prepared["turn_id"])
+        assert owner_turn is not None
+        assert owner_turn.state == "sent"
+        assert owner_turn.payload is None
+        owner_workflow = db.get(WorkflowModel, owner_turn.workflow_id)
+        assert owner_workflow is not None
+        assert owner_workflow.status == "open"
+        assert owner_workflow.active_turn_id == owner_turn.id
+
+
+def test_f13_lifecycle_cancellation_fails_closed_workflow_inbox_transport(workflow_db):
+    """The central terminal/session cancellation path clears its stale FIFO head."""
+    parent = "parent-closed-inbox-lifecycle"
+    _start_admitted_input(parent)
+    stale = create_inbox_message("sender", parent, "stale lifecycle input")
+    stale_turn = database.ensure_workflow_turn_for_inbox(stale.id)
+    assert stale_turn is not None
+    with database.SessionLocal() as db:
+        stale_workflow_id = db.get(WorkflowTurnModel, stale_turn).workflow_id
+
+    assert cancel_workflows_for_terminal(parent) == 1
+
+    with database.SessionLocal() as db:
+        assert db.get(InboxModel, stale.id).status == "failed"
+        assert db.get(WorkflowTurnModel, stale_turn).state == "cancelled"
+        workflow = db.get(WorkflowModel, stale_workflow_id)
+        assert workflow is not None
+        assert workflow.status == "cancelled"
+
+
+def test_f13_closed_inbox_dispatch_cas_preserves_concurrent_delivery(workflow_db):
+    """A stale close observer cannot overwrite a transport outcome that already won."""
+    parent = "parent-closed-inbox-delivery-race"
+    _start_admitted_input(parent)
+    stale, _stale_turn = _pending_inbox_turn(parent, "concurrently delivered input")
+    assert set_workflow_terminal_state(parent, "terminal", "closed during delivery")
+    with database.SessionLocal() as db:
+        db.get(InboxModel, stale.id).status = "delivered"
+        db.commit()
+
+    with patch(
+        "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+        side_effect=[[stale], []],
+    ):
+        assert _dispatch_pending_messages_with_admission(parent) is False
+
+    with database.SessionLocal() as db:
+        assert db.get(InboxModel, stale.id).status == "delivered"
+
+
+def test_f13_transport_retry_owner_gate_fences_its_pending_inbox(workflow_db):
+    """The bounded pre-send retry guard closes its exact Inbox transport atomically."""
+    root = "root-inbox-transport-retry-gate"
+    _start_admitted_input(root)
+    stale, stale_turn = _pending_inbox_turn(root, "retry until owner gate")
+    now = datetime(2026, 8, 24, 21, 0, 0)
+    observe_workflow_final(root, now=now)
+
+    claim = claim_workflow_turn(root, now=now, inbox_message_id=stale.id)
+    assert claim is not None and claim["id"] == stale_turn
+    assert requeue_workflow_turn(
+        claim["id"], claim["claim_token"], claim["claim_generation"], now=now
+    )
+    claim = claim_workflow_turn(root, now=now + timedelta(seconds=2), inbox_message_id=stale.id)
+    assert claim is not None and claim["id"] == stale_turn
+    assert requeue_workflow_turn(
+        claim["id"],
+        claim["claim_token"],
+        claim["claim_generation"],
+        now=now + timedelta(seconds=2),
+    )
+    claim = claim_workflow_turn(root, now=now + timedelta(seconds=5), inbox_message_id=stale.id)
+    assert claim is not None and claim["id"] == stale_turn
+    assert requeue_workflow_turn(
+        claim["id"],
+        claim["claim_token"],
+        claim["claim_generation"],
+        now=now + timedelta(seconds=5),
+    )
+
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowTurnModel, stale_turn).state == "cancelled"
+        assert db.get(InboxModel, stale.id).status == "failed"
+        assert db.get(WorkflowModel, db.get(WorkflowTurnModel, stale_turn).workflow_id).status == (
+            "owner_gate"
+        )
+
+
+def test_f13_authoritative_child_terminalization_fences_pending_inbox(workflow_db):
+    """Result finalization closes the child and its exact transport together."""
+    parent = "parent-child-terminal-inbox-fence"
+    child = "child-terminal-inbox-fence"
+    _start_admitted_input(parent)
+    assert register_child_assignment(parent, child)
+    callback = _authorized_callback(child)
+    stale, stale_turn = _pending_inbox_turn(child, "late child transport")
+
+    notice, duplicate = create_child_assignment_result_message(
+        child, parent, "authoritative child result", **callback
+    )
+    assert notice is not None and duplicate is False
+
+    with database.SessionLocal() as db:
+        child_workflow = db.query(WorkflowModel).filter_by(root_terminal_id=child).one()
+        assert child_workflow.status == "terminal"
+        assert db.get(WorkflowTurnModel, stale_turn).state == "cancelled"
+        assert db.get(InboxModel, stale.id).status == "failed"
+
+
+def test_f13_restart_reconciles_closed_inbox_before_queued_owner_input_once(
+    workflow_db, monkeypatch
+):
+    """Pre-fix persisted FIFO state advances automatically and exactly once."""
+    parent = "parent-closed-inbox-restart"
+    _start_admitted_input(parent)
+    stale = create_inbox_message("sender", parent, "stale closed-workflow input")
+    stale_turn = database.ensure_workflow_turn_for_inbox(stale.id)
+    assert stale_turn is not None
+    assert set_workflow_terminal_state(parent, "terminal", "closed before restart")
+
+    owner_payload = "resume the queued owner mission"
+    with database.SessionLocal() as db:
+        # Reconstruct the durable state left by a pre-fix process at restart.
+        db.get(InboxModel, stale.id).status = "pending"
+        replacement = WorkflowModel(root_terminal_id=parent, status="open")
+        db.add(replacement)
+        db.flush()
+        owner_turn = WorkflowTurnModel(
+            workflow_id=replacement.id,
+            kind="external_input",
+            dedupe_key="external:pre-fix-persisted-owner",
+            payload=owner_payload,
+            state="queued",
+        )
+        db.add(owner_turn)
+        db.commit()
+        owner_turn_id = owner_turn.id
+
+    provider = MagicMock()
+    provider.get_status.return_value = TerminalStatus.IDLE
+    provider.is_process_alive.return_value = True
+    terminal_state = {"lifecycle": "running", "status": TerminalStatus.COMPLETED.value}
+    with (
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+            return_value=provider,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.workflow_service.terminal_service.get_terminal",
+            return_value=terminal_state,
+        ),
+        patch.object(workflow_service, "reconcile_open_workflows", return_value=0),
+        patch("cli_agent_orchestrator.services.inbox_service.terminal_service.send_input") as send,
+    ):
+        assert reconcile_pending_messages() == 1
+        assert claim_workflow_turn_receipt(parent, owner_turn_id)
+        assert reconcile_pending_messages() == 0
+
+    assert send.call_count == 1
+    assert send.call_args.args[1].endswith(owner_payload)
+    assert f"logical-turn={owner_turn_id}" in send.call_args.args[1]
+    with database.SessionLocal() as db:
+        assert db.get(InboxModel, stale.id).status == "failed"
+        persisted_owner = db.get(WorkflowTurnModel, owner_turn_id)
+        assert persisted_owner is not None
+        assert persisted_owner.state == "sent"
 
 
 def test_f13_cancelled_result_notice_cannot_strand_next_open_handoff_boundary(workflow_db):
@@ -2094,6 +2296,7 @@ def test_f13_reconnect_attempt_budget_survives_restart_and_stops_launches(
 ):
     root = "root-sidecar-attempt-exhaustion"
     turn_id = _start_admitted_input(root)
+    stale, stale_turn = _pending_inbox_turn(root, "closed by reconnect exhaustion")
     now = datetime(2026, 8, 22, 14, 0, 0)
 
     tokens = []
@@ -2135,6 +2338,8 @@ def test_f13_reconnect_attempt_budget_survives_restart_and_stops_launches(
         )
         assert [attempt.state for attempt in attempts] == ["failed", "failed", "failed"]
         assert all(attempt.finished_at is not None for attempt in attempts)
+        assert db.get(WorkflowTurnModel, stale_turn).state == "cancelled"
+        assert db.get(InboxModel, stale.id).status == "failed"
 
     mock_terminal.get_terminal.return_value = {
         "status": TerminalStatus.COMPLETED.value,
@@ -2143,6 +2348,40 @@ def test_f13_reconnect_attempt_budget_survives_restart_and_stops_launches(
     mock_terminal.provider_runtime_sidecar_reconnect_required.return_value = True
     assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=11)) is False
     mock_terminal.request_provider_runtime_sidecar_reconnect.assert_not_called()
+
+
+def test_f13_historical_reconnect_exhaustion_fences_pending_inbox(workflow_db):
+    """Recovered exhausted attempt history closes transport in the same transaction."""
+    root = "root-historical-reconnect-exhaustion"
+    active_turn = _start_admitted_input(root)
+    stale, stale_turn = _pending_inbox_turn(root, "pre-restart reconnect transport")
+    now = datetime(2026, 8, 24, 20, 0, 0)
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        for attempt_number in range(1, 4):
+            db.add(
+                WorkflowProviderReconnectAttemptModel(
+                    workflow_id=workflow.id,
+                    workflow_turn_id=active_turn,
+                    root_terminal_id=root,
+                    attempt_number=attempt_number,
+                    attempt_token=f"historical-attempt-{attempt_number}",
+                    state="failed",
+                    outcome_code="process_exited_before_runtime_ready",
+                    created_at=now,
+                    finished_at=now,
+                    updated_at=now,
+                )
+            )
+        db.commit()
+
+    exhausted = database.claim_workflow_provider_reconnect(root, now=now + timedelta(seconds=1))
+    assert exhausted == {"exhausted": True, "turn_id": active_turn, "attempt_count": 3}
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        assert workflow.status == "owner_gate"
+        assert db.get(WorkflowTurnModel, stale_turn).state == "cancelled"
+        assert db.get(InboxModel, stale.id).status == "failed"
 
 
 def test_f13_reconnect_and_input_transport_have_one_terminal_mutation_owner(workflow_db):
@@ -3465,6 +3704,7 @@ def test_f13_repeated_no_progress_final_hits_durable_owner_visible_circuit_break
         assert turn is not None and turn["id"] == successor
         _admit_sent_continuation(root, turn, current + timedelta(seconds=40))
 
+    stale, stale_turn = _pending_inbox_turn(root, "closed by open-final circuit breaker")
     # A fresh DB session models restart recovery: the third no-progress final
     # atomically finishes the paid turn and enters a visible terminal state.
     assert observe_workflow_final(root, now=now + timedelta(seconds=120)) is None
@@ -3478,6 +3718,8 @@ def test_f13_repeated_no_progress_final_hits_durable_owner_visible_circuit_break
             db.query(WorkflowTurnModel).filter_by(workflow_id=workflow.id, state="queued").count()
             == 0
         )
+        assert db.get(WorkflowTurnModel, stale_turn).state == "cancelled"
+        assert db.get(InboxModel, stale.id).status == "failed"
     assert len(notified) == 1 and notified[0][:2] == (root, "owner_attention")
 
     # Deliberate owner input starts a new workflow instead of reviving the

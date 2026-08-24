@@ -5038,6 +5038,106 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
         return False
 
 
+def update_pending_message_status(message_id: int, status: MessageStatus) -> bool:
+    """CAS one exact PENDING Inbox transport to a terminal delivery state."""
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        changed = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id == message_id,
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .update(
+                {InboxModel.status: status.value},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return changed == 1
+
+
+def _fail_closed_workflow_inbox_transports_in_transaction(
+    db: Any,
+    receiver_id: Optional[str] = None,
+    workflow_id: Optional[int] = None,
+) -> int:
+    """Terminalize pending transports whose exact workflow is no longer OPEN.
+
+    Inbox is transport rather than semantic workflow authority. Once the
+    workflow bound through ``WorkflowTurnModel.inbox_message_id`` reaches a
+    terminal state, that row can never be delivered or rebound into a later
+    workflow. Leaving it pending would make it a false FIFO predecessor and
+    suppress a newer durable owner turn forever.
+    """
+    query = (
+        db.query(InboxModel.id)
+        .join(
+            WorkflowTurnModel,
+            WorkflowTurnModel.inbox_message_id == InboxModel.id,
+        )
+        .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+        .filter(
+            InboxModel.status == MessageStatus.PENDING.value,
+            WorkflowModel.status != WORKFLOW_OPEN,
+        )
+    )
+    if receiver_id is not None:
+        query = query.filter(InboxModel.receiver_id == receiver_id)
+    if workflow_id is not None:
+        query = query.filter(WorkflowModel.id == workflow_id)
+    stale_ids = [int(row[0]) for row in query.all()]
+    if not stale_ids:
+        return 0
+    return cast(
+        int,
+        db.query(InboxModel)
+        .filter(
+            InboxModel.id.in_(stale_ids),
+            InboxModel.status == MessageStatus.PENDING.value,
+        )
+        .update(
+            {InboxModel.status: MessageStatus.FAILED.value},
+            synchronize_session=False,
+        ),
+    )
+
+
+def fail_pending_closed_workflow_inbox_transport(message_id: int) -> bool:
+    """CAS one stale closed-workflow transport without overwriting delivery."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        changed = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.id == message_id,
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.id.in_(
+                    db.query(WorkflowTurnModel.inbox_message_id)
+                    .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+                    .filter(WorkflowModel.status != WORKFLOW_OPEN)
+                ),
+            )
+            .update(
+                {InboxModel.status: MessageStatus.FAILED.value},
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return changed == 1
+
+
+def reconcile_closed_workflow_inbox_transports(receiver_id: Optional[str] = None) -> int:
+    """Fail exact closed-workflow Inbox rows before provider FIFO selection."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        changed = _fail_closed_workflow_inbox_transports_in_transaction(db, receiver_id)
+        db.commit()
+        return changed
+
+
 def keep_managed_handoff_continuation_retryable(message_id: int) -> bool:
     """Retain one failed managed continuation on the normal pending retry path.
 
@@ -5389,6 +5489,11 @@ def _prepare_workflow_input(
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         if not _retirement_quiescence_allows_commit(db, root_terminal_id):
             return None
+        # Terminal workflow turns can leave their ordinary Inbox transport
+        # pending. That row is historical, not predecessor authority for a
+        # deliberate replacement workflow, and must never force the new owner
+        # input into a queue that only the ineligible row can head.
+        _fail_closed_workflow_inbox_transports_in_transaction(db, root_terminal_id)
         workflow = _open_workflow(db, root_terminal_id, create=True)
         assert workflow is not None
         if workflow.status != WORKFLOW_OPEN:
@@ -6811,6 +6916,7 @@ def claim_workflow_provider_reconnect(
                 synchronize_session=False,
             )
             _cancel_parent_assignments(db, root_terminal_id, now)
+            _fail_closed_workflow_inbox_transports_in_transaction(db, workflow_id=int(workflow.id))
             db.query(ProviderExecutionLeaseModel).filter_by(terminal_id=root_terminal_id).delete(
                 synchronize_session=False
             )
@@ -7431,6 +7537,7 @@ def fail_workflow_provider_reconnect_attempt(
                 synchronize_session=False,
             )
             _cancel_parent_assignments(db, root_terminal_id, now)
+            _fail_closed_workflow_inbox_transports_in_transaction(db, workflow_id=int(workflow.id))
             db.query(ProviderExecutionLeaseModel).filter_by(terminal_id=root_terminal_id).delete(
                 synchronize_session=False
             )
@@ -7761,6 +7868,9 @@ def observe_workflow_final(
                     )
                 )
                 _cancel_parent_assignments(db, root_terminal_id, now)
+                _fail_closed_workflow_inbox_transports_in_transaction(
+                    db, workflow_id=int(workflow.id)
+                )
                 db.query(ProviderExecutionLeaseModel).filter(
                     ProviderExecutionLeaseModel.terminal_id == root_terminal_id
                 ).delete(synchronize_session=False)
@@ -8098,6 +8208,8 @@ def requeue_workflow_turn(
         if workflow_updated != 1:
             db.rollback()
             return False
+        if owner_gate:
+            _fail_closed_workflow_inbox_transports_in_transaction(db, workflow_id=int(workflow.id))
         db.commit()
         if owner_gate:
             _dispatch_workflow_notification_fail_open(
@@ -8347,6 +8459,7 @@ def set_workflow_terminal_state(
                 synchronize_session=False,
             )
         )
+        _fail_closed_workflow_inbox_transports_in_transaction(db, workflow_id=int(workflow.id))
         # State transition and callback fence share this transaction: no late
         # child result can observe a terminal workflow while retaining a live
         # assignment edge that would wake it again.
@@ -8410,6 +8523,11 @@ def _cancel_protected_workflows_in_transaction(
             )
         )
     for terminal_id in normalized:
+        # Deletion and historical lifecycle paths share this cancellation
+        # helper. Their pending Inbox rows are transport for the workflows we
+        # just closed, not authority which may block a later workflow rooted
+        # at the same durable terminal identity.
+        _fail_closed_workflow_inbox_transports_in_transaction(db, terminal_id)
         # A session/terminal removal can race a child callback. Fence every
         # active edge and provider execution in the same transaction.
         _cancel_parent_assignments(db, terminal_id, now)
@@ -10140,6 +10258,7 @@ def _terminalize_child_after_authoritative_result(
     if workflow is None:
         return True
     if workflow.status == WORKFLOW_TERMINAL:
+        _fail_closed_workflow_inbox_transports_in_transaction(db, workflow_id=int(workflow.id))
         return True
     if workflow.status != WORKFLOW_OPEN:
         return False
@@ -10161,6 +10280,7 @@ def _terminalize_child_after_authoritative_result(
             synchronize_session=False,
         )
     )
+    _fail_closed_workflow_inbox_transports_in_transaction(db, workflow_id=int(workflow.id))
     return True
 
 

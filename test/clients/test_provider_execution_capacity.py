@@ -14,6 +14,7 @@ from cli_agent_orchestrator.clients.database import (
     TerminalModel,
     WorkflowTurnModel,
     acquire_provider_execution,
+    acquire_provider_execution_decision,
     list_provider_execution_leases,
     mark_terminal_runtime_exited,
     release_provider_execution,
@@ -80,6 +81,126 @@ def test_provider_execution_admission_is_atomic_and_wakes_after_release(capacity
     waiting_index = int(waiting[0].split("-")[1])
     assert acquire_provider_execution(waiting[0], 100 + waiting_index, 3) is True
     assert len(list_provider_execution_leases()) == 3
+
+
+def test_provider_admission_reports_runtime_busy_with_available_capacity(capacity_db):
+    """A pane-operation conflict is not mislabeled as slot exhaustion."""
+    turn_id = database.start_workflow_input("term-0")
+    assert turn_id is not None
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, "term-0")
+        terminal.runtime_operation_kind = "transport"
+        terminal.runtime_operation_token = "busy-token"
+        terminal.runtime_operation_expires_at = datetime.now() + timedelta(minutes=1)
+        db.commit()
+
+    decision = acquire_provider_execution_decision("term-0", turn_id, 3)
+
+    assert decision == {
+        "acquired": False,
+        "reason_code": "TERMINAL_RUNTIME_OPERATION_BUSY",
+        "active": 0,
+        "limit": 3,
+        "available": 3,
+        "draining": False,
+        "certain": True,
+    }
+    assert list_provider_execution_leases() == []
+
+
+def test_provider_admission_reports_only_true_saturation_as_capacity(capacity_db):
+    for index in range(3):
+        assert acquire_provider_execution(f"term-{index}", 500 + index, 3)
+
+    decision = acquire_provider_execution_decision("term-3", 503, 3)
+
+    assert decision["acquired"] is False
+    assert decision["reason_code"] == "PROVIDER_EXECUTION_CAPACITY_EXHAUSTED"
+    assert decision["active"] == 3
+    assert decision["limit"] == 3
+    assert decision["available"] == 0
+
+
+def test_operations_admission_uses_same_atomic_capacity_snapshot(capacity_db, monkeypatch):
+    turn_id = database.start_workflow_input("term-0")
+    assert turn_id is not None
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, "term-0")
+        terminal.runtime_operation_kind = "transport"
+        terminal.runtime_operation_token = "busy-token"
+        terminal.runtime_operation_expires_at = datetime.now() + timedelta(minutes=1)
+        db.commit()
+    monkeypatch.setattr(
+        operations_service,
+        "require_resource_admission",
+        lambda _config: {
+            "provider_executions": {
+                "active": 0,
+                "limit": 3,
+                "available": 3,
+                "draining": False,
+                "certain": True,
+            }
+        },
+    )
+
+    with pytest.raises(operations_service.AdmissionDenied) as denied:
+        operations_service.acquire_provider_execution_slot(
+            "term-0",
+            turn_id,
+            config={"max_provider_executions": 3},
+        )
+
+    assert denied.value.reason_code == "TERMINAL_RUNTIME_OPERATION_BUSY"
+    assert denied.value.status["provider_executions"] == {
+        "active": 0,
+        "limit": 3,
+        "available": 3,
+        "draining": False,
+        "certain": True,
+    }
+
+
+def test_runtime_release_wakes_queued_input_once_without_owner_resend(capacity_db, monkeypatch):
+    message = database.create_inbox_message("owner", "term-0", "continue once")
+    provider = SimpleNamespace(
+        paste_enter_count=1,
+        get_status=lambda: TerminalStatus.IDLE,
+        is_process_alive=lambda: True,
+        mark_input_received=lambda: None,
+    )
+    monkeypatch.setattr(inbox_service.provider_manager, "get_provider", lambda *_: provider)
+    monkeypatch.setattr(terminal_service.provider_manager, "get_provider", lambda *_: provider)
+    monkeypatch.setattr(
+        operations_service,
+        "load_operations_config",
+        lambda: {
+            "max_resident_supervisors": 5,
+            "max_provider_executions": 3,
+            "max_work_contexts": 2,
+            "max_heavy_execution_slots": 1,
+        },
+    )
+    monkeypatch.setattr(operations_service, "require_resource_admission", lambda *_: {})
+    monkeypatch.setattr(workflow_service, "reconcile_open_workflows", lambda *_args, **_kw: 0)
+    sent: list[str] = []
+    monkeypatch.setattr(
+        terminal_service.tmux_client,
+        "send_keys",
+        lambda _session, _window, payload, **_kwargs: sent.append(payload),
+    )
+    monkeypatch.setattr(terminal_service.tmux_client, "send_special_key", lambda *_args: None)
+
+    # The control-key transport owns the pane until its finally block. Its
+    # committed release immediately wakes the durable owner input.
+    assert terminal_service.send_special_key("term-0", "C-c") is True
+    assert len(sent) == 1
+    assert "continue once" in sent[0]
+    with database.SessionLocal() as db:
+        assert db.get(InboxModel, message.id).status == "delivered"
+
+    assert inbox_service.reconcile_provider_execution_queue() == 0
+    assert len(sent) == 1
 
 
 def test_provider_execution_release_is_exactly_once_on_failure_and_exit(capacity_db):

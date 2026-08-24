@@ -960,6 +960,20 @@ def create_terminal(
         context_role=resolved_role,
         project_id=project_context.get("id") if project_context else None,
     ):
+        # Housekeeping holds this same lifecycle fence while retiring linked
+        # worktrees. A caller may have resolved its directory before waiting
+        # for the fence, so prove that authority again before creating tmux or
+        # publishing a writer lease.
+        try:
+            current_source_worktree = _canonical_worktree(working_directory)
+        except (FileNotFoundError, ValueError) as exc:
+            from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+            raise AdmissionDenied("WORKTREE_AUTHORITY_CHANGED", {}) from exc
+        if current_source_worktree != source_worktree:
+            from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+            raise AdmissionDenied("WORKTREE_AUTHORITY_CHANGED", {})
         if managed_worktree_kind is not None:
             managed = create_managed_worktree(source_worktree, terminal_id, managed_worktree_kind)
         launch_worktree = managed.path if managed is not None else source_worktree
@@ -1398,6 +1412,7 @@ def send_input(
     bracketed paste triggers multi-line mode).
     """
     runtime_operation_token: str | None = None
+    provider_execution_released = False
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
@@ -1442,8 +1457,9 @@ def send_input(
             transport_accepted = True
         finally:
             if execution_acquired and not transport_accepted:
-                if release_provider_execution(terminal_id, logical_turn_id):
-                    _wake_queued_provider_execution(registry)
+                provider_execution_released = release_provider_execution(
+                    terminal_id, logical_turn_id
+                )
 
         # Notify the provider that external input was received.
         # This allows providers to adjust status
@@ -1501,7 +1517,11 @@ def send_input(
         raise
     finally:
         if runtime_operation_token is not None and runtime_operation_claim_token is None:
-            release_terminal_runtime_operation(terminal_id, runtime_operation_token)
+            if (
+                release_terminal_runtime_operation(terminal_id, runtime_operation_token)
+                or provider_execution_released
+            ):
+                _wake_queued_provider_execution(registry)
 
 
 def send_special_key(terminal_id: str, key: str) -> bool:
@@ -1545,7 +1565,8 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         raise
     finally:
         if runtime_operation_token is not None:
-            release_terminal_runtime_operation(terminal_id, runtime_operation_token)
+            if release_terminal_runtime_operation(terminal_id, runtime_operation_token):
+                _wake_queued_provider_execution()
 
 
 def prepare_terminal_for_destruction(terminal_id: str) -> None:

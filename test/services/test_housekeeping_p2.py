@@ -557,6 +557,56 @@ def test_plan_identity_is_content_addressed_not_timestamp_addressed(tmp_path):
     assert changed.plan_id != first.plan_id
 
 
+def test_protected_byte_drift_does_not_churn_plan_but_actionability_does(tmp_path):
+    protected = HousekeepingCandidate(
+        category="tools",
+        path=str(tmp_path / "tools"),
+        canonical_identity="tools:inventory",
+        fingerprint="a" * 64,
+        bytes=100,
+        estimated_reclaim_bytes=0,
+        action="preserve",
+        retention_reason="inventory_only",
+        protection_reason="TOOLS_RETENTION_AUTHORITY_UNKNOWN",
+        resource_kind="inventory",
+    )
+    first = finalize_plan(
+        generated_at=NOW,
+        mode="pressure",
+        root=tmp_path,
+        candidates=[protected],
+        warnings=[],
+    )
+    drifted = finalize_plan(
+        generated_at=NOW + 1,
+        mode="pressure",
+        root=tmp_path,
+        candidates=[
+            HousekeepingCandidate(**{**protected.as_dict(), "fingerprint": "b" * 64, "bytes": 200})
+        ],
+        warnings=[],
+    )
+    actionable = finalize_plan(
+        generated_at=NOW + 1,
+        mode="pressure",
+        root=tmp_path,
+        candidates=[
+            HousekeepingCandidate(
+                **{
+                    **protected.as_dict(),
+                    "action": "retire",
+                    "protection_reason": None,
+                    "estimated_reclaim_bytes": 200,
+                }
+            )
+        ],
+        warnings=[],
+    )
+
+    assert drifted.plan_id == first.plan_id
+    assert actionable.plan_id != first.plan_id
+
+
 def test_plan_is_structured_and_dry_run_compression_estimate_is_nonzero(tmp_path, monkeypatch):
     log = tmp_path / "state/cao/logs/cao_old.log"
     log.parent.mkdir(parents=True)
@@ -745,10 +795,14 @@ def test_browser_cache_cleanup_is_reference_aware_and_plan_driven(tmp_path, monk
     cache = tmp_path / "browser-cache"
     referenced = cache / "chromium-2222"
     stale = cache / "chromium-1111"
+    recent = cache / "chromium-3333"
     for path in (referenced, stale):
         path.mkdir(parents=True)
         (path / "binary").write_bytes(b"rebuildable")
         _age(path, 300)
+    recent.mkdir(parents=True)
+    (recent / "binary").write_bytes(b"rebuildable")
+    _age(recent, 30)
     config = _config(tmp_path)
     config.update(
         playwright_browser_cache=str(cache),
@@ -772,6 +826,7 @@ def test_browser_cache_cleanup_is_reference_aware_and_plan_driven(tmp_path, monk
     }
     assert by_name["chromium-2222"].protection_reason == "BROWSER_REVISION_REFERENCED"
     assert by_name["chromium-1111"].action == "delete"
+    assert by_name["chromium-3333"].protection_reason == "BROWSER_WITHIN_RETENTION"
 
     report = execute_plan(
         plan,
@@ -943,8 +998,8 @@ def test_release_gc_preserves_active_rollback_and_backups_and_removes_only_stale
     )
 
     by_name = {Path(item.path).name: item for item in plan.candidates}
-    assert by_name["active"].protection_reason == "ACTIVE_OR_ROLLBACK_RELEASE"
-    assert by_name["rollback"].protection_reason == "ACTIVE_OR_ROLLBACK_RELEASE"
+    assert by_name["active"].protection_reason == "ACTIVE_RELEASE"
+    assert by_name["rollback"].protection_reason == "CANONICAL_ROLLBACK_RELEASE"
     assert by_name["stale"].action == "delete"
     assert by_name["backups"].protection_reason == "BACKUP_PROTECTED"
 
@@ -990,9 +1045,9 @@ def test_active_link_target_remains_protected_after_candidate_metadata_eviction(
     )
     by_name = {Path(item.path).name: item for item in plan.candidates}
 
-    assert by_name["linked-active"].protection_reason == "ACTIVE_OR_ROLLBACK_RELEASE"
-    assert by_name["newer-one"].protection_reason == "ACTIVE_OR_ROLLBACK_RELEASE"
-    assert by_name["newer-two"].protection_reason == "ACTIVE_OR_ROLLBACK_RELEASE"
+    assert by_name["linked-active"].protection_reason == "ACTIVE_RELEASE"
+    assert by_name["newer-one"].protection_reason == "CANDIDATE_RELEASE"
+    assert by_name["newer-two"].protection_reason == "CANDIDATE_RELEASE"
     assert by_name["stale"].action == "delete"
     assert "active_release_metadata_diverged" in plan.warnings
 

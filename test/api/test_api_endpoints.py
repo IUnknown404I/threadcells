@@ -1571,6 +1571,46 @@ class TestSendTerminalInput:
         }
         queue.assert_called_once_with("abcd1234", 76, "durable task")
 
+    def test_runtime_busy_queue_does_not_claim_capacity_exhaustion(self, client):
+        from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+        capacity = {
+            "provider_executions": {
+                "active": 0,
+                "limit": 3,
+                "available": 3,
+                "draining": False,
+                "certain": True,
+            }
+        }
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.workflow_service.prepare_external_input",
+                return_value={"turn_id": 77, "queued": False},
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.queue_workflow_input_for_provider",
+                return_value=True,
+            ) as queue,
+        ):
+            mock_svc.send_input.side_effect = AdmissionDenied(
+                "TERMINAL_RUNTIME_OPERATION_BUSY", capacity
+            )
+            response = client.post(
+                "/terminals/abcd1234/workflow-input",
+                json={"message": "durable owner turn"},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": True,
+            "queued": True,
+            "status": "queued_provider_execution",
+            "reason_code": "TERMINAL_RUNTIME_OPERATION_BUSY",
+        }
+        queue.assert_called_once_with("abcd1234", 77, "durable owner turn")
+
     def test_runtime_recovery_queues_external_input_without_physical_send(self, client):
         with (
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
@@ -1956,8 +1996,8 @@ class TestFlowDaemon:
 
 class TestWorkflowDaemon:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("failed_reconciliation", ["handoff", "root"])
-    async def test_workflow_daemon_reconciles_handoffs_before_root_and_isolates_failures(
+    @pytest.mark.parametrize("failed_reconciliation", ["handoff", "queue"])
+    async def test_workflow_daemon_reconciles_handoffs_before_queue_and_isolates_failures(
         self, failed_reconciliation
     ):
         """One failed reconciliation cannot suppress the other in the same one-second tick."""
@@ -1968,10 +2008,10 @@ class TestWorkflowDaemon:
             if failed_reconciliation == "handoff":
                 raise RuntimeError("handoff failure")
 
-        def reconcile_root(_registry=None):
-            calls.append("root")
-            if failed_reconciliation == "root":
-                raise RuntimeError("root failure")
+        def reconcile_queue(_registry=None):
+            calls.append("queue")
+            if failed_reconciliation == "queue":
+                raise RuntimeError("queue failure")
 
         with (
             patch(
@@ -1979,15 +2019,15 @@ class TestWorkflowDaemon:
                 side_effect=reconcile_handoffs,
             ) as handoffs,
             patch(
-                "cli_agent_orchestrator.api.main.workflow_service.reconcile_open_workflows",
-                side_effect=reconcile_root,
-            ) as root,
+                "cli_agent_orchestrator.api.main.inbox_service.reconcile_provider_execution_queue",
+                side_effect=reconcile_queue,
+            ) as queue,
         ):
             assert await _workflow_reconciliation_tick(None, False) is False
 
-        assert calls == ["handoff", "root"]
+        assert calls == ["handoff", "queue"]
         handoffs.assert_called_once_with(None)
-        root.assert_called_once_with(None)
+        queue.assert_called_once_with(None)
 
 
 # ── lifespan ─────────────────────────────────────────────────────────

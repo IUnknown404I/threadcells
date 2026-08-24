@@ -18,12 +18,24 @@ Depending on age and ownership evidence, a plan can include:
 - inactive candidates/releases represented by canonical staging metadata.
 - exact closed-terminal runtime panes and process descendants whose durable terminal is already closed and whose process identity still matches;
 - cleanup-pending managed child worktrees after their durable result/retirement boundary is acknowledged and revalidated.
+- clean inactive linked worktrees whose HEAD is already contained in an explicitly configured durable Git ref;
+- marked reproducible caches/generated evidence located directly under an approved cache root, after their owner is dead and retention elapsed.
 
-Housekeeping does not blindly delete source repositories, active or unknown worktrees, running terminals, open files, current/rollback releases, staged candidates, or backups. Retiring a closed terminal runtime does not delete its durable session, agent, Inbox, result, or workflow history.
+Housekeeping does not blindly delete source repositories, active or unknown worktrees, running terminals, open files, current/rollback releases, staged candidates, or backups. Linked worktrees are retired through `git worktree remove` and `git worktree prune`, never generic recursive deletion. Retiring a closed terminal runtime does not delete its durable session, agent, Inbox, result, or workflow history.
+
+A reproducible directory must be an immediate child of a configured root and carry `.threadcells-reproducible.json`:
+
+```json
+{"schema_version":1,"owner":"threadcells","kind":"cache","created_at":1790000000,"owner_pid":12345}
+```
+
+Supported kinds are `cache`, `generated`, `test_evidence`, and `candidate`. Missing or invalid markers, symlinks, path escapes, live owners, and paths inside the retention window remain protected.
+
+Deployments may additionally name exact ThreadCells-owned cache prefixes for backward-compatible CI caches. Those entries remain constrained to direct children of the approved runtime-owned root and require elapsed retention plus the same active-process and execute-time identity checks. Unlisted prefixes, including ambiguous release-candidate artifacts, remain protected.
 
 ## Plan first, execute second
 
-A dry-run plan is read-only. Each candidate includes its category, canonical identity/fingerprint, proposed action, estimated bytes when known, retention reason, and protection reason.
+A dry-run plan is read-only. Each candidate includes its category, canonical identity/fingerprint, proposed action, total bytes, estimated reclaim bytes when known, retention reason, and protection reason. Class summaries separately report actionable/reclaimable and preserved/protected footprints, so a large protected class is not hidden as zero bytes.
 
 ```text
 Inspect current state
@@ -77,7 +89,7 @@ Housekeeping changes and manual execution are protected by [Operator authorizati
 
 ## Disk-pressure behavior
 
-At YELLOW, inspect growth and run a dry plan. At RED, ThreadCells can admit a recovery-safe Housekeeping heavy lease even though ordinary heavy work may be denied. The cleanup still counts as one Heavy execution and does not bypass candidate protection.
+At YELLOW, inspect growth and run a dry plan. At RED, ThreadCells can admit a recovery-safe Housekeeping heavy lease even though ordinary heavy work may be denied. Pressure plans order the largest proven-safe candidates first and show dominant protected classes, but the cleanup still counts as one Heavy execution and does not bypass any candidate protection.
 
 Package-cache reclaim is reported as unknown/zero when the command cannot prove bytes; ThreadCells does not advertise guessed recovery.
 

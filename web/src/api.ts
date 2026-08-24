@@ -250,7 +250,7 @@ export interface OrchestrationCapacity {
   work_contexts: { active: number; limit: number; available: number; draining?: boolean; certain: boolean }
   heavy_executions: { active: number; limit: number; available: number; draining?: boolean; waiting: number | null }
   memory: { available_mib: number; swap_total_mib: number; swap_free_mib: number }
-  root_disk: { used_percent: number; free_gib: number }
+  root_disk: { state?: 'GREEN' | 'YELLOW' | 'RED' | 'CRITICAL'; used_percent: number; free_gib: number }
   memory_pressure: { some_avg10: number; full_avg10: number }
   cpu_load: { one_minute: number; cpu_count: number }
   housekeeping: { ok?: boolean; warnings?: string[] } | null
@@ -363,10 +363,21 @@ export type HousekeepingMode = 'frequent' | 'weekly' | 'pressure'
 export interface HousekeepingCandidate {
   canonical_identity: string
   category: string
-  action: 'preserve' | 'compress' | 'delete' | 'terminate' | 'prune'
+  action: 'preserve' | 'compress' | 'delete' | 'terminate' | 'prune' | 'retire'
+  bytes?: number
   estimated_reclaim_bytes: number
   retention_reason: string
   protection_reason: string | null
+  resource_kind?: string
+}
+
+export interface HousekeepingClassSummary {
+  candidate_count: number
+  actionable_count: number
+  reclaimable_bytes: number
+  preserved_count: number
+  preserved_bytes: number
+  protection_reasons: Record<string, number>
 }
 
 export interface HousekeepingPlan {
@@ -376,6 +387,7 @@ export interface HousekeepingPlan {
   mode: HousekeepingMode
   root: string
   reclaimable_bytes: number
+  class_summaries?: Record<string, HousekeepingClassSummary>
   warnings: string[]
   candidates: HousekeepingCandidate[]
 }

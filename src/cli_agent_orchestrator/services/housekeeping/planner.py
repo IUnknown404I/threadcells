@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -48,6 +49,8 @@ def _candidate(
     protection: ProtectedSet,
     estimated_reclaim: int | None = None,
     forced_protection: str | None = None,
+    measure_preserved: bool = False,
+    preserved_size: int | None = None,
 ) -> HousekeepingCandidate:
     protection_reason = forced_protection or protection.reason(path, category)
     resolved_action = "preserve" if protection_reason else action
@@ -62,7 +65,13 @@ def _candidate(
                 "mtime_ns": metadata.st_mtime_ns,
             }
         )
-        size = metadata.st_size if path.is_file() else 0
+        size = (
+            preserved_size
+            if preserved_size is not None
+            else (
+                metadata.st_size if path.is_file() else _tree_size(path) if measure_preserved else 0
+            )
+        )
     else:
         fingerprint, size = candidate_fingerprint(path)
     return HousekeepingCandidate(
@@ -102,7 +111,7 @@ def _resource_candidate(
         fingerprint=resource_fingerprint(fingerprint_payload),
         bytes=size,
         estimated_reclaim_bytes=(
-            size if resolved_action in {"delete", "terminate", "prune"} else 0
+            size if resolved_action in {"delete", "terminate", "prune", "retire"} else 0
         ),
         action=resolved_action,  # type: ignore[arg-type]
         retention_reason=retention_reason,
@@ -113,14 +122,39 @@ def _resource_candidate(
 
 
 def _tree_size(path: Path) -> int:
-    total = 0
+    return _tree_size_inventory(path)[0]
+
+
+def _tree_size_inventory(path: Path) -> tuple[int, bool]:
+    if path.is_file() and not path.is_symlink():
+        try:
+            return path.lstat().st_size, True
+        except OSError:
+            return 0, False
     try:
-        for child in path.rglob("*"):
-            if child.is_file() and not child.is_symlink():
-                total += child.lstat().st_size
-    except OSError:
-        return 0
-    return total
+        completed = subprocess.run(
+            ["du", "-sb", "--apparent-size", "--", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 0, False
+    first_line = completed.stdout.splitlines()[0] if completed.stdout else ""
+    raw_size, separator, _name = first_line.partition("\t")
+    try:
+        size = int(raw_size) if separator else 0
+    except ValueError:
+        size = 0
+    return size, completed.returncode == 0 and bool(separator)
+
+
+def _parallel_tree_sizes(paths: list[Path]) -> dict[Path, tuple[int, bool]]:
+    """Measure independent bounded roots concurrently and preserve input identity."""
+    workers = max(1, min(8, len(paths) or 1))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return dict(zip(paths, pool.map(_tree_size_inventory, paths), strict=True))
 
 
 def _ephemeral_marker(path: Path) -> dict[str, Any] | None:
@@ -234,47 +268,320 @@ def _plan_browser_cache(
 ) -> tuple[list[HousekeepingCandidate], list[str]]:
     if not policy.get("enabled"):
         return [], []
-    cache_value = config.get("playwright_browser_cache")
-    if not isinstance(cache_value, str) or not cache_value:
-        return [], []
-    cache = Path(cache_value)
-    if not cache.is_absolute() or not cache.is_dir():
-        return [], []
+    configured_caches = config.get("playwright_browser_caches")
+    if configured_caches is None:
+        configured_caches = [config.get("playwright_browser_cache")]
+    if not isinstance(configured_caches, list):
+        return [], ["browser_cache_roots_invalid"]
     referenced, certain = _referenced_browser_revisions(
         [str(item) for item in config.get("playwright_manifest_roots", [])]
     )
     warnings = [] if certain else ["browser_manifest_inventory_uncertain"]
     retention = int(policy["retain_minutes"])
     result: list[HousekeepingCandidate] = []
-    for path in sorted(cache.iterdir()):
+    for cache_value in configured_caches:
+        if not isinstance(cache_value, str) or not cache_value:
+            warnings.append("browser_cache_root_invalid")
+            continue
+        cache = Path(cache_value)
+        if not cache.is_absolute() or cache.is_symlink() or not cache.is_dir():
+            continue
         try:
-            match = re.fullmatch(r"[a-zA-Z_-]+-(\d+)", path.name)
-            if not match or path.is_symlink() or not path.is_dir():
+            inventory_paths = [
+                path
+                for path in sorted(cache.iterdir())
+                if re.fullmatch(r"[a-zA-Z_-]+-(\d+)", path.name)
+                and not path.is_symlink()
+                and path.is_dir()
+            ]
+        except OSError:
+            warnings.append("browser_cache_root_unreadable")
+            continue
+        measured = _parallel_tree_sizes(inventory_paths)
+        for path in inventory_paths:
+            try:
+                match = re.fullmatch(r"[a-zA-Z_-]+-(\d+)", path.name)
+                assert match is not None
+                reason = None
+                retention_reason = f"unreferenced_older_than_{retention}_minutes"
+                action = "delete"
+                if not certain:
+                    reason = "BROWSER_MANIFEST_INVENTORY_UNKNOWN"
+                    action = "preserve"
+                elif match.group(1) in referenced:
+                    reason = "BROWSER_REVISION_REFERENCED"
+                    action = "preserve"
+                    retention_reason = "referenced_by_installed_playwright"
+                elif not _older_than(path, now, retention):
+                    reason = "BROWSER_WITHIN_RETENTION"
+                    action = "preserve"
+                    retention_reason = "within_retention_window"
+                size, size_certain = measured[path]
+                if not size_certain:
+                    warnings.append("browser_cache_inventory_incomplete")
+                    reason = reason or "BROWSER_SIZE_INVENTORY_UNKNOWN"
+                    action = "preserve"
+                result.append(
+                    _candidate(
+                        path,
+                        category="browser_cache",
+                        action=action,
+                        retention_reason=retention_reason,
+                        protection=protection,
+                        forced_protection=reason,
+                        measure_preserved=True,
+                        preserved_size=size,
+                    )
+                )
+            except FileNotFoundError:
                 continue
-            if not _older_than(path, now, retention):
+    return result, warnings
+
+
+def _reproducible_marker(path: Path) -> dict[str, Any] | None:
+    marker = path / ".threadcells-reproducible.json"
+    try:
+        if marker.is_symlink() or not marker.is_file():
+            return None
+        value = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    if (
+        value.get("schema_version") != 1
+        or value.get("owner") != "threadcells"
+        or value.get("kind") not in {"cache", "generated", "test_evidence", "candidate"}
+        or isinstance(value.get("created_at"), bool)
+        or not isinstance(value.get("created_at"), (int, float))
+        or isinstance(value.get("owner_pid"), bool)
+        or not isinstance(value.get("owner_pid"), int)
+    ):
+        return None
+    return value
+
+
+def _plan_reproducible_caches(
+    config: Mapping[str, Any],
+    protection: ProtectedSet,
+    *,
+    now: float,
+    proc_root: Path,
+) -> tuple[list[HousekeepingCandidate], list[str]]:
+    """Inventory only direct children of explicitly approved cache roots."""
+    values = config.get("reproducible_cache_roots", [])
+    if not isinstance(values, list):
+        return [], ["reproducible_cache_roots_invalid"]
+    try:
+        runtime_uid = pwd.getpwnam(str(config["runtime_user"])).pw_uid
+    except (KeyError, TypeError):
+        return [], ["reproducible_cache_owner_unknown"]
+    retention = int(config.get("reproducible_cache_retain_minutes", 1440))
+    prefixes_raw = config.get("reproducible_cache_owned_prefixes", [])
+    prefixes: tuple[str, ...] = ()
+    prefix_warning: str | None = None
+    if (
+        isinstance(prefixes_raw, list)
+        and len(prefixes_raw) == len(set(prefixes_raw))
+        and all(
+            isinstance(value, str) and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]{1,62}-", value)
+            for value in prefixes_raw
+        )
+    ):
+        prefixes = tuple(prefixes_raw)
+    else:
+        prefix_warning = "reproducible_cache_owned_prefixes_invalid"
+    configured_browser_roots = config.get("playwright_browser_caches") or [
+        config.get("playwright_browser_cache")
+    ]
+    if not isinstance(configured_browser_roots, list):
+        configured_browser_roots = []
+    specialized_roots = {
+        Path(value).resolve(strict=False)
+        for value in configured_browser_roots
+        if isinstance(value, str) and Path(value).is_absolute()
+    }
+    specialized_roots.update(
+        Path(str(entry.get("path", ""))).resolve(strict=False)
+        for entry in config.get("package_caches", [])
+        if isinstance(entry, Mapping) and Path(str(entry.get("path", ""))).is_absolute()
+    )
+    result: list[HousekeepingCandidate] = []
+    warnings: list[str] = [prefix_warning] if prefix_warning else []
+    for value in values:
+        root = Path(str(value))
+        try:
+            resolved_root = root.resolve(strict=True)
+            if (
+                not root.is_absolute()
+                or root != resolved_root
+                or root.is_symlink()
+                or not root.is_dir()
+                or root.stat().st_uid != runtime_uid
+            ):
+                warnings.append("reproducible_cache_root_invalid")
                 continue
-            reason = None
-            retention_reason = f"unreferenced_older_than_{retention}_minutes"
-            action = "delete"
+            children = sorted(root.iterdir())
+        except OSError:
+            warnings.append("reproducible_cache_root_unreadable")
+            continue
+        inventory_paths: list[tuple[Path, Path]] = []
+        for path in children:
+            try:
+                if path.is_symlink():
+                    result.append(
+                        HousekeepingCandidate(
+                            category="reproducible_cache",
+                            path=str(path.absolute()),
+                            canonical_identity=f"reproducible_cache:{path.absolute()}",
+                            fingerprint=resource_fingerprint(
+                                {"path": str(path.absolute()), "symlink": True}
+                            ),
+                            bytes=path.lstat().st_size,
+                            estimated_reclaim_bytes=0,
+                            action="preserve",
+                            retention_reason="path_identity_invalid",
+                            protection_reason="REPRODUCIBLE_PATH_SYMLINK",
+                            resource_kind="reproducible_cache",
+                        )
+                    )
+                    continue
+                resolved = path.resolve(strict=True)
+                if resolved in specialized_roots:
+                    continue
+                if (
+                    not path.is_dir()
+                    or resolved.parent != resolved_root
+                    or path.stat().st_uid != runtime_uid
+                ):
+                    continue
+                inventory_paths.append((path, resolved))
+            except FileNotFoundError:
+                continue
+            except OSError:
+                warnings.append("reproducible_cache_candidate_unreadable")
+        measured = _parallel_tree_sizes([path for path, _resolved in inventory_paths])
+        for path, resolved in inventory_paths:
+            try:
+                marker = _reproducible_marker(path)
+                owned_prefix = next(
+                    (
+                        prefix
+                        for prefix in prefixes
+                        if path.name.startswith(prefix) and len(path.name) > len(prefix)
+                    ),
+                    None,
+                )
+                reason: str | None = None
+                action = "delete"
+                retention_reason = f"marked_older_than_{retention}_minutes"
+                if marker is None and owned_prefix is None:
+                    reason = "REPRODUCIBLE_MARKER_UNKNOWN"
+                    action = "preserve"
+                    retention_reason = "marker_unknown"
+                elif (
+                    float(marker["created_at"]) if marker is not None else path.lstat().st_mtime
+                ) > now - retention * 60:
+                    reason = "REPRODUCIBLE_WITHIN_RETENTION"
+                    action = "preserve"
+                    retention_reason = "within_retention_window"
+                elif marker is not None and _pid_alive(int(marker["owner_pid"]), proc_root):
+                    reason = "REPRODUCIBLE_OWNER_ACTIVE"
+                    action = "preserve"
+                    retention_reason = "marker_owner_active"
+                elif owned_prefix is not None:
+                    retention_reason = f"owned_prefix_older_than_{retention}_minutes"
+                reason = reason or protection.reason(path, "reproducible_cache")
+                if reason is not None:
+                    action = "preserve"
+                size, size_certain = measured[path]
+                if action == "delete":
+                    fingerprint, size = candidate_fingerprint(path)
+                else:
+                    if not size_certain:
+                        warnings.append("reproducible_cache_inventory_incomplete")
+                    metadata = path.lstat()
+                    fingerprint = resource_fingerprint(
+                        {
+                            "path": str(resolved),
+                            "device": metadata.st_dev,
+                            "inode": metadata.st_ino,
+                            "mode": metadata.st_mode,
+                            "size": size,
+                            "mtime_ns": metadata.st_mtime_ns,
+                        }
+                    )
+                result.append(
+                    HousekeepingCandidate(
+                        category="reproducible_cache",
+                        path=str(resolved),
+                        canonical_identity=f"reproducible_cache:{resolved}",
+                        fingerprint=fingerprint,
+                        bytes=size,
+                        estimated_reclaim_bytes=size if action == "delete" else 0,
+                        action=action,  # type: ignore[arg-type]
+                        retention_reason=retention_reason,
+                        protection_reason=reason,
+                        resource_kind="reproducible_cache",
+                        attributes=(("root", str(resolved_root)),),
+                    )
+                )
+            except FileNotFoundError:
+                continue
+            except OSError:
+                warnings.append("reproducible_cache_candidate_unreadable")
+    return result, warnings
+
+
+def _plan_protected_inventory(
+    config: Mapping[str, Any],
+) -> tuple[list[HousekeepingCandidate], list[str]]:
+    result: list[HousekeepingCandidate] = []
+    warnings: list[str] = []
+    values = config.get("protected_inventory_roots", [])
+    if not isinstance(values, list):
+        return [], ["protected_inventory_roots_invalid"]
+    inventories: list[tuple[Mapping[str, Any], Path, Path, str, str]] = []
+    for entry in values:
+        if not isinstance(entry, Mapping):
+            warnings.append("protected_inventory_entry_invalid")
+            continue
+        path = Path(str(entry.get("path", "")))
+        category = str(entry.get("category", "protected_storage"))
+        reason = str(entry.get("reason", "RETENTION_AUTHORITY_UNKNOWN"))
+        try:
+            if not path.is_absolute() or path.is_symlink() or not path.exists():
+                continue
+            inventories.append((entry, path, path.resolve(strict=True), category, reason))
+        except OSError:
+            warnings.append(f"protected_inventory_unreadable:{category}")
+    measured = _parallel_tree_sizes(
+        [path for _entry, path, _resolved, _category, _reason in inventories]
+    )
+    for entry, path, resolved, category, reason in inventories:
+        try:
+            size, certain = measured[path]
             if not certain:
-                reason = "BROWSER_MANIFEST_INVENTORY_UNKNOWN"
-                action = "preserve"
-            elif match.group(1) in referenced:
-                reason = "BROWSER_REVISION_REFERENCED"
-                action = "preserve"
-                retention_reason = "referenced_by_installed_playwright"
+                warnings.append(f"protected_inventory_incomplete:{category}")
             result.append(
-                _candidate(
-                    path,
-                    category="browser_cache",
-                    action=action,
-                    retention_reason=retention_reason,
-                    protection=protection,
-                    forced_protection=reason,
+                _resource_candidate(
+                    category=category,
+                    resource_kind="inventory",
+                    identity=str(resolved),
+                    fingerprint_payload={
+                        "path": str(resolved),
+                        "size": size,
+                        "mtime_ns": path.lstat().st_mtime_ns,
+                    },
+                    size=size,
+                    action="preserve",
+                    retention_reason="inventory_only",
+                    protection_reason=reason,
+                    attributes={"purpose": str(entry.get("purpose", "protected storage"))},
                 )
             )
-        except FileNotFoundError:
-            continue
+        except OSError:
+            warnings.append(f"protected_inventory_unreadable:{category}")
     return result, warnings
 
 
@@ -488,17 +795,91 @@ def _plan_docker(
     return result, warnings
 
 
+def package_command_running(name: str, proc_root: Path, runtime_uid: int) -> bool | None:
+    """Return whether the runtime owner has the package command or its script resident."""
+    script_names = {name, f"{name}.js", f"{name}.cjs", f"{name}-cli.js", f"{name}-cli.cjs"}
+    try:
+        processes = list(proc_root.iterdir())
+    except OSError:
+        return None
+    for process in processes:
+        if not process.name.isdigit():
+            continue
+        try:
+            if process.stat().st_uid != runtime_uid:
+                continue
+            arguments = (process / "cmdline").read_bytes().split(b"\0")
+            if any(
+                Path(os.fsdecode(argument)).name in script_names
+                for argument in arguments
+                if argument
+            ):
+                return True
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+    return False
+
+
+def package_command_bound_to_path(
+    command: object,
+    *,
+    path_argument: object,
+    path: Path,
+) -> bool:
+    """Require an explicit command option to bind pruning to the planned root."""
+    if (
+        not isinstance(command, list)
+        or not command
+        or not all(isinstance(argument, str) and argument for argument in command)
+        or not isinstance(path_argument, str)
+        or not path_argument.startswith("--")
+        or command.count(path_argument) != 1
+    ):
+        return False
+    index = command.index(path_argument)
+    if index + 1 >= len(command):
+        return False
+    value = Path(command[index + 1])
+    return value.is_absolute() and value.resolve(strict=False) == path
+
+
 def _plan_package_caches(
-    config: Mapping[str, Any], policy: Mapping[str, Any]
+    config: Mapping[str, Any], policy: Mapping[str, Any], *, proc_root: Path
 ) -> list[HousekeepingCandidate]:
     if not policy.get("enabled"):
         return []
     threshold = int(config.get("cache_prune_threshold_gib", 1)) * 1024**3
+    try:
+        runtime_uid = pwd.getpwnam(str(config["runtime_user"])).pw_uid
+    except (KeyError, TypeError):
+        runtime_uid = -1
+    browser_values = config.get("playwright_browser_caches")
+    if browser_values is None:
+        browser_values = [config.get("playwright_browser_cache")]
+    browser_roots = (
+        {
+            Path(value).resolve(strict=False)
+            for value in browser_values
+            if isinstance(value, str) and Path(value).is_absolute()
+        }
+        if isinstance(browser_values, list)
+        else set()
+    )
+    protected_inventory_roots = {
+        Path(str(entry.get("path", ""))).resolve(strict=False)
+        for entry in config.get("protected_inventory_roots", [])
+        if isinstance(entry, Mapping) and Path(str(entry.get("path", ""))).is_absolute()
+    }
     result: list[HousekeepingCandidate] = []
     for entry in config.get("package_caches", []):
         path = Path(str(entry.get("path", "")))
         command = entry.get("command")
+        path_argument = entry.get("path_argument")
         name = str(entry.get("name", ""))
+        entry_threshold = entry.get("minimum_bytes", threshold)
+        full_reclaim = entry.get("full_reclaim", False)
         if (
             not name
             or not path.is_absolute()
@@ -506,27 +887,75 @@ def _plan_package_caches(
             or not path.is_dir()
             or not isinstance(command, list)
             or not command
+            or not all(isinstance(argument, str) and argument for argument in command)
+            or isinstance(entry_threshold, bool)
+            or not isinstance(entry_threshold, int)
+            or entry_threshold < 1
+            or not isinstance(full_reclaim, bool)
         ):
             continue
-        size = _tree_size(path)
-        if size < threshold:
+        resolved = path.resolve(strict=True)
+        if resolved != path:
             continue
-        fingerprint, _ = candidate_fingerprint(path)
+        size, size_certain = _tree_size_inventory(path)
+        executable = shutil.which(command[0])
+        running = (
+            package_command_running(Path(executable).name, proc_root, runtime_uid)
+            if executable is not None and runtime_uid >= 0
+            else None
+        )
+        reason: str | None = None
+        if not size_certain:
+            reason = "PACKAGE_CACHE_SIZE_UNKNOWN"
+        elif any(
+            resolved == other or resolved in other.parents or other in resolved.parents
+            for other in (*browser_roots, *protected_inventory_roots)
+        ):
+            reason = "PACKAGE_CACHE_CLASS_OVERLAP"
+        elif not package_command_bound_to_path(
+            command,
+            path_argument=path_argument,
+            path=resolved,
+        ):
+            reason = "PACKAGE_CACHE_COMMAND_UNBOUND"
+        elif executable is None:
+            reason = "PACKAGE_CACHE_COMMAND_UNAVAILABLE"
+        elif running is None:
+            reason = "PACKAGE_CACHE_PROCESS_INVENTORY_UNKNOWN"
+        elif running:
+            reason = "PACKAGE_CACHE_OWNER_ACTIVE"
+        elif size < entry_threshold:
+            reason = "PACKAGE_CACHE_BELOW_THRESHOLD"
+        if reason is None:
+            fingerprint, _ = candidate_fingerprint(path)
+        else:
+            metadata = path.lstat()
+            fingerprint = resource_fingerprint(
+                {
+                    "path": str(resolved),
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                    "mode": metadata.st_mode,
+                    "size": size,
+                    "mtime_ns": metadata.st_mtime_ns,
+                }
+            )
         result.append(
             HousekeepingCandidate(
                 category="package_cache",
-                path=str(path.resolve()),
-                canonical_identity=f"package_cache:{name}:{path.resolve()}",
+                path=str(resolved),
+                canonical_identity=f"package_cache:{name}:{resolved}",
                 fingerprint=fingerprint,
                 bytes=size,
-                # Trusted cache commands decide their own safe subset. The
-                # footprint is known, but claiming all bytes as reclaimable
-                # would make a dry-run estimate dishonest.
-                estimated_reclaim_bytes=0,
-                action="prune",
-                retention_reason=f"over_{threshold}_bytes",
+                # A command explicitly declared as full-reclaim owns this
+                # bounded cache root and may truthfully advertise its entire
+                # footprint. Prune commands retain the conservative zero.
+                estimated_reclaim_bytes=size if full_reclaim and reason is None else 0,
+                action="preserve" if reason else "prune",
+                retention_reason=f"over_{entry_threshold}_bytes",
+                protection_reason=reason,
                 resource_kind="package_cache",
-                attributes=(("name", name),),
+                attributes=(("full_reclaim", str(full_reclaim).lower()), ("name", name)),
             )
         )
     return result
@@ -571,6 +1000,49 @@ def discover_runtime_candidates(
         *terminal_warnings,
         *retirement_warnings,
     ]
+
+
+def revalidate_runtime_candidate(
+    candidate: HousekeepingCandidate,
+    *,
+    root: Path,
+    config: Mapping[str, Any],
+    settings: Mapping[str, Any],
+    now: float,
+    open_inventory: Callable[[], tuple[set[Path], bool]],
+    proc_root: Path,
+    runner: Callable[..., Any],
+) -> HousekeepingCandidate | None:
+    """Rebuild only the lifecycle class needed for one execute-time check."""
+    policy = settings["policy"]
+    protection = resolve_protected_set(root, config, open_inventory=open_inventory)
+    if candidate.category == "browser_cache":
+        current, _warnings = _plan_browser_cache(
+            config, policy["browser_cache"], protection, now=now
+        )
+    elif candidate.category == "package_cache":
+        current = _plan_package_caches(config, policy["package_cache"], proc_root=proc_root)
+    elif candidate.category == "reproducible_cache":
+        current, _warnings = _plan_reproducible_caches(
+            config,
+            protection,
+            now=now,
+            proc_root=proc_root,
+        )
+    else:
+        current, _warnings = discover_runtime_candidates(
+            root=root,
+            config=config,
+            policy=policy,
+            now=now,
+            proc_root=proc_root,
+            runner=runner,
+            protection=protection,
+        )
+    return next(
+        (item for item in current if item.canonical_identity == candidate.canonical_identity),
+        None,
+    )
 
 
 def _plan_retirement_cleanups(
@@ -879,6 +1351,7 @@ def _plan_releases(
     ordered_directories = sorted(
         directories, key=lambda path: (path.lstat().st_mtime_ns, path.name), reverse=True
     )
+    measured = _parallel_tree_sizes(ordered_directories)
     result: list[HousekeepingCandidate] = []
     for index, path in enumerate(ordered_directories):
         marker_valid = _release_marker(path)
@@ -889,6 +1362,8 @@ def _plan_releases(
                 action="preserve",
                 retention_reason="release_marker_unknown",
                 protection=protection,
+                measure_preserved=True,
+                preserved_size=measured[path][0],
             )
             result.append(
                 HousekeepingCandidate(
@@ -913,6 +1388,8 @@ def _plan_releases(
                 action=action,
                 retention_reason=reason,
                 protection=protection,
+                measure_preserved=True,
+                preserved_size=measured[path][0],
             )
         )
     return result
@@ -946,25 +1423,68 @@ def build_plan(
     )
     candidates.extend(runtime_candidates)
     if mode in {"weekly", "pressure"}:
+        from .worktrees import plan_worktrees
+
+        worktrees, worktree_warnings = plan_worktrees(
+            config=config,
+            protection=protection,
+            runner=runner,
+        )
+        candidates.extend(worktrees)
+        runtime_warnings.extend(worktree_warnings)
         candidates.extend(_plan_releases(policy["releases"], protection, now=now))
         browser_candidates, browser_warnings = _plan_browser_cache(
             config, policy["browser_cache"], protection, now=now
         )
         candidates.extend(browser_candidates)
         runtime_warnings.extend(browser_warnings)
-        candidates.extend(_plan_package_caches(config, policy["package_cache"]))
+        candidates.extend(
+            _plan_package_caches(config, policy["package_cache"], proc_root=proc_root)
+        )
+        reproducible, reproducible_warnings = _plan_reproducible_caches(
+            config,
+            protection,
+            now=now,
+            proc_root=proc_root,
+        )
+        candidates.extend(reproducible)
+        runtime_warnings.extend(reproducible_warnings)
     backups = root / "backups"
     if backups.exists():
+        backup_size, backup_inventory_certain = _tree_size_inventory(backups)
         candidates.append(
-            _candidate(
-                backups,
+            _resource_candidate(
                 category="backups",
+                resource_kind="inventory",
+                identity=str(backups.resolve()),
+                fingerprint_payload={
+                    "path": str(backups.resolve()),
+                    "size": backup_size,
+                    "mtime_ns": backups.lstat().st_mtime_ns,
+                },
+                size=backup_size,
                 action="preserve",
                 retention_reason="inventory_only",
-                protection=protection,
+                protection_reason="BACKUP_PROTECTED",
+                attributes={"purpose": "recovery points and source snapshots"},
             )
         )
-    candidates.sort(key=lambda item: (item.category, item.canonical_identity))
+        if not backup_inventory_certain:
+            runtime_warnings.append("backup_inventory_incomplete")
+    protected_inventory, protected_warnings = _plan_protected_inventory(config)
+    candidates.extend(protected_inventory)
+    runtime_warnings.extend(protected_warnings)
+    if mode == "pressure":
+        candidates.sort(
+            key=lambda item: (
+                item.action == "preserve",
+                -item.estimated_reclaim_bytes if item.action != "preserve" else -item.bytes,
+                item.category,
+                item.canonical_identity,
+            )
+        )
+    else:
+        candidates.sort(key=lambda item: (item.category, item.canonical_identity))
     return finalize_plan(
         generated_at=now,
         mode=mode,

@@ -3796,14 +3796,18 @@ def release_worktree_writer_lease(terminal_id: str) -> bool:
         return changed
 
 
-def acquire_provider_execution(
+def acquire_provider_execution_decision(
     terminal_id: str, workflow_turn_id: int, limit: Optional[int] = None
-) -> bool:
-    """Atomically acquire one provider-turn slot, idempotently for one turn.
+) -> Dict[str, Any]:
+    """Atomically decide provider admission and return its capacity snapshot.
 
     SQLite's immediate transaction is the admission CAS: concurrent API and
     watchdog processes cannot both observe the last free slot and over-admit.
     A terminal owns at most one slot and a logical turn can execute only once.
+
+    The reason is intentionally decided inside the same transaction as the
+    capacity count.  Callers must not relabel terminal/turn lifecycle conflicts
+    as capacity exhaustion based on an earlier status projection.
     """
     _ensure_provider_execution_schema()
     with SessionLocal() as db:
@@ -3813,6 +3817,19 @@ def acquire_provider_execution(
         if effective_limit is None:
             db.rollback()
             raise RuntimeError("provider capacity settings are not initialized")
+        active = db.query(ProviderExecutionLeaseModel).count()
+
+        def decision(acquired: bool, reason_code: Optional[str] = None) -> Dict[str, Any]:
+            return {
+                "acquired": acquired,
+                "reason_code": reason_code,
+                "active": active,
+                "limit": effective_limit,
+                "available": max(0, effective_limit - active),
+                "draining": active > effective_limit,
+                "certain": True,
+            }
+
         existing = (
             db.query(ProviderExecutionLeaseModel)
             .filter(ProviderExecutionLeaseModel.terminal_id == terminal_id)
@@ -3821,7 +3838,10 @@ def acquire_provider_execution(
         if existing is not None:
             acquired = existing.workflow_turn_id == workflow_turn_id
             db.commit()
-            return acquired
+            return decision(
+                acquired,
+                None if acquired else "PROVIDER_EXECUTION_TERMINAL_BUSY",
+            )
         duplicate_turn = (
             db.query(ProviderExecutionLeaseModel)
             .filter(ProviderExecutionLeaseModel.workflow_turn_id == workflow_turn_id)
@@ -3829,18 +3849,28 @@ def acquire_provider_execution(
         )
         if duplicate_turn is not None:
             db.commit()
-            return False
-        active = db.query(ProviderExecutionLeaseModel).count()
+            return decision(False, "PROVIDER_EXECUTION_TURN_BUSY")
         if active >= effective_limit:
             db.commit()
-            return False
+            return decision(False, "PROVIDER_EXECUTION_CAPACITY_EXHAUSTED")
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
-        if terminal is None or terminal.runtime_lifecycle in ("exit_pending", "exited"):
+        if terminal is None:
             db.commit()
-            return False
-        if _terminal_runtime_mutation_blocked(db, terminal_id, datetime.now()):
+            return decision(False, "TERMINAL_NOT_FOUND")
+        if terminal.runtime_lifecycle in ("exit_pending", "exited"):
             db.commit()
-            return False
+            return decision(False, "TERMINAL_RUNTIME_NOT_WRITABLE")
+        if _terminal_has_pending_provider_reconnect(db, terminal_id):
+            db.commit()
+            return decision(False, "TERMINAL_RUNTIME_RECONNECT_PENDING")
+        now = datetime.now()
+        operation_live = terminal.runtime_operation_token is not None and (
+            terminal.runtime_operation_expires_at is None
+            or terminal.runtime_operation_expires_at > now
+        )
+        if operation_live:
+            db.commit()
+            return decision(False, "TERMINAL_RUNTIME_OPERATION_BUSY")
         workflow_exists = (
             db.query(WorkflowModel.id).filter(WorkflowModel.root_terminal_id == terminal_id).first()
             is not None
@@ -3861,15 +3891,25 @@ def acquire_provider_execution(
         # closure, preventing a post-close successor lease.
         if workflow_exists and admitted_turn is None:
             db.commit()
-            return False
+            return decision(False, "WORKFLOW_TURN_NOT_ADMISSIBLE")
         db.add(
             ProviderExecutionLeaseModel(
                 terminal_id=terminal_id,
                 workflow_turn_id=workflow_turn_id,
             )
         )
+        active += 1
         db.commit()
-        return True
+        return decision(True)
+
+
+def acquire_provider_execution(
+    terminal_id: str, workflow_turn_id: int, limit: Optional[int] = None
+) -> bool:
+    """Compatibility wrapper for callers that only need the admission result."""
+    return bool(
+        acquire_provider_execution_decision(terminal_id, workflow_turn_id, limit)["acquired"]
+    )
 
 
 def release_provider_execution(terminal_id: str, workflow_turn_id: Optional[int] = None) -> bool:
@@ -5487,6 +5527,18 @@ def get_open_workflow_root_terminal_ids() -> List[str]:
             row[0]
             for row in db.query(WorkflowModel.root_terminal_id)
             .filter(WorkflowModel.status == WORKFLOW_OPEN)
+            .all()
+        ]
+
+
+def get_protected_workflow_root_terminal_ids() -> List[str]:
+    """Return workflow roots which still own live or recovery authority."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        return [
+            row[0]
+            for row in db.query(WorkflowModel.root_terminal_id)
+            .filter(WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)))
             .all()
         ]
 

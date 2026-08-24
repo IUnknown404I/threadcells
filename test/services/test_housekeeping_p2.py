@@ -384,6 +384,90 @@ def test_pending_retirement_cleanup_uses_the_revalidated_plan_executor(tmp_path,
     assert completed == [("child001", "claim-token", intent, "assign")]
 
 
+def test_unclaimed_retirement_cleanup_reenters_atomic_claim_before_execution(tmp_path, monkeypatch):
+    intent = {"version": 1, "terminal_id": "child-unclaimed", "managed": False}
+    pending = {
+        "parent_terminal_id": "parent-exact",
+        "child_terminal_id": "child-unclaimed",
+        "claim_token": None,
+        "intent": intent,
+        "delegation_kind": "assign",
+    }
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.list_pending_child_retirement_cleanups",
+        lambda: [pending],
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.list_all_terminals", lambda: [])
+    claims = []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.claim_completed_child_retirement",
+        lambda parent, child, kind, require_exited_runtime=False: claims.append(
+            (parent, child, kind, require_exited_runtime)
+        )
+        or {"eligible": True, "claim_token": "recovered-claim"},
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.get_child_retirement_cleanup_intent",
+        lambda child, token: {
+            "intent": intent,
+            "cleanup_completed": False,
+            "claim_token": token,
+        },
+    )
+    completed = []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.complete_child_retirement",
+        lambda child, token, current, kind: completed.append((child, token, current, kind)) or True,
+    )
+    config = _config(tmp_path)
+
+    plan = build_plan(
+        root=tmp_path,
+        config=config,
+        settings=default_settings(config),
+        mode="frequent",
+        now=NOW,
+        open_inventory=lambda: (set(), True),
+    )
+    candidate = next(item for item in plan.candidates if item.resource_kind == "retirement_cleanup")
+
+    assert dict(candidate.attributes)["stage"] == "unclaimed"
+    assert not any(
+        warning.startswith("retirement_cleanup_claim_unknown:") for warning in plan.warnings
+    )
+    report = execute_plan(plan, config=config, open_inventory=lambda: (set(), True))
+    assert report.ok is True
+    assert claims == [("parent-exact", "child-unclaimed", "assign", True)]
+    assert completed == [("child-unclaimed", "recovered-claim", intent, "assign")]
+
+
+def test_unclaimed_retirement_cleanup_without_exact_parent_remains_preserved(tmp_path, monkeypatch):
+    pending = {
+        "child_terminal_id": "child-unknown",
+        "claim_token": None,
+        "intent": {"version": 1, "terminal_id": "child-unknown", "managed": False},
+        "delegation_kind": "assign",
+    }
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.list_pending_child_retirement_cleanups",
+        lambda: [pending],
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.list_all_terminals", lambda: [])
+    config = _config(tmp_path)
+
+    plan = build_plan(
+        root=tmp_path,
+        config=config,
+        settings=default_settings(config),
+        mode="frequent",
+        now=NOW,
+        open_inventory=lambda: (set(), True),
+    )
+
+    assert not [item for item in plan.candidates if item.resource_kind == "retirement_cleanup"]
+    assert "retirement_cleanup_claim_unknown:child-unknown" in plan.warnings
+
+
 def test_housekeeping_cli_forwards_the_inspected_plan_id(monkeypatch, capsys):
     calls = []
 

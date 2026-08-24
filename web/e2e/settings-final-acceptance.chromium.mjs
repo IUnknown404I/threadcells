@@ -72,6 +72,14 @@ const report = {
   attachments_deleted: 0, ephemeral_resources_removed: 1, browser_revisions_removed: 0,
   cache_pruned: 1, skipped_open: 1, skipped_unknown: 0, execution_failures: [], warnings: [],
 }
+const housekeepingPlan = {
+  schema_version: 1, plan_id: 'a'.repeat(64), generated_at: 100, mode: 'frequent', root: '/fixture',
+  reclaimable_bytes: 1024, warnings: ['retirement_cleanup_claim_unknown:diagnostic-only'],
+  candidates: [
+    { canonical_identity: 'logs:actionable', category: 'logs', action: 'compress', estimated_reclaim_bytes: 1024, retention_reason: 'older_than_policy', protection_reason: null },
+    { canonical_identity: 'backup:protected', category: 'backups', action: 'preserve', estimated_reclaim_bytes: 0, retention_reason: 'protected_inventory', protection_reason: 'BACKUP_PROTECTED' },
+  ],
+}
 const telegram = {
   schema_version: 1, enabled: false, chat_id: null, message_thread_id: null,
   token_configured: false, token_state: 'missing', configuration_state: 'not_configured',
@@ -102,6 +110,7 @@ const server = http.createServer((request, response) => {
   if (request.method === 'GET' && url.pathname === '/api/v1/profiles') return json(response, registryProfiles)
   if (request.method === 'GET' && url.pathname === '/api/v1/providers') return json(response, { api_version: '1.0', entry_point_group: 'threadcells.provider_adapters.v1', adapters: [], configurations: [], load_failures: [] })
   if (request.method === 'GET' && url.pathname === '/api/v1/housekeeping') return json(response, housekeeping)
+  if (request.method === 'GET' && url.pathname === '/api/v1/housekeeping/plan') return json(response, housekeepingPlan)
   if (request.method === 'GET' && url.pathname === '/api/v1/housekeeping/report') return json(response, report)
   if (request.method === 'GET' && url.pathname === '/api/v1/telegram') return json(response, telegram)
   vite.middlewares(request, response)
@@ -162,6 +171,15 @@ try {
     assert.equal(await page.getByText('retain_minutes', { exact: true }).count(), 0)
     assert.equal(await page.getByText('Protected · inventory only', { exact: true }).count(), 1)
     assert.equal(await page.getByText('1.5 KiB', { exact: true }).count(), 1)
+    await page.getByRole('button', { name: 'Build dry-run plan' }).click()
+    await page.getByText(/could not safely confirm an exclusive claim/).waitFor()
+    assert.equal(await page.getByRole('button', { name: 'Execute inspected plan safely' }).isDisabled(), true)
+    assert.equal(await page.getByText('Unlock operator changes to execute this inspected plan.', { exact: true }).count(), 1)
+    assert.equal(await page.getByText(/could not safely confirm an exclusive claim/).count(), 1)
+    assert.equal(await page.getByText(/retirement cleanup claim unknown/).count(), 0)
+    assert((await page.getByText(/Diagnostic ID:/).textContent())?.includes('diagnostic-only'))
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth), 0, `Housekeeping plan overflow at ${viewport.width}px`)
+    await page.screenshot({ path: `${evidenceDir}/housekeeping-plan-${viewport.width}.png`, fullPage: true })
     if (viewport.width < 1000) await page.getByRole('link', { name: 'About' }).tap()
     else await page.getByRole('link', { name: 'About' }).click()
     await page.getByText('settings-evidence-revision', { exact: true }).waitFor()
@@ -174,7 +192,7 @@ try {
     assert.equal(await page.getByText('OWNER ONLY — exceptional direct critical architecture and implementation.', { exact: true }).count(), 1)
     await context.close()
   }
-  console.log(JSON.stringify({ evidenceDir, profileCount: profileIds.length, viewports, evidence, assertions: ['current Capacity and Telegram navigation', 'registry and Spawn inventory', 'operator-owned XHigh copy', 'Profiles keyboard access', 'Housekeeping human labels and structured report', 'About identity', 'touch navigation', 'WCAG-AA operational helper colors', 'no horizontal overflow'] }))
+  console.log(JSON.stringify({ evidenceDir, profileCount: profileIds.length, viewports, evidence, assertions: ['current Capacity and Telegram navigation', 'registry and Spawn inventory', 'operator-owned XHigh copy', 'Profiles keyboard access', 'Housekeeping human labels and structured report', 'Housekeeping disabled reason and safe retirement warning', 'About identity', 'touch navigation', 'WCAG-AA operational helper colors', 'no horizontal overflow'] }))
 } finally {
   await browser?.close()
   await new Promise(resolve => server.close(resolve))

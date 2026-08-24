@@ -11,11 +11,28 @@ type ZoomableImageProps = {
   height: number
   eager?: boolean
   className?: string
+  locale?: 'en' | 'ru'
 }
 
 const subscribeToBrowser = () => () => undefined
 
-export function ZoomableImage({ src, alt, width, height, eager = false, className = '' }: ZoomableImageProps) {
+export function ZoomableImage({ src, alt, width, height, eager = false, className = '', locale = 'en' }: ZoomableImageProps) {
+  const ru = locale === 'ru'
+  const copy = ru ? {
+    expanded: `Развёрнутый скриншот: ${alt}`,
+    close: 'Закрыть развёрнутый скриншот',
+    closeButton: 'Закрыть',
+    hint: 'Нажмите на изображение, фон или Esc, чтобы закрыть.',
+    expand: `Открыть: ${alt}`,
+    expandButton: 'Открыть',
+  } : {
+    expanded: `Expanded screenshot: ${alt}`,
+    close: 'Close expanded screenshot',
+    closeButton: 'Close',
+    hint: 'Click the image, the backdrop, or press Esc to close.',
+    expand: `Click to expand: ${alt}`,
+    expandButton: 'Click to expand',
+  }
   const [open, setOpen] = useState(false)
   const mounted = useSyncExternalStore(subscribeToBrowser, () => true, () => false)
   const triggerRef = useRef<HTMLButtonElement>(null)
@@ -58,12 +75,12 @@ export function ZoomableImage({ src, alt, width, height, eager = false, classNam
 
   const modal = open && mounted ? createPortal(
     <div className="screenshot-lightbox" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setOpen(false) }}>
-      <div className="lightbox-dialog" role="dialog" aria-modal="true" aria-label={`Expanded screenshot: ${alt}`}>
-        <button ref={closeRef} type="button" className="lightbox-close" onClick={() => setOpen(false)} aria-label="Close expanded screenshot"><X size={20} /> Close</button>
-        <button type="button" className="lightbox-image-button" onClick={() => setOpen(false)} aria-label="Close expanded screenshot">
+      <div className="lightbox-dialog" role="dialog" aria-modal="true" aria-label={copy.expanded}>
+        <button ref={closeRef} type="button" className="lightbox-close" onClick={() => setOpen(false)} aria-label={copy.close}><X size={20} /> {copy.closeButton}</button>
+        <button type="button" className="lightbox-image-button" onClick={() => setOpen(false)} aria-label={copy.close}>
           <img src={src} alt={alt} width={width} height={height} />
         </button>
-        <p>Click the image, the backdrop, or press Esc to close.</p>
+        <p>{copy.hint}</p>
       </div>
     </div>,
     document.body,
@@ -71,9 +88,9 @@ export function ZoomableImage({ src, alt, width, height, eager = false, classNam
 
   return (
     <>
-      <button ref={triggerRef} type="button" className={`screenshot-trigger ${className}`} onClick={() => setOpen(true)} aria-label={`Click to expand: ${alt}`}>
+      <button ref={triggerRef} type="button" className={`screenshot-trigger ${className}`} onClick={() => setOpen(true)} aria-label={copy.expand}>
         <img src={src} alt={alt} loading={eager ? 'eager' : 'lazy'} width={width} height={height} />
-        <span className="screenshot-expand"><ZoomIn size={16} /> Click to expand</span>
+        <span className="screenshot-expand"><ZoomIn size={16} /> {copy.expandButton}</span>
       </button>
       {modal}
     </>

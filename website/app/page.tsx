@@ -4,6 +4,9 @@ import { ProductShot } from '@/components/ProductShot'
 import { SiteFooter } from '@/components/SiteFooter'
 import { SiteHeader } from '@/components/SiteHeader'
 import { assetPath, site } from '@/lib/site'
+import { localeCopy, type Locale } from '@/lib/locales'
+import type { Metadata } from 'next'
+import { canonicalUrl } from '@/lib/site'
 
 const capabilities = [
   { icon: <Eye />, id: '01', title: 'Operational truth', copy: 'See what is resident, executing, waiting, draining, blocked, or actually complete—without inferring state from a terminal tab.' },
@@ -40,22 +43,36 @@ const jsonLd = {
   ],
 }
 
-export default function Home() {
+export const metadata: Metadata = {
+  alternates: { canonical: canonicalUrl('/') || undefined, languages: { en: canonicalUrl('/') || '/', ru: canonicalUrl('/ru') || '/ru/' } },
+}
+
+export function LandingPage({ locale = 'en' }: { locale?: Locale }) {
+  const copy = localeCopy[locale]
+  const ru = locale === 'ru'
+  const t = (english: string, russian: string) => ru ? russian : english
+  const localizedCapabilities = ru ? [
+    { icon: <Eye />, id: '01', title: 'Операционная правда', copy: 'Видьте, что действительно находится в памяти, выполняется, ожидает, завершается, заблокировано или готово.' },
+    { icon: <GitBranch />, id: '02', title: 'Полномочия worktree', copy: 'Привязывайте работу к доверенным проектам и управляемым Git worktree.' },
+    { icon: <Layers />, id: '03', title: 'Долговременные результаты', copy: 'Делегированная работа возвращает сохранённый результат без потери истории.' },
+    { icon: <Gauge />, id: '04', title: 'Здоровая среда агентов', copy: 'ThreadCells следит за нагрузкой хоста и безопасно очищает подходящие артефакты.' },
+  ] : capabilities
+  const localizedSteps = ru ? [['01', 'Создайте сессию', 'Выберите доверенный локальный проект и профиль агента или супервизора.'], ['02', 'Дайте задачу', 'Супервизор делегирует целостную работу нативным CLI-исполнителям и ревьюерам.'], ['03', 'Наблюдайте за системой', 'ThreadCells ведёт рабочий процесс между модельными ходами, сохраняя видимость сессий, worktree и ёмкости.'], ['04', 'Вмешайтесь по запросу', 'Результаты возвращаются долговременно. Owner gate ждёт только действительно нужных решений.']] : steps
   return (
     <>
       <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd).replace(/</g, '\\u003c') }} />
-      <SiteHeader />
-      <main id="top">
+      <SiteHeader locale={locale} />
+      <main id="top" lang={copy.htmlLang}>
         <section className="hero section-shell" aria-labelledby="hero-title">
           <div className="hero-ambient" aria-hidden="true" />
           <div className="hero-copy">
-            <p className="eyebrow"><span>SELF-HOSTED</span> CODING-AGENT OPERATIONS</p>
-            <h1 id="hero-title">Run coding agents as a system.<br /> <em>Not a pile</em> of terminals.</h1>
-            <p className="hero-lede">ThreadCells coordinates native CLI agents, keeps open workflows moving across model turns, and maintains the orchestration environment underneath them—on your own Linux host.</p>
+            <p className="eyebrow"><span>{t('SELF-HOSTED', 'САМОСТОЯТЕЛЬНОЕ РАЗВЁРТЫВАНИЕ')}</span> {t('CODING-AGENT OPERATIONS', 'ОПЕРАЦИИ С КОДОВЫМИ АГЕНТАМИ')}</p>
+            <h1 id="hero-title">{t('Run coding agents as a system.', 'Запускайте кодовых агентов как систему.')}<br /> <em>{t('Not a pile', 'Не как груду')}</em> {t('of terminals.', 'терминалов.')}</h1>
+            <p className="hero-lede">{t('ThreadCells coordinates native CLI agents, keeps open workflows moving across model turns, and maintains the orchestration environment underneath them—on your own Linux host.', 'ThreadCells координирует нативных CLI-агентов, ведёт открытые рабочие процессы между модельными ходами и поддерживает среду оркестрации на вашем Linux-хосте.')}</p>
             <div className="hero-actions">
-              <a className="button button-primary" href={site.githubUrl} target="_blank" rel="noopener noreferrer"><Github /> View on GitHub <ArrowUpRight /></a>
-              <a className="button button-secondary" href={site.docsUrl}><Book /> Read the docs <ArrowRight /></a>
-              <span className="hero-note"><i /> Start the work. Watch the system. Step in only when it needs you.</span>
+              <a className="button button-primary" href={site.githubUrl} target="_blank" rel="noopener noreferrer"><Github /> {t('View on GitHub', 'Открыть на GitHub')} <ArrowUpRight /></a>
+              <a className="button button-secondary" href={site.docsUrl}><Book /> {t('Read the docs', 'Читать документацию')} <ArrowRight /></a>
+              <span className="hero-note"><i /> {t('Start the work. Watch the system. Step in only when it needs you.', 'Запустите работу. Наблюдайте за системой. Вмешивайтесь только когда это нужно.')}</span>
             </div>
           </div>
           <div className="hero-visual"><div className="hero-index" aria-hidden="true"><span>01</span><i /><small>CONTROL / RESULT</small></div><ExecutionMesh /></div>
@@ -69,11 +86,11 @@ export default function Home() {
 
         <section className="problem section-shell" aria-labelledby="problem-title">
           <div className="section-heading split-heading">
-            <p className="eyebrow">THE HARD PART / 02</p>
-            <h2 id="problem-title">Starting more agents is easy.<br /><span>Knowing what is true is not.</span></h2>
+            <p className="eyebrow">{t('THE HARD PART', 'СЛОЖНАЯ ЧАСТЬ')} / 02</p>
+            <h2 id="problem-title">{t('Starting more agents is easy.', 'Запускать больше агентов легко.')}<br /><span>{t('Knowing what is true is not.', 'Понять, что происходит на самом деле, — нет.')}</span></h2>
           </div>
           <div className="problem-body">
-            <p className="problem-lede">Which process owns the worktree? Which session is only idle—and which one is finished? Is the machine out of provider capacity, work contexts, or heavy execution? Did the reviewer return a result, or just stop printing?</p>
+            <p className="problem-lede">{t('Which process owns the worktree? Which session is only idle—and which one is finished? Is the machine out of provider capacity, work contexts, or heavy execution? Did the reviewer return a result, or just stop printing?', 'Какой процесс владеет worktree? Какая сессия просто простаивает, а какая завершена? Не исчерпана ли ёмкость провайдера, рабочих контекстов или тяжёлых задач? Ревьюер вернул результат или просто перестал писать?')}</p>
             <div className="truth-ledger" role="list" aria-label="Operational questions ThreadCells answers">
               <div role="listitem"><span>tm-83A1</span><strong>SUPERVISOR</strong><em className="state-running">RUNNING</em><small>provider 01 / 03</small></div>
               <div role="listitem"><span>tm-94C2</span><strong>WORKER</strong><em className="state-complete">COMPLETE</em><small>result persisted</small></div>
@@ -85,8 +102,8 @@ export default function Home() {
 
         <section id="control-plane" className="control-plane section-shell" aria-labelledby="control-plane-title">
           <div className="section-heading product-heading">
-            <div><p className="eyebrow">THE CONTROL PLANE / 03</p><h2 id="control-plane-title">One place to see the work,<br />the host, and the handoff.</h2></div>
-            <p>ThreadCells wraps native agent execution in an operational surface: sessions, projects, terminals, profiles, capacity, workflows, documentation, optional global Telegram lifecycle alerts, and current build identity.</p>
+            <div><p className="eyebrow">{t('THE CONTROL PLANE', 'ПАНЕЛЬ УПРАВЛЕНИЯ')} / 03</p><h2 id="control-plane-title">{t('One place to see the work,', 'Одно место для работы,')}<br />{t('the host, and the handoff.', 'хоста и передачи результата.')}</h2></div>
+            <p>{t('ThreadCells wraps native agent execution in an operational surface: sessions, projects, terminals, profiles, capacity, workflows, documentation, optional global Telegram lifecycle alerts, and current build identity.', 'ThreadCells объединяет нативное выполнение агентов в операционную поверхность: сессии, проекты, терминалы, профили, ёмкость, рабочие процессы, документацию, опциональные глобальные уведомления Telegram и текущую идентичность сборки.')}</p>
           </div>
           <ProductShot
             src="/media/screenshots/threadcells-home.webp"
@@ -104,12 +121,12 @@ export default function Home() {
 
         <section className="capabilities section-shell" aria-labelledby="capabilities-title">
           <div className="section-heading narrow-heading">
-            <p className="eyebrow">CORE IDEAS / 04</p>
-            <h2 id="capabilities-title">A control room built around<br />the failure modes that matter.</h2>
+            <p className="eyebrow">{t('CORE IDEAS', 'ОСНОВНЫЕ ИДЕИ')} / 04</p>
+            <h2 id="capabilities-title">{t('A control room built around', 'Панель управления для')}<br />{t('the failure modes that matter.', 'существенных отказов.')}</h2>
           </div>
           <div className="capability-system">
             <div className="capability-spine" aria-hidden="true"><span>THREAD</span><i /><span>CELLS</span></div>
-            {capabilities.map((item) => (
+            {localizedCapabilities.map((item) => (
               <article key={item.id} className="capability-row">
                 <span className="capability-number">{item.id}</span>
                 <span className="capability-icon">{item.icon}</span>
@@ -122,12 +139,12 @@ export default function Home() {
 
         <section id="how-it-works" className="how section-shell" aria-labelledby="how-title">
           <div className="how-heading">
-            <p className="eyebrow">WORKFLOW / 05</p>
-            <h2 id="how-title">Intent goes out.<br /><span>Evidence comes back.</span></h2>
-            <p>The coding agent stays native. ThreadCells makes the surrounding lifecycle explicit.</p>
+            <p className="eyebrow">{t('WORKFLOW', 'РАБОЧИЙ ПРОЦЕСС')} / 05</p>
+            <h2 id="how-title">{t('Intent goes out.', 'Намерение уходит.')}<br /><span>{t('Evidence comes back.', 'Доказательства возвращаются.')}</span></h2>
+            <p>{t('The coding agent stays native. ThreadCells makes the surrounding lifecycle explicit.', 'Кодовый агент остаётся нативным. ThreadCells делает окружающий жизненный цикл явным.')}</p>
           </div>
           <ol className="workflow-steps">
-            {steps.map(([number, title, copy]) => (
+            {localizedSteps.map(([number, title, copy]) => (
               <li key={number}><span>{number}</span><i aria-hidden="true" /><div><h3>{title}</h3><p>{copy}</p></div></li>
             ))}
           </ol>
@@ -135,9 +152,9 @@ export default function Home() {
 
         <section className="demo section-shell" aria-labelledby="demo-title">
           <div className="demo-copy">
-            <p className="eyebrow">LIVE RELEASE TOUR</p>
-            <h2 id="demo-title">See the control plane in motion.</h2>
-            <p>A short tour through the real release system: dense Home state, an expanded multi-agent session, protected Housekeeping, and independent capacity.</p>
+            <p className="eyebrow">{t('LIVE RELEASE TOUR', 'ТУР ПО РАБОЧЕЙ СИСТЕМЕ')}</p>
+            <h2 id="demo-title">{t('See the control plane in motion.', 'Панель управления в действии.')}</h2>
+            <p>{t('A short tour through the real release system: dense Home state, an expanded multi-agent session, protected Housekeeping, and independent capacity.', 'Краткий тур по реальной системе релизов: плотная главная панель, развёрнутая мультиагентная сессия, защищённое обслуживание и независимая ёмкость.')}</p>
           </div>
           <div className="demo-frame">
             <div className="shot-chrome" aria-hidden="true"><span className="window-dots"><i /><i /><i /></span><span>THREADCELLS / LIVE RELEASE SYSTEM</span><span>00:14</span></div>
@@ -151,8 +168,8 @@ export default function Home() {
 
         <section className="experience section-shell" aria-labelledby="experience-title">
           <div className="section-heading product-heading">
-            <div><p className="eyebrow">PRODUCT EXPERIENCE / 06</p><h2 id="experience-title">The workflow and the host,<br />in one operating view.</h2></div>
-            <p>Open the real session behind the summary, keep the runtime healthy, and route high-signal owner attention without losing durable context.</p>
+            <div><p className="eyebrow">{t('PRODUCT EXPERIENCE', 'РАБОТА С ПРОДУКТОМ')} / 06</p><h2 id="experience-title">{t('The workflow and the host,', 'Рабочий процесс и хост')}<br />{t('in one operating view.', 'в одном операционном представлении.')}</h2></div>
+            <p>{t('Open the real session behind the summary, keep the runtime healthy, and route high-signal owner attention without losing durable context.', 'Открывайте реальную сессию за сводкой, поддерживайте среду в рабочем состоянии и привлекайте владельца по важным сигналам, не теряя долговременный контекст.')}</p>
           </div>
           <div className="shot-gallery">
             <ProductShot src="/media/screenshots/threadcells-session-workflow.webp" alt="Expanded live ThreadCells session with one active owner and two completed reviewers" label="SESSION / MULTI-AGENT WORKFLOW" detail="Real profiles, lifecycle, and durable completion" />
@@ -167,9 +184,9 @@ export default function Home() {
             <pre><code><span>$</span> threadcells launch --agents supervisor_terra_medium{`\n`}<em>✓ project authority resolved</em>{`\n`}<em>✓ provider capacity admitted</em>{`\n`}<b>session cao-atlas-control started</b>{`\n`}{`\n`}<span>$</span> threadcells-resource-status{`\n`}resident      2 / 5   <i>READY</i>{`\n`}provider      1 / 3   <i>READY</i>{`\n`}work context  0 / 2   <i>READY</i>{`\n`}heavy         0 / 1   <i>READY</i></code></pre>
           </div>
           <div className="native-copy">
-            <p className="eyebrow">NATIVE BY DESIGN / 07</p>
-            <h2 id="native-title">Keep the coding agent.<br />Add the operating system around it.</h2>
-            <p>ThreadCells drives native provider CLIs in real tmux terminals. Provider adapters report what the installed host genuinely supports; unsupported capabilities stay visible instead of being simulated.</p>
+            <p className="eyebrow">{t('NATIVE BY DESIGN', 'НАТИВНО ПО ЗАМЫСЛУ')} / 07</p>
+            <h2 id="native-title">{t('Keep the coding agent.', 'Сохраните кодового агента.')}<br />{t('Add the operating system around it.', 'Добавьте операционную систему вокруг него.')}</h2>
+            <p>{t('ThreadCells drives native provider CLIs in real tmux terminals. Provider adapters report what the installed host genuinely supports; unsupported capabilities stay visible instead of being simulated.', 'ThreadCells запускает нативные CLI провайдеров в настоящих tmux-терминалах. Адаптеры сообщают, что реально поддерживает установленный хост; неподдерживаемые возможности не имитируются.')}</p>
             <ul>
               <li><Check /> Codex reference adapter and first-class Claude Code adapter</li>
               <li><Check /> Provider-native authentication remains with the operator</li>
@@ -180,9 +197,9 @@ export default function Home() {
 
         <section id="open-source" className="ownership section-shell" aria-labelledby="ownership-title">
           <div className="ownership-copy">
-            <p className="eyebrow">MACHINE OWNERSHIP / 08</p>
-            <h2 id="ownership-title">Your host.<br />Your terminals.<br /><span>Your control.</span></h2>
-            <p>ThreadCells is self-hosted and loopback-first. It coordinates powerful local tools; it does not pretend a worktree is a security sandbox or promise hostile multi-tenancy.</p>
+            <p className="eyebrow">{t('MACHINE OWNERSHIP', 'ВЛАДЕНИЕ МАШИНОЙ')} / 08</p>
+            <h2 id="ownership-title">{t('Your host.', 'Ваш хост.')}<br />{t('Your terminals.', 'Ваши терминалы.')}<br /><span>{t('Your control.', 'Ваш контроль.')}</span></h2>
+            <p>{t('ThreadCells is self-hosted and loopback-first. It coordinates powerful local tools; it does not pretend a worktree is a security sandbox or promise hostile multi-tenancy.', 'ThreadCells разворачивается самостоятельно и по умолчанию слушает loopback. Он координирует мощные локальные инструменты, но не выдаёт worktree за песочницу безопасности и не обещает изоляцию враждебных арендаторов.')}</p>
             <div className="ownership-points">
               <span><Lock /><strong>Loopback first</strong><small>SSH-tunnel access is the supported preview boundary.</small></span>
               <span><Terminal /><strong>Real terminals</strong><small>Inspectable tmux sessions, not hidden disposable jobs.</small></span>
@@ -197,16 +214,18 @@ export default function Home() {
         <section className="final-cta section-shell" aria-labelledby="cta-title">
           <div className="cta-grid" aria-hidden="true" />
           <img src={assetPath('/threadcells-symbol.webp')} alt="" width="512" height="512" />
-          <p className="eyebrow">READY / 09</p>
-          <h2 id="cta-title">Stop guessing what the agents are doing.</h2>
-          <p>Run the work. See the machine. Keep the result.</p>
+          <p className="eyebrow">{t('READY', 'ГОТОВО')} / 09</p>
+          <h2 id="cta-title">{t('Stop guessing what the agents are doing.', 'Перестаньте гадать, что делают агенты.')}</h2>
+          <p>{t('Run the work. See the machine. Keep the result.', 'Запускайте работу. Видьте машину. Сохраняйте результат.')}</p>
           <div className="hero-actions">
             <a className="button button-primary" href={site.githubUrl} target="_blank" rel="noopener noreferrer"><Github /> View on GitHub <ArrowUpRight /></a>
             <a className="button button-secondary" href={`${site.docsUrl}/getting-started`}><Book /> Open Quick Setup <ArrowRight /></a>
           </div>
         </section>
       </main>
-      <SiteFooter />
+      <SiteFooter locale={locale} />
     </>
   )
 }
+
+export default function Home() { return <LandingPage /> }

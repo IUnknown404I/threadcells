@@ -174,6 +174,28 @@ def _legacy_profile_resolution_for_service_unit_tests(monkeypatch):
             process_start_ticks=777,
         ),
     )
+    resolved_session_name: dict[str, str | None] = {"value": None}
+
+    def resolve_session(identifier):
+        if identifier != "stable-existing-session":
+            resolved_session_name["value"] = identifier
+        return {
+            "session_id": "stable-existing-session",
+            "session_name": resolved_session_name["value"] or identifier,
+            "deleted": False,
+            "terminals": [{"id": "resident", "runtime_lifecycle": "running"}],
+        }
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.resolve_session_lifetime",
+        resolve_session,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.prove_live_session_runtime_authority",
+        lambda _name, _terminals, **_kwargs: SimpleNamespace(
+            proven=True, reason_code=None, inventory_uncertain=False
+        ),
+    )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.replace_starting_terminal_runtime_identity",
         lambda *_args, **_kwargs: True,
@@ -970,12 +992,20 @@ class TestCreateTerminal:
 
     def test_existing_session_identifier_is_not_renormalized(self, monkeypatch):
         tmux = MagicMock()
+        db_create = MagicMock()
+        prove_runtime = MagicMock(
+            return_value=SimpleNamespace(proven=True, reason_code=None, inventory_uncertain=False)
+        )
         tmux.session_exists.return_value = True
         tmux.create_window.return_value = "developer-window"
         monkeypatch.setattr("cli_agent_orchestrator.services.terminal_service.tmux_client", tmux)
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.terminal_service.db_create_terminal",
-            MagicMock(),
+            db_create,
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.prove_live_session_runtime_authority",
+            prove_runtime,
         )
         monkeypatch.setattr(
             "cli_agent_orchestrator.services.terminal_service.load_agent_profile",
@@ -998,6 +1028,68 @@ class TestCreateTerminal:
 
         tmux.session_exists.assert_called_once_with("cao-existing.v1")
         assert tmux.create_window.call_args.args[0] == "cao-existing.v1"
+        assert db_create.call_args.kwargs["session_lifetime_id"] == "stable-existing-session"
+        assert prove_runtime.call_count == 2
+        prospective = prove_runtime.call_args_list[1].args[1][-1]
+        assert prospective["id"] == db_create.call_args.args[0]
+        assert prospective["tmux_window"] == "developer-window"
+        assert prospective["runtime_lifecycle"] == "starting"
+
+    def test_existing_session_post_create_identity_divergence_aborts_before_metadata(
+        self, monkeypatch
+    ):
+        from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+        tmux = MagicMock()
+        tmux.session_exists.return_value = True
+        tmux.create_window.return_value = "developer-window"
+        tmux.kill_window.return_value = True
+        db_create = MagicMock()
+        monkeypatch.setattr("cli_agent_orchestrator.services.terminal_service.tmux_client", tmux)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
+            lambda: "new-terminal",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.generate_window_name",
+            lambda _profile: "developer-window",
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.db_create_terminal", db_create
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.resolve_session_lifetime",
+            lambda _identifier: {
+                "session_id": "stable-existing-session",
+                "session_name": "cao-existing",
+                "deleted": False,
+                "terminals": [{"id": "resident", "runtime_lifecycle": "running"}],
+            },
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.provider_manager", MagicMock()
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.prove_live_session_runtime_authority",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                proven=False,
+                reason_code="SESSION_RUNTIME_AUTHORITY_DIVERGED",
+                inventory_uncertain=False,
+            ),
+        )
+
+        with pytest.raises(AdmissionDenied) as error:
+            _create_terminal_after_admission(
+                "kiro_cli",
+                "developer",
+                session_name="cao-existing",
+                new_session=False,
+                session_lifetime_id="stable-existing-session",
+            )
+
+        assert error.value.reason_code == "SESSION_RUNTIME_AUTHORITY_DIVERGED"
+        db_create.assert_not_called()
+        tmux.kill_window.assert_called_once_with("cao-existing", "developer-window")
 
     @patch("cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")

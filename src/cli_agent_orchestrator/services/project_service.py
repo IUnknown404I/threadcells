@@ -185,14 +185,14 @@ def launch_context(project_id: str | None) -> tuple[str | None, dict[str, str] |
 
 
 def resolve_add_agent_context(
-    session_name: str,
+    session_identifier: str,
     explicit_project_id: str | None,
     legacy_working_directory: str | None,
 ) -> tuple[str | None, dict[str, str] | None]:
     """Apply the explicit/session/exact-path/legacy-cwd precedence without defaults."""
     if explicit_project_id is not None:
         return launch_context(explicit_project_id)
-    session_project_id = database.get_session_project_id(session_name)
+    session_project_id = database.get_session_project_id(session_identifier)
     if session_project_id:
         try:
             return launch_context(session_project_id)

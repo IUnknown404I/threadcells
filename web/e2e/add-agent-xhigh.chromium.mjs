@@ -5,7 +5,7 @@ import { createServer as createViteServer } from 'vite'
 import { chromium } from 'playwright'
 
 const webRoot = fileURLToPath(new URL('..', import.meta.url))
-const session = { id: 'cao-existing', name: 'cao-existing', status: 'detached', created_at: '1' }
+const session = { id: 'stable-existing-lifetime', name: 'cao-existing', status: 'active', created_at: '1' }
 const existingAgent = { id: 'existing-agent', tmux_session: session.name, tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null }
 const profiles = [
   { name: 'developer', description: 'Ordinary worker', source: 'built-in' },
@@ -16,6 +16,30 @@ const expectedWorkingDirectory = '/workspace/existing-session'
 const operatorSecret = 'correct-browser-secret'
 const grantRequests = []
 const addRequests = []
+const sessionSummary = {
+  ...session,
+  agent_count: 1,
+  active_agent_count: 1,
+  workflow_counts: { active: 1 },
+  activity_counts: { idle: 1 },
+  project_name: null,
+  last_active: '1',
+  first_agent: { id: existingAgent.id, activity: 'idle', execution_state: 'ready', lifecycle: 'running', workflow_state: 'active', workflow_reason: null },
+  last_agent: { id: existingAgent.id, activity: 'idle', execution_state: 'ready', lifecycle: 'running', workflow_state: 'active', workflow_reason: null },
+}
+const agentSummary = {
+  id: existingAgent.id,
+  name: existingAgent.tmux_window,
+  provider: existingAgent.provider,
+  session_id: session.id,
+  session_name: session.name,
+  agent_profile: existingAgent.agent_profile,
+  activity: 'idle',
+  execution_state: 'ready',
+  lifecycle: 'running',
+  workflow_state: 'active',
+  last_active: null,
+}
 
 const vite = await createViteServer({
   root: webRoot,
@@ -37,14 +61,17 @@ const requestJson = async request => {
 
 const server = http.createServer(async (request, response) => {
   const url = new URL(request.url, 'http://localhost')
+  if (request.method === 'GET' && url.pathname === '/ui/sessions') return json(response, { items: [sessionSummary], total: 1, limit: 10, offset: 0, next_offset: null })
+  if (request.method === 'GET' && url.pathname === '/ui/agents') return json(response, { items: [agentSummary], total: 1, limit: 40, offset: 0, next_offset: null, facets: { activities: ['idle'], workflow_states: ['active'], profiles: ['developer'] } })
   if (request.method === 'GET' && url.pathname === '/sessions') return json(response, [session])
-  if (request.method === 'GET' && url.pathname === `/sessions/${session.name}`) return json(response, { session, terminals: [existingAgent] })
-  if (request.method === 'GET' && url.pathname === `/sessions/${session.name}/working-directory`) return json(response, { working_directory: expectedWorkingDirectory })
+  if (request.method === 'GET' && url.pathname === `/sessions/${session.id}`) return json(response, { session, terminals: [existingAgent] })
+  if (request.method === 'GET' && url.pathname === `/sessions/${session.id}/working-directory`) return json(response, { working_directory: expectedWorkingDirectory })
   if (request.method === 'GET' && url.pathname === `/terminals/${existingAgent.id}`) return json(response, { ...existingAgent, status: 'idle', lifecycle: 'running', workflow_state: 'active' })
   if (request.method === 'GET' && url.pathname === `/terminals/${existingAgent.id}/working-directory`) return json(response, { working_directory: expectedWorkingDirectory })
   if (request.method === 'GET' && url.pathname === '/agents/providers') return json(response, [{ name: 'codex', binary: 'codex', installed: true }])
   if (request.method === 'GET' && url.pathname === '/agents/profiles') return json(response, profiles)
   if (request.method === 'GET' && url.pathname === '/projects') return json(response, projects)
+  if (request.method === 'GET' && url.pathname === '/ui/overview') return json(response, { sessions: 1, agents: 1, active: 1, waiting: 0, owner_gate: 0, cancelled: 0, completed: 0 })
   if (request.method === 'POST' && url.pathname === '/operator/session') {
     const body = await requestJson(request)
     if (body?.secret !== operatorSecret) return json(response, { detail: { reason_code: 'OPERATOR_AUTHENTICATION_FAILED' } }, 401)
@@ -54,7 +81,7 @@ const server = http.createServer(async (request, response) => {
     grantRequests.push(await requestJson(request))
     return json(response, { launch_id: `browser-add-${grantRequests.length}`, grant: `one-use-browser-grant-${grantRequests.length}`, expires_in_seconds: 60 })
   }
-  if (request.method === 'POST' && url.pathname === `/sessions/${session.name}/terminals`) {
+  if (request.method === 'POST' && url.pathname === `/sessions/${session.id}/terminals`) {
     addRequests.push({
       profile: url.searchParams.get('agent_profile'),
       provider: url.searchParams.get('provider'),
@@ -124,7 +151,7 @@ try {
     agent_profile: 'critical_sol_xhigh_owner',
     provider: 'codex',
     working_directory: expectedWorkingDirectory,
-    requested_session_name: session.name,
+    requested_session_name: session.id,
     launch_mode: 'existing_session',
     confirmed: true,
   }))

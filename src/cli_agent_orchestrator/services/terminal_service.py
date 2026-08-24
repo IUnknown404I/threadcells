@@ -63,6 +63,7 @@ from cli_agent_orchestrator.clients.database import (
     release_provider_execution,
     release_terminal_runtime_operation,
     replace_starting_terminal_runtime_identity,
+    resolve_session_lifetime,
     terminal_requires_result_snapshot,
     terminal_runtime_operation_owned,
     update_last_active,
@@ -95,6 +96,168 @@ from cli_agent_orchestrator.utils.terminal import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SessionRuntimeAuthorityProof:
+    """Fail-closed proof that one durable lifetime owns its live tmux session."""
+
+    proven: bool
+    reason_code: str | None = None
+    message: str | None = None
+    inventory_uncertain: bool = False
+
+
+def prove_live_session_runtime_authority(
+    session_name: str,
+    terminals: list[Dict[str, Any]],
+    *,
+    runtime_client: Any | None = None,
+) -> SessionRuntimeAuthorityProof:
+    """Match every active durable terminal to its exact process-backed pane.
+
+    A tmux session name is reusable, so ``session_exists`` cannot by itself
+    authorize adding a window or killing a session. Persisted pane/process
+    generations bind the current runtime to the stable session lifetime.
+    """
+    client = runtime_client or tmux_client
+    active = [
+        terminal
+        for terminal in terminals
+        if terminal.get("runtime_lifecycle") != TerminalLifecycle.EXITED.value
+    ]
+    if not active:
+        return SessionRuntimeAuthorityProof(
+            False,
+            "SESSION_HISTORY_INELIGIBLE",
+            "This session lifetime has no live runtime owner",
+        )
+    exists = client.session_exists(session_name)
+    if exists is None:
+        return SessionRuntimeAuthorityProof(
+            False,
+            "SESSION_RUNTIME_INVENTORY_UNCERTAIN",
+            "ThreadCells could not verify the live session runtime",
+            inventory_uncertain=True,
+        )
+    if exists is False:
+        return SessionRuntimeAuthorityProof(
+            False,
+            "SESSION_RUNTIME_MISSING",
+            "The durable session is not backed by a live runtime",
+        )
+    try:
+        windows = client.get_session_windows(session_name)
+    except Exception:
+        windows = None
+    if not isinstance(windows, list):
+        return SessionRuntimeAuthorityProof(
+            False,
+            "SESSION_RUNTIME_INVENTORY_UNCERTAIN",
+            "ThreadCells could not inventory every window in the live session",
+            inventory_uncertain=True,
+        )
+    observed_windows: list[str] = []
+    for window in windows:
+        if not isinstance(window, dict) or not str(window.get("name") or ""):
+            return SessionRuntimeAuthorityProof(
+                False,
+                "SESSION_RUNTIME_INVENTORY_UNCERTAIN",
+                "ThreadCells received an incomplete live session window inventory",
+                inventory_uncertain=True,
+            )
+        observed_windows.append(str(window["name"]))
+    if not observed_windows:
+        return SessionRuntimeAuthorityProof(
+            False,
+            "SESSION_RUNTIME_INVENTORY_UNCERTAIN",
+            "The live session has no provable runtime windows",
+            inventory_uncertain=True,
+        )
+    if len(observed_windows) != len(set(observed_windows)):
+        return SessionRuntimeAuthorityProof(
+            False,
+            "SESSION_RUNTIME_AUTHORITY_DIVERGED",
+            "The live session contains duplicate window identities",
+        )
+    durable_by_window: dict[str, Dict[str, Any]] = {}
+    for terminal in terminals:
+        window_name = str(terminal.get("tmux_window") or "")
+        if not window_name or window_name in durable_by_window:
+            return SessionRuntimeAuthorityProof(
+                False,
+                "SESSION_RUNTIME_AUTHORITY_DIVERGED",
+                "Durable session window authority is incomplete or duplicated",
+            )
+        durable_by_window[window_name] = terminal
+    observed_set = set(observed_windows)
+    if not {str(terminal.get("tmux_window") or "") for terminal in active}.issubset(observed_set):
+        return SessionRuntimeAuthorityProof(
+            False,
+            "SESSION_RUNTIME_AUTHORITY_DIVERGED",
+            "A live durable terminal is missing from the session runtime",
+        )
+    if not observed_set.issubset(durable_by_window):
+        return SessionRuntimeAuthorityProof(
+            False,
+            "SESSION_RUNTIME_AUTHORITY_DIVERGED",
+            "The live session contains a window without durable lifetime authority",
+        )
+    for window_name in observed_windows:
+        terminal = durable_by_window[window_name]
+        if str(terminal.get("tmux_session") or "") != session_name:
+            return SessionRuntimeAuthorityProof(
+                False,
+                "SESSION_RUNTIME_AUTHORITY_DIVERGED",
+                "Durable terminal ownership no longer matches the session",
+            )
+        try:
+            target = client.exact_runtime_target(session_name, window_name)
+        except PaneTargetError as exc:
+            uncertain = exc.reason_code == "EXIT_INVENTORY_UNCERTAIN"
+            return SessionRuntimeAuthorityProof(
+                False,
+                (
+                    "SESSION_RUNTIME_INVENTORY_UNCERTAIN"
+                    if uncertain
+                    else "SESSION_RUNTIME_AUTHORITY_DIVERGED"
+                ),
+                "ThreadCells could not prove the durable session's exact runtime authority",
+                inventory_uncertain=uncertain,
+            )
+        except Exception:
+            return SessionRuntimeAuthorityProof(
+                False,
+                "SESSION_RUNTIME_INVENTORY_UNCERTAIN",
+                "ThreadCells could not inventory the durable session's exact runtime authority",
+                inventory_uncertain=True,
+            )
+        durable_identity = (
+            terminal.get("runtime_pane_id"),
+            terminal.get("runtime_pane_pid"),
+            terminal.get("runtime_generation"),
+            terminal.get("runtime_process_start_ticks"),
+        )
+        observed_identity = (
+            target.pane_id,
+            target.pane_pid,
+            target.runtime_generation,
+            target.process_start_ticks,
+        )
+        origin = terminal.get("runtime_generation_origin")
+        if (
+            target.terminal_id != terminal.get("id")
+            or any(value in (None, "") for value in durable_identity)
+            or durable_identity != observed_identity
+            or origin not in {"launch", "reconciled"}
+            or ((origin == "launch") != bool(target.generation_inherited))
+        ):
+            return SessionRuntimeAuthorityProof(
+                False,
+                "SESSION_RUNTIME_AUTHORITY_DIVERGED",
+                "The live pane identity does not match durable session authority",
+            )
+    return SessionRuntimeAuthorityProof(True)
 
 
 def _capture_created_runtime_identity(
@@ -511,6 +674,7 @@ def _create_terminal_after_admission(
     provider_configuration: Dict[str, Any] | None = None,
     resolved_profile: Any | None = None,
     owner_grant_canonical_worktree: str | None = None,
+    session_lifetime_id: str | None = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -547,7 +711,7 @@ def _create_terminal_after_admission(
     terminal_auth_token_sha256 = hashlib.sha256(
         terminal_auth_token.encode("utf-8", "strict")
     ).hexdigest()
-    session_lifetime_id = str(uuid.uuid4()) if new_session else None
+    session_lifetime_id = str(uuid.uuid4()) if new_session else session_lifetime_id
     if structured_owner_authorized is None:
         structured_owner_authorized = privileged_launch
     try:
@@ -607,6 +771,46 @@ def _create_terminal_after_admission(
         runtime_target = _capture_created_runtime_identity(
             session_name, window_name, terminal_id, runtime_generation
         )
+
+        if not new_session and session_lifetime_id is not None:
+            # Creating the window is an external tmux mutation. Re-prove the
+            # complete session after that mutation and before attaching the
+            # new row to a stable lifetime, so a kill/recreate race cannot
+            # contaminate either the old or replacement session identity.
+            durable_session = resolve_session_lifetime(session_lifetime_id)
+            if (
+                durable_session is None
+                or durable_session["deleted"]
+                or durable_session["session_id"] != session_lifetime_id
+                or durable_session["session_name"] != session_name
+            ):
+                from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+                raise AdmissionDenied("SESSION_IDENTITY_CHANGED", {})
+            prospective_terminal = {
+                "id": terminal_id,
+                "tmux_session": session_name,
+                "session_id": session_lifetime_id,
+                "tmux_window": window_name,
+                "runtime_lifecycle": TerminalLifecycle.STARTING.value,
+                "runtime_pane_id": runtime_target.pane_id,
+                "runtime_pane_pid": runtime_target.pane_pid,
+                "runtime_generation": runtime_target.runtime_generation,
+                "runtime_generation_origin": "launch",
+                "runtime_process_start_ticks": runtime_target.process_start_ticks,
+            }
+            runtime_proof = prove_live_session_runtime_authority(
+                session_name,
+                [*durable_session["terminals"], prospective_terminal],
+                runtime_client=tmux_client,
+            )
+            if not runtime_proof.proven:
+                from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+                raise AdmissionDenied(
+                    runtime_proof.reason_code or "SESSION_IDENTITY_CHANGED",
+                    {"inventory_uncertain": runtime_proof.inventory_uncertain},
+                )
 
         # Step 3: Persist terminal metadata to database
         try:
@@ -881,6 +1085,7 @@ def create_terminal(
     project_context: Dict[str, str] | None = None,
     owner_grant_token: str | None = None,
     owner_grant_launch_id: str | None = None,
+    session_lifetime_id: str | None = None,
 ) -> Terminal:
     """Create one terminal under the cross-process context admission fence."""
     # An explicit name for a new session is request admission data.  Normalize
@@ -974,6 +1179,39 @@ def create_terminal(
             from cli_agent_orchestrator.services.operations_service import AdmissionDenied
 
             raise AdmissionDenied("WORKTREE_AUTHORITY_CHANGED", {})
+        if not new_session and session_name is not None:
+            durable_session = resolve_session_lifetime(session_lifetime_id or session_name or "")
+            expected_session_id = (
+                session_lifetime_id
+                if session_lifetime_id is not None
+                else durable_session["session_id"] if durable_session is not None else None
+            )
+            if (
+                durable_session is None
+                or durable_session["deleted"]
+                or durable_session["session_id"] != expected_session_id
+                or durable_session["session_name"] != session_name
+                or not any(
+                    terminal.get("runtime_lifecycle") != TerminalLifecycle.EXITED.value
+                    for terminal in durable_session["terminals"]
+                )
+            ):
+                from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+                raise AdmissionDenied("SESSION_IDENTITY_CHANGED", {})
+            runtime_proof = prove_live_session_runtime_authority(
+                str(session_name),
+                durable_session["terminals"],
+                runtime_client=tmux_client,
+            )
+            if not runtime_proof.proven:
+                from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+                raise AdmissionDenied(
+                    runtime_proof.reason_code or "SESSION_IDENTITY_CHANGED",
+                    {"inventory_uncertain": runtime_proof.inventory_uncertain},
+                )
+            session_lifetime_id = str(expected_session_id)
         if managed_worktree_kind is not None:
             managed = create_managed_worktree(source_worktree, terminal_id, managed_worktree_kind)
         launch_worktree = managed.path if managed is not None else source_worktree
@@ -1027,6 +1265,7 @@ def create_terminal(
                     launch_resolution.profile if launch_resolution is not None else None
                 ),
                 owner_grant_canonical_worktree=source_worktree,
+                session_lifetime_id=session_lifetime_id,
             )
         except Exception as error:
             if managed is not None:

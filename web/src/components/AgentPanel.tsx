@@ -152,7 +152,8 @@ export function AgentPanel({
   const [operatorSecret, setOperatorSecret] = useState('')
   const consumedNavigationIntent = useRef<'create-session' | null>(null)
   const sessionFeed = useSessionSummaryFeed(sessionSearch, agentViewMode === 'sessions')
-  const activeSessionName = sessionFeed.items.find(session => session.id === activeSession)?.name || null
+  const activeSessionRecord = sessionFeed.items.find(session => session.id === activeSession) || null
+  const activeSessionIdentifier = activeSessionRecord?.id || null
   const activeSessionFeed = useAgentSummaryFeed(
     { sessionId: activeSession || undefined },
     agentViewMode === 'sessions' && activeSession !== null,
@@ -219,7 +220,7 @@ export function AgentPanel({
     const id = pendingDeleteSession.id
     setDeletingSession(id)
     try {
-      await deleteSession(pendingDeleteSession.name)
+      await deleteSession(pendingDeleteSession.id)
       if (activeSession === id) setActiveSession(null)
       sessionFeed.reload()
       filteredAgentFeed.reload()
@@ -354,20 +355,20 @@ export function AgentPanel({
   }
 
   useEffect(() => {
-    if (!showAddAgent || !activeSessionName) {
+    if (!showAddAgent || !activeSessionIdentifier) {
       setSessionRootWorkDir(null)
       return
     }
     let disposed = false
     setSessionRootWorkDir(null)
-    api.getSessionWorkingDirectory(activeSessionName)
+    api.getSessionWorkingDirectory(activeSessionIdentifier)
       .then(result => { if (!disposed) setSessionRootWorkDir(result.working_directory) })
       .catch(() => { if (!disposed) setSessionRootWorkDir(null) })
     return () => { disposed = true }
-  }, [showAddAgent, activeSessionName])
+  }, [showAddAgent, activeSessionIdentifier])
 
   const handleAddAgent = async () => {
-    if (!addProfile.trim() || !activeSessionName) return
+    if (!addProfile.trim() || !activeSessionIdentifier || activeSessionRecord?.status !== 'active') return
     setAddingAgent(true)
     setAddError(null)
     try {
@@ -375,18 +376,18 @@ export function AgentPanel({
         selectedProfile: selectedAddProfile,
         provider: addProvider,
         workingDirectory: resolvedAddWorkingDirectory || undefined,
-        requestedSessionName: activeSessionName,
+        requestedSessionName: activeSessionIdentifier,
         projectId: addProjectId || undefined,
         confirmed: addOwnerConfirmed,
         operatorSecret: addOperatorSecret,
       })
       const ownerGrant = authorization ? await authorization : undefined
       if (ownerGrant) {
-        await api.addTerminalToSession(activeSessionName, addProvider, addProfile.trim(), resolvedAddWorkingDirectory || undefined, addProjectId || undefined, ownerGrant)
+        await api.addTerminalToSession(activeSessionIdentifier, addProvider, addProfile.trim(), resolvedAddWorkingDirectory || undefined, addProjectId || undefined, ownerGrant)
       } else if (addProjectId) {
-        await api.addTerminalToSession(activeSessionName, addProvider, addProfile.trim(), resolvedAddWorkingDirectory || undefined, addProjectId)
+        await api.addTerminalToSession(activeSessionIdentifier, addProvider, addProfile.trim(), resolvedAddWorkingDirectory || undefined, addProjectId)
       } else {
-        await api.addTerminalToSession(activeSessionName, addProvider, addProfile.trim(), resolvedAddWorkingDirectory || undefined)
+        await api.addTerminalToSession(activeSessionIdentifier, addProvider, addProfile.trim(), resolvedAddWorkingDirectory || undefined)
       }
       showSnackbar({ type: 'success', message: 'Agent added to session' })
       setShowAddAgent(false)
@@ -468,8 +469,9 @@ export function AgentPanel({
         </h3>
         <button
           onClick={showAddAgent ? () => setShowAddAgent(false) : openAddAgent}
-          className="min-h-11 self-start sm:self-auto flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-400 hover:text-emerald-400 bg-gray-900/50 hover:bg-gray-900 border border-gray-700/50 hover:border-emerald-700/50 rounded-lg transition-colors"
-          title="Add another agent to this session so they can collaborate"
+          disabled={session.status !== 'active'}
+          className="min-h-11 self-start sm:self-auto flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-gray-400 hover:text-emerald-400 bg-gray-900/50 hover:bg-gray-900 border border-gray-700/50 hover:border-emerald-700/50 rounded-lg transition-colors disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-gray-400"
+          title={session.status === 'active' ? 'Add another agent to this session so they can collaborate' : 'Historical sessions cannot accept new agents'}
         >
           <Plus size={14} />
           Add Agent
@@ -477,7 +479,7 @@ export function AgentPanel({
       </div>
 
       {/* Add Agent Inline Form */}
-      {showAddAgent && (
+      {showAddAgent && session.status === 'active' && (
         <div className="mb-4 p-4 bg-gray-900/70 border border-gray-700/50 rounded-lg space-y-3">
           <p className="text-xs text-gray-500">
             Add another agent to this session. Agents in the same session can send messages to each other and coordinate on tasks. A supervisor can delegate work to agents you add here.

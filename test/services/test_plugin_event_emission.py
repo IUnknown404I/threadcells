@@ -106,11 +106,12 @@ class TestSessionPluginEvents:
 
         registry.dispatch.assert_not_awaited()
 
-    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session")
-    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session_lifetime")
+    @patch("cli_agent_orchestrator.services.session_service.prove_live_session_runtime_authority")
+    @patch("cli_agent_orchestrator.services.session_service.resolve_session_authority")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
     def test_delete_session_dispatches_post_kill_session_event_after_cleanup(
-        self, mock_tmux, mock_list_terminals, mock_delete_terminals
+        self, mock_tmux, mock_resolve, mock_prove_runtime, mock_delete_terminals
     ):
         """Session kill should emit after the tmux kill and DB cleanup succeed."""
         registry = _registry_mock()
@@ -119,20 +120,29 @@ class TestSessionPluginEvents:
         async def record_dispatch(*_args):
             call_order.append("dispatch")
 
-        mock_tmux.session_exists.return_value = True
+        mock_resolve.return_value = SimpleNamespace(
+            session_id="session-lifetime-1",
+            session_name="cao-demo",
+            terminals=[],
+            deleted=False,
+            has_live_runtime_owner=True,
+        )
+        mock_prove_runtime.return_value = SimpleNamespace(proven=True)
         mock_tmux.kill_session.side_effect = lambda *_: call_order.append("kill_session") or True
-        mock_list_terminals.return_value = []
-        mock_delete_terminals.side_effect = lambda *_: call_order.append("delete_terminals")
+        mock_tmux.session_exists.return_value = False
+        mock_delete_terminals.side_effect = lambda *_args, **_kwargs: (
+            call_order.append("delete_terminals") or {"already_deleted": False, "deleted": 0}
+        )
         registry.dispatch.side_effect = record_dispatch
 
         result = delete_session("cao-demo", registry=registry)
 
-        assert result == {"deleted": ["cao-demo"], "errors": []}
+        assert result == {"deleted": ["cao-demo"], "errors": [], "already_deleted": False}
         assert call_order == ["kill_session", "delete_terminals", "dispatch"]
         event_type, event = registry.dispatch.await_args.args
         assert event_type == "post_kill_session"
         assert isinstance(event, PostKillSessionEvent)
-        assert event.session_id == "cao-demo"
+        assert event.session_id == "session-lifetime-1"
         assert event.session_name == "cao-demo"
 
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")

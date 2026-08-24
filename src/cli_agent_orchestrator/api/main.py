@@ -101,6 +101,10 @@ from cli_agent_orchestrator.services.operations_service import (
     set_capacity_settings,
 )
 from cli_agent_orchestrator.services.project_service import ProjectResolutionError
+from cli_agent_orchestrator.services.session_service import (
+    SessionLifecycleError,
+    SessionNotFoundError,
+)
 from cli_agent_orchestrator.services.terminal_service import ExitAuthorityError, OutputMode
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
@@ -895,17 +899,23 @@ async def create_xhigh_grant_endpoint(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid provider"
         ) from exc
     requested_session_name = (
-        validate_session_name(body.requested_session_name.strip())
+        body.requested_session_name.strip()
         if body.requested_session_name and body.requested_session_name.strip()
         else None
     )
+    if requested_session_name is not None and body.launch_mode != "existing_session":
+        requested_session_name = validate_session_name(requested_session_name)
     try:
         resolved_project_id = body.project_id
         if body.launch_mode == "existing_session":
             if requested_session_name is None:
                 raise ValueError("requested_session_name is required for existing session launches")
+            authority = session_service.resolve_session_authority(
+                requested_session_name, require_live=True
+            )
+            requested_session_name = authority.session_name
             launch_directory, project_context = project_service.resolve_add_agent_context(
-                requested_session_name,
+                authority.session_id,
                 body.project_id,
                 body.working_directory,
             )
@@ -941,6 +951,8 @@ async def create_xhigh_grant_endpoint(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"reason_code": "XHIGH_CONFIRMATION_REQUIRED"},
         ) from exc
+    except (SessionNotFoundError, SessionLifecycleError) as exc:
+        raise _session_http_exception(exc) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -1591,6 +1603,21 @@ def _csv_query_values(value: Optional[str]) -> List[str]:
     return [item.strip() for item in (value or "").split(",") if item.strip()]
 
 
+def _session_http_exception(exc: Exception) -> HTTPException:
+    if isinstance(exc, (SessionNotFoundError, ValueError)):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    if isinstance(exc, SessionLifecycleError):
+        return HTTPException(
+            status_code=(
+                status.HTTP_503_SERVICE_UNAVAILABLE
+                if exc.inventory_uncertain
+                else status.HTTP_409_CONFLICT
+            ),
+            detail={"reason_code": exc.reason_code, "message": str(exc)},
+        )
+    return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+
+
 @app.get("/ui/overview")
 async def get_ui_overview() -> Dict:
     return await _run_ui_read(ui_read_model_service.get_overview)
@@ -1652,8 +1679,8 @@ async def list_sessions() -> List[Dict]:
 async def get_session(session_name: str) -> Dict:
     try:
         return await _run_operational_io(session_service.get_session, session_name)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except (SessionNotFoundError, ValueError, SessionLifecycleError) as e:
+        raise _session_http_exception(e) from e
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1669,8 +1696,8 @@ async def get_session_root_working_directory(session_name: str) -> WorkingDirect
             session_service.get_session_root_working_directory, session_name
         )
         return WorkingDirectoryResponse(working_directory=working_directory)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except (SessionNotFoundError, ValueError, SessionLifecycleError) as e:
+        raise _session_http_exception(e) from e
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1687,8 +1714,8 @@ async def delete_session(request: Request, session_name: str) -> Dict:
             registry=get_plugin_registry(request),
         )
         return {"success": True, **result}
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except (SessionNotFoundError, ValueError, SessionLifecycleError) as e:
+        raise _session_http_exception(e) from e
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1720,9 +1747,14 @@ async def create_terminal_in_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
+        authority = await run_in_threadpool(
+            session_service.resolve_session_authority,
+            session_name,
+            require_live=True,
+        )
         launch_directory, project_context = await run_in_threadpool(
             project_service.resolve_add_agent_context,
-            session_name,
+            authority.session_id,
             project_id,
             working_directory,
         )
@@ -1730,7 +1762,8 @@ async def create_terminal_in_session(
             terminal_service.create_terminal,
             provider=resolved_provider,
             agent_profile=agent_profile,
-            session_name=session_name,
+            session_name=authority.session_name,
+            session_lifetime_id=authority.session_id,
             new_session=False,
             working_directory=launch_directory,
             allowed_tools=allowed_tools_list,
@@ -1745,6 +1778,8 @@ async def create_terminal_in_session(
         raise _admission_http_exception(e)
     except ProjectResolutionError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except (SessionNotFoundError, SessionLifecycleError) as e:
+        raise _session_http_exception(e) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -1758,9 +1793,11 @@ async def create_terminal_in_session(
 async def list_terminals_in_session(session_name: str) -> List[Dict]:
     """List all terminals in a session."""
     try:
-        from cli_agent_orchestrator.clients.database import list_terminals_by_session
+        authority = await _run_ui_read(session_service.resolve_session_authority, session_name)
 
-        return await _run_ui_read(list_terminals_by_session, session_name)
+        return authority.terminals
+    except (SessionNotFoundError, SessionLifecycleError) as e:
+        raise _session_http_exception(e) from e
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

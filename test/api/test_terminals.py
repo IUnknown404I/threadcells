@@ -146,6 +146,12 @@ class TestTerminalCreationWithWorkingDirectory:
                 side_effect=lambda _, fallback_provider: fallback_provider,
             ),
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.session_service.resolve_session_authority",
+                return_value=SimpleNamespace(
+                    session_id="stable-session", session_name="test-session"
+                ),
+            ),
         ):
             mock_svc.create_terminal.return_value = Terminal(
                 id="abcd5678",
@@ -176,6 +182,12 @@ class TestTerminalCreationWithWorkingDirectory:
                 side_effect=lambda _, fallback_provider: fallback_provider,
             ),
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.session_service.resolve_session_authority",
+                return_value=SimpleNamespace(
+                    session_id="stable-session", session_name="test-session"
+                ),
+            ),
         ):
             mock_svc.create_terminal.return_value = Terminal(
                 id="abcd5678",
@@ -207,6 +219,12 @@ class TestTerminalCreationWithWorkingDirectory:
                 return_value="codex",
             ),
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.session_service.resolve_session_authority",
+                return_value=SimpleNamespace(
+                    session_id="stable-session", session_name="cao-existing"
+                ),
+            ),
         ):
             mock_svc.create_terminal.return_value = Terminal(
                 id="owner5678",
@@ -504,6 +522,12 @@ class TestCrossProviderResolution:
         with (
             patch("cli_agent_orchestrator.api.main.resolve_provider") as mock_resolve,
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.session_service.resolve_session_authority",
+                return_value=SimpleNamespace(
+                    session_id="stable-session", session_name="test-session"
+                ),
+            ),
         ):
             mock_resolve.return_value = "claude_code"
             mock_svc.create_terminal.return_value = Terminal(
@@ -534,6 +558,12 @@ class TestCrossProviderResolution:
         with (
             patch("cli_agent_orchestrator.api.main.resolve_provider") as mock_resolve,
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.session_service.resolve_session_authority",
+                return_value=SimpleNamespace(
+                    session_id="stable-session", session_name="test-session"
+                ),
+            ),
         ):
             # resolve_provider returns the fallback (no profile provider key)
             mock_resolve.return_value = "kiro_cli"

@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Mapping, Optional, cast
+from typing import Any, Dict, List, Mapping, Optional, Sequence, cast
 
 from sqlalchemy import (
     Boolean,
@@ -48,6 +48,10 @@ from cli_agent_orchestrator.models.usage import UsageObservation
 logger = logging.getLogger(__name__)
 
 Base: Any = declarative_base()
+
+
+class AmbiguousSessionIdentity(RuntimeError):
+    """A reusable session name identifies more than one durable lifetime."""
 
 
 class TerminalModel(Base):
@@ -127,6 +131,16 @@ class TerminalModel(Base):
     launch_snapshot_json = Column(Text, nullable=True)
     launch_snapshot_status = Column(String, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
+
+
+class SessionDeletionReceiptModel(Base):
+    """Durable idempotency receipt for one retired session lifetime."""
+
+    __tablename__ = "session_deletion_receipts"
+
+    session_id = Column(String, primary_key=True)
+    session_name = Column(String, nullable=False, index=True)
+    deleted_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
 class WorktreeWriterLeaseModel(Base):
@@ -3124,46 +3138,141 @@ def terminal_auth_token_matches(terminal_id: str, token: str) -> bool:
         )
 
 
+def _session_terminal_dict(terminal: TerminalModel) -> Dict[str, Any]:
+    return {
+        "id": terminal.id,
+        "tmux_session": terminal.tmux_session,
+        "session_id": terminal.session_id,
+        "tmux_window": terminal.tmux_window,
+        "provider": terminal.provider,
+        "agent_profile": terminal.agent_profile,
+        "profile_revision_id": terminal.profile_revision_id,
+        "provider_config_revision_id": terminal.provider_config_revision_id,
+        "launch_snapshot_status": terminal.launch_snapshot_status,
+        "launch_worktree": terminal.launch_worktree,
+        "write_enabled": terminal.write_enabled,
+        "context_role": terminal.context_role,
+        "managed_worktree_kind": terminal.managed_worktree_kind,
+        "managed_worktree_source": terminal.managed_worktree_source,
+        "managed_worktree_branch": terminal.managed_worktree_branch,
+        "managed_worktree_commit": terminal.managed_worktree_commit,
+        "project_id": terminal.project_id,
+        "project_name": terminal.project_name,
+        "project_path": terminal.project_path,
+        "project_description": terminal.project_description,
+        "runtime_lifecycle": terminal.runtime_lifecycle,
+        "runtime_exit_requested_at": terminal.runtime_exit_requested_at,
+        "runtime_exited_at": terminal.runtime_exited_at,
+        "runtime_pane_id": terminal.runtime_pane_id,
+        "runtime_pane_pid": terminal.runtime_pane_pid,
+        "runtime_generation": terminal.runtime_generation,
+        "runtime_generation_origin": terminal.runtime_generation_origin,
+        "runtime_process_start_ticks": terminal.runtime_process_start_ticks,
+        "last_active": terminal.last_active,
+    }
+
+
+def _ensure_session_deletion_receipt_schema() -> None:
+    SessionDeletionReceiptModel.__table__.create(bind=engine, checkfirst=True)
+
+
+def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
+    """Resolve a stable lifetime ID or a unique legacy/raw tmux name.
+
+    Names are reusable and therefore resolve only when exactly one durable
+    lifetime owns them. A deletion receipt remains authoritative for retrying
+    an already completed deletion by stable ID.
+    """
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_usage_schema()
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        terminals = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.session_id == identifier)
+            .order_by(TerminalModel.creation_order.asc(), TerminalModel.id.asc())
+            .all()
+        )
+        if not terminals and identifier.startswith("legacy:"):
+            legacy_name = identifier[len("legacy:") :]
+            terminals = (
+                db.query(TerminalModel)
+                .filter(
+                    TerminalModel.session_id.is_(None),
+                    TerminalModel.tmux_session == legacy_name,
+                )
+                .order_by(TerminalModel.creation_order.asc(), TerminalModel.id.asc())
+                .all()
+            )
+        if not terminals:
+            named = (
+                db.query(TerminalModel)
+                .filter(TerminalModel.tmux_session == identifier)
+                .order_by(TerminalModel.creation_order.asc(), TerminalModel.id.asc())
+                .all()
+            )
+            identities = {
+                str(row.session_id) if row.session_id else f"legacy:{row.tmux_session}"
+                for row in named
+            }
+            if len(identities) > 1:
+                raise AmbiguousSessionIdentity(identifier)
+            if named:
+                prior_lifetime = (
+                    db.query(SessionDeletionReceiptModel.session_id)
+                    .filter(SessionDeletionReceiptModel.session_name == identifier)
+                    .first()
+                )
+                if prior_lifetime is not None:
+                    raise AmbiguousSessionIdentity(identifier)
+            terminals = named
+        if terminals:
+            names = {str(row.tmux_session) for row in terminals}
+            identities = {
+                str(row.session_id) if row.session_id else f"legacy:{row.tmux_session}"
+                for row in terminals
+            }
+            if len(names) != 1 or len(identities) != 1:
+                raise AmbiguousSessionIdentity(identifier)
+            return {
+                "session_id": identities.pop(),
+                "session_name": names.pop(),
+                "deleted": False,
+                "terminals": [_session_terminal_dict(row) for row in terminals],
+            }
+
+        receipt = (
+            db.query(SessionDeletionReceiptModel)
+            .filter(SessionDeletionReceiptModel.session_id == identifier)
+            .first()
+        )
+        if receipt is None:
+            receipts = (
+                db.query(SessionDeletionReceiptModel)
+                .filter(SessionDeletionReceiptModel.session_name == identifier)
+                .order_by(SessionDeletionReceiptModel.deleted_at.desc())
+                .all()
+            )
+            if len(receipts) > 1:
+                raise AmbiguousSessionIdentity(identifier)
+            receipt = receipts[0] if receipts else None
+        if receipt is None:
+            return None
+        return {
+            "session_id": str(receipt.session_id),
+            "session_name": str(receipt.session_name),
+            "deleted": True,
+            "terminals": [],
+        }
+
+
 def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
-    """List all terminals in a tmux session."""
+    """List all terminals with one tmux name (legacy compatibility only)."""
     _ensure_terminal_worktree_authority_schema()
     _ensure_control_plane_schema()
     with SessionLocal() as db:
         terminals = db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).all()
-        return [
-            {
-                "id": t.id,
-                "tmux_session": t.tmux_session,
-                "session_id": t.session_id,
-                "tmux_window": t.tmux_window,
-                "provider": t.provider,
-                "agent_profile": t.agent_profile,
-                "profile_revision_id": t.profile_revision_id,
-                "provider_config_revision_id": t.provider_config_revision_id,
-                "launch_snapshot_status": t.launch_snapshot_status,
-                "launch_worktree": t.launch_worktree,
-                "write_enabled": t.write_enabled,
-                "context_role": t.context_role,
-                "managed_worktree_kind": t.managed_worktree_kind,
-                "managed_worktree_source": t.managed_worktree_source,
-                "managed_worktree_branch": t.managed_worktree_branch,
-                "managed_worktree_commit": t.managed_worktree_commit,
-                "project_id": t.project_id,
-                "project_name": t.project_name,
-                "project_path": t.project_path,
-                "project_description": t.project_description,
-                "runtime_lifecycle": t.runtime_lifecycle,
-                "runtime_exit_requested_at": t.runtime_exit_requested_at,
-                "runtime_exited_at": t.runtime_exited_at,
-                "runtime_pane_id": t.runtime_pane_id,
-                "runtime_pane_pid": t.runtime_pane_pid,
-                "runtime_generation": t.runtime_generation,
-                "runtime_generation_origin": t.runtime_generation_origin,
-                "runtime_process_start_ticks": t.runtime_process_start_ticks,
-                "last_active": t.last_active,
-            }
-            for t in terminals
-        ]
+        return [_session_terminal_dict(terminal) for terminal in terminals]
 
 
 def update_last_active(terminal_id: str) -> bool:
@@ -3711,6 +3820,67 @@ def delete_terminals_by_session(tmux_session: str) -> int:
         )
         db.commit()
         return deleted
+
+
+def delete_terminals_by_session_lifetime(
+    session_id: str,
+    session_name: str,
+    *,
+    expected_terminal_ids: Sequence[str],
+) -> Dict[str, Any]:
+    """Delete one unchanged, proven-dead lifetime and persist its receipt."""
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        existing_receipt = (
+            db.query(SessionDeletionReceiptModel)
+            .filter(SessionDeletionReceiptModel.session_id == session_id)
+            .first()
+        )
+        if existing_receipt is not None:
+            if str(existing_receipt.session_name) != session_name:
+                db.rollback()
+                raise AmbiguousSessionIdentity(session_id)
+            db.rollback()
+            return {"deleted": 0, "already_deleted": True}
+        terminal_query = db.query(TerminalModel).filter(
+            (
+                TerminalModel.session_id == session_id
+                if not session_id.startswith("legacy:")
+                else (
+                    TerminalModel.session_id.is_(None)
+                    & (TerminalModel.tmux_session == session_name)
+                )
+            )
+        )
+        terminals = terminal_query.all()
+        if not terminals:
+            db.rollback()
+            return {"deleted": 0, "already_deleted": False}
+        if any(str(row.tmux_session) != session_name for row in terminals):
+            db.rollback()
+            raise AmbiguousSessionIdentity(session_id)
+        terminal_ids = [str(row.id) for row in terminals]
+        expected_ids = [str(terminal_id) for terminal_id in expected_terminal_ids]
+        if len(expected_ids) != len(set(expected_ids)) or set(terminal_ids) != set(expected_ids):
+            db.rollback()
+            raise AmbiguousSessionIdentity(session_id)
+        _purge_staged_handoff_submissions_for_terminals(db, terminal_ids)
+        for terminal_id in terminal_ids:
+            _release_or_transfer_worktree_writer_lease(
+                db, terminal_id, excluding_terminal_ids=terminal_ids
+            )
+        db.flush()
+        deleted = terminal_query.delete(synchronize_session=False)
+        db.add(
+            SessionDeletionReceiptModel(
+                session_id=session_id,
+                session_name=session_name,
+                deleted_at=datetime.now(),
+            )
+        )
+        db.commit()
+        return {"deleted": int(deleted), "already_deleted": False}
 
 
 def list_worktree_writer_leases() -> List[Dict[str, Any]]:
@@ -11373,16 +11543,24 @@ def find_project_by_normalized_path(normalized_path: str) -> Project | None:
         return _project_from_row(project) if project else None
 
 
-def get_session_project_id(session_name: str) -> str | None:
-    """Recover the explicit launch project already established for a session."""
+def get_session_project_id(session_identifier: str) -> str | None:
+    """Recover launch project authority from one stable session lifetime."""
     _ensure_project_schema()
+    resolved = resolve_session_lifetime(session_identifier)
+    if resolved is None or resolved["deleted"]:
+        return None
+    session_id = str(resolved["session_id"])
+    session_name = str(resolved["session_name"])
     with SessionLocal() as db:
+        lifetime_filter = (
+            TerminalModel.session_id == session_id
+            if not session_id.startswith("legacy:")
+            else (TerminalModel.session_id.is_(None) & (TerminalModel.tmux_session == session_name))
+        )
         row = (
             db.query(TerminalModel.project_id)
-            .filter(
-                TerminalModel.tmux_session == session_name, TerminalModel.project_id.is_not(None)
-            )
-            .order_by(TerminalModel.last_active.asc(), TerminalModel.id.asc())
+            .filter(lifetime_filter, TerminalModel.project_id.is_not(None))
+            .order_by(TerminalModel.creation_order.asc(), TerminalModel.id.asc())
             .first()
         )
         return str(row[0]) if row and row[0] else None

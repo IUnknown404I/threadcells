@@ -3812,6 +3812,11 @@ def delete_terminal(terminal_id: str) -> bool:
     accidentally reopening the canonical worktree to another writer.
     """
     with SessionLocal() as db:
+        _cancel_protected_workflows_in_transaction(
+            db,
+            [terminal_id],
+            reason="root terminal exited or deleted",
+        )
         _purge_staged_handoff_submissions_for_terminals(db, [terminal_id])
         _release_or_transfer_worktree_writer_lease(db, terminal_id)
         db.flush()
@@ -3890,6 +3895,11 @@ def delete_exited_terminal(
         terminal.runtime_operation_token = None
         terminal.runtime_operation_claimed_at = None
         terminal.runtime_operation_expires_at = None
+        _cancel_protected_workflows_in_transaction(
+            db,
+            [terminal_id],
+            reason="root terminal exited or deleted",
+        )
         _release_or_transfer_worktree_writer_lease(db, terminal_id)
         provider_execution = db.get(ProviderExecutionLeaseModel, terminal_id)
         if provider_execution is not None:
@@ -3929,6 +3939,11 @@ def delete_terminals_by_session(tmux_session: str) -> int:
             .filter(TerminalModel.tmux_session == tmux_session)
             .all()
         ]
+        _cancel_protected_workflows_in_transaction(
+            db,
+            terminal_ids,
+            reason="root terminal exited or deleted",
+        )
         _purge_staged_handoff_submissions_for_terminals(db, terminal_ids)
         for terminal_id in terminal_ids:
             _release_or_transfer_worktree_writer_lease(
@@ -3985,6 +4000,11 @@ def delete_terminals_by_session_lifetime(
         if len(expected_ids) != len(set(expected_ids)) or set(terminal_ids) != set(expected_ids):
             db.rollback()
             raise AmbiguousSessionIdentity(session_id)
+        _cancel_protected_workflows_in_transaction(
+            db,
+            terminal_ids,
+            reason="root terminal exited or deleted",
+        )
         _purge_staged_handoff_submissions_for_terminals(db, terminal_ids)
         for terminal_id in terminal_ids:
             _release_or_transfer_worktree_writer_lease(
@@ -4071,6 +4091,11 @@ def retire_unreconciled_terminal_authority(terminal_id: str) -> bool:
         )
         if lease is not None:
             return False
+        _cancel_protected_workflows_in_transaction(
+            db,
+            [terminal_id],
+            reason="root terminal exited or deleted",
+        )
         _purge_staged_handoff_submissions_for_terminals(db, [terminal_id])
         deleted = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).delete()
         db.commit()
@@ -8343,56 +8368,335 @@ def set_workflow_terminal_state(
         return True
 
 
+def _cancel_protected_workflows_in_transaction(
+    db: Any,
+    terminal_ids: Sequence[str],
+    *,
+    reason: str,
+) -> List[int]:
+    """Cancel resumable workflow authority without deleting durable history."""
+    normalized = list(dict.fromkeys(str(value) for value in terminal_ids if value))
+    if not normalized:
+        return []
+    workflows = (
+        db.query(WorkflowModel)
+        .filter(
+            WorkflowModel.root_terminal_id.in_(normalized),
+            WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+        )
+        .all()
+    )
+    workflow_ids = [int(workflow.id) for workflow in workflows]
+    now = datetime.now()
+    for workflow in workflows:
+        workflow.status = WORKFLOW_CANCELLED
+        workflow.terminal_reason = reason
+        workflow.updated_at = now
+    if workflow_ids:
+        (
+            db.query(WorkflowTurnModel)
+            .filter(
+                WorkflowTurnModel.workflow_id.in_(workflow_ids),
+                WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+            )
+            .update(
+                {
+                    WorkflowTurnModel.state: TURN_CANCELLED,
+                    WorkflowTurnModel.claim_token: None,
+                    WorkflowTurnModel.claim_expires_at: None,
+                    WorkflowTurnModel.updated_at: now,
+                },
+                synchronize_session=False,
+            )
+        )
+    for terminal_id in normalized:
+        # A session/terminal removal can race a child callback. Fence every
+        # active edge and provider execution in the same transaction.
+        _cancel_parent_assignments(db, terminal_id, now)
+    db.query(ProviderExecutionLeaseModel).filter(
+        ProviderExecutionLeaseModel.terminal_id.in_(normalized)
+    ).delete(synchronize_session=False)
+    return workflow_ids
+
+
 def cancel_workflows_for_terminal_with_ids(terminal_id: str) -> List[int]:
-    """Cancel open workflows and return the exact transition-winning IDs."""
+    """Cancel resumable workflows and return the exact transition-winning IDs."""
     _ensure_workflow_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
-        workflows = (
-            db.query(WorkflowModel)
-            .filter(
-                WorkflowModel.root_terminal_id == terminal_id,
-                WorkflowModel.status == WORKFLOW_OPEN,
-            )
-            .all()
+        workflow_ids = _cancel_protected_workflows_in_transaction(
+            db,
+            [terminal_id],
+            reason="root terminal exited or deleted",
         )
-        workflow_ids = [int(workflow.id) for workflow in workflows]
-        now = datetime.now()
-        for workflow in workflows:
-            workflow.status = WORKFLOW_CANCELLED
-            workflow.terminal_reason = "root terminal exited or deleted"
-            workflow.updated_at = now
-            (
-                db.query(WorkflowTurnModel)
-                .filter(
-                    WorkflowTurnModel.workflow_id == workflow.id,
-                    WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
-                )
-                .update(
-                    {
-                        WorkflowTurnModel.state: TURN_CANCELLED,
-                        WorkflowTurnModel.claim_token: None,
-                        WorkflowTurnModel.claim_expires_at: None,
-                    },
-                    synchronize_session=False,
-                )
-            )
-        # A session/terminal removal can race a child callback.  Fence every
-        # active edge owned by this parent in the same commit as cancellation.
-        assignments_cancelled = _cancel_parent_assignments(db, terminal_id, now)
-        execution_released = (
-            db.query(ProviderExecutionLeaseModel)
-            .filter(ProviderExecutionLeaseModel.terminal_id == terminal_id)
-            .delete(synchronize_session=False)
-        )
-        if workflows or assignments_cancelled or execution_released:
-            db.commit()
+        # The helper may still have released a stale execution/assignment edge
+        # even when the workflow was already terminal.
+        db.commit()
         return workflow_ids
 
 
 def cancel_workflows_for_terminal(terminal_id: str) -> int:
     """Cancel open workflows while preserving the established count contract."""
     return len(cancel_workflows_for_terminal_with_ids(terminal_id))
+
+
+def _orphaned_protected_workflow_authority_snapshot(
+    db: Any,
+    root_terminal_id: str,
+) -> Dict[str, Any] | None:
+    """Return the complete mutable authority snapshot for one absent root."""
+    if db.get(TerminalModel, root_terminal_id) is not None:
+        return None
+    workflows = (
+        db.query(WorkflowModel)
+        .filter(
+            WorkflowModel.root_terminal_id == root_terminal_id,
+            WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+        )
+        .order_by(WorkflowModel.id.asc())
+        .all()
+    )
+    if not workflows:
+        return None
+    workflow_ids = [int(workflow.id) for workflow in workflows]
+    turns = (
+        db.query(WorkflowTurnModel)
+        .filter(
+            WorkflowTurnModel.workflow_id.in_(workflow_ids),
+            WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+        )
+        .order_by(WorkflowTurnModel.id.asc())
+        .all()
+    )
+    assignments = (
+        db.query(ChildAssignmentModel)
+        .filter(
+            ChildAssignmentModel.parent_terminal_id == root_terminal_id,
+            ChildAssignmentModel.status.in_(_active_child_assignment_statuses()),
+        )
+        .order_by(ChildAssignmentModel.id.asc())
+        .all()
+    )
+    execution = db.get(ProviderExecutionLeaseModel, root_terminal_id)
+    writer = (
+        db.query(WorktreeWriterLeaseModel)
+        .filter(WorktreeWriterLeaseModel.terminal_id == root_terminal_id)
+        .first()
+    )
+    return {
+        "root_terminal_id": root_terminal_id,
+        "workflows": [
+            {
+                "id": int(workflow.id),
+                "status": str(workflow.status),
+                "active_turn_id": workflow.active_turn_id,
+                "updated_at": workflow.updated_at.isoformat() if workflow.updated_at else None,
+            }
+            for workflow in workflows
+        ],
+        "pending_turns": [
+            {
+                "id": int(turn.id),
+                "workflow_id": int(turn.workflow_id),
+                "state": str(turn.state),
+                "claim_generation": int(turn.claim_generation or 0),
+                "claim_token": turn.claim_token,
+                "claim_expires_at": (
+                    turn.claim_expires_at.isoformat() if turn.claim_expires_at else None
+                ),
+            }
+            for turn in turns
+        ],
+        "active_assignments": [
+            {
+                "id": int(assignment.id),
+                "child_terminal_id": str(assignment.child_terminal_id),
+                "status": str(assignment.status),
+            }
+            for assignment in assignments
+        ],
+        "provider_execution_turn_id": (
+            int(execution.workflow_turn_id) if execution is not None else None
+        ),
+        "writer_lease_path": str(writer.canonical_worktree) if writer is not None else None,
+    }
+
+
+def _workflow_authority_snapshot_fingerprint(snapshot: Mapping[str, Any]) -> str:
+    """Match the Housekeeping non-filesystem candidate fingerprint contract."""
+    serialized_snapshot = json.dumps(dict(snapshot), sort_keys=True, separators=(",", ":"))
+    serialized_payload = json.dumps(
+        {"snapshot": serialized_snapshot},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized_payload.encode()).hexdigest()
+
+
+def list_orphaned_protected_workflow_authorities() -> List[Dict[str, Any]]:
+    """Inventory resumable workflows whose canonical root terminal is absent.
+
+    One row represents one missing root identity, even when historical retries
+    created several protected workflow rows for it. The snapshot binds every
+    lifecycle edge that reconciliation is permitted to cancel.
+    """
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        orphaned = (
+            db.query(WorkflowModel)
+            .outerjoin(TerminalModel, TerminalModel.id == WorkflowModel.root_terminal_id)
+            .filter(
+                TerminalModel.id.is_(None),
+                WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+            )
+            .order_by(WorkflowModel.root_terminal_id.asc(), WorkflowModel.id.asc())
+            .all()
+        )
+        roots = list(dict.fromkeys(str(workflow.root_terminal_id) for workflow in orphaned))
+        return [
+            snapshot
+            for root_terminal_id in roots
+            if (
+                snapshot := _orphaned_protected_workflow_authority_snapshot(
+                    db,
+                    root_terminal_id,
+                )
+            )
+            is not None
+        ]
+
+
+def reconcile_orphaned_protected_workflow_authority(
+    root_terminal_id: str,
+    expected_workflow_ids: Sequence[int],
+    expected_fingerprint: str,
+    expected_writer_lease_path: str,
+    expected_direct_assignment_ids: Sequence[int],
+) -> Dict[str, Any]:
+    """Cancel one unchanged missing-root authority under a write transaction."""
+    _ensure_workflow_schema()
+    expected = sorted({int(value) for value in expected_workflow_ids})
+    expected_direct = sorted({int(value) for value in expected_direct_assignment_ids})
+    if not root_terminal_id or not expected or not expected_fingerprint:
+        return {"reconciled": 0, "already_reconciled": False, "reason": "invalid_identity"}
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        if db.get(TerminalModel, root_terminal_id) is not None:
+            db.rollback()
+            return {"reconciled": 0, "already_reconciled": False, "reason": "terminal_exists"}
+        current_snapshot = _orphaned_protected_workflow_authority_snapshot(db, root_terminal_id)
+        if current_snapshot is None:
+            rows = (
+                db.query(WorkflowModel)
+                .filter(
+                    WorkflowModel.id.in_(expected),
+                    WorkflowModel.root_terminal_id == root_terminal_id,
+                )
+                .all()
+            )
+            if sorted(int(row.id) for row in rows) != expected:
+                db.rollback()
+                return {
+                    "reconciled": 0,
+                    "already_reconciled": False,
+                    "reason": "identity_changed",
+                }
+            if any(row.status in (WORKFLOW_OPEN, WORKFLOW_OWNER_GATE) for row in rows):
+                db.rollback()
+                return {
+                    "reconciled": 0,
+                    "already_reconciled": False,
+                    "reason": "state_changed",
+                }
+            active_turns = (
+                db.query(WorkflowTurnModel)
+                .filter(
+                    WorkflowTurnModel.workflow_id.in_(expected),
+                    WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+                )
+                .count()
+            )
+            active_assignments = (
+                db.query(ChildAssignmentModel)
+                .filter(
+                    ChildAssignmentModel.parent_terminal_id == root_terminal_id,
+                    ChildAssignmentModel.status.in_(_active_child_assignment_statuses()),
+                )
+                .all()
+            )
+            active_direct = sorted(
+                int(assignment.id)
+                for assignment in active_assignments
+                if assignment.status == ChildAssignmentStatus.HANDOFF_DIRECT_RESULT_CLAIMED.value
+            )
+            unexpected_assignments = len(active_assignments) != len(active_direct)
+            provider_execution = db.get(ProviderExecutionLeaseModel, root_terminal_id)
+            writer = (
+                db.query(WorktreeWriterLeaseModel)
+                .filter(WorktreeWriterLeaseModel.terminal_id == root_terminal_id)
+                .first()
+            )
+            writer_path = str(writer.canonical_worktree) if writer is not None else ""
+            if (
+                active_turns
+                or unexpected_assignments
+                or any(assignment_id not in expected_direct for assignment_id in active_direct)
+                or provider_execution is not None
+                or (writer is not None and writer_path != expected_writer_lease_path)
+            ):
+                db.rollback()
+                return {
+                    "reconciled": 0,
+                    "already_reconciled": False,
+                    "reason": "state_changed",
+                }
+            if writer is not None:
+                _release_or_transfer_worktree_writer_lease(db, root_terminal_id)
+            db.commit()
+            return {
+                "reconciled": 0,
+                "already_reconciled": True,
+                "reason": "authority_already_terminal",
+            }
+        current_fingerprint = _workflow_authority_snapshot_fingerprint(current_snapshot)
+        if not hmac.compare_digest(current_fingerprint, expected_fingerprint):
+            db.rollback()
+            return {"reconciled": 0, "already_reconciled": False, "reason": "state_changed"}
+        rows = (
+            db.query(WorkflowModel)
+            .filter(
+                WorkflowModel.id.in_(expected),
+                WorkflowModel.root_terminal_id == root_terminal_id,
+            )
+            .all()
+        )
+        if sorted(int(row.id) for row in rows) != expected:
+            db.rollback()
+            return {"reconciled": 0, "already_reconciled": False, "reason": "identity_changed"}
+        protected = sorted(
+            int(row.id) for row in rows if row.status in (WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)
+        )
+        if not protected:
+            db.rollback()
+            return {"reconciled": 0, "already_reconciled": True, "reason": "already_reconciled"}
+        if protected != expected:
+            db.rollback()
+            return {"reconciled": 0, "already_reconciled": False, "reason": "state_changed"}
+        reconciled = _cancel_protected_workflows_in_transaction(
+            db,
+            [root_terminal_id],
+            reason="root terminal record absent",
+        )
+        _release_or_transfer_worktree_writer_lease(db, root_terminal_id)
+        if sorted(reconciled) != expected:
+            db.rollback()
+            return {"reconciled": 0, "already_reconciled": False, "reason": "state_changed"}
+        db.commit()
+        return {
+            "reconciled": len(reconciled),
+            "already_reconciled": False,
+            "reason": "root_terminal_absent",
+        }
 
 
 def _inbox_model_to_message(inbox_msg: InboxModel) -> InboxMessage:

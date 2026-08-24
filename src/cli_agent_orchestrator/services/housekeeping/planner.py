@@ -992,14 +992,75 @@ def discover_runtime_candidates(
     candidates.extend(docker)
     terminal_runtimes, terminal_warnings = _plan_closed_terminal_runtimes(proc_root=proc_root)
     candidates.extend(terminal_runtimes)
+    workflow_authorities, workflow_authority_warnings = _plan_orphan_workflow_authorities()
+    candidates.extend(workflow_authorities)
     retirement_cleanups, retirement_warnings = _plan_retirement_cleanups(protection=protection)
     candidates.extend(retirement_cleanups)
     return candidates, [
         *browser_warnings,
         *docker_warnings,
         *terminal_warnings,
+        *workflow_authority_warnings,
         *retirement_warnings,
     ]
+
+
+def _plan_orphan_workflow_authorities() -> tuple[list[HousekeepingCandidate], list[str]]:
+    """Expose missing-root workflow authority as an explicit zero-byte repair."""
+    from cli_agent_orchestrator.clients.database import (
+        list_orphaned_protected_workflow_authorities,
+    )
+
+    try:
+        rows = list_orphaned_protected_workflow_authorities()
+    except Exception:
+        return [], ["workflow_authority_inventory_uncertain"]
+    candidates: list[HousekeepingCandidate] = []
+    warnings: list[str] = []
+    for row in rows:
+        root_terminal_id = row.get("root_terminal_id")
+        workflows = row.get("workflows")
+        if (
+            not isinstance(root_terminal_id, str)
+            or not root_terminal_id
+            or not isinstance(workflows, list)
+            or not workflows
+            or any(
+                not isinstance(item, Mapping) or not isinstance(item.get("id"), int)
+                for item in workflows
+            )
+        ):
+            warnings.append("workflow_authority_identity_unknown")
+            continue
+        snapshot = json.dumps(row, sort_keys=True, separators=(",", ":"))
+        candidates.append(
+            _resource_candidate(
+                category="retirement_cleanup",
+                resource_kind="workflow_authority",
+                identity=f"workflow-authority:{root_terminal_id}",
+                fingerprint_payload={"snapshot": snapshot},
+                size=0,
+                action="prune",
+                retention_reason="missing_root_terminal",
+                attributes={
+                    "root_terminal_id": root_terminal_id,
+                    "workflow_ids": json.dumps(
+                        sorted(int(item["id"]) for item in workflows),
+                        separators=(",", ":"),
+                    ),
+                    "direct_assignment_ids": json.dumps(
+                        sorted(
+                            int(item["id"])
+                            for item in row.get("active_assignments", [])
+                            if item.get("status") == "handoff_direct_result_claimed"
+                        ),
+                        separators=(",", ":"),
+                    ),
+                    "writer_lease_path": str(row.get("writer_lease_path") or ""),
+                },
+            )
+        )
+    return candidates, warnings
 
 
 def revalidate_runtime_candidate(

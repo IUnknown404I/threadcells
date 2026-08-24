@@ -51,8 +51,9 @@ describe('Control-plane settings routes', () => {
     mode: 'frequent' as const,
     root: '/fixture',
     reclaimable_bytes: 100,
+    class_summaries: { logs: { candidate_count: 1, actionable_count: 1, reclaimable_bytes: 100, preserved_count: 0, preserved_bytes: 0, protection_reasons: {} } },
     warnings: [],
-    candidates: [{ canonical_identity: 'logs:item', category: 'logs', action: 'compress' as const, estimated_reclaim_bytes: 100, retention_reason: 'older_than_policy', protection_reason: null }],
+    candidates: [{ canonical_identity: 'logs:item', category: 'logs', action: 'compress' as const, bytes: 100, estimated_reclaim_bytes: 100, retention_reason: 'older_than_policy', protection_reason: null, resource_kind: 'path' }],
     ...overrides,
   })
 
@@ -186,7 +187,7 @@ describe('Control-plane settings routes', () => {
       resource_state: 'GREEN', reasons: [], resident_supervisors: { active: 1, limit: 5, available: 4, certain: true }, provider_executions: { active: 0, limit: 3, available: 3, certain: true }, work_contexts: { active: 0, limit: 2, available: 2, certain: true }, heavy_executions: { active: 0, limit: 1, available: 1, waiting: 0 }, memory: { available_mib: 1024, swap_total_mib: 0, swap_free_mib: 0 }, root_disk: { used_percent: 42, free_gib: 50 }, memory_pressure: { some_avg10: 0, full_avg10: 0 }, cpu_load: { one_minute: 0, cpu_count: 4 }, housekeeping: null,
     })
     const planId = 'a'.repeat(64)
-    const plan = vi.spyOn(api, 'getHousekeepingPlan').mockResolvedValue({ schema_version: 1, plan_id: planId, generated_at: 100, mode: 'frequent', root: '/fixture', reclaimable_bytes: 100, warnings: ['retirement_cleanup_claim_unknown:diagnostic-only'], candidates: [{ canonical_identity: 'logs:item', category: 'logs', action: 'compress', estimated_reclaim_bytes: 100, retention_reason: 'older_than_policy', protection_reason: null }, { canonical_identity: 'backup:protected', category: 'backups', action: 'preserve', estimated_reclaim_bytes: 0, retention_reason: 'protected_inventory', protection_reason: 'BACKUP_PROTECTED' }] })
+    const plan = vi.spyOn(api, 'getHousekeepingPlan').mockResolvedValue({ schema_version: 1, plan_id: planId, generated_at: 100, mode: 'frequent', root: '/fixture', reclaimable_bytes: 100, class_summaries: { logs: { candidate_count: 1, actionable_count: 1, reclaimable_bytes: 100, preserved_count: 0, preserved_bytes: 0, protection_reasons: {} }, backups: { candidate_count: 1, actionable_count: 0, reclaimable_bytes: 0, preserved_count: 1, preserved_bytes: 4096, protection_reasons: { BACKUP_PROTECTED: 1 } } }, warnings: ['retirement_cleanup_claim_unknown:diagnostic-only'], candidates: [{ canonical_identity: 'logs:item', category: 'logs', action: 'compress', bytes: 100, estimated_reclaim_bytes: 100, retention_reason: 'older_than_policy', protection_reason: null, resource_kind: 'path' }, { canonical_identity: 'backup:protected', category: 'backups', action: 'preserve', bytes: 4096, estimated_reclaim_bytes: 0, retention_reason: 'protected_inventory', protection_reason: 'BACKUP_PROTECTED', resource_kind: 'inventory' }] })
     const run = vi.spyOn(api, 'runHousekeeping').mockResolvedValue({ ok: true, plan_id: planId })
 
     render(<ControlPlaneSettings section="housekeeping" navigate={() => {}} />)
@@ -202,6 +203,8 @@ describe('Control-plane settings routes', () => {
     expect((await screen.findAllByText('100 B')).length).toBeGreaterThan(0)
     expect(screen.getByText('logs:item')).toBeInTheDocument()
     expect(within(screen.getByText('Protected / skipped').parentElement as HTMLElement).getByText('1')).toBeInTheDocument()
+    expect(screen.getByText('Protected footprint by class')).toBeInTheDocument()
+    expect(screen.getByText('Backups: 4.0 KiB')).toBeInTheDocument()
     expect(screen.getByText(/could not safely confirm an exclusive claim/)).toBeInTheDocument()
     expect(screen.getByText(/Diagnostic ID:/)).toHaveTextContent('diagnostic-only')
     expect(screen.queryByText(/retirement cleanup claim unknown/)).not.toBeInTheDocument()
@@ -313,6 +316,7 @@ describe('Control-plane settings routes', () => {
     vi.spyOn(api, 'getHousekeepingReport').mockResolvedValue({
       ok: false, started_at: '2026-08-20T10:00:00Z', completed_at: '2026-08-20T10:00:02.5Z',
       duration_seconds: 2.5, freed_bytes: 1536, logs_compressed: 2, logs_deleted: 1,
+      reclaimed_bytes_by_class: { logs: 1024, package_cache: 512 }, observed_disk_free_delta: 2048,
       attachments_deleted: 0, ephemeral_resources_removed: 1, browser_revisions_removed: 0,
       cache_pruned: 1, skipped_open: 1, skipped_unknown: 0,
       execution_failures: [{ reason_code: 'FINGERPRINT_CHANGED' }], warnings: ['metadata_unknown'],
@@ -327,6 +331,8 @@ describe('Control-plane settings routes', () => {
     expect((await screen.findAllByText('Completed with issues')).length).toBeGreaterThan(0)
     expect(screen.getByText('2.5 seconds')).toBeInTheDocument()
     expect(screen.getByText('1.5 KiB')).toBeInTheDocument()
+    expect(screen.getByText('logs')).toBeInTheDocument()
+    expect(screen.getByText('package cache')).toBeInTheDocument()
     expect(screen.getByText('1 protected or skipped item')).toBeInTheDocument()
     expect(screen.getByText('FINGERPRINT_CHANGED')).toBeInTheDocument()
     expect(screen.getByText('metadata unknown')).toBeInTheDocument()

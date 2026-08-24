@@ -5458,6 +5458,18 @@ def get_open_workflow_root_terminal_ids() -> List[str]:
         ]
 
 
+def get_protected_workflow_root_terminal_ids() -> List[str]:
+    """Return workflow roots which still own live or recovery authority."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        return [
+            row[0]
+            for row in db.query(WorkflowModel.root_terminal_id)
+            .filter(WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)))
+            .all()
+        ]
+
+
 def get_queued_workflow_root_terminal_ids() -> List[str]:
     """Return queued provider inputs oldest-first, with one entry per resident."""
     _ensure_workflow_schema()

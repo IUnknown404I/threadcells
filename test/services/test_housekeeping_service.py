@@ -19,6 +19,7 @@ from cli_agent_orchestrator.services.housekeeping_service import (
     _reconcile_supervisor_context_roles,
     _reconcile_writer_leases,
     _runtime_open_paths_inventory,
+    run_pressure_recovery,
 )
 
 
@@ -40,6 +41,34 @@ def _config(root: Path):
 
 def _age(path: Path, now: float, minutes: int):
     os.utime(path, (now - minutes * 60, now - minutes * 60))
+
+
+def test_pressure_recovery_executes_the_exact_fresh_plan(tmp_path, monkeypatch):
+    observed = {}
+
+    def plan(**kwargs):
+        observed["plan"] = kwargs
+        return SimpleNamespace(plan_id="a" * 64)
+
+    def run(**kwargs):
+        observed["run"] = kwargs
+        return HousekeepingSummary()
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service.plan_housekeeping", plan
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service.run_housekeeping",
+        run,
+    )
+    config = _config(tmp_path)
+    config["_housekeeping_heavy_slot"] = True
+
+    run_pressure_recovery(config, now=123.0, proc_root=tmp_path / "proc")
+
+    assert observed["plan"]["mode"] == "pressure"
+    assert observed["run"]["dry_run"] is False
+    assert observed["run"]["expected_plan_id"] == "a" * 64
 
 
 def test_housekeeping_reuses_canonical_supervisor_role_reconciliation(monkeypatch):

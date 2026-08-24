@@ -334,6 +334,11 @@ def test_release_builder_and_public_config_are_host_neutral_and_offline() -> Non
     assert config["active_release_link"] == "/var/lib/threadcells/active"
     assert config["release_admin_group"] == "threadcells-release-admin"
     assert config["release_control_uid"] == 0
+    assert config["worktree_durable_refs"] == []
+    assert config["reproducible_cache_roots"] == []
+    for cache in config["package_caches"]:
+        argument = cache["path_argument"]
+        assert cache["command"][cache["command"].index(argument) + 1] == cache["path"]
     audit = _public_audit_module()
     assert config_path.relative_to(ROOT).as_posix() in audit.PUBLIC_FILES
     assert (

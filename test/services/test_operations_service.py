@@ -194,6 +194,8 @@ def test_disk_pressure_reasons_distinguish_red_and_critical(tmp_path):
 
     assert red["reasons"] == ["ROOT_DISK_PRESSURE"]
     assert critical["reasons"] == ["ROOT_DISK_PRESSURE", "DISK_CRITICAL"]
+    assert red["root_disk"]["state"] == "RED"
+    assert critical["root_disk"]["state"] == "CRITICAL"
 
 
 def test_resource_status_projects_explicit_linux_cpu_load(tmp_path):
@@ -375,6 +377,7 @@ def test_pressure_recovery_subprocess_is_bounded_and_temp_config_is_removed(tmp_
     observed = {}
 
     def timed_out(command, **kwargs):
+        observed["command"] = command
         observed.update(kwargs)
         config_path = Path(kwargs["env"]["CAO_OPERATIONS_CONFIG"])
         observed["config_path"] = config_path
@@ -386,7 +389,45 @@ def test_pressure_recovery_subprocess_is_bounded_and_temp_config_is_removed(tmp_
     )
     _attempt_pressure_recovery(_config(tmp_path))
     assert observed["timeout"] == 1
+    assert "run_pressure_recovery" in observed["command"][2]
     assert not observed["config_path"].exists()
+
+
+def test_heavy_admission_recovery_runs_without_holding_admission_lock(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    lock_dir = Path(config["lock_dir"])
+    lock_dir.mkdir(parents=True)
+    statuses = iter(
+        (
+            _status(tmp_path, memory_mib=2048, used_percent=90),
+            _status(tmp_path, memory_mib=2048, used_percent=50),
+            _status(tmp_path, memory_mib=2048, used_percent=50),
+        )
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.operations_service.get_resource_status",
+        lambda _config: next(statuses),
+    )
+    recovery_lock_available = []
+
+    def recovery(_config):
+        with (lock_dir / "heavy-admission.lock").open("a+") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                recovery_lock_available.append(False)
+            else:
+                recovery_lock_available.append(True)
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.operations_service._attempt_pressure_recovery",
+        recovery,
+    )
+
+    with acquire_heavy_slot(config) as slot:
+        assert slot == 0
+    assert recovery_lock_available == [True]
 
 
 def test_heavy_limit_one_waits_then_proceeds_and_releases_on_failure(tmp_path, monkeypatch):

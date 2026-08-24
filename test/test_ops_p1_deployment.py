@@ -89,9 +89,18 @@ def test_stage_ops_p1_is_dry_run_capable_and_idempotent(tmp_path):
         str(agent_root),
         "--system-root",
         str(system_root),
+        "--worktree-durable-ref",
+        "refs/remotes/threadcells-public/main",
     ]
     dry_run = subprocess.run([*command, "--dry-run"], capture_output=True, text=True)
     assert dry_run.returncode == 0
+    invalid_ref = subprocess.run(
+        [*command[:-1], "refs/heads/invalid..ref", "--dry-run"],
+        capture_output=True,
+        text=True,
+    )
+    assert invalid_ref.returncode != 0
+    assert "WORKTREE_DURABLE_REF_INVALID" in invalid_ref.stdout + invalid_ref.stderr
     assert not (system_root / "etc/agent-control/cao-operations.json").exists()
     assert policy.read_text() == "# Existing authority\n"
     for _ in range(2):
@@ -109,6 +118,31 @@ def test_stage_ops_p1_is_dry_run_capable_and_idempotent(tmp_path):
     assert config["active_release_link"] == str(release_state_root / "active")
     assert config["release_admin_group"] == "threadcells-release-admin"
     assert config["release_control_uid"] == os.getuid()
+    assert config["worktree_roots"] == [
+        str(agent_root.resolve() / "tmp"),
+        str(agent_root.resolve() / "state/cao/worktrees"),
+    ]
+    assert config["worktree_durable_refs"] == ["refs/remotes/threadcells-public/main"]
+    assert config["reproducible_cache_roots"]
+    assert config["reproducible_cache_owned_prefixes"] == [
+        "threadcells-ci-uv-cache-",
+        "threadcells-ci-venv-",
+        "threadcells-ci-wheel-",
+    ]
+    package_caches = {item["name"]: item for item in config["package_caches"]}
+    assert package_caches["uv-agent-control"]["path"] == str(agent_root.resolve() / "cache")
+    assert package_caches["uv-agent-control"]["full_reclaim"] is True
+    assert package_caches["uv-agent-control"]["path_argument"] == "--cache-dir"
+    assert package_caches["uv-runtime-user"]["full_reclaim"] is True
+    assert package_caches["npm"]["path_argument"] == "--cache"
+    assert "pnpm" not in package_caches
+    assert {item["category"] for item in config["protected_inventory_roots"]} == {
+        "tools",
+        "projects",
+        "sources",
+        "provider_state",
+        "runtime_tooling",
+    }
     staged_policy = policy.read_text()
     assert staged_policy.count("<!-- CAO.OPS.P1 BEGIN -->") == 1
     assert staged_policy.count("<!-- CAO.OPS.P1 END -->") == 1

@@ -249,6 +249,15 @@ def get_resource_status(
     mem_available_mib = memory.get("MemAvailable", 0) // (1024 * 1024)
     root_used_percent = round((disk.used * 100 / disk.total) if disk.total else 100.0, 1)
     root_free_gib = round(disk.free / (1024**3), 2)
+    root_disk_state = (
+        "CRITICAL"
+        if root_used_percent >= int(cfg["root_used_critical_percent"])
+        else (
+            "RED"
+            if root_used_percent >= int(cfg["root_used_red_percent"])
+            else "YELLOW" if root_used_percent >= int(cfg["root_used_yellow_percent"]) else "GREEN"
+        )
+    )
     full_avg10 = pressure.get("full_avg10", 0.0)
     some_avg10 = pressure.get("some_avg10", 0.0)
 
@@ -364,7 +373,11 @@ def get_resource_status(
             "swap_total_mib": memory.get("SwapTotal", 0) // (1024 * 1024),
             "swap_free_mib": memory.get("SwapFree", 0) // (1024 * 1024),
         },
-        "root_disk": {"used_percent": root_used_percent, "free_gib": root_free_gib},
+        "root_disk": {
+            "state": root_disk_state,
+            "used_percent": root_used_percent,
+            "free_gib": root_free_gib,
+        },
         "memory_pressure": {"some_avg10": some_avg10, "full_avg10": full_avg10},
         "cpu_load": {"one_minute": one_minute_load, "cpu_count": available_cpus},
         "housekeeping": housekeeping,
@@ -402,9 +415,7 @@ def _attempt_pressure_recovery(config: Mapping[str, Any]) -> None:
             [
                 sys.executable,
                 "-c",
-                "from cli_agent_orchestrator.services.housekeeping_service import housekeeping_main; raise SystemExit(housekeeping_main())",
-                "--mode",
-                "pressure",
+                "from cli_agent_orchestrator.services.housekeeping_service import run_pressure_recovery; run_pressure_recovery()",
             ],
             check=False,
             capture_output=True,
@@ -430,12 +441,13 @@ def require_resource_admission(
     include_work_capacity: bool = False,
     include_context_capacity: bool | None = None,
     status_probe: Callable[[], dict[str, Any]] | None = None,
+    attempt_pressure_recovery: bool = True,
 ) -> dict[str, Any]:
     """Recover once from RED, recheck, then enforce health and optional capacity."""
     cfg = _canonical_capacity_config(config or load_operations_config())
     probe = status_probe or (lambda: get_resource_status(cfg))
     status = probe()
-    if status["resource_state"] == "RED":
+    if status["resource_state"] == "RED" and attempt_pressure_recovery:
         _attempt_pressure_recovery(cfg)
         status = probe()
     if status["resource_state"] == "RED":
@@ -464,6 +476,34 @@ def _lock_with_timeout(handle: Any, timeout_seconds: float) -> None:
             if time.monotonic() >= deadline:
                 raise AdmissionDenied("ADMISSION_FENCE_TIMEOUT", {})
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+@contextmanager
+def context_lifecycle_fence(
+    config: Mapping[str, Any] | None = None,
+    *,
+    nonblocking: bool = False,
+) -> Iterator[bool]:
+    """Serialize authorities which can acquire or retire a worktree.
+
+    ``False`` is yielded only for a requested non-blocking acquisition.  This
+    is the same canonical fence used by context launch; it is intentionally
+    narrower than capacity admission so registry maintenance remains possible
+    while the host is under disk pressure.
+    """
+    cfg = _canonical_capacity_config(config or load_operations_config())
+    lock_dir = Path(str(cfg["lock_dir"]))
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with (lock_dir / "context-launch.lock").open("a+") as handle:
+        if nonblocking:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+        else:
+            _lock_with_timeout(handle, float(cfg["context_launch_lock_timeout_seconds"]))
+        yield True
 
 
 @contextmanager
@@ -588,6 +628,13 @@ def acquire_heavy_slot(
     handles: list[Any] = []
     try:
         while acquired is None:
+            # Pressure recovery itself needs a recovery-safe heavy slot.  Run
+            # the recovering admission probe before taking the serialization
+            # lock so the recovery child can acquire that lock and slot.
+            if recovery_safe:
+                _recovery_safe_heavy_status(cfg)
+            else:
+                require_resource_admission(cfg)
             with (lock_dir / "heavy-admission.lock").open("a+") as admission_handle:
                 _lock_with_timeout(
                     admission_handle, float(cfg["context_launch_lock_timeout_seconds"])
@@ -598,7 +645,9 @@ def acquire_heavy_slot(
                     status = _recovery_safe_heavy_status(cfg)
                     heavy = status.get("heavy_executions", {})
                 else:
-                    status = require_resource_admission(cfg)
+                    # Revalidate while serialized, but never launch recovery
+                    # while holding the lock it must acquire.
+                    status = require_resource_admission(cfg, attempt_pressure_recovery=False)
                     heavy = status.get("heavy_executions", {})
                 active_heavy, configured_heavy = _heavy_utilization(cfg)
                 if not isinstance(heavy.get("active"), int):
@@ -627,12 +676,6 @@ def acquire_heavy_slot(
                 if time.monotonic() >= deadline:
                     raise AdmissionDenied("HEAVY_SLOT_WAIT_TIMEOUT", {})
                 time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
-        # Health can degrade while this process waits. The acquired slot must
-        # not be handed to the executable until the current state is admitted.
-        if recovery_safe:
-            _recovery_safe_heavy_status(config or load_operations_config())
-        else:
-            require_resource_admission(config or load_operations_config())
         yield acquired[0]
     finally:
         if acquired is not None:

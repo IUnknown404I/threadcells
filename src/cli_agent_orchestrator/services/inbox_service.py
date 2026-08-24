@@ -371,7 +371,10 @@ def _dispatch_pending_messages_with_admission(
 
         if isinstance(e, AdmissionDenied) and e.reason_code in {
             "PROVIDER_EXECUTION_CAPACITY_EXHAUSTED",
+            "PROVIDER_EXECUTION_TERMINAL_BUSY",
             "RESOURCE_HEALTH_REJECTED",
+            "TERMINAL_RUNTIME_OPERATION_BUSY",
+            "TERMINAL_RUNTIME_RECONNECT_PENDING",
         }:
             logger.info(
                 "Keeping Inbox wake %s queued for provider admission (%s)",

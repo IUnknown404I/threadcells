@@ -441,7 +441,7 @@ def test_final_brand_asset_manifest_matches_runtime_assets() -> None:
         assert hashlib.sha256(path.read_bytes()).hexdigest() == asset["sha256"]
     index = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
     assert 'href="/favicon.ico"' in index
-    assert 'href="/manifest.webmanifest"' in index
+    assert 'rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials"' in index
     assert 'content="/threadcells-og-1200x630.png"' in index
 
 

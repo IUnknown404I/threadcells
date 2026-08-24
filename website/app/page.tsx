@@ -81,7 +81,7 @@ export function LandingPage({ locale = 'en' }: { locale?: Locale }) {
           <div className="hero-ambient" aria-hidden="true" />
           <div className="hero-copy">
             <p className="eyebrow"><span>{t('SELF-HOSTED', 'НА СВОЁМ ХОСТЕ')}</span> {t('CODING-AGENT OPERATIONS', 'УПРАВЛЕНИЕ КОДОВЫМИ АГЕНТАМИ')}</p>
-            <h1 id="hero-title">{t('Run coding agents as a system.', 'Запускайте кодовых агентов как систему.')}<br /> <em>{t('Not a pile', 'Не набор')}</em> {t('of terminals.', 'терминалов.')}</h1>
+            <h1 id="hero-title">{t('Work with AI agents ', 'Работайте с AI-агентами в ')}<em>{t('as a system', 'полностью автономной системе')}</em>.</h1>
             <p className="hero-lede">{t('ThreadCells coordinates native CLI agents, keeps open workflows moving across model turns, and maintains the orchestration environment underneath them—on your own Linux host.', 'ThreadCells координирует нативных CLI-агентов, ведёт открытые процессы между обращениями к модели и поддерживает среду оркестрации на вашем Linux-хосте.')}</p>
             <div className="hero-actions">
               <a className="button button-primary" href={site.githubUrl} target="_blank" rel="noopener noreferrer"><Github /> {t('View on GitHub', 'Открыть на GitHub')} <ArrowUpRight /></a>

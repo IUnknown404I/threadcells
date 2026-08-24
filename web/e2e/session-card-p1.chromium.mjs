@@ -149,33 +149,42 @@ try {
     assert.equal(await longCard.getByTestId(`session-status-agent-${longSession.id}-ready`).getByText('×12').count(), 1, `Total Ready aggregation changed at ${width}px`)
 
     const fewSummary = fewCard.getByLabel('Session status')
-    const agentLayout = fewSummary.getByRole('group', { name: 'Agent layout' })
-    if (width < 640) {
-      assert.equal(await agentLayout.isVisible(), false, 'mobile must hide the redundant List/Grid switch')
+    const fewActions = fewHeader.getByTestId(`session-actions-${fewSession.id}`)
+    const agentLayout = fewActions.getByRole('group', { name: 'Agent layout' })
+    assert.equal(await agentLayout.isVisible(), true, `session List/Grid controls must remain available at ${width}px`)
+    assert.equal(await fewSummary.getByRole('group', { name: 'Agent layout' }).count(), 0, 'layout controls must not remain in the status strip')
+    await agentLayout.getByRole('button', { name: 'List view' }).click()
+    assert.equal(await agentLayout.getByRole('button', { name: 'List view' }).getAttribute('aria-pressed'), 'true')
+    if (width < 768) {
       const [titleRowBox, metadataBox, actionsBox] = await Promise.all([
         longTitleRow.boundingBox(), longMetadata.boundingBox(), longActions.boundingBox(),
       ])
       assert(titleRowBox && metadataBox && actionsBox, 'mobile session header rows must be measurable')
       assert(metadataBox.y >= titleRowBox.y + titleRowBox.height - 1, 'mobile metadata must be on row 2')
-      assert(actionsBox.y >= titleRowBox.y + titleRowBox.height - 1, 'mobile actions must be on row 2')
-      assert.equal(
-        await longCard.getByTestId('session-agent-container').evaluate(node => getComputedStyle(node).display),
-        'block',
-        'mobile agent layout must remain the canonical list even when desktop Grid was selected',
-      )
-    } else {
-      assert.equal(await agentLayout.isVisible(), true, 'tablet/desktop must retain List/Grid controls')
-      await fewSummary.getByRole('button', { name: 'List view' }).click()
-      assert.equal(await fewSummary.getByRole('button', { name: 'List view' }).getAttribute('aria-pressed'), 'true')
+      assert(actionsBox.y >= metadataBox.y + metadataBox.height - 1, 'mobile session controls must wrap to a clean secondary row')
     }
     await fewCard.screenshot({ path: `${evidenceDir}/${width}-few-expanded-list.png` })
     await longCard.screenshot({ path: `${evidenceDir}/${width}-many-expanded-list.png` })
 
-    const longSummary = longCard.getByLabel('Session status')
-    if (width >= 640) {
-      await longSummary.getByRole('button', { name: 'Grid view' }).click()
-      assert.equal(await longSummary.getByRole('button', { name: 'Grid view' }).getAttribute('aria-pressed'), 'true')
+    const longLayout = longActions.getByRole('group', { name: 'Agent layout' })
+    await longLayout.getByRole('button', { name: 'Grid view' }).click()
+    assert.equal(await longLayout.getByRole('button', { name: 'Grid view' }).getAttribute('aria-pressed'), 'true')
+    const gridEvidence = await longCard.getByTestId('session-agent-container').evaluate(node => ({
+      display: getComputedStyle(node).display,
+      columns: getComputedStyle(node).gridTemplateColumns.split(' ').filter(Boolean).length,
+      agentIds: Array.from(node.querySelectorAll('[data-testid^="agent-detail-card-"]')).map(card => card.getAttribute('data-testid')),
+      terminalActions: node.querySelectorAll('button').length,
+    }))
+    assert.deepEqual(gridEvidence.agentIds, Array.from({ length: 12 }, (_, index) => `agent-detail-card-${longSession.id}-terminal-${index}`), `Grid changed durable agent order at ${width}px`)
+    assert(gridEvidence.terminalActions >= 12 * 6, `Grid lost agent actions at ${width}px`)
+    if (width < 768) {
+      assert.equal(gridEvidence.display, 'block', 'mobile Grid preference must preserve the canonical single-column physical layout')
+    } else {
+      assert.equal(gridEvidence.display, 'grid', `tablet/desktop Grid must use CSS grid at ${width}px`)
+      assert.equal(gridEvidence.columns, 2, `tablet/desktop Grid must render exactly two columns at ${width}px`)
     }
+    await page.waitForTimeout(240)
+    assert.equal(await longLayout.getByRole('button', { name: 'Grid view' }).getAttribute('aria-pressed'), 'true', `polling reset Grid preference at ${width}px`)
     await longCard.screenshot({ path: `${evidenceDir}/${width}-many-expanded-grid.png` })
 
     await longHeader.getByRole('button', { name: `Collapse ${displayName(longSession)} using chevron` }).click()
@@ -187,7 +196,7 @@ try {
     await longCard.screenshot({ path: `${evidenceDir}/${width}-many-collapsed-grid.png` })
     await longHeader.getByRole('button', { name: `Expand ${displayName(longSession)}`, exact: true }).press('Enter')
   }
-  console.log(JSON.stringify({ evidenceDir, widths: [1440, 834, 390], assertions: ['no horizontal overflow', 'long title remains single-line', 'mobile two-row header', 'mobile List/Grid hidden', 'mobile canonical list layout', 'tablet/desktop List/Grid pressed state', 'status-only badges', 'owner reason dedicated panel', 'First/Last/Total aggregation', 'emerald expanded surface', 'gray collapsed surface', 'title keyboard expansion'] }))
+  console.log(JSON.stringify({ evidenceDir, widths: [1440, 834, 390], assertions: ['no horizontal overflow', 'long title remains single-line', 'responsive session-header controls', 'mobile List/Grid available', 'mobile canonical single-column layout', 'tablet/desktop two-column Grid', 'stable agent order and actions', 'polling preserves view preference', 'status-only badges', 'owner reason dedicated panel', 'First/Last/Total aggregation', 'emerald expanded surface', 'gray collapsed surface', 'title keyboard expansion'] }))
 } finally {
   await browser?.close()
   await new Promise(resolve => server.close(resolve))

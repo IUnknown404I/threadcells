@@ -560,19 +560,23 @@ def acquire_provider_execution_slot(
     """Acquire provider-turn authority immediately before physical transport."""
     cfg = _canonical_capacity_config(config or load_operations_config())
     status = require_resource_admission(cfg)
-    from cli_agent_orchestrator.clients.database import acquire_provider_execution
+    from cli_agent_orchestrator.clients.database import acquire_provider_execution_decision
 
     if config is None:
         from cli_agent_orchestrator.clients.database import ensure_capacity_settings
 
         ensure_capacity_settings(cfg)
 
-    if not acquire_provider_execution(
+    decision = acquire_provider_execution_decision(
         terminal_id,
         workflow_turn_id,
         int(cfg["max_provider_executions"]) if config is not None else None,
-    ):
-        raise AdmissionDenied("PROVIDER_EXECUTION_CAPACITY_EXHAUSTED", status)
+    )
+    status["provider_executions"] = {
+        key: decision[key] for key in ("active", "limit", "draining", "available", "certain")
+    }
+    if not decision["acquired"]:
+        raise AdmissionDenied(str(decision["reason_code"]), status)
 
 
 def set_capacity_settings(values: Mapping[str, Any], *, actor: str) -> dict[str, Any]:

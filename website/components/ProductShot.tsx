@@ -1,6 +1,7 @@
 import type { CSSProperties } from 'react'
 import { ZoomableImage } from '@/components/ZoomableImage'
 import { assetPath } from '@/lib/site'
+import type { Locale } from '@/lib/locales'
 
 type ProductShotProps = {
   src: string
@@ -12,9 +13,10 @@ type ProductShotProps = {
   width?: number
   height?: number
   stateLabel?: string
+  locale?: Locale
 }
 
-export function ProductShot({ src, alt, label, detail, className = '', eager = false, width = 1440, height = 960, stateLabel = 'LIVE RELEASE SYSTEM' }: ProductShotProps) {
+export function ProductShot({ src, alt, label, detail, className = '', eager = false, width = 1440, height = 960, stateLabel = 'LIVE RELEASE SYSTEM', locale = 'en' }: ProductShotProps) {
   const resolvedSrc = assetPath(src)
   return (
     <figure className={`product-shot ${className}`}>
@@ -24,7 +26,7 @@ export function ProductShot({ src, alt, label, detail, className = '', eager = f
         <span>{stateLabel}</span>
       </div>
       <div className="shot-media" style={{ '--shot-aspect': `${width} / ${height}` } as CSSProperties}>
-        <ZoomableImage src={resolvedSrc} alt={alt} eager={eager} width={width} height={height} />
+        <ZoomableImage src={resolvedSrc} alt={alt} eager={eager} width={width} height={height} locale={locale} />
       </div>
       <figcaption><strong>{label}</strong><span>{detail}</span></figcaption>
     </figure>

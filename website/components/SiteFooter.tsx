@@ -9,7 +9,7 @@ export function SiteFooter({ locale = 'en' }: { locale?: Locale }) {
   return (
     <footer className="site-footer">
       <div className="footer-top">
-        <a className="brand-link" href={home} aria-label="ThreadCells home"><Mark /></a>
+        <a className="brand-link" href={home} aria-label={locale === 'ru' ? 'Главная ThreadCells' : 'ThreadCells home'}><Mark locale={locale} /></a>
         <p>{copy.footer}<small>{locale === 'ru' ? <>Создано и поддерживается <a href={site.creator.url} target="_blank" rel="noopener noreferrer">{site.creator.name}</a> при участии сообщества ThreadCells.</> : <>Created and maintained by <a href={site.creator.url} target="_blank" rel="noopener noreferrer">{site.creator.name}</a>, with contributions from the ThreadCells community.</>}</small></p>
         <nav aria-label={copy.footerNav}>
           <a href={site.githubUrl} target="_blank" rel="noopener noreferrer"><Github /> GitHub <ArrowUpRight size={14} /></a>
@@ -20,7 +20,7 @@ export function SiteFooter({ locale = 'en' }: { locale?: Locale }) {
       <div className="footer-bottom">
         <span>Apache-2.0</span>
         <span>ThreadCells © 2026 · <a href={site.creator.url} target="_blank" rel="noopener noreferrer">{site.creator.name}</a></span>
-        <p>{locale === 'ru' ? 'Независимый неофициальный downstream AWS Labs CLI Agent Orchestrator. Спонсорство или одобрение AWS не подразумевается.' : 'Independent, unofficial downstream of AWS Labs CLI Agent Orchestrator. No AWS sponsorship or endorsement is implied.'}</p>
+        <p>{locale === 'ru' ? 'Независимый неофициальный проект на основе AWS Labs CLI Agent Orchestrator. AWS не спонсирует и не одобряет его.' : 'Independent, unofficial downstream of AWS Labs CLI Agent Orchestrator. No AWS sponsorship or endorsement is implied.'}</p>
       </div>
     </footer>
   )

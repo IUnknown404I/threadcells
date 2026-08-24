@@ -1,6 +1,6 @@
 import { assetPath } from '@/lib/site'
 
-export function Mark({ compact = false, horizontal = false }: { compact?: boolean; horizontal?: boolean }) {
+export function Mark({ compact = false, horizontal = false, locale = 'en' }: { compact?: boolean; horizontal?: boolean; locale?: 'en' | 'ru' }) {
   if (horizontal) {
     return (
       <span className="brand-mark-horizontal">
@@ -14,7 +14,7 @@ export function Mark({ compact = false, horizontal = false }: { compact?: boolea
       <img src={assetPath('/threadcells-symbol.webp')} alt="" width="52" height="52" />
       <span>
         <span className="brand-name">ThreadCells</span>
-        {!compact && <span className="brand-subtitle">CONTROL PLANE</span>}
+        {!compact && <span className="brand-subtitle">{locale === 'ru' ? 'ПАНЕЛЬ УПРАВЛЕНИЯ' : 'CONTROL PLANE'}</span>}
       </span>
     </span>
   )

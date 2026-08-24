@@ -9,11 +9,11 @@ export function SiteHeader({ locale = 'en' }: { locale?: Locale }) {
   return (
     <header className="site-header">
       <div className="header-inner">
-        <a href={assetPath(`${locale === 'ru' ? '/ru' : ''}/#top`)} className="brand-link" aria-label="ThreadCells home">
-          <span className="desktop-brand"><Mark /></span>
-          <span className="mobile-brand"><Mark compact /></span>
+        <a href={assetPath(`${locale === 'ru' ? '/ru' : ''}/#top`)} className="brand-link" aria-label={locale === 'ru' ? 'Главная ThreadCells' : 'ThreadCells home'}>
+          <span className="desktop-brand"><Mark locale={locale} /></span>
+          <span className="mobile-brand"><Mark compact locale={locale} /></span>
         </a>
-        <nav aria-label="Primary navigation">
+        <nav aria-label={locale === 'ru' ? 'Основная навигация' : 'Primary navigation'}>
           <a href={assetPath(`${locale === 'ru' ? '/ru' : ''}/#control-plane`)}>{copy.nav[0]}</a>
           <a href={assetPath(`${locale === 'ru' ? '/ru' : ''}/#how-it-works`)}>{copy.nav[1]}</a>
           <a href={assetPath(`${locale === 'ru' ? '/ru' : ''}/#open-source`)}>{copy.nav[2]}</a>
@@ -26,8 +26,8 @@ export function SiteHeader({ locale = 'en' }: { locale?: Locale }) {
             </div>
           </details>
           <a className="header-icon-link header-docs-link" href={site.docsUrl} aria-label={copy.docs}><Book /> <span>{copy.docs}</span></a>
-          <a className="header-icon-link header-github-link" href={site.githubUrl} target="_blank" rel="noopener noreferrer" aria-label="ThreadCells on GitHub"><Github /> <span>{copy.github}</span></a>
-          <span className="system-state"><i /> SYSTEM READY</span>
+          <a className="header-icon-link header-github-link" href={site.githubUrl} target="_blank" rel="noopener noreferrer" aria-label={locale === 'ru' ? 'ThreadCells на GitHub' : 'ThreadCells on GitHub'}><Github /> <span>{copy.github}</span></a>
+          <span className="system-state"><i /> {locale === 'ru' ? 'СИСТЕМА ГОТОВА' : 'SYSTEM READY'}</span>
         </div>
       </div>
     </header>

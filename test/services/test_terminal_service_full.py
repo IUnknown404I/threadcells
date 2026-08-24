@@ -28,6 +28,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     _canonical_worktree,
     _create_terminal_after_admission,
     _resolve_context_role,
+    _sanitize_human_terminal_output,
     _write_enabled_lane,
     bind_provider_runtime_session_identity,
     create_terminal,
@@ -39,6 +40,20 @@ from cli_agent_orchestrator.services.terminal_service import (
     request_provider_runtime_sidecar_reconnect,
     send_input,
 )
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("plain\x1b", "plain"),
+        ("plain\x1b[?2026", "plain"),
+        ("plain\x1b]unterminated", "plain"),
+        ("plain\x90unterminated", "plain"),
+        ("plain\x1b[\nnext", "plain\nnext"),
+    ],
+)
+def test_human_output_sanitizer_fails_closed_on_partial_controls(raw, expected):
+    assert _sanitize_human_terminal_output(raw) == expected
 
 
 def test_bind_provider_runtime_session_identity_proves_exact_hook_path(monkeypatch, tmp_path):
@@ -2230,6 +2245,84 @@ class TestGetOutput:
         result = get_output("test1234", OutputMode.FULL)
 
         assert result == "full terminal output"
+
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_output_full_sanitizes_ansi_vt_and_preserves_unicode(
+        self, mock_get_metadata, mock_tmux
+    ):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_tmux.get_history.return_value = (
+            "\x1b[?2026h\x1b[31mПривет\x1b[0m, мир\x1b[?2026l\n"
+            "\x1b[?25h\x1b[0 q\x1bMТекст\tданные\x1b[?2004h\x1b[?2004l"
+        )
+
+        result = get_output("test1234", OutputMode.FULL)
+
+        assert result == "Привет, мир\nТекст\tданные"
+        assert "\x1b" not in result
+
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_output_full_removes_control_strings_and_c1_forms(
+        self, mock_get_metadata, mock_tmux
+    ):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_tmux.get_history.return_value = (
+            "до\x1b]0;private title\x07после\n"
+            "link \x1b]8;;https://example.invalid\x1b\\ссылка\x1b]8;;\x1b\\\n"
+            "\x1bPprivate-dcs\x1b\\готово\n"
+            "A\x9b31mB\x9b0m C\x9dprivate-osc\x9cD\x90private-dcs\x9cE"
+        )
+
+        result = get_output("test1234", OutputMode.FULL)
+
+        assert result == "допосле\nlink ссылка\nготово\nAB CDE"
+        assert "private" not in result
+        assert all(not (0x80 <= ord(character) <= 0x9F) for character in result)
+
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_output_full_handles_partial_controls_and_normalizes_lines(
+        self, mock_get_metadata, mock_tmux
+    ):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_tmux.get_history.return_value = (
+            "Русский\r\nтекст\t✓\x00\x07\nprogressXX\b\bOK\rnext\nplain\x1b[?2026"
+        )
+
+        result = get_output("test1234", OutputMode.FULL)
+
+        assert result == "Русский\nтекст\t✓\nprogressOK\nnext\nplain"
+        assert "\x1b" not in result
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_output_last_keeps_raw_controls_for_provider_extraction(
+        self, mock_get_metadata, mock_tmux, mock_provider_manager
+    ):
+        raw = "\x1b[36m• result\x1b[0m"
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+        }
+        mock_tmux.get_history.return_value = raw
+        mock_provider = MagicMock(extraction_retries=0)
+        mock_provider.extract_last_message_from_script.return_value = "result"
+        mock_provider_manager.get_provider.return_value = mock_provider
+
+        assert get_output("test1234", OutputMode.LAST) == "result"
+        mock_provider.extract_last_message_from_script.assert_called_once_with(raw)
 
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")

@@ -341,6 +341,113 @@ class OutputMode(str, Enum):
     LAST = "last"
 
 
+def _consume_terminal_control_string(value: str, index: int) -> int:
+    """Return the first index after an OSC/DCS-style control string."""
+    while index < len(value):
+        if value[index] in {"\x07", "\x9c"}:
+            return index + 1
+        if value[index] == "\x1b" and index + 1 < len(value) and value[index + 1] == "\\":
+            return index + 2
+        index += 1
+    return len(value)
+
+
+def _consume_terminal_csi(value: str, index: int) -> int:
+    """Consume one CSI sequence, including a safe incomplete suffix."""
+    while index < len(value):
+        if value[index] in {"\n", "\r", "\t"}:
+            return index
+        codepoint = ord(value[index])
+        if 0x40 <= codepoint <= 0x7E:
+            return index + 1
+        if 0x20 <= codepoint <= 0x3F or codepoint < 0x20 or codepoint == 0x7F:
+            index += 1
+            continue
+        # Preserve non-ASCII/plain text after a malformed introducer while
+        # still removing the control bytes already consumed.
+        return index
+    return len(value)
+
+
+def _sanitize_human_terminal_output(value: str) -> str:
+    """Remove terminal effects while preserving readable Unicode text.
+
+    Raw tmux history and durable logs intentionally retain controls for
+    provider parsing and diagnostics.  This renderer is applied only to the
+    human-facing FULL output boundary.
+    """
+    rendered: list[str] = []
+    index = 0
+    while index < len(value):
+        character = value[index]
+        codepoint = ord(character)
+
+        if character == "\x1b":
+            if index + 1 >= len(value):
+                break
+            introducer = value[index + 1]
+            if introducer == "[":
+                index = _consume_terminal_csi(value, index + 2)
+                continue
+            if introducer in "]PX^_":
+                index = _consume_terminal_control_string(value, index + 2)
+                continue
+            if introducer in "\n\r\t":
+                index += 1
+                continue
+            introducer_codepoint = ord(introducer)
+            if 0x20 <= introducer_codepoint <= 0x2F:
+                index += 2
+                while index < len(value) and 0x20 <= ord(value[index]) <= 0x2F:
+                    index += 1
+                if index < len(value) and 0x30 <= ord(value[index]) <= 0x7E:
+                    index += 1
+                continue
+            if 0x30 <= introducer_codepoint <= 0x7E:
+                index += 2
+                continue
+            # Unknown/non-ASCII text is not part of a valid ESC sequence.
+            index += 1
+            continue
+
+        if character == "\x9b":
+            index = _consume_terminal_csi(value, index + 1)
+            continue
+        if character in {"\x90", "\x98", "\x9d", "\x9e", "\x9f"}:
+            index = _consume_terminal_control_string(value, index + 1)
+            continue
+        if 0x80 <= codepoint <= 0x9F:
+            index += 1
+            continue
+
+        if character == "\r":
+            if index + 1 < len(value) and value[index + 1] == "\n":
+                if not rendered or rendered[-1] != "\n":
+                    rendered.append("\n")
+                index += 2
+                continue
+            if not rendered or rendered[-1] != "\n":
+                rendered.append("\n")
+            index += 1
+            continue
+        if character == "\b":
+            if rendered and rendered[-1] not in {"\n", "\t"}:
+                rendered.pop()
+            index += 1
+            continue
+        if character in {"\n", "\t"}:
+            rendered.append(character)
+            index += 1
+            continue
+        if codepoint < 0x20 or codepoint == 0x7F:
+            index += 1
+            continue
+
+        rendered.append(character)
+        index += 1
+    return "".join(rendered)
+
+
 # Providers that accept a runtime skill_prompt kwarg and append it to the
 # system prompt at launch time.  Other providers deliver skills differently:
 # Kiro (skill:// resources) and OpenCode (OPENCODE_CONFIG_DIR/skills symlink)
@@ -2143,7 +2250,7 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                 raise
 
         if mode == OutputMode.FULL:
-            return capture_output()
+            return _sanitize_human_terminal_output(capture_output())
         elif mode == OutputMode.LAST:
             provider = provider_manager.get_provider(terminal_id)
             if provider is None:

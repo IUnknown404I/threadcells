@@ -536,7 +536,7 @@ describe('session creation and canonical ordering', () => {
     expect(within(header).getByRole('button', { name: 'Collapse header using chevron' })).toBeInTheDocument()
   })
 
-  it('keeps deletion isolated from accordion state and places equal List/Grid controls in the summary row', async () => {
+  it('keeps session actions isolated and switches the same ordered agents from List to Grid', async () => {
     const terminals = [
       { id: 'summary-terminal-a', tmux_session: 'cao-summary', tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null },
       { id: 'summary-terminal-b', tmux_session: 'cao-summary', tmux_window: '1', provider: 'codex', agent_profile: 'reviewer', last_active: null },
@@ -547,15 +547,18 @@ describe('session creation and canonical ordering', () => {
 
     const header = await screen.findByTestId('session-header-cao-summary')
     const summary = screen.getByLabelText('Session status')
-    const layoutControls = within(summary).getByRole('group', { name: 'Agent layout' })
-    const list = within(summary).getByRole('button', { name: 'List view' })
-    const grid = within(summary).getByRole('button', { name: 'Grid view' })
+    const actions = within(header).getByTestId('session-actions-cao-summary')
+    const layoutControls = within(actions).getByRole('group', { name: 'Agent layout' })
+    const list = within(actions).getByRole('button', { name: 'List view' })
+    const grid = within(actions).getByRole('button', { name: 'Grid view' })
 
     expect(header).toHaveClass('grid', 'grid-cols-[minmax(0,1fr)_auto]', 'sm:grid-cols-[minmax(0,1fr)_auto_auto]')
     expect(within(header).getByTestId('session-title-row-cao-summary')).toHaveClass('col-span-2', 'sm:col-span-1')
     expect(within(header).getByTestId('session-metadata-cao-summary')).toContainElement(within(header).getByText('2 agents'))
-    expect(within(header).getByTestId('session-actions-cao-summary')).toContainElement(within(header).getByRole('button', { name: 'Delete summary' }))
-    expect(layoutControls).toHaveClass('hidden', 'sm:inline-flex')
+    expect(actions).toContainElement(within(header).getByRole('button', { name: 'Delete summary' }))
+    expect(actions).toHaveClass('col-span-2', 'flex-wrap', 'justify-end', 'sm:col-span-1', 'sm:flex-nowrap')
+    expect(layoutControls).toHaveClass('inline-flex')
+    expect(within(summary).queryByRole('group', { name: 'Agent layout' })).not.toBeInTheDocument()
 
     fireEvent.click(within(header).getByRole('button', { name: 'Expand summary' }))
     expect(await within(header).findByRole('button', { name: 'Collapse summary' })).toBeInTheDocument()
@@ -564,10 +567,29 @@ describe('session creation and canonical ordering', () => {
     expect(list.className).toContain('w-9')
     expect(grid).toHaveClass('inline-flex', 'h-9', 'w-9', 'items-center', 'justify-center')
     expect(screen.getByTestId('session-agent-container').previousElementSibling).toBeNull()
+    const renderedAgentIds = () => within(screen.getByTestId('session-agent-container'))
+      .getAllByTestId(/^agent-detail-card-/)
+      .map(card => card.getAttribute('data-testid'))
+    expect(renderedAgentIds()).toEqual(['agent-detail-card-summary-terminal-a', 'agent-detail-card-summary-terminal-b'])
+    for (const terminalId of ['summary-terminal-a', 'summary-terminal-b']) {
+      const card = screen.getByTestId(`agent-detail-card-${terminalId}`)
+      expect(within(card).getByTitle('Inbox')).toBeInTheDocument()
+      expect(within(card).getByTitle('Output')).toBeInTheDocument()
+      expect(within(card).getByRole('button', { name: 'Terminal' })).toBeInTheDocument()
+      expect(within(card).getByTitle('Graceful Exit')).toBeInTheDocument()
+      expect(within(card).getByTitle('Close')).toBeInTheDocument()
+    }
 
     fireEvent.click(grid)
     expect(grid).toHaveAttribute('aria-pressed', 'true')
-    expect(screen.getByTestId('session-agent-container')).toHaveClass('space-y-2', 'sm:grid', 'lg:grid-cols-2')
+    expect(screen.getByTestId('session-agent-container')).toHaveClass('space-y-2', 'md:grid', 'md:grid-cols-2')
+    expect(renderedAgentIds()).toEqual(['agent-detail-card-summary-terminal-a', 'agent-detail-card-summary-terminal-b'])
+
+    fireEvent.click(list)
+    expect(list).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByTestId('session-agent-container')).toHaveClass('space-y-2')
+    expect(screen.getByTestId('session-agent-container')).not.toHaveClass('md:grid')
+    expect(renderedAgentIds()).toEqual(['agent-detail-card-summary-terminal-a', 'agent-detail-card-summary-terminal-b'])
 
     fireEvent.click(within(header).getByRole('button', { name: 'Delete summary' }))
     expect(screen.getByRole('heading', { name: 'Delete Session' })).toBeInTheDocument()

@@ -38,6 +38,7 @@ from cli_agent_orchestrator.clients.database import (
     claim_workflow_turn,
     create_handoff_child_result_message,
     ensure_workflow_turn_for_inbox,
+    fail_pending_closed_workflow_inbox_transport,
     get_child_assignment_result_child_id,
     get_child_assignment_result_id,
     get_delegation_result,
@@ -65,6 +66,7 @@ from cli_agent_orchestrator.clients.database import (
     requeue_workflow_turn,
     terminalize_missing_terminal_assignments_for_restart,
     update_message_status,
+    update_pending_message_status,
 )
 from cli_agent_orchestrator.constants import TERMINAL_LOG_DIR
 from cli_agent_orchestrator.models.inbox import MessageStatus, OrchestrationType
@@ -186,7 +188,7 @@ def _dispatch_pending_messages_with_admission(
             and result is not None
             and result.get("delivery_status") == "cancelled"
         ):
-            if not update_message_status(message.id, MessageStatus.FAILED):
+            if not update_pending_message_status(message.id, MessageStatus.FAILED):
                 # Another reconciler won the terminal transition. Re-read the
                 # FIFO head so this observer stays idempotent.
                 continue
@@ -197,7 +199,7 @@ def _dispatch_pending_messages_with_admission(
             continue
         if workflow_turn is None or workflow_turn["status"] == "open":
             break
-        if not update_message_status(message.id, MessageStatus.FAILED):
+        if not fail_pending_closed_workflow_inbox_transport(message.id):
             # Another reconciler won the terminal transition. Re-read the
             # FIFO head so this observer stays idempotent.
             continue

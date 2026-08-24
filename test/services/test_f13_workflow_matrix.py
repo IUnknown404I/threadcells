@@ -144,6 +144,14 @@ def _start_admitted_input(root: str) -> int:
     return turn_id
 
 
+def _pending_inbox_turn(root: str, message: str) -> tuple[database.InboxMessage, int]:
+    """Bind one ordinary PENDING transport to the root's current OPEN workflow."""
+    inbox = create_inbox_message("synthetic-sender", root, message)
+    turn_id = database.ensure_workflow_turn_for_inbox(inbox.id)
+    assert turn_id is not None
+    return inbox, turn_id
+
+
 def _admit_sent_continuation(root: str, turn: dict, now: datetime) -> None:
     """Model transport activation, receiver admission, and sender ack in order."""
     assert activate_workflow_turn(root, turn["id"])
@@ -792,6 +800,85 @@ def test_f13_lifecycle_cancellation_fails_closed_workflow_inbox_transport(workfl
         workflow = db.get(WorkflowModel, stale_workflow_id)
         assert workflow is not None
         assert workflow.status == "cancelled"
+
+
+def test_f13_closed_inbox_dispatch_cas_preserves_concurrent_delivery(workflow_db):
+    """A stale close observer cannot overwrite a transport outcome that already won."""
+    parent = "parent-closed-inbox-delivery-race"
+    _start_admitted_input(parent)
+    stale, _stale_turn = _pending_inbox_turn(parent, "concurrently delivered input")
+    assert set_workflow_terminal_state(parent, "terminal", "closed during delivery")
+    with database.SessionLocal() as db:
+        db.get(InboxModel, stale.id).status = "delivered"
+        db.commit()
+
+    with patch(
+        "cli_agent_orchestrator.services.inbox_service.get_pending_messages",
+        side_effect=[[stale], []],
+    ):
+        assert _dispatch_pending_messages_with_admission(parent) is False
+
+    with database.SessionLocal() as db:
+        assert db.get(InboxModel, stale.id).status == "delivered"
+
+
+def test_f13_transport_retry_owner_gate_fences_its_pending_inbox(workflow_db):
+    """The bounded pre-send retry guard closes its exact Inbox transport atomically."""
+    root = "root-inbox-transport-retry-gate"
+    _start_admitted_input(root)
+    stale, stale_turn = _pending_inbox_turn(root, "retry until owner gate")
+    now = datetime(2026, 8, 24, 21, 0, 0)
+    observe_workflow_final(root, now=now)
+
+    claim = claim_workflow_turn(root, now=now, inbox_message_id=stale.id)
+    assert claim is not None and claim["id"] == stale_turn
+    assert requeue_workflow_turn(
+        claim["id"], claim["claim_token"], claim["claim_generation"], now=now
+    )
+    claim = claim_workflow_turn(root, now=now + timedelta(seconds=2), inbox_message_id=stale.id)
+    assert claim is not None and claim["id"] == stale_turn
+    assert requeue_workflow_turn(
+        claim["id"],
+        claim["claim_token"],
+        claim["claim_generation"],
+        now=now + timedelta(seconds=2),
+    )
+    claim = claim_workflow_turn(root, now=now + timedelta(seconds=5), inbox_message_id=stale.id)
+    assert claim is not None and claim["id"] == stale_turn
+    assert requeue_workflow_turn(
+        claim["id"],
+        claim["claim_token"],
+        claim["claim_generation"],
+        now=now + timedelta(seconds=5),
+    )
+
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowTurnModel, stale_turn).state == "cancelled"
+        assert db.get(InboxModel, stale.id).status == "failed"
+        assert db.get(WorkflowModel, db.get(WorkflowTurnModel, stale_turn).workflow_id).status == (
+            "owner_gate"
+        )
+
+
+def test_f13_authoritative_child_terminalization_fences_pending_inbox(workflow_db):
+    """Result finalization closes the child and its exact transport together."""
+    parent = "parent-child-terminal-inbox-fence"
+    child = "child-terminal-inbox-fence"
+    _start_admitted_input(parent)
+    assert register_child_assignment(parent, child)
+    callback = _authorized_callback(child)
+    stale, stale_turn = _pending_inbox_turn(child, "late child transport")
+
+    notice, duplicate = create_child_assignment_result_message(
+        child, parent, "authoritative child result", **callback
+    )
+    assert notice is not None and duplicate is False
+
+    with database.SessionLocal() as db:
+        child_workflow = db.query(WorkflowModel).filter_by(root_terminal_id=child).one()
+        assert child_workflow.status == "terminal"
+        assert db.get(WorkflowTurnModel, stale_turn).state == "cancelled"
+        assert db.get(InboxModel, stale.id).status == "failed"
 
 
 def test_f13_restart_reconciles_closed_inbox_before_queued_owner_input_once(
@@ -2209,6 +2296,7 @@ def test_f13_reconnect_attempt_budget_survives_restart_and_stops_launches(
 ):
     root = "root-sidecar-attempt-exhaustion"
     turn_id = _start_admitted_input(root)
+    stale, stale_turn = _pending_inbox_turn(root, "closed by reconnect exhaustion")
     now = datetime(2026, 8, 22, 14, 0, 0)
 
     tokens = []
@@ -2250,6 +2338,8 @@ def test_f13_reconnect_attempt_budget_survives_restart_and_stops_launches(
         )
         assert [attempt.state for attempt in attempts] == ["failed", "failed", "failed"]
         assert all(attempt.finished_at is not None for attempt in attempts)
+        assert db.get(WorkflowTurnModel, stale_turn).state == "cancelled"
+        assert db.get(InboxModel, stale.id).status == "failed"
 
     mock_terminal.get_terminal.return_value = {
         "status": TerminalStatus.COMPLETED.value,
@@ -2258,6 +2348,40 @@ def test_f13_reconnect_attempt_budget_survives_restart_and_stops_launches(
     mock_terminal.provider_runtime_sidecar_reconnect_required.return_value = True
     assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=11)) is False
     mock_terminal.request_provider_runtime_sidecar_reconnect.assert_not_called()
+
+
+def test_f13_historical_reconnect_exhaustion_fences_pending_inbox(workflow_db):
+    """Recovered exhausted attempt history closes transport in the same transaction."""
+    root = "root-historical-reconnect-exhaustion"
+    active_turn = _start_admitted_input(root)
+    stale, stale_turn = _pending_inbox_turn(root, "pre-restart reconnect transport")
+    now = datetime(2026, 8, 24, 20, 0, 0)
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        for attempt_number in range(1, 4):
+            db.add(
+                WorkflowProviderReconnectAttemptModel(
+                    workflow_id=workflow.id,
+                    workflow_turn_id=active_turn,
+                    root_terminal_id=root,
+                    attempt_number=attempt_number,
+                    attempt_token=f"historical-attempt-{attempt_number}",
+                    state="failed",
+                    outcome_code="process_exited_before_runtime_ready",
+                    created_at=now,
+                    finished_at=now,
+                    updated_at=now,
+                )
+            )
+        db.commit()
+
+    exhausted = database.claim_workflow_provider_reconnect(root, now=now + timedelta(seconds=1))
+    assert exhausted == {"exhausted": True, "turn_id": active_turn, "attempt_count": 3}
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        assert workflow.status == "owner_gate"
+        assert db.get(WorkflowTurnModel, stale_turn).state == "cancelled"
+        assert db.get(InboxModel, stale.id).status == "failed"
 
 
 def test_f13_reconnect_and_input_transport_have_one_terminal_mutation_owner(workflow_db):
@@ -3580,6 +3704,7 @@ def test_f13_repeated_no_progress_final_hits_durable_owner_visible_circuit_break
         assert turn is not None and turn["id"] == successor
         _admit_sent_continuation(root, turn, current + timedelta(seconds=40))
 
+    stale, stale_turn = _pending_inbox_turn(root, "closed by open-final circuit breaker")
     # A fresh DB session models restart recovery: the third no-progress final
     # atomically finishes the paid turn and enters a visible terminal state.
     assert observe_workflow_final(root, now=now + timedelta(seconds=120)) is None
@@ -3593,6 +3718,8 @@ def test_f13_repeated_no_progress_final_hits_durable_owner_visible_circuit_break
             db.query(WorkflowTurnModel).filter_by(workflow_id=workflow.id, state="queued").count()
             == 0
         )
+        assert db.get(WorkflowTurnModel, stale_turn).state == "cancelled"
+        assert db.get(InboxModel, stale.id).status == "failed"
     assert len(notified) == 1 and notified[0][:2] == (root, "owner_attention")
 
     # Deliberate owner input starts a new workflow instead of reviving the

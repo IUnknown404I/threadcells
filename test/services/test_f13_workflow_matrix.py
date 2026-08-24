@@ -774,6 +774,26 @@ def test_f13_closed_ordinary_inbox_is_not_a_new_owner_input_predecessor(workflow
         assert owner_workflow.active_turn_id == owner_turn.id
 
 
+def test_f13_lifecycle_cancellation_fails_closed_workflow_inbox_transport(workflow_db):
+    """The central terminal/session cancellation path clears its stale FIFO head."""
+    parent = "parent-closed-inbox-lifecycle"
+    _start_admitted_input(parent)
+    stale = create_inbox_message("sender", parent, "stale lifecycle input")
+    stale_turn = database.ensure_workflow_turn_for_inbox(stale.id)
+    assert stale_turn is not None
+    with database.SessionLocal() as db:
+        stale_workflow_id = db.get(WorkflowTurnModel, stale_turn).workflow_id
+
+    assert cancel_workflows_for_terminal(parent) == 1
+
+    with database.SessionLocal() as db:
+        assert db.get(InboxModel, stale.id).status == "failed"
+        assert db.get(WorkflowTurnModel, stale_turn).state == "cancelled"
+        workflow = db.get(WorkflowModel, stale_workflow_id)
+        assert workflow is not None
+        assert workflow.status == "cancelled"
+
+
 def test_f13_restart_reconciles_closed_inbox_before_queued_owner_input_once(
     workflow_db, monkeypatch
 ):

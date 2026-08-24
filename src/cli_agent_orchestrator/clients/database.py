@@ -8468,6 +8468,11 @@ def _cancel_protected_workflows_in_transaction(
             )
         )
     for terminal_id in normalized:
+        # Deletion and historical lifecycle paths share this cancellation
+        # helper. Their pending Inbox rows are transport for the workflows we
+        # just closed, not authority which may block a later workflow rooted
+        # at the same durable terminal identity.
+        _fail_closed_workflow_inbox_transports_in_transaction(db, terminal_id)
         # A session/terminal removal can race a child callback. Fence every
         # active edge and provider execution in the same transaction.
         _cancel_parent_assignments(db, terminal_id, now)

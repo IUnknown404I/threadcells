@@ -234,21 +234,34 @@ export function SettingsPanel() {
           Effective persisted limits and live utilization. The 5 / 3 / 2 / 1 values are a host recommendation, not hardcoded runtime authority; decreases drain and never terminate active work.
         </p>
         {capacity ? (
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <dl className="contents" aria-label="Orchestration capacity details">
-              <CapacityItem label="Resident supervisors / owners" value={`${capacity.resident_supervisors.active} / ${capacity.resident_supervisors.limit}`} detail={capacity.resident_supervisors.certain ? `${capacity.resident_supervisors.available} available; top-level conductors remain resident${capacity.resident_supervisors.draining ? '; draining' : ''}` : 'inventory unavailable; admission closed'} />
-              <CapacityItem label="Provider executions" value={`${capacity.provider_executions.active} / ${capacity.provider_executions.limit}`} detail={capacity.provider_executions.certain ? `${capacity.provider_executions.available} available; active model turns only${capacity.provider_executions.draining ? '; draining' : ''}` : 'inventory unavailable; admission closed'} />
-              <CapacityItem label="Work contexts" value={`${capacity.work_contexts.active} / ${capacity.work_contexts.limit}`} detail={capacity.work_contexts.certain ? `${capacity.work_contexts.available} available; delegated resident workers/reviewers${capacity.work_contexts.draining ? '; draining' : ''}` : 'inventory unavailable; admission closed'} />
-              <CapacityItem label="Heavy executions" value={`${capacity.heavy_executions.active} / ${capacity.heavy_executions.limit}`} detail={`${capacity.heavy_executions.available} available${capacity.heavy_executions.draining ? '; draining' : ''}`} />
-              <CapacityItem label="Memory available" value={`${capacity.memory.available_mib} MiB`} detail={`Pressure avg10 ${capacity.memory_pressure.some_avg10}`} />
-              <CapacityItem label="Root disk" value={`${capacity.root_disk.used_percent}% used`} detail={`${capacity.root_disk.free_gib} GiB free`} />
-              {capacity.heavy_executions.waiting !== null && (
-                <CapacityItem label="Heavy waiting" value={String(capacity.heavy_executions.waiting)} detail="Kernel-backed queue" />
-              )}
-            </dl>
-            <div className="grid grid-cols-1 gap-3 sm:col-span-2 sm:grid-cols-2">
-              <CapacityItem label="CPU load" value={`${capacity.cpu_load.one_minute.toFixed(2)} / ${capacity.cpu_load.cpu_count} CPUs`} detail="1m Linux load average" />
-              <ProfileCard count={profileCount} onClick={() => setProfilesOpen(true)} />
+          <div className="space-y-3">
+            {capacity.reasons.length > 0 && (
+              <section
+                aria-label={`${capacity.resource_state} resource health reasons`}
+                className={`rounded-lg border px-3 py-3 ${capacity.resource_state === 'RED' ? 'border-red-700/50 bg-red-950/20' : 'border-amber-700/50 bg-amber-950/20'}`}
+              >
+                <h4 className={`text-xs font-semibold ${capacity.resource_state === 'RED' ? 'text-red-200' : 'text-amber-200'}`}>Health drivers</h4>
+                <ul className="mt-1 list-disc space-y-1 pl-5 text-xs text-gray-300">
+                  {capacity.reasons.map(reason => <li key={reason} title={reason}>{capacityReasonLabel(reason)}</li>)}
+                </ul>
+              </section>
+            )}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <dl className="contents" aria-label="Orchestration capacity details">
+                <CapacityItem label="Resident supervisors / owners" value={`${capacity.resident_supervisors.active} / ${capacity.resident_supervisors.limit}`} detail={capacity.resident_supervisors.certain ? `${capacity.resident_supervisors.available} available; top-level conductors remain resident${capacity.resident_supervisors.draining ? '; draining' : ''}` : 'inventory unavailable; admission closed'} />
+                <CapacityItem label="Provider executions" value={`${capacity.provider_executions.active} / ${capacity.provider_executions.limit}`} detail={capacity.provider_executions.certain ? `${capacity.provider_executions.available} available; active model turns only${capacity.provider_executions.draining ? '; draining' : ''}` : 'inventory unavailable; admission closed'} />
+                <CapacityItem label="Work contexts" value={`${capacity.work_contexts.active} / ${capacity.work_contexts.limit}`} detail={capacity.work_contexts.certain ? `${capacity.work_contexts.available} available; delegated resident workers/reviewers${capacity.work_contexts.draining ? '; draining' : ''}` : 'inventory unavailable; admission closed'} />
+                <CapacityItem label="Heavy executions" value={`${capacity.heavy_executions.active} / ${capacity.heavy_executions.limit}`} detail={`${capacity.heavy_executions.available} available${capacity.heavy_executions.draining ? '; draining' : ''}`} />
+                <CapacityItem label="Memory available" value={`${capacity.memory.available_mib} MiB`} detail={`Pressure avg10 ${capacity.memory_pressure.some_avg10}`} />
+                <CapacityItem label="Root disk" value={`${capacity.root_disk.used_percent}% used`} detail={`${capacity.root_disk.state ? `${capacity.root_disk.state} · ` : ''}${capacity.root_disk.free_gib} GiB free`} />
+                {capacity.heavy_executions.waiting !== null && (
+                  <CapacityItem label="Heavy waiting" value={String(capacity.heavy_executions.waiting)} detail="Kernel-backed queue" />
+                )}
+              </dl>
+              <div className="grid grid-cols-1 gap-3 sm:col-span-2 sm:grid-cols-2">
+                <CapacityItem label="CPU load" value={`${capacity.cpu_load.one_minute.toFixed(2)} / ${capacity.cpu_load.cpu_count} CPUs`} detail="1m Linux load average" />
+                <ProfileCard count={profileCount} onClick={() => setProfilesOpen(true)} />
+              </div>
             </div>
           </div>
         ) : (
@@ -363,6 +376,20 @@ export function SettingsPanel() {
       </ConfirmModal>
     </div>
   )
+}
+
+const CAPACITY_REASON_LABELS: Record<string, string> = {
+  ROOT_DISK_PRESSURE: 'Root disk usage reached a pressure threshold',
+  DISK_CRITICAL: 'Root disk usage reached the CRITICAL threshold',
+  root_free_below_green: 'Root disk free space is below the GREEN target',
+  memory_below_red: 'Available memory is below the RED floor',
+  memory_below_green: 'Available memory is below the GREEN target',
+  critical_memory_pressure: 'Memory PSI full pressure reached the RED threshold',
+  sustained_memory_pressure: 'Memory PSI pressure reached the YELLOW threshold',
+}
+
+function capacityReasonLabel(reason: string) {
+  return CAPACITY_REASON_LABELS[reason] || reason
 }
 
 function CapacityItem({ label, value, detail }: { label: string; value: string; detail: string }) {

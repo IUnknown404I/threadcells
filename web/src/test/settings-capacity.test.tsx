@@ -52,6 +52,33 @@ describe('Settings orchestration capacity', () => {
     await waitFor(() => expect(api.getOrchestrationCapacity).toHaveBeenCalledTimes(1))
   })
 
+  it('shows the authoritative RED reason when root disk health is only YELLOW', async () => {
+    vi.spyOn(api, 'getOperatorSession').mockResolvedValue({ configured: true, authenticated: false, expires_in_seconds: 0, session_ttl_seconds: 300, verifier_reference: 'THREADCELLS_OPERATOR_VERIFIER_FILE' })
+    vi.spyOn(api, 'getAgentDirs').mockResolvedValue({ agent_dirs: {}, extra_dirs: [] })
+    vi.spyOn(api, 'listProfiles').mockResolvedValue([])
+    vi.spyOn(api, 'getOrchestrationCapacity').mockResolvedValue({
+      resource_state: 'RED',
+      reasons: ['critical_memory_pressure', 'NEW_RESOURCE_SIGNAL'],
+      resident_supervisors: { active: 0, limit: 5, available: 5, certain: true },
+      provider_executions: { active: 0, limit: 3, available: 3, certain: true },
+      work_contexts: { active: 0, limit: 2, available: 2, certain: true },
+      heavy_executions: { active: 0, limit: 1, available: 1, waiting: null },
+      memory: { available_mib: 2048, swap_total_mib: 0, swap_free_mib: 0 },
+      root_disk: { state: 'YELLOW', used_percent: 77.5, free_gib: 10.62 },
+      memory_pressure: { some_avg10: 6, full_avg10: 1 },
+      cpu_load: { one_minute: 0.5, cpu_count: 4 },
+      housekeeping: null,
+    })
+
+    render(<SettingsPanel />)
+
+    expect(await screen.findByLabelText('Resource health RED')).toBeInTheDocument()
+    const reasons = screen.getByLabelText('RED resource health reasons')
+    expect(reasons).toHaveTextContent('Memory PSI full pressure reached the RED threshold')
+    expect(reasons).toHaveTextContent('NEW_RESOURCE_SIGNAL')
+    expect(screen.getByText('YELLOW · 10.62 GiB free')).toBeInTheDocument()
+  })
+
   it('keeps the project list separate from registration and preserves project guidance in both forms', async () => {
     vi.spyOn(api, 'getOperatorSession').mockResolvedValue({ configured: false, authenticated: false, expires_in_seconds: 0, session_ttl_seconds: 300, verifier_reference: 'THREADCELLS_OPERATOR_VERIFIER_FILE' })
     const project = { projectId: 'project-a', name: 'Project A', path: '/workspace/project-a', description: 'Existing guidance', isDefault: true }

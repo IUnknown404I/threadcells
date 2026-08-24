@@ -198,6 +198,19 @@ def test_disk_pressure_reasons_distinguish_red_and_critical(tmp_path):
     assert critical["root_disk"]["state"] == "CRITICAL"
 
 
+def test_red_aggregate_reports_non_disk_reason_while_disk_is_yellow(tmp_path):
+    status = _status(
+        tmp_path,
+        memory_mib=2048,
+        used_percent=77.5,
+        pressure="some avg10=6.00\nfull avg10=1.00\n",
+    )
+
+    assert status["resource_state"] == "RED"
+    assert status["root_disk"]["state"] == "YELLOW"
+    assert status["reasons"] == ["critical_memory_pressure", "ROOT_DISK_PRESSURE"]
+
+
 def test_resource_status_projects_explicit_linux_cpu_load(tmp_path):
     status = get_resource_status(
         _config(tmp_path),

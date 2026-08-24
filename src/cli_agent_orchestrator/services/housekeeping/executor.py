@@ -6,6 +6,7 @@ import fcntl
 import grp
 import gzip
 import os
+import pwd
 import shutil
 import signal
 import stat
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .models import HousekeepingCandidate, HousekeepingPlan, candidate_fingerprint, default_settings
-from .planner import build_plan
+from .planner import revalidate_runtime_candidate
 from .protected_set import resolve_protected_set
 
 
@@ -26,6 +27,8 @@ class ExecutionReport:
     plan_id: str
     ok: bool = True
     freed_bytes: int = 0
+    reclaimed_bytes_by_class: dict[str, int] = field(default_factory=dict)
+    executed_count_by_class: dict[str, int] = field(default_factory=dict)
     executed: list[str] = field(default_factory=list)
     skipped: list[dict[str, str]] = field(default_factory=list)
     failures: list[dict[str, str]] = field(default_factory=list)
@@ -124,25 +127,6 @@ def _pidfd_alive(descriptor: int) -> bool:
         return False
 
 
-def _command_running(name: str, proc_root: Path) -> bool | None:
-    try:
-        processes = list(proc_root.iterdir())
-    except OSError:
-        return None
-    for process in processes:
-        if not process.name.isdigit():
-            continue
-        try:
-            command = (process / "cmdline").read_bytes().split(b"\0", 1)[0]
-            if Path(os.fsdecode(command)).name == name:
-                return True
-        except FileNotFoundError:
-            continue
-        except OSError:
-            return None
-    return False
-
-
 def _execute_resource(
     candidate: HousekeepingCandidate,
     *,
@@ -210,12 +194,26 @@ def _execute_resource(
             None,
         )
         cache_command = entry.get("command") if isinstance(entry, Mapping) else None
-        if not isinstance(cache_command, list) or not cache_command:
+        path_argument = entry.get("path_argument") if isinstance(entry, Mapping) else None
+        from .planner import package_command_bound_to_path
+
+        if not package_command_bound_to_path(
+            cache_command,
+            path_argument=path_argument,
+            path=Path(candidate.path),
+        ):
             raise RuntimeError("package cache command authority disappeared")
+        assert isinstance(cache_command, list)
         executable = shutil.which(str(cache_command[0]))
         if executable is None:
             raise RuntimeError("package cache executable disappeared")
-        running = _command_running(Path(executable).name, proc_root)
+        from .planner import package_command_running
+
+        try:
+            runtime_uid = pwd.getpwnam(str(config["runtime_user"])).pw_uid
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError("package cache owner is unavailable") from exc
+        running = package_command_running(Path(executable).name, proc_root, runtime_uid)
         if running is None:
             raise RuntimeError("package process inventory is unavailable")
         if running:
@@ -233,6 +231,25 @@ def _execute_resource(
         path = Path(candidate.path)
         after = candidate_fingerprint(path)[1] if path.exists() else 0
         return max(0, before - after)
+    if candidate.resource_kind == "reproducible_cache":
+        path = Path(candidate.path)
+        configured_roots = {
+            Path(str(value)).resolve()
+            for value in config.get("reproducible_cache_roots", [])
+            if isinstance(value, str) and Path(value).is_absolute()
+        }
+        planned_root = Path(attributes["root"])
+        if (
+            planned_root not in configured_roots
+            or path.parent != planned_root
+            or path.is_symlink()
+            or not path.is_dir()
+            or candidate_fingerprint(path)[0] != candidate.fingerprint
+        ):
+            raise RuntimeError("reproducible cache authority changed")
+        before = candidate_fingerprint(path)[1]
+        shutil.rmtree(path)
+        return before
     if candidate.resource_kind == "terminal_runtime":
         from cli_agent_orchestrator.services.terminal_service import (
             retire_exited_terminal_runtime,
@@ -386,30 +403,86 @@ def execute_plan(
                 )
                 continue
             try:
+                if candidate.resource_kind == "git_worktree":
+                    from cli_agent_orchestrator.services.operations_service import (
+                        context_lifecycle_fence,
+                    )
+
+                    with context_lifecycle_fence(config, nonblocking=True) as acquired:
+                        if not acquired:
+                            report.skipped.append(
+                                {
+                                    "candidate": candidate.canonical_identity,
+                                    "reason_code": "WORKTREE_LIFECYCLE_BUSY",
+                                }
+                            )
+                            continue
+                        current_protection = resolve_protected_set(
+                            root,
+                            config=config,
+                            open_inventory=open_inventory,
+                        )
+                        from .worktrees import (
+                            remove_worktree,
+                            revalidate_worktree_candidate,
+                        )
+
+                        current = revalidate_worktree_candidate(
+                            candidate,
+                            config=config,
+                            protection=current_protection,
+                            runner=runner,
+                        )
+                        if current is None:
+                            report.skipped.append(
+                                {
+                                    "candidate": candidate.canonical_identity,
+                                    "reason_code": "CANDIDATE_NO_LONGER_ELIGIBLE",
+                                }
+                            )
+                            continue
+                        if current.action != "retire" or current.protection_reason:
+                            report.skipped.append(
+                                {
+                                    "candidate": candidate.canonical_identity,
+                                    "reason_code": current.protection_reason
+                                    or "CANDIDATE_NO_LONGER_ELIGIBLE",
+                                }
+                            )
+                            continue
+                        if current.fingerprint != candidate.fingerprint:
+                            raise RuntimeError("candidate fingerprint changed")
+                        reclaimed = remove_worktree(
+                            candidate,
+                            runner=runner,
+                            timeout=float(config.get("subprocess_timeout_seconds", 20)),
+                        )
+                        report.freed_bytes += reclaimed
+                        report.reclaimed_bytes_by_class[candidate.category] = (
+                            report.reclaimed_bytes_by_class.get(candidate.category, 0) + reclaimed
+                        )
+                        report.executed_count_by_class[candidate.category] = (
+                            report.executed_count_by_class.get(candidate.category, 0) + 1
+                        )
+                        report.executed.append(candidate.canonical_identity)
+                    continue
                 if candidate.category in {
                     "ephemeral",
                     "browser_cache",
                     "package_cache",
                     "terminal_runtime",
                     "retirement_cleanup",
+                    "reproducible_cache",
                 }:
-                    refreshed = build_plan(
+                    current = revalidate_runtime_candidate(
+                        candidate,
                         root=root,
                         config=config,
                         settings=effective_settings,
-                        mode=plan.mode,
                         now=plan.generated_at,
                         open_inventory=open_inventory,
                         proc_root=proc_root,
                         runner=runner,
-                    )
-                    current = next(
-                        (
-                            item
-                            for item in refreshed.candidates
-                            if item.canonical_identity == candidate.canonical_identity
-                        ),
-                        None,
                     )
                     if current is None:
                         report.skipped.append(
@@ -431,12 +504,19 @@ def execute_plan(
                     if current.fingerprint != candidate.fingerprint:
                         raise RuntimeError("candidate fingerprint changed")
                     if candidate.resource_kind != "path":
-                        report.freed_bytes += _execute_resource(
+                        reclaimed = _execute_resource(
                             candidate,
                             config=config,
                             proc_root=proc_root,
                             runner=runner,
                             sleeper=sleeper,
+                        )
+                        report.freed_bytes += reclaimed
+                        report.reclaimed_bytes_by_class[candidate.category] = (
+                            report.reclaimed_bytes_by_class.get(candidate.category, 0) + reclaimed
+                        )
+                        report.executed_count_by_class[candidate.category] = (
+                            report.executed_count_by_class.get(candidate.category, 0) + 1
                         )
                         report.executed.append(candidate.canonical_identity)
                         continue
@@ -445,7 +525,12 @@ def execute_plan(
                 if candidate.category == "releases":
                     allowed_roots = release_roots
                 elif candidate.category == "browser_cache":
-                    allowed_roots = (Path(str(config["playwright_browser_cache"])).resolve(),)
+                    configured_browser_roots = config.get("playwright_browser_caches") or [
+                        config["playwright_browser_cache"]
+                    ]
+                    allowed_roots = tuple(
+                        Path(str(value)).resolve() for value in configured_browser_roots
+                    )
                 elif candidate.category == "package_cache":
                     allowed_roots = tuple(
                         Path(str(entry.get("path", ""))).resolve()
@@ -478,7 +563,14 @@ def execute_plan(
                         {"candidate": candidate.canonical_identity, "reason_code": reason}
                     )
                     continue
-                report.freed_bytes += _execute_candidate(path, candidate)
+                reclaimed = _execute_candidate(path, candidate)
+                report.freed_bytes += reclaimed
+                report.reclaimed_bytes_by_class[candidate.category] = (
+                    report.reclaimed_bytes_by_class.get(candidate.category, 0) + reclaimed
+                )
+                report.executed_count_by_class[candidate.category] = (
+                    report.executed_count_by_class.get(candidate.category, 0) + 1
+                )
                 report.executed.append(candidate.canonical_identity)
             except FileNotFoundError:
                 report.skipped.append(

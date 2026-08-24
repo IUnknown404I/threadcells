@@ -9,6 +9,7 @@ import grp
 import hashlib
 import json
 import os
+import pwd
 import re
 import shutil
 import stat
@@ -555,10 +556,32 @@ def main() -> int:
     parser.add_argument("--expected-commit")
     parser.add_argument("--release-lock", type=Path)
     parser.add_argument("--release-metadata", type=Path)
+    parser.add_argument(
+        "--worktree-durable-ref",
+        action="append",
+        default=[],
+        help="exact refs/* authority which may prove a worktree HEAD durable",
+    )
     parser.add_argument("--test-unprivileged-staging", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     source = args.source_root
+    durable_refs_valid = len(set(args.worktree_durable_ref)) == len(args.worktree_durable_ref)
+    for value in args.worktree_durable_ref:
+        if not isinstance(value, str) or not value.startswith("refs/"):
+            durable_refs_valid = False
+            break
+        checked = subprocess.run(
+            ["git", "check-ref-format", value],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if checked.returncode:
+            durable_refs_valid = False
+            break
+    if not durable_refs_valid:
+        fail("WORKTREE_DURABLE_REF_INVALID")
     config_source = source / "src/cli_agent_orchestrator/config/cao-operations.json"
     policy_source = source / "deployment/cao-ops-policy.md"
     unit_source = source / "deployment/systemd"
@@ -588,6 +611,10 @@ def main() -> int:
     root = args.agent_control_root.resolve()
     system_root = args.system_root.resolve()
     runtime_user = root.owner()
+    try:
+        runtime_home = Path(pwd.getpwnam(runtime_user).pw_dir).resolve()
+    except KeyError:
+        fail("RUNTIME_HOME_UNAVAILABLE")
     production_system_root = system_root == Path("/")
     if args.test_unprivileged_staging and production_system_root:
         fail("TEST_STAGING_OVERRIDE_FORBIDDEN")
@@ -627,18 +654,93 @@ def main() -> int:
         release_control_uid=trusted_owner[0],
         runtime_user=runtime_user,
         playwright_manifest_roots=[str(root / "sources"), str(root / "projects")],
-        playwright_browser_cache=str(root / "cache/ms-playwright"),
-        package_caches=[
-            {"name": "uv", "path": str(root / "cache/uv"), "command": ["uv", "cache", "prune"]},
+        playwright_browser_cache=str(runtime_home / ".cache/ms-playwright"),
+        playwright_browser_caches=[
+            str(runtime_home / ".cache/ms-playwright"),
+        ],
+        worktree_roots=[str(root / "tmp"), str(root / "state/cao/worktrees")],
+        worktree_repository_collections=[str(root / "sources"), str(root / "projects")],
+        worktree_repository_paths=[],
+        worktree_durable_refs=list(args.worktree_durable_ref),
+        reproducible_cache_roots=[str(runtime_home / ".cache")],
+        reproducible_cache_owned_prefixes=[
+            "threadcells-ci-uv-cache-",
+            "threadcells-ci-venv-",
+            "threadcells-ci-wheel-",
+        ],
+        protected_inventory_roots=[
             {
-                "name": "pnpm",
-                "path": str(root / "cache/pnpm"),
-                "command": ["pnpm", "store", "prune"],
+                "category": "tools",
+                "path": str(root / "tools"),
+                "purpose": "runtime and candidate tool authorities",
+                "reason": "TOOLS_RETENTION_AUTHORITY_UNKNOWN",
+            },
+            {
+                "category": "projects",
+                "path": str(root / "projects"),
+                "purpose": "registered project source authorities",
+                "reason": "PROJECT_SOURCE_AUTHORITY",
+            },
+            {
+                "category": "sources",
+                "path": str(root / "sources"),
+                "purpose": "Git common directories and source authorities",
+                "reason": "SOURCE_AND_GIT_COMMON_DIR_AUTHORITY",
+            },
+            {
+                "category": "provider_state",
+                "path": str(runtime_home / ".codex"),
+                "purpose": "provider sessions, history, and installed packages",
+                "reason": "PROVIDER_DURABLE_STATE",
+            },
+            {
+                "category": "runtime_tooling",
+                "path": str(runtime_home / ".local"),
+                "purpose": "runtime-owned installed tools and data",
+                "reason": "RUNTIME_TOOLING_AUTHORITY",
+            },
+        ],
+        package_caches=[
+            {
+                "name": "uv-agent-control",
+                "path": str(root / "cache"),
+                "command": [
+                    "uv",
+                    "cache",
+                    "clean",
+                    "--cache-dir",
+                    str(root / "cache"),
+                ],
+                "path_argument": "--cache-dir",
+                "minimum_bytes": 64 * 1024 * 1024,
+                "full_reclaim": True,
+            },
+            {
+                "name": "uv-runtime-user",
+                "path": str(runtime_home / ".cache/uv"),
+                "command": [
+                    "uv",
+                    "cache",
+                    "clean",
+                    "--cache-dir",
+                    str(runtime_home / ".cache/uv"),
+                ],
+                "path_argument": "--cache-dir",
+                "minimum_bytes": 64 * 1024 * 1024,
+                "full_reclaim": True,
             },
             {
                 "name": "npm",
-                "path": str(root / "cache/npm"),
-                "command": ["npm", "cache", "clean", "--force"],
+                "path": str(runtime_home / ".npm"),
+                "command": [
+                    "npm",
+                    "cache",
+                    "clean",
+                    "--force",
+                    "--cache",
+                    str(runtime_home / ".npm"),
+                ],
+                "path_argument": "--cache",
             },
         ],
     )

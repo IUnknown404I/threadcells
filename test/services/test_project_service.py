@@ -1,5 +1,6 @@
 """Focused Projects P1 service tests."""
 
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -7,6 +8,60 @@ import pytest
 
 from cli_agent_orchestrator.models.project import Project
 from cli_agent_orchestrator.services import project_service
+
+
+def test_project_authority_changes_hold_the_context_lifecycle_fence(tmp_path: Path):
+    project = Project(
+        projectId="6d7606b5-32ba-4f6b-8b1b-edc4ac0cbd80",
+        name="Project",
+        path=str(tmp_path.resolve()),
+    )
+    events: list[str] = []
+
+    @contextmanager
+    def fence():
+        events.append("fence-enter")
+        yield True
+        events.append("fence-exit")
+
+    def create(**_kwargs):
+        events.append("create")
+        return project
+
+    def update(*_args, **_kwargs):
+        events.append("update")
+        return project
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.operations_service.context_lifecycle_fence",
+            fence,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.project_service.database.create_project",
+            side_effect=create,
+        ),
+    ):
+        project_service.create_project(name="Project", path=str(tmp_path))
+    assert events == ["fence-enter", "create", "fence-exit"]
+
+    events.clear()
+    with (
+        patch(
+            "cli_agent_orchestrator.services.operations_service.context_lifecycle_fence",
+            fence,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.project_service.database.get_project",
+            return_value=project,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.project_service.database.update_project",
+            side_effect=update,
+        ),
+    ):
+        project_service.update_project(project.id, path=str(tmp_path))
+    assert events == ["fence-enter", "update", "fence-exit"]
 
 
 def test_final_component_creation_never_creates_missing_parents(tmp_path: Path):

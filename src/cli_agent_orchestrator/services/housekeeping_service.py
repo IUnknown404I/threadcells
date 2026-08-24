@@ -30,6 +30,7 @@ class HousekeepingSummary:
     disk_before: int = 0
     disk_after: int = 0
     freed_bytes: int = 0
+    observed_disk_free_delta: int = 0
     logs_compressed: int = 0
     logs_deleted: int = 0
     attachments_deleted: int = 0
@@ -43,12 +44,19 @@ class HousekeepingSummary:
     legacy_authority_reconciled: int = 0
     supervisor_roles_reconciled: int = 0
     cache_pruned: int = 0
+    worktrees_retired: int = 0
+    reproducible_caches_removed: int = 0
     skipped_open: int = 0
     skipped_unknown: int = 0
     plan_id: str | None = None
     planned_candidates: int = 0
     reclaimable_bytes: int = 0
+    reclaimable_bytes_by_class: dict[str, int] = field(default_factory=dict)
+    preserved_bytes_by_class: dict[str, int] = field(default_factory=dict)
+    reclaimed_bytes_by_class: dict[str, int] = field(default_factory=dict)
+    execution_skips: list[dict[str, str]] = field(default_factory=list)
     execution_failures: list[dict[str, str]] = field(default_factory=list)
+    completed_with_issues: bool = False
     warnings: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -115,6 +123,14 @@ def _open_paths_inventory(
             executable = os.readlink(process / "exe")
             if executable.startswith("/"):
                 result.add(Path(executable.removesuffix(" (deleted)")))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return result, False
+        try:
+            working_directory = os.readlink(process / "cwd")
+            if working_directory.startswith("/"):
+                result.add(Path(working_directory.removesuffix(" (deleted)")))
         except FileNotFoundError:
             pass
         except OSError:
@@ -971,6 +987,32 @@ def plan_housekeeping(
     )
 
 
+def run_pressure_recovery(
+    config: Mapping[str, Any] | None = None,
+    *,
+    now: float | None = None,
+    proc_root: Path = Path("/proc"),
+) -> HousekeepingSummary:
+    """Build and execute one content-bound automatic disk-pressure plan."""
+    cfg = dict(config or load_operations_config())
+    if not cfg.get("_housekeeping_heavy_slot"):
+        from cli_agent_orchestrator.services.operations_service import acquire_heavy_slot
+
+        with acquire_heavy_slot(cfg, recovery_safe=True):
+            nested = dict(cfg)
+            nested["_housekeeping_heavy_slot"] = True
+            return run_pressure_recovery(nested, now=now, proc_root=proc_root)
+    plan = plan_housekeeping(config=cfg, mode="pressure", now=now, proc_root=proc_root)
+    return run_housekeeping(
+        config=cfg,
+        dry_run=False,
+        mode="pressure",
+        now=now,
+        proc_root=proc_root,
+        expected_plan_id=plan.plan_id,
+    )
+
+
 def run_housekeeping(
     *,
     config: Mapping[str, Any] | None = None,
@@ -1028,6 +1070,17 @@ def run_housekeeping(
         summary.plan_id = plan.plan_id
         summary.planned_candidates = len(plan.candidates)
         summary.reclaimable_bytes = plan.reclaimable_bytes
+        class_summaries = getattr(plan, "class_summaries", {})
+        summary.reclaimable_bytes_by_class = {
+            category: int(values["reclaimable_bytes"])
+            for category, values in class_summaries.items()
+            if values["reclaimable_bytes"]
+        }
+        summary.preserved_bytes_by_class = {
+            category: int(values["preserved_bytes"])
+            for category, values in class_summaries.items()
+            if values["preserved_bytes"]
+        }
         summary.warnings.extend(plan.warnings)
         actionable = [candidate for candidate in plan.candidates if candidate.action != "preserve"]
         if dry_run:
@@ -1066,6 +1119,12 @@ def run_housekeeping(
             summary.cache_pruned += sum(
                 candidate.category == "package_cache" for candidate in actionable
             )
+            summary.worktrees_retired += sum(
+                candidate.resource_kind == "git_worktree" for candidate in actionable
+            )
+            summary.reproducible_caches_removed += sum(
+                candidate.resource_kind == "reproducible_cache" for candidate in actionable
+            )
         else:
             report = execute_plan(
                 plan,
@@ -1076,7 +1135,10 @@ def run_housekeeping(
             )
             summary.ok = summary.ok and report.ok
             summary.freed_bytes += report.freed_bytes
+            summary.reclaimed_bytes_by_class = dict(getattr(report, "reclaimed_bytes_by_class", {}))
+            summary.execution_skips.extend(getattr(report, "skipped", []))
             summary.execution_failures.extend(report.failures)
+            summary.completed_with_issues = bool(getattr(report, "skipped", []) or report.failures)
             summary.warnings.extend(
                 f"{item['reason_code']}:{item['candidate']}" for item in report.failures
             )
@@ -1129,13 +1191,23 @@ def run_housekeeping(
                 candidate.canonical_identity in executed and candidate.category == "package_cache"
                 for candidate in actionable
             )
+            summary.worktrees_retired += sum(
+                candidate.canonical_identity in executed
+                and candidate.resource_kind == "git_worktree"
+                for candidate in actionable
+            )
+            summary.reproducible_caches_removed += sum(
+                candidate.canonical_identity in executed
+                and candidate.resource_kind == "reproducible_cache"
+                for candidate in actionable
+            )
         if not dry_run:
             _reconcile_supervisor_context_roles(summary)
             _reconcile_writer_leases(summary)
             _reconcile_legacy_terminal_authority(summary)
         _inventory_warnings(root, cfg, summary)
         summary.disk_after = shutil.disk_usage("/").free
-        summary.freed_bytes = max(summary.freed_bytes, summary.disk_after - summary.disk_before, 0)
+        summary.observed_disk_free_delta = summary.disk_after - summary.disk_before
         if not dry_run:
             if summary.ok and mode in {"frequent", "weekly"}:
                 _write_schedule_receipt(root, mode, current)

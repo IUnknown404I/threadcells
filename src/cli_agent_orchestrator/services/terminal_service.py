@@ -960,6 +960,20 @@ def create_terminal(
         context_role=resolved_role,
         project_id=project_context.get("id") if project_context else None,
     ):
+        # Housekeeping holds this same lifecycle fence while retiring linked
+        # worktrees. A caller may have resolved its directory before waiting
+        # for the fence, so prove that authority again before creating tmux or
+        # publishing a writer lease.
+        try:
+            current_source_worktree = _canonical_worktree(working_directory)
+        except (FileNotFoundError, ValueError) as exc:
+            from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+            raise AdmissionDenied("WORKTREE_AUTHORITY_CHANGED", {}) from exc
+        if current_source_worktree != source_worktree:
+            from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+            raise AdmissionDenied("WORKTREE_AUTHORITY_CHANGED", {})
         if managed_worktree_kind is not None:
             managed = create_managed_worktree(source_worktree, terminal_id, managed_worktree_kind)
         launch_worktree = managed.path if managed is not None else source_worktree

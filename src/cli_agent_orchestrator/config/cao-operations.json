@@ -37,9 +37,25 @@
     "/var/lib/threadcells/projects"
   ],
   "playwright_browser_cache": "/var/cache/threadcells/ms-playwright",
+  "playwright_browser_caches": [
+    "/var/cache/threadcells/ms-playwright"
+  ],
+  "worktree_roots": [
+    "/var/lib/threadcells/tmp",
+    "/var/lib/threadcells/state/cao/worktrees"
+  ],
+  "worktree_repository_collections": [
+    "/var/lib/threadcells/sources",
+    "/var/lib/threadcells/projects"
+  ],
+  "worktree_repository_paths": [],
+  "worktree_durable_refs": [],
+  "reproducible_cache_roots": [],
+  "reproducible_cache_owned_prefixes": [],
+  "reproducible_cache_retain_minutes": 1440,
+  "protected_inventory_roots": [],
   "package_caches": [
-    {"name": "uv", "path": "/var/cache/threadcells/uv", "command": ["uv", "cache", "prune"]},
-    {"name": "pnpm", "path": "/var/cache/threadcells/pnpm", "command": ["pnpm", "store", "prune"]},
-    {"name": "npm", "path": "/var/cache/threadcells/npm", "command": ["npm", "cache", "clean", "--force"]}
+    {"name": "uv", "path": "/var/cache/threadcells/uv", "command": ["uv", "cache", "clean", "--cache-dir", "/var/cache/threadcells/uv"], "path_argument": "--cache-dir"},
+    {"name": "npm", "path": "/var/cache/threadcells/npm", "command": ["npm", "cache", "clean", "--force", "--cache", "/var/cache/threadcells/npm"], "path_argument": "--cache"}
   ]
 }

@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 
 HousekeepingMode = Literal["frequent", "weekly", "pressure"]
-CandidateAction = Literal["preserve", "compress", "delete", "terminate", "prune"]
+CandidateAction = Literal[
+    "preserve",
+    "compress",
+    "delete",
+    "terminate",
+    "prune",
+    "retire",
+]
 CandidateKind = Literal[
     "path",
     "browser_process_group",
@@ -19,6 +26,9 @@ CandidateKind = Literal[
     "package_cache",
     "terminal_runtime",
     "retirement_cleanup",
+    "git_worktree",
+    "reproducible_cache",
+    "inventory",
 ]
 
 DEFAULT_POLICY: dict[str, dict[str, Any]] = {
@@ -72,6 +82,34 @@ class HousekeepingPlan:
             item.estimated_reclaim_bytes for item in self.candidates if item.action != "preserve"
         )
 
+    @property
+    def class_summaries(self) -> dict[str, dict[str, Any]]:
+        """Return truthful actionable and protected footprints by lifecycle class."""
+        summaries: dict[str, dict[str, Any]] = {}
+        for item in self.candidates:
+            summary = summaries.setdefault(
+                item.category,
+                {
+                    "candidate_count": 0,
+                    "actionable_count": 0,
+                    "reclaimable_bytes": 0,
+                    "preserved_count": 0,
+                    "preserved_bytes": 0,
+                    "protection_reasons": {},
+                },
+            )
+            summary["candidate_count"] += 1
+            if item.action == "preserve":
+                summary["preserved_count"] += 1
+                summary["preserved_bytes"] += item.bytes
+                reason = item.protection_reason or item.retention_reason
+                reasons = summary["protection_reasons"]
+                reasons[reason] = reasons.get(reason, 0) + 1
+            else:
+                summary["actionable_count"] += 1
+                summary["reclaimable_bytes"] += item.estimated_reclaim_bytes
+        return summaries
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
@@ -80,6 +118,7 @@ class HousekeepingPlan:
             "mode": self.mode,
             "root": self.root,
             "reclaimable_bytes": self.reclaimable_bytes,
+            "class_summaries": self.class_summaries,
             "warnings": list(self.warnings),
             "candidates": [candidate.as_dict() for candidate in self.candidates],
         }
@@ -123,6 +162,22 @@ def resource_fingerprint(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(serialized.encode()).hexdigest()
 
 
+def _plan_identity_candidate(candidate: HousekeepingCandidate) -> dict[str, Any]:
+    """Bind destructive state exactly without letting protected byte drift churn plans."""
+    if candidate.action != "preserve":
+        return candidate.as_dict()
+    return {
+        "category": candidate.category,
+        "path": candidate.path,
+        "canonical_identity": candidate.canonical_identity,
+        "action": candidate.action,
+        "retention_reason": candidate.retention_reason,
+        "protection_reason": candidate.protection_reason,
+        "resource_kind": candidate.resource_kind,
+        "attributes": list(candidate.attributes),
+    }
+
+
 def finalize_plan(
     *,
     generated_at: float,
@@ -135,7 +190,10 @@ def finalize_plan(
         "schema_version": 1,
         "mode": mode,
         "root": str(root.resolve()),
-        "candidates": [candidate.as_dict() for candidate in candidates],
+        "candidates": sorted(
+            (_plan_identity_candidate(candidate) for candidate in candidates),
+            key=lambda item: str(item["canonical_identity"]),
+        ),
         "warnings": warnings,
     }
     plan_id = hashlib.sha256(

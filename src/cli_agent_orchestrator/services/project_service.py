@@ -67,21 +67,24 @@ def create_project(
     is_default: bool = False,
     create_directory: bool = False,
 ) -> Project:
-    clean_name = " ".join(name.split())
-    normalized_name = _normalized_name(clean_name)
-    resolved_path = validate_project_path(path, create_directory=create_directory)
-    clean_description = (
-        description.strip() if isinstance(description, str) and description.strip() else None
-    )
-    return database.create_project(
-        project_id=str(uuid.uuid4()),
-        name=clean_name,
-        normalized_name=normalized_name,
-        path=resolved_path,
-        normalized_path=os.path.normcase(resolved_path),
-        description=clean_description,
-        is_default=is_default,
-    )
+    from cli_agent_orchestrator.services.operations_service import context_lifecycle_fence
+
+    with context_lifecycle_fence():
+        clean_name = " ".join(name.split())
+        normalized_name = _normalized_name(clean_name)
+        resolved_path = validate_project_path(path, create_directory=create_directory)
+        clean_description = (
+            description.strip() if isinstance(description, str) and description.strip() else None
+        )
+        return database.create_project(
+            project_id=str(uuid.uuid4()),
+            name=clean_name,
+            normalized_name=normalized_name,
+            path=resolved_path,
+            normalized_path=os.path.normcase(resolved_path),
+            description=clean_description,
+            is_default=is_default,
+        )
 
 
 def list_projects() -> list[Project]:
@@ -141,30 +144,33 @@ def update_project(
     is_default: bool | None = None,
 ) -> Project:
     """Edit registry metadata only.  No filesystem move or historical rewrite occurs."""
-    current = get_registered_project(project_id)
-    clean_name = " ".join((name if name is not None else current.name).split())
-    normalized_name = _normalized_name(clean_name)
-    # Existing metadata is deliberately not revalidated: a stale row must be
-    # repairable or removable.  Only a newly requested path is a filesystem
-    # action and therefore requires launch-grade validation.
-    resolved_path = validate_project_path(path) if path is not None else current.path
-    clean_description = (
-        description.strip() if isinstance(description, str) and description.strip() else None
-    )
-    updated = database.update_project(
-        project_id,
-        name=clean_name,
-        normalized_name=normalized_name,
-        path=resolved_path,
-        normalized_path=os.path.normcase(resolved_path),
-        description=clean_description,
-        is_default=is_default,
-    )
-    if updated is None:
-        raise ProjectResolutionError(
-            f"Unknown projectId '{project_id}'. Select a registered project."
+    from cli_agent_orchestrator.services.operations_service import context_lifecycle_fence
+
+    with context_lifecycle_fence():
+        current = get_registered_project(project_id)
+        clean_name = " ".join((name if name is not None else current.name).split())
+        normalized_name = _normalized_name(clean_name)
+        # Existing metadata is deliberately not revalidated: a stale row must
+        # be repairable or removable. Only a newly requested path can acquire
+        # worktree authority and therefore requires launch-grade validation.
+        resolved_path = validate_project_path(path) if path is not None else current.path
+        clean_description = (
+            description.strip() if isinstance(description, str) and description.strip() else None
         )
-    return updated
+        updated = database.update_project(
+            project_id,
+            name=clean_name,
+            normalized_name=normalized_name,
+            path=resolved_path,
+            normalized_path=os.path.normcase(resolved_path),
+            description=clean_description,
+            is_default=is_default,
+        )
+        if updated is None:
+            raise ProjectResolutionError(
+                f"Unknown projectId '{project_id}'. Select a registered project."
+            )
+        return updated
 
 
 def launch_context(project_id: str | None) -> tuple[str | None, dict[str, str] | None]:

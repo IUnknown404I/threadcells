@@ -63,8 +63,9 @@ Disk status uses exact thresholds:
 
 - **GREEN:** below 70% used.
 - **YELLOW:** 70% to below 85%.
-- **RED:** 85% or above.
-- At 92% or above, the reason also reports critical disk pressure.
+- **RED:** 85% to below 92%.
+- **CRITICAL:** 92% or above. Aggregate admission remains RED and includes the
+  `DISK_CRITICAL` reason, while the disk-specific projection reports CRITICAL.
 
 YELLOW is a prompt to inspect growth and plan Housekeeping. RED can deny risky new work and admit recovery-safe cleanup. Unknown state fails closed; ThreadCells does not assume an unreadable filesystem is healthy.
 

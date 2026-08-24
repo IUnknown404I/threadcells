@@ -17,6 +17,7 @@ const contentTypes = new Map([
   ['.webmanifest', 'application/manifest+json'],
 ])
 let probeCount = 0
+let credentialedManifestRequests = 0
 
 function sendJson(response, value) {
   response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
@@ -28,6 +29,14 @@ const server = http.createServer(async (request, response) => {
   if (url.pathname === '/sessions') return sendJson(response, [])
   if (url.pathname === '/settings/branding') return sendJson(response, { title: 'ThreadCells', subtitle: 'Multi-agent control plane', logoUrl: '/threadcells-symbol.png', customLogo: false })
   if (url.pathname === '/api/pwa-probe' || url.pathname === '/operator/session') return sendJson(response, { sequence: ++probeCount })
+  if (url.pathname === '/manifest.webmanifest') {
+    if (!request.headers.cookie?.includes('threadcells_manifest_session=accepted')) {
+      response.writeHead(401, { 'content-type': 'text/plain' })
+      response.end('authentication required')
+      return
+    }
+    credentialedManifestRequests += 1
+  }
 
   const relative = url.pathname === '/' ? 'index.html' : url.pathname.replace(/^\//, '')
   let candidate = path.resolve(distRoot, relative)
@@ -40,10 +49,14 @@ const server = http.createServer(async (request, response) => {
     candidate = path.join(distRoot, 'index.html')
   }
   const body = await readFile(candidate)
-  response.writeHead(200, {
+  const headers = {
     'content-type': contentTypes.get(path.extname(candidate)) || 'application/octet-stream',
     'cache-control': candidate.endsWith('index.html') ? 'no-store' : 'public, max-age=60',
-  })
+  }
+  if (candidate.endsWith('index.html')) {
+    headers['set-cookie'] = 'threadcells_manifest_session=accepted; Path=/; HttpOnly; SameSite=Lax'
+  }
+  response.writeHead(200, headers)
   response.end(body)
 })
 
@@ -67,6 +80,7 @@ try {
   const appManifest = await cdp.send('Page.getAppManifest')
   assert.equal(appManifest.url, `${origin}/manifest.webmanifest`)
   assert.equal(appManifest.errors.length, 0, JSON.stringify(appManifest.errors))
+  assert(credentialedManifestRequests > 0, 'browser manifest fetch must include same-origin authentication')
   const installability = await cdp.send('Page.getInstallabilityErrors')
   assert.deepEqual(installability.installabilityErrors, [])
 
@@ -75,6 +89,7 @@ try {
     const registration = await navigator.serviceWorker.ready
     return {
       manifest,
+      manifestCrossOrigin: document.querySelector('link[rel="manifest"]')?.crossOrigin,
       worker: registration.active?.scriptURL,
       appleCapable: document.querySelector('meta[name="apple-mobile-web-app-capable"]')?.getAttribute('content'),
       appleIcon: document.querySelector('link[rel="apple-touch-icon"]')?.getAttribute('href'),
@@ -84,6 +99,7 @@ try {
   assert.equal(metadata.manifest.display, 'standalone')
   assert.equal(metadata.manifest.start_url, '/')
   assert.equal(metadata.manifest.scope, '/')
+  assert.equal(metadata.manifestCrossOrigin, 'use-credentials')
   assert.equal(metadata.appleCapable, 'yes')
   assert.equal(metadata.appleIcon, '/apple-touch-icon.png')
 

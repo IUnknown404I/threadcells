@@ -105,7 +105,11 @@ from cli_agent_orchestrator.services.session_service import (
     SessionLifecycleError,
     SessionNotFoundError,
 )
-from cli_agent_orchestrator.services.terminal_service import ExitAuthorityError, OutputMode
+from cli_agent_orchestrator.services.terminal_service import (
+    ExitAuthorityError,
+    OutputMode,
+    TerminalDeletionError,
+)
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
 from cli_agent_orchestrator.utils.skills import (
@@ -2179,7 +2183,7 @@ async def exit_terminal(terminal_id: TerminalId) -> Dict:
 
 @app.delete("/terminals/{terminal_id}")
 async def delete_terminal(request: Request, terminal_id: TerminalId) -> Dict:
-    """Delete a terminal."""
+    """Delete one durably exited terminal under exact runtime authority."""
     try:
         success = await run_in_threadpool(
             terminal_service.delete_terminal,
@@ -2189,6 +2193,15 @@ async def delete_terminal(request: Request, terminal_id: TerminalId) -> Dict:
         return {"success": success}
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except TerminalDeletionError as e:
+        raise HTTPException(
+            status_code=(
+                status.HTTP_503_SERVICE_UNAVAILABLE
+                if e.inventory_uncertain
+                else status.HTTP_409_CONFLICT
+            ),
+            detail={"reason_code": e.reason_code, "message": str(e)},
+        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

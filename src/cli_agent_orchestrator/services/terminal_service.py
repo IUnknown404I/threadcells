@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from cli_agent_orchestrator.clients.database import (
+    AmbiguousTerminalIdentity,
     OwnerGrantRejected,
     UnreconciledTerminalAuthority,
     WorktreeWriterLeaseConflict,
@@ -43,6 +44,9 @@ from cli_agent_orchestrator.clients.database import (
     claim_terminal_runtime_exit,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
+from cli_agent_orchestrator.clients.database import (
+    delete_exited_terminal as db_delete_exited_terminal,
+)
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
     get_provider_execution_turn,
@@ -64,6 +68,7 @@ from cli_agent_orchestrator.clients.database import (
     release_terminal_runtime_operation,
     replace_starting_terminal_runtime_identity,
     resolve_session_lifetime,
+    terminal_deletion_receipt_exists,
     terminal_requires_result_snapshot,
     terminal_runtime_operation_owned,
     update_last_active,
@@ -379,6 +384,15 @@ class ExitTerminalResult:
 
 class ExitAuthorityError(RuntimeError):
     """Exact provider/tmux delivery authority could not be established."""
+
+    def __init__(self, reason_code: str, message: str, *, inventory_uncertain: bool = False):
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.inventory_uncertain = inventory_uncertain
+
+
+class TerminalDeletionError(RuntimeError):
+    """Terminal deletion lacked exact, exited runtime authority."""
 
     def __init__(self, reason_code: str, message: str, *, inventory_uncertain: bool = False):
         super().__init__(message)
@@ -2166,57 +2180,131 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         raise
 
 
+_TERMINAL_DELETION_IDENTITY_FIELDS = (
+    "session_id",
+    "tmux_session",
+    "tmux_window",
+    "launch_worktree",
+    "write_enabled",
+    "managed_worktree_kind",
+    "managed_worktree_source",
+    "managed_worktree_branch",
+    "managed_worktree_commit",
+    "runtime_pane_id",
+    "runtime_pane_pid",
+    "runtime_generation",
+    "runtime_generation_origin",
+    "runtime_process_start_ticks",
+)
+
+
+def _terminal_deletion_identity(metadata: Dict) -> Dict[str, object]:
+    return {field: metadata.get(field) for field in _TERMINAL_DELETION_IDENTITY_FIELDS}
+
+
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
-    """Delete terminal and kill its tmux window."""
+    """Delete only one durably exited terminal under exact runtime authority."""
     try:
-        prepare_terminal_for_destruction(terminal_id)
-        cancel_child_assignments_for_terminal(terminal_id)
-        # Get metadata before deletion
-        metadata = get_terminal_metadata(terminal_id)
+        from cli_agent_orchestrator.services.operations_service import (
+            context_lifecycle_fence,
+        )
 
-        if metadata:
-            # Stop pipe-pane logging
+        with context_lifecycle_fence():
+            metadata = get_terminal_metadata(terminal_id)
+            if not metadata:
+                if terminal_deletion_receipt_exists(terminal_id):
+                    return True
+                raise ValueError(f"Terminal '{terminal_id}' not found")
+
+            lifecycle = metadata.get("runtime_lifecycle")
+            if lifecycle != TerminalLifecycle.EXITED.value:
+                reason_code = (
+                    "TERMINAL_EXIT_PENDING"
+                    if lifecycle == TerminalLifecycle.EXIT_PENDING.value
+                    else "TERMINAL_RUNTIME_ACTIVE"
+                )
+                raise TerminalDeletionError(
+                    reason_code,
+                    "Terminal runtime is not durably exited; use graceful exit and wait for "
+                    "positive provider death before deleting history",
+                )
+
+            # Worktree authority and any required child-result snapshot are
+            # read-only preconditions. Never retire a pane until both pass.
+            validate_managed_worktree_cleanup(metadata)
+            prepare_terminal_for_destruction(terminal_id)
+
+            retirement = retire_exited_terminal_runtime(terminal_id)
+            if retirement is not True:
+                raise TerminalDeletionError(
+                    (
+                        "TERMINAL_DEATH_UNCONFIRMED"
+                        if retirement is False
+                        else "TERMINAL_RUNTIME_AUTHORITY_UNCERTAIN"
+                    ),
+                    (
+                        "The exact exited terminal pane could not be retired; metadata remains "
+                        "protected"
+                        if retirement is False
+                        else "Exact terminal runtime identity could not be established; metadata "
+                        "remains protected"
+                    ),
+                    inventory_uncertain=retirement is None,
+                )
+
+            current = get_terminal_metadata(terminal_id)
+            if (
+                not current
+                or current.get("runtime_lifecycle") != TerminalLifecycle.EXITED.value
+                or _terminal_deletion_identity(current) != _terminal_deletion_identity(metadata)
+            ):
+                raise TerminalDeletionError(
+                    "TERMINAL_IDENTITY_CHANGED",
+                    "Terminal identity changed during deletion; retry after reconciliation",
+                    inventory_uncertain=True,
+                )
+
+            # Re-running the exited transition is intentional: it clears any
+            # legacy stale writer/provider leases only after exact death proof.
+            if not mark_terminal_runtime_exited(terminal_id):
+                raise TerminalDeletionError(
+                    "TERMINAL_IDENTITY_CHANGED",
+                    "Terminal metadata changed during deletion; retry after reconciliation",
+                    inventory_uncertain=True,
+                )
+            cancel_child_assignments_for_terminal(terminal_id)
+            cancel_workflows_for_terminal(terminal_id)
+            _wake_queued_provider_execution(registry)
             try:
-                tmux_client.stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
-            except Exception as e:
-                logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
-
-            # Kill the tmux window (this terminates the agent process)
-            death_confirmed = False
+                provider_manager.cleanup_provider(terminal_id)
+            except Exception:
+                logger.warning("Provider cleanup failed for exited terminal %s", terminal_id)
+            cleanup_managed_worktree(metadata)
             try:
-                death_confirmed = bool(
-                    tmux_client.kill_window(metadata["tmux_session"], metadata["tmux_window"])
+                deletion = db_delete_exited_terminal(
+                    terminal_id,
+                    expected_identity=_terminal_deletion_identity(metadata),
                 )
-            except Exception as e:
-                logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
-            if not death_confirmed:
-                death_confirmed = (
-                    tmux_client.window_exists(metadata["tmux_session"], metadata["tmux_window"])
-                    is False
+            except AmbiguousTerminalIdentity as exc:
+                raise TerminalDeletionError(
+                    "TERMINAL_IDENTITY_CHANGED",
+                    "Terminal identity changed during deletion; retry after reconciliation",
+                    inventory_uncertain=True,
+                ) from exc
+            if deletion["missing"]:
+                raise TerminalDeletionError(
+                    "TERMINAL_IDENTITY_CHANGED",
+                    "Terminal metadata disappeared during deletion; retry after reconciliation",
+                    inventory_uncertain=True,
                 )
-            if not death_confirmed:
-                raise RuntimeError(
-                    f"Terminal death not confirmed for {terminal_id}; metadata and writer lease retained"
-                )
-        else:
-            raise RuntimeError(
-                f"Terminal metadata missing for {terminal_id}; writer lease release is unsafe"
-            )
 
-        # Runtime ownership ends at positive death, before optional history or
-        # managed-worktree cleanup.  A later cleanup failure must not resurrect
-        # a dead writer lease.
-        mark_terminal_runtime_exited(terminal_id)
-
-        # Cleanup provider state and database record
-        cancel_workflows_for_terminal(terminal_id)
-        _wake_queued_provider_execution(registry)
-        provider_manager.cleanup_provider(terminal_id)
-        validate_managed_worktree_cleanup(metadata)
-        cleanup_managed_worktree(metadata)
-        deleted = db_delete_terminal(terminal_id)
-        logger.info(f"Deleted terminal: {terminal_id}")
-        if deleted and metadata:
+        deleted = bool(deletion["deleted"])
+        logger.info(
+            "Deleted terminal: %s (already_deleted=%s)",
+            terminal_id,
+            deletion["already_deleted"],
+        )
+        if deleted:
             dispatch_plugin_event(
                 registry,
                 "post_kill_terminal",
@@ -2226,7 +2314,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                     agent_name=metadata.get("agent_profile"),
                 ),
             )
-        return deleted
+        return True
 
     except Exception as e:
         logger.error(f"Failed to delete terminal {terminal_id}: {e}")

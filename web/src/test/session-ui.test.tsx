@@ -266,7 +266,12 @@ describe('session creation and canonical ordering', () => {
       session: name === sessionA.name ? sessionA : sessionB,
       terminals: name === sessionA.name ? [terminalA] : [terminalB],
     }) as never)
-    useStore.setState({ sessions: [sessionA, sessionB] })
+    useStore.setState({
+      sessions: [sessionA, sessionB],
+      terminalStatuses: {
+        [terminalB.id]: { lifecycle: 'exited', status: 'idle' },
+      } as never,
+    })
     render(<AgentPanel />)
 
     const aToggle = await screen.findByRole('button', { name: `Expand ${sessionDisplayName(sessionA.name)}` })
@@ -281,8 +286,8 @@ describe('session creation and canonical ordering', () => {
     expect(within(screen.getByTestId(`agent-session-${sessionB.id}`)).getByTestId(`agent-session-detail-${sessionB.id}`)).toBe(bDetail)
     expect(screen.getByTestId(`agent-session-${sessionB.id}`).nextElementSibling).toBeNull()
 
-    fireEvent.click(within(bDetail).getByTitle('Close terminal'))
-    expect(screen.getByRole('heading', { name: 'Close Terminal' })).toBeInTheDocument()
+    fireEvent.click(within(bDetail).getByTitle('Delete exited terminal history'))
+    expect(screen.getByRole('heading', { name: 'Delete Exited Terminal' })).toBeInTheDocument()
     expect(screen.getByTestId(`agent-session-detail-${sessionB.id}`)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: `Collapse ${sessionDisplayName(sessionB.name)}` })).toHaveAttribute('aria-expanded', 'true')
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
@@ -592,7 +597,7 @@ describe('session creation and canonical ordering', () => {
       expect(within(card).getByTitle('Output')).toBeInTheDocument()
       expect(within(card).getByRole('button', { name: 'Terminal' })).toBeInTheDocument()
       expect(within(card).getByTitle('Graceful Exit')).toBeInTheDocument()
-      expect(within(card).getByTitle('Close')).toBeInTheDocument()
+      expect(within(card).getByTitle('Gracefully exit this terminal before deleting it')).toBeDisabled()
     }
 
     fireEvent.click(grid)
@@ -834,22 +839,25 @@ describe('session deletion confirmation', () => {
     await waitFor(() => expect(screen.queryByRole('heading', { name: 'Delete Session' })).not.toBeInTheDocument())
   })
 
-  it('keeps the existing agent close confirmation unchanged', async () => {
+  it('opens the terminal deletion confirmation only for an exited terminal', async () => {
     const terminal = { id: 'codex-terminal', tmux_session: 'cao-delete-me', tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null }
     const closeTerminal = vi.spyOn(api, 'deleteTerminal').mockResolvedValue({} as never)
     useStore.setState({
       activeSession: 'lifetime-delete-me',
       activeSessionDetail: { session: { ...session('lifetime-delete-me', '100'), name: 'cao-delete-me' }, terminals: [terminal] },
+      terminalStatuses: {
+        [terminal.id]: { lifecycle: 'exited', status: 'idle' },
+      } as never,
     })
     render(<AgentPanel />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand delete-me' }))
-    fireEvent.click(await screen.findByTitle('Close terminal'))
-    expect(screen.getByRole('heading', { name: 'Close Terminal' })).toBeInTheDocument()
+    fireEvent.click(await screen.findByTitle('Delete exited terminal history'))
+    expect(screen.getByRole('heading', { name: 'Delete Exited Terminal' })).toBeInTheDocument()
     expect(closeTerminal).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
-    expect(screen.queryByRole('heading', { name: 'Close Terminal' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Delete Exited Terminal' })).not.toBeInTheDocument()
     expect(closeTerminal).not.toHaveBeenCalled()
   })
 })

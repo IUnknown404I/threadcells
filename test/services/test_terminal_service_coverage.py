@@ -331,88 +331,161 @@ class TestCreateTerminalSessionCleanupGuard:
 
 
 class TestDeleteTerminal:
-    """Test delete_terminal coverage including pipe-pane and kill_window."""
+    """Exited-only deletion and exact runtime authority."""
 
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal", return_value=True)
-    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_delete_terminal_full_path(self, mock_meta, mock_tmux, mock_pm, mock_db_del):
-        """Delete should stop pipe-pane, kill window, cleanup provider, delete DB record."""
+    @staticmethod
+    def _metadata(lifecycle="exited"):
+        return {
+            "id": "tid1",
+            "tmux_session": "ses",
+            "tmux_window": "win",
+            "runtime_lifecycle": lifecycle,
+        }
+
+    def test_delete_terminal_full_path(self):
         from cli_agent_orchestrator.services.terminal_service import delete_terminal
 
-        mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
+        metadata = self._metadata()
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.prepare_terminal_for_destruction"
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.retire_exited_terminal_runtime",
+                return_value=True,
+            ) as retire,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.mark_terminal_runtime_exited",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_exited_terminal",
+                return_value={"deleted": 1, "already_deleted": False, "missing": False},
+            ) as db_delete,
+            patch("cli_agent_orchestrator.services.terminal_service.provider_manager") as manager,
+        ):
+            assert delete_terminal("tid1") is True
 
-        result = delete_terminal("tid1")
+        retire.assert_called_once_with("tid1")
+        manager.cleanup_provider.assert_called_once_with("tid1")
+        db_delete.assert_called_once()
 
-        assert result is True
-        mock_tmux.stop_pipe_pane.assert_called_once_with("ses", "win")
-        mock_tmux.kill_window.assert_called_once_with("ses", "win")
-        mock_pm.cleanup_provider.assert_called_once_with("tid1")
+    @pytest.mark.parametrize(
+        ("retirement", "reason_code"),
+        [
+            (False, "TERMINAL_DEATH_UNCONFIRMED"),
+            (None, "TERMINAL_RUNTIME_AUTHORITY_UNCERTAIN"),
+        ],
+    )
+    def test_delete_terminal_uncertain_runtime_is_protected(self, retirement, reason_code):
+        from cli_agent_orchestrator.services.terminal_service import (
+            TerminalDeletionError,
+            delete_terminal,
+        )
 
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal", return_value=True)
-    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_delete_terminal_pipe_pane_failure_continues(
-        self, mock_meta, mock_tmux, mock_pm, mock_db_del
-    ):
-        """Pipe-pane failure should be logged and not block deletion."""
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=self._metadata(),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.prepare_terminal_for_destruction"
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.retire_exited_terminal_runtime",
+                return_value=retirement,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_exited_terminal"
+            ) as db_delete,
+        ):
+            with pytest.raises(TerminalDeletionError) as raised:
+                delete_terminal("tid1")
+
+        assert raised.value.reason_code == reason_code
+        db_delete.assert_not_called()
+
+    def test_delete_terminal_active_runtime_is_protected_before_snapshot(self):
+        from cli_agent_orchestrator.services.terminal_service import (
+            TerminalDeletionError,
+            delete_terminal,
+        )
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=self._metadata("running"),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.prepare_terminal_for_destruction"
+            ) as prepare,
+        ):
+            with pytest.raises(TerminalDeletionError) as raised:
+                delete_terminal("tid1")
+
+        assert raised.value.reason_code == "TERMINAL_RUNTIME_ACTIVE"
+        prepare.assert_not_called()
+
+    def test_delete_terminal_identity_change_after_retirement_is_protected(self):
+        from cli_agent_orchestrator.services.terminal_service import (
+            TerminalDeletionError,
+            delete_terminal,
+        )
+
+        changed = {**self._metadata(), "runtime_generation": "replacement"}
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                side_effect=[self._metadata(), changed],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.prepare_terminal_for_destruction"
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.retire_exited_terminal_runtime",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.mark_terminal_runtime_exited"
+            ) as mark_exited,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_exited_terminal"
+            ) as db_delete,
+        ):
+            with pytest.raises(TerminalDeletionError) as raised:
+                delete_terminal("tid1")
+
+        assert raised.value.reason_code == "TERMINAL_IDENTITY_CHANGED"
+        mark_exited.assert_not_called()
+        db_delete.assert_not_called()
+
+    def test_delete_terminal_db_failure_raises(self):
         from cli_agent_orchestrator.services.terminal_service import delete_terminal
 
-        mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
-        mock_tmux.stop_pipe_pane.side_effect = Exception("pipe error")
-
-        result = delete_terminal("tid1")
-
-        assert result is True
-        mock_tmux.kill_window.assert_called_once()
-
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal", return_value=True)
-    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_delete_terminal_kill_window_failure_retains_metadata_and_lease(
-        self, mock_meta, mock_tmux, mock_pm, mock_db_del
-    ):
-        """Uncertain kill must not reopen the writer worktree."""
-        from cli_agent_orchestrator.services.terminal_service import delete_terminal
-
-        mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
-        mock_tmux.kill_window.side_effect = Exception("kill error")
-        mock_tmux.window_exists.return_value = None
-
-        with pytest.raises(RuntimeError, match="metadata and writer lease retained"):
-            delete_terminal("tid1")
-        mock_pm.cleanup_provider.assert_not_called()
-        mock_db_del.assert_not_called()
-
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal", return_value=True)
-    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_delete_terminal_releases_after_positive_absence(
-        self, mock_meta, mock_tmux, mock_pm, mock_db_del
-    ):
-        from cli_agent_orchestrator.services.terminal_service import delete_terminal
-
-        mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
-        mock_tmux.kill_window.return_value = False
-        mock_tmux.window_exists.return_value = False
-
-        assert delete_terminal("tid1") is True
-        mock_db_del.assert_called_once_with("tid1")
-
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_delete_terminal_db_failure_raises(self, mock_meta, mock_tmux, mock_pm, mock_db_del):
-        """DB delete failure should propagate."""
-        from cli_agent_orchestrator.services.terminal_service import delete_terminal
-
-        mock_meta.return_value = {"tmux_session": "ses", "tmux_window": "win"}
-        mock_db_del.side_effect = Exception("DB error")
-
-        with pytest.raises(Exception, match="DB error"):
-            delete_terminal("tid1")
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=self._metadata(),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.prepare_terminal_for_destruction"
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.retire_exited_terminal_runtime",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.mark_terminal_runtime_exited",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_exited_terminal",
+                side_effect=RuntimeError("DB error"),
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="DB error"):
+                delete_terminal("tid1")

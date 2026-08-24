@@ -259,6 +259,34 @@ def _execute_resource(
         if retire_exited_terminal_runtime(terminal_id, proc_root=proc_root) is not True:
             raise RuntimeError("terminal runtime retirement was not confirmed")
         return 0
+    if candidate.resource_kind == "workflow_authority":
+        import json
+
+        from cli_agent_orchestrator.clients.database import (
+            reconcile_orphaned_protected_workflow_authority,
+        )
+
+        root_terminal_id = attributes["root_terminal_id"]
+        workflow_ids = json.loads(attributes["workflow_ids"])
+        direct_assignment_ids = json.loads(attributes.get("direct_assignment_ids", "[]"))
+        if (
+            not isinstance(workflow_ids, list)
+            or not workflow_ids
+            or any(not isinstance(value, int) for value in workflow_ids)
+            or not isinstance(direct_assignment_ids, list)
+            or any(not isinstance(value, int) for value in direct_assignment_ids)
+        ):
+            raise RuntimeError("workflow authority identity is unavailable")
+        result = reconcile_orphaned_protected_workflow_authority(
+            root_terminal_id,
+            workflow_ids,
+            candidate.fingerprint,
+            attributes.get("writer_lease_path", ""),
+            direct_assignment_ids,
+        )
+        if not result.get("reconciled") and not result.get("already_reconciled"):
+            raise RuntimeError("workflow authority reconciliation was rejected")
+        return 0
     if candidate.resource_kind == "retirement_cleanup":
         import json
 
@@ -403,6 +431,57 @@ def execute_plan(
                 )
                 continue
             try:
+                if candidate.resource_kind == "workflow_authority":
+                    from cli_agent_orchestrator.services.operations_service import (
+                        context_lifecycle_fence,
+                    )
+
+                    with context_lifecycle_fence(config, nonblocking=True) as acquired:
+                        if not acquired:
+                            report.skipped.append(
+                                {
+                                    "candidate": candidate.canonical_identity,
+                                    "reason_code": "WORKTREE_LIFECYCLE_BUSY",
+                                }
+                            )
+                            continue
+                        current = revalidate_runtime_candidate(
+                            candidate,
+                            root=root,
+                            config=config,
+                            settings=effective_settings,
+                            now=plan.generated_at,
+                            open_inventory=open_inventory,
+                            proc_root=proc_root,
+                            runner=runner,
+                        )
+                        # A concurrent explicit workflow close removes this
+                        # identity from the OPEN/OWNER_GATE planner inventory
+                        # while its writer lease can still require exact
+                        # reconciliation. Let only that absent-candidate case
+                        # reach the transactional database verifier below. It
+                        # binds the planned workflow IDs, direct claims, writer
+                        # path, terminal absence, and all remaining authority
+                        # edges before releasing anything. A candidate which
+                        # still exists but changed remains fail-closed here.
+                        if current is not None and (
+                            current.action == "preserve"
+                            or current.protection_reason
+                            or current.fingerprint != candidate.fingerprint
+                        ):
+                            raise RuntimeError("candidate fingerprint changed")
+                        _execute_resource(
+                            candidate,
+                            config=config,
+                            proc_root=proc_root,
+                            runner=runner,
+                            sleeper=sleeper,
+                        )
+                        report.executed_count_by_class[candidate.category] = (
+                            report.executed_count_by_class.get(candidate.category, 0) + 1
+                        )
+                        report.executed.append(candidate.canonical_identity)
+                    continue
                 if candidate.resource_kind == "git_worktree":
                     from cli_agent_orchestrator.services.operations_service import (
                         context_lifecycle_fence,

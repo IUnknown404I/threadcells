@@ -26,6 +26,7 @@ CandidateKind = Literal[
     "package_cache",
     "terminal_runtime",
     "retirement_cleanup",
+    "workflow_authority",
     "git_worktree",
     "reproducible_cache",
     "inventory",

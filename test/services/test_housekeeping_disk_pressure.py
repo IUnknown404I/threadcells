@@ -7,7 +7,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
+from cli_agent_orchestrator.clients import database
+from cli_agent_orchestrator.clients.database import (
+    Base,
+    WorkflowModel,
+    WorktreeWriterLeaseModel,
+)
 from cli_agent_orchestrator.services.housekeeping.executor import (
     _execute_resource,
     execute_plan,
@@ -16,6 +24,17 @@ from cli_agent_orchestrator.services.housekeeping.models import default_settings
 from cli_agent_orchestrator.services.housekeeping.planner import build_plan
 
 NOW = 2_000_000_000.0
+
+
+@pytest.fixture
+def workflow_authority_db(monkeypatch, tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'workflow-authority.db'}")
+    Base.metadata.create_all(bind=engine)
+    session = sessionmaker(bind=engine)
+    monkeypatch.setattr(database, "SessionLocal", session)
+    monkeypatch.setattr(database, "_ensure_workflow_schema", lambda: None)
+    yield session
+    engine.dispose()
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -111,6 +130,10 @@ def _authority(
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.list_projects",
         lambda: list(projects or []),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.list_orphaned_protected_workflow_authorities",
+        lambda: [],
     )
 
 
@@ -272,6 +295,130 @@ def test_orphan_workflow_authority_fails_closed_for_every_worktree(tmp_path, mon
     assert candidate.protection_reason == "WORKTREE_AUTHORITY_INVENTORY_UNKNOWN"
     assert "worktree_authority_inventory_uncertain" in plan.warnings
     assert "worktree_orphan_workflow_authority:1" in plan.warnings
+
+
+def test_missing_root_workflow_authority_is_reconciled_before_worktree_retirement(
+    tmp_path, monkeypatch
+):
+    repository, worktree = _repository(tmp_path)
+    config = _config(tmp_path, repository)
+    _authority(
+        monkeypatch,
+        terminals=[
+            {
+                "id": "active-owner",
+                "launch_worktree": str(worktree),
+                "runtime_lifecycle": "running",
+            }
+        ],
+    )
+    rows = [
+        {
+            "root_terminal_id": "missing-root",
+            "workflows": [
+                {
+                    "id": 42,
+                    "status": "owner_gate",
+                    "active_turn_id": None,
+                    "updated_at": None,
+                }
+            ],
+            "pending_turns": [],
+            "active_assignments": [],
+            "provider_execution_turn_id": None,
+            "writer_lease_path": str(worktree),
+        }
+    ]
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.list_orphaned_protected_workflow_authorities",
+        lambda: list(rows),
+    )
+
+    def reconcile(
+        root_terminal_id,
+        workflow_ids,
+        expected_fingerprint,
+        expected_writer_lease_path,
+        expected_direct_assignment_ids,
+    ):
+        assert root_terminal_id == "missing-root"
+        assert workflow_ids == [42]
+        assert expected_fingerprint
+        assert expected_writer_lease_path == str(worktree)
+        assert expected_direct_assignment_ids == []
+        rows.clear()
+        return {
+            "reconciled": 1,
+            "already_reconciled": False,
+            "reason": "root_terminal_absent",
+        }
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.reconcile_orphaned_protected_workflow_authority",
+        reconcile,
+    )
+    plan = _plan(tmp_path, config)
+    candidate = next(item for item in plan.candidates if item.resource_kind == "workflow_authority")
+
+    report = execute_plan(
+        plan,
+        config=config,
+        settings=default_settings(config),
+        open_inventory=lambda: (set(), True),
+        proc_root=tmp_path / "proc",
+    )
+
+    assert candidate.action == "prune"
+    assert candidate.estimated_reclaim_bytes == 0
+    assert candidate.canonical_identity in report.executed
+    assert report.executed_count_by_class["retirement_cleanup"] == 1
+    assert worktree.exists()
+
+
+def test_workflow_close_between_plan_and_execute_releases_planned_writer_authority(
+    tmp_path, workflow_authority_db
+):
+    """Executor passes an absent candidate to the exact transactional verifier."""
+    root = "missing-root-close-race"
+    writer_path = str(tmp_path / "worktrees" / "missing-root-close-race")
+    with workflow_authority_db() as db:
+        workflow = WorkflowModel(root_terminal_id=root, status="open")
+        db.add(workflow)
+        db.add(
+            WorktreeWriterLeaseModel(
+                canonical_worktree=writer_path,
+                terminal_id=root,
+            )
+        )
+        db.commit()
+
+    config = _config(tmp_path)
+    plan = _plan(tmp_path, config)
+    candidate = next(item for item in plan.candidates if item.resource_kind == "workflow_authority")
+    assert candidate.action == "prune"
+
+    # This transition removes the candidate from the OPEN/OWNER_GATE planner
+    # inventory but deliberately does not release writer authority itself.
+    assert database.set_workflow_terminal_state(root, "cancelled") is True
+    assert database.list_orphaned_protected_workflow_authorities() == []
+    with workflow_authority_db() as db:
+        assert db.query(WorktreeWriterLeaseModel).count() == 1
+
+    report = execute_plan(
+        plan,
+        config=config,
+        settings=default_settings(config),
+        open_inventory=lambda: (set(), True),
+        proc_root=tmp_path / "proc",
+    )
+
+    assert report.ok is True
+    assert report.skipped == []
+    assert report.failures == []
+    assert report.executed == [candidate.canonical_identity]
+    assert report.executed_count_by_class == {"retirement_cleanup": 1}
+    with workflow_authority_db() as db:
+        assert db.query(WorktreeWriterLeaseModel).count() == 0
 
 
 def test_worktree_becoming_active_after_plan_blocks_execution(tmp_path, monkeypatch):

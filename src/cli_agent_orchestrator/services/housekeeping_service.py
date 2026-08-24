@@ -1103,7 +1103,8 @@ def run_housekeeping(
                 candidate.resource_kind == "terminal_runtime" for candidate in actionable
             )
             summary.retirement_cleanups_reconciled += sum(
-                candidate.resource_kind == "retirement_cleanup" for candidate in actionable
+                candidate.resource_kind in {"retirement_cleanup", "workflow_authority"}
+                for candidate in actionable
             )
             summary.ephemeral_resources_removed += sum(
                 candidate.category == "ephemeral"
@@ -1171,7 +1172,7 @@ def run_housekeeping(
             )
             summary.retirement_cleanups_reconciled += sum(
                 candidate.canonical_identity in executed
-                and candidate.resource_kind == "retirement_cleanup"
+                and candidate.resource_kind in {"retirement_cleanup", "workflow_authority"}
                 for candidate in actionable
             )
             summary.ephemeral_resources_removed += sum(

@@ -27,6 +27,8 @@ const REASON_COPY: Record<string, [string, string]> = {
   CONTEXT_INVENTORY_UNAVAILABLE: ['Capacity status is unavailable', 'ThreadCells cannot safely confirm available execution capacity yet. Wait for runtime inventory to recover and try again.'],
   ADMISSION_FENCE_TIMEOUT: ['Admission timed out', 'ThreadCells could not safely reserve a slot in time. Try again shortly.'],
   HEAVY_SLOT_WAIT_TIMEOUT: ['Capacity limit reached', 'A compatible heavy-execution slot did not become available in time. Try again after active work finishes.'],
+  HOUSEKEEPING_PLAN_CHANGED: ['Housekeeping plan changed', 'The inspected plan no longer matches current cleanup state. Build and inspect a fresh plan before executing.'],
+  HOUSEKEEPING_BUSY: ['Housekeeping is already running', 'Another Housekeeping operation owns the canonical lock. Wait for it to finish, then build a fresh plan.'],
 }
 
 const STATUS_COPY: Record<number, [string, string]> = {
@@ -356,6 +358,28 @@ export interface HousekeepingSettings {
   updated_at?: string | null
 }
 
+export type HousekeepingMode = 'frequent' | 'weekly' | 'pressure'
+
+export interface HousekeepingCandidate {
+  canonical_identity: string
+  category: string
+  action: 'preserve' | 'compress' | 'delete' | 'terminate' | 'prune'
+  estimated_reclaim_bytes: number
+  retention_reason: string
+  protection_reason: string | null
+}
+
+export interface HousekeepingPlan {
+  schema_version: number
+  plan_id: string
+  generated_at: number
+  mode: HousekeepingMode
+  root: string
+  reclaimable_bytes: number
+  warnings: string[]
+  candidates: HousekeepingCandidate[]
+}
+
 export interface OwnerLaunchGrant {
   launch_id: string
   grant: string
@@ -436,8 +460,8 @@ export const api = {
   getProviderAiPrompt: () => fetchJSON<{ prompt: string }>('/api/v1/providers/ai-prompt'),
   getHousekeepingSettings: () => fetchJSON<HousekeepingSettings>('/api/v1/housekeeping'),
   updateHousekeepingSettings: (data: HousekeepingSettings) => fetchJSON<HousekeepingSettings>('/api/v1/housekeeping', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }),
-  getHousekeepingPlan: (mode: 'frequent' | 'weekly' | 'pressure') => fetchJSON<Record<string, any>>(`/api/v1/housekeeping/plan?mode=${mode}`),
-  runHousekeeping: (mode: 'frequent' | 'weekly' | 'pressure', dry_run: boolean, expectedPlanId?: string) => fetchJSON<Record<string, any>>('/api/v1/housekeeping/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, dry_run, expected_plan_id: expectedPlanId }), timeoutMs: null }),
+  getHousekeepingPlan: (mode: HousekeepingMode) => fetchJSON<HousekeepingPlan>(`/api/v1/housekeeping/plan?mode=${mode}`),
+  runHousekeeping: (mode: HousekeepingMode, dry_run: boolean, expectedPlanId?: string) => fetchJSON<Record<string, any>>('/api/v1/housekeeping/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, dry_run, expected_plan_id: expectedPlanId }), timeoutMs: null }),
   getHousekeepingReport: () => fetchJSON<Record<string, any>>('/api/v1/housekeeping/report'),
   getUsageStatistics: () => fetchJSON<UsageStatistics>('/usage/statistics'),
   getBranding: () => fetchJSON<RuntimeBranding>('/settings/branding'),

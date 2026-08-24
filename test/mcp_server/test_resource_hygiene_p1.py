@@ -1558,6 +1558,69 @@ def test_c1_partial_legacy_managed_identity_fails_closed(resource_db, monkeypatc
     exit_terminal.assert_not_called()
 
 
+def test_pending_cleanup_inventory_preserves_parent_for_atomic_reclaim(
+    resource_db, monkeypatch
+):
+    parent, child = "parent-unclaimed-cleanup", "child-unclaimed-cleanup"
+    _acknowledged_child(parent, child, monkeypatch)
+    intent = {"version": 1, "terminal_id": child, "managed": False}
+    with database.SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter_by(id=child).one()
+        terminal.runtime_lifecycle = "exited"
+        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id=child).one()
+        assignment.retirement_cleanup_intent = json.dumps(intent)
+        db.commit()
+
+    pending = database.list_pending_child_retirement_cleanups()
+
+    assert pending == [
+        {
+            "parent_terminal_id": parent,
+            "child_terminal_id": child,
+            "claim_token": None,
+            "delegation_kind": "assign",
+            "intent": intent,
+        }
+    ]
+
+
+def test_housekeeping_cleanup_claim_requires_exited_runtime_and_released_capacity(
+    resource_db, monkeypatch
+):
+    parent, child = "parent-housekeeping-claim", "child-housekeeping-claim"
+    _acknowledged_child(parent, child, monkeypatch)
+    intent = {"version": 1, "terminal_id": child, "managed": False}
+    with database.SessionLocal() as db:
+        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id=child).one()
+        assignment.retirement_cleanup_intent = json.dumps(intent)
+        db.commit()
+
+    running = database.claim_completed_child_retirement(
+        parent, child, "assign", require_exited_runtime=True
+    )
+    assert running == {"eligible": False, "error": "child_runtime_not_exited"}
+
+    with database.SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter_by(id=child).one()
+        terminal.runtime_lifecycle = "exited"
+        db.add(WorktreeWriterLeaseModel(canonical_worktree="/exact/child", terminal_id=child))
+        db.commit()
+    retained = database.claim_completed_child_retirement(
+        parent, child, "assign", require_exited_runtime=True
+    )
+    assert retained == {"eligible": False, "error": "child_capacity_not_released"}
+
+    with database.SessionLocal() as db:
+        db.query(WorktreeWriterLeaseModel).filter_by(terminal_id=child).delete()
+        db.commit()
+    claimed = database.claim_completed_child_retirement(
+        parent, child, "assign", require_exited_runtime=True
+    )
+    assert claimed["eligible"] is True
+    assert claimed["exit_dispatch_reserved"] is True
+    assert isinstance(claimed["claim_token"], str)
+
+
 def test_c1_housekeeping_resumes_exited_cleanup_intent_after_restart(resource_db, monkeypatch):
     parent, child = "parent-c1-housekeeping", "child-c1-housekeeping"
     _acknowledged_child(parent, child, monkeypatch)

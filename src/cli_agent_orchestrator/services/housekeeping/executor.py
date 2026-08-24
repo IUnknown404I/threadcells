@@ -259,12 +259,15 @@ def _execute_resource(
         delegation_kind = attributes["delegation_kind"]
         planned_intent = json.loads(attributes["intent"])
         token = attributes.get("claim_token") or None
-        if attributes["stage"] == "legacy":
+        if attributes["stage"] in {"legacy", "unclaimed"}:
             claimed = claim_completed_child_retirement(
-                attributes["parent_terminal_id"], child, delegation_kind
+                attributes["parent_terminal_id"],
+                child,
+                delegation_kind,
+                require_exited_runtime=True,
             )
             if not claimed.get("eligible"):
-                raise RuntimeError("legacy retirement cleanup claim was rejected")
+                raise RuntimeError("retirement cleanup claim was rejected")
             token = claimed.get("claim_token")
         if not isinstance(token, str) or not token:
             raise RuntimeError("retirement cleanup claim identity is unavailable")

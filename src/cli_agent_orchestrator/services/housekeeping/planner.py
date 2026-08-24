@@ -612,8 +612,20 @@ def _plan_retirement_cleanups(
             continue
         token = item.get("claim_token")
         if stage == "pending" and (not isinstance(token, str) or not token):
-            warnings.append(f"retirement_cleanup_claim_unknown:{child}")
-            continue
+            parent = item.get("parent_terminal_id")
+            delegation_kind = item.get("delegation_kind")
+            if (
+                not isinstance(parent, str)
+                or not parent
+                or delegation_kind not in {"assign", "handoff"}
+            ):
+                warnings.append(f"retirement_cleanup_claim_unknown:{child}")
+                continue
+            # The exact persisted relation can re-enter the same atomic claim
+            # boundary used by normal retirement. The executor must still win
+            # every result, workflow, child-barrier, and cleanup-identity
+            # predicate before it receives a token or mutates anything.
+            stage = "unclaimed"
 
         protection_reason = None
         if intent.get("managed"):

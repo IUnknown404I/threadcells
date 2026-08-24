@@ -8426,6 +8426,7 @@ def list_pending_child_retirement_cleanups() -> List[Dict[str, Any]]:
             if intent is not None and handoff_eligible:
                 pending.append(
                     {
+                        "parent_terminal_id": assignment.parent_terminal_id,
                         "child_terminal_id": assignment.child_terminal_id,
                         "claim_token": assignment.retirement_claim_token,
                         "delegation_kind": delegation_kind,
@@ -8487,13 +8488,17 @@ def claim_completed_child_retirement(
     parent_terminal_id: str,
     child_terminal_id: str,
     expected_delegation_kind: Optional[str] = None,
+    *,
+    require_exited_runtime: bool = False,
 ) -> Dict[str, Any]:
     """Atomically claim exact cleanup for an eligible completed child.
 
     Assigned children retain their acknowledgement/quiescence/provider-exit
     contract.  A direct handoff can join only after its exact immutable result
     is final and its runtime is positively exited; this path never fabricates
-    ``result_acknowledged`` for a handoff.
+    ``result_acknowledged`` for a handoff. Housekeeping recovery may require
+    an exited runtime and released writer lease so it can reconcile cleanup
+    without reserving or repeating a provider exit.
     """
     _ensure_child_assignment_schema()
     _ensure_delegation_result_schema()
@@ -8513,6 +8518,24 @@ def claim_completed_child_retirement(
         terminal = db.query(TerminalModel).filter(TerminalModel.id == child_terminal_id).first()
         if terminal is None:
             return {"eligible": False, "error": "child_terminal_metadata_not_found"}
+
+        def exited_runtime_error() -> Optional[str]:
+            current_terminal = (
+                db.query(TerminalModel).filter(TerminalModel.id == child_terminal_id).first()
+            )
+            if current_terminal is None or current_terminal.runtime_lifecycle != "exited":
+                return "child_runtime_not_exited"
+            owns_capacity = (
+                db.query(WorktreeWriterLeaseModel)
+                .filter(WorktreeWriterLeaseModel.terminal_id == child_terminal_id)
+                .first()
+            )
+            return "child_capacity_not_released" if owns_capacity is not None else None
+
+        if require_exited_runtime:
+            recovery_error = exited_runtime_error()
+            if recovery_error is not None:
+                return {"eligible": False, "error": recovery_error}
         if historical_supervisor:
             if delegation_kind != "assign":
                 return {"eligible": False, "error": "child_assignment_not_owned"}
@@ -8594,6 +8617,13 @@ def claim_completed_child_retirement(
                 # cleanup, but never to redispatch provider exit.
                 assignment.retirement_claim_token = uuid.uuid4().hex
                 assignment.retirement_claimed_at = datetime.now()
+                db.flush()
+                if require_exited_runtime:
+                    db.expire_all()
+                    recovery_error = exited_runtime_error()
+                    if recovery_error is not None:
+                        db.rollback()
+                        return {"eligible": False, "error": recovery_error}
                 db.commit()
             return {
                 "eligible": True,
@@ -8648,14 +8678,11 @@ def claim_completed_child_retirement(
             ChildAssignmentModel.retirement_cleanup_intent: assignment.retirement_cleanup_intent,
             ChildAssignmentModel.updated_at: claimed_at,
         }
-        if delegation_kind == "handoff":
+        if delegation_kind == "handoff" or historical_supervisor or require_exited_runtime:
             # The normal handoff path already crossed and positively observed
-            # provider exit. Record that fact; never dispatch another exit.
-            update_values[ChildAssignmentModel.retirement_exit_dispatched_at] = claimed_at
-        elif historical_supervisor:
-            # Both runtime death and capacity release were proven above.  This
-            # recovery must therefore reconcile cleanup only and can never
-            # redispatch provider exit on behalf of the inactive parent.
+            # provider exit. Historical and Housekeeping recovery also prove
+            # that the runtime exited. Record that fact; never dispatch an
+            # exit from the recovery path.
             update_values[ChildAssignmentModel.retirement_exit_dispatched_at] = claimed_at
         claimed = (
             db.query(ChildAssignmentModel)
@@ -8672,11 +8699,11 @@ def claim_completed_child_retirement(
         if claimed != 1:
             db.rollback()
             return {"eligible": False, "error": "child_retirement_in_progress"}
-        if historical_supervisor:
+        if historical_supervisor or require_exited_runtime:
             # The assignment update acquires the database writer boundary.
             # Re-read every cross-row authority predicate before commit so a
-            # concurrent parent/runtime/workflow transition cannot be hidden
-            # behind the earlier snapshot.
+            # concurrent runtime/capacity/parent/workflow transition cannot be
+            # hidden behind the earlier snapshot.
             db.expire_all()
             refreshed_assignment = (
                 db.query(ChildAssignmentModel)
@@ -8684,16 +8711,34 @@ def claim_completed_child_retirement(
                 .first()
             )
             refreshed_terminal = db.query(TerminalModel).filter_by(id=child_terminal_id).first()
+            historical_error = (
+                _historical_assigned_retirement_error(
+                    db, parent_terminal_id, refreshed_assignment, refreshed_terminal
+                )
+                if historical_supervisor
+                and refreshed_assignment is not None
+                and refreshed_terminal is not None
+                else None
+            )
+            recovery_error = exited_runtime_error() if require_exited_runtime else None
             if (
                 refreshed_assignment is None
                 or refreshed_terminal is None
-                or _historical_assigned_retirement_error(
-                    db, parent_terminal_id, refreshed_assignment, refreshed_terminal
-                )
-                is not None
+                or historical_error is not None
+                or recovery_error is not None
             ):
                 db.rollback()
-                return {"eligible": False, "error": "historical_retirement_authority_lost"}
+                return {
+                    "eligible": False,
+                    "error": (
+                        recovery_error
+                        or (
+                            "historical_retirement_authority_lost"
+                            if historical_supervisor
+                            else "retirement_cleanup_authority_lost"
+                        )
+                    ),
+                }
         db.commit()
         return {
             "eligible": True,
@@ -8701,7 +8746,11 @@ def claim_completed_child_retirement(
             "claim_token": token,
             "cleanup_required": True,
             "delegation_kind": delegation_kind,
-            "exit_dispatch_reserved": delegation_kind == "handoff" or historical_supervisor,
+            "exit_dispatch_reserved": (
+                delegation_kind == "handoff"
+                or historical_supervisor
+                or require_exited_runtime
+            ),
             "historical_recovery": historical_supervisor,
         }
 

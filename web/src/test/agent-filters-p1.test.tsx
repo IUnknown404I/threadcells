@@ -70,6 +70,16 @@ describe('Agents filters P1', () => {
 
   it('keeps profile multi-select state per view and retains filtered action handlers', async () => {
     const close = vi.spyOn(api, 'deleteTerminal').mockResolvedValue({ success: true })
+    vi.mocked(api.getTerminalStatus).mockImplementation(async id => ({
+      id,
+      name: id,
+      provider: 'codex',
+      session_name: '',
+      agent_profile: null,
+      lifecycle: id === 'agent-a' ? 'exited' : 'running',
+      last_active: null,
+      ...statuses[id as keyof typeof statuses],
+    }) as never)
     render(<AgentPanel />)
     fireEvent.click(screen.getByRole('tab', { name: 'Profiles' }))
     await screen.findByRole('button', { name: 'developer' })
@@ -84,8 +94,8 @@ describe('Agents filters P1', () => {
     expect(screen.getByRole('button', { name: 'developer' })).toHaveAttribute('aria-pressed', 'true')
     expect(screen.getByRole('button', { name: 'reviewer' })).toHaveAttribute('aria-pressed', 'true')
 
-    fireEvent.click(screen.getAllByTitle('Close terminal')[0])
-    expect(screen.getByRole('heading', { name: 'Close Terminal' })).toBeInTheDocument()
+    fireEvent.click(screen.getByTitle('Delete exited terminal history'))
+    expect(screen.getByRole('heading', { name: 'Delete Exited Terminal' })).toBeInTheDocument()
     expect(close).not.toHaveBeenCalled()
   })
 

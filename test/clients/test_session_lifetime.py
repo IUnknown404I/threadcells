@@ -6,8 +6,11 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import (
     AmbiguousSessionIdentity,
+    AmbiguousTerminalIdentity,
     Base,
+    ProviderExecutionLeaseModel,
     SessionDeletionReceiptModel,
+    TerminalDeletionReceiptModel,
     TerminalModel,
     WorktreeWriterLeaseModel,
 )
@@ -19,8 +22,10 @@ def _install_database(monkeypatch):
     monkeypatch.setattr(database, "engine", engine)
     monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
     monkeypatch.setattr(database, "_ensure_terminal_worktree_authority_schema", lambda: None)
+    monkeypatch.setattr(database, "_ensure_provider_execution_schema", lambda: None)
     monkeypatch.setattr(database, "_ensure_usage_schema", lambda: None)
     monkeypatch.setattr(database, "_ensure_session_deletion_receipt_schema", lambda: None)
+    monkeypatch.setattr(database, "_ensure_terminal_deletion_receipt_schema", lambda: None)
 
 
 def _terminal(
@@ -103,6 +108,109 @@ def test_exact_lifetime_delete_preserves_reused_name_and_is_idempotent(monkeypat
         pass
     else:
         raise AssertionError("a raw name reused after deletion must remain ambiguous")
+
+
+def test_exact_exited_terminal_delete_reconciles_stale_leases_and_is_idempotent(monkeypatch):
+    _install_database(monkeypatch)
+    terminal = _terminal("exited", "lifetime", "cao-session", "/work/exited")
+    with database.SessionLocal() as db:
+        db.add_all(
+            [
+                terminal,
+                WorktreeWriterLeaseModel(canonical_worktree="/work/exited", terminal_id="exited"),
+                ProviderExecutionLeaseModel(terminal_id="exited", workflow_turn_id=77),
+            ]
+        )
+        db.commit()
+        expected = {
+            field: getattr(terminal, field) for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
+        }
+    first = database.delete_exited_terminal("exited", expected_identity=expected)
+    second = database.delete_exited_terminal("exited", expected_identity=expected)
+
+    assert first == {"deleted": 1, "already_deleted": False, "missing": False}
+    assert second == {"deleted": 0, "already_deleted": True, "missing": False}
+    assert database.terminal_deletion_receipt_exists("exited") is True
+    with database.SessionLocal() as db:
+        assert db.get(TerminalModel, "exited") is None
+        assert db.get(TerminalDeletionReceiptModel, "exited") is not None
+        assert db.query(WorktreeWriterLeaseModel).count() == 0
+        assert db.query(ProviderExecutionLeaseModel).count() == 0
+
+
+def test_exact_exited_terminal_delete_rejects_changed_identity(monkeypatch):
+    _install_database(monkeypatch)
+    terminal = _terminal("exited", "lifetime", "cao-session", "/work/exited")
+    with database.SessionLocal() as db:
+        db.add(terminal)
+        db.commit()
+        expected = {
+            field: getattr(terminal, field) for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
+        }
+    expected["tmux_window"] = "reused-window"
+    try:
+        database.delete_exited_terminal("exited", expected_identity=expected)
+    except AmbiguousTerminalIdentity:
+        pass
+    else:
+        raise AssertionError("changed terminal identity must remain protected")
+
+    with database.SessionLocal() as db:
+        assert db.get(TerminalModel, "exited") is not None
+        assert db.get(TerminalDeletionReceiptModel, "exited") is None
+
+
+def test_exited_terminal_reconciliation_transfers_a_legacy_shared_writer_lease(monkeypatch):
+    _install_database(monkeypatch)
+    exited = _terminal("exited", "lifetime", "cao-session", "/work/shared")
+    replacement = _terminal("active", "lifetime", "cao-session", "/work/shared")
+    replacement.runtime_lifecycle = "running"
+    with database.SessionLocal() as db:
+        db.add_all(
+            [
+                exited,
+                replacement,
+                WorktreeWriterLeaseModel(canonical_worktree="/work/shared", terminal_id="exited"),
+            ]
+        )
+        db.commit()
+
+    assert database.mark_terminal_runtime_exited("exited") is True
+    with database.SessionLocal() as db:
+        lease = db.get(WorktreeWriterLeaseModel, "/work/shared")
+        assert lease is not None
+        assert lease.terminal_id == "active"
+
+
+def test_terminal_deletion_receipt_never_authorizes_a_reused_id(monkeypatch):
+    _install_database(monkeypatch)
+    original = _terminal("reused", "old-lifetime", "cao-old", "/work/old")
+    with database.SessionLocal() as db:
+        db.add(original)
+        db.commit()
+        expected = {
+            field: getattr(original, field) for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
+        }
+    assert database.delete_exited_terminal("reused", expected_identity=expected)["deleted"] == 1
+
+    replacement = _terminal("reused", "new-lifetime", "cao-new", "/work/new")
+    with database.SessionLocal() as db:
+        db.add(replacement)
+        db.commit()
+        replacement_identity = {
+            field: getattr(replacement, field)
+            for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
+        }
+
+    try:
+        database.delete_exited_terminal("reused", expected_identity=replacement_identity)
+    except AmbiguousTerminalIdentity:
+        pass
+    else:
+        raise AssertionError("an old deletion receipt must not authorize a reused terminal ID")
+
+    with database.SessionLocal() as db:
+        assert db.get(TerminalModel, "reused") is not None
 
 
 def test_changed_lifetime_aborts_before_deletion_or_receipt(monkeypatch):

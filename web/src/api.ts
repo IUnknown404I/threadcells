@@ -29,6 +29,11 @@ const REASON_COPY: Record<string, [string, string]> = {
   HEAVY_SLOT_WAIT_TIMEOUT: ['Capacity limit reached', 'A compatible heavy-execution slot did not become available in time. Try again after active work finishes.'],
   HOUSEKEEPING_PLAN_CHANGED: ['Housekeeping plan changed', 'The inspected plan no longer matches current cleanup state. Build and inspect a fresh plan before executing.'],
   HOUSEKEEPING_BUSY: ['Housekeeping is already running', 'Another Housekeeping operation owns the canonical lock. Wait for it to finish, then build a fresh plan.'],
+  TERMINAL_RUNTIME_ACTIVE: ['Exit terminal first', 'Use Graceful Exit and wait until ThreadCells confirms the provider has exited before deleting terminal history.'],
+  TERMINAL_EXIT_PENDING: ['Terminal exit is pending', 'ThreadCells has not confirmed provider death yet. Wait for exit reconciliation before deleting terminal history.'],
+  TERMINAL_DEATH_UNCONFIRMED: ['Terminal death is not confirmed', 'ThreadCells could not retire the exact exited runtime, so terminal metadata remains protected.'],
+  TERMINAL_RUNTIME_AUTHORITY_UNCERTAIN: ['Terminal authority is uncertain', 'ThreadCells could not verify the exact terminal runtime identity, so metadata remains protected.'],
+  TERMINAL_IDENTITY_CHANGED: ['Terminal identity changed', 'Terminal authority changed during deletion. Refresh and retry after lifecycle reconciliation.'],
 }
 
 const STATUS_COPY: Record<number, [string, string]> = {
@@ -114,6 +119,8 @@ export interface SessionBoundaryAgent {
   workflow_reason: string | null
 }
 
+export type TerminalLifecycle = 'starting' | 'running' | 'exit_pending' | 'exited'
+
 export interface AgentSummary {
   id: string
   name: string
@@ -123,7 +130,7 @@ export interface AgentSummary {
   agent_profile: string | null
   activity: string | null
   execution_state: string | null
-  lifecycle: string | null
+  lifecycle: TerminalLifecycle | null
   workflow_state: string | null
   workflow_status: string | null
   workflow_reason: string | null
@@ -163,7 +170,7 @@ export interface Terminal {
   status: string | null
   execution_state?: 'ready' | 'processing' | 'queued_provider_execution' | 'waiting_child_retirement' | 'waiting_workflow_continuation' | 'exited' | null
   execution_wait_reason?: 'provider_capacity' | 'child_retirement' | 'workflow_continuation' | null
-  lifecycle?: 'running' | 'exited' | null
+  lifecycle?: TerminalLifecycle | null
   workflow_state?: 'open' | 'active' | 'waiting' | 'recoverable' | 'result_ready' | 'owner_gate' | 'completed' | 'incomplete' | 'failed' | 'cancelled' | null
   workflow_status?: string | null
   workflow_reason?: string | null
@@ -198,6 +205,7 @@ export interface TerminalMeta {
   provider: string
   agent_profile: string | null
   last_active: string | null
+  lifecycle?: TerminalLifecycle | null
   project_id?: string | null
   project_name?: string | null
   project_path?: string | null

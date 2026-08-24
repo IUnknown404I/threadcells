@@ -1805,11 +1805,12 @@ class TestCodexStartupReliability:
 class TestGetTerminal:
     """Tests for get_terminal function."""
 
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_workflow_projection")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_terminal_success(
-        self, mock_get_metadata, mock_get_projection, mock_provider_manager
+        self, mock_get_metadata, mock_get_projection, mock_provider_manager, mock_tmux
     ):
         """Test getting terminal successfully."""
         mock_get_metadata.return_value = {
@@ -1824,6 +1825,7 @@ class TestGetTerminal:
         mock_provider.get_status.return_value = TerminalStatus.IDLE
         mock_provider.is_process_alive.return_value = True
         mock_provider_manager.get_provider.return_value = mock_provider
+        mock_tmux.window_exists.return_value = True
         mock_get_projection.return_value = {
             "state": "waiting",
             "workflow_status": "open",
@@ -2354,66 +2356,47 @@ class TestCodexProviderLifecycleThroughTerminalService:
 class TestDeleteTerminal:
     """Tests for delete_terminal function."""
 
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_delete_terminal_success(
-        self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete
-    ):
-        """Test deleting terminal successfully."""
-        mock_get_metadata.return_value = {
-            "tmux_session": "cao-session",
-            "tmux_window": "developer-abcd",
-        }
-        mock_db_delete.return_value = True
-
-        result = delete_terminal("test1234")
-
-        assert result is True
-        mock_tmux.stop_pipe_pane.assert_called_once()
-        mock_provider_manager.cleanup_provider.assert_called_once_with("test1234")
-
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_delete_terminal_pipe_pane_error(
-        self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete
-    ):
-        """Test deleting terminal when stop_pipe_pane fails."""
-        mock_get_metadata.return_value = {
-            "tmux_session": "cao-session",
-            "tmux_window": "developer-abcd",
-        }
-        mock_tmux.stop_pipe_pane.side_effect = Exception("Pipe error")
-        mock_db_delete.return_value = True
-
-        # Should not raise, just warn
-        result = delete_terminal("test1234")
-
-        assert result is True
-
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_delete_terminal_no_metadata_retains_unknown_lease(
-        self, mock_get_metadata, mock_provider_manager, mock_db_delete
-    ):
-        """Missing target identity cannot authorize a durable lease release."""
-        mock_get_metadata.return_value = None
-        mock_db_delete.return_value = True
-
-        with pytest.raises(RuntimeError, match="writer lease release is unsafe"):
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.terminal_deletion_receipt_exists",
+        return_value=False,
+    )
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+        return_value=None,
+    )
+    def test_delete_terminal_unknown_metadata_is_not_invented(self, _metadata, _receipt):
+        with pytest.raises(ValueError, match="not found"):
             delete_terminal("test1234")
-        mock_db_delete.assert_not_called()
+
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.terminal_deletion_receipt_exists",
+        return_value=True,
+    )
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+        return_value=None,
+    )
+    def test_delete_terminal_retry_uses_durable_receipt(self, _metadata, _receipt):
+        assert delete_terminal("test1234") is True
 
     @patch("cli_agent_orchestrator.services.terminal_service.prepare_terminal_for_destruction")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
-    def test_delete_terminal_aborts_before_kill_when_snapshot_fails(self, mock_tmux, mock_prepare):
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_delete_terminal_aborts_before_retirement_when_snapshot_fails(
+        self, mock_metadata, mock_prepare
+    ):
+        mock_metadata.return_value = {
+            "id": "child-with-partial",
+            "tmux_session": "cao-session",
+            "tmux_window": "child",
+            "runtime_lifecycle": "exited",
+        }
         mock_prepare.side_effect = RuntimeError("snapshot persistence failed")
 
-        with pytest.raises(RuntimeError, match="snapshot persistence failed"):
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.retire_exited_terminal_runtime"
+            ) as retire,
+            pytest.raises(RuntimeError, match="snapshot persistence failed"),
+        ):
             delete_terminal("child-with-partial")
-
-        mock_tmux.kill_window.assert_not_called()
+        retire.assert_not_called()

@@ -54,6 +54,10 @@ class AmbiguousSessionIdentity(RuntimeError):
     """A reusable session name identifies more than one durable lifetime."""
 
 
+class AmbiguousTerminalIdentity(RuntimeError):
+    """Terminal deletion authority changed after runtime death was proven."""
+
+
 class TerminalModel(Base):
     """SQLAlchemy model for terminal metadata only."""
 
@@ -140,6 +144,18 @@ class SessionDeletionReceiptModel(Base):
 
     session_id = Column(String, primary_key=True)
     session_name = Column(String, nullable=False, index=True)
+    deleted_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class TerminalDeletionReceiptModel(Base):
+    """Durable idempotency receipt for one retired terminal identity."""
+
+    __tablename__ = "terminal_deletion_receipts"
+
+    terminal_id = Column(String, primary_key=True)
+    session_id = Column(String, nullable=True, index=True)
+    session_name = Column(String, nullable=False, index=True)
+    window_name = Column(String, nullable=False)
     deleted_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
@@ -3176,6 +3192,10 @@ def _ensure_session_deletion_receipt_schema() -> None:
     SessionDeletionReceiptModel.__table__.create(bind=engine, checkfirst=True)
 
 
+def _ensure_terminal_deletion_receipt_schema() -> None:
+    TerminalDeletionReceiptModel.__table__.create(bind=engine, checkfirst=True)
+
+
 def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
     """Resolve a stable lifetime ID or a unique legacy/raw tmux name.
 
@@ -3798,6 +3818,106 @@ def delete_terminal(terminal_id: str) -> bool:
         deleted = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).delete()
         db.commit()
         return deleted > 0
+
+
+_TERMINAL_DELETION_IDENTITY_FIELDS = (
+    "session_id",
+    "tmux_session",
+    "tmux_window",
+    "launch_worktree",
+    "write_enabled",
+    "managed_worktree_kind",
+    "managed_worktree_source",
+    "managed_worktree_branch",
+    "managed_worktree_commit",
+    "runtime_pane_id",
+    "runtime_pane_pid",
+    "runtime_generation",
+    "runtime_generation_origin",
+    "runtime_process_start_ticks",
+)
+
+
+def terminal_deletion_receipt_exists(terminal_id: str) -> bool:
+    """Return whether one exact terminal was already deleted successfully."""
+    _ensure_terminal_deletion_receipt_schema()
+    with SessionLocal() as db:
+        return db.get(TerminalDeletionReceiptModel, terminal_id) is not None
+
+
+def delete_exited_terminal(
+    terminal_id: str, *, expected_identity: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """Delete one unchanged exited terminal and persist an idempotency receipt.
+
+    Runtime death must already have been established by the caller. The final
+    transaction rechecks the immutable pane/session/worktree identity and the
+    exited lifecycle before releasing stale runtime-owned leases or deleting
+    metadata. A concurrent identity change therefore fails closed.
+    """
+    _ensure_terminal_deletion_receipt_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.get(TerminalModel, terminal_id)
+        receipt = db.get(TerminalDeletionReceiptModel, terminal_id)
+        if terminal is None and receipt is not None:
+            db.rollback()
+            return {"deleted": 0, "already_deleted": True, "missing": False}
+        if terminal is None:
+            db.rollback()
+            return {"deleted": 0, "already_deleted": False, "missing": True}
+        if receipt is not None:
+            # Terminal IDs are intended to be durable identities. If an old ID
+            # was nevertheless reused, its prior receipt cannot authorize
+            # deletion of the replacement row.
+            db.rollback()
+            raise AmbiguousTerminalIdentity(terminal_id)
+        if terminal.runtime_lifecycle != "exited" or any(
+            getattr(terminal, field) != expected_identity.get(field)
+            for field in _TERMINAL_DELETION_IDENTITY_FIELDS
+        ):
+            db.rollback()
+            raise AmbiguousTerminalIdentity(terminal_id)
+        receipt_identity = {
+            "session_id": terminal.session_id,
+            "session_name": terminal.tmux_session,
+            "window_name": terminal.tmux_window,
+        }
+
+        # Exited is the durable terminal boundary. Reconcile any legacy stale
+        # runtime-owned leases inside the same transaction as row deletion.
+        terminal.runtime_operation_kind = None
+        terminal.runtime_operation_token = None
+        terminal.runtime_operation_claimed_at = None
+        terminal.runtime_operation_expires_at = None
+        _release_or_transfer_worktree_writer_lease(db, terminal_id)
+        provider_execution = db.get(ProviderExecutionLeaseModel, terminal_id)
+        if provider_execution is not None:
+            db.delete(provider_execution)
+        _purge_staged_handoff_submissions_for_terminals(db, [terminal_id])
+        db.flush()
+        deleted = (
+            db.query(TerminalModel)
+            .filter(
+                TerminalModel.id == terminal_id,
+                TerminalModel.runtime_lifecycle == "exited",
+            )
+            .delete(synchronize_session=False)
+        )
+        if deleted != 1:
+            db.rollback()
+            raise AmbiguousTerminalIdentity(terminal_id)
+        db.add(
+            TerminalDeletionReceiptModel(
+                terminal_id=terminal_id,
+                session_id=receipt_identity["session_id"],
+                session_name=receipt_identity["session_name"],
+                window_name=receipt_identity["window_name"],
+                deleted_at=datetime.now(),
+            )
+        )
+        db.commit()
+        return {"deleted": 1, "already_deleted": False, "missing": False}
 
 
 def delete_terminals_by_session(tmux_session: str) -> int:
@@ -4593,13 +4713,7 @@ def mark_terminal_runtime_exited(terminal_id: str) -> bool:
         terminal.runtime_operation_token = None
         terminal.runtime_operation_claimed_at = None
         terminal.runtime_operation_expires_at = None
-        lease = (
-            db.query(WorktreeWriterLeaseModel)
-            .filter(WorktreeWriterLeaseModel.terminal_id == terminal_id)
-            .first()
-        )
-        if lease is not None:
-            db.delete(lease)
+        _release_or_transfer_worktree_writer_lease(db, terminal_id)
         execution = (
             db.query(ProviderExecutionLeaseModel)
             .filter(ProviderExecutionLeaseModel.terminal_id == terminal_id)

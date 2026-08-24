@@ -387,6 +387,29 @@ class TestDeleteTerminalEndpoint:
 
             assert response.status_code == 404
 
+    @pytest.mark.parametrize(
+        ("inventory_uncertain", "expected_status"), [(False, 409), (True, 503)]
+    )
+    def test_delete_terminal_lifecycle_error_is_actionable(
+        self, client, inventory_uncertain, expected_status
+    ):
+        from cli_agent_orchestrator.services.terminal_service import TerminalDeletionError
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.delete_terminal.side_effect = TerminalDeletionError(
+                "TERMINAL_RUNTIME_AUTHORITY_UNCERTAIN",
+                "Terminal authority is protected",
+                inventory_uncertain=inventory_uncertain,
+            )
+
+            response = client.delete("/terminals/abcd1234")
+
+        assert response.status_code == expected_status
+        assert response.json()["detail"] == {
+            "reason_code": "TERMINAL_RUNTIME_AUTHORITY_UNCERTAIN",
+            "message": "Terminal authority is protected",
+        }
+
     def test_delete_terminal_server_error(self, client):
         """DELETE /terminals/{terminal_id} returns 500 on internal error."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:

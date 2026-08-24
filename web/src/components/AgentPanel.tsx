@@ -85,7 +85,7 @@ function terminalBadgeStatus(status: AgentSummary | null): string | null {
 }
 
 function toTerminalMeta(agent: AgentSummary): TerminalMeta {
-  return { id: agent.id, tmux_session: agent.session_name, tmux_window: agent.name, provider: agent.provider, agent_profile: agent.agent_profile, last_active: agent.last_active, project_id: agent.projectId, project_name: agent.project_name, project_path: agent.project_path }
+  return { id: agent.id, tmux_session: agent.session_name, tmux_window: agent.name, provider: agent.provider, agent_profile: agent.agent_profile, last_active: agent.last_active, lifecycle: agent.lifecycle, project_id: agent.projectId, project_name: agent.project_name, project_path: agent.project_path }
 }
 
 export function AgentPanel({
@@ -206,7 +206,7 @@ export function AgentPanel({
       activeSessionFeed.reload()
       filteredAgentFeed.reload()
       sessionFeed.reload()
-      showSnackbar({ type: 'success', message: `Terminal ${id} closed — tmux window killed` })
+      showSnackbar({ type: 'success', message: `Exited terminal ${id} deleted` })
     } catch (error: any) {
       showSnackbar({ type: 'error', message: error.message || `Failed to close terminal ${id}` })
     }
@@ -449,7 +449,7 @@ export function AgentPanel({
           <button onClick={() => openTerminal(terminal.id, terminal.provider, terminal.agent_profile)} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium rounded-lg transition-colors" title="Open live terminal"><Monitor size={14} />Open Terminal</button>
           <button onClick={() => setOutputTerminalId(terminal.id)} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs font-medium rounded-lg transition-colors" title="View output"><FileText size={14} />Output</button>
           <button onClick={() => setPendingExit(toTerminalMeta(terminal))} disabled={exitingTerminal === terminal.id || terminal.lifecycle === 'exited'} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white text-xs font-medium rounded-lg transition-colors" title="Graceful exit"><LogOut size={14} />{exitingTerminal === terminal.id ? 'Exiting...' : 'Graceful Exit'}</button>
-          <button onClick={() => setPendingClose(toTerminalMeta(terminal))} disabled={closingTerminal === terminal.id} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-red-600 hover:bg-red-500 disabled:opacity-40 text-white text-xs font-medium rounded-lg transition-colors" title="Close terminal"><Trash2 size={14} />{closingTerminal === terminal.id ? 'Closing...' : 'Close'}</button>
+          <button onClick={() => setPendingClose(toTerminalMeta(terminal))} disabled={closingTerminal === terminal.id || terminal.lifecycle !== 'exited'} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-red-600 hover:bg-red-500 disabled:opacity-40 text-white text-xs font-medium rounded-lg transition-colors" title={terminal.lifecycle === 'exited' ? 'Delete exited terminal history' : 'Gracefully exit this terminal before deleting it'}><Trash2 size={14} />{closingTerminal === terminal.id ? 'Deleting...' : 'Delete'}</button>
         </div>
       </div>
       {terminal.launch_worktree && <div className="flex items-center gap-1.5" title={terminal.launch_worktree}><FolderOpen size={12} className="text-gray-600 shrink-0" /><span className="text-xs font-mono text-gray-500 truncate max-w-[400px]">{terminal.launch_worktree}</span></div>}
@@ -749,15 +749,15 @@ export function AgentPanel({
       {/* Close Confirmation Modal */}
       <ConfirmModal
         open={!!pendingClose}
-        title="Close Terminal"
-        message="This will kill the tmux window and terminate the agent process. This action cannot be undone."
+        title="Delete Exited Terminal"
+        message="ThreadCells will revalidate exact runtime absence, then permanently delete this exited terminal’s metadata. This action cannot be undone."
         details={pendingClose ? [
           { label: 'Terminal ID', value: pendingClose.id },
           { label: 'Provider', value: pendingClose.provider },
           { label: 'Profile', value: pendingClose.agent_profile || 'none' },
           { label: 'Session', value: sessionDisplayName(pendingClose.tmux_session) },
         ] : []}
-        confirmLabel="Close Terminal"
+        confirmLabel="Delete Terminal"
         variant="danger"
         loading={!!closingTerminal}
         onConfirm={handleDeleteTerminal}

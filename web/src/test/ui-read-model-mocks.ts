@@ -54,7 +54,10 @@ async function allAgents(): Promise<AgentSummary[]> {
     for (const [creationIndex, terminal] of detail.terminals.entries()) {
       const state = await statusFor(terminal.id)
       const activity = String(state.activity || state.status || 'idle').toLowerCase()
-      const lifecycle = String(state.lifecycle || 'running').toLowerCase()
+      const lifecycleValue = String(state.lifecycle || 'running').toLowerCase()
+      const lifecycle: AgentSummary['lifecycle'] = ['starting', 'running', 'exit_pending', 'exited'].includes(lifecycleValue)
+        ? lifecycleValue as AgentSummary['lifecycle']
+        : 'running'
       result.push({
         id: terminal.id,
         name: terminal.tmux_window,

@@ -35,6 +35,7 @@ function toTerminalMeta(agent: AgentSummary): TerminalMeta {
     provider: agent.provider,
     agent_profile: agent.agent_profile,
     last_active: agent.last_active,
+    lifecycle: agent.lifecycle,
     project_id: agent.projectId,
     project_name: agent.project_name,
     project_path: agent.project_path,
@@ -79,7 +80,7 @@ function ExpandedSessionAgents({
             <button onClick={() => onOutput(agent.id)} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white" title="Output"><FileText size={14}/></button>
             <button onClick={() => onTerminal(agent)} className="flex min-h-11 items-center gap-1.5 rounded-lg bg-emerald-600 px-3 text-xs font-medium text-white hover:bg-emerald-500"><Monitor size={12}/>Terminal</button>
             <button onClick={() => onExit(agent)} disabled={exitingTerminal === agent.id || agent.lifecycle === 'exited'} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-amber-400 disabled:opacity-30" title="Graceful Exit"><LogOut size={14}/></button>
-            <button onClick={() => onClose(agent)} disabled={closingTerminal === agent.id} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-red-400 disabled:opacity-30" title="Close"><Trash2 size={14}/></button>
+            <button onClick={() => onClose(agent)} disabled={closingTerminal === agent.id || agent.lifecycle !== 'exited'} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-red-400 disabled:opacity-30" title={agent.lifecycle === 'exited' ? 'Delete exited terminal history' : 'Gracefully exit this terminal before deleting it'}><Trash2 size={14}/></button>
           </div>
         </div>
         {ownerGated && <div data-testid={`owner-decision-${agent.id}`} className="flex flex-col gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 sm:flex-row sm:items-center sm:justify-between"><div className="flex items-start gap-2 text-xs text-amber-100"><MessageSquareWarning size={15} className="mt-0.5 shrink-0 text-amber-400"/><span><strong className="font-semibold">This workflow is waiting for an owner decision.</strong>{agent.workflow_reason ? ` ${agent.workflow_reason}` : ''} The agent is {agent.execution_state === 'processing' ? 'currently processing.' : agent.lifecycle === 'exited' ? 'exited.' : 'ready.'}</span></div><button type="button" onClick={() => onTerminal(agent)} className="min-h-10 shrink-0 rounded-lg border border-amber-500/50 px-3 text-xs font-medium text-amber-200 hover:bg-amber-500/10">Continue workflow</button></div>}
@@ -125,7 +126,7 @@ export function DashboardHome({ onNavigate, overviewState }: { onNavigate: (dest
       if (liveTerminal?.id === pendingClose.id) setLiveTerminal(null)
       setAgentRefreshKey(value => value + 1)
       sessionFeed.reload()
-      showSnackbar({ type: 'success', message: `Terminal ${pendingClose.id} closed` })
+      showSnackbar({ type: 'success', message: `Exited terminal ${pendingClose.id} deleted` })
     } catch (reason: any) {
       showSnackbar({ type: 'error', message: reason.message || 'Failed to close terminal' })
     } finally {
@@ -195,7 +196,7 @@ export function DashboardHome({ onNavigate, overviewState }: { onNavigate: (dest
     {inboxTerminalId && <InboxPanel terminalId={inboxTerminalId} onClose={() => setInboxTerminalId(null)}/>}
     {liveTerminal && <Suspense fallback={null}><TerminalView terminalId={liveTerminal.id} provider={liveTerminal.provider} agentProfile={liveTerminal.agentProfile} onClose={() => setLiveTerminal(null)} /></Suspense>}
     {outputTerminalId && <OutputViewer terminalId={outputTerminalId} onClose={() => setOutputTerminalId(null)}/>}
-    <ConfirmModal open={!!pendingClose} title="Close Terminal" message="This will kill the tmux window and terminate the agent process." details={pendingClose ? [{ label: 'Terminal', value: `${pendingClose.agent_profile || 'default'} (${pendingClose.id})` }, { label: 'Session', value: sessionDisplayName(pendingClose.tmux_session) }] : []} confirmLabel="Close Terminal" variant="danger" loading={!!closingTerminal} onConfirm={handleDeleteTerminal} onCancel={() => setPendingClose(null)}/>
+    <ConfirmModal open={!!pendingClose} title="Delete Exited Terminal" message="ThreadCells will revalidate exact runtime absence, then permanently delete this exited terminal’s metadata." details={pendingClose ? [{ label: 'Terminal', value: `${pendingClose.agent_profile || 'default'} (${pendingClose.id})` }, { label: 'Session', value: sessionDisplayName(pendingClose.tmux_session) }] : []} confirmLabel="Delete Terminal" variant="danger" loading={!!closingTerminal} onConfirm={handleDeleteTerminal} onCancel={() => setPendingClose(null)}/>
     <ConfirmModal open={!!pendingExit} title="Graceful Exit" message="This will send the provider-specific exit command (e.g., /exit)." details={pendingExit ? [{ label: 'Terminal', value: `${pendingExit.agent_profile || 'default'} (${pendingExit.id})` }, { label: 'Provider', value: pendingExit.provider }] : []} confirmLabel="Send Exit" variant="warning" loading={!!exitingTerminal} onConfirm={handleExitTerminal} onCancel={() => setPendingExit(null)}/>
     <ConfirmModal open={!!pendingDeleteSession} title="Delete Session" message="This will permanently delete this session and all of its terminals. This action cannot be undone." details={pendingDeleteSession ? [{ label: 'Session', value: sessionDisplayName(pendingDeleteSession.name) }, { label: 'Status', value: pendingDeleteSession.status }] : []} confirmLabel="Delete Session" variant="danger" loading={!!deletingSession} onConfirm={handleDeleteSession} onCancel={() => setPendingDeleteSession(null)}/>
   </div>

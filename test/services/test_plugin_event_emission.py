@@ -263,13 +263,7 @@ class TestTerminalPluginEvents:
 
         registry.dispatch.assert_not_awaited()
 
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal", return_value=True)
-    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_delete_terminal_dispatches_post_kill_terminal_event_after_delete(
-        self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete_terminal
-    ):
+    def test_delete_terminal_dispatches_post_kill_terminal_event_after_delete(self):
         """Terminal kill should emit only after deletion succeeds."""
         registry = _registry_mock()
         call_order: list[str] = []
@@ -277,16 +271,39 @@ class TestTerminalPluginEvents:
         async def record_dispatch(*_args):
             call_order.append("dispatch")
 
-        mock_get_metadata.return_value = {
+        metadata = {
+            "id": "abcd1234",
             "tmux_session": "cao-demo",
             "tmux_window": "developer-abcd",
             "agent_profile": "developer",
+            "runtime_lifecycle": "exited",
         }
-        mock_provider_manager.cleanup_provider.side_effect = lambda *_: call_order.append("cleanup")
-        mock_db_delete_terminal.side_effect = lambda *_: call_order.append("db_delete") or True
         registry.dispatch.side_effect = record_dispatch
-
-        deleted = delete_terminal("abcd1234", registry=registry)
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.prepare_terminal_for_destruction"
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.retire_exited_terminal_runtime",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.mark_terminal_runtime_exited",
+                return_value=True,
+            ),
+            patch("cli_agent_orchestrator.services.terminal_service.provider_manager") as manager,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_exited_terminal",
+                side_effect=lambda *_args, **_kwargs: call_order.append("db_delete")
+                or {"deleted": 1, "already_deleted": False, "missing": False},
+            ),
+        ):
+            manager.cleanup_provider.side_effect = lambda *_: call_order.append("cleanup")
+            deleted = delete_terminal("abcd1234", registry=registry)
 
         assert deleted is True
         assert call_order[-2:] == ["db_delete", "dispatch"]
@@ -297,23 +314,38 @@ class TestTerminalPluginEvents:
         assert event.terminal_id == "abcd1234"
         assert event.agent_name == "developer"
 
-    @patch("cli_agent_orchestrator.services.terminal_service.db_delete_terminal")
-    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
-    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
-    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_delete_terminal_does_not_dispatch_on_failure(
-        self, mock_get_metadata, mock_tmux, mock_provider_manager, mock_db_delete_terminal
-    ):
+    def test_delete_terminal_does_not_dispatch_on_failure(self):
         """Deletion failures must not emit post_kill_terminal."""
         registry = _registry_mock()
-        mock_get_metadata.return_value = {
+        metadata = {
+            "id": "abcd1234",
             "tmux_session": "cao-demo",
             "tmux_window": "developer-abcd",
             "agent_profile": "developer",
+            "runtime_lifecycle": "exited",
         }
-        mock_db_delete_terminal.side_effect = RuntimeError("db delete failed")
-
-        with pytest.raises(RuntimeError, match="db delete failed"):
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.prepare_terminal_for_destruction"
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.retire_exited_terminal_runtime",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.mark_terminal_runtime_exited",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.db_delete_exited_terminal",
+                side_effect=RuntimeError("db delete failed"),
+            ),
+            pytest.raises(RuntimeError, match="db delete failed"),
+        ):
             delete_terminal("abcd1234", registry=registry)
 
         registry.dispatch.assert_not_awaited()

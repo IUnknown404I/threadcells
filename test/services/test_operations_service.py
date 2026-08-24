@@ -515,7 +515,11 @@ def test_recovery_safe_heavy_slot_counts_capacity_without_recursive_health_gate(
         "cli_agent_orchestrator.services.operations_service.get_resource_status",
         lambda _config: {
             "resource_state": "RED",
-            "reasons": ["ROOT_DISK_PRESSURE", "DISK_CRITICAL"],
+            "reasons": [
+                "ROOT_DISK_PRESSURE",
+                "DISK_CRITICAL",
+                "root_free_below_green",
+            ],
             "heavy_executions": {"active": 0, "limit": 1},
         },
     )
@@ -524,7 +528,25 @@ def test_recovery_safe_heavy_slot_counts_capacity_without_recursive_health_gate(
         assert slot == 0
 
 
-def test_recovery_safe_heavy_slot_does_not_bypass_non_disk_red(tmp_path, monkeypatch):
+def test_recovery_safe_heavy_slot_admits_red_used_and_low_free_disk(tmp_path, monkeypatch):
+    status = _status(tmp_path, memory_mib=2048, used_percent=85, free_gib=7)
+    assert status["reasons"] == ["ROOT_DISK_PRESSURE", "root_free_below_green"]
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.operations_service.get_resource_status",
+        lambda _config: status,
+    )
+
+    with acquire_heavy_slot(_config(tmp_path), recovery_safe=True) as slot:
+        assert slot == 0
+
+
+@pytest.mark.parametrize(
+    "non_disk_reason",
+    ["memory_below_red", "critical_memory_pressure", "future_health_reason"],
+)
+def test_recovery_safe_heavy_slot_does_not_bypass_non_disk_red(
+    tmp_path, monkeypatch, non_disk_reason
+):
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.operations_service.require_resource_admission",
         lambda *args, **kwargs: pytest.fail("recovery mode must not recurse"),
@@ -533,7 +555,11 @@ def test_recovery_safe_heavy_slot_does_not_bypass_non_disk_red(tmp_path, monkeyp
         "cli_agent_orchestrator.services.operations_service.get_resource_status",
         lambda _config: {
             "resource_state": "RED",
-            "reasons": ["memory_below_red"],
+            "reasons": [
+                "ROOT_DISK_PRESSURE",
+                "root_free_below_green",
+                non_disk_reason,
+            ],
             "heavy_executions": {"active": 0, "limit": 1},
         },
     )

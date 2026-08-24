@@ -395,7 +395,7 @@ Simple prompt without variables.
         mock_gen_session.return_value = "cao-test-session"
 
         mock_terminal = MagicMock()
-        mock_terminal.id = "terminal-123"
+        mock_terminal.id = "terminal-simple-flow"
         mock_create_terminal.return_value = mock_terminal
 
         result = execute_flow("simple-flow")
@@ -544,7 +544,10 @@ Value is [[value]].
             )
 
             mock_terminal = MagicMock()
-            mock_terminal.id = "terminal-123"
+            # Each mocked launch represents a distinct runtime. Reusing the
+            # earlier test's terminal ID leaves its durable workflow as a
+            # legitimate predecessor and correctly queues this later input.
+            mock_terminal.id = "terminal-scripted-flow"
             mock_create_terminal.return_value = mock_terminal
 
             result = execute_flow("scripted-flow")

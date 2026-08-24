@@ -5038,6 +5038,58 @@ def update_message_status(message_id: int, status: MessageStatus) -> bool:
         return False
 
 
+def _fail_closed_workflow_inbox_transports_in_transaction(
+    db: Any, receiver_id: Optional[str] = None
+) -> int:
+    """Terminalize pending transports whose exact workflow is no longer OPEN.
+
+    Inbox is transport rather than semantic workflow authority. Once the
+    workflow bound through ``WorkflowTurnModel.inbox_message_id`` reaches a
+    terminal state, that row can never be delivered or rebound into a later
+    workflow. Leaving it pending would make it a false FIFO predecessor and
+    suppress a newer durable owner turn forever.
+    """
+    query = (
+        db.query(InboxModel.id)
+        .join(
+            WorkflowTurnModel,
+            WorkflowTurnModel.inbox_message_id == InboxModel.id,
+        )
+        .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+        .filter(
+            InboxModel.status == MessageStatus.PENDING.value,
+            WorkflowModel.status != WORKFLOW_OPEN,
+        )
+    )
+    if receiver_id is not None:
+        query = query.filter(InboxModel.receiver_id == receiver_id)
+    stale_ids = [int(row[0]) for row in query.all()]
+    if not stale_ids:
+        return 0
+    return cast(
+        int,
+        db.query(InboxModel)
+        .filter(
+            InboxModel.id.in_(stale_ids),
+            InboxModel.status == MessageStatus.PENDING.value,
+        )
+        .update(
+            {InboxModel.status: MessageStatus.FAILED.value},
+            synchronize_session=False,
+        ),
+    )
+
+
+def reconcile_closed_workflow_inbox_transports(receiver_id: Optional[str] = None) -> int:
+    """Fail exact closed-workflow Inbox rows before provider FIFO selection."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        changed = _fail_closed_workflow_inbox_transports_in_transaction(db, receiver_id)
+        db.commit()
+        return changed
+
+
 def keep_managed_handoff_continuation_retryable(message_id: int) -> bool:
     """Retain one failed managed continuation on the normal pending retry path.
 
@@ -5389,6 +5441,11 @@ def _prepare_workflow_input(
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         if not _retirement_quiescence_allows_commit(db, root_terminal_id):
             return None
+        # Terminal workflow turns can leave their ordinary Inbox transport
+        # pending. That row is historical, not predecessor authority for a
+        # deliberate replacement workflow, and must never force the new owner
+        # input into a queue that only the ineligible row can head.
+        _fail_closed_workflow_inbox_transports_in_transaction(db, root_terminal_id)
         workflow = _open_workflow(db, root_terminal_id, create=True)
         assert workflow is not None
         if workflow.status != WORKFLOW_OPEN:
@@ -8347,6 +8404,7 @@ def set_workflow_terminal_state(
                 synchronize_session=False,
             )
         )
+        _fail_closed_workflow_inbox_transports_in_transaction(db, root_terminal_id)
         # State transition and callback fence share this transaction: no late
         # child result can observe a terminal workflow while retaining a live
         # assignment edge that would wake it again.

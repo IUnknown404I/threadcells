@@ -738,6 +738,101 @@ def test_f13_restart_resumes_two_results_before_queued_owner_input_once(workflow
         assert len([turn for turn in owner_turns if turn.payload == owner_payload]) == 1
 
 
+def test_f13_closed_ordinary_inbox_is_not_a_new_owner_input_predecessor(workflow_db):
+    """A terminal workflow's transport row cannot defer a new semantic workflow."""
+    parent = "parent-closed-inbox-submit"
+    _start_admitted_input(parent)
+    stale = create_inbox_message("sender", parent, "stale closed-workflow input")
+    stale_turn = database.ensure_workflow_turn_for_inbox(stale.id)
+    assert stale_turn is not None
+    assert set_workflow_terminal_state(parent, "terminal", "completed before Inbox send")
+    with database.SessionLocal() as db:
+        assert db.get(InboxModel, stale.id).status == "failed"
+        # Model a row persisted by a pre-fix runtime before the owner submits
+        # the deliberate replacement workflow.
+        db.get(InboxModel, stale.id).status = "pending"
+        db.commit()
+
+    owner_payload = "begin the deliberate replacement workflow"
+    prepared = database.prepare_workflow_input(parent, owner_payload)
+    assert prepared == {
+        "turn_id": prepared["turn_id"],
+        "queued": False,
+        "queue_reason": None,
+    }
+
+    with database.SessionLocal() as db:
+        assert db.get(InboxModel, stale.id).status == "failed"
+        assert db.get(WorkflowTurnModel, stale_turn).state == "cancelled"
+        owner_turn = db.get(WorkflowTurnModel, prepared["turn_id"])
+        assert owner_turn is not None
+        assert owner_turn.state == "sent"
+        assert owner_turn.payload is None
+        owner_workflow = db.get(WorkflowModel, owner_turn.workflow_id)
+        assert owner_workflow is not None
+        assert owner_workflow.status == "open"
+        assert owner_workflow.active_turn_id == owner_turn.id
+
+
+def test_f13_restart_reconciles_closed_inbox_before_queued_owner_input_once(
+    workflow_db, monkeypatch
+):
+    """Pre-fix persisted FIFO state advances automatically and exactly once."""
+    parent = "parent-closed-inbox-restart"
+    _start_admitted_input(parent)
+    stale = create_inbox_message("sender", parent, "stale closed-workflow input")
+    stale_turn = database.ensure_workflow_turn_for_inbox(stale.id)
+    assert stale_turn is not None
+    assert set_workflow_terminal_state(parent, "terminal", "closed before restart")
+
+    owner_payload = "resume the queued owner mission"
+    with database.SessionLocal() as db:
+        # Reconstruct the durable state left by a pre-fix process at restart.
+        db.get(InboxModel, stale.id).status = "pending"
+        replacement = WorkflowModel(root_terminal_id=parent, status="open")
+        db.add(replacement)
+        db.flush()
+        owner_turn = WorkflowTurnModel(
+            workflow_id=replacement.id,
+            kind="external_input",
+            dedupe_key="external:pre-fix-persisted-owner",
+            payload=owner_payload,
+            state="queued",
+        )
+        db.add(owner_turn)
+        db.commit()
+        owner_turn_id = owner_turn.id
+
+    provider = MagicMock()
+    provider.get_status.return_value = TerminalStatus.IDLE
+    provider.is_process_alive.return_value = True
+    terminal_state = {"lifecycle": "running", "status": TerminalStatus.COMPLETED.value}
+    with (
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+            return_value=provider,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.workflow_service.terminal_service.get_terminal",
+            return_value=terminal_state,
+        ),
+        patch.object(workflow_service, "reconcile_open_workflows", return_value=0),
+        patch("cli_agent_orchestrator.services.inbox_service.terminal_service.send_input") as send,
+    ):
+        assert reconcile_pending_messages() == 1
+        assert claim_workflow_turn_receipt(parent, owner_turn_id)
+        assert reconcile_pending_messages() == 0
+
+    assert send.call_count == 1
+    assert send.call_args.args[1].endswith(owner_payload)
+    assert f"logical-turn={owner_turn_id}" in send.call_args.args[1]
+    with database.SessionLocal() as db:
+        assert db.get(InboxModel, stale.id).status == "failed"
+        persisted_owner = db.get(WorkflowTurnModel, owner_turn_id)
+        assert persisted_owner is not None
+        assert persisted_owner.state == "sent"
+
+
 def test_f13_cancelled_result_notice_cannot_strand_next_open_handoff_boundary(workflow_db):
     """A fenced old callback must not occupy FIFO ahead of a recoverable batch.
 

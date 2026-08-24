@@ -57,6 +57,7 @@ from cli_agent_orchestrator.clients.database import (
     mark_workflow_turn_sent,
     mark_workflow_turn_sent_for_inbox,
     materialize_deferred_handoff_result_turn_for_inbox,
+    reconcile_closed_workflow_inbox_transports,
     reconcile_superseded_workflow_turns_for_restart,
     request_workflow_provider_reconnect,
     requeue_unacknowledged_child_assignment_results,
@@ -159,11 +160,11 @@ def _dispatch_pending_messages_with_admission(
     # transport, but they must not remain at the head of this FIFO forever and
     # strand a later OPEN workflow's durable handoff-result boundary.
     #
-    # Only a delegation-result notice gets this terminal outcome here.  It has
-    # an immutable result/assignment projection which already records the
-    # parent fence; marking its Inbox transport failed neither fabricates a
-    # callback nor changes the completed result.  Ordinary Inbox messages
-    # retain their historical closed-workflow handling.
+    # Any Inbox row bound to a closed workflow is historical transport, never
+    # authority for a later semantic workflow. Result artifacts retain their
+    # immutable projection independently; ordinary messages retain their
+    # cancelled workflow turn. Terminalizing either transport cannot rebind or
+    # revive it, and lets the next eligible FIFO item advance.
     while True:
         messages = get_pending_messages(terminal_id, limit=1)
         if not messages:
@@ -196,15 +197,12 @@ def _dispatch_pending_messages_with_admission(
             continue
         if workflow_turn is None or workflow_turn["status"] == "open":
             break
-        if message.kind != "delegation_result_notice":
-            logger.info("Suppressing Inbox wake %s for closed workflow", message.id)
-            return False
         if not update_message_status(message.id, MessageStatus.FAILED):
             # Another reconciler won the terminal transition. Re-read the
             # FIFO head so this observer stays idempotent.
             continue
         logger.info(
-            "Marked ineligible delegation-result notice %s failed for closed workflow",
+            "Marked ineligible Inbox transport %s failed for closed workflow",
             message.id,
         )
 
@@ -427,6 +425,12 @@ def reconcile_provider_execution_queue(
     if not _provider_queue_reconcile_lock.acquire(blocking=False):
         return 0
     try:
+        # Remove rows whose exact workflow has already closed before building
+        # the merged queue. Otherwise that stale Inbox head suppresses the
+        # same resident's queued OPEN-workflow turn for the whole scan. The
+        # transaction is restart-safe and dispatch repeats the fence for a
+        # close-vs-scan race.
+        reconcile_closed_workflow_inbox_transports()
         admitted = 0
         for candidate in get_provider_execution_admission_queue():
             terminal_id = candidate["terminal_id"]

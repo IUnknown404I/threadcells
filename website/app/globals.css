@@ -85,6 +85,13 @@ img { display: block; max-width: 100%; }
 .header-inner > nav a, .header-icon-link { transition: color 180ms ease; }
 .header-inner > nav a:hover, .header-icon-link:hover { color: var(--green); }
 .header-actions { display: flex; justify-content: flex-end; align-items: center; gap: 18px; }
+.language-menu { position: relative; flex: 0 0 auto; }
+.language-menu summary { display: flex; min-width: 32px; min-height: 44px; align-items: center; justify-content: center; color: #aeb8b0; cursor: pointer; font: 600 12px/1 var(--mono); list-style: none; text-transform: lowercase; }
+.language-menu summary::-webkit-details-marker { display: none; }
+.language-menu summary:focus-visible, .language-menu a:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
+.language-menu > div { position: absolute; top: calc(100% + 6px); right: 0; z-index: 3; display: grid; min-width: 106px; padding: 6px; border: 1px solid var(--line); border-radius: 8px; background: #0b110d; box-shadow: 0 14px 30px rgba(0,0,0,.35); }
+.language-menu a { padding: 9px 10px; border-radius: 5px; color: #cbd5cd; font-size: 12px; }
+.language-menu a:hover, .language-menu a[aria-current='page'] { color: var(--green); background: rgba(121,255,157,.08); }
 .header-icon-link { display: inline-flex; min-height: 44px; align-items: center; gap: 7px; color: #aeb8b0; font-size: 12px; }
 .system-state { display: inline-flex; align-items: center; gap: 8px; color: #8c9c90; font: 500 9px/1 var(--mono); letter-spacing: .1em; }
 .system-state i, .mesh-live i { width: 6px; height: 6px; border-radius: 50%; background: var(--green); box-shadow: 0 0 12px rgba(121,255,157,.7); }
@@ -467,7 +474,7 @@ img { display: block; max-width: 100%; }
   .brand-mark-compact img { width: 34px; height: 34px; }
   .brand-mark-compact .brand-name { font-size: 14px; }
   .header-actions { gap: 12px; }
-  .header-docs-link { display: none; }
+  .header-docs-link { display: inline-flex; min-width: 44px; justify-content: center; }
   .header-github-link { min-width: 44px; justify-content: center; }
   .hero { padding-top: 112px; gap: 45px; }
   .hero-copy h1 { margin-top: 24px; font-size: clamp(44px, 13vw, 58px); line-height: 1.02; }

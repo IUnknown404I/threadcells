@@ -19,6 +19,16 @@ from typing import Any, Callable, Iterator, Mapping, Sequence, cast
 
 PACKAGE_CONFIG = Path(__file__).parents[1] / "config" / "cao-operations.json"
 SYSTEM_CONFIG = Path("/etc/agent-control/cao-operations.json")
+_ROOT_DISK_PRESSURE_REASON = "ROOT_DISK_PRESSURE"
+_DISK_CRITICAL_REASON = "DISK_CRITICAL"
+_ROOT_FREE_BELOW_GREEN_REASON = "root_free_below_green"
+_DISK_RESOURCE_HEALTH_REASONS = frozenset(
+    {
+        _ROOT_DISK_PRESSURE_REASON,
+        _DISK_CRITICAL_REASON,
+        _ROOT_FREE_BELOW_GREEN_REASON,
+    }
+)
 
 
 class AdmissionDenied(RuntimeError):
@@ -268,13 +278,13 @@ def get_resource_status(
     elif mem_available_mib < int(cfg["memory_green_mib"]):
         yellow_reasons.append("memory_below_green")
     if root_used_percent >= int(cfg["root_used_critical_percent"]):
-        red_reasons.extend(("ROOT_DISK_PRESSURE", "DISK_CRITICAL"))
+        red_reasons.extend((_ROOT_DISK_PRESSURE_REASON, _DISK_CRITICAL_REASON))
     elif root_used_percent >= int(cfg["root_used_red_percent"]):
-        red_reasons.append("ROOT_DISK_PRESSURE")
+        red_reasons.append(_ROOT_DISK_PRESSURE_REASON)
     elif root_used_percent >= int(cfg["root_used_yellow_percent"]):
-        yellow_reasons.append("ROOT_DISK_PRESSURE")
+        yellow_reasons.append(_ROOT_DISK_PRESSURE_REASON)
     if root_free_gib < int(cfg["root_free_green_gib"]):
-        yellow_reasons.append("root_free_below_green")
+        yellow_reasons.append(_ROOT_FREE_BELOW_GREEN_REASON)
     if full_avg10 >= float(cfg["memory_pressure_full_red_avg10"]):
         red_reasons.append("critical_memory_pressure")
     elif some_avg10 >= float(cfg["memory_pressure_some_yellow_avg10"]):
@@ -608,9 +618,7 @@ def _recovery_safe_heavy_status(config: Mapping[str, Any]) -> dict[str, Any]:
     reasons = status.get("reasons")
     if not isinstance(reasons, list):
         reasons = []
-    non_disk_reasons = [
-        reason for reason in reasons if reason not in {"ROOT_DISK_PRESSURE", "DISK_CRITICAL"}
-    ]
+    non_disk_reasons = [reason for reason in reasons if reason not in _DISK_RESOURCE_HEALTH_REASONS]
     if status.get("resource_state") == "RED" and (not reasons or non_disk_reasons):
         raise AdmissionDenied("RESOURCE_HEALTH_REJECTED", status)
     return status

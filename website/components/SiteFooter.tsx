@@ -20,7 +20,7 @@ export function SiteFooter({ locale = 'en' }: { locale?: Locale }) {
       <div className="footer-bottom">
         <span>Apache-2.0</span>
         <span>ThreadCells © 2026 · <a href={site.creator.url} target="_blank" rel="noopener noreferrer">{site.creator.name}</a></span>
-        <p>{locale === 'ru' ? 'AWS не спонсирует и не участвует в нём.' : 'Independent, unofficial downstream of AWS Labs CLI Agent Orchestrator. No AWS sponsorship or endorsement is implied.'}</p>
+        <p>{locale === 'ru' ? 'Независимый неофициальный проект на основе AWS Labs CLI Agent Orchestrator. AWS не спонсирует и не участвует в нём.' : 'Independent, unofficial downstream of AWS Labs CLI Agent Orchestrator. No AWS sponsorship or endorsement is implied.'}</p>
       </div>
     </footer>
   )

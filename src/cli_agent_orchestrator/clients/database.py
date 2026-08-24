@@ -5026,7 +5026,14 @@ def _prepare_workflow_input(
     transport_binding: Optional[str] = None,
     defer_while_runtime_owned: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Persist one input without replacing a reconnect-owned active turn."""
+    """Persist one input without overtaking existing provider work.
+
+    A public owner input can arrive while the current provider turn, an Inbox
+    callback, or another durable continuation already owns the resident's
+    next admission.  Persist that input as a successor without moving the
+    active-turn fence; otherwise the newer turn makes the older FIFO head
+    permanently stale and neither item can progress.
+    """
     _ensure_workflow_schema()
     _ensure_child_assignment_schema()
     with SessionLocal() as db:
@@ -5042,6 +5049,7 @@ def _prepare_workflow_input(
             db.add(workflow)
             db.flush()
         runtime_owned = False
+        workflow_predecessor = False
         if defer_while_runtime_owned:
             terminal = db.query(TerminalModel).filter(TerminalModel.id == root_terminal_id).first()
             runtime_owned = bool(
@@ -5052,12 +5060,29 @@ def _prepare_workflow_input(
                     or _terminal_has_pending_provider_reconnect(db, root_terminal_id)
                 )
             )
+            workflow_predecessor = bool(
+                db.get(ProviderExecutionLeaseModel, root_terminal_id)
+                or _workflow_has_unadmitted_active_turn(db, workflow)
+                or db.query(WorkflowTurnModel.id)
+                .filter(
+                    WorkflowTurnModel.workflow_id == workflow.id,
+                    WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+                )
+                .first()
+                or db.query(InboxModel.id)
+                .filter(
+                    InboxModel.receiver_id == root_terminal_id,
+                    InboxModel.status == MessageStatus.PENDING.value,
+                )
+                .first()
+            )
+        queued = runtime_owned or workflow_predecessor
         turn = WorkflowTurnModel(
             workflow_id=workflow.id,
             kind="external_input",
             dedupe_key=f"external:{datetime.now().isoformat()}:{id(workflow)}",
-            payload=payload if runtime_owned else None,
-            state=TURN_QUEUED if runtime_owned else TURN_SENT,
+            payload=payload if queued else None,
+            state=TURN_QUEUED if queued else TURN_SENT,
             transport_binding=transport_binding,
         )
         db.add(turn)
@@ -5066,7 +5091,7 @@ def _prepare_workflow_input(
         # The direct input about to reach the provider is the only turn whose
         # public MCP calls may be admitted.  A later input replaces this
         # binding, so an old prompt cannot borrow its retained receipt.
-        if not runtime_owned:
+        if not queued:
             workflow.active_turn_id = turn.id
         # A direct owner/user input is genuine progress and re-arms the bounded
         # automatic continuation path for this still-open mission.
@@ -5076,7 +5101,15 @@ def _prepare_workflow_input(
             db.rollback()
             return None
         db.commit()
-        return {"turn_id": cast(int, turn.id), "queued": runtime_owned}
+        return {
+            "turn_id": cast(int, turn.id),
+            "queued": queued,
+            "queue_reason": (
+                "runtime_recovery"
+                if runtime_owned
+                else "workflow_predecessor" if workflow_predecessor else None
+            ),
+        }
 
 
 def _start_workflow_input(

@@ -1593,6 +1593,33 @@ class TestSendTerminalInput:
         prepare.assert_called_once_with("abcd1234", "after reconnect")
         mock_svc.send_input.assert_not_called()
 
+    def test_pending_workflow_continuation_queues_external_input_without_overtaking(self, client):
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.workflow_service.prepare_external_input",
+                return_value={
+                    "turn_id": 78,
+                    "queued": True,
+                    "queue_reason": "workflow_predecessor",
+                },
+            ) as prepare,
+        ):
+            response = client.post(
+                "/terminals/abcd1234/workflow-input",
+                json={"message": "after the child callback"},
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": True,
+            "queued": True,
+            "status": "queued_provider_execution",
+            "reason_code": "WORKFLOW_CONTINUATION_PENDING",
+        }
+        prepare.assert_called_once_with("abcd1234", "after the child callback")
+        mock_svc.send_input.assert_not_called()
+
     def test_public_orchestration_metadata_cannot_suppress_admission(self, client):
         """Public sender/type query values are ignored and cannot retain an old turn."""
         with (

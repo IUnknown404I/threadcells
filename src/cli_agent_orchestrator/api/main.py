@@ -1853,11 +1853,20 @@ def _send_server_bound_input(
             prepared = workflow_service.prepare_external_input(terminal_id, raw_message)
             turn_id = prepared["turn_id"]
             if prepared["queued"]:
+                runtime_recovery = prepared.get("queue_reason") != "workflow_predecessor"
                 return {
                     "success": True,
                     "queued": True,
-                    "status": "queued_runtime_recovery",
-                    "reason_code": "TERMINAL_RUNTIME_OPERATION_BUSY",
+                    "status": (
+                        "queued_runtime_recovery"
+                        if runtime_recovery
+                        else "queued_provider_execution"
+                    ),
+                    "reason_code": (
+                        "TERMINAL_RUNTIME_OPERATION_BUSY"
+                        if runtime_recovery
+                        else "WORKFLOW_CONTINUATION_PENDING"
+                    ),
                 }
         message = workflow_service.admission_message(message, turn_id)
         success = terminal_service.send_input(

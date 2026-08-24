@@ -615,6 +615,129 @@ def test_f13_two_queued_handoffs_share_one_safe_boundary_and_clear_barrier(
     assert get_workflow_status(parent) == "terminal"
 
 
+def test_f13_restart_resumes_two_results_before_queued_owner_input_once(workflow_db, monkeypatch):
+    """A queued owner turn cannot fence the callback that clears its barrier."""
+    parent = "parent-result-owner-order"
+    children = ("child-result-owner-one", "child-result-owner-two")
+    active_turn = _start_admitted_input(parent)
+    with database.SessionLocal() as db:
+        for index, child in enumerate(children):
+            db.add(
+                TerminalModel(
+                    id=child,
+                    tmux_session=f"cao-{child}",
+                    tmux_window=f"worker-{index}",
+                    provider="codex",
+                    runtime_lifecycle="exited",
+                )
+            )
+        db.commit()
+
+    notices = []
+    for child in children:
+        assert register_handoff_child(parent, child)
+        notice, duplicate = create_handoff_child_result_message(child, f"result from {child}")
+        assert notice is not None and duplicate is False and notice.result_id is not None
+        notices.append(notice)
+    with database.SessionLocal() as db:
+        db.query(database.ChildAssignmentModel).update({"cleanup_acknowledged": True})
+        db.commit()
+
+    monkeypatch.setenv("CAO_TERMINAL_ID", parent)
+    monkeypatch.setattr(mcp_server, "_SIDECAR_RUNTIME_GENERATION", "test-generation")
+    monkeypatch.setattr(mcp_server, "_active_runtime_generation", lambda: "test-generation")
+    blocked = asyncio.run(mcp_server.complete_workflow(active_turn, "children incorporated"))
+    assert blocked["error"] == "active child completion barrier"
+    assert blocked["active_children"] == 2
+
+    owner_payload = "perform the queued owner landing correction"
+    prepared = database.prepare_workflow_input(parent, owner_payload)
+    assert prepared == {
+        "turn_id": prepared["turn_id"],
+        "queued": True,
+        "queue_reason": "workflow_predecessor",
+    }
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=parent).one()
+        assert workflow.active_turn_id == active_turn
+        owner_turn = db.get(WorkflowTurnModel, prepared["turn_id"])
+        assert owner_turn is not None
+        assert owner_turn.state == "queued"
+        assert owner_turn.payload == owner_payload
+
+    provider = MagicMock()
+    provider.get_status.return_value = TerminalStatus.IDLE
+    provider.is_process_alive.return_value = True
+    terminal_state = {"lifecycle": "running", "status": TerminalStatus.COMPLETED.value}
+    with (
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+            return_value=provider,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.terminal_service.get_terminal",
+            return_value=terminal_state,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.workflow_service.terminal_service.get_terminal",
+            return_value=terminal_state,
+        ),
+        patch("cli_agent_orchestrator.services.inbox_service.terminal_service.send_input") as send,
+    ):
+        # Startup reconciliation owns the persisted queue even without a new
+        # terminal-log event. Both results share one exact callback turn.
+        assert reconcile_pending_messages() == 1
+        assert send.call_count == 1
+        callback_payload = send.call_args.args[1]
+        assert owner_payload not in callback_payload
+        for notice in notices:
+            assert f"result_id={notice.result_id}" in callback_payload
+
+        callback = get_workflow_turn_for_inbox(notices[0].id)
+        assert callback is not None
+        assert claim_workflow_turn_receipt(parent, callback["turn_id"])
+        for notice in notices:
+            read = asyncio.run(
+                mcp_server.read_delegation_result(callback["turn_id"], notice.result_id)
+            )
+            assert read["success"] is True
+            acknowledged = asyncio.run(
+                mcp_server.acknowledge_assigned_result(
+                    callback["turn_id"], result_id=notice.result_id
+                )
+            )
+            replay = asyncio.run(
+                mcp_server.acknowledge_assigned_result(
+                    callback["turn_id"], result_id=notice.result_id
+                )
+            )
+            assert acknowledged["success"] is True
+            assert replay["reason_code"] == "RESULT_ALREADY_ACKNOWLEDGED"
+
+        assert get_parent_completion_barrier(parent) == (0, 0)
+        assert workflow_service.reconcile_root_workflow(parent) is True
+        assert send.call_count == 2
+        owner_delivery = send.call_args.args[1]
+        assert owner_delivery.endswith(owner_payload)
+        assert f"logical-turn={prepared['turn_id']}" in owner_delivery
+
+    assert claim_workflow_turn_receipt(parent, prepared["turn_id"])
+    with database.SessionLocal() as db:
+        assert db.query(InboxModel).filter_by(status="delivered").count() == 2
+        assert (
+            db.query(WorkflowTurnModel)
+            .filter_by(workflow_id=callback["workflow_id"], kind="handoff_result")
+            .count()
+            == 1
+        )
+        owner_turns = (
+            db.query(WorkflowTurnModel)
+            .filter_by(workflow_id=callback["workflow_id"], kind="external_input")
+            .all()
+        )
+        assert len([turn for turn in owner_turns if turn.payload == owner_payload]) == 1
+
+
 def test_f13_cancelled_result_notice_cannot_strand_next_open_handoff_boundary(workflow_db):
     """A fenced old callback must not occupy FIFO ahead of a recoverable batch.
 

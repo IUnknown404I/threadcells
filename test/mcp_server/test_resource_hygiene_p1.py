@@ -1558,9 +1558,7 @@ def test_c1_partial_legacy_managed_identity_fails_closed(resource_db, monkeypatc
     exit_terminal.assert_not_called()
 
 
-def test_pending_cleanup_inventory_preserves_parent_for_atomic_reclaim(
-    resource_db, monkeypatch
-):
+def test_pending_cleanup_inventory_preserves_parent_for_atomic_reclaim(resource_db, monkeypatch):
     parent, child = "parent-unclaimed-cleanup", "child-unclaimed-cleanup"
     _acknowledged_child(parent, child, monkeypatch)
     intent = {"version": 1, "terminal_id": child, "managed": False}

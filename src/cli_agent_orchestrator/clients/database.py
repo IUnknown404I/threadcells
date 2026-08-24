@@ -8747,9 +8747,7 @@ def claim_completed_child_retirement(
             "cleanup_required": True,
             "delegation_kind": delegation_kind,
             "exit_dispatch_reserved": (
-                delegation_kind == "handoff"
-                or historical_supervisor
-                or require_exited_runtime
+                delegation_kind == "handoff" or historical_supervisor or require_exited_runtime
             ),
             "historical_recovery": historical_supervisor,
         }

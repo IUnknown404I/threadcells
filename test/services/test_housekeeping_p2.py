@@ -384,9 +384,7 @@ def test_pending_retirement_cleanup_uses_the_revalidated_plan_executor(tmp_path,
     assert completed == [("child001", "claim-token", intent, "assign")]
 
 
-def test_unclaimed_retirement_cleanup_reenters_atomic_claim_before_execution(
-    tmp_path, monkeypatch
-):
+def test_unclaimed_retirement_cleanup_reenters_atomic_claim_before_execution(tmp_path, monkeypatch):
     intent = {"version": 1, "terminal_id": "child-unclaimed", "managed": False}
     pending = {
         "parent_terminal_id": "parent-exact",
@@ -419,8 +417,7 @@ def test_unclaimed_retirement_cleanup_reenters_atomic_claim_before_execution(
     completed = []
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.complete_child_retirement",
-        lambda child, token, current, kind: completed.append((child, token, current, kind))
-        or True,
+        lambda child, token, current, kind: completed.append((child, token, current, kind)) or True,
     )
     config = _config(tmp_path)
 
@@ -436,8 +433,7 @@ def test_unclaimed_retirement_cleanup_reenters_atomic_claim_before_execution(
 
     assert dict(candidate.attributes)["stage"] == "unclaimed"
     assert not any(
-        warning.startswith("retirement_cleanup_claim_unknown:")
-        for warning in plan.warnings
+        warning.startswith("retirement_cleanup_claim_unknown:") for warning in plan.warnings
     )
     report = execute_plan(plan, config=config, open_inventory=lambda: (set(), True))
     assert report.ok is True
@@ -445,9 +441,7 @@ def test_unclaimed_retirement_cleanup_reenters_atomic_claim_before_execution(
     assert completed == [("child-unclaimed", "recovered-claim", intent, "assign")]
 
 
-def test_unclaimed_retirement_cleanup_without_exact_parent_remains_preserved(
-    tmp_path, monkeypatch
-):
+def test_unclaimed_retirement_cleanup_without_exact_parent_remains_preserved(tmp_path, monkeypatch):
     pending = {
         "child_terminal_id": "child-unknown",
         "claim_token": None,

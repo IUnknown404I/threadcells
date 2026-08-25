@@ -49,7 +49,7 @@ try {
       `${viewport.name} live tour uses native autoplay, muted, loop, and playsinline behavior`,
     )
     assert.equal(demoState.sources.length, 2, `${viewport.name} live tour has WebM and MP4 sources`)
-    assert.equal(await page.getByRole('link', { name: 'ThreadCells on GitHub' }).getAttribute('href'), 'https://github.com/IUnknown404I/threadcells', `${viewport.name} uses the official repository`)
+    assert.equal(await page.getByRole('link', { name: 'ThreadCells — GitHub' }).getAttribute('href'), 'https://github.com/IUnknown404I/threadcells', `${viewport.name} uses the official repository`)
     const footer = page.locator('footer')
     assert.equal(await footer.getByRole('link', { name: 'ThreadCells home' }).getAttribute('href'), `${basePath}/#top`, `${viewport.name} footer brand uses the Pages-aware landing root`)
     assert.equal(await footer.getByRole('link', { name: 'Docs' }).getAttribute('href'), `${basePath}/docs`, `${viewport.name} footer Docs uses the Pages-aware public route`)

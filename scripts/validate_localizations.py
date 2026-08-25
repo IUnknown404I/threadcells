@@ -32,6 +32,7 @@ README_LABELS = {
     "de": "Deutsch",
     "ja": "日本語",
 }
+PUBLIC_SITE_ROOT = "https://iunknown404i.github.io/threadcells/"
 PLACEHOLDER = re.compile(r"\b(?:TODO|TBD|TRANSLATE(?:D|\s+ME)?)\b|(?i:\bLOREM\s+IPSUM\b)")
 FRONT_MATTER = re.compile(r"\A---\n(?P<header>.*?)\n---\n(?P<body>.*)\Z", re.S)
 HEADING = re.compile(r"^(#{1,4})\s+.+?\s*$", re.M)
@@ -173,6 +174,14 @@ def validate_readmes() -> list[str]:
             continue
         value = path.read_text(encoding="utf-8")
         first_block = value.split("\n\n", 1)[0]
+        public_prefix = "" if locale == "en" else f"{locale}/"
+        hero = "\n".join(value.splitlines()[:16])
+        for label, target in (
+            ("website", f"{PUBLIC_SITE_ROOT}{public_prefix}"),
+            ("documentation", f"{PUBLIC_SITE_ROOT}{public_prefix}docs/"),
+        ):
+            if f"]({target})" not in hero:
+                errors.append(f"{filename}: primary {label} link does not preserve locale")
         if f"**{README_LABELS[locale]}**" not in first_block:
             errors.append(f"{filename}: current language is not highlighted")
         for target_locale, target in README_FILES.items():

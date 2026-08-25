@@ -8,8 +8,8 @@
 
 ThreadCells はネイティブ CLI コーディングエージェントを協調させ、モデルターンをまたぐオープンなワークフローを進め続け、その下層にあるオーケストレーション環境を管理します。ホストの負荷を監視し、使い捨て可能な ThreadCells ランタイムの残骸を安全に回収しながら、自分の Linux ホスト上の進行中の作業と永続的な履歴を保護します。
 
-**[Web サイト](https://iunknown404i.github.io/threadcells/)** ·
-**[ドキュメント](https://iunknown404i.github.io/threadcells/docs/)** ·
+**[Web サイト](https://iunknown404i.github.io/threadcells/ja/)** ·
+**[ドキュメント](https://iunknown404i.github.io/threadcells/ja/docs/)** ·
 **[GitHub](https://github.com/IUnknown404I/threadcells)** ·
 **[クイックセットアップ](QUICK_SETUP.md)**
 

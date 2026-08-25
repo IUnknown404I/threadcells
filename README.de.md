@@ -8,8 +8,8 @@
 
 ThreadCells koordiniert native CLI-Coding-Agenten, hält offene Workflows über Modell-Turns hinweg in Bewegung und kümmert sich um die Orchestrierungsumgebung darunter. Es überwacht die Host-Auslastung, bereinigt sicher entbehrliche ThreadCells-Laufzeitartefakte und bewahrt aktive Arbeit sowie dauerhafte Historie auf deinem eigenen Linux-Host.
 
-**[Website](https://iunknown404i.github.io/threadcells/)** ·
-**[Dokumentation](https://iunknown404i.github.io/threadcells/docs/)** ·
+**[Website](https://iunknown404i.github.io/threadcells/de/)** ·
+**[Dokumentation](https://iunknown404i.github.io/threadcells/de/docs/)** ·
 **[GitHub](https://github.com/IUnknown404I/threadcells)** ·
 **[Schnellstart](QUICK_SETUP.md)**
 

@@ -8,7 +8,7 @@
 
 ThreadCells координирует нативных CLI-агентов программирования, продолжает открытые рабочие процессы между ответами модели и обслуживает их среду оркестрации. Он следит за нагрузкой на хост, безопасно удаляет одноразовые артефакты среды исполнения ThreadCells и сохраняет активную работу и долговременную историю на вашем Linux-хосте.
 
-**[Сайт](https://iunknown404i.github.io/threadcells/)** ·
+**[Сайт](https://iunknown404i.github.io/threadcells/ru/)** ·
 **[Документация](https://iunknown404i.github.io/threadcells/ru/docs/)** ·
 **[GitHub](https://github.com/IUnknown404I/threadcells)** ·
 **[Быстрая настройка](QUICK_SETUP.md)**

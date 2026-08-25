@@ -1,6 +1,7 @@
 """Tests for CLI Agent Orchestrator constants."""
 
 import os
+import tomllib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +13,17 @@ class TestServerConstants:
         from cli_agent_orchestrator.constants import SERVER_VERSION
 
         assert SERVER_VERSION == "0.2.0-alpha.1"
+
+    def test_package_metadata_matches_alpha_release(self):
+        project = tomllib.loads(
+            (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(
+                encoding="utf-8"
+            )
+        )["project"]
+
+        assert project["version"] == "0.2.0a1"
+        assert "Development Status :: 3 - Alpha" in project["classifiers"]
+        assert "Development Status :: 4 - Beta" not in project["classifiers"]
 
     def test_server_host_defaults_to_127_0_0_1(self):
         """Test that SERVER_HOST defaults to '127.0.0.1' (not 'localhost')."""

@@ -14,6 +14,15 @@ from pathlib import Path
 from typing import Any
 
 RELEASE_ADMIN_GROUP = "threadcells-release-admin"
+CORE_RELEASE_EXECUTABLES = (
+    "cao-server",
+    "cao-housekeeping",
+    "threadcells-mcp-server",
+)
+CURRENT_RELEASE_EXECUTABLES = (
+    *CORE_RELEASE_EXECUTABLES,
+    "threadcells-full-cleanup-helper",
+)
 
 
 def fail(reason: str) -> None:
@@ -114,6 +123,7 @@ def _validate_release(
     release_owner: tuple[int, int],
     expected_commit: str | None,
     allowed_states: set[str],
+    required_executables: tuple[str, ...] = CORE_RELEASE_EXECUTABLES,
 ) -> dict[str, Any]:
     if (
         not path.is_absolute()
@@ -143,12 +153,7 @@ def _validate_release(
         or (expected_commit is not None and marker.get("source_commit") != expected_commit)
     ):
         fail("RELEASE_MARKER_INVALID")
-    for executable in (
-        "cao-server",
-        "cao-housekeeping",
-        "threadcells-full-cleanup-helper",
-        "threadcells-mcp-server",
-    ):
+    for executable in required_executables:
         target = path / "runtime/bin" / executable
         if not target.is_file() or not os.access(target, os.X_OK):
             fail("RELEASE_RUNTIME_INVALID")
@@ -254,6 +259,7 @@ def main() -> int:
         release_owner=release_owner,
         expected_commit=args.expected_commit,
         allowed_states={"candidate", "active"},
+        required_executables=CURRENT_RELEASE_EXECUTABLES,
     )
     rollback = args.rollback_root
     if rollback is not None:

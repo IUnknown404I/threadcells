@@ -38,6 +38,11 @@ HEADING = re.compile(r"^(#{1,4})\s+.+?\s*$", re.M)
 FENCE = re.compile(r"^```[^\n]*\n.*?^```\s*$", re.M | re.S)
 INLINE_CODE = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
 LINK = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
+LIST_ITEM = re.compile(r"^\s*[-*+]\s+", re.M)
+ORDERED_ITEM = re.compile(r"^\s*\d+\.\s+", re.M)
+TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$", re.M)
+BLOCKQUOTE = re.compile(r"^\s*>\s?", re.M)
+LOCALE_MINIMUM_RATIO = {"ru": 0.55, "zh-CN": 0.28, "es": 0.65, "pt-BR": 0.65, "de": 0.65, "ja": 0.32}
 
 
 def digest(path: Path) -> str:
@@ -88,6 +93,16 @@ def heading_levels(markdown: str) -> list[int]:
     return [len(prefix) for prefix in HEADING.findall(markdown)]
 
 
+def prose_blocks(markdown: str) -> list[str]:
+    blocks: list[str] = []
+    for block in without_fences(markdown).split("\n\n"):
+        value = block.strip()
+        if not value or re.match(r"^(?:#{1,4}\s|[-*+]\s|\d+\.\s|\||>)", value):
+            continue
+        blocks.append(re.sub(r"\s+", " ", value))
+    return blocks
+
+
 def validate_translation(
     *, locale: str, document: dict[str, object], fingerprints: dict[str, str]
 ) -> list[str]:
@@ -110,7 +125,8 @@ def validate_translation(
     source = source_path.read_text(encoding="utf-8")
     if PLACEHOLDER.search(body):
         errors.append(f"{relative}: placeholder text is not allowed")
-    if len(body.strip()) < max(80, len(source.strip()) // 4):
+    minimum_ratio = LOCALE_MINIMUM_RATIO[locale]
+    if len(body.strip()) < max(80, int(len(source.strip()) * minimum_ratio)):
         errors.append(f"{relative}: translation is unexpectedly short")
     if heading_levels(body) != heading_levels(source):
         errors.append(f"{relative}: heading-level sequence differs from English")
@@ -121,6 +137,27 @@ def validate_translation(
         errors.append(f"{relative}: missing inline code identifiers {sorted(missing_inline.elements())}")
     if link_targets(body) != link_targets(source):
         errors.append(f"{relative}: Markdown link/media targets differ from English")
+    for label, pattern in (
+        ("unordered-list items", LIST_ITEM),
+        ("ordered-list items", ORDERED_ITEM),
+        ("table rows", TABLE_ROW),
+        ("blockquotes", BLOCKQUOTE),
+    ):
+        if len(pattern.findall(body)) != len(pattern.findall(source)):
+            errors.append(f"{relative}: {label} differ from English")
+    source_paragraphs = prose_blocks(source)
+    translated_paragraphs = prose_blocks(body)
+    if len(translated_paragraphs) != len(source_paragraphs):
+        errors.append(f"{relative}: prose-block count differs from English")
+    repeated = [text for text, count in Counter(translated_paragraphs).items() if count > 1 and len(text) >= 60]
+    if repeated:
+        errors.append(f"{relative}: repeated prose blocks indicate omitted content")
+    source_long_lines = {
+        line.strip() for line in without_fences(source).splitlines() if len(line.strip()) >= 80
+    }
+    copied = [line for line in without_fences(body).splitlines() if line.strip() in source_long_lines]
+    if copied:
+        errors.append(f"{relative}: long English prose was copied without translation")
     return errors
 
 

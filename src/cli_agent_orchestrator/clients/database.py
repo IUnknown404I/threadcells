@@ -10197,9 +10197,26 @@ def _submit_handoff_result_v1_once(
                 _raise_submission_conflict(
                     db, existing_result.id, child_terminal_id, logical_turn_id, content_sha256
                 )
-        assignment, child_workflow, result = _submission_relation(
-            db, child_terminal_id, logical_turn_id
-        )
+        try:
+            assignment, child_workflow, result = _submission_relation(
+                db, child_terminal_id, logical_turn_id
+            )
+        except HandoffResultSubmissionError as error:
+            if error.code != "turn_not_admitted":
+                raise
+            # The winning submit finalizes the child workflow in the same
+            # transaction as its staged result.  A concurrent loser can have
+            # read the pre-finalization result and then observe the terminal
+            # workflow before its original transaction sees the staged row.
+            # Drop that snapshot and classify only an exact committed result;
+            # a genuinely stale turn still retains turn_not_admitted.
+            db.rollback()
+            resolved = _resolve_committed_handoff_submission(
+                token_digest, logical_turn_id, content_sha256
+            )
+            if resolved is not None:
+                return resolved
+            raise
 
         existing = db.query(DelegationResultSubmissionModel).filter_by(result_id=result.id).first()
         if existing is not None:
@@ -10287,6 +10304,22 @@ def _resolve_handoff_submission_race(
     token_digest: str, logical_turn_id: int, content_sha256: str
 ) -> Dict[str, Any]:
     """Resolve a unique-constraint race from the durable staged row."""
+    resolved = _resolve_committed_handoff_submission(
+        token_digest, logical_turn_id, content_sha256, require_staged=True
+    )
+    if resolved is not None:
+        return resolved
+    raise HandoffResultSubmissionError(409, "submission_effect_indeterminate")
+
+
+def _resolve_committed_handoff_submission(
+    token_digest: str,
+    logical_turn_id: int,
+    content_sha256: str,
+    *,
+    require_staged: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Classify an exact staged result from a fresh durable snapshot."""
     with SessionLocal() as db:
         terminal = _terminal_for_handoff_submission(db, token_digest)
         child_terminal_id = cast(str, terminal.id)
@@ -10299,10 +10332,14 @@ def _resolve_handoff_submission_race(
             else None
         )
         if result is None:
-            raise HandoffResultSubmissionError(409, "submission_indeterminate")
+            if require_staged:
+                raise HandoffResultSubmissionError(409, "submission_indeterminate")
+            return None
         staged = _staged_handoff_submission(db, result.id)
         if staged is None:
-            raise HandoffResultSubmissionError(409, "submission_effect_indeterminate")
+            if require_staged:
+                raise HandoffResultSubmissionError(409, "submission_effect_indeterminate")
+            return None
         if hmac.compare_digest(cast(str, staged.content_sha256), content_sha256):
             return _submission_response(
                 result.id, cast(str, staged.content_sha256), True, result.status
@@ -10310,7 +10347,7 @@ def _resolve_handoff_submission_race(
         _raise_submission_conflict(
             db, result.id, child_terminal_id, logical_turn_id, content_sha256
         )
-    raise AssertionError("unreachable")
+    return None
 
 
 def _staged_handoff_submission(

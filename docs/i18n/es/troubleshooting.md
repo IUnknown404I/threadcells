@@ -1,6 +1,7 @@
 ---
-source_path: docs/TROUBLESHOOTING.md
-source_sha256: c422c6a5847d601b8583045e4c41220ef7e8ab70410c1f775d9a7f603c0f0b61
+slug: troubleshooting
+source: docs/TROUBLESHOOTING.md
+source_sha256: sha256:5e66928bd64c8837b5480d71160eb1548dbe9369be3069800fcf18e0f1e99836
 ---
 
 # Solución de problemas
@@ -54,6 +55,10 @@ Lea el motivo de la puerta. Proporcione la decisión solicitada solo si se trata
 ## Resultado no incorporado
 
 Confirme que el hijo registró un resultado duradero y que se entregó al padre correcto. El padre debe leer/usar el resultado inmutable y después confirmar la incorporación. La repetición tras reinicio puede volver a entregar un resultado no confirmado; no lo aplique dos veces.
+
+## La nueva entrada del propietario permanece en cola detrás de un flujo de trabajo cerrado
+
+Reinicie una vez el runtime mediante el procedimiento compatible e inspeccione las identidades exactas del flujo de trabajo y de Inbox. Las versiones actuales reconcilian un transporte ordinario de Inbox pendiente cuyo flujo de trabajo asociado ya no está abierto, y después permiten que continúe el turno más reciente del propietario en un flujo de trabajo abierto. No vuelva a asociar ni edite manualmente la fila de Inbox; conserve la base de datos e informe de un defecto si el transporte obsoleto sigue pendiente o si algún payload cruza la identidad del flujo de trabajo.
 
 ## Autorización de operador no configurada
 

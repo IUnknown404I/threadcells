@@ -1,6 +1,7 @@
 ---
-source_path: docs/HOUSEKEEPING.md
-source_sha256: 9fec11f36bc4e4ba02212122e6ff393b8cea51beed5819e3dbe0987b205b1841
+slug: housekeeping
+source: docs/HOUSEKEEPING.md
+source_sha256: sha256:257f62fb21c7538031f3600d65b7d5eb152d905024b11135637a1cafa633d84d
 ---
 
 # Housekeeping
@@ -43,17 +44,17 @@ Los despliegues también pueden nombrar prefijos exactos de caché propiedad de 
 Un plan dry-run es de solo lectura. Cada candidato incluye su categoría, identidad/huella canónica, acción propuesta, bytes totales, bytes estimados a recuperar cuando se conocen, motivo de retención y motivo de protección. Los resúmenes por clase informan por separado las superficies accionables/recuperables y las conservadas/protegidas, para que una clase protegida grande no quede oculta como cero bytes.
 
 ```text
-Inspeccionar estado actual
+Inspect current state
       ↓
-Crear plan inmutable y plan_id
-      ↓ revisión del operador
-Ejecutar plan_id exacto
+Build immutable plan and plan_id
+      ↓ operator reviews
+Execute exact plan_id
       ↓
-Reconstruir conjunto protegido bajo bloqueo
+Rebuild protected set under lock
       ↓
-Revalidar cada candidato inmediatamente antes de actuar
+Revalidate each candidate immediately before action
       ↓
-Informar elementos recuperados, omitidos, modificados y fallidos
+Report reclaimed, skipped, changed, and failed items
 ```
 
 Si el conjunto de candidatos cambia entre la planificación y la ejecución, la ejecución manual rechaza el plan obsoleto sin cambiar recursos. Cada candidato restante se comprueba de nuevo justo antes de la mutación.
@@ -80,6 +81,8 @@ El conjunto protegido combina terminales y worktrees activos, propiedad de escri
 
 Los detalles importan para la implementación, pero la regla para el operador es sencilla: **la ausencia de evidencia no es evidencia de que un recurso esté muerto**. Si la protección no puede establecerse con precisión, Housekeeping lo omite e informa el motivo.
 
+La autoridad protegida del flujo de trabajo se deriva de la identidad duradera del terminal raíz. La reconciliación de inicio y la frecuente cancelan los flujos de trabajo huérfanos que no son de recuperación y cuyo terminal raíz ya no existe, y después regeneran el conjunto protegido. Hasta que se reconcilie esa relación, la retirada de worktrees falla de forma cerrada para todo el inventario incierto.
+
 ## Programaciones
 
 Settings → Housekeeping separa política, programación, planificación, ejecución e informes. Las formas de programación compatibles incluyen:
@@ -95,6 +98,8 @@ Los cambios de Housekeeping y la ejecución manual están protegidos por [Autori
 ## Comportamiento ante presión de disco
 
 En YELLOW, inspeccione el crecimiento y ejecute un plan en seco. En RED, ThreadCells puede admitir un arrendamiento pesado de Housekeeping seguro para recuperación aunque se pueda denegar el trabajo pesado ordinario. Los planes de presión ordenan primero los mayores candidatos demostrablemente seguros y muestran las clases protegidas dominantes, pero la limpieza sigue contando como una ejecución Heavy y no elude ninguna protección de candidatos.
+
+YELLOW es un estado de inspección, no un permiso para fabricar bytes recuperables. Cuando todas las clases grandes restantes estén protegidas, cree capacidad externa o documente la superficie protegida en lugar de debilitar los criterios.
 
 La recuperación de caché de paquetes se informa como desconocida/cero cuando el comando no puede demostrar los bytes; ThreadCells no anuncia recuperación estimada.
 

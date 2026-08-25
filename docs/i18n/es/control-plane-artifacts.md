@@ -1,6 +1,7 @@
 ---
-source_path: docs/CONTROL_PLANE_ARTIFACTS.md
-source_sha256: bbb3ff2ed634050407d78c0fff79f097ecc2c8f29b783d422a52469c624fd8b7
+slug: control-plane-artifacts
+source: docs/CONTROL_PLANE_ARTIFACTS.md
+source_sha256: sha256:bbb3ff2ed634050407d78c0fff79f097ecc2c8f29b783d422a52469c624fd8b7
 ---
 
 # Artefactos del plano de control y flujo de trabajo con IA

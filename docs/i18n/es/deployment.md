@@ -1,6 +1,7 @@
 ---
-source_path: docs/DEPLOYMENT.md
-source_sha256: cee85798400280ba54daab0d4a766fdbb7c57b3c5fb820b3e1f1c0d6ae4b3de9
+slug: deployment
+source: docs/DEPLOYMENT.md
+source_sha256: sha256:0a1e81cb71e94e5fe3a400baf7d83caaca2b9abf0a13cc7c7fcd19e62761e835
 ---
 
 # Despliegue local
@@ -14,7 +15,7 @@ Compile a partir de un commit de código fuente limpio y exacto; después verifi
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
 python3 scripts/verify_local_candidate.py \
-  --candidate "$PWD/threadcells-candidate/threadcells-0.1.0a2-local"
+  --candidate "$PWD/threadcells-candidate/threadcells-0.2.0a1-local"
 ```
 
 El candidato debe contener código Python, activos Web empaquetados, el paquete Docs incluido en la lista permitida, identidad de compilación, checksums y metadatos de release de la misma revisión.

@@ -1,6 +1,7 @@
 ---
-source_path: docs/BACKUP_AND_RESTORE.md
-source_sha256: 3e62f0b30f78fa32bfab783c5fa15e89b9646e2c6de211b8c8ddec3b05b53da1
+slug: backup-and-restore
+source: docs/BACKUP_AND_RESTORE.md
+source_sha256: sha256:3e62f0b30f78fa32bfab783c5fa15e89b9646e2c6de211b8c8ddec3b05b53da1
 ---
 
 # Copia de seguridad y restauración

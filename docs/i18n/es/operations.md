@@ -1,6 +1,7 @@
 ---
-source_path: docs/OPERATIONS.md
-source_sha256: 730fb5dd4e2411ee28adea1e7df752307512484828c2861f015e24ddfd031573
+slug: operations
+source: docs/OPERATIONS.md
+source_sha256: sha256:c1b5d152c38e373d316a3a27b417872f4f6943ad591e69ed7eeb9cf3e030ec27
 ---
 
 # Operaciones
@@ -48,6 +49,8 @@ Use Graceful Exit para el ciclo de vida del proveedor. Matar tmux o eliminar fil
 ## Higiene de sesiones y flujos de trabajo
 
 Un hijo que ha salido no es desechable de inmediato. Confirme que su resultado duradero se haya entregado, leído, incorporado y confirmado. Después retire sus recursos de runtime conservando el historial.
+
+**Add Agent** se dirige a la vida útil estable de la sesión seleccionada. La eliminación de sesiones históricas y de terminales finalizados se dirige a identidades duraderas exactas y se rechaza mientras permanezcan un runtime activo, un flujo de trabajo abierto o de recuperación, un writer lease, un resultado pendiente u otra relación protegida.
 
 Un mensaje final del proveedor no cierra una misión abierta. Complete explícitamente un flujo de trabajo de nivel superior solo después de terminar todo el trabajo autorizado por el propietario. Use la puerta del propietario solo ante un límite real de decisión.
 

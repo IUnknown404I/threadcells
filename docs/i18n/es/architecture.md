@@ -1,6 +1,7 @@
 ---
-source_path: docs/ARCHITECTURE.md
-source_sha256: 0fa43fdddc696e3203367cd85ab6b0ca6ec9d4c03753ebdfea3fc1d336507447
+slug: architecture
+source: docs/ARCHITECTURE.md
+source_sha256: sha256:0fa43fdddc696e3203367cd85ab6b0ca6ec9d4c03753ebdfea3fc1d336507447
 ---
 
 # Arquitectura
@@ -12,18 +13,18 @@ Empiece por [Conceptos básicos](CONCEPTS.md) si los términos siguientes le res
 ## Vista del sistema
 
 ```text
-Navegador o PWA instalada
-        ↓ HTTP / WebSocket en loopback
-Servidor FastAPI de ThreadCells
-  ├── estado duradero de SQLite
-  ├── registros de proveedores/perfiles
-  ├── servicio de flujos de trabajo y resultados
-  ├── servicio de capacidad y Housekeeping
-  └── control de tmux/adaptadores de proveedores
+Browser or installed PWA
+        ↓ HTTP / WebSocket on loopback
+FastAPI ThreadCells server
+  ├── SQLite durable state
+  ├── provider/profile registries
+  ├── workflow and result service
+  ├── capacity and Housekeeping service
+  └── tmux/provider adapter control
                ↓
-        CLI nativas de proveedores
+        Native provider CLIs
                ↓
-      Repositorios/worktrees Git
+      Git repositories/worktrees
 ```
 
 ## Servidor y UI web

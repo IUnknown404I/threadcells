@@ -725,6 +725,10 @@ class WorkflowTurnModel(Base):
     provider_reconnect_requested_at = Column(DateTime, nullable=True)
     provider_reconnect_claim_token = Column(String, nullable=True)
     provider_reconnect_resume_identity = Column(String, nullable=True)
+    # An execution-resume turn transfers authority away from an interrupted
+    # admitted turn without reusing that turn's receipt.  The parent link is
+    # audit history; the workflow's active_turn_id remains the live fence.
+    resume_parent_turn_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now)
 
@@ -792,6 +796,12 @@ class WorkflowTurnReceiptModel(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     workflow_turn_id = Column(Integer, nullable=False)
     receiver_terminal_id = Column(String, nullable=False)
+    # Only the model execution that received this opaque capability may
+    # transfer an interrupted turn to a fresh admitted continuation. Store
+    # only its digest and consume it exactly once.
+    resume_token_sha256 = Column(String, nullable=True)
+    resumed_by_turn_id = Column(Integer, nullable=True)
+    resumed_at = Column(DateTime, nullable=True)
     consumed_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
@@ -2255,6 +2265,17 @@ def _migrate_workflow_turn_columns() -> None:
             conn.execute(
                 "ALTER TABLE workflow_turns " "ADD COLUMN provider_reconnect_resume_identity TEXT"
             )
+        if "resume_parent_turn_id" not in columns:
+            conn.execute("ALTER TABLE workflow_turns ADD COLUMN resume_parent_turn_id INTEGER")
+        receipt_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(workflow_turn_receipts)")
+        }
+        if "resume_token_sha256" not in receipt_columns:
+            conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resume_token_sha256 TEXT")
+        if "resumed_by_turn_id" not in receipt_columns:
+            conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resumed_by_turn_id INTEGER")
+        if "resumed_at" not in receipt_columns:
+            conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resumed_at DATETIME")
         conn.commit()
         conn.close()
     except Exception as exc:
@@ -5205,6 +5226,7 @@ TURN_CLAIMED = "claimed"
 TURN_SENT = "sent"
 TURN_FINISHED = "finished"
 TURN_CANCELLED = "cancelled"
+WORKFLOW_EXECUTION_RESUME_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{40,64}$")
 # A provider-final observation for a turn whose receiver never admitted the
 # envelope is not progress.  Keep this distinct from ``None`` (no workflow or
 # no sendable turn) so callers and deterministic tests can prove that the
@@ -6439,17 +6461,20 @@ def claim_handoff_result_batch_for_inbox(
         }
 
 
-def claim_workflow_turn_receipt(
-    receiver_terminal_id: str, logical_turn_id: int, now: Optional[datetime] = None
-) -> bool:
-    """Atomically admit one receiver-side logical turn before model work.
+def claim_or_resume_workflow_turn_receipt(
+    receiver_terminal_id: str,
+    logical_turn_id: int,
+    resume_token: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Admit a new turn or transfer an interrupted admitted execution.
 
     A sender can die after tmux accepts a continuation and retry the same
-    stable ``logical-turn`` envelope.  This receipt deliberately records the
-    *receiver's* one semantic admission, independent of any physical sends.
-    There is no lease to reclaim: once model work has been admitted it is an
-    irreversible effect, so a duplicate must be rejected rather than allowed
-    to create a second supervisor turn.
+    stable ``logical-turn`` envelope. A replay without the opaque resume token
+    is always rejected. If the admitted model execution itself is interrupted,
+    its one-use token transfers authority to a new durable logical turn. This
+    fences the old execution through ``active_turn_id`` while keeping every
+    prior effect key visible in the resumed turn.
 
     The eligibility update and receipt insert share one write transaction. A
     terminal transition that wins first makes the update fail; a receipt that
@@ -6457,8 +6482,10 @@ def claim_workflow_turn_receipt(
     idempotent across restarts and duplicate arrivals.
     """
     _ensure_workflow_schema()
+    _ensure_provider_execution_schema()
     now = now or datetime.now()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         existing = (
             db.query(WorkflowTurnReceiptModel)
             .filter(
@@ -6468,7 +6495,138 @@ def claim_workflow_turn_receipt(
             .first()
         )
         if existing is not None:
-            return False
+            workflow = _open_workflow(db, receiver_terminal_id, create=False)
+            token_digest = (
+                hashlib.sha256(resume_token.encode("utf-8", "strict")).hexdigest()
+                if resume_token
+                and WORKFLOW_EXECUTION_RESUME_TOKEN_PATTERN.fullmatch(resume_token) is not None
+                else None
+            )
+            if (
+                workflow is None
+                or workflow.status != WORKFLOW_OPEN
+                or workflow.active_turn_id != logical_turn_id
+                or existing.resumed_by_turn_id is not None
+                or not token_digest
+                or not existing.resume_token_sha256
+                or not hmac.compare_digest(str(existing.resume_token_sha256), token_digest)
+            ):
+                db.rollback()
+                return {"accepted": False, "reason": "duplicate_or_closed_workflow"}
+            interrupted = db.get(WorkflowTurnModel, logical_turn_id)
+            if (
+                interrupted is None
+                or interrupted.workflow_id != workflow.id
+                or interrupted.state != TURN_SENT
+            ):
+                db.rollback()
+                return {"accepted": False, "reason": "duplicate_or_closed_workflow"}
+
+            resumed = WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="execution_resume",
+                dedupe_key=f"execution-resume:{logical_turn_id}",
+                payload="Resume interrupted admitted model execution.",
+                state=TURN_SENT,
+                attempt_count=0,
+                claim_generation=0,
+                provider_processing_observed_at=now,
+                resume_parent_turn_id=logical_turn_id,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(resumed)
+            db.flush()
+
+            # Provider capacity is execution authority for the active logical
+            # turn, not merely a terminal-wide counter.  Transfer an exact
+            # interrupted-turn lease under the same BEGIN IMMEDIATE fence as
+            # active_turn_id.  Releasing and reacquiring here would expose a
+            # capacity race; accepting a lease owned by any other turn would
+            # strand the resumed execution with split authority.
+            provider_lease = db.get(ProviderExecutionLeaseModel, receiver_terminal_id)
+            if provider_lease is not None:
+                if provider_lease.workflow_turn_id != logical_turn_id:
+                    db.rollback()
+                    return {
+                        "accepted": False,
+                        "reason": "provider_execution_lease_conflict",
+                    }
+                transferred = (
+                    db.query(ProviderExecutionLeaseModel)
+                    .filter(
+                        ProviderExecutionLeaseModel.terminal_id == receiver_terminal_id,
+                        ProviderExecutionLeaseModel.workflow_turn_id == logical_turn_id,
+                    )
+                    .update(
+                        {ProviderExecutionLeaseModel.workflow_turn_id: resumed.id},
+                        synchronize_session=False,
+                    )
+                )
+                if transferred != 1:
+                    db.rollback()
+                    return {
+                        "accepted": False,
+                        "reason": "provider_execution_lease_conflict",
+                    }
+
+            # A fresh logical turn fences the interrupted model invocation.
+            # Mirror its effect ledger so retrying an already-completed or
+            # indeterminate operation cannot acquire a new capability merely
+            # because execution resumed. Only proven pre-effect rejections
+            # remain reclaimable.
+            prior_effects = (
+                db.query(WorkflowEffectModel)
+                .filter(
+                    WorkflowEffectModel.workflow_id == workflow.id,
+                    WorkflowEffectModel.workflow_turn_id == logical_turn_id,
+                )
+                .all()
+            )
+            for prior in prior_effects:
+                db.add(
+                    WorkflowEffectModel(
+                        workflow_id=workflow.id,
+                        workflow_turn_id=resumed.id,
+                        effect_kind=prior.effect_kind,
+                        effect_key=prior.effect_key,
+                        state=("indeterminate" if prior.state == "claimed" else prior.state),
+                        claim_token=uuid.uuid4().hex,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+
+            next_resume_token = secrets.token_urlsafe(32)
+            db.add(
+                WorkflowTurnReceiptModel(
+                    workflow_turn_id=resumed.id,
+                    receiver_terminal_id=receiver_terminal_id,
+                    resume_token_sha256=hashlib.sha256(
+                        next_resume_token.encode("utf-8", "strict")
+                    ).hexdigest(),
+                    consumed_at=now,
+                )
+            )
+            interrupted.state = TURN_FINISHED
+            interrupted.updated_at = now
+            existing.resumed_by_turn_id = resumed.id
+            existing.resumed_at = now
+            workflow.active_turn_id = resumed.id
+            workflow.updated_at = now
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                return {"accepted": False, "reason": "duplicate_or_closed_workflow"}
+            return {
+                "accepted": True,
+                "resumed": True,
+                "logical_turn_id": int(resumed.id),
+                "resumed_from_logical_turn_id": logical_turn_id,
+                "resume_token": next_resume_token,
+                "reason": "interrupted_execution_resumed",
+            }
 
         # Acquire a short write fence against terminal closure before adding
         # the unique receipt.  This is not a queue transition; it only proves
@@ -6489,11 +6647,15 @@ def claim_workflow_turn_receipt(
         )
         if eligible != 1:
             db.rollback()
-            return False
+            return {"accepted": False, "reason": "duplicate_or_closed_workflow"}
+        next_resume_token = secrets.token_urlsafe(32)
         db.add(
             WorkflowTurnReceiptModel(
                 workflow_turn_id=logical_turn_id,
                 receiver_terminal_id=receiver_terminal_id,
+                resume_token_sha256=hashlib.sha256(
+                    next_resume_token.encode("utf-8", "strict")
+                ).hexdigest(),
                 consumed_at=now,
             )
         )
@@ -6503,8 +6665,25 @@ def claim_workflow_turn_receipt(
             # A concurrent physical duplicate inserted the same durable
             # receipt. Its supervisor turn owns the only logical effect.
             db.rollback()
-            return False
-        return True
+            return {"accepted": False, "reason": "duplicate_or_closed_workflow"}
+        return {
+            "accepted": True,
+            "resumed": False,
+            "logical_turn_id": logical_turn_id,
+            "resume_token": next_resume_token,
+            "reason": "admitted",
+        }
+
+
+def claim_workflow_turn_receipt(
+    receiver_terminal_id: str, logical_turn_id: int, now: Optional[datetime] = None
+) -> bool:
+    """Backward-compatible boolean admission for internal callers and tests."""
+    return bool(
+        claim_or_resume_workflow_turn_receipt(receiver_terminal_id, logical_turn_id, now=now)[
+            "accepted"
+        ]
+    )
 
 
 def has_admitted_workflow_turn(receiver_terminal_id: str, logical_turn_id: int) -> bool:
@@ -10018,9 +10197,26 @@ def _submit_handoff_result_v1_once(
                 _raise_submission_conflict(
                     db, existing_result.id, child_terminal_id, logical_turn_id, content_sha256
                 )
-        assignment, child_workflow, result = _submission_relation(
-            db, child_terminal_id, logical_turn_id
-        )
+        try:
+            assignment, child_workflow, result = _submission_relation(
+                db, child_terminal_id, logical_turn_id
+            )
+        except HandoffResultSubmissionError as error:
+            if error.code != "turn_not_admitted":
+                raise
+            # The winning submit finalizes the child workflow in the same
+            # transaction as its staged result.  A concurrent loser can have
+            # read the pre-finalization result and then observe the terminal
+            # workflow before its original transaction sees the staged row.
+            # Drop that snapshot and classify only an exact committed result;
+            # a genuinely stale turn still retains turn_not_admitted.
+            db.rollback()
+            resolved = _resolve_committed_handoff_submission(
+                token_digest, logical_turn_id, content_sha256
+            )
+            if resolved is not None:
+                return resolved
+            raise
 
         existing = db.query(DelegationResultSubmissionModel).filter_by(result_id=result.id).first()
         if existing is not None:
@@ -10108,6 +10304,22 @@ def _resolve_handoff_submission_race(
     token_digest: str, logical_turn_id: int, content_sha256: str
 ) -> Dict[str, Any]:
     """Resolve a unique-constraint race from the durable staged row."""
+    resolved = _resolve_committed_handoff_submission(
+        token_digest, logical_turn_id, content_sha256, require_staged=True
+    )
+    if resolved is not None:
+        return resolved
+    raise HandoffResultSubmissionError(409, "submission_effect_indeterminate")
+
+
+def _resolve_committed_handoff_submission(
+    token_digest: str,
+    logical_turn_id: int,
+    content_sha256: str,
+    *,
+    require_staged: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Classify an exact staged result from a fresh durable snapshot."""
     with SessionLocal() as db:
         terminal = _terminal_for_handoff_submission(db, token_digest)
         child_terminal_id = cast(str, terminal.id)
@@ -10120,10 +10332,14 @@ def _resolve_handoff_submission_race(
             else None
         )
         if result is None:
-            raise HandoffResultSubmissionError(409, "submission_indeterminate")
+            if require_staged:
+                raise HandoffResultSubmissionError(409, "submission_indeterminate")
+            return None
         staged = _staged_handoff_submission(db, result.id)
         if staged is None:
-            raise HandoffResultSubmissionError(409, "submission_effect_indeterminate")
+            if require_staged:
+                raise HandoffResultSubmissionError(409, "submission_effect_indeterminate")
+            return None
         if hmac.compare_digest(cast(str, staged.content_sha256), content_sha256):
             return _submission_response(
                 result.id, cast(str, staged.content_sha256), True, result.status
@@ -10131,7 +10347,7 @@ def _resolve_handoff_submission_race(
         _raise_submission_conflict(
             db, result.id, child_terminal_id, logical_turn_id, content_sha256
         )
-    raise AssertionError("unreachable")
+    return None
 
 
 def _staged_handoff_submission(
@@ -11161,7 +11377,7 @@ def acknowledge_child_assignment_result_outcome(
     parent_terminal_id: str,
     child_terminal_id: Optional[str] = None,
     result_id: Optional[str] = None,
-) -> Dict[str, Optional[str] | bool]:
+) -> Dict[str, Any]:
     """Apply one acknowledgement and return its durable typed outcome.
 
     The legacy boolean helper above remains for in-process compatibility. MCP
@@ -11194,16 +11410,29 @@ def acknowledge_child_assignment_result_outcome(
                 DelegationResultModel,
                 DelegationResultModel.child_assignment_id == ChildAssignmentModel.id,
             ).filter(DelegationResultModel.id == result_id)
-        elif child_terminal_id:
+        if child_terminal_id:
             query = query.filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
         assignment = query.first()
         if assignment is None:
             return {
                 "accepted": False,
-                "reason_code": "WRONG_DISPATCH_MODE",
+                "reason_code": (
+                    "RESULT_IDENTITY_MISMATCH"
+                    if result_id and child_terminal_id
+                    else "WRONG_DISPATCH_MODE"
+                ),
                 "workflow_state": parent_workflow.status,
                 "assignment_status": None,
             }
+        canonical_result = (
+            db.query(DelegationResultModel)
+            .filter(DelegationResultModel.child_assignment_id == assignment.id)
+            .first()
+        )
+        canonical_identity = {
+            "child_terminal_id": assignment.child_terminal_id,
+            "result_id": canonical_result.id if canonical_result is not None else None,
+        }
         if assignment.status in (
             ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
             ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value,
@@ -11213,6 +11442,7 @@ def acknowledge_child_assignment_result_outcome(
                 "reason_code": "RESULT_ALREADY_ACKNOWLEDGED",
                 "workflow_state": parent_workflow.status,
                 "assignment_status": assignment.status,
+                **canonical_identity,
             }
         if assignment.status in (
             ChildAssignmentStatus.RESULT_QUEUED.value,
@@ -11223,6 +11453,7 @@ def acknowledge_child_assignment_result_outcome(
                 "reason_code": "RESULT_NOT_DELIVERED",
                 "workflow_state": parent_workflow.status,
                 "assignment_status": assignment.status,
+                **canonical_identity,
             }
         if assignment.status not in (
             ChildAssignmentStatus.RESULT_DELIVERED.value,
@@ -11233,6 +11464,7 @@ def acknowledge_child_assignment_result_outcome(
                 "reason_code": "WRONG_DISPATCH_MODE",
                 "workflow_state": parent_workflow.status,
                 "assignment_status": assignment.status,
+                **canonical_identity,
             }
         assignment.status = (
             ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value
@@ -11246,6 +11478,7 @@ def acknowledge_child_assignment_result_outcome(
             "reason_code": None,
             "workflow_state": parent_workflow.status,
             "assignment_status": assignment.status,
+            **canonical_identity,
         }
 
 
@@ -11270,16 +11503,36 @@ def describe_child_assignment_acknowledgement(
                 DelegationResultModel,
                 DelegationResultModel.child_assignment_id == ChildAssignmentModel.id,
             ).filter(DelegationResultModel.id == result_id)
-        elif child_terminal_id:
-            query = query.filter_by(child_terminal_id=child_terminal_id)
+        if child_terminal_id:
+            query = query.filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
         assignment = query.first()
         if assignment is None:
-            return {"reason_code": "WRONG_DISPATCH_MODE", "workflow_state": workflow.status}
+            return {
+                "reason_code": (
+                    "RESULT_IDENTITY_MISMATCH"
+                    if result_id and child_terminal_id
+                    else "WRONG_DISPATCH_MODE"
+                ),
+                "workflow_state": workflow.status,
+            }
+        canonical_result = (
+            db.query(DelegationResultModel)
+            .filter(DelegationResultModel.child_assignment_id == assignment.id)
+            .first()
+        )
+        canonical_identity = {
+            "child_terminal_id": assignment.child_terminal_id,
+            "result_id": canonical_result.id if canonical_result is not None else None,
+        }
         if assignment.status in (
             ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
             ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value,
         ):
-            return {"reason_code": "RESULT_ALREADY_ACKNOWLEDGED", "workflow_state": workflow.status}
+            return {
+                "reason_code": "RESULT_ALREADY_ACKNOWLEDGED",
+                "workflow_state": workflow.status,
+                **canonical_identity,
+            }
         if assignment.status in (
             ChildAssignmentStatus.RESULT_QUEUED.value,
             ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value,
@@ -11288,8 +11541,13 @@ def describe_child_assignment_acknowledgement(
                 "reason_code": "RESULT_NOT_DELIVERED",
                 "workflow_state": workflow.status,
                 "assignment_status": assignment.status,
+                **canonical_identity,
             }
-        return {"reason_code": "WRONG_DISPATCH_MODE", "workflow_state": workflow.status}
+        return {
+            "reason_code": "WRONG_DISPATCH_MODE",
+            "workflow_state": workflow.status,
+            **canonical_identity,
+        }
 
 
 def requeue_unacknowledged_child_assignment_results() -> int:

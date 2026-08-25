@@ -296,6 +296,44 @@ describe('session creation and canonical ordering', () => {
     await waitFor(() => expect(screen.queryByTestId(`agent-session-detail-${sessionB.id}`)).not.toBeInTheDocument())
   })
 
+  it('shows each Agents session total next to its status without disturbing row actions', async () => {
+    const sessionA = { ...session('cao-count-a', '200'), status: 'active' }
+    const sessionB = { ...session('cao-count-b', '100'), status: 'history' }
+    const terminalsBySession = {
+      [sessionA.name]: [
+        { id: 'count-a-1', tmux_session: sessionA.name, tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null },
+        { id: 'count-a-2', tmux_session: sessionA.name, tmux_window: '1', provider: 'codex', agent_profile: 'reviewer', last_active: null },
+      ],
+      [sessionB.name]: [
+        { id: 'count-b-1', tmux_session: sessionB.name, tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null },
+      ],
+    }
+    vi.spyOn(api, 'getSession').mockImplementation(async name => ({
+      session: name === sessionA.name ? sessionA : sessionB,
+      terminals: terminalsBySession[name as keyof typeof terminalsBySession],
+    }) as never)
+    useStore.setState({ sessions: [sessionA, sessionB] })
+    render(<AgentPanel />)
+
+    const rowA = await screen.findByTestId(`agent-session-${sessionA.id}`)
+    const rowB = screen.getByTestId(`agent-session-${sessionB.id}`)
+    const statusA = within(rowA).getByText('active')
+    const countA = within(rowA).getByTestId(`agent-session-count-${sessionA.id}`)
+    const statusB = within(rowB).getByText('history')
+    const countB = within(rowB).getByTestId(`agent-session-count-${sessionB.id}`)
+
+    expect(countA).toHaveTextContent('Agents: 2')
+    expect(countB).toHaveTextContent('Agents: 1')
+    expect(statusA.nextElementSibling).toBe(countA)
+    expect(statusB.nextElementSibling).toBe(countB)
+    expect(countA).toHaveClass('shrink-0', 'text-xs', 'text-gray-500')
+
+    fireEvent.click(within(rowA).getByRole('button', { name: `Expand ${sessionDisplayName(sessionA.name)}` }))
+    expect(await within(rowA).findByTestId(`agent-session-detail-${sessionA.id}`)).toBeInTheDocument()
+    expect(within(rowA).getByTestId(`agent-session-count-${sessionA.id}`)).toHaveTextContent('Agents: 2')
+    expect(within(rowA).getByTitle('Delete session')).toBeInTheDocument()
+  })
+
   it('does not add a session-name field to Add Agent', async () => {
     useStore.setState({
       sessions: [session('cao-existing', '100')],

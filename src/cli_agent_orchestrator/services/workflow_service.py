@@ -175,11 +175,14 @@ def admission_envelope(turn_id: int) -> str:
         f"[CAO workflow input: logical-turn={turn_id}]\n"
         "Before any model-dependent work, call "
         f"claim_workflow_turn_receipt(logical_turn_id={turn_id}). "
-        "If it returns accepted=false, this is a duplicate or a closed workflow: "
-        "stop without creating another supervisor effect. Every privileged CAO "
-        "operation (assign, handoff, send_message, acknowledgement, or workflow "
-        "terminal transition) must include logical_turn_id="
-        f"{turn_id}; the MCP runtime rejects duplicate or unadmitted effects.\n\n"
+        "Preserve the returned resume_token across context compaction. If this admitted "
+        "model execution is interrupted before its work is complete, call the same tool "
+        "with that resume_token; a safe resume receives a new logical_turn_id. If it "
+        "returns accepted=false, this is a duplicate or a closed workflow: stop without "
+        "creating another supervisor effect. Every privileged CAO operation (assign, "
+        "handoff, send_message, acknowledgement, or workflow terminal transition) must "
+        "use the logical_turn_id returned by the successful receipt call (normally "
+        f"{turn_id}); the MCP runtime rejects duplicate or unadmitted effects.\n\n"
     )
     return envelope
 

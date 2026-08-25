@@ -1,11 +1,20 @@
+'use client'
+
 import { Book, Github } from '@/components/Icons'
+import { usePathname } from 'next/navigation'
 import { Mark } from '@/components/Mark'
-import { assetPath, site } from '@/lib/site'
+import { assetPath, basePath, site } from '@/lib/site'
 import { docsPath, landingPath, localeCopy, locales, localizedPath, type Locale } from '@/lib/locales'
 
 export function SiteHeader({ locale = 'en', routePath = '/' }: { locale?: Locale; routePath?: string }) {
   const copy = localeCopy[locale]
-  const localeHref = (next: Locale) => assetPath(localizedPath(next, routePath))
+  const pathname = usePathname() || routePath
+  const withoutBase = basePath && pathname.startsWith(basePath) ? pathname.slice(basePath.length) || '/' : pathname
+  const currentPrefix = locale === 'en' ? '' : `/${locale}`
+  const semanticPath = currentPrefix && (withoutBase === currentPrefix || withoutBase.startsWith(`${currentPrefix}/`))
+    ? withoutBase.slice(currentPrefix.length) || '/'
+    : withoutBase
+  const localeHref = (next: Locale) => assetPath(localizedPath(next, semanticPath))
   return (
     <header className="site-header">
       <div className="header-inner">
@@ -22,7 +31,7 @@ export function SiteHeader({ locale = 'en', routePath = '/' }: { locale?: Locale
           <details className="language-menu">
             <summary aria-label={copy.language}>{copy.code}</summary>
             <div role="menu" aria-label={copy.language}>
-              {locales.map(next => <a key={next} role="menuitem" href={localeHref(next)} aria-current={next === locale ? 'page' : undefined}>{localeCopy[next].name}</a>)}
+              {locales.map(next => <a key={next} role="menuitem" href={localeHref(next)} hrefLang={localeCopy[next].htmlLang} aria-current={next === locale ? 'page' : undefined}>{localeCopy[next].name}</a>)}
             </div>
           </details>
           <a className="header-icon-link header-docs-link" href={assetPath(docsPath(locale))} aria-label={copy.docs}><Book /> <span>{copy.docs}</span></a>

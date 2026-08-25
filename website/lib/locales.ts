@@ -185,7 +185,8 @@ export function localizedPath(locale: Locale, path = '/') {
 }
 
 export function landingPath(locale: Locale, anchor = '') {
-  return `${localizedPath(locale)}/${anchor}`.replace(/\/\/$/, '/')
+  const root = localizedPath(locale).replace(/\/$/, '')
+  return `${root}/${anchor}` || '/'
 }
 
 export function docsPath(locale: Locale, slug?: string) {

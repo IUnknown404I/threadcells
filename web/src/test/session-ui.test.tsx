@@ -324,8 +324,8 @@ describe('session creation and canonical ordering', () => {
 
     expect(countA).toHaveTextContent('Agents: 2')
     expect(countB).toHaveTextContent('Agents: 1')
-    expect(statusA.nextElementSibling).toBe(countA)
-    expect(statusB.nextElementSibling).toBe(countB)
+    expect(countA.nextElementSibling).toBe(statusA)
+    expect(countB.nextElementSibling).toBe(statusB)
     expect(countA).toHaveClass('shrink-0', 'text-xs', 'text-gray-500')
 
     fireEvent.click(within(rowA).getByRole('button', { name: `Expand ${sessionDisplayName(sessionA.name)}` }))

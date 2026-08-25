@@ -1,9 +1,13 @@
 """Tests for CLI Agent Orchestrator constants."""
 
 import os
-import tomllib
 from pathlib import Path
 from unittest.mock import patch
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+    import tomli as tomllib
 
 
 class TestServerConstants:
@@ -16,9 +20,7 @@ class TestServerConstants:
 
     def test_package_metadata_matches_alpha_release(self):
         project = tomllib.loads(
-            (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(
-                encoding="utf-8"
-            )
+            (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
         )["project"]
 
         assert project["version"] == "0.2.0a1"

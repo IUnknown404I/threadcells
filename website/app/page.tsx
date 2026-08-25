@@ -6,6 +6,7 @@ import { SiteHeader } from '@/components/SiteHeader'
 import { assetPath, site } from '@/lib/site'
 import { docsPath, localeAlternates, localeCopy, type Locale } from '@/lib/locales'
 import { zhCNLanding } from '@/lib/landing/zh-CN'
+import { jaLanding } from '@/lib/landing/ja'
 import type { Metadata } from 'next'
 import { canonicalUrl } from '@/lib/site'
 
@@ -68,7 +69,7 @@ export const metadata: Metadata = {
 export function LandingPage({ locale = 'en' }: { locale?: Locale }) {
   const copy = localeCopy[locale]
   const ru = locale === 'ru'
-  const localized = locale === 'zh-CN' ? zhCNLanding : null
+  const localized = locale === 'zh-CN' ? zhCNLanding : locale === 'ja' ? jaLanding : null
   const t = (english: string, russian: string) => localized?.strings[english] || (ru ? russian : english)
   const localizedCapabilities = localized ? capabilities.map((item, index) => ({ ...item, ...localized.capabilities[index] })) : ru ? [
     { icon: <Eye />, id: '01', title: 'Состояние без догадок', copy: 'Видно, какие процессы остаются в среде, выполняются, ждут, завершаются, заблокированы или действительно завершены — без догадок по вкладкам терминала.' },

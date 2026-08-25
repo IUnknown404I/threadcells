@@ -29,7 +29,15 @@ const packets: Array<[NodeId, NodeId, string]> = [
 export function ExecutionMesh({ locale = 'en' }: { locale?: Locale }) {
   const ru = locale === 'ru'
   const zh = locale === 'zh-CN'
-  const localizedNodes: MeshNode[] = zh ? [
+  const ja = locale === 'ja'
+  const localizedNodes: MeshNode[] = ja ? [
+    { id: 'owner', label: 'オーナー', meta: '意図 / 権限', state: '準備完了', x: 8, y: 48 },
+    { id: 'supervisor', label: 'スーパーバイザー', meta: 'ワークフローの起点', state: '実行中', x: 34, y: 48 },
+    { id: 'worker-03', label: 'ワーカー 03', meta: 'コンテキスト 02 / 02', state: '実行中', x: 61, y: 17 },
+    { id: 'worker-02', label: 'ワーカー 02', meta: 'コンテキスト 01 / 02', state: '完了', x: 61, y: 73 },
+    { id: 'reviewer', label: 'レビュアー', meta: '受け入れゲート', state: '準備完了', x: 83, y: 34 },
+    { id: 'result', label: '永続結果', meta: '結果 · 8A17', state: '永続化済み', x: 83, y: 73 },
+  ] : zh ? [
     { id: 'owner', label: '所有者', meta: '意图 / 权限', state: '就绪', x: 8, y: 48 },
     { id: 'supervisor', label: '监督者', meta: '工作流根', state: '运行中', x: 34, y: 48 },
     { id: 'worker-03', label: '执行者 03', meta: '上下文 02 / 02', state: '运行中', x: 61, y: 17 },
@@ -44,7 +52,11 @@ export function ExecutionMesh({ locale = 'en' }: { locale?: Locale }) {
     { id: 'reviewer', label: 'РЕВЬЮЕР', meta: 'точка приёмки', state: 'ГОТОВ', x: 83, y: 34 },
     { id: 'result', label: 'СОХРАНЁННЫЙ РЕЗУЛЬТАТ', meta: 'результат · 8A17', state: 'СОХРАНЁН', x: 83, y: 73 },
   ] : nodes
-  const meshCopy = zh ? {
+  const meshCopy = ja ? {
+    title: '実行 / tm-web-p1', live: '稼働中', state: 'ワークフロー状態の例',
+    sequenced: 'ワークフローを編成済み', supervisor: 'スーパーバイザー', flow: '意図 → ワーカー → レビュアー → 永続結果',
+    capacity: '容量テレメトリの例', resident: '常駐', provider: 'プロバイダー', work: '作業', heavy: '重い実行',
+  } : zh ? {
     title: '执行 / tm-web-p1', live: '实时', state: '示意工作流状态',
     sequenced: '工作流已编排', supervisor: '监督者', flow: '意图 → 执行者 → 审阅者 → 持久结果',
     capacity: '示意容量遥测', resident: '常驻', provider: '提供商', work: '工作', heavy: '重型执行',

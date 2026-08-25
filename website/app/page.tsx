@@ -4,7 +4,8 @@ import { ProductShot } from '@/components/ProductShot'
 import { SiteFooter } from '@/components/SiteFooter'
 import { SiteHeader } from '@/components/SiteHeader'
 import { assetPath, site } from '@/lib/site'
-import { localeAlternates, localeCopy, type Locale } from '@/lib/locales'
+import { docsPath, localeAlternates, localeCopy, type Locale } from '@/lib/locales'
+import { zhCNLanding } from '@/lib/landing/zh-CN'
 import type { Metadata } from 'next'
 import { canonicalUrl } from '@/lib/site'
 
@@ -67,17 +68,19 @@ export const metadata: Metadata = {
 export function LandingPage({ locale = 'en' }: { locale?: Locale }) {
   const copy = localeCopy[locale]
   const ru = locale === 'ru'
-  const t = (english: string, russian: string) => ru ? russian : english
-  const localizedCapabilities = ru ? [
+  const localized = locale === 'zh-CN' ? zhCNLanding : null
+  const t = (english: string, russian: string) => localized?.strings[english] || (ru ? russian : english)
+  const localizedCapabilities = localized ? capabilities.map((item, index) => ({ ...item, ...localized.capabilities[index] })) : ru ? [
     { icon: <Eye />, id: '01', title: 'Состояние без догадок', copy: 'Видно, какие процессы остаются в среде, выполняются, ждут, завершаются, заблокированы или действительно завершены — без догадок по вкладкам терминала.' },
     { icon: <GitBranch />, id: '02', title: 'Явные права на запись', copy: 'Привязывайте работу к доверенным проектам и управляемым Git worktree. Лизы на запись чётко фиксируют, кто может вносить параллельные изменения.' },
     { icon: <Layers />, id: '03', title: 'Сохранённые результаты', copy: 'Результат делегированной работы сохраняется: его можно доставить, подтвердить получение, принять и вывести из активной среды без потери истории.' },
     { icon: <Gauge />, id: '04', title: 'Рабочая среда агентов', copy: 'ThreadCells следит за нагрузкой хоста и безопасно убирает пригодные к очистке остатки сред выполнения, логов, кэша, сборок и релизов, не затрагивая активную работу и сохранённую историю.' },
   ] : capabilities
-  const localizedSteps = ru ? [['01', 'Создайте сессию', 'Выберите доверенный локальный проект и профиль агента или супервизора.'], ['02', 'Поставьте задачу', 'Супервизор делегирует связный объём работы нативным CLI-исполнителям и ревьюерам.'], ['03', 'Следите за системой', 'ThreadCells ведёт открытые процессы между обращениями к модели; сессии, worktree, ёмкость и нагрузка хоста остаются на виду.'], ['04', 'Подключайтесь по запросу', 'Результаты сохраняются. Процесс ждёт решения владельца только там, где без него действительно не обойтись.']] : steps
+  const localizedSteps = localized ? localized.steps.map((item, index) => [`0${index + 1}`, item.title, item.copy]) : ru ? [['01', 'Создайте сессию', 'Выберите доверенный локальный проект и профиль агента или супервизора.'], ['02', 'Поставьте задачу', 'Супервизор делегирует связный объём работы нативным CLI-исполнителям и ревьюерам.'], ['03', 'Следите за системой', 'ThreadCells ведёт открытые процессы между обращениями к модели; сессии, worktree, ёмкость и нагрузка хоста остаются на виду.'], ['04', 'Подключайтесь по запросу', 'Результаты сохраняются. Процесс ждёт решения владельца только там, где без него действительно не обойтись.']] : steps
+  const localizedJsonLd = { ...jsonLd, description: copy.description, featureList: localized?.jsonLdFeatures || (ru ? russianJsonLd.featureList : jsonLd.featureList) }
   return (
     <>
-      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(ru ? russianJsonLd : jsonLd).replace(/</g, '\\u003c') }} />
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(localizedJsonLd).replace(/</g, '\\u003c') }} />
       <SiteHeader locale={locale} />
       <main id="top" lang={copy.htmlLang}>
         <section className="hero section-shell" aria-labelledby="hero-title">
@@ -88,7 +91,7 @@ export function LandingPage({ locale = 'en' }: { locale?: Locale }) {
             <p className="hero-lede">{t('ThreadCells coordinates native CLI agents, keeps open workflows moving across model turns, and maintains the orchestration environment underneath them—on your own Linux host.', 'ThreadCells координирует нативных CLI-агентов, ведёт открытые процессы между обращениями к модели и поддерживает среду оркестрации на вашем Linux-хосте.')}</p>
             <div className="hero-actions">
               <a className="button button-primary" href={site.githubUrl} target="_blank" rel="noopener noreferrer"><Github /> {t('View on GitHub', 'Открыть на GitHub')} <ArrowUpRight /></a>
-              <a className="button button-secondary" href={site.docsUrl}><Book /> {t('Read the docs', 'Читать документацию')} <ArrowRight /></a>
+              <a className="button button-secondary" href={assetPath(docsPath(locale))}><Book /> {t('Read the docs', 'Читать документацию')} <ArrowRight /></a>
               <span className="hero-note"><i /> {t('Start the work. Watch the system. Step in only when it needs you.', 'Запускайте работу. Следите за системой. Подключайтесь, только когда без вас нельзя.')}</span>
             </div>
           </div>
@@ -96,7 +99,7 @@ export function LandingPage({ locale = 'en' }: { locale?: Locale }) {
         </section>
 
         <section className="signal-strip" aria-label={t('ThreadCells operating principles', 'Принципы работы ThreadCells')}>
-          {(ru ? ['СОГЛАСОВАННЫЕ ПРОЦЕССЫ', 'ЗАЩИЩЁННОЕ ОБСЛУЖИВАНИЕ', 'СОХРАНЁННАЯ ИСТОРИЯ', 'СНАЧАЛА LOOPBACK'] : ['COORDINATED WORKFLOWS', 'PROTECTED HOUSEKEEPING', 'DURABLE HISTORY', 'LOOPBACK FIRST']).map((signal, index) => (
+          {(localized?.signals || (ru ? ['СОГЛАСОВАННЫЕ ПРОЦЕССЫ', 'ЗАЩИЩЁННОЕ ОБСЛУЖИВАНИЕ', 'СОХРАНЁННАЯ ИСТОРИЯ', 'СНАЧАЛА LOOPBACK'] : ['COORDINATED WORKFLOWS', 'PROTECTED HOUSEKEEPING', 'DURABLE HISTORY', 'LOOPBACK FIRST'])).map((signal, index) => (
             <span key={signal}><small>0{index + 1}</small>{signal}<i /></span>
           ))}
         </section>
@@ -238,7 +241,7 @@ export function LandingPage({ locale = 'en' }: { locale?: Locale }) {
           <p>{t('Run the work. See the machine. Keep the result.', 'Запускайте работу. Держите хост в поле зрения. Сохраняйте результат.')}</p>
           <div className="hero-actions">
             <a className="button button-primary" href={site.githubUrl} target="_blank" rel="noopener noreferrer"><Github /> {t('View on GitHub', 'Открыть на GitHub')} <ArrowUpRight /></a>
-            <a className="button button-secondary" href={`${site.docsUrl}/getting-started`}><Book /> {t('Open Quick Setup', 'Открыть Quick Setup')} <ArrowRight /></a>
+            <a className="button button-secondary" href={assetPath(docsPath(locale, 'getting-started'))}><Book /> {t('Open Quick Setup', 'Открыть Quick Setup')} <ArrowRight /></a>
           </div>
         </section>
       </main>

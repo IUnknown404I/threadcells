@@ -28,7 +28,15 @@ const packets: Array<[NodeId, NodeId, string]> = [
 
 export function ExecutionMesh({ locale = 'en' }: { locale?: Locale }) {
   const ru = locale === 'ru'
-  const localizedNodes: MeshNode[] = ru ? [
+  const zh = locale === 'zh-CN'
+  const localizedNodes: MeshNode[] = zh ? [
+    { id: 'owner', label: '所有者', meta: '意图 / 权限', state: '就绪', x: 8, y: 48 },
+    { id: 'supervisor', label: '监督者', meta: '工作流根', state: '运行中', x: 34, y: 48 },
+    { id: 'worker-03', label: '执行者 03', meta: '上下文 02 / 02', state: '运行中', x: 61, y: 17 },
+    { id: 'worker-02', label: '执行者 02', meta: '上下文 01 / 02', state: '已完成', x: 61, y: 73 },
+    { id: 'reviewer', label: '审阅者', meta: '验收关卡', state: '就绪', x: 83, y: 34 },
+    { id: 'result', label: '持久结果', meta: '结果 · 8A17', state: '已持久化', x: 83, y: 73 },
+  ] : ru ? [
     { id: 'owner', label: 'ВЛАДЕЛЕЦ', meta: 'задача / полномочия', state: 'ГОТОВ', x: 8, y: 48 },
     { id: 'supervisor', label: 'СУПЕРВИЗОР', meta: 'корень workflow', state: 'В РАБОТЕ', x: 34, y: 48 },
     { id: 'worker-03', label: 'ИСПОЛНИТЕЛЬ 03', meta: 'контекст 02 / 02', state: 'В РАБОТЕ', x: 61, y: 17 },
@@ -36,7 +44,11 @@ export function ExecutionMesh({ locale = 'en' }: { locale?: Locale }) {
     { id: 'reviewer', label: 'РЕВЬЮЕР', meta: 'точка приёмки', state: 'ГОТОВ', x: 83, y: 34 },
     { id: 'result', label: 'СОХРАНЁННЫЙ РЕЗУЛЬТАТ', meta: 'результат · 8A17', state: 'СОХРАНЁН', x: 83, y: 73 },
   ] : nodes
-  const meshCopy = ru ? {
+  const meshCopy = zh ? {
+    title: '执行 / tm-web-p1', live: '实时', state: '示意工作流状态',
+    sequenced: '工作流已编排', supervisor: '监督者', flow: '意图 → 执行者 → 审阅者 → 持久结果',
+    capacity: '示意容量遥测', resident: '常驻', provider: '提供商', work: '工作', heavy: '重型执行',
+  } : ru ? {
     title: 'ВЫПОЛНЕНИЕ / tm-web-p1', live: 'АКТИВНО', state: 'Схема процесса',
     sequenced: 'ПРОЦЕСС ВЫСТРОЕН', supervisor: 'СУПЕРВИЗОР', flow: 'задача → исполнители → ревьюер → сохранённый результат',
     capacity: 'Условная телеметрия ёмкости', resident: 'RESIDENT', provider: 'ПРОВАЙДЕР', work: 'РАБОТА', heavy: 'ТЯЖЁЛЫЕ',

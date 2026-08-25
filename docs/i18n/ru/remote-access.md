@@ -9,7 +9,7 @@ ThreadCells ориентирован прежде всего на loopback: се
 
 > Не открывайте необработанный порт ThreadCells напрямую в публичный Интернет.
 
-Для редкого доступа выберите SSH-туннель. Если нужен постоянный URL и владелец хоста явно одобрил такую границу аутентификации/proxy, используйте аутентифицированный HTTPS reverse proxy.
+Для редкого доступа выберите SSH-туннель. Если нужен постоянный URL и владелец хоста явно одобрил такую границу аутентификации и проксирования, используйте аутентифицированный HTTPS reverse proxy.
 
 ## Вариант A: SSH-туннель
 
@@ -58,7 +58,7 @@ Caddy завершает TLS и проксирует HTTP/WebSocket-трафик
 - работоспособный ThreadCells на `127.0.0.1:9889`;
 - Caddy и Authelia, установленные по их официальным инструкциям;
 - безопасно настроенные хранилище Authelia, session secrets, notifier и как минимум один пользователь.
-- `THREADCELLS_TRUSTED_PROXY_ORIGINS=https://threadcells.example.com`, установленная в существующем service environment ThreadCells.
+- `THREADCELLS_TRUSTED_PROXY_ORIGINS=https://threadcells.example.com`, заданная в существующем окружении службы ThreadCells.
 
 Используйте [официальное руководство по установке Caddy](https://caddyserver.com/docs/install) и [официальное руководство по началу работы с Authelia](https://www.authelia.com/integration/prologue/get-started/). Authelia документирует развёртывания [bare-metal](https://www.authelia.com/integration/deployment/bare-metal/) и [в контейнере](https://www.authelia.com/integration/deployment/docker/).
 
@@ -82,7 +82,7 @@ threadcells.example.com {
 }
 ```
 
-Считайте это связью между сервисами, а не полной конфигурацией Authelia. В Authelia настройте публичные URL, cookie domain, access-control policy, пользователей, notifier, storage и второй фактор по официальным руководствам. Храните сгенерированные secrets вне репозитория. Перезапустите ThreadCells после добавления или изменения `THREADCELLS_TRUSTED_PROXY_ORIGINS`; значение представляет собой точный разделённый запятыми allowlist HTTPS origins без path. Оно позволяет мутациям оператора с аутентификацией cookie принимать public browser origin, не доверяя произвольным proxy headers.
+Считайте это связью между сервисами, а не полной конфигурацией Authelia. В Authelia настройте публичные URL, cookie domain, access-control policy, пользователей, notifier, storage и второй фактор по официальным руководствам. Храните сгенерированные secrets вне репозитория. Перезапустите ThreadCells после добавления или изменения `THREADCELLS_TRUSTED_PROXY_ORIGINS`; значение представляет собой точный разделённый запятыми allowlist HTTPS origins без path. Оно позволяет изменяющим запросам оператора с cookie-аутентификацией принимать public browser origin, не доверяя произвольным proxy headers.
 
 [`forward_auth`](https://caddyserver.com/docs/caddyfile/directives/forward_auth) Caddy проверяет каждый запрос, прежде чем тот достигнет ThreadCells. Переопределение upstream `Host` сохраняет границу Trusted Host ThreadCells, доступную только через loopback, тогда как Caddy владеет внешним hostname и границей аутентификации. [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy) Caddy поддерживает WebSocket upgrades, которые использует live terminal.
 

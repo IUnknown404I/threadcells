@@ -1,7 +1,7 @@
 ---
 slug: providers
 source: docs/PROVIDERS.md
-source_sha256: sha256:f8e60cc3d04c639f47aab637310fa1588e4e8c18c29a3a4e2071a98c580e9267
+source_sha256: sha256:7f782daac9b50583042705af486afbdcc65d19ed545e0d8addd6e918808d7b0f
 ---
 
 # Proveedores
@@ -38,6 +38,23 @@ La compilación actual registra estos adaptadores:
 | OpenCode CLI | `opencode` |
 
 El registro es compatibilidad factual del producto, no una instrucción para instalar todas las CLI. Instala solo los proveedores que vayas a usar, siguiendo las instrucciones oficiales y el flujo de autenticación de cada proveedor.
+
+## Matriz de compatibilidad
+
+Esta matriz describe el contrato del adaptador en esta versión, no promete que todas las versiones de una CLI externa o todas las cuentas estén listas en un host concreto. **Compatible** significa que el adaptador implementa directamente la capacidad, **Condicional** indica que el comportamiento depende de la CLI del proveedor o del modo de sesión, y **No informado** significa que ThreadCells no inventa esos datos.
+
+| Proveedor | Inicio/cancelación | Reanudación y persistencia | Finalización estructurada | Telemetría de uso | Controles de modelo/razonamiento | Comprobación de disponibilidad |
+| --- | --- | --- | --- | --- | --- | --- |
+| Codex | Compatible | Reanudación condicional; persistencia compatible | Condicional | Campos de tokens nativos del proveedor compatibles | Compatible | Comando, versión y autenticación |
+| Claude Code | Compatible | Condicional | Condicional | Campos nativos del proveedor condicionales | Selección de modelo compatible; otros controles dependen del adaptador | Comando, versión y autenticación |
+| Amazon Q Developer | Compatible | Condicional | Condicional | No informado | Condicional | Comando y versión; autenticación sin verificar |
+| Gemini CLI | Compatible | Condicional | Condicional | No informado | Condicional | Comando y versión; autenticación sin verificar |
+| GitHub Copilot CLI | Compatible | Condicional | Condicional | No informado | Condicional | Comando y versión; autenticación sin verificar |
+| Kimi CLI | Compatible | Condicional | Condicional | No informado | Condicional | Comando y versión; autenticación sin verificar |
+| Kiro CLI | Compatible | Condicional | Condicional | No informado | Condicional | Comando y versión; autenticación sin verificar |
+| OpenCode CLI | Compatible | Condicional | Condicional | No informado | Condicional | Comando y versión; autenticación sin verificar |
+
+Codex es el proveedor de referencia y de aceptación de la versión. Los demás adaptadores integrados siguen siendo utilizables cuando su preflight público permite el lanzamiento, pero el comportamiento nativo y la autenticación pueden variar según el proveedor. La vista activa de capacidades en Settings es la autoridad para una compilación instalada.
 
 ## Etiquetas de disponibilidad
 

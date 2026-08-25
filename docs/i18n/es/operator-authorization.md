@@ -15,15 +15,15 @@ Esta función no es autenticación de usuario remoto. Mantén ThreadCells solo e
 ThreadCells almacena un verificador derivado del secreto, nunca el secreto en texto plano. El servidor carga ese verificador al iniciar. Introducir el secreto correcto crea una sesión de operador segura y de corta duración; las mutaciones protegidas permanecen bloqueadas tras expirar.
 
 ```text
-Verificador configurado
+Verifier configured
       ↓
-Settings muestra Bloqueado
-      ↓ introducir el secreto de operador
-Desbloquear cambios de operador
+Settings shows Locked
+      ↓ enter operator secret
+Unlock operator changes
       ↓
-Sesión autenticada de corta duración
-      ↓ expira
-Bloqueado de nuevo
+Short-lived authenticated session
+      ↓ expires
+Locked again
 ```
 
 La longitud mínima del secreto de operador es exactamente **5 caracteres**. Cuatro caracteres se rechazan. Se recomienda encarecidamente un secreto más largo, generado aleatoriamente.

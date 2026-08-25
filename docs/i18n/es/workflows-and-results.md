@@ -1,7 +1,7 @@
 ---
 slug: workflows-and-results
 source: docs/WORKFLOWS_AND_RESULTS.md
-source_sha256: sha256:03b28e15482a0b27a8cee6641ad22ccc6aeb7bb0aa2cf3801722be96e93e5be2
+source_sha256: sha256:7068aa3c7d3d2ab4211dd0799d398b26251e0e77e5320017d5d9f7e5ebe7520e
 ---
 
 # Flujos de trabajo y resultados duraderos
@@ -15,10 +15,10 @@ Un flujo de trabajo representa trabajo que debe permanecer coherente a través d
 El **flujo de trabajo de nivel superior** pertenece al agente o supervisor lanzado para la misión del propietario. Un **flujo de trabajo delegado** pertenece a un hijo al que se asigna una tarea acotada.
 
 ```text
-Nivel superior: "Preparar el candidato de lanzamiento"
-  ├── Delegado: "Corregir el analizador de estadísticas"
-  ├── Delegado: "Revisar la autorización del operador"
-  └── Puerta del propietario: "Aprobar la publicación pública"
+Top-level: "Prepare the release candidate"
+  ├── Delegated: "Fix the statistics parser"
+  ├── Delegated: "Review operator authorization"
+  └── Owner gate: "Approve public publication"
 ```
 
 Cada flujo de trabajo tiene su propia entrada lógica actual y estado de finalización. Un trabajador puede completar su flujo de trabajo delegado mientras el flujo de trabajo de nivel superior permanece abierto.
@@ -36,24 +36,26 @@ Una denegación transitoria de admisión previa al lanzamiento, como capacidad a
 ## Ciclo de vida del resultado
 
 ```text
-Tarea admitida
+Task admitted
    ↓
-El hijo trabaja
+Child works
    ↓
-Resultado estructurado registrado
+Structured result recorded
    ↓
-Resultado entregado al padre
+Result delivered to parent
    ↓
-El padre lee e incorpora el resultado
+Parent reads and incorporates it
    ↓
-El padre acusa su incorporación
+Parent acknowledges incorporation
    ↓
-Los recursos elegibles del hijo pueden retirarse
+Eligible child resources can retire
 ```
 
 Normalmente, un resultado incluye un resumen conciso, archivos modificados, comprobaciones realizadas, riesgos restantes y bloqueadores. Es evidencia operativa, no un sustituto de examinar el diff o la salida de las pruebas.
 
 La entrega es de al menos una vez. Si el padre se reinicia antes de acusar un resultado entregado, ThreadCells puede entregarlo otra vez. El padre debería usar la identidad inmutable del resultado para evitar incorporar el mismo trabajo dos veces.
+
+La entrega de Inbox sigue FIFO dentro de un terminal y queda vinculada al flujo de trabajo y al turno lógico exactos que la crearon. Un transporte pendiente es estado de entrega, no autoridad para mover un payload o resultado a otro flujo de trabajo. Si el flujo de trabajo asociado ya no está abierto, ThreadCells terminaliza ese transporte obsoleto y permite que continúe el trabajo más reciente del propietario en un flujo de trabajo abierto, sin volver a vincular las identidades de payload, flujo de trabajo, entrega, receipt o effect. La misma reconciliación se ejecuta después de reiniciar y es idempotente.
 
 ## Finalización del proveedor frente a finalización del flujo de trabajo
 
@@ -77,6 +79,8 @@ No uses una puerta del propietario simplemente porque el trabajo sea lento, fall
 ## Recuperación
 
 Al reiniciar, ThreadCells reconstruye la propiedad del flujo de trabajo desde el estado duradero. Los resultados entregados pero no acusados siguen disponibles. Un handoff en espera puede reanudarse con el mismo hijo en vez de lanzar un duplicado. Una vez que se admite un turno lógico más nuevo para un flujo de trabajo abierto, una continuación pendiente más antigua queda sustituida de forma duradera y no puede reproducirse después como trabajo independiente tras una compactación o interrupción.
+
+La finalización directa, el fallo, la cancelación, la puerta del propietario, la terminalización de hijos y la cancelación central de flujos de trabajo protegidos cercan los transportes pendientes de Inbox en la misma transacción de base de datos. Así se evita que una transición terminal deje un estado de entrega ordinario capaz de bloquear un turno posterior del propietario.
 
 Un reinicio del servicio con la misma compilación mantiene compatible la conexión de control del lado del proveedor. Después de que una compilación promovida cambie el código de orquestación privilegiado, una conexión antigua queda cercada antes de que pueda crear un efecto. Si la identidad activa no está disponible temporalmente durante el reinicio, la operación se rechaza sin efecto y se reintenta cuando el servicio vuelve. Para Codex, ThreadCells vincula la conversación exacta del proveedor al terminal gestionado y a la generación de runtime al estar listo el lanzamiento, y después conserva esa identidad como autoridad de reconexión. Otros archivos de despliegue abiertos no pueden volver ambiguo ese terminal gestionado. Una identidad ausente, obsoleta, incorrecta o imposible de probar falla de forma cerrada antes del despacho al proveedor. La identidad de reanudación duradera hace seguro un reinicio del servicio incluso entre la salida y el relanzamiento. El transporte de entrada, la reconexión y el retiro comparten una única reclamación de mutación duradera por terminal, por lo que no se puede pegar texto en el hueco de shell de reconexión y una reconexión obsoleta no puede relanzarse después de que gane el retiro. El turno lógico ya duradero se reintenta en lugar de reemplazarse.
 

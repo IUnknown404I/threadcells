@@ -1,7 +1,7 @@
 ---
 slug: resource-model
 source: docs/RESOURCE_MODEL.md
-source_sha256: sha256:18faf41a8395401b1b6b0e4dbe1bd740ca2c1c9a49d2bf7124c4e23a6ed6ca0b
+source_sha256: sha256:6eaee9cd5449ab9af23c8a9ce5b6687e73b301bb445da3e35de369a65fa05bb2
 ---
 
 # Capacidad y modelo de recursos
@@ -40,7 +40,7 @@ Usa el ejecutor pesado canónico para los comandos que cumplen los requisitos. L
 
 ## El punto de partida predeterminado
 
-La configuración empaquetada `5 residentes / 3 proveedores / 2 Work / 1 Heavy` es un punto de partida conservador para un host pequeño, no una referencia ni un límite fijo del producto.
+La configuración empaquetada `5 resident / 3 provider / 2 Work / 1 Heavy` es un punto de partida conservador para un host pequeño, no una referencia ni un límite fijo del producto.
 
 Los intervalos permitidos son de 2 a 50 ranuras residentes y de 1 a 50 para cada uno de los demás límites. Los valores se conservan en la base de datos de runtime y tienen efecto sin reiniciar el servidor.
 
@@ -91,6 +91,8 @@ El inventario Heavy sigue contando ranuras activas con número mayor tras una re
 - La capacidad residente se libera cuando se cierra la sesión de supervisor/propietario de nivel superior.
 
 El resultado de un hijo completado debe registrarse, entregarse, incorporarse y acusarse antes de retirar recursos. El historial permanece después de liberar la capacidad de runtime.
+
+La admisión vuelve a comprobarse en los límites de lanzamiento y continuación. Un turno de proveedor en cola empieza cuando hay una ranura de proveedor disponible. La finalización del proveedor solo libera capacidad de ejecución del proveedor; no cierra un flujo de trabajo abierto, descarta su callback ni libera un contexto Work delegado que todavía posee trabajo duradero.
 
 ## Configurar y observar
 

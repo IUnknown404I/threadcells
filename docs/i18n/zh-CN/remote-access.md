@@ -82,7 +82,7 @@ threadcells.example.com {
 }
 ```
 
-将此视为服务之间的连接，而非完整的 Authelia 配置。在 Authelia 中，请按其官方指南配置公共 URL、cookie 域、访问控制策略、用户、通知器、存储和第二因素。将生成的秘密存储在仓库外部。添加或更改 `THREADCELLS_TRUSTED_PROXY_ORIGINS` 后重启 ThreadCells；该值是 HTTPS origins 的精确逗号分隔 allowlist，不含路径。它允许经 cookie 认证的操作员变更接受公共浏览器 origin，而不信任任意代理 header。
+将此视为服务之间的连接，而非完整的 Authelia 配置。在 Authelia 中，请按其官方指南配置公共 URL、cookie 域、访问控制策略、用户、通知器、存储和第二认证因素。将生成的秘密存储在仓库外部。添加或更改 `THREADCELLS_TRUSTED_PROXY_ORIGINS` 后重启 ThreadCells；该值是 HTTPS origins 的精确逗号分隔 allowlist，不含路径。它允许经 cookie 认证的操作员变更接受公共浏览器 origin，而不信任任意代理 header。
 
 Caddy 的 [`forward_auth`](https://caddyserver.com/docs/caddyfile/directives/forward_auth) 会在每个请求到达 ThreadCells 前检查它。上游 `Host` 覆盖保留了 ThreadCells 仅 loopback 的 Trusted Host 边界，而 Caddy 拥有外部主机名和认证边界。Caddy 的 [`reverse_proxy`](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy) 支持 WebSocket 升级，这是实时终端所使用的功能。
 
@@ -100,7 +100,7 @@ sudo systemctl status caddy authelia --no-pager
 
 - `https://auth.example.com` 显示预期的 Authelia 页面；
 - 在未登录时访问 `https://threadcells.example.com` 会被拒绝或重定向；
-- 登录并完成配置的第二因素后会打开 ThreadCells；
+- 登录并完成配置的第二认证因素后会打开 ThreadCells；
 - 智能体终端流式输出，并在浏览器刷新后重新连接；
 - 在主机上 `curl http://127.0.0.1:9889/health` 仍然有效；
 - 端口 9889 无法从公共网络访问。

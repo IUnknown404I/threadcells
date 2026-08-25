@@ -47,7 +47,7 @@ ThreadCells 可以注册其 CLI 缺失的适配器。这不是安装失败；只
 已安装的应用与其运行时状态不同：
 
 - **candidate/install** 包含有版本的代码和静态 Web 资源；
-- **state root** 包含数据库、可变的操作员数据，以及可选的限制性 ThreadCells 所有秘密文件，例如 Telegram bot token；
+- **state root** 包含数据库、可变的操作员数据，以及可选的由 ThreadCells 管理且访问受限的秘密文件，例如 Telegram bot token；
 - 提供商 CLI 可能在其他位置保留各自的凭据和发布历史。
 
 在替换安装前备份可变状态。切勿提交运行时状态或提供商凭据。

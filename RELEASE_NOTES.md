@@ -4,7 +4,7 @@ This release consolidates the reliability work completed after `v0.1.0-alpha.2` 
 
 ## What changed
 
-- Provider and workflow continuation now preserve durable parent/child results across model turns, admit execution against exact provider capacity, and expose the reason when aggregate capacity is unavailable.
+- Provider and workflow continuation now preserve durable parent/child results across model turns, safely resume an admitted turn interrupted before its required durable effects finish, admit execution against exact provider capacity, and expose the reason when aggregate capacity is unavailable. Receipt, acknowledgement, and effect fencing remain exactly once across reconnects.
 - Inbox FIFO lifecycle handling fences stale pending transport bound to a closed workflow without rebinding payload, delivery, result, or workflow identity. Live submit, restart reconciliation, terminal transitions, and repeat repair are covered.
 - Sessions use a stable lifetime identity. Add Agent targets the existing lifetime, historical sessions remain distinguishable, and terminal/session deletion resolves exact exited runtimes while respecting writer authority.
 - Housekeeping now covers managed worktrees, caches, releases, logs, orphaned workflow authority, backups, and protected runtime/source sets with inspect–revalidate–execute safety and disk-pressure recovery.

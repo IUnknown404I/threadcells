@@ -53,6 +53,20 @@ Report reclaimed, skipped, changed, and failed items
 
 If the candidate set changes between plan and execution, manual execution rejects the stale plan without changing resources. Every remaining candidate is checked again just before mutation.
 
+## Full Cleanup
+
+The final danger-zone action in Settings → Housekeeping is **Delete all system files — Full Cleanup**. It uses the same canonical inventory, protected set, immutable plan identity, and execute-time identity checks as normal Housekeeping, but applies maximum proven-safe retention: reproducible caches, old logs, build/candidate/temp artifacts, safely retirable worktrees, and every inactive local release can become eligible. Unknown ownership or ambiguous authority remains protected and is explained in the plan and report.
+
+Full Cleanup is available only when backend lifecycle truth proves every relevant agent is Ready, Exited, or an explicitly equivalent non-executing state. Working, Processing, Starting, queued filesystem mutation, provider execution, Heavy work, runtime operations, and unknown lifecycle identity block execution. The server acquires the canonical admission fences and rechecks this idle gate immediately before mutation; an agent becoming active after preview aborts the run without deleting anything.
+
+Preview is read-only. Execution requires the existing short-lived operator unlock and the existing permanent-action confirmation modal; there is no Full Cleanup password or client-stored secret. The request confirms one exact 64-character `plan_id` and carries no arbitrary path.
+
+Every pathname-based Full Cleanup candidate is executed by the narrow, socket-activated root helper after it independently reauthenticates the operator, rebuilds the exact plan, proves the idle gate, and verifies the control plane still holds every admission fence. The helper moves each candidate into a root-exclusive same-filesystem quarantine, locks the captured directory tree against runtime-user mutation, and then deletes only the verified identities through directory descriptors. A changed identity is retained and reported; execution never falls back to a weaker runtime-user path deletion. Non-filesystem lifecycle resources continue through their canonical transactional executors.
+
+On a successful Full Cleanup, only the active immutable local ThreadCells release remains. All proven inactive rollback/recovery releases are removed, release metadata is reconciled atomically, and local rollback is reported as unavailable. The active release and active pointer can never be candidates. Ready agents remain usable: their worktrees, writer authority, current context, current output, and other continuation state stay protected. Exited history may remain in SQLite after its safe filesystem output is cleaned; Full Output then reports that durable output is unavailable instead of failing or fabricating text.
+
+Backups, current source/tool authority, provider credentials/state, the SQLite database, and any unproven resource remain protected. A second Full Cleanup safely produces a near-zero actionable plan except for newly eligible or previously protected items.
+
 ## Safe manual example
 
 From the installed environment, first request JSON output:
@@ -107,7 +121,7 @@ After a run, verify disk pressure and inspect skipped/failed entries. Re-plan be
 
 Backups are inventory-only. Retention decisions for backup media belong to the operator's backup policy, not automatic Housekeeping.
 
-Release and candidate cleanup shares the canonical staging lock and requires trusted reference metadata. The active and rollback runtimes remain protected. See [Upgrading](UPGRADING.md).
+Release and candidate cleanup shares the canonical staging lock and requires trusted reference metadata. Normal Housekeeping protects the active and rollback runtimes. Full Cleanup protects only the active release and deliberately removes every proven inactive local rollback release after explicit operator confirmation. See [Upgrading](UPGRADING.md).
 
 Installed scheduled Housekeeping services receive the narrow release-maintenance group needed to reclaim an eligible immutable release. The main control plane and ordinary agent processes do not. A manual/API run without that authority skips release deletion with `RELEASE_ADMIN_GROUP_REQUIRED`, continues independent safe cleanup, and leaves the scheduled service to reclaim the release later through the same plan/execute engine.
 

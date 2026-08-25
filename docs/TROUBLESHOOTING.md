@@ -82,6 +82,12 @@ Settings → About, Docs footer, candidate manifest, and static asset revision s
 
 Inspect a Housekeeping dry-run plan. Protected, active, unknown, backup, current, and rollback items are intentionally retained. Address the reported owner/reference or expand disk safely; never recursively delete the runtime root.
 
+For maximum proven-safe reclaim, inspect the separate Full Cleanup preview. Execution stays blocked until every agent is authoritatively idle and no provider, Heavy, queued mutation, or runtime operation is active. Do not close Ready agents or weaken this gate: their continuation state remains protected. Full Cleanup removes all proven inactive local releases, so confirm that losing local rollback is acceptable. Protected ambiguous tools, backups, source authority, dirty or unpublished worktrees, and unknown paths are expected report entries rather than reasons to delete them manually.
+
+## Full Output says output was cleaned
+
+An exited historical agent can remain in SQLite after Full Cleanup removes its old durable log. This is a truthful retained-metadata state: Sessions and Agents remain usable, while Full Output reports `DURABLE_OUTPUT_UNAVAILABLE`. Current and Ready agent output is protected. Restore from a retained backup if historical text is required; do not fabricate or reattach a different log.
+
 ## Browser terminal does not reconnect after restart
 
 Refresh once, confirm the server and tmux session are healthy, and check the browser's WebSocket connection through any reverse proxy. Ensure Caddy or another proxy is not stripping upgrade headers. An installed PWA does not cache terminal or WebSocket state.

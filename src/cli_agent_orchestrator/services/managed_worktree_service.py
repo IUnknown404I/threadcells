@@ -143,6 +143,11 @@ def managed_worktree_status(metadata: Mapping[str, Any]) -> dict[str, Any]:
             "source": str(resolved_source),
             "clean": True,
             "absent": True,
+            # An absent, unregistered worktree has already crossed the exact
+            # cleanup boundary.  Preserve its durable launch commit in the
+            # status document so reviewer validation and idempotent replay do
+            # not contradict the positive absence proof.
+            "commit": metadata.get("managed_worktree_commit"),
             "expected_commit": metadata.get("managed_worktree_commit"),
             "expected_branch": expected_branch,
             "branch": expected_branch,

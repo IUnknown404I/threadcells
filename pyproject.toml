@@ -1,6 +1,6 @@
 [project]
 name = "threadcells"
-version = "0.2.0a1"
+version = "0.3.0a1"
 description = "ThreadCells — a self-hosted coding-agent operations console"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -50,6 +50,7 @@ dependencies = [
 "threadcells-resource-status" = "cli_agent_orchestrator.services.operations_service:resource_status_main"
 "threadcells-heavy-run" = "cli_agent_orchestrator.services.operations_service:heavy_run_main"
 "threadcells-housekeeping" = "cli_agent_orchestrator.services.housekeeping_service:housekeeping_main"
+"threadcells-full-cleanup-helper" = "cli_agent_orchestrator.services.full_cleanup_helper:main"
 
 [project.urls]
 Homepage = "https://iunknown404i.github.io/threadcells/"

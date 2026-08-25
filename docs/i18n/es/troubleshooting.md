@@ -1,7 +1,7 @@
 ---
 slug: troubleshooting
 source: docs/TROUBLESHOOTING.md
-source_sha256: sha256:5e66928bd64c8837b5480d71160eb1548dbe9369be3069800fcf18e0f1e99836
+source_sha256: sha256:f6ed11a9ba51cf79c46f46c4e50ce638862a009bcbc3323f875bccfc49ed14a2
 ---
 
 # Solución de problemas
@@ -87,6 +87,12 @@ Settings → About, el pie de página de Docs, el manifiesto del candidato y la 
 ## Presión de disco o Housekeeping no puede recuperar
 
 Inspeccione un plan dry-run de Housekeeping. Los elementos protegidos, activos, desconocidos, de backup, actuales y de rollback se conservan intencionadamente. Aborde la referencia/propietario informado o amplíe el disco de forma segura; nunca elimine recursivamente la raíz de runtime.
+
+Para obtener la máxima recuperación de seguridad demostrada, inspeccione la vista previa separada de Full Cleanup. La ejecución permanece bloqueada hasta que todos los agentes estén inactivos de forma autoritativa y no haya ningún proveedor, trabajo Heavy, mutación en cola ni operación de runtime activos. No cierre los agentes Ready ni debilite esta barrera: su estado de continuación permanece protegido. Full Cleanup elimina todas las releases locales inactivas demostradas, así que confirme que perder el rollback local sea aceptable. Las herramientas ambiguas protegidas, las copias de seguridad, la autoridad de código fuente, los worktrees sucios o no publicados y las rutas desconocidas son entradas esperadas del informe, no motivos para eliminarlos manualmente.
+
+## Full Output indica que la salida se limpió
+
+Un agente histórico Exited puede permanecer en SQLite después de que Full Cleanup elimine su registro duradero antiguo. Este es un estado veraz de metadatos retenidos: Sessions y Agents siguen siendo utilizables, mientras que Full Output informa `DURABLE_OUTPUT_UNAVAILABLE`. La salida de agentes actuales y Ready está protegida. Restaure desde una copia de seguridad conservada si necesita el texto histórico; no invente ni vuelva a adjuntar un registro diferente.
 
 ## El terminal del navegador no se reconecta después de reiniciar
 

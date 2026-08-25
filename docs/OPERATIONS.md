@@ -44,7 +44,9 @@ Use Graceful Exit for provider lifecycle. Killing tmux or deleting database rows
 
 An exited child is not immediately disposable. Confirm that its durable result is delivered, read, incorporated, and acknowledged. Then retire its runtime resources while retaining history.
 
-**Add Agent** targets the stable selected session lifetime. Historical session deletion and exited-terminal deletion target exact durable identities and are rejected while an active runtime, open/recovery workflow, writer lease, pending result, or other protected relationship remains.
+**Add Agent** targets the stable selected session lifetime. Historical session deletion and exited-terminal deletion target exact durable identities and are rejected while an active runtime, open/recovery workflow, writer lease, pending result, or other genuine lifecycle dependency remains. Retained logs, protected cleanup worktrees, and post-exit cleanup claims do not by themselves prevent logical deletion: ThreadCells preserves the resource authority, tombstones the exact session, and makes retries idempotent. A blocked deletion returns the specific lifecycle conflict rather than a generic missing/server error.
+
+Within one session, Home and Agents preserve the backend's durable agent creation sequence in List and Grid views. Status, provider, profile, activity, polling, reconnect, and restart do not reorder agents; a newly created agent appends after earlier ones.
 
 A provider final does not close an open mission. Explicitly complete a top-level workflow only after all owner-authorized work is finished. Use owner gate only for a genuine decision boundary.
 
@@ -64,7 +66,7 @@ Avoid logging prompts or values that contain credentials. ThreadCells public/API
 
 Housekeeping is always plan-first. Inspect the dry-run candidate list and plan identity, then explicitly execute the exact plan. The executor rebuilds current protection and revalidates every candidate before mutation. It may retire proven closed terminal runtimes and acknowledged cleanup-pending worktrees without erasing durable history.
 
-Backups are inventory-only and never automatically deleted. Unknown or active resources remain protected. See [Housekeeping](HOUSEKEEPING.md).
+Backups are inventory-only and never automatically deleted. Unknown or active resources remain protected. Full Cleanup is a separately confirmed operator action that runs only while all agents are idle, preserves Ready continuation authority, and intentionally removes every proven inactive local release so local rollback becomes unavailable. See [Housekeeping](HOUSEKEEPING.md).
 
 ## Production change discipline
 

@@ -1,7 +1,7 @@
 ---
 slug: housekeeping
 source: docs/HOUSEKEEPING.md
-source_sha256: sha256:257f62fb21c7538031f3600d65b7d5eb152d905024b11135637a1cafa633d84d
+source_sha256: sha256:a7a64e54c6aaea5593617556363e4741ecb97759caa08e9d8bd3ba47d879927c
 ---
 
 # Housekeeping
@@ -59,6 +59,20 @@ Report reclaimed, skipped, changed, and failed items
 
 Si el conjunto de candidatos cambia entre la planificación y la ejecución, la ejecución manual rechaza el plan obsoleto sin cambiar recursos. Cada candidato restante se comprueba de nuevo justo antes de la mutación.
 
+## Full Cleanup
+
+La acción final de la zona de peligro en Settings → Housekeeping es **Delete all system files — Full Cleanup**. Usa el mismo inventario canónico, conjunto protegido, identidad de plan inmutable y comprobaciones de identidad en el momento de ejecución que el Housekeeping normal, pero aplica la máxima retención de seguridad demostrada: pueden pasar a ser elegibles las cachés reproducibles, los registros antiguos, los artefactos de compilación/candidatos/temporales, los worktrees que se puedan retirar de forma segura y todas las releases locales inactivas. La propiedad desconocida o la autoridad ambigua permanecen protegidas y se explican en el plan y el informe.
+
+Full Cleanup solo está disponible cuando la verdad del ciclo de vida del backend demuestra que cada agente relevante está Ready, Exited o en un estado no ejecutor explícitamente equivalente. Los estados Working, Processing o Starting, las mutaciones del sistema de archivos en cola, la ejecución del proveedor, el trabajo Heavy, las operaciones de runtime y una identidad de ciclo de vida desconocida bloquean la ejecución. El servidor adquiere los límites canónicos de admisión y vuelve a comprobar esta barrera de inactividad inmediatamente antes de la mutación; si un agente pasa a estar activo después de la vista previa, la ejecución se cancela sin eliminar nada.
+
+La vista previa es de solo lectura. La ejecución requiere el desbloqueo de operador existente y de corta duración y el modal de confirmación de acción permanente existente; no hay contraseña de Full Cleanup ni secreto almacenado por el cliente. La solicitud confirma un `plan_id` exacto de 64 caracteres y no incluye ninguna ruta arbitraria.
+
+Cada candidato de Full Cleanup basado en una ruta lo ejecuta el root helper de ámbito reducido, activado por socket, después de que este vuelva a autenticar al operador de forma independiente, reconstruya el plan exacto, demuestre la barrera de inactividad y verifique que el plano de control aún mantiene todos los límites de admisión. El helper mueve cada candidato a una cuarentena exclusiva de root en el mismo sistema de archivos, bloquea el árbol de directorios capturado frente a mutaciones del usuario de runtime y después elimina únicamente las identidades verificadas mediante descriptores de directorio. Una identidad modificada se conserva y se incluye en el informe; la ejecución nunca recurre a una eliminación de rutas más débil como usuario de runtime. Los recursos de ciclo de vida ajenos al sistema de archivos siguen pasando por sus ejecutores transaccionales canónicos.
+
+Después de un Full Cleanup correcto, solo queda la release local activa e inmutable de ThreadCells. Se eliminan todas las releases de rollback/recuperación inactivas demostradas, los metadatos de release se reconcilian atómicamente y el rollback local se informa como no disponible. La release activa y el puntero activo nunca pueden ser candidatos. Los agentes Ready siguen siendo utilizables: sus worktrees, autoridad de escritor, contexto actual, salida actual y demás estado de continuación permanecen protegidos. El historial Exited puede permanecer en SQLite después de limpiar de forma segura su salida del sistema de archivos; Full Output informa entonces de que la salida duradera no está disponible, en lugar de fallar o inventar texto.
+
+Las copias de seguridad, la autoridad actual del código fuente y las herramientas, las credenciales/estado del proveedor, la base de datos SQLite y cualquier recurso no demostrado permanecen protegidos. Un segundo Full Cleanup genera de forma segura un plan procesable casi nulo, salvo los elementos que hayan pasado a ser elegibles o que antes estuvieran protegidos.
+
 ## Ejemplo manual seguro
 
 Desde el entorno instalado, solicite primero salida JSON:
@@ -113,7 +127,7 @@ Después de una ejecución, verifique la presión de disco e inspeccione las ent
 
 Las copias de seguridad son solo de inventario. Las decisiones de retención para el medio de backup pertenecen a la política de backup del operador, no a Housekeeping automático.
 
-La limpieza de releases y candidatos comparte el bloqueo canónico de preparación y requiere metadatos de referencia de confianza. Los runtimes activos y de rollback permanecen protegidos. Consulte [Actualización](UPGRADING.md).
+La limpieza de releases y candidatos comparte el bloqueo canónico de preparación y requiere metadatos de referencia de confianza. El Housekeeping normal protege los runtimes activo y de rollback. Full Cleanup protege solo la release activa y elimina intencionadamente todas las releases locales de rollback inactivas demostradas después de la confirmación explícita del operador. Consulte [Actualización](UPGRADING.md).
 
 Los servicios programados de Housekeeping instalados reciben el grupo limitado de mantenimiento de releases necesario para recuperar un release inmutable elegible. El plano de control principal y los procesos ordinarios de agentes no lo reciben. Una ejecución manual/de API sin esa autoridad omite la eliminación de releases con `RELEASE_ADMIN_GROUP_REQUIRED`, continúa con la limpieza segura independiente y deja que el servicio programado recupere el release más tarde mediante el mismo motor de planificar/ejecutar.
 

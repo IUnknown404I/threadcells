@@ -1,7 +1,7 @@
 ---
 slug: upgrading
 source: docs/UPGRADING.md
-source_sha256: sha256:583ec58e621329fd7dc9914a0c29c18a7f12bee09808f2f18908fe4d972536cf
+source_sha256: sha256:9f73c3caf0e5c41d2ea38998c5d5da2f41091658ba94c3c36095164390f96bfe
 ---
 # Обновление ThreadCells
 
@@ -22,7 +22,7 @@ source_sha256: sha256:583ec58e621329fd7dc9914a0c29c18a7f12bee09808f2f18908fe4d97
 
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
-candidate="$PWD/threadcells-candidate/threadcells-0.2.0a1-local"
+candidate="$PWD/threadcells-candidate/threadcells-0.3.0a1-local"
 python3 scripts/verify_local_candidate.py --candidate "$candidate"
 ```
 
@@ -63,5 +63,7 @@ python3 scripts/verify_local_candidate.py --candidate "$candidate"
 5. восстанавливайте базу данных до обновления, только если этого требует совместимость schema/данных.
 
 Не используйте разрушительный Git reset и не удаляйте более новые свидетельства runtime, чтобы имитировать восстановление.
+
+Явно подтверждённый Full Cleanup — исключение из обычной политики хранения локальных релизов: он удаляет все доказанно неактивные релизы, включая выбранный при развёртывании релиз отката, и оставляет только активный неизменяемый релиз. Не запускайте его во время приёмки обновления или пока какой-либо агент выполняет работу. После успешного Full Cleanup доступность отката можно восстановить только подготовкой другого проверенного неизменяемого релиза; никогда не воссоздавайте его из непроверенного каталога.
 
 См. [Локальное развёртывание](DEPLOYMENT.md) и [Резервное копирование и восстановление](BACKUP_AND_RESTORE.md).

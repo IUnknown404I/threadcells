@@ -32,6 +32,20 @@ cross-module, and architecture-sensitive workflows.
   integration.
 - Use parallel workers only for genuinely independent, non-overlapping lanes.
 - Keep critical acceptance review independent from implementation.
+- Route routine bounded work to `developer_terra_medium`, important product
+  work or difficult bounded defects to `developer_terra_high`, and subtle
+  cross-subsystem invariants to `developer_sol_medium`. Sol supervision does
+  not require Sol implementation for routine work.
+
+## Retry and escalation
+
+- Operational failure may retry at the same tier.
+- Mechanically incomplete work gets one bounded same-tier correction.
+- Semantic-quality failure escalates the implementation tier; never perform a
+  third same-tier semantic attempt.
+- Underestimated bounded complexity routes to a stronger developer.
+- A critical systemic boundary routes only to owner-authorized XHigh.
+- Passing tests do not prove semantic quality.
 
 ## Authority boundaries
 
@@ -41,4 +55,3 @@ cross-module, and architecture-sensitive workflows.
   an orchestrator, not an owner-executor.
 - Preserve repository-local Git, release, security, recovery, and notification
   authority.
-

@@ -1,7 +1,7 @@
 ---
 slug: backup-and-restore
 source: docs/BACKUP_AND_RESTORE.md
-source_sha256: sha256:3e62f0b30f78fa32bfab783c5fa15e89b9646e2c6de211b8c8ddec3b05b53da1
+source_sha256: sha256:d5f0fb66a4513e8c56a811e1e21c5384f39831b8729af46e22b67896a79e3a66
 ---
 
 # Copia de seguridad y restauración
@@ -80,3 +80,5 @@ Después de restaurar, verifique:
 - los releases activos/de rollback siguen identificados correctamente.
 
 Las copias de seguridad están protegidas de Housekeeping automático. Aplique una política de retención separada y revisada al almacenamiento de backups.
+
+Full Cleanup no sustituye la retención de copias de seguridad. Protege la base de datos canónica y cualquier copia de seguridad cuya disponibilidad para eliminarse no esté demostrada, pero elimina intencionadamente cada release local inactiva y de rollback representada por metadatos de release confiables. Antes de autorizarlo, confirme que todos los puntos de recuperación que necesite existen fuera del conjunto de releases locales y que se ha comprobado su integridad. Después, el operador debe esperar que el rollback local no esté disponible hasta que se prepare otra release verificada.

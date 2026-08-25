@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.3.0-alpha.1] - 2026-08-25
+
+### Added
+
+- Add operator-authorized, all-idle Full Cleanup with active-only release retention, plan fingerprinting, execute-time revalidation, and truthful reports.
+- Encode canonical supervisor/developer routing plus retry and escalation failure classes.
+
+### Fixed
+
+- Allow logical deletion of eligible completed sessions while retaining protected cleanup authority, with durable idempotent receipts and explicit lifecycle blockers.
+- Preserve durable agent creation order across Home and Agents List/Grid views and refreshes.
+- Make Flow removal and configured-directory removal match their actual persistence authority.
+
+### Documentation
+
+- Document Full Cleanup, lifecycle deletion, agent ordering, routing policy, and release behavior across all seven supported locales.
+
 ## [2.1.1] - 2026-04-28
 
 ### Added
@@ -344,5 +362,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
-
 

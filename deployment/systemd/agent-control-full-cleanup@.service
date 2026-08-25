@@ -1,0 +1,19 @@
+[Unit]
+Description=ThreadCells privileged Full Cleanup helper connection
+
+[Service]
+Type=exec
+User=root
+Group=root
+WorkingDirectory=/srv/agent-control
+Environment=HOME=/root
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PATH=/var/lib/threadcells/active/runtime/bin:/srv/agent-control/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=/etc/agent-control/cao.env
+ExecStart=/var/lib/threadcells/active/runtime/bin/threadcells-full-cleanup-helper
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_UNIX
+UMask=0077

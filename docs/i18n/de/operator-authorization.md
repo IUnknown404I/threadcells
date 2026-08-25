@@ -1,7 +1,7 @@
 ---
 slug: operator-authorization
 source: docs/OPERATOR_AUTHORIZATION.md
-source_sha256: sha256:55cf518ba75105911c8db6d4618c30b1ee63fa26645e7fc8cca063480385e50c
+source_sha256: sha256:543fc9c31e1ffe8e120aa726c819f0e9180d0f6ca92b28c9b4ce549d0025d4b1
 ---
 
 # Operatorautorisierung
@@ -72,6 +72,8 @@ Das erwartete Ergebnis enthält vor dem Entsperren `"configured": true` und `"au
 Geben Sie in Settings das Geheimnis ein und wählen Sie **Unlock operator changes**. Das standardmäßige authentifizierte Zeitfenster beträgt fünf Minuten. Die UI zeigt den Ablaufzeitpunkt an und kehrt nach Sitzungsende zum gesperrten Zustand zurück.
 
 Geschützte Settings-Aufrufe schlagen im gesperrten Zustand fehl und sind während der authentifizierten Sitzung erfolgreich. Der Browser verwendet das kurzlebige sichere Sitzungscookie des Servers; er speichert das Operatorgeheimnis nicht dauerhaft.
+
+Full Cleanup verwendet exakt dieselbe Autorität. Die Vorschau bleibt als schreibgeschützte Sicherheitsprüfung verfügbar, während die Ausführung die aktuelle Operatorsitzung und die standardmäßige Bestätigung einer dauerhaften Aktion erfordert. Die Bestätigung fragt das Secret nicht erneut ab. Es gibt weder ein separates Cleanup-Secret noch URL-Zugangsdaten, einen Wert im Browserspeicher oder eine dauerhafte Klartextkopie; Ablauf, erneutes Sperren und Rate-Limits bleiben unverändert.
 
 ## Das Geheimnis ersetzen
 

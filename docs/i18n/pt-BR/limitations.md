@@ -1,7 +1,7 @@
 ---
 slug: limitations
 source: docs/LIMITATIONS.md
-source_sha256: sha256:b2b9aa6344d8b7d6c1b1391b1022817b51ce189237616721475510e23dd29cd5
+source_sha256: sha256:3456542efd4138cb1868100f5311749f297d32a65687a455d2a7b213ef89f050
 ---
 
 # Limitações atuais
@@ -41,6 +41,7 @@ O ThreadCells é uma prévia técnica focada em operações locais confiáveis p
 - A recuperação reconcilia o estado durável com processos externos tmux/provedor, mas não pode tornar reversível um comando externo não idempotente.
 - Backups e restauração exigem disciplina do operador e devem ser ensaiados.
 - O Housekeeping intencionalmente deixa artefatos ambíguos no lugar.
+- O Full Cleanup oferece a recuperação máxima comprovadamente segura, não uma garantia de que todo arquivo grande seja descartável. Ele exige que todos os agentes estejam ociosos, pode preservar ferramentas, backups e worktrees ambíguos e deixa intencionalmente sem rollback de release local após a limpeza bem-sucedida das releases inativas.
 - Automação de publicação e lançamento remoto intencionalmente não faz parte da implantação local comum.
 
 Avalie primeiro o ThreadCells em repositórios não críticos, mantenha backups verificados e inspecione a saída dos agentes antes de ações consequentes.

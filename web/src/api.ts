@@ -29,11 +29,17 @@ const REASON_COPY: Record<string, [string, string]> = {
   HEAVY_SLOT_WAIT_TIMEOUT: ['Capacity limit reached', 'A compatible heavy-execution slot did not become available in time. Try again after active work finishes.'],
   HOUSEKEEPING_PLAN_CHANGED: ['Housekeeping plan changed', 'The inspected plan no longer matches current cleanup state. Build and inspect a fresh plan before executing.'],
   HOUSEKEEPING_BUSY: ['Housekeeping is already running', 'Another Housekeeping operation owns the canonical lock. Wait for it to finish, then build a fresh plan.'],
+  FULL_CLEANUP_ADMISSION_BUSY: ['Full Cleanup cannot start', 'An agent admission boundary is busy. Wait for agents to become idle, then build a fresh preview.'],
+  FULL_CLEANUP_NOT_IDLE: ['Agents are still working', 'Full Cleanup is available only when every agent is Ready or Exited and no provider or Heavy execution is active.'],
+  FULL_CLEANUP_IDLE_INVENTORY_UNKNOWN: ['Idle state could not be proven', 'ThreadCells could not prove that every agent and execution lane is idle, so Full Cleanup was blocked.'],
   TERMINAL_RUNTIME_ACTIVE: ['Exit terminal first', 'Use Graceful Exit and wait until ThreadCells confirms the provider has exited before deleting terminal history.'],
   TERMINAL_EXIT_PENDING: ['Terminal exit is pending', 'ThreadCells has not confirmed provider death yet. Wait for exit reconciliation before deleting terminal history.'],
   TERMINAL_DEATH_UNCONFIRMED: ['Terminal death is not confirmed', 'ThreadCells could not retire the exact exited runtime, so terminal metadata remains protected.'],
   TERMINAL_RUNTIME_AUTHORITY_UNCERTAIN: ['Terminal authority is uncertain', 'ThreadCells could not verify the exact terminal runtime identity, so metadata remains protected.'],
   TERMINAL_IDENTITY_CHANGED: ['Terminal identity changed', 'Terminal authority changed during deletion. Refresh and retry after lifecycle reconciliation.'],
+  TERMINAL_WORKTREE_PROTECTED: ['Managed worktree retained', 'ThreadCells cannot delete this terminal history because its managed worktree contains state that must remain recoverable.'],
+  SESSION_RUNTIME_ACTIVE: ['Exit every agent first', 'A live or Ready agent still owns this session. Gracefully exit every agent before deleting the session.'],
+  SESSION_RUNTIME_AUTHORITY_UNPROVEN: ['Session runtime authority is uncertain', 'ThreadCells could not prove that every historical runtime is gone, so the session remains protected.'],
 }
 
 const STATUS_COPY: Record<number, [string, string]> = {
@@ -400,6 +406,29 @@ export interface HousekeepingPlan {
   candidates: HousekeepingCandidate[]
 }
 
+export interface FullCleanupIdleGate {
+  eligible: boolean
+  reason_code: string | null
+  blockers: Array<{ terminal_id: string; reason_code: string }>
+  ready_agents: number
+  exited_agents: number
+}
+
+export interface FullCleanupPlan extends Omit<HousekeepingPlan, 'mode'> {
+  mode: 'full'
+  idle_gate: FullCleanupIdleGate
+  release_state: {
+    metadata_certain: boolean
+    active_release: string | null
+    active_release_candidates: string[]
+    protected_non_active_releases: number
+    active_only_expected: boolean
+    releases_to_delete: number
+    rollback_releases_to_delete: number
+    rollback_available: boolean
+  }
+}
+
 export interface OwnerLaunchGrant {
   launch_id: string
   grant: string
@@ -482,6 +511,8 @@ export const api = {
   updateHousekeepingSettings: (data: HousekeepingSettings) => fetchJSON<HousekeepingSettings>('/api/v1/housekeeping', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }),
   getHousekeepingPlan: (mode: HousekeepingMode) => fetchJSON<HousekeepingPlan>(`/api/v1/housekeeping/plan?mode=${mode}`),
   runHousekeeping: (mode: HousekeepingMode, dry_run: boolean, expectedPlanId?: string) => fetchJSON<Record<string, any>>('/api/v1/housekeeping/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, dry_run, expected_plan_id: expectedPlanId }), timeoutMs: null }),
+  getFullCleanupPlan: () => fetchJSON<FullCleanupPlan>('/api/v1/housekeeping/full-cleanup/plan'),
+  runFullCleanup: (expectedPlanId: string) => fetchJSON<Record<string, any>>('/api/v1/housekeeping/full-cleanup/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_plan_id: expectedPlanId, confirmed: true }), timeoutMs: null }),
   getHousekeepingReport: () => fetchJSON<Record<string, any>>('/api/v1/housekeeping/report'),
   getUsageStatistics: () => fetchJSON<UsageStatistics>('/usage/statistics'),
   getBranding: () => fetchJSON<RuntimeBranding>('/settings/branding'),
@@ -528,7 +559,7 @@ export const api = {
   // Terminals
   getTerminalStatus: (id: string) => fetchJSON<Terminal>(`/terminals/${id}`),
   getTerminalOutput: (id: string, mode: 'full' | 'last' = 'full') =>
-    fetchJSON<{ output: string; mode: string }>(`/terminals/${id}/output?mode=${mode}`),
+    fetchJSON<{ output: string; mode: string; availability?: 'available' | 'unavailable'; reason_code?: string | null }>(`/terminals/${id}/output?mode=${mode}`),
   sendInput: (id: string, message: string) =>
     fetchJSON<{ success: boolean }>(`/terminals/${id}/input?message=${encodeURIComponent(message)}`, { method: 'POST' }),
   sendWorkflowInput: (id: string, message: string) =>

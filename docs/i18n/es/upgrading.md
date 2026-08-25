@@ -1,7 +1,7 @@
 ---
 slug: upgrading
 source: docs/UPGRADING.md
-source_sha256: sha256:583ec58e621329fd7dc9914a0c29c18a7f12bee09808f2f18908fe4d972536cf
+source_sha256: sha256:9f73c3caf0e5c41d2ea38998c5d5da2f41091658ba94c3c36095164390f96bfe
 ---
 
 # Actualización de ThreadCells
@@ -23,7 +23,7 @@ Desde el commit de código fuente previsto:
 
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
-candidate="$PWD/threadcells-candidate/threadcells-0.2.0a1-local"
+candidate="$PWD/threadcells-candidate/threadcells-0.3.0a1-local"
 python3 scripts/verify_local_candidate.py --candidate "$candidate"
 ```
 
@@ -64,5 +64,7 @@ Si la aceptación falla de forma material:
 5. restaure la base de datos previa a la actualización solo si la compatibilidad de esquema/datos lo requiere.
 
 No use Git reset destructivo ni elimine evidencia de runtime más reciente para simular un rollback.
+
+Un Full Cleanup confirmado explícitamente es la excepción a la retención normal de releases locales: elimina todas las releases inactivas demostradas, incluido el rollback seleccionado durante el despliegue, y deja solo la release activa e inmutable. No lo ejecute durante la aceptación de una actualización ni mientras se esté ejecutando algún agente. Después de un Full Cleanup correcto, restaure la disponibilidad de rollback solo mediante la preparación de otra release verificada e inmutable; nunca la reconstruya a partir de un directorio no verificado.
 
 Consulte [Despliegue local](DEPLOYMENT.md) y [Copia de seguridad y restauración](BACKUP_AND_RESTORE.md).

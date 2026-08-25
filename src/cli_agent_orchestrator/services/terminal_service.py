@@ -341,6 +341,10 @@ class OutputMode(str, Enum):
     LAST = "last"
 
 
+class TerminalOutputUnavailable(Exception):
+    """Durable terminal history was intentionally cleaned or is absent."""
+
+
 def _consume_terminal_control_string(value: str, index: int) -> int:
     """Return the first index after an OSC/DCS-style control string."""
     while index < len(value):
@@ -505,6 +509,14 @@ class TerminalDeletionError(RuntimeError):
         super().__init__(message)
         self.reason_code = reason_code
         self.inventory_uncertain = inventory_uncertain
+
+
+class ManagedWorktreeCleanupError(RuntimeError):
+    """A managed worktree must be retained under its durable authority."""
+
+    def __init__(self, reason_code: str):
+        super().__init__("Managed worktree cleanup was not proven safe " f"({reason_code})")
+        self.reason_code = reason_code
 
 
 _PROVIDER_CLASS_NAMES = {
@@ -1953,10 +1965,7 @@ def cleanup_managed_worktree(metadata: Dict) -> None:
 
     cleanup = remove_managed_worktree(metadata)
     if not cleanup.get("removed"):
-        raise RuntimeError(
-            "Managed worktree cleanup was not proven safe; terminal metadata and "
-            f"writer lease retained ({cleanup.get('reason_code', 'unknown')})"
-        )
+        raise ManagedWorktreeCleanupError(cleanup.get("reason_code", "MANAGED_WORKTREE_UNVERIFIED"))
 
 
 def validate_managed_worktree_cleanup(metadata: Dict) -> None:
@@ -1980,7 +1989,7 @@ def validate_managed_worktree_cleanup(metadata: Dict) -> None:
     ):
         reason = "REVIEW_WORKTREE_AUTHORITY_CHANGED"
     if reason:
-        raise RuntimeError(f"Managed worktree cleanup was not proven safe ({reason})")
+        raise ManagedWorktreeCleanupError(reason)
 
 
 def _validate_exit_provider(metadata: Dict, provider) -> None:
@@ -2237,7 +2246,9 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
             if compressed.is_file() and not compressed.is_symlink():
                 with gzip.open(compressed, "rt", encoding="utf-8", errors="replace") as stream:
                     return stream.read()
-            raise ValueError(f"Durable output is unavailable for terminal {terminal_id}")
+            raise TerminalOutputUnavailable(
+                f"Durable output is unavailable for terminal {terminal_id}"
+            )
 
         def capture_output(*, tail_lines: int | None = None) -> str:
             try:
@@ -2338,7 +2349,14 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
 
             # Worktree authority and any required child-result snapshot are
             # read-only preconditions. Never retire a pane until both pass.
-            validate_managed_worktree_cleanup(metadata)
+            try:
+                validate_managed_worktree_cleanup(metadata)
+            except ManagedWorktreeCleanupError as exc:
+                raise TerminalDeletionError(
+                    "TERMINAL_WORKTREE_PROTECTED",
+                    "The exited terminal still owns a managed worktree that ThreadCells "
+                    f"must retain ({exc.reason_code})",
+                ) from exc
             prepare_terminal_for_destruction(terminal_id)
 
             retirement = retire_exited_terminal_runtime(terminal_id)
@@ -2386,7 +2404,14 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 provider_manager.cleanup_provider(terminal_id)
             except Exception:
                 logger.warning("Provider cleanup failed for exited terminal %s", terminal_id)
-            cleanup_managed_worktree(metadata)
+            try:
+                cleanup_managed_worktree(metadata)
+            except ManagedWorktreeCleanupError as exc:
+                raise TerminalDeletionError(
+                    "TERMINAL_WORKTREE_PROTECTED",
+                    "The exited terminal's managed worktree changed during deletion and "
+                    f"was retained ({exc.reason_code})",
+                ) from exc
             try:
                 deletion = db_delete_exited_terminal(
                     terminal_id,

@@ -1,7 +1,7 @@
 ---
 slug: web-ui
 source: docs/WEB_UI.md
-source_sha256: sha256:d3556d3674af5593090f679a3897b8b3a3bfe79b540c9e97ab4ffdf5f05e76d7
+source_sha256: sha256:dc45952406ae34d9be16d78c4e5b4a6f73d8862fe8b5fe6a557528cecaf45928
 ---
 
 # Usando a Web UI
@@ -34,7 +34,9 @@ URLs diretas são compatíveis. O histórico do navegador deve preservar a pági
 
 Os rótulos de status vêm da verdade durável do plano de controle. **Processing** significa que um turno está ativo; **Ready** significa que o runtime do provedor está vivo e realmente ocioso. Rótulos de fila distinguem esgotamento de capacidade do provedor, barreiras de aposentadoria de filhos e continuação geral do fluxo de trabalho. Um selo de controle do proprietário permanece categórico, enquanto o painel expandido Owner Decision mostra o motivo durável concreto.
 
-Sessões ativas e históricas continuam sendo vidas úteis duráveis separadas. Excluir uma sessão histórica remove somente aquela vida útil exata elegível. Excluir um terminal encerrado também verifica sua identidade exata de runtime, lease de escritor, proteção de fluxo de trabalho/resultado e relação de sessão antes da limpeza; estados ambíguos ou ativos permanecem protegidos.
+Sessões ativas e históricas continuam sendo vidas úteis duráveis separadas. Excluir uma sessão histórica remove somente aquela vida útil exata elegível. Excluir um terminal encerrado também verifica sua identidade exata de runtime, lease de escritor, proteção de fluxo de trabalho/resultado e relação de sessão antes da limpeza; estados ambíguos ou ativos permanecem protegidos. Recursos de limpeza retidos não criam um falso bloqueio de execução: a vida útil exata pode ser tombstonada enquanto a autoridade protegida sobre o sistema de arquivos continua disponível para aposentadoria posterior, e repetir a mesma exclusão é seguro.
+
+Os agentes dentro de uma sessão sempre usam sua sequência de criação durável. Home e Agents preservam a mesma ordem em List e Grid, durante expansão, polling, reconexão, reinício e mudanças de ciclo de vida. Status, ID, provedor, perfil, atividade e horário de atualização não são chaves de ordenação da apresentação; um novo agente é acrescentado ao fim da sessão.
 
 ![Visualização de status ao vivo de Agents com caminhos locais de worktree removidos da captura pública](/media/screenshots/threadcells-agents.webp)
 
@@ -42,7 +44,9 @@ Sessões ativas e históricas continuam sendo vidas úteis duráveis separadas. 
 
 Mutações sensíveis compartilham um controle **Unlock operator changes**. Os estados ausente, inválido, bloqueado, desbloqueado e expirado são distintos. O tamanho mínimo exato do segredo é cinco caracteres, e a sessão autenticada padrão dura cinco minutos.
 
-A UI envia o segredo somente para desbloquear, limpa-o imediatamente e nunca o coloca em persistência do navegador nem em exportações. Capacidade, alterações privilegiadas de perfil/provedor, configuração/testes do Telegram, execução de Housekeeping e inícios de proprietário aplicáveis permanecem bloqueados sem a sessão do servidor.
+A UI envia o segredo somente para desbloquear, limpa-o imediatamente e nunca o coloca em persistência do navegador nem em exportações. Capacidade, alterações privilegiadas de perfil/provedor, configuração/testes do Telegram, execução de Housekeeping, execução de Full Cleanup e inícios de proprietário aplicáveis permanecem bloqueados sem a sessão do servidor.
+
+Settings → Housekeeping termina com o bloco de perigo **Delete all system files — Full Cleanup**. Sua prévia somente leitura mostra estimativas de recuperação por classe, motivos de proteção, estado de ociosidade, releases/worktrees e o aviso de que somente a release ativa permanecerá. O modal de confirmação existente é obrigatório após o desbloqueio. A execução fica desabilitada enquanto algum agente ou execução que altere o sistema de arquivos estiver ativo, e o servidor verifica novamente essa condição antes de excluir. O resultado informa a recuperação planejada/real, itens ignorados, estado do disco, release ativa e disponibilidade de rollback.
 
 Siga [Autorização do operador](OPERATOR_AUTHORIZATION.md) para provisionar o verificador com segurança.
 
@@ -66,7 +70,7 @@ A navegação de Docs é agrupada pela jornada de aprendizagem, pesquisável e a
 
 ## Full Output
 
-Full Output renderiza texto de provedor retido para inspeção humana depois de remover sequências de controle ANSI/VT e manipulação do cursor do terminal. A sanitização impede que controles de apresentação reescrevam o histórico visível; ela não reinterpreta, executa nem certifica o texto do provedor.
+Full Output renderiza texto de provedor retido para inspeção humana depois de remover sequências de controle ANSI/VT e manipulação do cursor do terminal. A sanitização impede que controles de apresentação reescrevam o histórico visível; ela não reinterpreta, executa nem certifica o texto do provedor. Se o Full Cleanup removeu com segurança o log antigo de um agente encerrado enquanto reteve seus metadados, o visualizador informa que a saída durável está indisponível em vez de exibir um erro ou conteúdo inventado.
 
 ## Instalar como aplicativo
 

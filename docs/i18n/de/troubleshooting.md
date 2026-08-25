@@ -1,7 +1,7 @@
 ---
 slug: troubleshooting
 source: docs/TROUBLESHOOTING.md
-source_sha256: sha256:5e66928bd64c8837b5480d71160eb1548dbe9369be3069800fcf18e0f1e99836
+source_sha256: sha256:f6ed11a9ba51cf79c46f46c4e50ce638862a009bcbc3323f875bccfc49ed14a2
 ---
 # Fehlerbehebung
 
@@ -86,6 +86,12 @@ Settings → About, Docs-Footer, Kandidatenmanifest und Revision statischer Asse
 ## Festplattendruck oder Housekeeping kann nicht freigeben
 
 Einen Housekeeping-Dry-Run-Plan prüfen. Geschützte, aktive, unbekannte, Backup-, aktuelle und Rollback-Elemente werden absichtlich erhalten. Gemeldete Owner-/Referenzbeziehung beheben oder Speicherplatz sicher erweitern; niemals den Laufzeit-Root rekursiv löschen.
+
+Für die maximal nachweislich sichere Freigabe prüfen Sie die separate Full-Cleanup-Vorschau. Die Ausführung bleibt blockiert, bis jeder Agent nach autoritativer Prüfung untätig ist und weder Provider-, Heavy- noch Warteschlangenmutation oder Laufzeitoperation aktiv ist. Schließen Sie Ready-Agenten nicht und schwächen Sie dieses Gate nicht: Ihr Fortsetzungszustand bleibt geschützt. Full Cleanup entfernt alle nachweislich inaktiven lokalen Releases; bestätigen Sie daher, dass der Verlust des lokalen Rollbacks akzeptabel ist. Geschützte mehrdeutige Tools, Backups, Source-Autorität, schmutzige oder unveröffentlichte Worktrees und unbekannte Pfade sind erwartete Berichtseinträge und kein Grund, sie manuell zu löschen.
+
+## Full Output meldet eine bereinigte Ausgabe
+
+Ein beendeter historischer Agent kann in SQLite verbleiben, nachdem Full Cleanup sein altes dauerhaftes Log entfernt hat. Dies ist ein wahrheitsgemäßer Zustand mit aufbewahrten Metadaten: Sessions und Agents bleiben nutzbar, während Full Output `DURABLE_OUTPUT_UNAVAILABLE` meldet. Die Ausgabe aktueller und Ready-Agenten ist geschützt. Stellen Sie aus einem aufbewahrten Backup wieder her, wenn der historische Text benötigt wird; erfinden Sie kein Log und hängen Sie kein anderes an.
 
 ## Browser-Terminal verbindet sich nach Neustart nicht wieder
 

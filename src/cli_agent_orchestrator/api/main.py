@@ -109,6 +109,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     ExitAuthorityError,
     OutputMode,
     TerminalDeletionError,
+    TerminalOutputUnavailable,
 )
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
 from cli_agent_orchestrator.utils.logging import setup_logging
@@ -251,6 +252,13 @@ class HousekeepingRunRequest(BaseModel):
     )
 
 
+class FullCleanupRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_plan_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    confirmed: Literal[True]
+
+
 class TelegramSettingsUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -354,6 +362,8 @@ async def workflow_daemon(registry: PluginRegistry | None = None, *, recover_sta
 class TerminalOutputResponse(BaseModel):
     output: str
     mode: str
+    availability: Literal["available", "unavailable"] = "available"
+    reason_code: Optional[str] = None
 
 
 class SkillContentResponse(BaseModel):
@@ -1276,6 +1286,90 @@ async def run_housekeeping_endpoint(
         raise
 
 
+@app.get("/api/v1/housekeeping/full-cleanup/plan")
+async def get_full_cleanup_plan_endpoint() -> Dict:
+    from starlette.concurrency import run_in_threadpool
+
+    from cli_agent_orchestrator.services.housekeeping_service import plan_full_cleanup
+
+    return await run_in_threadpool(plan_full_cleanup)
+
+
+@app.post("/api/v1/housekeeping/full-cleanup/run")
+async def run_full_cleanup_endpoint(
+    body: FullCleanupRunRequest,
+    request: Request,
+    authorization: Annotated[Optional[str], Header()] = None,
+) -> Dict:
+    from starlette.concurrency import run_in_threadpool
+
+    from cli_agent_orchestrator.services.full_cleanup_helper import (
+        FullCleanupHelperError,
+        execute_via_privileged_helper,
+    )
+    from cli_agent_orchestrator.services.housekeeping_service import run_full_cleanup
+
+    actor = _require_operator(request, authorization)
+    session_token = (
+        request.cookies.get(OPERATOR_SESSION_COOKIE)
+        if actor.startswith("operator_session:")
+        else None
+    )
+    bearer_secret = (
+        authorization[len("Bearer ") :]
+        if actor == "operator_bearer"
+        and authorization is not None
+        and authorization.startswith("Bearer ")
+        else None
+    )
+    try:
+        summary = await run_in_threadpool(
+            lambda: run_full_cleanup(
+                expected_plan_id=body.expected_plan_id,
+                confirmed=body.confirmed,
+                privileged_cleanup_executor=lambda **_kwargs: execute_via_privileged_helper(
+                    expected_plan_id=body.expected_plan_id,
+                    confirmed=True,
+                    session_token=session_token,
+                    bearer_secret=bearer_secret,
+                ),
+            )
+        )
+        return summary.as_dict()
+    except (FullCleanupHelperError, RuntimeError) as exc:
+        reason = str(exc)
+        if not re.fullmatch(r"[A-Z0-9_]{3,96}", reason):
+            reason = "FULL_CLEANUP_EXECUTION_FAILED"
+        if reason in {"HOUSEKEEPING_BUSY", "FULL_CLEANUP_ADMISSION_BUSY"}:
+            raise HTTPException(
+                status_code=status.HTTP_423_LOCKED,
+                detail={"reason_code": reason},
+            ) from exc
+        if reason in {
+            "HOUSEKEEPING_PLAN_CHANGED",
+            "FULL_CLEANUP_NOT_IDLE",
+            "FULL_CLEANUP_IDLE_INVENTORY_UNKNOWN",
+        }:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"reason_code": reason},
+            ) from exc
+        if reason == "FULL_CLEANUP_CONFIRMATION_REQUIRED":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"reason_code": reason},
+            ) from exc
+        if reason == "OPERATOR_AUTHENTICATION_FAILED":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={"reason_code": reason},
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"reason_code": reason},
+        ) from exc
+
+
 @app.get("/api/v1/housekeeping/report")
 async def get_housekeeping_report_endpoint() -> Dict:
     config = load_operations_config()
@@ -1340,6 +1434,7 @@ def _admission_http_exception(exc: AdmissionDenied) -> HTTPException:
         "OWNER_GRANT_INVALID_OR_EXPIRED": status.HTTP_403_FORBIDDEN,
         "OWNER_GRANT_ALREADY_CONSUMED": status.HTTP_403_FORBIDDEN,
         "OWNER_GRANT_SCOPE_MISMATCH": status.HTTP_403_FORBIDDEN,
+        "ADMISSION_FENCE_TIMEOUT": status.HTTP_409_CONFLICT,
     }
     return HTTPException(
         status_code=status_by_reason.get(exc.reason_code, status.HTTP_503_SERVICE_UNAVAILABLE),
@@ -1361,20 +1456,19 @@ class RuntimeBrandingUpdate(BaseModel):
 async def set_agent_dirs_endpoint(body: AgentDirsUpdate) -> Dict:
     """Update agent directories per provider."""
     from cli_agent_orchestrator.services.settings_service import (
+        get_agent_dirs,
         get_extra_agent_dirs,
         set_agent_dirs,
         set_extra_agent_dirs,
     )
 
-    result_dirs = {}
-    result_extra = []
-    if body.agent_dirs:
-        result_dirs = set_agent_dirs(body.agent_dirs)
+    if body.agent_dirs is not None:
+        set_agent_dirs(body.agent_dirs)
     if body.extra_dirs is not None:
-        result_extra = set_extra_agent_dirs(body.extra_dirs)
+        set_extra_agent_dirs(body.extra_dirs)
     return {
-        "agent_dirs": result_dirs or {},
-        "extra_dirs": result_extra or get_extra_agent_dirs(),
+        "agent_dirs": get_agent_dirs(),
+        "extra_dirs": get_extra_agent_dirs(),
     }
 
 
@@ -2141,7 +2235,14 @@ async def get_terminal_output(
 ) -> TerminalOutputResponse:
     try:
         output = await _run_operational_io(terminal_service.get_output, terminal_id, mode)
-        return TerminalOutputResponse(output=output, mode=mode)
+        return TerminalOutputResponse(output=output, mode=mode, availability="available")
+    except TerminalOutputUnavailable:
+        return TerminalOutputResponse(
+            output="",
+            mode=mode,
+            availability="unavailable",
+            reason_code="DURABLE_OUTPUT_UNAVAILABLE",
+        )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -2221,9 +2322,17 @@ async def create_inbox_message_endpoint(
         # sender_id is not a capability to finalize a registered child result;
         # authoritative callbacks are persisted directly by MCP send_message
         # after its admitted durable effect is claimed.
-        inbox_msg = await _run_operational_io(
-            create_inbox_message, payload.sender_id, receiver_id, payload.message
-        )
+        def persist_message():
+            from cli_agent_orchestrator.services.operations_service import (
+                workflow_execution_admission_fence,
+            )
+
+            with workflow_execution_admission_fence():
+                return create_inbox_message(payload.sender_id, receiver_id, payload.message)
+
+        inbox_msg = await _run_operational_io(persist_message)
+    except AdmissionDenied as e:
+        raise _admission_http_exception(e)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:

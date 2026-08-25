@@ -1,7 +1,7 @@
 ---
 slug: security-model
 source: docs/SECURITY_MODEL.md
-source_sha256: sha256:6305e6199bae4706af6ed41e99eb0465ed0877bff4e83a7b1df57019f1a3383c
+source_sha256: sha256:3289f7f4f98e1df65f02b4331233327e3adb0e0d7b0b56cffe5ef04b2b64cfe9
 ---
 
 # Modelo de segurança
@@ -59,6 +59,10 @@ Não coloque segredos do operador/provedor/Telegram em texto simples em reposit�
 ## Operações destrutivas
 
 O Housekeeping é orientado por plano e falha de forma fechada. Recursos desconhecidos, ilegíveis, abertos, ativos, referenciados, com identidade alterada ou metadados incompletos permanecem protegidos. Backups nunca são excluídos automaticamente.
+
+O Full Cleanup é um modo de retenção mais agressivo dentro da mesma autoridade de Housekeeping, não um subsistema de exclusão separado. Ele reutiliza a sessão de operador no servidor e a confirmação de ação permanente, não aceita nenhum caminho de sistema de arquivos selecionado pelo chamador, serializa com a admissão de inicialização/provedor/Heavy e revalida um ciclo de vida totalmente ocioso imediatamente antes da mutação. A release ativa, o estado do SQLite, a autoridade de continuação de agentes Ready, as credenciais/estado do provedor, a autoridade atual de código-fonte/ferramentas e os recursos ambíguos permanecem protegidos. Releases locais inativas comprovadas de rollback são removidas intencionalmente somente por essa operação explícita.
+
+A exclusão baseada em caminhos é limitada ao root helper ativado por socket. Ele reautentica a mesma autoridade do operador, aceita somente um ID de plano canônico exato, exige que o processo do plano de controle mantenha todos os limites de admissão e bloqueia as identidades dos diretórios em quarentena contra substituição pelo usuário de runtime antes da exclusão relativa a descritores. A API sem privilégios não oferece nenhuma operação de caminho arbitrário nem um fallback mais fraco.
 
 A implantação preserva um runtime de rollback e um backup do banco de dados. Publicação, exposição à rede pública e mudanças destrutivas de histórico continuam sendo decisões separadas do proprietário.
 

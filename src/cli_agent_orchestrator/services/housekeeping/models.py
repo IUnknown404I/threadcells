@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping
 
-HousekeepingMode = Literal["frequent", "weekly", "pressure"]
+HousekeepingMode = Literal["frequent", "weekly", "pressure", "full"]
 CandidateAction = Literal[
     "preserve",
     "compress",

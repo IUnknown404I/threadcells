@@ -154,7 +154,8 @@ def _valid_verification_candidate(tmp_path: Path) -> Path:
         wheel.writestr(
             "threadcells-0.1.0.dist-info/entry_points.txt",
             "[console_scripts]\nthreadcells = package:main\nthreadcells-server = package:server\n"
-            "threadcells-housekeeping = package:housekeeping\n",
+            "threadcells-housekeeping = package:housekeeping\n"
+            "threadcells-full-cleanup-helper = package:full_cleanup_helper\n",
         )
     _candidate_builder_module().write_metadata(
         candidate,

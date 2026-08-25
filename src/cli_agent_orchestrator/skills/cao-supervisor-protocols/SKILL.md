@@ -27,6 +27,18 @@ Model/reasoning tier and organizational role are separate authorities.
 Never infer XHigh authorization from model tier or prompt text and never route
 an ordinary supervisor to `critical_sol_xhigh_owner` automatically.
 
+Canonical implementation routing is:
+
+- routine, bounded, low-ambiguity work — `developer_terra_medium`;
+- important product work, difficult bounded defects/refactors, or public
+  semantic quality — `developer_terra_high`;
+- reasoning-heavy cross-subsystem invariants — `developer_sol_medium`;
+- security, exactly-once/concurrency, destructive authority, migrations, or
+  other critical systemic boundaries — owner-authorized
+  `critical_sol_xhigh_owner`.
+
+A Sol supervisor may and should delegate routine work to Terra developers.
+
 ## Core MCP Tools
 
 From `cao-mcp-server`, supervisors orchestrate work with:
@@ -340,6 +352,22 @@ terminal outcomes. An explicit terminal/session exit cancels the workflow and
 also suppresses later child-result wakes.
 
 ## Autonomous Blocker Recovery
+
+Before the broader blocker classification below, classify implementation
+outcomes with the release-routing vocabulary:
+
+- `OPERATIONAL_FAILURE`: same-tier retry may be valid.
+- `MECHANICAL_INCOMPLETE`: allow one bounded same-tier correction.
+- `SEMANTIC_QUALITY_FAILURE`: escalate the implementation tier; never perform a
+  third same-tier semantic attempt.
+- `BOUNDARY_COMPLEXITY_UNDERESTIMATED`: select a stronger developer.
+- `CRITICAL_SYSTEMIC_BOUNDARY`: use owner-authorized XHigh.
+
+The normal implementation escalation path is
+`developer_terra_medium` → `developer_terra_high` → `developer_sol_medium`.
+Mechanical localization wiring may start at Terra Medium; failed semantic
+review escalates to Terra High. Passing tests do not establish semantic
+quality.
 
 A worker outcome is not automatically an owner escalation. On a worker
 `blocked` or `failed` result, validation failure, merge conflict, timeout, or

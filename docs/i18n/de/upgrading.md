@@ -1,7 +1,7 @@
 ---
 slug: upgrading
 source: docs/UPGRADING.md
-source_sha256: sha256:583ec58e621329fd7dc9914a0c29c18a7f12bee09808f2f18908fe4d972536cf
+source_sha256: sha256:9f73c3caf0e5c41d2ea38998c5d5da2f41091658ba94c3c36095164390f96bfe
 ---
 # ThreadCells aktualisieren
 
@@ -22,7 +22,7 @@ Aus dem vorgesehenen Source-Commit:
 
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
-candidate="$PWD/threadcells-candidate/threadcells-0.2.0a1-local"
+candidate="$PWD/threadcells-candidate/threadcells-0.3.0a1-local"
 python3 scripts/verify_local_candidate.py --candidate "$candidate"
 ```
 
@@ -63,5 +63,7 @@ Wenn die Abnahme wesentlich fehlschlägt:
 5. Pre-Upgrade-Datenbank nur wiederherstellen, wenn Schema-/Datenkompatibilität es erfordert.
 
 Verwenden Sie keinen destruktiven Git-Reset und löschen Sie keine neueren Laufzeitnachweise, um ein Rollback zu simulieren.
+
+Ein ausdrücklich bestätigtes Full Cleanup ist die Ausnahme von der normalen Aufbewahrung lokaler Releases: Es entfernt alle nachweislich inaktiven Releases einschließlich des beim Deployment ausgewählten Rollbacks und lässt nur das aktive unveränderliche Release zurück. Führen Sie es nicht während der Upgrade-Abnahme oder während der Ausführung eines Agenten aus. Stellen Sie nach einem erfolgreichen Full Cleanup die Rollback-Verfügbarkeit nur durch Staging eines weiteren verifizierten unveränderlichen Releases wieder her; rekonstruieren Sie es niemals aus einem ungeprüften Verzeichnis.
 
 Siehe [Lokales Deployment](DEPLOYMENT.md) und [Backup und Wiederherstellung](BACKUP_AND_RESTORE.md).

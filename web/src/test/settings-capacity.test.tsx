@@ -6,6 +6,28 @@ import { SettingsPanel } from '../components/SettingsPanel'
 describe('Settings orchestration capacity', () => {
   afterEach(() => vi.restoreAllMocks())
 
+  it('keeps provider-owned directories read-only and saves only additional directories', async () => {
+    vi.spyOn(api, 'getOperatorSession').mockResolvedValue({ configured: false, authenticated: false, expires_in_seconds: 0, session_ttl_seconds: 300, verifier_reference: 'THREADCELLS_OPERATOR_VERIFIER_FILE' })
+    vi.spyOn(api, 'getAgentDirs').mockResolvedValue({ agent_dirs: { codex: '/provider/codex' }, extra_dirs: ['/extra/one', '/extra/two'] })
+    const save = vi.spyOn(api, 'setAgentDirs').mockResolvedValue({ agent_dirs: { codex: '/provider/codex' }, extra_dirs: ['/extra/two'] })
+    vi.spyOn(api, 'listProfiles').mockResolvedValue([])
+    vi.spyOn(api, 'getOrchestrationCapacity').mockRejectedValue(new Error('not needed'))
+    vi.spyOn(api, 'listProjects').mockResolvedValue([])
+    vi.spyOn(api, 'getBranding').mockResolvedValue({ title: 'ThreadCells', subtitle: 'Multi-agent control plane', logoUrl: '/threadcells-symbol.png', customLogo: false })
+
+    render(<SettingsPanel />)
+
+    expect(await screen.findByText('/provider/codex')).toBeInTheDocument()
+    expect(screen.getByText('codex · read-only')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /provider\/codex/ })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Remove additional directory /extra/one' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save Settings' }))
+
+    await waitFor(() => expect(save).toHaveBeenCalledWith({ extra_dirs: ['/extra/two'] }))
+    expect(screen.getByText('/provider/codex')).toBeInTheDocument()
+    expect(screen.queryByText('/extra/one')).not.toBeInTheDocument()
+  })
+
   it('shows effective limits separately from live utilization and has no policy controls', async () => {
     vi.spyOn(api, 'getOperatorSession').mockResolvedValue({ configured: true, authenticated: false, expires_in_seconds: 0, session_ttl_seconds: 300, verifier_reference: 'THREADCELLS_OPERATOR_VERIFIER_FILE' })
     vi.spyOn(api, 'getAgentDirs').mockResolvedValue({ agent_dirs: {}, extra_dirs: [] })

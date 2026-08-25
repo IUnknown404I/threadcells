@@ -40,12 +40,7 @@ export function SettingsPanel() {
     try {
       const s = await api.getAgentDirs()
       setSettings(s)
-      // Merge all configured dirs into a single flat list, deduped
-      const allDirs = [
-        ...Object.values(s.agent_dirs),
-        ...s.extra_dirs,
-      ].filter((d, i, arr) => d && arr.indexOf(d) === i)
-      setDirs(allDirs)
+      setDirs(s.extra_dirs)
     } catch {
       showSnackbar({ type: 'error', message: 'Failed to load settings' })
     }
@@ -111,9 +106,9 @@ export function SettingsPanel() {
     setSaving(true)
     setSaved(false)
     try {
-      // Send all dirs as extra_dirs — the backend will scan all of them
       const result = await api.setAgentDirs({ extra_dirs: dirs })
       setSettings(result)
+      setDirs(result.extra_dirs)
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
       showSnackbar({ type: 'success', message: 'Settings saved' })
@@ -301,16 +296,31 @@ export function SettingsPanel() {
           Install built-in profiles with: <code className="bg-gray-900 px-1.5 py-0.5 rounded text-emerald-300">threadcells install developer</code>
         </p>
 
+        {Object.entries(settings.agent_dirs).length > 0 && (
+          <div className="mb-4 space-y-2" aria-label="Provider-managed profile directories">
+            <p className="text-xs font-medium text-gray-300">Provider-managed directories</p>
+            {Object.entries(settings.agent_dirs).map(([provider, dir]) => (
+              <div key={provider} className="flex min-w-0 items-center gap-2 rounded-lg border border-gray-700/30 bg-gray-900/50 px-3 py-2.5">
+                <FolderOpen size={14} className="shrink-0 text-gray-400" />
+                <span className="min-w-0 flex-1 truncate font-mono text-sm text-gray-300" title={dir}>{dir}</span>
+                <span className="shrink-0 text-xs text-gray-400">{provider} · read-only</span>
+              </div>
+            ))}
+          </div>
+        )}
+
         {dirs.length > 0 && (
-          <div className="space-y-2 mb-4">
+          <div className="space-y-2 mb-4" aria-label="Additional profile directories">
+            <p className="text-xs font-medium text-gray-300">Additional directories</p>
             {dirs.map((dir, i) => (
-              <div key={i} className="flex items-center gap-2 bg-gray-900/50 border border-gray-700/30 rounded-lg px-3 py-2.5 min-w-0">
+              <div key={dir} className="flex items-center gap-2 bg-gray-900/50 border border-gray-700/30 rounded-lg px-3 py-2.5 min-w-0">
                 <FolderOpen size={14} className="text-emerald-500 shrink-0" />
                 <span className="text-sm text-gray-300 font-mono flex-1 truncate" title={dir}>{dir}</span>
                 <button
                   onClick={() => removeDir(i)}
                   className="min-w-11 min-h-11 -my-2 inline-flex items-center justify-center text-gray-400 hover:text-red-400 transition-colors shrink-0 rounded-lg hover:bg-gray-800"
-                  title="Remove directory"
+                  title={`Remove additional directory ${dir}`}
+                  aria-label={`Remove additional directory ${dir}`}
                 >
                   <X size={14} />
                 </button>
@@ -322,8 +332,8 @@ export function SettingsPanel() {
         {dirs.length === 0 && (
           <div className="text-center py-6 mb-4 bg-gray-900/30 border border-dashed border-gray-700 rounded-lg">
             <FolderOpen size={24} className="mx-auto text-gray-400 mb-2" />
-            <p className="text-gray-400 text-sm">No directories configured.</p>
-            <p className="text-gray-400 text-xs mt-1">Add a directory below to start discovering agent profiles.</p>
+            <p className="text-gray-400 text-sm">No additional directories configured.</p>
+            <p className="text-gray-400 text-xs mt-1">Provider-managed directories above remain active. Add another directory below if needed.</p>
           </div>
         )}
 
@@ -344,6 +354,7 @@ export function SettingsPanel() {
             <Plus size={14} /> Add
           </button>
         </div>
+        <p className="mt-2 text-xs text-gray-400">Removing an additional directory only stops profile discovery there; it never deletes the directory or its files.</p>
       </div>
 
       {/* Actions */}

@@ -99,7 +99,7 @@ export function ConfirmModal({
             className={`min-h-11 justify-center px-4 py-2 text-sm font-medium text-white rounded-lg transition-all focus:outline-none focus:ring-2 disabled:opacity-60 flex items-center gap-2 ${colors.btn}`}
           >
             {loading && <Loader2 size={14} className="animate-spin" />}
-            {loading ? 'Closing...' : confirmLabel}
+            {loading ? 'Working…' : confirmLabel}
           </button>
         </div>
       </div>

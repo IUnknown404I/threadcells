@@ -51,7 +51,7 @@ def capacity_db(tmp_path, monkeypatch):
                 )
             )
         db.commit()
-    yield
+    yield tmp_path
     engine.dispose()
 
 
@@ -148,7 +148,11 @@ def test_operations_admission_uses_same_atomic_capacity_snapshot(capacity_db, mo
         operations_service.acquire_provider_execution_slot(
             "term-0",
             turn_id,
-            config={"max_provider_executions": 3},
+            config={
+                "max_provider_executions": 3,
+                "lock_dir": str(capacity_db / "locks"),
+                "context_launch_lock_timeout_seconds": 1,
+            },
         )
 
     assert denied.value.reason_code == "TERMINAL_RUNTIME_OPERATION_BUSY"
@@ -179,6 +183,8 @@ def test_runtime_release_wakes_queued_input_once_without_owner_resend(capacity_d
             "max_provider_executions": 3,
             "max_work_contexts": 2,
             "max_heavy_execution_slots": 1,
+            "lock_dir": str(capacity_db / "locks"),
+            "context_launch_lock_timeout_seconds": 1,
         },
     )
     monkeypatch.setattr(operations_service, "require_resource_admission", lambda *_: {})
@@ -408,6 +414,8 @@ def test_direct_inbox_wake_uses_real_fifo_leases_under_saturation(capacity_db, m
             "max_provider_executions": 3,
             "max_work_contexts": 2,
             "max_heavy_execution_slots": 1,
+            "lock_dir": str(capacity_db / "locks"),
+            "context_launch_lock_timeout_seconds": 1,
         },
     )
     monkeypatch.setattr(operations_service, "require_resource_admission", lambda *_: {})

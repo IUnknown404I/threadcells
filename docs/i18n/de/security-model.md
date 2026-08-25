@@ -1,7 +1,7 @@
 ---
 slug: security-model
 source: docs/SECURITY_MODEL.md
-source_sha256: sha256:6305e6199bae4706af6ed41e99eb0465ed0877bff4e83a7b1df57019f1a3383c
+source_sha256: sha256:3289f7f4f98e1df65f02b4331233327e3adb0e0d7b0b56cffe5ef04b2b64cfe9
 ---
 # Sicherheitsmodell
 
@@ -58,6 +58,10 @@ Legen Sie keine Klartext-Operator-/Provider-/Telegram-Geheimnisse in Repositorie
 ## Destruktive Vorgänge
 
 Housekeeping erfolgt planbasiert und schlägt geschlossen fehl. Unbekannte, nicht lesbare, geöffnete, aktive, referenzierte, identitätsveränderte oder mit unvollständigen Metadaten versehene Ressourcen bleiben geschützt. Backups werden niemals automatisch gelöscht.
+
+Full Cleanup ist ein aggressiverer Aufbewahrungsmodus innerhalb derselben Housekeeping-Autorität und kein separates Löschsubsystem. Er verwendet die serverseitige Operatorsitzung und die Bestätigung dauerhafter Aktionen erneut, akzeptiert keinen vom Aufrufer gewählten Dateisystempfad, serialisiert mit Launch-/Provider-/Heavy-Admission und prüft einen vollständigen Leerlauf-Lebenszyklus unmittelbar vor der Mutation erneut. Das aktive Release, SQLite-Zustand, Fortsetzungsautorität von Ready-Agenten, Zugangsdaten/Provider-Zustand, aktuelle Source-/Tool-Autorität und mehrdeutige Ressourcen bleiben geschützt. Nachweislich inaktive lokale Rollback-Releases werden absichtlich nur durch diese ausdrückliche Operation entfernt.
+
+Die Löschung anhand von Pfadnamen ist auf den socket-aktivierten Root-Helper beschränkt. Er authentifiziert dieselbe Operatorautorität erneut, akzeptiert nur eine exakte kanonische Plan-ID, setzt voraus, dass der Control-Plane-Prozess alle Admission-Fences hält, und sperrt unter Quarantäne gestellte Verzeichnisidentitäten vor der deskriptorrelativen Löschung gegen Ersetzung durch den Runtime-Benutzer. Die unprivilegierte API besitzt weder eine Operation mit beliebigem Pfad noch einen schwächeren Fallback.
 
 Das Deployment bewahrt eine Rollback-Laufzeitumgebung und ein Datenbank-Backup. Veröffentlichung, öffentliche Netzwerkfreigabe und destruktive Verlaufsänderungen bleiben separate Owner-Entscheidungen.
 

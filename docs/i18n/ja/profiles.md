@@ -1,7 +1,7 @@
 ---
 slug: profiles
 source: docs/PROFILES.md
-source_sha256: sha256:2bef7848e092db4dfc8e667bf98ea781cbae3ac77e80f02e25cc2500c7ad7776
+source_sha256: sha256:c378cfce9445d9171027ab61113863019c5478942bbdf218c8cdd1a6a608c552
 ---
 # プロファイル
 
@@ -29,9 +29,11 @@ ThreadCells には、日常用および強力なスーパーバイザー、開�
 
 例:
 
-- `supervisor_terra_medium`: 通常の分解と統合を行う日常的なスーパーバイザー。
-- `supervisor_sol_medium`: 重要な作業またはモジュール横断の作業のための、より強力なオーケストレーション。
-- `developer_terra_medium` と `developer_sol_medium`: 範囲を限定した実装ロール。
+- `supervisor_terra_medium`: 通常および中程度のリスクのワークフローに使う既定の継続的オーケストレーター。分解、委任、レビュー、受け入れ、統合を担います。
+- `supervisor_sol_medium`: リスクのある、モジュール横断、アーキテクチャ依存、またはライフサイクル依存のワークフロー向けの、オーケストレーション優先スーパーバイザー。
+- `developer_terra_medium`: 定型的で範囲が限定され、曖昧さの少ない実装。
+- `developer_terra_high`: 重要なプロダクト作業、難しいが範囲の限定された不具合とリファクタリング、および公開文面の意味品質。
+- `developer_sol_medium`: 推論負荷が高いサブシステム横断作業と、微妙な不変条件に関わる作業。
 - `reviewer_sol_high`: リスクのある変更または統合された変更の独立レビュー。
 - `critical_sol_xhigh_owner`: 独立した認可境界を持つ、例外的なオーナー実行者プロファイル。
 
@@ -51,6 +53,22 @@ ThreadCells には、日常用および強力なスーパーバイザー、開�
 | 重要なフロンティアのオーナー実行 | オーナー承認済み XHigh のみ |
 
 より大きな推論量と広い権限は容量を消費し、影響も増大させます。既定にするのではなく、タスクを反映させてください。
+
+Sol スーパーバイザーだからといって、Sol 開発者が必要とは限りません。定型実装は引き続き Terra 開発者に割り当て、`developer_sol_medium` は正しさが微妙なシステム横断の推論に依存する作業に限るべきです。
+
+## 再試行とエスカレーション
+
+ThreadCells は別のエージェントを選ぶ前に、失敗した実装試行を分類します。
+
+| 失敗クラス | 正規の対応 |
+| --- | --- |
+| `OPERATIONAL_FAILURE` | 同じティアでの再試行が妥当な場合があります。 |
+| `MECHANICAL_INCOMPLETE` | 範囲を限定した同じティアでの修正を一度許可します。 |
+| `SEMANTIC_QUALITY_FAILURE` | 実装ティアを引き上げます。同じティアで意味品質の試行を3回行ってはいけません。 |
+| `BOUNDARY_COMPLEXITY_UNDERESTIMATED` | より強力な開発者を選びます。 |
+| `CRITICAL_SYSTEMIC_BOUNDARY` | オーナー承認済みの `critical_sol_xhigh_owner` を使用します。 |
+
+通常のエスカレーション経路は `developer_terra_medium` → `developer_terra_high` → `developer_sol_medium` です。XHigh は、セキュリティ、exactly-once 並行処理、破壊的 Housekeeping、移行、危険な復旧など、真に重要でシステム全体に関わる権限に限ります。テスト合格は必要な証拠ですが、それだけで意味品質を証明するものではありません。
 
 ## 解決済みプレビュー
 

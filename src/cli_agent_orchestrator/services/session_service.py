@@ -27,7 +27,6 @@ from cli_agent_orchestrator.clients.database import (
     AmbiguousSessionIdentity,
     cancel_workflows_for_terminal,
     delete_terminals_by_session_lifetime,
-    mark_terminal_runtime_exited,
     resolve_session_lifetime,
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
@@ -41,6 +40,7 @@ from cli_agent_orchestrator.plugins import (
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.terminal_service import (
+    ManagedWorktreeCleanupError,
     cleanup_managed_worktree,
     create_terminal,
     prepare_terminal_for_destruction,
@@ -70,6 +70,7 @@ class SessionAuthority:
     session_id: str
     session_name: str
     terminals: List[Dict]
+    retained_resources: List[Dict]
     deleted: bool
     runtime_exists: bool | None
 
@@ -94,6 +95,7 @@ def resolve_session_authority(identifier: str, *, require_live: bool = False) ->
         session_id=str(durable["session_id"]),
         session_name=str(durable["session_name"]),
         terminals=list(durable["terminals"]),
+        retained_resources=list(durable.get("retained_resources", [])),
         deleted=bool(durable["deleted"]),
         runtime_exists=runtime_exists,
     )
@@ -224,23 +226,32 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
             authority = resolve_session_authority(session_name)
             if authority.deleted:
                 result["already_deleted"] = True
+                result["retained_resources"] = authority.retained_resources
                 return result
             terminals = authority.terminals
 
-            # Worktree safety and exact runtime authority are read-only
-            # preconditions. Do not cancel workflows or clean providers until
-            # every destructive boundary is known to be eligible.
-            for terminal in terminals:
-                validate_managed_worktree_cleanup(terminal)
+            # A live session remains usable authority even while its provider
+            # is Ready.  Session deletion is a historical operation: callers
+            # must gracefully exit every terminal before removing the session
+            # from the operational read model.
             if authority.has_live_runtime_owner:
-                proof = prove_live_session_runtime_authority(
-                    authority.session_name, terminals, runtime_client=tmux_client
+                raise SessionLifecycleError(
+                    "SESSION_RUNTIME_ACTIVE",
+                    "Every agent must be durably exited before deleting this session",
                 )
-                if not proof.proven:
-                    raise SessionLifecycleError(
-                        proof.reason_code or "SESSION_RUNTIME_AUTHORITY_DIVERGED",
-                        f"{proof.message}; deletion is protected",
-                        inventory_uncertain=proof.inventory_uncertain,
+
+            # Worktree validation classifies filesystem cleanup, not logical
+            # session eligibility.  A protected worktree is retained with its
+            # terminal metadata after the session is tombstoned.
+            retained_resources: list[dict[str, str]] = []
+            cleanup_eligible: set[str] = set()
+            for terminal in terminals:
+                try:
+                    validate_managed_worktree_cleanup(terminal)
+                    cleanup_eligible.add(str(terminal["id"]))
+                except ManagedWorktreeCleanupError as exc:
+                    retained_resources.append(
+                        {"terminal_id": str(terminal["id"]), "reason_code": exc.reason_code}
                     )
 
             # Capture every child result before cancelling workflows, cleaning
@@ -249,17 +260,16 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
             for terminal in terminals:
                 prepare_terminal_for_destruction(terminal["id"])
 
-            if not authority.has_live_runtime_owner:
-                # Historical rows remain deletable without a tmux session, but
-                # each exact terminal identity must independently prove that no
-                # runtime can still write through its lease. This happens only
-                # after any required result snapshot has been made durable.
-                for terminal in terminals:
-                    if retire_exited_terminal_runtime(terminal["id"]) is not True:
-                        raise SessionLifecycleError(
-                            "SESSION_RUNTIME_AUTHORITY_UNPROVEN",
-                            "Historical session runtime authority is ambiguous; metadata and writer leases remain protected",
-                        )
+            # Historical rows remain deletable without a tmux session, but
+            # each exact terminal identity must independently prove that no
+            # runtime can still write through its lease. This happens only
+            # after any required result snapshot has been made durable.
+            for terminal in terminals:
+                if retire_exited_terminal_runtime(terminal["id"]) is not True:
+                    raise SessionLifecycleError(
+                        "SESSION_RUNTIME_AUTHORITY_UNPROVEN",
+                        "Historical session runtime authority is ambiguous; metadata and writer leases remain protected",
+                    )
 
             for terminal in terminals:
                 cancel_workflows_for_terminal(terminal["id"])
@@ -276,38 +286,27 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                 except Exception as e:
                     logger.warning(f"Provider cleanup failed for {terminal['id']}: {e}")
 
-            if authority.has_live_runtime_owner:
-                # Revalidate immediately before killing the reusable tmux
-                # name; the first proof may have become stale meanwhile.
-                proof = prove_live_session_runtime_authority(
-                    authority.session_name, terminals, runtime_client=tmux_client
-                )
-                if not proof.proven:
-                    raise SessionLifecycleError(
-                        proof.reason_code or "SESSION_RUNTIME_AUTHORITY_DIVERGED",
-                        f"{proof.message}; deletion is protected",
-                        inventory_uncertain=proof.inventory_uncertain,
-                    )
-                tmux_client.kill_session(authority.session_name)
-                death = tmux_client.session_exists(authority.session_name)
-                if death is not False:
-                    raise SessionLifecycleError(
-                        "SESSION_DEATH_UNCONFIRMED",
-                        "Session death was not confirmed; metadata and writer leases remain protected",
-                        inventory_uncertain=death is None,
-                    )
-                for terminal in terminals:
-                    mark_terminal_runtime_exited(terminal["id"])
-
-            # Every managed worktree was validated before runtime mutation.
+            # Cleanup is best effort after positive runtime-death proof.  A
+            # race or newly protected Git state is preserved and represented
+            # by retained terminal metadata rather than half-deleting it.
             for terminal in terminals:
-                cleanup_managed_worktree(terminal)
+                terminal_id = str(terminal["id"])
+                if terminal_id not in cleanup_eligible:
+                    continue
+                try:
+                    cleanup_managed_worktree(terminal)
+                except ManagedWorktreeCleanupError as exc:
+                    cleanup_eligible.discard(terminal_id)
+                    retained_resources.append(
+                        {"terminal_id": terminal_id, "reason_code": exc.reason_code}
+                    )
 
             try:
                 deletion = delete_terminals_by_session_lifetime(
                     authority.session_id,
                     authority.session_name,
                     expected_terminal_ids=[terminal["id"] for terminal in terminals],
+                    retained_resources=retained_resources,
                 )
             except AmbiguousSessionIdentity as exc:
                 raise SessionLifecycleError(
@@ -315,7 +314,7 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                     "Session identity changed during deletion; retry after reconciliation",
                     inventory_uncertain=True,
                 ) from exc
-            if not deletion["already_deleted"] and deletion["deleted"] != len(terminals):
+            if not deletion["already_deleted"] and deletion["logical_deleted"] != len(terminals):
                 raise SessionLifecycleError(
                     "SESSION_IDENTITY_CHANGED",
                     "Session identity changed during deletion; retry after reconciliation",
@@ -324,6 +323,7 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
 
         result["deleted"].append(authority.session_name)
         result["already_deleted"] = bool(deletion["already_deleted"])
+        result["retained_resources"] = list(deletion["retained_resources"])
         logger.info(f"Deleted session lifetime: {authority.session_id}")
         dispatch_plugin_event(
             registry,

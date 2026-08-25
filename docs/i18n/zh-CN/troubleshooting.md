@@ -1,7 +1,7 @@
 ---
 slug: troubleshooting
 source: docs/TROUBLESHOOTING.md
-source_sha256: sha256:5e66928bd64c8837b5480d71160eb1548dbe9369be3069800fcf18e0f1e99836
+source_sha256: sha256:f6ed11a9ba51cf79c46f46c4e50ce638862a009bcbc3323f875bccfc49ed14a2
 ---
 # 故障排除
 
@@ -86,6 +86,12 @@ Settings → About、Docs 页脚、候选清单和静态资源修订版本应保
 ## 磁盘压力或 Housekeeping 无法回收
 
 检查 Housekeeping dry-run 计划。受保护、活动、未知、备份、当前和回滚项目会被有意保留。处理报告的所有者/引用问题，或安全扩充磁盘；绝不要递归删除运行时根目录。
+
+如需最大化已证实安全的回收量，请检查单独的 Full Cleanup 预览。执行会一直受阻，直到每个智能体都被权威证明为空闲，且没有提供商、Heavy、排队变更或运行时操作处于活跃状态。不要关闭 Ready 智能体或削弱该门控：其继续执行状态仍受保护。Full Cleanup 会移除所有已证实不活跃的本地发布版本，因此请确认失去本地回滚可以接受。受保护的含糊工具、备份、源代码权限、dirty 或 unpublished worktree 以及未知路径都应作为预期报告条目，而不是手动删除它们的理由。
+
+## Full Output 显示输出已清理
+
+Full Cleanup 移除旧持久日志后，已退出的历史智能体仍可保留在 SQLite 中。这是如实保留元数据的状态：Sessions 和 Agents 仍可使用，而 Full Output 会报告 `DURABLE_OUTPUT_UNAVAILABLE`。当前和 Ready 智能体的输出受保护。如果需要历史文本，请从保留的备份恢复；不要伪造或重新附加其他日志。
 
 ## 重启后浏览器终端无法重新连接
 

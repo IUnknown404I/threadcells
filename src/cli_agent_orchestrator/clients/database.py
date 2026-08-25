@@ -144,6 +144,7 @@ class SessionDeletionReceiptModel(Base):
 
     session_id = Column(String, primary_key=True)
     session_name = Column(String, nullable=False, index=True)
+    retained_resources_json = Column(Text, nullable=False, default="[]", server_default="[]")
     deleted_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
@@ -864,6 +865,7 @@ _control_plane_schema_engine_identity: Optional[int] = None
 _terminal_ui_projection_schema_lock = threading.Lock()
 _terminal_ui_projection_schema_ready = False
 _terminal_ui_projection_schema_engine_identity: Optional[int] = None
+_session_deletion_receipt_schema_lock = threading.Lock()
 
 CONTROL_PLANE_SCHEMA_VERSION = 1
 # Durable compatibility identifier: deployed databases already use this key.
@@ -3210,7 +3212,57 @@ def _session_terminal_dict(terminal: TerminalModel) -> Dict[str, Any]:
 
 
 def _ensure_session_deletion_receipt_schema() -> None:
-    SessionDeletionReceiptModel.__table__.create(bind=engine, checkfirst=True)
+    with _session_deletion_receipt_schema_lock:
+        SessionDeletionReceiptModel.__table__.create(bind=engine, checkfirst=True)
+        with engine.begin() as connection:
+            columns = {
+                row[1]
+                for row in connection.exec_driver_sql(
+                    "PRAGMA table_info(session_deletion_receipts)"
+                ).fetchall()
+            }
+            if "retained_resources_json" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_receipts "
+                    "ADD COLUMN retained_resources_json TEXT NOT NULL DEFAULT '[]'"
+                )
+
+
+def _normalize_session_retained_resources(
+    resources: Sequence[Mapping[str, str]],
+) -> list[dict[str, str]]:
+    if isinstance(resources, (str, bytes)):
+        raise ValueError("retained resources must be a sequence of objects")
+    normalized: list[dict[str, str]] = []
+    terminal_ids: set[str] = set()
+    for item in resources:
+        if not isinstance(item, Mapping) or set(item) != {"terminal_id", "reason_code"}:
+            raise ValueError("retained resource identity is invalid")
+        terminal_id = item.get("terminal_id")
+        reason_code = item.get("reason_code")
+        if (
+            not isinstance(terminal_id, str)
+            or not terminal_id
+            or terminal_id in terminal_ids
+            or not isinstance(reason_code, str)
+            or not re.fullmatch(r"[A-Z0-9_]{3,96}", reason_code)
+        ):
+            raise ValueError("retained resource identity is invalid")
+        terminal_ids.add(terminal_id)
+        normalized.append({"terminal_id": terminal_id, "reason_code": reason_code})
+    return sorted(normalized, key=lambda item: item["terminal_id"])
+
+
+def _session_receipt_retained_resources(
+    receipt: SessionDeletionReceiptModel,
+) -> list[dict[str, str]]:
+    try:
+        value = json.loads(str(receipt.retained_resources_json or "[]"))
+        if not isinstance(value, list):
+            raise ValueError("retained resources must be a list")
+        return _normalize_session_retained_resources(value)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AmbiguousSessionIdentity(str(receipt.session_id)) from exc
 
 
 def _ensure_terminal_deletion_receipt_schema() -> None:
@@ -3228,6 +3280,19 @@ def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
     _ensure_usage_schema()
     _ensure_session_deletion_receipt_schema()
     with SessionLocal() as db:
+        exact_receipt = (
+            db.query(SessionDeletionReceiptModel)
+            .filter(SessionDeletionReceiptModel.session_id == identifier)
+            .first()
+        )
+        if exact_receipt is not None:
+            return {
+                "session_id": str(exact_receipt.session_id),
+                "session_name": str(exact_receipt.session_name),
+                "deleted": True,
+                "terminals": [],
+                "retained_resources": _session_receipt_retained_resources(exact_receipt),
+            }
         terminals = (
             db.query(TerminalModel)
             .filter(TerminalModel.session_id == identifier)
@@ -3246,9 +3311,23 @@ def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
                 .all()
             )
         if not terminals:
+            tombstone_exists = (
+                db.query(SessionDeletionReceiptModel.session_id)
+                .filter(
+                    SessionDeletionReceiptModel.session_id
+                    == func.coalesce(
+                        TerminalModel.session_id,
+                        "legacy:" + TerminalModel.tmux_session,
+                    )
+                )
+                .exists()
+            )
             named = (
                 db.query(TerminalModel)
-                .filter(TerminalModel.tmux_session == identifier)
+                .filter(
+                    TerminalModel.tmux_session == identifier,
+                    ~tombstone_exists,
+                )
                 .order_by(TerminalModel.creation_order.asc(), TerminalModel.id.asc())
                 .all()
             )
@@ -3280,6 +3359,7 @@ def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
                 "session_name": names.pop(),
                 "deleted": False,
                 "terminals": [_session_terminal_dict(row) for row in terminals],
+                "retained_resources": [],
             }
 
         receipt = (
@@ -3304,6 +3384,7 @@ def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
             "session_name": str(receipt.session_name),
             "deleted": True,
             "terminals": [],
+            "retained_resources": _session_receipt_retained_resources(receipt),
         }
 
 
@@ -3363,6 +3444,8 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "runtime_generation": t.runtime_generation,
                 "runtime_generation_origin": t.runtime_generation_origin,
                 "runtime_process_start_ticks": t.runtime_process_start_ticks,
+                "runtime_operation_kind": t.runtime_operation_kind,
+                "runtime_operation_token": t.runtime_operation_token,
                 "last_active": t.last_active,
             }
             for t in terminals
@@ -3399,8 +3482,12 @@ WITH selected_terminals AS MATERIALIZED (
            project_id, project_name, project_path,
            COALESCE(creation_order, rowid) AS creation_order, last_active
     FROM terminals
+    WHERE NOT EXISTS (
+        SELECT 1 FROM session_deletion_receipts sdr
+        WHERE sdr.session_id = COALESCE(terminals.session_id, 'legacy:' || terminals.tmux_session)
+    )
 """
-        + selected_where
+        + (selected_where.replace(" WHERE ", " AND ", 1) if selected_where else "")
         + """
 ), workflow_ranked AS (
     SELECT w.root_terminal_id, w.status, w.terminal_reason, w.active_turn_id,
@@ -3563,6 +3650,7 @@ def _ensure_terminal_ui_projection_schema() -> None:
     _ensure_workflow_schema()
     _ensure_child_assignment_schema()
     _ensure_delegation_result_schema()
+    _ensure_session_deletion_receipt_schema()
     engine_identity = id(engine)
     if (
         _terminal_ui_projection_schema_ready
@@ -3999,8 +4087,9 @@ def delete_terminals_by_session_lifetime(
     session_name: str,
     *,
     expected_terminal_ids: Sequence[str],
+    retained_resources: Sequence[Mapping[str, str]] = (),
 ) -> Dict[str, Any]:
-    """Delete one unchanged, proven-dead lifetime and persist its receipt."""
+    """Tombstone one proven-dead lifetime and retain protected cleanup authority."""
     _ensure_session_deletion_receipt_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
@@ -4013,8 +4102,15 @@ def delete_terminals_by_session_lifetime(
             if str(existing_receipt.session_name) != session_name:
                 db.rollback()
                 raise AmbiguousSessionIdentity(session_id)
+            existing_retained = _session_receipt_retained_resources(existing_receipt)
             db.rollback()
-            return {"deleted": 0, "already_deleted": True}
+            return {
+                "deleted": 0,
+                "logical_deleted": 0,
+                "retained": len(existing_retained),
+                "retained_resources": existing_retained,
+                "already_deleted": True,
+            }
         terminal_query = db.query(TerminalModel).filter(
             (
                 TerminalModel.session_id == session_id
@@ -4028,13 +4124,27 @@ def delete_terminals_by_session_lifetime(
         terminals = terminal_query.all()
         if not terminals:
             db.rollback()
-            return {"deleted": 0, "already_deleted": False}
+            return {
+                "deleted": 0,
+                "logical_deleted": 0,
+                "retained": 0,
+                "already_deleted": False,
+            }
         if any(str(row.tmux_session) != session_name for row in terminals):
             db.rollback()
             raise AmbiguousSessionIdentity(session_id)
         terminal_ids = [str(row.id) for row in terminals]
         expected_ids = [str(terminal_id) for terminal_id in expected_terminal_ids]
+        try:
+            normalized_retained = _normalize_session_retained_resources(retained_resources)
+        except ValueError as exc:
+            db.rollback()
+            raise AmbiguousSessionIdentity(session_id) from exc
+        retained_ids = {item["terminal_id"] for item in normalized_retained}
         if len(expected_ids) != len(set(expected_ids)) or set(terminal_ids) != set(expected_ids):
+            db.rollback()
+            raise AmbiguousSessionIdentity(session_id)
+        if not retained_ids.issubset(set(terminal_ids)):
             db.rollback()
             raise AmbiguousSessionIdentity(session_id)
         _cancel_protected_workflows_in_transaction(
@@ -4048,16 +4158,29 @@ def delete_terminals_by_session_lifetime(
                 db, terminal_id, excluding_terminal_ids=terminal_ids
             )
         db.flush()
-        deleted = terminal_query.delete(synchronize_session=False)
+        deleted = terminal_query.filter(~TerminalModel.id.in_(sorted(retained_ids))).delete(
+            synchronize_session=False
+        )
         db.add(
             SessionDeletionReceiptModel(
                 session_id=session_id,
                 session_name=session_name,
+                retained_resources_json=json.dumps(
+                    normalized_retained,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
                 deleted_at=datetime.now(),
             )
         )
         db.commit()
-        return {"deleted": int(deleted), "already_deleted": False}
+        return {
+            "deleted": int(deleted),
+            "logical_deleted": len(terminal_ids),
+            "retained": len(retained_ids),
+            "retained_resources": normalized_retained,
+            "already_deleted": False,
+        }
 
 
 def list_worktree_writer_leases() -> List[Dict[str, Any]]:

@@ -89,6 +89,7 @@ def test_reviewer_is_detached_at_exact_commit_and_dirty_cleanup_is_fail_closed(
     repeated = managed_worktree_service.remove_managed_worktree(_metadata(reviewer))
     assert repeated["removed"] is True
     assert repeated["already_removed"] is True
+    assert repeated["commit"] == reviewer.commit
 
 
 def test_non_git_directory_is_not_duplicated(tmp_path, monkeypatch):

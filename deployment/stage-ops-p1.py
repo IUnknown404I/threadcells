@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate and stage CAO.OPS.P1 host artifacts without activating them."""
+"""Validate and stage CAO.OPS.P1 host artifacts and live socket authority."""
 
 from __future__ import annotations
 
@@ -497,6 +497,71 @@ def _atomic_runtime_launcher(path: Path, target: Path, *, owner: tuple[int, int]
         temporary.unlink(missing_ok=True)
 
 
+def _enable_systemd_unit(path: Path, unit_name: str) -> None:
+    """Install one exact, idempotent systemd enablement link without starting it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent.is_symlink() or not path.parent.is_dir():
+        fail("SYSTEMD_ENABLEMENT_INVALID")
+    if path.exists() and not path.is_symlink():
+        fail("SYSTEMD_ENABLEMENT_INVALID")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}")
+    if temporary.exists() or temporary.is_symlink():
+        fail("SYSTEMD_ENABLEMENT_TEMPORARY_EXISTS")
+    try:
+        temporary.symlink_to(Path("..") / unit_name)
+        os.replace(temporary, path)
+        parent_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent_descriptor)
+        finally:
+            os.close(parent_descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _activate_full_cleanup_socket(
+    socket_path: Path,
+    *,
+    expected_owner: tuple[int, int],
+    runner=subprocess.run,
+) -> None:
+    """Activate and verify the live privileged helper's exact AF_UNIX socket."""
+    for command, reason in (
+        (("systemctl", "daemon-reload"), "SYSTEMD_RELOAD_FAILED"),
+        (
+            (
+                "systemctl",
+                "enable",
+                "--now",
+                "agent-control-full-cleanup.socket",
+            ),
+            "FULL_CLEANUP_SOCKET_ACTIVATION_FAILED",
+        ),
+        (
+            (
+                "systemctl",
+                "is-active",
+                "--quiet",
+                "agent-control-full-cleanup.socket",
+            ),
+            "FULL_CLEANUP_SOCKET_INACTIVE",
+        ),
+    ):
+        completed = runner(command, text=True, capture_output=True, check=False)
+        if completed.returncode:
+            fail(reason)
+    try:
+        socket_metadata = socket_path.lstat()
+    except OSError:
+        fail("FULL_CLEANUP_SOCKET_NOT_LISTENING")
+    if (
+        not stat.S_ISSOCK(socket_metadata.st_mode)
+        or (socket_metadata.st_uid, socket_metadata.st_gid) != expected_owner
+        or stat.S_IMODE(socket_metadata.st_mode) != 0o600
+    ):
+        fail("FULL_CLEANUP_SOCKET_UNTRUSTED")
+
+
 def _record_staged_candidate(
     metadata_path: Path,
     candidate_root: Path,
@@ -587,6 +652,8 @@ def main() -> int:
     unit_source = source / "deployment/systemd"
     policy_target = args.agent_control_root / "policy/ORCHESTRATION.md"
     required_units = (
+        "agent-control-full-cleanup.socket",
+        "agent-control-full-cleanup@.service",
         "agent-control-housekeeping.service",
         "agent-control-housekeeping.timer",
         "agent-control-housekeeping-weekly.service",
@@ -668,6 +735,29 @@ def main() -> int:
             "threadcells-ci-venv-",
             "threadcells-ci-wheel-",
         ],
+        full_cleanup_artifact_roots=[
+            {
+                "path": str(root / "tmp"),
+                "owned_names": ["node-compile-cache"],
+                "owned_prefixes": [
+                    "cao-",
+                    "disposable-threadcells-",
+                    "f12-",
+                    "framer-",
+                    "issue22-",
+                    "provider-candidate-",
+                    "threadcells-",
+                    "threadmesh-",
+                ],
+                "process_names": {},
+            },
+            {
+                "path": str(runtime_home / ".cache"),
+                "owned_names": ["pip", "pnpm"],
+                "owned_prefixes": [],
+                "process_names": {"pip": "pip", "pnpm": "pnpm"},
+            },
+        ],
         protected_inventory_roots=[
             {
                 "category": "tools",
@@ -743,6 +833,8 @@ def main() -> int:
                 "path_argument": "--cache",
             },
         ],
+        full_cleanup_helper_socket="/run/threadcells/full-cleanup.sock",
+        full_cleanup_helper_timeout_seconds=1800,
     )
     if (
         config.get("max_resident_supervisors") != 5
@@ -763,12 +855,17 @@ def main() -> int:
         policy = policy.rstrip() + "\n\n" + block + "\n"
     config_target = args.system_root / "etc/agent-control/cao-operations.json"
     unit_targets = tuple(args.system_root / "etc/systemd/system" / name for name in required_units)
+    full_cleanup_socket_enablement = (
+        args.system_root
+        / "etc/systemd/system/sockets.target.wants/agent-control-full-cleanup.socket"
+    )
     runtime_dropin_target = (
         args.system_root / "etc/systemd/system/agent-control-cao.service.d/threadcells-runtime.conf"
     )
     targets = [
         config_target,
         *unit_targets,
+        full_cleanup_socket_enablement,
         runtime_dropin_target,
         mcp_runtime_launcher,
         policy_target,
@@ -830,6 +927,7 @@ def main() -> int:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(unit_source / name, target)
         target.chmod(0o644)
+    _enable_systemd_unit(full_cleanup_socket_enablement, "agent-control-full-cleanup.socket")
     runtime_dropin_target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(runtime_dropin_source, runtime_dropin_target)
     runtime_dropin_target.chmod(0o644)
@@ -839,6 +937,13 @@ def main() -> int:
         owner=(root.stat().st_uid, root.stat().st_gid),
     )
     policy_target.write_text(policy, encoding="utf-8")
+    if production_system_root:
+        runtime_account = pwd.getpwnam(runtime_user)
+        runtime_group = grp.getgrnam(runtime_user)
+        _activate_full_cleanup_socket(
+            Path(str(config["full_cleanup_helper_socket"])),
+            expected_owner=(runtime_account.pw_uid, runtime_group.gr_gid),
+        )
     print("OPS_P1_STAGED")
     return 0
 

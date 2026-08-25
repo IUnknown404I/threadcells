@@ -54,6 +54,10 @@ Do not put plaintext operator/provider/Telegram secrets in repositories, environ
 
 Housekeeping is plan-first and fails closed. Unknown, unreadable, open, active, referenced, identity-changed, or metadata-incomplete resources remain protected. Backups are never automatically deleted.
 
+Full Cleanup is a more aggressive retention mode inside the same Housekeeping authority, not a separate deletion subsystem. It reuses the server-side operator session and permanent-action confirmation, accepts no caller-selected filesystem path, serializes with launch/provider/Heavy admission, and revalidates an all-idle lifecycle immediately before mutation. The active release, SQLite state, Ready-agent continuation authority, credentials/provider state, current source/tool authority, and ambiguous resources remain protected. Proven inactive local rollback releases are intentionally removed only by this explicit operation.
+
+Pathname deletion is confined to the socket-activated root helper. It reauthenticates the same operator authority, accepts only an exact canonical plan ID, requires the control-plane process to hold every admission fence, and locks quarantined directory identities against runtime-user replacement before descriptor-relative deletion. The unprivileged API has no arbitrary-path or weaker fallback operation.
+
 Deployment preserves a rollback runtime and database backup. Publication, public network exposure, and destructive history changes remain separate owner decisions.
 
 ## Operator responsibilities

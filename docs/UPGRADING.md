@@ -17,7 +17,7 @@ From the intended source commit:
 
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
-candidate="$PWD/threadcells-candidate/threadcells-0.2.0a1-local"
+candidate="$PWD/threadcells-candidate/threadcells-0.3.0a1-local"
 python3 scripts/verify_local_candidate.py --candidate "$candidate"
 ```
 
@@ -58,5 +58,7 @@ If acceptance fails materially:
 5. restore the pre-upgrade database only if schema/data compatibility requires it.
 
 Do not use destructive Git reset or delete newer runtime evidence to simulate rollback.
+
+An explicitly confirmed Full Cleanup is the exception to normal local-release retention: it removes all proven inactive releases, including the rollback selected during deployment, and leaves only the active immutable release. Do not run it during upgrade acceptance or while any agent is executing. After a successful Full Cleanup, restore rollback availability only by staging another verified immutable release; never reconstruct it from an unverified directory.
 
 See [Local deployment](DEPLOYMENT.md) and [Backup and restore](BACKUP_AND_RESTORE.md).

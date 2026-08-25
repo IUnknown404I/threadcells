@@ -1,7 +1,7 @@
 ---
 slug: profiles
 source: docs/PROFILES.md
-source_sha256: sha256:2bef7848e092db4dfc8e667bf98ea781cbae3ac77e80f02e25cc2500c7ad7776
+source_sha256: sha256:c378cfce9445d9171027ab61113863019c5478942bbdf218c8cdd1a6a608c552
 ---
 # 配置文件
 
@@ -29,9 +29,11 @@ ThreadCells 为常见角色提供不可变配置文件，包括日常和更强�
 
 示例：
 
-- `supervisor_terra_medium`：适用于常规分解和集成的日常主管。
-- `supervisor_sol_medium`：用于重要或跨模块工作的更强编排能力。
-- `developer_terra_medium` 和 `developer_sol_medium`：有边界的实现角色。
+- `supervisor_terra_medium`：普通及中等风险工作流的默认常驻编排者；负责分解、委派、审查、验收和集成。
+- `supervisor_sol_medium`：面向风险较高、跨模块、架构敏感或生命周期敏感工作流的编排优先主管。
+- `developer_terra_medium`：常规、有边界且歧义较低的实现工作。
+- `developer_terra_high`：重要产品工作、困难但有边界的缺陷与重构，以及公开语义质量工作。
+- `developer_sol_medium`：需要深入推理、涉及跨子系统和细微不变量的工作。
 - `reviewer_sol_high`：用于有风险或集成变更的独立审查。
 - `critical_sol_xhigh_owner`：具有独立授权边界的例外所有者执行器配置文件。
 
@@ -51,6 +53,22 @@ ThreadCells 为常见角色提供不可变配置文件，包括日常和更强�
 | 关键前沿所有者执行 | 仅限经所有者授权的 XHigh |
 
 更高的推理强度和更广的权限会消耗容量并增加后果。它们应反映任务本身，而不应成为默认选择。
+
+使用 Sol 主管并不意味着必须使用 Sol 开发者。它仍应将常规实现路由给 Terra 开发者，只为正确性依赖细微跨系统推理的工作保留 `developer_sol_medium`。
+
+## 重试与升级
+
+ThreadCells 会先对失败的实现尝试分类，再选择下一个智能体：
+
+| 失败类别 | 规范响应 |
+| --- | --- |
+| `OPERATIONAL_FAILURE` | 可以考虑同级重试。 |
+| `MECHANICAL_INCOMPLETE` | 允许一次有边界的同级修正。 |
+| `SEMANTIC_QUALITY_FAILURE` | 提升实现层级；绝不进行第三次同级语义尝试。 |
+| `BOUNDARY_COMPLEXITY_UNDERESTIMATED` | 选择能力更强的开发者。 |
+| `CRITICAL_SYSTEMIC_BOUNDARY` | 使用经所有者授权的 `critical_sol_xhigh_owner`。 |
+
+常规升级路径为 `developer_terra_medium` → `developer_terra_high` → `developer_sol_medium`。XHigh 仅用于真正关键的系统权限，例如安全、exactly-once 并发、破坏性 Housekeeping、迁移或危险恢复。测试通过是必要证据，但其本身不能证明语义质量。
 
 ## 解析后的预览
 

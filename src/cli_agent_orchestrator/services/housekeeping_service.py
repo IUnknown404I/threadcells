@@ -14,7 +14,8 @@ import signal
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass, field
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence, cast
@@ -46,6 +47,7 @@ class HousekeepingSummary:
     cache_pruned: int = 0
     worktrees_retired: int = 0
     reproducible_caches_removed: int = 0
+    build_artifacts_removed: int = 0
     skipped_open: int = 0
     skipped_unknown: int = 0
     plan_id: str | None = None
@@ -54,9 +56,15 @@ class HousekeepingSummary:
     reclaimable_bytes_by_class: dict[str, int] = field(default_factory=dict)
     preserved_bytes_by_class: dict[str, int] = field(default_factory=dict)
     reclaimed_bytes_by_class: dict[str, int] = field(default_factory=dict)
+    protected_resources: list[dict[str, Any]] = field(default_factory=list)
     execution_skips: list[dict[str, str]] = field(default_factory=list)
     execution_failures: list[dict[str, str]] = field(default_factory=list)
     completed_with_issues: bool = False
+    full_cleanup: bool = False
+    releases_removed: int = 0
+    active_release: str | None = None
+    rollback_available: bool | None = None
+    idle_gate: dict[str, Any] | None = None
     warnings: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
@@ -920,6 +928,147 @@ def _scheduled_mode_due(
     return False, "pressure_schedule_is_event_driven"
 
 
+@contextmanager
+def _housekeeping_execution_lock(lock_dir: Path):
+    """Own the canonical Housekeeping mutation boundary for one operation."""
+    with (lock_dir / "housekeeping.lock").open("a+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError("HOUSEKEEPING_BUSY") from exc
+        yield
+
+
+@contextmanager
+def _full_cleanup_execution_fence(config: Mapping[str, Any]):
+    """Prevent new context, provider-turn, or Heavy admission during Full Cleanup."""
+    lock_dir = Path(str(config["lock_dir"]))
+    handles = []
+    try:
+        for name in (
+            "context-launch.lock",
+            "workflow-execution-admission.lock",
+            "provider-execution-admission.lock",
+            "heavy-admission.lock",
+        ):
+            handle = (lock_dir / name).open("a+")
+            handles.append(handle)
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise RuntimeError("FULL_CLEANUP_ADMISSION_BUSY") from exc
+        yield
+    finally:
+        for handle in reversed(handles):
+            try:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+
+def full_cleanup_idle_gate(
+    config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return fail-closed lifecycle truth for the destructive idle boundary."""
+    cfg = dict(config or load_operations_config())
+    blockers: list[dict[str, str]] = []
+    try:
+        from cli_agent_orchestrator.clients.database import (
+            get_provider_execution_admission_queue,
+            list_all_terminals,
+            list_provider_execution_leases,
+        )
+        from cli_agent_orchestrator.services import ui_read_model_service
+        from cli_agent_orchestrator.services.operations_service import _heavy_utilization
+
+        terminals = list_all_terminals()
+        by_id = {str(item["id"]): item for item in terminals}
+        offset = 0
+        projected: list[dict[str, Any]] = []
+        while True:
+            page = ui_read_model_service.list_agent_summaries(limit=100, offset=offset)
+            projected.extend(page["items"])
+            next_offset = page.get("next_offset")
+            if next_offset is None:
+                break
+            offset = int(next_offset)
+        projected_ids = {str(item["id"]) for item in projected}
+        for terminal_id, terminal in by_id.items():
+            # Logically deleted retained metadata is historical cleanup
+            # authority and does not represent a usable agent.
+            if terminal_id not in projected_ids and terminal.get("runtime_lifecycle") == "exited":
+                continue
+            lifecycle = str(terminal.get("runtime_lifecycle") or "starting")
+            operation = terminal.get("runtime_operation_kind")
+            if terminal_id not in projected_ids:
+                blockers.append(
+                    {
+                        "terminal_id": terminal_id,
+                        "reason_code": "AGENT_EXECUTION_STATE_UNKNOWN",
+                    }
+                )
+            if lifecycle not in {"running", "exited"}:
+                blockers.append(
+                    {"terminal_id": terminal_id, "reason_code": "AGENT_LIFECYCLE_NOT_IDLE"}
+                )
+            if operation:
+                blockers.append(
+                    {"terminal_id": terminal_id, "reason_code": "AGENT_RUNTIME_OPERATION_ACTIVE"}
+                )
+        for item in projected:
+            if str(item["id"]) not in by_id:
+                blockers.append(
+                    {
+                        "terminal_id": str(item["id"]),
+                        "reason_code": "AGENT_LIFECYCLE_UNKNOWN",
+                    }
+                )
+            if item.get("execution_state") not in {"ready", "exited"}:
+                blockers.append(
+                    {
+                        "terminal_id": str(item["id"]),
+                        "reason_code": "AGENT_EXECUTION_NOT_IDLE",
+                    }
+                )
+        for lease in list_provider_execution_leases():
+            blockers.append(
+                {
+                    "terminal_id": str(lease["terminal_id"]),
+                    "reason_code": "PROVIDER_EXECUTION_ACTIVE",
+                }
+            )
+        for queued in get_provider_execution_admission_queue():
+            blockers.append(
+                {
+                    "terminal_id": str(queued["terminal_id"]),
+                    "reason_code": "PROVIDER_EXECUTION_QUEUED",
+                }
+            )
+        heavy_active, _heavy_limit = _heavy_utilization(cfg)
+        if heavy_active:
+            blockers.append({"terminal_id": "", "reason_code": "HEAVY_EXECUTION_ACTIVE"})
+    except Exception:
+        return {
+            "eligible": False,
+            "reason_code": "FULL_CLEANUP_IDLE_INVENTORY_UNKNOWN",
+            "blockers": [],
+            "ready_agents": 0,
+            "exited_agents": 0,
+        }
+    unique = sorted(
+        {tuple(sorted(item.items())) for item in blockers},
+        key=lambda item: dict(item).get("terminal_id", ""),
+    )
+    blockers = [dict(item) for item in unique]
+    return {
+        "eligible": not blockers,
+        "reason_code": None if not blockers else "FULL_CLEANUP_NOT_IDLE",
+        "blockers": blockers,
+        "ready_agents": sum(item.get("execution_state") == "ready" for item in projected),
+        "exited_agents": sum(item.get("execution_state") == "exited" for item in projected),
+    }
+
+
 def get_housekeeping_settings(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     from cli_agent_orchestrator.clients.database import (
         ensure_housekeeping_settings,
@@ -971,7 +1120,7 @@ def plan_housekeeping(
     from cli_agent_orchestrator.services.housekeeping.models import HousekeepingMode
     from cli_agent_orchestrator.services.housekeeping.planner import build_plan
 
-    if mode not in {"frequent", "weekly", "pressure"}:
+    if mode not in {"frequent", "weekly", "pressure", "full"}:
         raise ValueError("invalid housekeeping mode")
     cfg = dict(config or load_operations_config())
     settings = get_housekeeping_settings(cfg)
@@ -984,6 +1133,73 @@ def plan_housekeeping(
         now=current,
         open_inventory=lambda: _runtime_open_paths_inventory(cfg, proc_root),
         proc_root=proc_root,
+    )
+
+
+def _full_cleanup_release_state(plan) -> dict[str, Any]:
+    releases = [item for item in plan.candidates if item.category == "releases"]
+    roles = {item.path: dict(item.attributes).get("release_role") for item in releases}
+    active = [
+        item.path
+        for item in releases
+        if item.protection_reason == "ACTIVE_RELEASE" or roles.get(item.path) == "ACTIVE_RELEASE"
+    ]
+    rollback_roles = {"CANONICAL_ROLLBACK_RELEASE", "RECOVERY_RELEASE"}
+    metadata_certain = "release_metadata_inventory_uncertain" not in plan.warnings
+    protected_non_active = sum(
+        item.action == "preserve" and item.path not in active for item in releases
+    )
+    return {
+        "metadata_certain": metadata_certain,
+        "active_release": active[0] if len(active) == 1 else None,
+        "active_release_candidates": active,
+        "protected_non_active_releases": protected_non_active,
+        "active_only_expected": (
+            metadata_certain and len(active) == 1 and protected_non_active == 0
+        ),
+        "releases_to_delete": sum(item.action == "delete" for item in releases),
+        "rollback_releases_to_delete": sum(
+            item.action == "delete" and roles.get(item.path) in rollback_roles for item in releases
+        ),
+        "rollback_available": any(roles.get(item.path) in rollback_roles for item in releases),
+    }
+
+
+def plan_full_cleanup(
+    *,
+    config: Mapping[str, Any] | None = None,
+    now: float | None = None,
+    proc_root: Path = Path("/proc"),
+) -> dict[str, Any]:
+    """Build the canonical maximum proven-safe cleanup preview."""
+    cfg = dict(config or load_operations_config())
+    plan = plan_housekeeping(config=cfg, mode="full", now=now, proc_root=proc_root)
+    result = cast(dict[str, Any], plan.as_dict())
+    result["idle_gate"] = full_cleanup_idle_gate(cfg)
+    result["release_state"] = _full_cleanup_release_state(plan)
+    return result
+
+
+def run_full_cleanup(
+    *,
+    expected_plan_id: str,
+    confirmed: bool,
+    config: Mapping[str, Any] | None = None,
+    now: float | None = None,
+    proc_root: Path = Path("/proc"),
+    privileged_cleanup_executor: Callable[..., Any] | None = None,
+) -> HousekeepingSummary:
+    """Execute one confirmed Full Cleanup through canonical Housekeeping."""
+    if confirmed is not True:
+        raise RuntimeError("FULL_CLEANUP_CONFIRMATION_REQUIRED")
+    return run_housekeeping(
+        config=config,
+        dry_run=False,
+        mode="full",
+        now=now,
+        proc_root=proc_root,
+        expected_plan_id=expected_plan_id,
+        privileged_cleanup_executor=privileged_cleanup_executor,
     )
 
 
@@ -1022,7 +1238,10 @@ def run_housekeeping(
     proc_root: Path = Path("/proc"),
     scheduled: bool = False,
     expected_plan_id: str | None = None,
+    privileged_cleanup_executor: Callable[..., Any] | None = None,
 ) -> HousekeepingSummary:
+    if mode not in {"frequent", "weekly", "pressure", "full"}:
+        raise ValueError("invalid housekeeping mode")
     if not dry_run and not scheduled and expected_plan_id is None:
         raise RuntimeError("HOUSEKEEPING_PLAN_REQUIRED")
     cfg = dict(config or load_operations_config())
@@ -1044,13 +1263,20 @@ def run_housekeeping(
     root = Path(str(cfg["root"]))
     lock_dir = Path(str(cfg["lock_dir"]))
     lock_dir.mkdir(parents=True, exist_ok=True)
-    summary = HousekeepingSummary(dry_run=dry_run, mode=mode)
+    summary = HousekeepingSummary(
+        dry_run=dry_run,
+        mode=mode,
+        full_cleanup=mode == "full",
+    )
     current = time.time() if now is None else now
-    with (lock_dir / "housekeeping.lock").open("a+") as handle:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError("HOUSEKEEPING_BUSY") from exc
+    with (
+        _housekeeping_execution_lock(lock_dir),
+        _full_cleanup_execution_fence(cfg) if mode == "full" else nullcontext(),
+    ):
+        if mode == "full":
+            summary.idle_gate = full_cleanup_idle_gate(cfg)
+            if not summary.idle_gate["eligible"]:
+                raise RuntimeError(str(summary.idle_gate["reason_code"]))
         settings = get_housekeeping_settings(cfg)
         if scheduled:
             due, schedule_warning = _scheduled_mode_due(
@@ -1062,7 +1288,10 @@ def run_housekeeping(
                 summary.warnings.append("schedule_not_due")
                 return summary
         summary.disk_before = shutil.disk_usage("/").free
-        from cli_agent_orchestrator.services.housekeeping.executor import execute_plan
+        from cli_agent_orchestrator.services.housekeeping.executor import (
+            execute_plan,
+            merge_execution_reports,
+        )
 
         plan = plan_housekeeping(config=cfg, mode=mode, now=current, proc_root=proc_root)
         if expected_plan_id is not None and plan.plan_id != expected_plan_id:
@@ -1081,6 +1310,16 @@ def run_housekeeping(
             for category, values in class_summaries.items()
             if values["preserved_bytes"]
         }
+        summary.protected_resources = [
+            {
+                "canonical_identity": candidate.canonical_identity,
+                "category": candidate.category,
+                "bytes": candidate.bytes,
+                "reason": candidate.protection_reason or candidate.retention_reason,
+            }
+            for candidate in plan.candidates
+            if candidate.action == "preserve"
+        ]
         summary.warnings.extend(plan.warnings)
         actionable = [candidate for candidate in plan.candidates if candidate.action != "preserve"]
         if dry_run:
@@ -1126,20 +1365,63 @@ def run_housekeeping(
             summary.reproducible_caches_removed += sum(
                 candidate.resource_kind == "reproducible_cache" for candidate in actionable
             )
-        else:
-            report = execute_plan(
-                plan,
-                config=cfg,
-                open_inventory=lambda: _runtime_open_paths_inventory(cfg, proc_root),
-                settings=settings,
-                proc_root=proc_root,
+            summary.build_artifacts_removed += sum(
+                candidate.category == "build_artifact" for candidate in actionable
             )
+        else:
+            if mode == "full" and privileged_cleanup_executor is not None:
+                privileged_report = privileged_cleanup_executor(
+                    plan=plan,
+                    config=cfg,
+                    settings=settings,
+                    proc_root=proc_root,
+                )
+                if privileged_report.plan_id != plan.plan_id:
+                    raise RuntimeError("HOUSEKEEPING_REPORT_PLAN_MISMATCH")
+                if privileged_report.ok:
+                    from cli_agent_orchestrator.services.housekeeping.executor import (
+                        privileged_full_cleanup_candidate,
+                    )
+
+                    local_plan = replace(
+                        plan,
+                        candidates=tuple(
+                            candidate
+                            for candidate in plan.candidates
+                            if not privileged_full_cleanup_candidate(candidate)
+                        ),
+                    )
+                    local_report = execute_plan(
+                        local_plan,
+                        config=cfg,
+                        open_inventory=lambda: _runtime_open_paths_inventory(cfg, proc_root),
+                        settings=settings,
+                        proc_root=proc_root,
+                        full_cleanup=True,
+                        lifecycle_fence_held=True,
+                        reconcile_releases=False,
+                    )
+                    report = merge_execution_reports(privileged_report, local_report)
+                else:
+                    report = privileged_report
+            else:
+                report = execute_plan(
+                    plan,
+                    config=cfg,
+                    open_inventory=lambda: _runtime_open_paths_inventory(cfg, proc_root),
+                    settings=settings,
+                    proc_root=proc_root,
+                    full_cleanup=mode == "full",
+                    lifecycle_fence_held=mode == "full",
+                )
             summary.ok = summary.ok and report.ok
             summary.freed_bytes += report.freed_bytes
             summary.reclaimed_bytes_by_class = dict(getattr(report, "reclaimed_bytes_by_class", {}))
             summary.execution_skips.extend(getattr(report, "skipped", []))
             summary.execution_failures.extend(report.failures)
             summary.completed_with_issues = bool(getattr(report, "skipped", []) or report.failures)
+            summary.active_release = getattr(report, "active_release", None)
+            summary.rollback_available = getattr(report, "rollback_available", None)
             summary.warnings.extend(
                 f"{item['reason_code']}:{item['candidate']}" for item in report.failures
             )
@@ -1188,6 +1470,10 @@ def run_housekeeping(
                 candidate.canonical_identity in executed and candidate.category == "browser_cache"
                 for candidate in actionable
             )
+            summary.releases_removed += sum(
+                candidate.canonical_identity in executed and candidate.category == "releases"
+                for candidate in actionable
+            )
             summary.cache_pruned += sum(
                 candidate.canonical_identity in executed and candidate.category == "package_cache"
                 for candidate in actionable
@@ -1200,6 +1486,10 @@ def run_housekeeping(
             summary.reproducible_caches_removed += sum(
                 candidate.canonical_identity in executed
                 and candidate.resource_kind == "reproducible_cache"
+                for candidate in actionable
+            )
+            summary.build_artifacts_removed += sum(
+                candidate.canonical_identity in executed and candidate.category == "build_artifact"
                 for candidate in actionable
             )
         if not dry_run:

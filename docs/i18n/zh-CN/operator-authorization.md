@@ -1,7 +1,7 @@
 ---
 slug: operator-authorization
 source: docs/OPERATOR_AUTHORIZATION.md
-source_sha256: sha256:55cf518ba75105911c8db6d4618c30b1ee63fa26645e7fc8cca063480385e50c
+source_sha256: sha256:543fc9c31e1ffe8e120aa726c819f0e9180d0f6ca92b28c9b4ce549d0025d4b1
 ---
 # 操作员授权
 
@@ -71,6 +71,8 @@ curl -s http://127.0.0.1:9889/operator/session
 在 Settings 中输入密钥并选择 **Unlock operator changes**。默认认证窗口为五分钟。UI 显示到期时间，并在会话结束时恢复锁定。
 
 受保护的 Settings 调用在锁定时失败，在已认证会话期间成功。浏览器使用服务器的短时有效安全会话 cookie；它不会持久化操作员密钥。
+
+Full Cleanup 完全复用这一权限。预览仍是只读安全检查；执行则需要当前操作员会话以及标准的永久操作确认。确认不会再次询问密钥。系统中没有单独的清理密钥、URL 凭据、浏览器存储值或持久化明文副本；过期、重新锁定和速率限制行为均保持不变。
 
 ## 替换密钥
 

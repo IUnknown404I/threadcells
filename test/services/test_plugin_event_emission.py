@@ -107,13 +107,11 @@ class TestSessionPluginEvents:
         registry.dispatch.assert_not_awaited()
 
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session_lifetime")
-    @patch("cli_agent_orchestrator.services.session_service.prove_live_session_runtime_authority")
     @patch("cli_agent_orchestrator.services.session_service.resolve_session_authority")
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
     def test_delete_session_dispatches_post_kill_session_event_after_cleanup(
-        self, mock_tmux, mock_resolve, mock_prove_runtime, mock_delete_terminals
+        self, mock_resolve, mock_delete_terminals
     ):
-        """Session kill should emit after the tmux kill and DB cleanup succeed."""
+        """Logical session deletion should emit only after DB cleanup succeeds."""
         registry = _registry_mock()
         call_order: list[str] = []
 
@@ -125,20 +123,27 @@ class TestSessionPluginEvents:
             session_name="cao-demo",
             terminals=[],
             deleted=False,
-            has_live_runtime_owner=True,
+            has_live_runtime_owner=False,
         )
-        mock_prove_runtime.return_value = SimpleNamespace(proven=True)
-        mock_tmux.kill_session.side_effect = lambda *_: call_order.append("kill_session") or True
-        mock_tmux.session_exists.return_value = False
         mock_delete_terminals.side_effect = lambda *_args, **_kwargs: (
-            call_order.append("delete_terminals") or {"already_deleted": False, "deleted": 0}
+            call_order.append("delete_terminals")
+            or {
+                "already_deleted": False,
+                "logical_deleted": 0,
+                "retained_resources": [],
+            }
         )
         registry.dispatch.side_effect = record_dispatch
 
         result = delete_session("cao-demo", registry=registry)
 
-        assert result == {"deleted": ["cao-demo"], "errors": [], "already_deleted": False}
-        assert call_order == ["kill_session", "delete_terminals", "dispatch"]
+        assert result == {
+            "deleted": ["cao-demo"],
+            "errors": [],
+            "already_deleted": False,
+            "retained_resources": [],
+        }
+        assert call_order == ["delete_terminals", "dispatch"]
         event_type, event = registry.dispatch.await_args.args
         assert event_type == "post_kill_session"
         assert isinstance(event, PostKillSessionEvent)

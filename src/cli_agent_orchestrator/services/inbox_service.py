@@ -398,7 +398,7 @@ def check_and_send_pending_messages(
     return reconcile_provider_execution_queue(registry, observe_open_workflows=False) > 0
 
 
-def reconcile_pending_messages(registry: PluginRegistry | None = None) -> int:
+def _reconcile_pending_messages_with_admission(registry: PluginRegistry | None = None) -> int:
     """Replay durable pending inbox rows once after a server restart.
 
     The watcher only observes future log writes. This bounded sweep makes a
@@ -414,7 +414,19 @@ def reconcile_pending_messages(registry: PluginRegistry | None = None) -> int:
     return reconcile_provider_execution_queue(registry)
 
 
-def reconcile_provider_execution_queue(
+def reconcile_pending_messages(registry: PluginRegistry | None = None) -> int:
+    """Replay restart state only while Full Cleanup admits workflow mutation."""
+    from cli_agent_orchestrator.services.operations_service import (
+        workflow_execution_admission_fence,
+    )
+
+    with workflow_execution_admission_fence(nonblocking=True) as admitted:
+        if not admitted:
+            return 0
+        return _reconcile_pending_messages_with_admission(registry)
+
+
+def _reconcile_provider_execution_queue_with_admission(
     registry: PluginRegistry | None = None, *, observe_open_workflows: bool = True
 ) -> int:
     """Wake durable provider inputs in one deterministic cross-source FIFO.
@@ -463,6 +475,22 @@ def reconcile_provider_execution_queue(
         _provider_queue_reconcile_lock.release()
 
 
+def reconcile_provider_execution_queue(
+    registry: PluginRegistry | None = None, *, observe_open_workflows: bool = True
+) -> int:
+    """Reconcile queued execution only while workflow admission is unfenced."""
+    from cli_agent_orchestrator.services.operations_service import (
+        workflow_execution_admission_fence,
+    )
+
+    with workflow_execution_admission_fence(nonblocking=True) as admitted:
+        if not admitted:
+            return 0
+        return _reconcile_provider_execution_queue_with_admission(
+            registry, observe_open_workflows=observe_open_workflows
+        )
+
+
 def wake_provider_execution_queue(registry: PluginRegistry | None = None) -> int:
     """Best-effort fast wake after a committed release.
 
@@ -478,7 +506,7 @@ def wake_provider_execution_queue(registry: PluginRegistry | None = None) -> int
         return 0
 
 
-def reconcile_handoff_continuations(
+def _reconcile_handoff_continuations_with_admission(
     registry: PluginRegistry | None = None, child_terminal_id: str | None = None
 ) -> int:
     """Capture completed direct handoffs into the ordinary durable Inbox path.
@@ -603,6 +631,22 @@ def reconcile_handoff_continuations(
         except Exception as exc:
             logger.warning("Handoff continuation reconciliation failed for %s: %s", child_id, exc)
     return queued
+
+
+def reconcile_handoff_continuations(
+    registry: PluginRegistry | None = None, child_terminal_id: str | None = None
+) -> int:
+    """Materialize handoff-result turns only while workflow admission is open."""
+    from cli_agent_orchestrator.services.operations_service import (
+        workflow_execution_admission_fence,
+    )
+
+    with workflow_execution_admission_fence(nonblocking=True) as admitted:
+        if not admitted:
+            return 0
+        return _reconcile_handoff_continuations_with_admission(
+            registry, child_terminal_id=child_terminal_id
+        )
 
 
 class LogFileHandler(FileSystemEventHandler):

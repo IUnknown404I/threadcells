@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -29,6 +30,7 @@ _DISK_RESOURCE_HEALTH_REASONS = frozenset(
         _ROOT_FREE_BELOW_GREEN_REASON,
     }
 )
+_workflow_execution_fence_local = threading.local()
 
 
 class AdmissionDenied(RuntimeError):
@@ -91,6 +93,7 @@ def _load_legacy_operations_config(path: Path | None = None) -> dict[str, Any]:
         "subprocess_timeout_seconds",
         "context_launch_lock_timeout_seconds",
         "heavy_slot_wait_timeout_seconds",
+        "full_cleanup_helper_timeout_seconds",
     )
     if any(not isinstance(data.get(key), int) or data[key] < 1 for key in integer_keys):
         raise ValueError("operations config contains an invalid positive integer")
@@ -517,6 +520,49 @@ def context_lifecycle_fence(
 
 
 @contextmanager
+def workflow_execution_admission_fence(
+    config: Mapping[str, Any] | None = None,
+    *,
+    nonblocking: bool = False,
+) -> Iterator[bool]:
+    """Serialize every durable transition which can make an agent execute.
+
+    Full Cleanup owns this fence from its final idle check through the last
+    destructive mutation.  Workflow input creation, queued-turn activation,
+    Inbox delivery, and provider reconnect acquisition use the same boundary,
+    so either their durable non-idle state wins first or cleanup does.  The
+    small thread-local depth makes service-layer composition re-entrant while
+    retaining process-wide ``flock`` exclusion.
+    """
+    depth = int(getattr(_workflow_execution_fence_local, "depth", 0))
+    if depth:
+        _workflow_execution_fence_local.depth = depth + 1
+        try:
+            yield True
+        finally:
+            _workflow_execution_fence_local.depth = depth
+        return
+
+    cfg = _canonical_capacity_config(config or load_operations_config())
+    lock_dir = Path(str(cfg["lock_dir"]))
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with (lock_dir / "workflow-execution-admission.lock").open("a+") as handle:
+        if nonblocking:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+        else:
+            _lock_with_timeout(handle, float(cfg["context_launch_lock_timeout_seconds"]))
+        _workflow_execution_fence_local.depth = 1
+        try:
+            yield True
+        finally:
+            _workflow_execution_fence_local.depth = 0
+
+
+@contextmanager
 def context_launch_admission(
     config: Mapping[str, Any] | None = None,
     *,
@@ -572,16 +618,20 @@ def acquire_provider_execution_slot(
     status = require_resource_admission(cfg)
     from cli_agent_orchestrator.clients.database import acquire_provider_execution_decision
 
-    if config is None:
-        from cli_agent_orchestrator.clients.database import ensure_capacity_settings
+    lock_dir = Path(str(cfg["lock_dir"]))
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with (lock_dir / "provider-execution-admission.lock").open("a+") as handle:
+        _lock_with_timeout(handle, float(cfg["context_launch_lock_timeout_seconds"]))
+        if config is None:
+            from cli_agent_orchestrator.clients.database import ensure_capacity_settings
 
-        ensure_capacity_settings(cfg)
+            ensure_capacity_settings(cfg)
 
-    decision = acquire_provider_execution_decision(
-        terminal_id,
-        workflow_turn_id,
-        int(cfg["max_provider_executions"]) if config is not None else None,
-    )
+        decision = acquire_provider_execution_decision(
+            terminal_id,
+            workflow_turn_id,
+            int(cfg["max_provider_executions"]) if config is not None else None,
+        )
     status["provider_executions"] = {
         key: decision[key] for key in ("active", "limit", "draining", "available", "certain")
     }

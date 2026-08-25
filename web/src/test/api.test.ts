@@ -141,6 +141,21 @@ describe('API wrapper', () => {
         body: JSON.stringify({ mode: 'weekly', dry_run: false, expected_plan_id: planId }),
       })
     )
+
+    mockResponse({ mode: 'full', plan_id: planId })
+    await api.getFullCleanupPlan()
+    expect(mockFetch).toHaveBeenCalledWith('/api/v1/housekeeping/full-cleanup/plan', expect.any(Object))
+
+    mockResponse({ ok: true })
+    await api.runFullCleanup(planId)
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/v1/housekeeping/full-cleanup/run',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ expected_plan_id: planId, confirmed: true }),
+      })
+    )
+    expect(JSON.stringify(mockFetch.mock.calls[mockFetch.mock.calls.length - 1])).not.toMatch(/secret|password/i)
   })
 
   it('uses the canonical operator session status and revocation endpoints', async () => {

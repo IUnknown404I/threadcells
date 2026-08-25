@@ -189,8 +189,9 @@ def _plan_ephemeral_paths(
     *,
     now: float,
     proc_root: Path,
+    full_cleanup: bool = False,
 ) -> list[HousekeepingCandidate]:
-    if not policy.get("enabled"):
+    if not policy.get("enabled") and not full_cleanup:
         return []
     temp_root = root / "tmp"
     if not temp_root.is_dir():
@@ -206,7 +207,7 @@ def _plan_ephemeral_paths(
             retention_reason = "marker_unknown"
             if marker is None:
                 reason = "EPHEMERAL_MARKER_UNKNOWN"
-            elif float(marker["expires_at"]) > now:
+            elif not full_cleanup and float(marker["expires_at"]) > now:
                 reason = "EPHEMERAL_NOT_EXPIRED"
                 retention_reason = "within_marker_lifetime"
             elif _pid_alive(int(marker["owner_pid"]), proc_root):
@@ -214,7 +215,11 @@ def _plan_ephemeral_paths(
                 retention_reason = "marker_owner_active"
             else:
                 action = "delete"
-                retention_reason = "expired_marker_dead_owner"
+                retention_reason = (
+                    "full_cleanup_marker_dead_owner"
+                    if full_cleanup
+                    else "expired_marker_dead_owner"
+                )
             result.append(
                 _candidate(
                     path,
@@ -265,8 +270,9 @@ def _plan_browser_cache(
     protection: ProtectedSet,
     *,
     now: float,
+    full_cleanup: bool = False,
 ) -> tuple[list[HousekeepingCandidate], list[str]]:
-    if not policy.get("enabled"):
+    if not policy.get("enabled") and not full_cleanup:
         return [], []
     configured_caches = config.get("playwright_browser_caches")
     if configured_caches is None:
@@ -312,7 +318,7 @@ def _plan_browser_cache(
                     reason = "BROWSER_REVISION_REFERENCED"
                     action = "preserve"
                     retention_reason = "referenced_by_installed_playwright"
-                elif not _older_than(path, now, retention):
+                elif not full_cleanup and not _older_than(path, now, retention):
                     reason = "BROWSER_WITHIN_RETENTION"
                     action = "preserve"
                     retention_reason = "within_retention_window"
@@ -367,6 +373,7 @@ def _plan_reproducible_caches(
     *,
     now: float,
     proc_root: Path,
+    full_cleanup: bool = False,
 ) -> tuple[list[HousekeepingCandidate], list[str]]:
     """Inventory only direct children of explicitly approved cache roots."""
     values = config.get("reproducible_cache_roots", [])
@@ -480,8 +487,12 @@ def _plan_reproducible_caches(
                     action = "preserve"
                     retention_reason = "marker_unknown"
                 elif (
-                    float(marker["created_at"]) if marker is not None else path.lstat().st_mtime
-                ) > now - retention * 60:
+                    not full_cleanup
+                    and (
+                        float(marker["created_at"]) if marker is not None else path.lstat().st_mtime
+                    )
+                    > now - retention * 60
+                ):
                     reason = "REPRODUCIBLE_WITHIN_RETENTION"
                     action = "preserve"
                     retention_reason = "within_retention_window"
@@ -531,6 +542,142 @@ def _plan_reproducible_caches(
             except OSError:
                 warnings.append("reproducible_cache_candidate_unreadable")
     return result, warnings
+
+
+def _plan_full_cleanup_artifacts(
+    config: Mapping[str, Any],
+    protection: ProtectedSet,
+    *,
+    proc_root: Path,
+    claimed_paths: set[Path] | None = None,
+) -> tuple[list[HousekeepingCandidate], list[str]]:
+    """Inventory direct children of explicit ThreadCells artifact roots.
+
+    Names are owned only by an exact configured name or prefix.  Git
+    authorities, symlinks, active package owners, foreign owners, and unknown
+    names remain visible protected resources.  Specialized planners may claim
+    paths first to prevent contradictory duplicate candidates.
+    """
+    entries = config.get("full_cleanup_artifact_roots", [])
+    if not isinstance(entries, list):
+        return [], ["full_cleanup_artifact_roots_invalid"]
+    try:
+        runtime_uid = pwd.getpwnam(str(config["runtime_user"])).pw_uid
+    except (KeyError, TypeError):
+        return [], ["full_cleanup_artifact_owner_unknown"]
+    claimed = claimed_paths or set()
+    candidates: list[HousekeepingCandidate] = []
+    warnings: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            warnings.append("full_cleanup_artifact_root_invalid")
+            continue
+        root = Path(str(entry.get("path", "")))
+        names = entry.get("owned_names", [])
+        prefixes = entry.get("owned_prefixes", [])
+        process_names = entry.get("process_names", {})
+        if (
+            not root.is_absolute()
+            or not isinstance(names, list)
+            or not isinstance(prefixes, list)
+            or not isinstance(process_names, Mapping)
+            or any(
+                not isinstance(value, str)
+                or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]{1,126}", value)
+                for value in names
+            )
+            or any(
+                not isinstance(value, str)
+                or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]{1,62}-", value)
+                for value in prefixes
+            )
+            or any(
+                not isinstance(key, str)
+                or key not in names
+                or not isinstance(value, str)
+                or not re.fullmatch(r"[a-zA-Z0-9._+-]{2,64}", value)
+                for key, value in process_names.items()
+            )
+        ):
+            warnings.append("full_cleanup_artifact_policy_invalid")
+            continue
+        try:
+            resolved_root = root.resolve(strict=True)
+            root_stat = root.stat()
+            if (
+                resolved_root != root
+                or root.is_symlink()
+                or not root.is_dir()
+                or root_stat.st_uid != runtime_uid
+            ):
+                warnings.append("full_cleanup_artifact_root_invalid")
+                continue
+            children = sorted(root.iterdir())
+        except OSError:
+            warnings.append("full_cleanup_artifact_root_unreadable")
+            continue
+        measurements = _parallel_tree_sizes([path for path in children if not path.is_symlink()])
+        for path in children:
+            lexical = path.absolute()
+            if lexical in claimed:
+                continue
+            owned = path.name in names or any(path.name.startswith(prefix) for prefix in prefixes)
+            reason: str | None = None
+            size = path.lstat().st_size if path.is_symlink() else measurements[path][0]
+            size_certain = True if path.is_symlink() else measurements[path][1]
+            if path.is_symlink():
+                reason = "ARTIFACT_SYMLINK_PROTECTED"
+            elif path.lstat().st_uid != runtime_uid:
+                reason = "ARTIFACT_OWNER_UNKNOWN"
+            elif not owned:
+                reason = "ARTIFACT_OWNERSHIP_UNKNOWN"
+            elif not size_certain:
+                reason = "ARTIFACT_SIZE_UNKNOWN"
+            elif path.is_dir() and ((path / ".git").exists() or (path / ".git").is_symlink()):
+                reason = "ARTIFACT_GIT_AUTHORITY"
+            elif path.name in process_names:
+                running = package_command_running(
+                    str(process_names[path.name]), proc_root, runtime_uid
+                )
+                if running is None:
+                    reason = "ARTIFACT_PROCESS_INVENTORY_UNKNOWN"
+                elif running:
+                    reason = "ARTIFACT_OWNER_ACTIVE"
+            if path.is_symlink():
+                metadata = path.lstat()
+                candidate = HousekeepingCandidate(
+                    category="build_artifact",
+                    path=str(lexical),
+                    canonical_identity=f"build_artifact:{lexical}",
+                    fingerprint=resource_fingerprint(
+                        {
+                            "path": str(lexical),
+                            "device": metadata.st_dev,
+                            "inode": metadata.st_ino,
+                            "mode": metadata.st_mode,
+                            "size": metadata.st_size,
+                            "mtime_ns": metadata.st_mtime_ns,
+                        }
+                    ),
+                    bytes=size,
+                    estimated_reclaim_bytes=0,
+                    action="preserve",
+                    retention_reason="full_cleanup_owned_artifact",
+                    protection_reason=reason,
+                )
+            else:
+                candidate = _candidate(
+                    path,
+                    category="build_artifact",
+                    action="delete",
+                    retention_reason="full_cleanup_owned_artifact",
+                    protection=protection,
+                    forced_protection=reason,
+                    measure_preserved=True,
+                    preserved_size=size,
+                )
+            candidates.append(candidate)
+    return candidates, warnings
 
 
 def _plan_protected_inventory(
@@ -601,8 +748,9 @@ def _plan_orphan_browsers(
     *,
     now: float,
     proc_root: Path,
+    full_cleanup: bool = False,
 ) -> tuple[list[HousekeepingCandidate], list[str]]:
-    if not policy.get("enabled"):
+    if not policy.get("enabled") and not full_cleanup:
         return [], []
     try:
         runtime_uid = pwd.getpwnam(str(config["runtime_user"])).pw_uid
@@ -682,8 +830,9 @@ def _plan_docker(
     proc_root: Path,
     runner: Callable[..., Any],
     timeout_seconds: float,
+    full_cleanup: bool = False,
 ) -> tuple[list[HousekeepingCandidate], list[str]]:
-    if not policy.get("enabled"):
+    if not policy.get("enabled") and not full_cleanup:
         return [], []
     docker = shutil.which("docker")
     if docker is None:
@@ -846,9 +995,13 @@ def package_command_bound_to_path(
 
 
 def _plan_package_caches(
-    config: Mapping[str, Any], policy: Mapping[str, Any], *, proc_root: Path
+    config: Mapping[str, Any],
+    policy: Mapping[str, Any],
+    *,
+    proc_root: Path,
+    full_cleanup: bool = False,
 ) -> list[HousekeepingCandidate]:
-    if not policy.get("enabled"):
+    if not policy.get("enabled") and not full_cleanup:
         return []
     threshold = int(config.get("cache_prune_threshold_gib", 1)) * 1024**3
     try:
@@ -924,7 +1077,7 @@ def _plan_package_caches(
             reason = "PACKAGE_CACHE_PROCESS_INVENTORY_UNKNOWN"
         elif running:
             reason = "PACKAGE_CACHE_OWNER_ACTIVE"
-        elif size < entry_threshold:
+        elif not full_cleanup and size < entry_threshold:
             reason = "PACKAGE_CACHE_BELOW_THRESHOLD"
         if reason is None:
             fingerprint, _ = candidate_fingerprint(path)
@@ -970,16 +1123,26 @@ def discover_runtime_candidates(
     proc_root: Path,
     runner: Callable[..., Any] = subprocess.run,
     protection: ProtectedSet | None = None,
+    full_cleanup: bool = False,
 ) -> tuple[list[HousekeepingCandidate], list[str]]:
     """Inventory non-release runtime resources without mutating them."""
     protection = protection or resolve_protected_set(
         root, config, open_inventory=lambda: (set(), False)
     )
     candidates = _plan_ephemeral_paths(
-        root, policy["ephemeral"], protection, now=now, proc_root=proc_root
+        root,
+        policy["ephemeral"],
+        protection,
+        now=now,
+        proc_root=proc_root,
+        full_cleanup=full_cleanup,
     )
     browsers, browser_warnings = _plan_orphan_browsers(
-        config, policy["ephemeral"], now=now, proc_root=proc_root
+        config,
+        policy["ephemeral"],
+        now=now,
+        proc_root=proc_root,
+        full_cleanup=full_cleanup,
     )
     docker, docker_warnings = _plan_docker(
         policy["ephemeral"],
@@ -987,6 +1150,7 @@ def discover_runtime_candidates(
         proc_root=proc_root,
         runner=runner,
         timeout_seconds=float(config.get("subprocess_timeout_seconds", 20)),
+        full_cleanup=full_cleanup,
     )
     candidates.extend(browsers)
     candidates.extend(docker)
@@ -1073,21 +1237,43 @@ def revalidate_runtime_candidate(
     open_inventory: Callable[[], tuple[set[Path], bool]],
     proc_root: Path,
     runner: Callable[..., Any],
+    full_cleanup: bool = False,
 ) -> HousekeepingCandidate | None:
     """Rebuild only the lifecycle class needed for one execute-time check."""
     policy = settings["policy"]
-    protection = resolve_protected_set(root, config, open_inventory=open_inventory)
+    protection = resolve_protected_set(
+        root,
+        config,
+        open_inventory=open_inventory,
+        full_cleanup=full_cleanup,
+    )
     if candidate.category == "browser_cache":
         current, _warnings = _plan_browser_cache(
-            config, policy["browser_cache"], protection, now=now
+            config,
+            policy["browser_cache"],
+            protection,
+            now=now,
+            full_cleanup=full_cleanup,
         )
     elif candidate.category == "package_cache":
-        current = _plan_package_caches(config, policy["package_cache"], proc_root=proc_root)
+        current = _plan_package_caches(
+            config,
+            policy["package_cache"],
+            proc_root=proc_root,
+            full_cleanup=full_cleanup,
+        )
     elif candidate.category == "reproducible_cache":
         current, _warnings = _plan_reproducible_caches(
             config,
             protection,
             now=now,
+            proc_root=proc_root,
+            full_cleanup=full_cleanup,
+        )
+    elif candidate.category == "build_artifact" and full_cleanup:
+        current, _warnings = _plan_full_cleanup_artifacts(
+            config,
+            protection,
             proc_root=proc_root,
         )
     else:
@@ -1099,6 +1285,7 @@ def revalidate_runtime_candidate(
             proc_root=proc_root,
             runner=runner,
             protection=protection,
+            full_cleanup=full_cleanup,
         )
     return next(
         (item for item in current if item.canonical_identity == candidate.canonical_identity),
@@ -1300,8 +1487,9 @@ def _plan_logs(
     protection: ProtectedSet,
     *,
     now: float,
+    full_cleanup: bool = False,
 ) -> list[HousekeepingCandidate]:
-    if not policy.get("enabled"):
+    if not policy.get("enabled") and not full_cleanup:
         return []
     logs = root / "state" / "cao" / "logs"
     if not logs.is_dir():
@@ -1313,13 +1501,17 @@ def _plan_logs(
         try:
             if path.is_symlink() or not path.is_file():
                 continue
-            if _older_than(path, now, retention):
+            if full_cleanup or _older_than(path, now, retention):
                 result.append(
                     _candidate(
                         path,
                         category="logs",
                         action="delete",
-                        retention_reason=f"older_than_{retention}_minutes",
+                        retention_reason=(
+                            "full_cleanup_closed_output"
+                            if full_cleanup
+                            else f"older_than_{retention}_minutes"
+                        ),
                         protection=protection,
                     )
                 )
@@ -1347,8 +1539,9 @@ def _plan_attachments(
     protection: ProtectedSet,
     *,
     now: float,
+    full_cleanup: bool = False,
 ) -> list[HousekeepingCandidate]:
-    if not policy.get("enabled"):
+    if not policy.get("enabled") and not full_cleanup:
         return []
     attachments = root / "state" / "cao" / "runtime" / "terminal-attachments"
     if not attachments.is_dir():
@@ -1357,14 +1550,22 @@ def _plan_attachments(
     result: list[HousekeepingCandidate] = []
     for path in sorted(attachments.glob("*/*")):
         try:
-            if path.is_symlink() or not path.is_file() or not _older_than(path, now, retention):
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or (not full_cleanup and not _older_than(path, now, retention))
+            ):
                 continue
             result.append(
                 _candidate(
                     path,
                     category="attachments",
                     action="delete",
-                    retention_reason=f"older_than_{retention}_minutes",
+                    retention_reason=(
+                        "full_cleanup_closed_attachment"
+                        if full_cleanup
+                        else f"older_than_{retention}_minutes"
+                    ),
                     protection=protection,
                 )
             )
@@ -1396,24 +1597,52 @@ def _plan_releases(
     protection: ProtectedSet,
     *,
     now: float,
+    full_cleanup: bool = False,
 ) -> list[HousekeepingCandidate]:
-    if not policy.get("enabled"):
+    if not policy.get("enabled") and not full_cleanup:
         return []
     retention = int(policy["retain_minutes"])
     retain_count = int(policy["retain_count"])
     directories: set[Path] = set()
+    unknown_entries: set[Path] = set()
     for release_root in protection.release_roots:
         if release_root.is_dir():
-            directories.update(
-                path.resolve()
-                for path in release_root.iterdir()
-                if path.is_dir() and not path.is_symlink()
-            )
+            for path in release_root.iterdir():
+                if path.is_dir() and not path.is_symlink():
+                    directories.add(path.resolve())
+                else:
+                    unknown_entries.add(path.absolute())
     ordered_directories = sorted(
         directories, key=lambda path: (path.lstat().st_mtime_ns, path.name), reverse=True
     )
     measured = _parallel_tree_sizes(ordered_directories)
     result: list[HousekeepingCandidate] = []
+    for path in sorted(unknown_entries, key=str):
+        metadata = path.lstat()
+        result.append(
+            HousekeepingCandidate(
+                category="releases",
+                path=str(path),
+                canonical_identity=f"releases:{path}",
+                fingerprint=resource_fingerprint(
+                    {
+                        "path": str(path),
+                        "device": metadata.st_dev,
+                        "inode": metadata.st_ino,
+                        "mode": metadata.st_mode,
+                        "size": metadata.st_size,
+                        "mtime_ns": metadata.st_mtime_ns,
+                    }
+                ),
+                bytes=metadata.st_size,
+                estimated_reclaim_bytes=0,
+                action="preserve",
+                retention_reason="release_entry_identity_unknown",
+                protection_reason="RELEASE_ENTRY_IDENTITY_UNKNOWN",
+                resource_kind="inventory",
+                attributes=(("release_role", "UNKNOWN_RELEASE_ENTRY"),),
+            )
+        )
     for index, path in enumerate(ordered_directories):
         marker_valid = _release_marker(path)
         if not marker_valid:
@@ -1439,18 +1668,35 @@ def _plan_releases(
             continue
         reason = "newest_retained_release" if index < retain_count else "within_retention_window"
         action = "preserve"
-        if index >= retain_count and _older_than(path, now, retention):
+        if full_cleanup and protection.reason(path, "releases") is None:
+            action = "delete"
+            reason = "full_cleanup_non_active_release"
+        elif index >= retain_count and _older_than(path, now, retention):
             action = "delete"
             reason = f"unreferenced_older_than_{retention}_minutes"
+        item = _candidate(
+            path,
+            category="releases",
+            action=action,
+            retention_reason=reason,
+            protection=protection,
+            measure_preserved=True,
+            preserved_size=measured[path][0],
+        )
+        release_role = next(
+            (
+                role
+                for referenced, role in protection.release_reference_reasons
+                if referenced == path
+            ),
+            "UNREFERENCED_RELEASE",
+        )
         result.append(
-            _candidate(
-                path,
-                category="releases",
-                action=action,
-                retention_reason=reason,
-                protection=protection,
-                measure_preserved=True,
-                preserved_size=measured[path][0],
+            HousekeepingCandidate(
+                **{
+                    **item.as_dict(),
+                    "attributes": (("release_role", release_role),),
+                }
             )
         )
     return result
@@ -1468,10 +1714,22 @@ def build_plan(
     runner: Callable[..., Any] = subprocess.run,
 ) -> HousekeepingPlan:
     policy = settings["policy"]
-    protection = resolve_protected_set(root, config, open_inventory=open_inventory)
+    full_cleanup = mode == "full"
+    protection = resolve_protected_set(
+        root,
+        config,
+        open_inventory=open_inventory,
+        full_cleanup=full_cleanup,
+    )
     candidates = [
-        *_plan_logs(root, policy["logs"], protection, now=now),
-        *_plan_attachments(root, policy["attachments"], protection, now=now),
+        *_plan_logs(root, policy["logs"], protection, now=now, full_cleanup=full_cleanup),
+        *_plan_attachments(
+            root,
+            policy["attachments"],
+            protection,
+            now=now,
+            full_cleanup=full_cleanup,
+        ),
     ]
     runtime_candidates, runtime_warnings = discover_runtime_candidates(
         root=root,
@@ -1481,9 +1739,10 @@ def build_plan(
         proc_root=proc_root,
         runner=runner,
         protection=protection,
+        full_cleanup=full_cleanup,
     )
     candidates.extend(runtime_candidates)
-    if mode in {"weekly", "pressure"}:
+    if mode in {"weekly", "pressure", "full"}:
         from .worktrees import plan_worktrees
 
         worktrees, worktree_warnings = plan_worktrees(
@@ -1493,23 +1752,55 @@ def build_plan(
         )
         candidates.extend(worktrees)
         runtime_warnings.extend(worktree_warnings)
-        candidates.extend(_plan_releases(policy["releases"], protection, now=now))
+        candidates.extend(
+            _plan_releases(
+                policy["releases"],
+                protection,
+                now=now,
+                full_cleanup=full_cleanup,
+            )
+        )
         browser_candidates, browser_warnings = _plan_browser_cache(
-            config, policy["browser_cache"], protection, now=now
+            config,
+            policy["browser_cache"],
+            protection,
+            now=now,
+            full_cleanup=full_cleanup,
         )
         candidates.extend(browser_candidates)
         runtime_warnings.extend(browser_warnings)
         candidates.extend(
-            _plan_package_caches(config, policy["package_cache"], proc_root=proc_root)
+            _plan_package_caches(
+                config,
+                policy["package_cache"],
+                proc_root=proc_root,
+                full_cleanup=full_cleanup,
+            )
         )
         reproducible, reproducible_warnings = _plan_reproducible_caches(
             config,
             protection,
             now=now,
             proc_root=proc_root,
+            full_cleanup=full_cleanup,
         )
         candidates.extend(reproducible)
         runtime_warnings.extend(reproducible_warnings)
+        if full_cleanup:
+            specialized_paths = {
+                Path(item.path)
+                for item in candidates
+                if item.resource_kind in {"git_worktree", "package_cache", "reproducible_cache"}
+                or item.category == "browser_cache"
+            }
+            artifacts, artifact_warnings = _plan_full_cleanup_artifacts(
+                config,
+                protection,
+                proc_root=proc_root,
+                claimed_paths=specialized_paths,
+            )
+            candidates.extend(artifacts)
+            runtime_warnings.extend(artifact_warnings)
     backups = root / "backups"
     if backups.exists():
         backup_size, backup_inventory_certain = _tree_size_inventory(backups)

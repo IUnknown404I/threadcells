@@ -15,6 +15,7 @@ interface OutputViewerProps {
 export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
   const [mode, setMode] = useState<'last' | 'full'>('last')
   const [output, setOutput] = useState('')
+  const [availability, setAvailability] = useState<'available' | 'unavailable' | 'error'>('available')
   const [loading, setLoading] = useState(true)
   const [copied, setCopied] = useState(false)
   const [fullscreen, setFullscreen] = useState(false)
@@ -28,8 +29,10 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
     try {
       const data = await api.getTerminalOutput(terminalId, m)
       setOutput(data.output || '')
+      setAvailability(data.availability || 'available')
     } catch {
       setOutput('')
+      setAvailability('error')
     }
     setLoading(false)
   }
@@ -185,6 +188,12 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
         <div className="flex min-h-0 min-w-0 w-full max-w-full flex-1 overflow-hidden px-3 py-3 sm:px-4">
           {loading ? (
             <ModalLoadingBody label="Loading terminal output" />
+          ) : availability === 'unavailable' ? (
+            <div className="flex h-full min-h-[200px] items-center justify-center rounded-lg border border-dashed border-gray-700 p-6 text-center">
+              <div><p className="text-sm text-gray-300">Output unavailable</p><p className="mt-1 max-w-md text-xs leading-5 text-gray-500">Its durable log may have been cleaned by Housekeeping. The retained Session and Agent history remains valid.</p></div>
+            </div>
+          ) : availability === 'error' ? (
+            <div className="flex h-full min-h-[200px] items-center justify-center"><p className="text-sm text-red-300">Output could not be loaded</p></div>
           ) : cleanOutput ? (
             <pre
               ref={outputRef}

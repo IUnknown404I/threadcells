@@ -8,6 +8,11 @@ from unittest.mock import patch
 class TestServerConstants:
     """Tests for server configuration constants."""
 
+    def test_server_version_matches_release(self):
+        from cli_agent_orchestrator.constants import SERVER_VERSION
+
+        assert SERVER_VERSION == "0.2.0-alpha.1"
+
     def test_server_host_defaults_to_127_0_0_1(self):
         """Test that SERVER_HOST defaults to '127.0.0.1' (not 'localhost')."""
         # Re-import with clean environment to test default

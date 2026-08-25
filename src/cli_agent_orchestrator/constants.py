@@ -105,7 +105,7 @@ DATABASE_URL = f"sqlite:///{DATABASE_FILE}"
 # FastAPI server settings for the CAO API
 SERVER_HOST = os.environ.get("CAO_API_HOST", "127.0.0.1")
 SERVER_PORT = int(os.environ.get("CAO_API_PORT", "9889"))
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0-alpha.1"
 
 
 API_BASE_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"

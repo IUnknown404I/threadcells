@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { createPortal } from 'react-dom'
 import { X, ZoomIn } from '@/components/Icons'
-import type { Locale } from '@/lib/locales'
+import { localeCopy, type Locale } from '@/lib/locales'
 
 type ZoomableImageProps = {
   src: string
@@ -18,22 +18,8 @@ type ZoomableImageProps = {
 const subscribeToBrowser = () => () => undefined
 
 export function ZoomableImage({ src, alt, width, height, eager = false, className = '', locale = 'en' }: ZoomableImageProps) {
-  const ru = locale === 'ru'
-  const copy = ru ? {
-    expanded: `Развёрнутый скриншот: ${alt}`,
-    close: 'Закрыть развёрнутый скриншот',
-    closeButton: 'Закрыть',
-    hint: 'Нажмите на изображение, фон или Esc, чтобы закрыть.',
-    expand: `Открыть: ${alt}`,
-    expandButton: 'Открыть',
-  } : {
-    expanded: `Expanded screenshot: ${alt}`,
-    close: 'Close expanded screenshot',
-    closeButton: 'Close',
-    hint: 'Click the image, the backdrop, or press Esc to close.',
-    expand: `Click to expand: ${alt}`,
-    expandButton: 'Click to expand',
-  }
+  const localized = localeCopy[locale].screenshot
+  const copy = { ...localized, expanded: `${localized.expanded} ${alt}`, expand: `${localized.expand} ${alt}` }
   const [open, setOpen] = useState(false)
   const mounted = useSyncExternalStore(subscribeToBrowser, () => true, () => false)
   const triggerRef = useRef<HTMLButtonElement>(null)

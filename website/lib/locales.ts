@@ -22,6 +22,14 @@ type LocaleCopy = {
   controlPlane: string
   creator: string
   downstream: string
+  screenshot: {
+    expanded: string
+    close: string
+    closeButton: string
+    hint: string
+    expand: string
+    expandButton: string
+  }
   docsUi: {
     browse: string
     publicGuide: string
@@ -59,6 +67,7 @@ export const localeCopy: Record<Locale, LocaleCopy> = {
     homeLabel: 'ThreadCells home', primaryNav: 'Primary navigation', systemReady: 'SYSTEM READY', controlPlane: 'CONTROL PLANE',
     creator: 'Created and maintained by Subaev Ruslan, with contributions from the ThreadCells community.',
     downstream: 'Independent, unofficial downstream of AWS Labs CLI Agent Orchestrator. No AWS sponsorship or endorsement is implied.',
+    screenshot: { expanded: 'Expanded screenshot:', close: 'Close expanded screenshot', closeButton: 'Close', hint: 'Click the image, the backdrop, or press Esc to close.', expand: 'Click to expand:', expandButton: 'Click to expand' },
     docsUi: {
       browse: 'Browse docs', publicGuide: 'PUBLIC GUIDE', articles: 'ARTICLES', article: 'article', readArticle: 'Read article', onThisPage: 'On this page', previous: 'Previous', next: 'Next', startHere: 'Start here',
       quickSetupHint: 'Quick Setup is the fastest supported path. Concepts and architecture can wait until after your first useful agent.',
@@ -76,6 +85,7 @@ export const localeCopy: Record<Locale, LocaleCopy> = {
     homeLabel: 'Главная ThreadCells', primaryNav: 'Основная навигация', systemReady: 'СИСТЕМА ГОТОВА', controlPlane: 'ПАНЕЛЬ УПРАВЛЕНИЯ',
     creator: 'Создано и поддерживается Субаевым Русланом при участии сообщества ThreadCells.',
     downstream: 'Независимый неофициальный проект на основе AWS Labs CLI Agent Orchestrator. AWS не спонсирует и не участвует в нём.',
+    screenshot: { expanded: 'Развёрнутый скриншот:', close: 'Закрыть развёрнутый скриншот', closeButton: 'Закрыть', hint: 'Нажмите на изображение, фон или Esc, чтобы закрыть.', expand: 'Открыть:', expandButton: 'Открыть' },
     docsUi: {
       browse: 'Разделы документации', publicGuide: 'ПУБЛИЧНОЕ РУКОВОДСТВО', articles: 'СТАТЕЙ', article: 'статья', readArticle: 'Читать статью', onThisPage: 'На этой странице', previous: 'Назад', next: 'Далее', startHere: 'С чего начать',
       quickSetupHint: 'Quick Setup — самый быстрый поддерживаемый путь. К концепциям и архитектуре можно вернуться после первого полезного агента.',
@@ -93,6 +103,7 @@ export const localeCopy: Record<Locale, LocaleCopy> = {
     homeLabel: 'ThreadCells 首页', primaryNav: '主导航', systemReady: '系统就绪', controlPlane: '控制平面',
     creator: '由 Subaev Ruslan 创建并维护，ThreadCells 社区共同贡献。',
     downstream: '基于 AWS Labs CLI Agent Orchestrator 的独立非官方下游项目。并非由 AWS 赞助或认可。',
+    screenshot: { expanded: '展开的屏幕截图：', close: '关闭展开的屏幕截图', closeButton: '关闭', hint: '点击图片、背景或按 Esc 键关闭。', expand: '点击展开：', expandButton: '点击展开' },
     docsUi: {
       browse: '浏览文档', publicGuide: '公开指南', articles: '篇文章', article: '篇文章', readArticle: '阅读文章', onThisPage: '本页内容', previous: '上一篇', next: '下一篇', startHere: '从这里开始',
       quickSetupHint: 'Quick Setup 是最快的受支持路径。完成第一个有用的智能体任务后，再阅读概念和架构即可。',
@@ -110,6 +121,7 @@ export const localeCopy: Record<Locale, LocaleCopy> = {
     homeLabel: 'Inicio de ThreadCells', primaryNav: 'Navegación principal', systemReady: 'SISTEMA LISTO', controlPlane: 'PLANO DE CONTROL',
     creator: 'Creado y mantenido por Subaev Ruslan, con contribuciones de la comunidad de ThreadCells.',
     downstream: 'Proyecto derivado, independiente y no oficial de AWS Labs CLI Agent Orchestrator. AWS no lo patrocina ni lo respalda.',
+    screenshot: { expanded: 'Captura ampliada:', close: 'Cerrar la captura ampliada', closeButton: 'Cerrar', hint: 'Haz clic en la imagen, en el fondo o pulsa Esc para cerrar.', expand: 'Ampliar:', expandButton: 'Ampliar' },
     docsUi: {
       browse: 'Explorar la documentación', publicGuide: 'GUÍA PÚBLICA', articles: 'ARTÍCULOS', article: 'artículo', readArticle: 'Leer artículo', onThisPage: 'En esta página', previous: 'Anterior', next: 'Siguiente', startHere: 'Empieza aquí',
       quickSetupHint: 'Quick Setup es la ruta compatible más rápida. Puedes dejar los conceptos y la arquitectura para después de tu primer agente útil.',
@@ -127,6 +139,7 @@ export const localeCopy: Record<Locale, LocaleCopy> = {
     homeLabel: 'Início do ThreadCells', primaryNav: 'Navegação principal', systemReady: 'SISTEMA PRONTO', controlPlane: 'PLANO DE CONTROLE',
     creator: 'Criado e mantido por Subaev Ruslan, com contribuições da comunidade ThreadCells.',
     downstream: 'Projeto derivado, independente e não oficial do AWS Labs CLI Agent Orchestrator. Não é patrocinado nem endossado pela AWS.',
+    screenshot: { expanded: 'Captura ampliada:', close: 'Fechar a captura ampliada', closeButton: 'Fechar', hint: 'Clique na imagem, no fundo ou pressione Esc para fechar.', expand: 'Ampliar:', expandButton: 'Ampliar' },
     docsUi: {
       browse: 'Explorar a documentação', publicGuide: 'GUIA PÚBLICO', articles: 'ARTIGOS', article: 'artigo', readArticle: 'Ler artigo', onThisPage: 'Nesta página', previous: 'Anterior', next: 'Próximo', startHere: 'Comece aqui',
       quickSetupHint: 'O Quick Setup é o caminho compatível mais rápido. Conceitos e arquitetura podem esperar até o primeiro agente útil.',
@@ -144,6 +157,7 @@ export const localeCopy: Record<Locale, LocaleCopy> = {
     homeLabel: 'ThreadCells-Startseite', primaryNav: 'Hauptnavigation', systemReady: 'SYSTEM BEREIT', controlPlane: 'STEUERUNGSEBENE',
     creator: 'Erstellt und gepflegt von Subaev Ruslan, mit Beiträgen der ThreadCells-Community.',
     downstream: 'Unabhängiges, inoffizielles Derivat des AWS Labs CLI Agent Orchestrator. Keine Förderung oder Unterstützung durch AWS.',
+    screenshot: { expanded: 'Vergrößerter Screenshot:', close: 'Vergrößerten Screenshot schließen', closeButton: 'Schließen', hint: 'Zum Schließen auf das Bild oder den Hintergrund klicken oder Esc drücken.', expand: 'Vergrößern:', expandButton: 'Vergrößern' },
     docsUi: {
       browse: 'Dokumentation durchsuchen', publicGuide: 'ÖFFENTLICHER LEITFADEN', articles: 'ARTIKEL', article: 'Artikel', readArticle: 'Artikel lesen', onThisPage: 'Auf dieser Seite', previous: 'Zurück', next: 'Weiter', startHere: 'Hier beginnen',
       quickSetupHint: 'Quick Setup ist der schnellste unterstützte Weg. Konzepte und Architektur können bis nach dem ersten sinnvollen Agenten warten.',
@@ -161,6 +175,7 @@ export const localeCopy: Record<Locale, LocaleCopy> = {
     homeLabel: 'ThreadCells ホーム', primaryNav: 'メインナビゲーション', systemReady: 'システム準備完了', controlPlane: 'コントロールプレーン',
     creator: 'Subaev Ruslan が作成・保守し、ThreadCells コミュニティが貢献しています。',
     downstream: 'AWS Labs CLI Agent Orchestrator を基にした独立・非公式の派生プロジェクトです。AWS による支援や推奨はありません。',
+    screenshot: { expanded: '拡大したスクリーンショット：', close: '拡大表示を閉じる', closeButton: '閉じる', hint: '画像または背景をクリックするか、Esc キーを押して閉じます。', expand: '拡大表示：', expandButton: '拡大表示' },
     docsUi: {
       browse: 'ドキュメントを見る', publicGuide: '公開ガイド', articles: '記事', article: '記事', readArticle: '記事を読む', onThisPage: 'このページの内容', previous: '前へ', next: '次へ', startHere: 'ここから始める',
       quickSetupHint: 'Quick Setup が最短のサポート手順です。概念とアーキテクチャは、最初の実用的なエージェントを動かした後で構いません。',

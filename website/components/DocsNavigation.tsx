@@ -2,11 +2,13 @@
 
 import { useMemo, useState } from 'react'
 import { assetPath } from '@/lib/site'
+import { docsPath, localeCopy, type Locale } from '@/lib/locales'
 
 export type DocsNavigationItem = { slug: string; title: string; group: string }
 
-export function DocsNavigation({ documents, activeSlug, idPrefix }: { documents: DocsNavigationItem[]; activeSlug?: string; idPrefix: string }) {
+export function DocsNavigation({ documents, locale, activeSlug, idPrefix }: { documents: DocsNavigationItem[]; locale: Locale; activeSlug?: string; idPrefix: string }) {
   const [query, setQuery] = useState('')
+  const copy = localeCopy[locale].docsUi
   const normalized = query.trim().toLowerCase()
   const groups = useMemo(() => {
     const filtered = normalized ? documents.filter(document => `${document.title} ${document.group}`.toLowerCase().includes(normalized)) : documents
@@ -17,16 +19,16 @@ export function DocsNavigation({ documents, activeSlug, idPrefix }: { documents:
 
   return (
     <div className="docs-navigation">
-      <label htmlFor={`${idPrefix}-docs-search`}>Search documentation</label>
-      <input id={`${idPrefix}-docs-search`} type="search" value={query} onChange={event => setQuery(event.target.value)} placeholder="Search articles…" autoComplete="off" />
-      <nav aria-label="Documentation articles">
+      <label htmlFor={`${idPrefix}-docs-search`}>{copy.search}</label>
+      <input id={`${idPrefix}-docs-search`} type="search" value={query} onChange={event => setQuery(event.target.value)} placeholder={copy.searchPlaceholder} autoComplete="off" />
+      <nav aria-label={copy.navLabel}>
         {groups.map(([group, docs]) => (
           <section key={group}>
             <h2>{group}</h2>
-            <ul>{docs.map(document => <li key={document.slug}><a href={assetPath(`/docs/${document.slug}`)} aria-current={document.slug === activeSlug ? 'page' : undefined}>{document.title}</a></li>)}</ul>
+            <ul>{docs.map(document => <li key={document.slug}><a href={assetPath(docsPath(locale, document.slug))} aria-current={document.slug === activeSlug ? 'page' : undefined}>{document.title}</a></li>)}</ul>
           </section>
         ))}
-        {groups.length === 0 && <p className="docs-search-empty">No matching articles.</p>}
+        {groups.length === 0 && <p className="docs-search-empty">{copy.noMatches}</p>}
       </nav>
     </div>
   )

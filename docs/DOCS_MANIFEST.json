@@ -31,6 +31,7 @@
     {"slug":"comparison","group":"About","order":160,"source":"docs/COMPARISON.md"},
     {"slug":"provenance","group":"About","order":170,"source":"docs/PROVENANCE.md"},
     {"slug":"contributing","group":"About","order":180,"source":"CONTRIBUTING.md"},
+    {"slug":"localization","group":"About","order":182,"source":"docs/LOCALIZATION.md","title":"Localization guide"},
     {"slug":"issues","group":"About","order":185,"source":"docs/ISSUES.md","title":"Public Issue policy"}
   ]
 }

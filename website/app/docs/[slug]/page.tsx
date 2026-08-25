@@ -2,6 +2,7 @@ import type { Metadata } from 'next'
 import { notFound } from 'next/navigation'
 import { DocsShell } from '@/components/DocsShell'
 import { canonicalUrl } from '@/lib/site'
+import { docsPath, localeCopy, locales } from '@/lib/locales'
 import { getDoc, getDocs } from '@/lib/docs'
 
 export const dynamicParams = false
@@ -19,7 +20,8 @@ export async function generateMetadata({ params }: { params: Promise<{ slug: str
   return {
     title,
     description: document.description,
-    ...(canonical ? { alternates: { canonical }, openGraph: { title, description: document.description, url: canonical } } : {}),
+    alternates: { canonical: canonical || undefined, languages: Object.fromEntries(locales.map(locale => [localeCopy[locale].htmlLang, canonicalUrl(docsPath(locale, slug)) || docsPath(locale, slug)])) },
+    ...(canonical ? { openGraph: { title, description: document.description, url: canonical } } : {}),
   }
 }
 

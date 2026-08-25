@@ -4,7 +4,7 @@ import { ProductShot } from '@/components/ProductShot'
 import { SiteFooter } from '@/components/SiteFooter'
 import { SiteHeader } from '@/components/SiteHeader'
 import { assetPath, site } from '@/lib/site'
-import { localeCopy, type Locale } from '@/lib/locales'
+import { localeAlternates, localeCopy, type Locale } from '@/lib/locales'
 import type { Metadata } from 'next'
 import { canonicalUrl } from '@/lib/site'
 
@@ -58,7 +58,10 @@ const russianJsonLd = {
 }
 
 export const metadata: Metadata = {
-  alternates: { canonical: canonicalUrl('/') || undefined, languages: { en: canonicalUrl('/') || '/', ru: canonicalUrl('/ru') || '/ru/' } },
+  alternates: {
+    canonical: canonicalUrl('/') || undefined,
+    languages: Object.fromEntries(Object.entries(localeAlternates('/')).map(([language, path]) => [language, canonicalUrl(path) || path])),
+  },
 }
 
 export function LandingPage({ locale = 'en' }: { locale?: Locale }) {

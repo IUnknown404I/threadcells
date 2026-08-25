@@ -10,6 +10,7 @@ Rename scope:
 
 Included:
 - Horizontal logos for black and #101622 backgrounds
+- Footer horizontal logo with a verified true-black `#000000` background
 - Standalone symbol for black and #101622 backgrounds
 - Favicon packs: 16/32/48/64/96/128/150/180/192/256/512
 - favicon.ico
@@ -22,6 +23,7 @@ Included:
 Recommended UI default:
 - Header background pack: bg-101622
 - Content/dark surface pack: bg-black
+- True-black footer surface: bg-true-black
 
 Asset geometry:
 - PNG logos, symbols and favicons use real alpha transparency outside the intended inner surface.

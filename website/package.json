@@ -5,10 +5,11 @@
   "description": "Static public website and launch-media tooling for ThreadCells",
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "next build && node scripts/localize-html.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "check": "npm run typecheck && npm run lint && npm run build",
+    "check": "npm run validate:i18n && npm run typecheck && npm run lint && npm run build",
+    "validate:i18n": "python3 ../scripts/validate_localizations.py",
     "test:browser": "node scripts/browser-smoke.mjs",
     "test:links": "node scripts/check-links.mjs",
     "test:lighthouse": "node scripts/lighthouse.mjs",

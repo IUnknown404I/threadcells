@@ -26,7 +26,7 @@ const packets: Array<[NodeId, NodeId, string]> = [
   ['result', 'supervisor', '4.7s'],
 ]
 
-export function ExecutionMesh({ locale = 'en' }: { locale?: 'en' | 'ru' }) {
+export function ExecutionMesh({ locale = 'en' }: { locale?: Locale }) {
   const ru = locale === 'ru'
   const localizedNodes: MeshNode[] = ru ? [
     { id: 'owner', label: 'ВЛАДЕЛЕЦ', meta: 'задача / полномочия', state: 'ГОТОВ', x: 8, y: 48 },
@@ -101,3 +101,4 @@ export function ExecutionMesh({ locale = 'en' }: { locale?: 'en' | 'ru' }) {
     </section>
   )
 }
+import type { Locale } from '@/lib/locales'

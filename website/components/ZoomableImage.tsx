@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { createPortal } from 'react-dom'
 import { X, ZoomIn } from '@/components/Icons'
+import type { Locale } from '@/lib/locales'
 
 type ZoomableImageProps = {
   src: string
@@ -11,7 +12,7 @@ type ZoomableImageProps = {
   height: number
   eager?: boolean
   className?: string
-  locale?: 'en' | 'ru'
+  locale?: Locale
 }
 
 const subscribeToBrowser = () => () => undefined

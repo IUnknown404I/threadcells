@@ -1,3 +1,5 @@
+**English** · [Русский](README.ru.md) · [简体中文](README.zh-CN.md) · [Español](README.es.md) · [Português (Brasil)](README.pt-BR.md) · [Deutsch](README.de.md) · [日本語](README.ja.md)
+
 # ThreadCells
 
 ![ThreadCells](docs/assets/threadcells-logo-horizontal.png)
@@ -57,7 +59,7 @@ flowchart LR
 
 ## Safety and preview status
 
-The `0.1.0-alpha.2` technical preview supports a single Ubuntu/Debian Linux host, loopback-first access, and a Codex-first setup. Native agents can execute powerful commands; worktrees are not a security sandbox. See [limitations](docs/LIMITATIONS.md) before evaluation.
+The `0.2.0-alpha.1` technical preview supports a single Ubuntu/Debian Linux host, loopback-first access, and a Codex-first setup. Native agents can execute powerful commands; worktrees are not a security sandbox. See [limitations](docs/LIMITATIONS.md) before evaluation.
 
 The public `ghcr.io/iunknown404i/threadcells-release-bundle` OCI package carries verified release archives and evidence. It is a distribution artifact, not a Docker image or a supported container deployment mode; see the [release process](docs/RELEASE_PROCESS.md).
 

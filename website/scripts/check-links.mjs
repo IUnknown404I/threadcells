@@ -7,7 +7,20 @@ import { startStaticServer } from './static-server.mjs'
 const basePath = process.env.BASE_PATH ?? process.env.NEXT_PUBLIC_BASE_PATH ?? ''
 const productRoot = path.resolve(process.env.THREADCELLS_PRODUCT_ROOT || path.join(process.cwd(), '..'))
 const manifest = JSON.parse(await readFile(path.join(productRoot, 'docs', 'DOCS_MANIFEST.json'), 'utf8'))
-const routes = ['', '/docs', ...manifest.documents.map(document => `/docs/${document.slug}`)]
+const locales = [
+  { locale: 'en', prefix: '', lang: 'en' },
+  { locale: 'ru', prefix: '/ru', lang: 'ru' },
+  { locale: 'zh-CN', prefix: '/zh-CN', lang: 'zh-CN' },
+  { locale: 'es', prefix: '/es', lang: 'es' },
+  { locale: 'pt-BR', prefix: '/pt-BR', lang: 'pt-BR' },
+  { locale: 'de', prefix: '/de', lang: 'de' },
+  { locale: 'ja', prefix: '/ja', lang: 'ja' },
+]
+const routes = locales.flatMap(({ locale, prefix, lang }) => [
+  { route: prefix, locale, lang },
+  { route: `${prefix}/docs`, locale, lang },
+  ...manifest.documents.map(document => ({ route: `${prefix}/docs/${document.slug}`, locale, lang })),
+])
 const server = await startStaticServer({ basePath })
 let browser
 
@@ -20,10 +33,15 @@ try {
   const checkedRoutes = new Set()
   let links = 0
 
-  for (const route of routes) {
+  for (const { route, locale, lang } of routes) {
     const response = await page.goto(`${server.origin}${route}`, { waitUntil: 'domcontentloaded' })
     assert(response?.ok(), `${route || '/'} returned ${response?.status()}`)
     assert.equal(await page.getByRole('heading', { level: 1 }).count(), 1, `${route || '/'} has one h1`)
+    assert.equal(await page.locator('html').getAttribute('lang'), lang, `${route || '/'} uses ${lang} html lang`)
+    assert.equal(await page.locator('link[rel="canonical"]').count(), 1, `${route || '/'} has one canonical`)
+    assert.equal(await page.locator('link[rel="alternate"][hreflang]').count(), locales.length, `${route || '/'} has every hreflang`)
+    assert.equal(await page.locator('.language-menu [role="menuitem"]').count(), locales.length, `${route || '/'} has every locale selector entry`)
+    assert.equal(await page.locator(`.language-menu [hreflang="${lang}"]`).getAttribute('aria-current'), 'page', `${route || '/'} selects ${locale}`)
     checkedRoutes.add(new URL(page.url()).pathname)
 
     const anchors = await page.locator('a').evaluateAll(elements => elements.map(anchor => ({ href: anchor.getAttribute('href'), text: anchor.textContent?.trim() || '' })))
@@ -61,7 +79,7 @@ try {
     }
   }
 
-  assert.equal(routes.length, manifest.documents.length + 2, 'index and every manifest document are included')
+  assert.equal(routes.length, locales.length * (manifest.documents.length + 2), 'every locale index and manifest document are included')
   assert.equal(checkedRoutes.size, routes.length, 'every public route resolves to a distinct static route')
   assert(links > 150, 'the public site exposes a navigable documentation corpus')
   console.log(JSON.stringify({ routes: routes.length, documents: manifest.documents.length, links, resourcesAndInternalRoutes: checkedResources.size, basePath }))

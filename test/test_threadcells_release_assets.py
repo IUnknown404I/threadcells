@@ -188,7 +188,7 @@ def test_docs_bundle_renders_canonical_navigation(tmp_path: Path) -> None:
         "issues",
     } <= documents.keys()
     assert "owner-decisions" not in documents
-    assert len(documents) == 31
+    assert len(documents) == 32
     assert "](/docs/getting-started)" in documents["installation"]["markdown"]
     assert "](/media/screenshots/threadcells-home.webp)" in documents["web-ui"]["markdown"]
     assert (
@@ -351,6 +351,7 @@ def test_release_builder_and_public_config_are_host_neutral_and_offline() -> Non
 
     builder = (ROOT / "scripts/build_local_candidate.py").read_text(encoding="utf-8")
     assert '"uv",\n            "build",\n            "--offline"' in builder
+    assert 'command(sys.executable, "scripts/validate_localizations.py")' in builder
     hook = (ROOT / "hatch_build.py").read_text(encoding="utf-8")
     assert 'os.environ.get("THREADCELLS_SOURCE_REVISION")' in hook
     assert 'install.extend(("--offline", "--ignore-scripts"))' in hook

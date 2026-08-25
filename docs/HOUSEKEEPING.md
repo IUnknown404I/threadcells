@@ -75,6 +75,8 @@ The protected set combines active terminals and worktrees, writer/workflow owner
 
 The details matter to the implementation, but the operator rule is simple: **absence of evidence is not evidence that a resource is dead**. If protection cannot be established accurately, Housekeeping skips it and reports why.
 
+Protected workflow authority is derived from durable root-terminal identity. Startup and frequent reconciliation cancel orphaned non-recovery workflows whose root terminal no longer exists, then regenerate the protected set. Until that relationship is reconciled, worktree retirement fails closed for the entire uncertain inventory.
+
 ## Schedules
 
 Settings → Housekeeping separates policy, schedule, planning, execution, and reports. Supported schedule shapes include:
@@ -90,6 +92,8 @@ Housekeeping changes and manual execution are protected by [Operator authorizati
 ## Disk-pressure behavior
 
 At YELLOW, inspect growth and run a dry plan. At RED, ThreadCells can admit a recovery-safe Housekeeping heavy lease even though ordinary heavy work may be denied. Pressure plans order the largest proven-safe candidates first and show dominant protected classes, but the cleanup still counts as one Heavy execution and does not bypass any candidate protection.
+
+YELLOW is an inspection state, not permission to manufacture reclaimable bytes. When all remaining large classes are protected, create external capacity or document the protected footprint rather than weakening the predicates.
 
 Package-cache reclaim is reported as unknown/zero when the command cannot prove bytes; ThreadCells does not advertise guessed recovery.
 

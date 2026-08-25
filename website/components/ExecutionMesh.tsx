@@ -26,9 +26,49 @@ const packets: Array<[NodeId, NodeId, string]> = [
   ['result', 'supervisor', '4.7s'],
 ]
 
-export function ExecutionMesh({ locale = 'en' }: { locale?: 'en' | 'ru' }) {
+export function ExecutionMesh({ locale = 'en' }: { locale?: Locale }) {
   const ru = locale === 'ru'
-  const localizedNodes: MeshNode[] = ru ? [
+  const zh = locale === 'zh-CN'
+  const ja = locale === 'ja'
+  const es = locale === 'es'
+  const pt = locale === 'pt-BR'
+  const de = locale === 'de'
+  const localizedNodes: MeshNode[] = de ? [
+    { id: 'owner', label: 'OWNER', meta: 'Auftrag / Berechtigung', state: 'BEREIT', x: 8, y: 48 },
+    { id: 'supervisor', label: 'SUPERVISOR', meta: 'Workflow-Wurzel', state: 'LÄUFT', x: 34, y: 48 },
+    { id: 'worker-03', label: 'WORKER 03', meta: 'Kontext 02 / 02', state: 'LÄUFT', x: 61, y: 17 },
+    { id: 'worker-02', label: 'WORKER 02', meta: 'Kontext 01 / 02', state: 'ABGESCHLOSSEN', x: 61, y: 73 },
+    { id: 'reviewer', label: 'REVIEWER', meta: 'Abnahmeprüfung', state: 'BEREIT', x: 83, y: 34 },
+    { id: 'result', label: 'DAUERHAFTES ERGEBNIS', meta: 'Ergebnis · 8A17', state: 'GESPEICHERT', x: 83, y: 73 },
+  ] : pt ? [
+    { id: 'owner', label: 'PROPRIETÁRIO', meta: 'intenção / autoridade', state: 'PRONTO', x: 8, y: 48 },
+    { id: 'supervisor', label: 'SUPERVISOR', meta: 'raiz do fluxo', state: 'EM EXECUÇÃO', x: 34, y: 48 },
+    { id: 'worker-03', label: 'EXECUTOR 03', meta: 'contexto 02 / 02', state: 'EM EXECUÇÃO', x: 61, y: 17 },
+    { id: 'worker-02', label: 'EXECUTOR 02', meta: 'contexto 01 / 02', state: 'CONCLUÍDO', x: 61, y: 73 },
+    { id: 'reviewer', label: 'REVISOR', meta: 'porta de aceitação', state: 'PRONTO', x: 83, y: 34 },
+    { id: 'result', label: 'RESULTADO DURÁVEL', meta: 'resultado · 8A17', state: 'PERSISTIDO', x: 83, y: 73 },
+  ] : es ? [
+    { id: 'owner', label: 'PROPIETARIO', meta: 'intención / autoridad', state: 'LISTO', x: 8, y: 48 },
+    { id: 'supervisor', label: 'SUPERVISOR', meta: 'raíz del flujo', state: 'EN EJECUCIÓN', x: 34, y: 48 },
+    { id: 'worker-03', label: 'EJECUTOR 03', meta: 'contexto 02 / 02', state: 'EN EJECUCIÓN', x: 61, y: 17 },
+    { id: 'worker-02', label: 'EJECUTOR 02', meta: 'contexto 01 / 02', state: 'COMPLETO', x: 61, y: 73 },
+    { id: 'reviewer', label: 'REVISOR', meta: 'puerta de aceptación', state: 'LISTO', x: 83, y: 34 },
+    { id: 'result', label: 'RESULTADO DURADERO', meta: 'resultado · 8A17', state: 'PERSISTIDO', x: 83, y: 73 },
+  ] : ja ? [
+    { id: 'owner', label: 'オーナー', meta: '意図 / 権限', state: '準備完了', x: 8, y: 48 },
+    { id: 'supervisor', label: 'スーパーバイザー', meta: 'ワークフローの起点', state: '実行中', x: 34, y: 48 },
+    { id: 'worker-03', label: 'ワーカー 03', meta: 'コンテキスト 02 / 02', state: '実行中', x: 61, y: 17 },
+    { id: 'worker-02', label: 'ワーカー 02', meta: 'コンテキスト 01 / 02', state: '完了', x: 61, y: 73 },
+    { id: 'reviewer', label: 'レビュアー', meta: '受け入れゲート', state: '準備完了', x: 83, y: 34 },
+    { id: 'result', label: '永続結果', meta: '結果 · 8A17', state: '永続化済み', x: 83, y: 73 },
+  ] : zh ? [
+    { id: 'owner', label: '所有者', meta: '意图 / 权限', state: '就绪', x: 8, y: 48 },
+    { id: 'supervisor', label: '监督者', meta: '工作流根', state: '运行中', x: 34, y: 48 },
+    { id: 'worker-03', label: '执行者 03', meta: '上下文 02 / 02', state: '运行中', x: 61, y: 17 },
+    { id: 'worker-02', label: '执行者 02', meta: '上下文 01 / 02', state: '已完成', x: 61, y: 73 },
+    { id: 'reviewer', label: '审阅者', meta: '验收关卡', state: '就绪', x: 83, y: 34 },
+    { id: 'result', label: '持久结果', meta: '结果 · 8A17', state: '已持久化', x: 83, y: 73 },
+  ] : ru ? [
     { id: 'owner', label: 'ВЛАДЕЛЕЦ', meta: 'задача / полномочия', state: 'ГОТОВ', x: 8, y: 48 },
     { id: 'supervisor', label: 'СУПЕРВИЗОР', meta: 'корень workflow', state: 'В РАБОТЕ', x: 34, y: 48 },
     { id: 'worker-03', label: 'ИСПОЛНИТЕЛЬ 03', meta: 'контекст 02 / 02', state: 'В РАБОТЕ', x: 61, y: 17 },
@@ -36,7 +76,27 @@ export function ExecutionMesh({ locale = 'en' }: { locale?: 'en' | 'ru' }) {
     { id: 'reviewer', label: 'РЕВЬЮЕР', meta: 'точка приёмки', state: 'ГОТОВ', x: 83, y: 34 },
     { id: 'result', label: 'СОХРАНЁННЫЙ РЕЗУЛЬТАТ', meta: 'результат · 8A17', state: 'СОХРАНЁН', x: 83, y: 73 },
   ] : nodes
-  const meshCopy = ru ? {
+  const meshCopy = de ? {
+    title: 'AUSFÜHRUNG / tm-web-p1', live: 'AKTIV', state: 'Beispielhafter Workflow-Status',
+    sequenced: 'WORKFLOW EINGEREIHT', supervisor: 'SUPERVISOR', flow: 'Auftrag → Worker → Reviewer → dauerhaftes Ergebnis',
+    capacity: 'Beispielhafte Kapazitätstelemetrie', resident: 'RESIDENT', provider: 'PROVIDER', work: 'ARBEIT', heavy: 'RECHENINTENSIV',
+  } : pt ? {
+    title: 'EXECUÇÃO / tm-web-p1', live: 'ATIVO', state: 'Estado ilustrativo do fluxo',
+    sequenced: 'FLUXO SEQUENCIADO', supervisor: 'SUPERVISOR', flow: 'intenção → executores → revisor → resultado durável',
+    capacity: 'Telemetria ilustrativa de capacidade', resident: 'RESIDENTE', provider: 'PROVEDOR', work: 'TRABALHO', heavy: 'PESADA',
+  } : es ? {
+    title: 'EJECUCIÓN / tm-web-p1', live: 'ACTIVO', state: 'Estado ilustrativo del flujo',
+    sequenced: 'FLUJO SECUENCIADO', supervisor: 'SUPERVISOR', flow: 'intención → ejecutores → revisor → resultado duradero',
+    capacity: 'Telemetría ilustrativa de capacidad', resident: 'RESIDENTE', provider: 'PROVEEDOR', work: 'TRABAJO', heavy: 'PESADA',
+  } : ja ? {
+    title: '実行 / tm-web-p1', live: '稼働中', state: 'ワークフロー状態の例',
+    sequenced: 'ワークフローを編成済み', supervisor: 'スーパーバイザー', flow: '意図 → ワーカー → レビュアー → 永続結果',
+    capacity: '容量テレメトリの例', resident: '常駐', provider: 'プロバイダー', work: '作業', heavy: '重い実行',
+  } : zh ? {
+    title: '执行 / tm-web-p1', live: '实时', state: '示意工作流状态',
+    sequenced: '工作流已编排', supervisor: '监督者', flow: '意图 → 执行者 → 审阅者 → 持久结果',
+    capacity: '示意容量遥测', resident: '常驻', provider: '提供商', work: '工作', heavy: '重型执行',
+  } : ru ? {
     title: 'ВЫПОЛНЕНИЕ / tm-web-p1', live: 'АКТИВНО', state: 'Схема процесса',
     sequenced: 'ПРОЦЕСС ВЫСТРОЕН', supervisor: 'СУПЕРВИЗОР', flow: 'задача → исполнители → ревьюер → сохранённый результат',
     capacity: 'Условная телеметрия ёмкости', resident: 'RESIDENT', provider: 'ПРОВАЙДЕР', work: 'РАБОТА', heavy: 'ТЯЖЁЛЫЕ',
@@ -101,3 +161,4 @@ export function ExecutionMesh({ locale = 'en' }: { locale?: 'en' | 'ru' }) {
     </section>
   )
 }
+import type { Locale } from '@/lib/locales'

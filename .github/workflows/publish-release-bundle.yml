@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   publish:
-    if: github.event_name == 'workflow_dispatch' || (startsWith(github.event.release.tag_name, 'v0.1.') && contains(github.event.release.tag_name, '-alpha.'))
+    if: github.event_name == 'workflow_dispatch' || (startsWith(github.event.release.tag_name, 'v0.') && contains(github.event.release.tag_name, '-alpha.'))
     runs-on: ubuntu-latest
     env:
       PACKAGE: ghcr.io/iunknown404i/threadcells-release-bundle
@@ -35,8 +35,8 @@ jobs:
           else
             release_tag="$INPUT_TAG"
           fi
-          if [[ ! "$release_tag" =~ ^v0\.1\.(0|[1-9][0-9]*)-alpha\.([1-9][0-9]*)$ ]]; then
-            echo "release tag must match v0.1.X-alpha.N" >&2
+          if [[ ! "$release_tag" =~ ^v0\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha\.([1-9][0-9]*)$ ]]; then
+            echo "release tag must match v0.X.Y-alpha.N" >&2
             exit 1
           fi
           release_state="$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,tagName)"

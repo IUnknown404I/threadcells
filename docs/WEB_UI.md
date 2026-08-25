@@ -13,6 +13,7 @@ The Web UI is the operator's live view of ThreadCells. It is designed for a loop
 - **Settings** contains General, Orchestration Capacity, Profiles, Providers, Housekeeping, installation-global Telegram notifications, and About.
 - **Docs** serves the public allowlisted documentation packaged with the running build.
 - **Spawn Agent** starts a new session from a project, provider, and profile.
+- **Add Agent** starts another terminal inside the exact selected session lifetime; it does not join a different historical session that happens to share a name.
 
 Direct URLs are supported. Browser history should preserve the selected Settings and Docs page.
 
@@ -26,6 +27,8 @@ Direct URLs are supported. Browser history should preserve the selected Settings
 6. Use Statistics to understand provider-reported usage.
 
 Status labels come from durable control-plane truth. **Processing** means a turn is active; **Ready** means the provider runtime is alive and genuinely idle. Queued labels distinguish provider-capacity exhaustion, child-retirement barriers, and general workflow continuation. An owner-gated badge remains categorical, while the expanded Owner Decision panel shows the concrete durable reason.
+
+Active and historical sessions remain separate durable lifetimes. Deleting a historical session removes only that exact eligible lifetime. Deleting an exited terminal likewise checks its exact runtime identity, writer lease, workflow/result protection, and session relationship before cleanup; ambiguous or active state remains protected.
 
 ![Live Agents status view with local worktree paths removed from the public capture](/media/screenshots/threadcells-agents.webp)
 
@@ -55,9 +58,15 @@ Statistics includes active, completed, and retained non-deleted sessions as soon
 
 Docs navigation is grouped by the learning journey, searchable, and accompanied by an on-page outline on wide screens. Previous/next links follow the published manifest order. The reader exposes only packaged allowlisted Markdown; it has no arbitrary filesystem browser or edit endpoint.
 
+## Full Output
+
+Full Output renders retained provider text for human inspection after stripping ANSI/VT control sequences and terminal cursor manipulation. Sanitization prevents presentation controls from rewriting the visible history; it does not reinterpret, execute, or certify the provider's text.
+
 ## Install as an app
 
 Supported Chromium browsers can install ThreadCells from the browser's install action. The manifest uses ThreadCells branding and opens in standalone display mode. iOS can use **Add to Home Screen**.
+
+When operator access is protected by browser credentials, manifest and related same-origin requests use the same credential boundary. Cross-origin access remains limited to explicitly trusted origins; PWA metadata does not bypass operator or remote-access controls.
 
 The conservative service worker caches only immutable fingerprinted static assets. It never caches HTML navigation, APIs, operator authorization, agents, sessions, workflows, results, Statistics, terminals, WebSockets, or mutations. If the server is unavailable, the installed app reports the real network failure instead of presenting stale operational state.
 

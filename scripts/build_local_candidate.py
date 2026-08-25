@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 from pathlib import Path
@@ -38,6 +39,13 @@ MANIFEST_EXCLUDED_PATHS = {Path("candidate-manifest.json"), Path("SHA256SUMS")}
 INSTALLER_FILES = {"install-threadcells.sh", "verify_local_candidate.py"}
 PUBLIC_ROOT_FILES = {
     "README.md",
+    "README.ru.md",
+    "README.zh-CN.md",
+    "README.es.md",
+    "README.pt-BR.md",
+    "README.de.md",
+    "README.ja.md",
+    "RELEASE_NOTES.md",
     "QUICK_SETUP.md",
     "SECURITY.md",
     "SUPPORT.md",
@@ -256,6 +264,11 @@ def prune_to_install_candidate(candidate: Path) -> None:
     manifest = json.loads((candidate / "docs" / "DOCS_MANIFEST.json").read_text(encoding="utf-8"))
     canonical_docs = {Path("docs/DOCS_MANIFEST.json"), Path("docs/CHANGES_FROM_UPSTREAM.md")}
     canonical_docs.update(Path(item["source"]) for item in manifest["documents"])
+    for locale in ("ru", "zh-CN", "es", "pt-BR", "de", "ja"):
+        canonical_docs.update(
+            Path("docs/i18n") / locale / f"{item['slug']}.md"
+            for item in manifest["documents"]
+        )
     shutil.copytree(
         candidate / "src" / "cli_agent_orchestrator" / "public_schemas" / "v1",
         candidate / "schemas" / "v1",
@@ -338,6 +351,7 @@ def main() -> None:
         raise SystemExit(f"refusing to overwrite existing output: {args.output}")
     if command("git", "status", "--porcelain", capture_output=True).stdout:
         raise SystemExit("candidate must be built from a clean committed tree")
+    command(sys.executable, "scripts/validate_localizations.py")
     revision = command("git", "rev-parse", "HEAD", capture_output=True).stdout.strip()
     epoch = int(
         command("git", "show", "-s", "--format=%ct", "HEAD", capture_output=True).stdout.strip()

@@ -10,7 +10,9 @@ import re
 import shutil
 from pathlib import Path
 
-TAG_PATTERN = re.compile(r"^v0\.1\.(0|[1-9][0-9]*)-alpha\.([1-9][0-9]*)$")
+TAG_PATTERN = re.compile(
+    r"^v0\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha\.([1-9][0-9]*)$"
+)
 PACKAGE = "ghcr.io/iunknown404i/threadcells-release-bundle"
 REPOSITORY = "https://github.com/IUnknown404I/threadcells"
 ARTIFACT_TYPE = "application/vnd.threadcells.release.bundle.v1"
@@ -46,9 +48,9 @@ def checksum_inventory(path: Path) -> dict[str, str]:
 def expected_python_version(release_tag: str) -> str:
     match = TAG_PATTERN.fullmatch(release_tag)
     if not match:
-        raise ValueError("release tag must match v0.1.X-alpha.N")
-    patch, alpha = match.groups()
-    return f"0.1.{patch}a{alpha}"
+        raise ValueError("release tag must match v0.X.Y-alpha.N")
+    minor, patch, alpha = match.groups()
+    return f"0.{minor}.{patch}a{alpha}"
 
 
 def prepare(

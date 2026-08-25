@@ -1,4 +1,4 @@
-4719ac9413959749297989411943b5c05998615fe7380aabfa20dca63a5ecc5a  ./README.md
+48832ee753cea8e4f8427685c4b3dcdc7eb8c7e8952c897c79a2c9a2920d6148  ./README.md
 36e9dac565f0d9f5309e3311b681fcc408d24d65d02be5cb2501b8a34f7e2b7c  ./docs/HEAD-example.html
 1599bb386fc4fd5db4c546a5373412b657c3cda4e04e875db8b135ddc2704143  ./favicons/bg-101622/android-chrome-192x192.png
 74071ffcf3380e1262b0f664232b53f89a57d12dbf78f93368d182c7555cc718  ./favicons/bg-101622/android-chrome-512x512.png
@@ -46,5 +46,6 @@ e01bb5fce877e05a3bffbc27333ba928962d8ab0de3b32fa8ce02b5cddea14f1  ./favicons/bg-
 bd7e89fdef0beb16dccb9c4ea318005df47c7c6611ae498596926f395cc6a71d  ./logos/bg-101622/threadcells-og-1200x630.png
 a4f008dbec895bb7b7c177696d808c0b4fcddd5cb2aeedd5b1b44c693b63db24  ./logos/bg-black/threadcells-logo-horizontal.png
 e3c22b226ebafc44ca79dbe073054efd94724e8adb6b44c1ede0bf39436902e4  ./logos/bg-black/threadcells-og-1200x630.png
+b5e0d393c516aa5daaac1134e2b26d2f94af2eae3728c5130efb345666db1c42  ./logos/bg-true-black/threadcells-logo-horizontal.png
 28016ca5b130e57c8863e044b84685d3ff946005fcfd3b0c25cb9377b12d3f32  ./symbols/bg-101622/threadcells-symbol-1024.png
 28016ca5b130e57c8863e044b84685d3ff946005fcfd3b0c25cb9377b12d3f32  ./symbols/bg-black/threadcells-symbol-1024.png

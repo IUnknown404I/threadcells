@@ -5,6 +5,7 @@ import { CodeBlock } from '@/components/CodeBlock'
 import { ZoomableImage } from '@/components/ZoomableImage'
 import { assetPath } from '@/lib/site'
 import { slugHeading } from '@/lib/docs'
+import { localeCopy, type Locale } from '@/lib/locales'
 
 function textContent(value: ReactNode): string {
   return Children.toArray(value).map(child => typeof child === 'string' || typeof child === 'number' ? String(child) : isValidElement<{ children?: ReactNode }>(child) ? textContent(child.props.children) : '').join('')
@@ -14,13 +15,13 @@ function external(href: string) {
   return /^(?:https?:\/\/|mailto:)/.test(href)
 }
 
-export function DocsArticle({ markdown }: { markdown: string }) {
+export function DocsArticle({ markdown, locale }: { markdown: string; locale: Locale }) {
   const seen = new Map<string, number>()
   const heading = (level: 2 | 3 | 4) => function Heading({ children }: { children?: ReactNode }) {
     const text = textContent(children)
     const id = slugHeading(text, seen)
     const Tag = `h${level}` as const
-    return <Tag id={id}><a href={`#${id}`} aria-label={`Link to ${text}`}>{children}</a></Tag>
+    return <Tag id={id}><a href={`#${id}`} aria-label={`${localeCopy[locale].docsUi.linkTo} ${text}`}>{children}</a></Tag>
   }
 
   return (

@@ -21,15 +21,15 @@ Approved published alpha releases also have a public OCI distribution artifact a
 
 This package is a distribution bundle, not a Docker image or a supported container deployment environment. Use the normal candidate installation and deployment process after verifying its checksums; do not try to run the OCI artifact as a ThreadCells service.
 
-`.github/workflows/publish-release-bundle.yml` publishes on an approved GitHub Release or by an explicit backfill dispatch. It accepts only annotated `v0.1.X-alpha.N` tags with an existing non-draft prerelease, rebuilds and verifies the exact tagged source, refuses to replace a mismatched version tag, and updates only `latest-alpha`. ThreadCells does not publish an unqualified `latest` tag during the technical preview.
+`.github/workflows/publish-release-bundle.yml` publishes on an approved GitHub Release or by an explicit backfill dispatch. It accepts only annotated `v0.X.Y-alpha.N` tags with an existing non-draft prerelease, rebuilds and verifies the exact tagged source, refuses to replace a mismatched version tag, and updates only `latest-alpha`. ThreadCells does not publish an unqualified `latest` tag during the technical preview.
 
 ## Version-line convention
 
 ThreadCells follows normal SemVer prerelease ordering. During the alpha preview, `0.1.X` identifies a meaningful product, reliability, or documentation iteration; `alpha.N` identifies additional publications within that same iteration when they are genuinely required.
 
 - `v0.1.0-alpha.1` was the first public alpha.
-- `v0.1.0-alpha.2` is the immutable current published technical preview.
-- The next meaningful release line is `v0.1.1-alpha.1`.
-- Use `v0.1.1-alpha.2` only if another publication is required within the same `0.1.1` iteration; the next meaningful iteration after that is `v0.1.2-alpha.1`.
+- `v0.1.0-alpha.2` is an immutable published technical preview.
+- `v0.2.0-alpha.1` is the consolidated multilingual and reliability release line.
+- A later publication in the same release line increments only the alpha sequence; a new product contour increments the semantic version deliberately.
 
-Do not continue the `v0.1.0-alpha.N` sequence or move an existing tag without explicit owner direction. Repository-governance changes alone do not trigger a version bump or release. Update all canonical version-bearing surfaces together only when the next meaningful implementation contour is ready for publication.
+Never move an existing tag. Repository-governance changes alone do not trigger a version bump or release. Update all canonical version-bearing surfaces together only when the next meaningful implementation contour is ready for publication.

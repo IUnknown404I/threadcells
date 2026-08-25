@@ -44,6 +44,8 @@ Use Graceful Exit for provider lifecycle. Killing tmux or deleting database rows
 
 An exited child is not immediately disposable. Confirm that its durable result is delivered, read, incorporated, and acknowledged. Then retire its runtime resources while retaining history.
 
+**Add Agent** targets the stable selected session lifetime. Historical session deletion and exited-terminal deletion target exact durable identities and are rejected while an active runtime, open/recovery workflow, writer lease, pending result, or other protected relationship remains.
+
 A provider final does not close an open mission. Explicitly complete a top-level workflow only after all owner-authorized work is finished. Use owner gate only for a genuine decision boundary.
 
 ## Capacity changes

@@ -30,6 +30,7 @@ class ProtectedSet:
     release_roots: tuple[Path, ...]
     protected_releases: frozenset[Path]
     protected_release_reasons: tuple[tuple[Path, str], ...]
+    release_reference_reasons: tuple[tuple[Path, str], ...]
     release_metadata_certain: bool
     warnings: tuple[str, ...]
 
@@ -69,6 +70,17 @@ class ProtectedSet:
                 return "ACTIVE_TERMINAL_INVENTORY_UNKNOWN"
             if terminal_id in self.active_terminal_ids:
                 return "ACTIVE_TERMINAL_ATTACHMENT"
+        if category == "logs":
+            terminal_log_root = (self.root / "state" / "cao" / "logs" / "terminal").resolve()
+            try:
+                terminal_id = resolved.relative_to(terminal_log_root).parts[0].split(".", 1)[0]
+            except (ValueError, IndexError):
+                terminal_id = ""
+            if terminal_id:
+                if not self.terminal_inventory_certain:
+                    return "ACTIVE_TERMINAL_INVENTORY_UNKNOWN"
+                if terminal_id in self.active_terminal_ids:
+                    return "ACTIVE_TERMINAL_OUTPUT"
         return None
 
 
@@ -85,8 +97,8 @@ def _active_terminal_inventory() -> tuple[set[str], bool]:
 
 
 def _release_metadata(
-    root: Path, config: Mapping[str, Any]
-) -> tuple[tuple[Path, ...], dict[Path, str], bool, list[str]]:
+    root: Path, config: Mapping[str, Any], *, full_cleanup: bool = False
+) -> tuple[tuple[Path, ...], dict[Path, str], dict[Path, str], bool, list[str]]:
     configured_release_roots = tuple(
         Path(str(value)) for value in config.get("release_roots", [str(root / "tools")])
     )
@@ -159,7 +171,7 @@ def _release_metadata(
             ),
             *((value, "CANDIDATE_RELEASE") for value in raw.get("candidate_releases") or []),
         ]
-        protected: dict[Path, str] = {}
+        references: dict[Path, str] = {}
         for value, reason in values:
             if value is None:
                 continue
@@ -168,7 +180,12 @@ def _release_metadata(
             candidate = Path(value).resolve()
             if candidate.parent not in release_roots:
                 raise ValueError("release reference is outside configured roots")
-            protected.setdefault(candidate, reason)
+            references.setdefault(candidate, reason)
+        protected = {
+            path: reason
+            for path, reason in references.items()
+            if not full_cleanup or reason == "ACTIVE_RELEASE"
+        }
         configured_active = raw.get("active_release")
         if active_link_path.exists() or active_link_path.is_symlink():
             if not active_link_path.is_symlink():
@@ -194,10 +211,10 @@ def _release_metadata(
                 warnings.append("active_release_metadata_diverged")
         elif configured_active is not None:
             raise ValueError("active release link is missing")
-        return release_roots, protected, True, warnings
+        return release_roots, protected, references, True, warnings
     except (KeyError, OSError, ValueError, TypeError, json.JSONDecodeError):
         warnings.append("release_metadata_inventory_uncertain")
-        return release_roots, {}, False, warnings
+        return release_roots, {}, {}, False, warnings
 
 
 def resolve_protected_set(
@@ -205,10 +222,17 @@ def resolve_protected_set(
     config: Mapping[str, Any],
     *,
     open_inventory: Callable[[], tuple[set[Path], bool]],
+    full_cleanup: bool = False,
 ) -> ProtectedSet:
     open_paths, open_certain = open_inventory()
     terminals, terminals_certain = _active_terminal_inventory()
-    release_roots, protected_releases, releases_certain, warnings = _release_metadata(root, config)
+    (
+        release_roots,
+        protected_releases,
+        release_references,
+        releases_certain,
+        warnings,
+    ) = _release_metadata(root, config, full_cleanup=full_cleanup)
     if not open_certain:
         warnings.append("process_inventory_uncertain")
     if not terminals_certain:
@@ -230,6 +254,9 @@ def resolve_protected_set(
         protected_releases=frozenset(protected_releases),
         protected_release_reasons=tuple(
             sorted(protected_releases.items(), key=lambda item: str(item[0]))
+        ),
+        release_reference_reasons=tuple(
+            sorted(release_references.items(), key=lambda item: str(item[0]))
         ),
         release_metadata_certain=releases_certain,
         warnings=tuple(warnings),

@@ -1,7 +1,7 @@
 ---
 slug: backup-and-restore
 source: docs/BACKUP_AND_RESTORE.md
-source_sha256: sha256:3e62f0b30f78fa32bfab783c5fa15e89b9646e2c6de211b8c8ddec3b05b53da1
+source_sha256: sha256:d5f0fb66a4513e8c56a811e1e21c5384f39831b8729af46e22b67896a79e3a66
 ---
 # 备份与恢复
 
@@ -79,3 +79,5 @@ sqlite3 /path/to/backup.db 'PRAGMA integrity_check;'
 - 活动/回滚发布版本仍被正确识别。
 
 备份受到自动 Housekeeping 保护。对备份存储应用单独、经审查的保留策略。
+
+Full Cleanup 不能替代备份保留策略。它会保护规范数据库以及任何无法证明可安全处置的备份，但会有意移除可信发布元数据所表示的每个不活跃本地发布版本和回滚。授权前，请确认任何必需的恢复点都存在于本地发布集合之外并已通过完整性检查。执行后，操作员应预期本地回滚不可用，直到另一个已验证发布版本完成暂存。

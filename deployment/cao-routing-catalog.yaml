@@ -1,4 +1,4 @@
-version: 2
+version: 3
 profiles:
   supervisor_terra_medium:
     execution_mode: orchestrator
@@ -8,6 +8,18 @@ profiles:
     execution_mode: orchestrator
     routing_role: complex_supervisor
     description: High-reasoning orchestration for important, risky, cross-module, and architecture-sensitive workflows
+  developer_terra_medium:
+    execution_mode: executor
+    routing_role: routine_implementation
+    reasoning: medium
+  developer_terra_high:
+    execution_mode: executor
+    routing_role: important_bounded_implementation
+    reasoning: high
+  developer_sol_medium:
+    execution_mode: executor
+    routing_role: reasoning_dense_implementation
+    reasoning: medium
   critical_sol_xhigh_owner:
     execution_mode: owner_executor
     routing_role: exceptional_owner_executor
@@ -18,3 +30,24 @@ routing:
   complex_orchestration: supervisor_sol_medium
   critical_owner_execution: critical_sol_xhigh_owner
   automatic_xhigh_escalation: false
+implementation_routing:
+  routine_bounded: developer_terra_medium
+  important_product_or_difficult_bounded: developer_terra_high
+  reasoning_dense_cross_subsystem: developer_sol_medium
+  critical_systemic: critical_sol_xhigh_owner
+retry_policy:
+  OPERATIONAL_FAILURE:
+    action: same_tier_retry_allowed
+  MECHANICAL_INCOMPLETE:
+    action: one_bounded_same_tier_correction_allowed
+  SEMANTIC_QUALITY_FAILURE:
+    action: escalate_implementation_tier
+    maximum_same_tier_semantic_attempts: 2
+  BOUNDARY_COMPLEXITY_UNDERESTIMATED:
+    action: stronger_developer
+  CRITICAL_SYSTEMIC_BOUNDARY:
+    action: owner_authorized_xhigh
+escalation_path:
+  - developer_terra_medium
+  - developer_terra_high
+  - developer_sol_medium

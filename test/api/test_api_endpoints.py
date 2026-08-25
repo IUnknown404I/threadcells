@@ -15,6 +15,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from fastapi import HTTPException
 
 from cli_agent_orchestrator.api import main as api_main
 from cli_agent_orchestrator.api.main import (
@@ -26,6 +27,7 @@ from cli_agent_orchestrator.api.main import (
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
+from cli_agent_orchestrator.services.full_cleanup_helper import FullCleanupHelperError
 from cli_agent_orchestrator.utils.skills import SkillNameError
 
 # ── Health endpoint ──────────────────────────────────────────────────
@@ -558,6 +560,129 @@ class TestPublicControlPlaneApi:
 
         assert response.status_code == 409
         assert response.json()["detail"]["reason_code"] == "HOUSEKEEPING_PLAN_CHANGED"
+
+    def test_full_cleanup_preview_is_read_only(self, client):
+        preview = {
+            "schema_version": 1,
+            "mode": "full",
+            "plan_id": "a" * 64,
+            "idle_gate": {"eligible": True, "blockers": []},
+        }
+        with patch(
+            "cli_agent_orchestrator.services.housekeeping_service.plan_full_cleanup",
+            return_value=preview,
+        ) as service:
+            response = client.get("/api/v1/housekeeping/full-cleanup/plan")
+
+        assert response.status_code == 200
+        assert response.json() == preview
+        service.assert_called_once_with()
+
+    def test_full_cleanup_execution_uses_operator_and_explicit_confirmation(self, client):
+        plan_id = "b" * 64
+        summary = MagicMock()
+        summary.as_dict.return_value = {"ok": True, "full_cleanup": True}
+
+        def run_service(**kwargs):
+            kwargs["privileged_cleanup_executor"]()
+            return summary
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main._require_operator",
+                return_value="operator_bearer",
+            ) as authorize,
+            patch(
+                "cli_agent_orchestrator.services.full_cleanup_helper.execute_via_privileged_helper",
+                return_value=MagicMock(plan_id=plan_id, ok=True),
+            ) as helper,
+            patch(
+                "cli_agent_orchestrator.services.housekeeping_service.run_full_cleanup",
+                side_effect=run_service,
+            ) as service,
+        ):
+            response = client.post(
+                "/api/v1/housekeeping/full-cleanup/run",
+                json={"expected_plan_id": plan_id, "confirmed": True},
+                headers={"Authorization": "Bearer existing-secret"},
+            )
+
+        assert response.status_code == 200
+        authorize.assert_called_once()
+        helper.assert_called_once_with(
+            expected_plan_id=plan_id,
+            confirmed=True,
+            session_token=None,
+            bearer_secret="existing-secret",
+        )
+        service.assert_called_once_with(
+            expected_plan_id=plan_id,
+            confirmed=True,
+            privileged_cleanup_executor=ANY,
+        )
+
+    def test_full_cleanup_execution_is_denied_while_operator_is_locked(self, client):
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main._require_operator",
+                side_effect=HTTPException(status_code=401, detail="operator session required"),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.housekeeping_service.run_full_cleanup",
+            ) as service,
+        ):
+            response = client.post(
+                "/api/v1/housekeeping/full-cleanup/run",
+                json={"expected_plan_id": "a" * 64, "confirmed": True},
+            )
+
+        assert response.status_code == 401
+        service.assert_not_called()
+
+    def test_full_cleanup_rejects_missing_confirmation_without_execution(self, client):
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main._require_operator",
+                return_value="operator_bearer",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.housekeeping_service.run_full_cleanup",
+            ) as service,
+        ):
+            response = client.post(
+                "/api/v1/housekeeping/full-cleanup/run",
+                json={"expected_plan_id": "a" * 64},
+            )
+
+        assert response.status_code == 422
+        service.assert_not_called()
+
+    def test_full_cleanup_maps_execute_time_idle_race_to_conflict(self, client):
+        def run_service(**kwargs):
+            kwargs["privileged_cleanup_executor"]()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main._require_operator",
+                return_value="operator_bearer",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.full_cleanup_helper.execute_via_privileged_helper",
+                side_effect=FullCleanupHelperError("FULL_CLEANUP_NOT_IDLE"),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.housekeeping_service.run_full_cleanup",
+                side_effect=run_service,
+            ),
+        ):
+            response = client.post(
+                "/api/v1/housekeeping/full-cleanup/run",
+                json={"expected_plan_id": "a" * 64, "confirmed": True},
+                headers={"Authorization": "Bearer existing-secret"},
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["reason_code"] == "FULL_CLEANUP_NOT_IDLE"
 
     def test_housekeeping_report_is_available_before_the_first_run(self, client, tmp_path):
         with patch(
@@ -1944,6 +2069,22 @@ class TestGetTerminalOutput:
 
         assert response.status_code == 404
         assert "Terminal not found" in response.json()["detail"]
+
+    def test_get_output_returns_cleaned_state_for_retained_history(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_output.side_effect = api_main.TerminalOutputUnavailable(
+                "durable output unavailable"
+            )
+
+            response = client.get("/terminals/abcd1234/output")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "output": "",
+            "mode": "full",
+            "availability": "unavailable",
+            "reason_code": "DURABLE_OUTPUT_UNAVAILABLE",
+        }
 
     def test_get_output_server_error(self, client):
         """GET /terminals/{id}/output returns 500 on error."""

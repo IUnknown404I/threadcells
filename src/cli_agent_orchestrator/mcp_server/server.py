@@ -1461,7 +1461,12 @@ async def _handoff_impl(
                     state=HandoffState.FAILED,
                 )
         try:
-            binding = issue_workflow_input_binding(terminal_id)
+            from cli_agent_orchestrator.services.operations_service import (
+                workflow_execution_admission_fence,
+            )
+
+            with workflow_execution_admission_fence():
+                binding = issue_workflow_input_binding(terminal_id)
             if binding is None:
                 raise RuntimeError("Could not create handoff child workflow binding")
             _send_direct_input_handoff(terminal_id, provider, message, binding)
@@ -1784,7 +1789,12 @@ def _assign_impl(
                     "message": "Parent workflow closed before assignment input could be sent",
                 }
         try:
-            binding = issue_workflow_input_binding(terminal_id)
+            from cli_agent_orchestrator.services.operations_service import (
+                workflow_execution_admission_fence,
+            )
+
+            with workflow_execution_admission_fence():
+                binding = issue_workflow_input_binding(terminal_id)
             if binding is None:
                 raise RuntimeError("Could not create assigned child workflow binding")
             _send_direct_input_assign(terminal_id, message, binding)
@@ -1921,6 +1931,10 @@ def _send_message_impl(
     logical_turn_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Implementation of send_message logic."""
+    from cli_agent_orchestrator.services.operations_service import (
+        workflow_execution_admission_fence,
+    )
+
     try:
         # Auto-inject sender terminal ID suffix when enabled
         if ENABLE_SENDER_ID_INJECTION:
@@ -1932,60 +1946,70 @@ def _send_message_impl(
 
         sender_id = os.environ.get("CAO_TERMINAL_ID")
         if sender_id and effect is not None and logical_turn_id is not None:
-            continuation = schedule_managed_handoff_continuation(sender_id, receiver_id, message)
-            if continuation.get("managed"):
-                if not continuation.get("accepted"):
+            # Managed/assigned callbacks persist their Inbox turn locally.
+            # Generic messages use the HTTP API below, whose persistence
+            # boundary owns this same cross-process fence.
+            with workflow_execution_admission_fence():
+                continuation = schedule_managed_handoff_continuation(
+                    sender_id, receiver_id, message
+                )
+                if continuation.get("managed"):
+                    if not continuation.get("accepted"):
+                        return {
+                            "success": False,
+                            "reason_code": continuation["reason_code"],
+                            "error": "managed handoff continuation was not admitted",
+                        }
+                    scheduled_message = continuation.get("message")
+                    if scheduled_message is not None:
+                        try:
+                            inbox_service.check_and_send_pending_messages(receiver_id)
+                        except Exception as exc:
+                            # The persisted Inbox/turn pair is authoritative.  A
+                            # later watchdog tick retries the same child turn.
+                            logger.warning(
+                                "Immediate managed continuation delivery failed: %s", exc
+                            )
                     return {
-                        "success": False,
-                        "reason_code": continuation["reason_code"],
-                        "error": "managed handoff continuation was not admitted",
+                        "success": True,
+                        "duplicate": bool(continuation.get("duplicate")),
+                        "message_id": (
+                            scheduled_message.id if scheduled_message is not None else None
+                        ),
+                        "sender_id": sender_id,
+                        "receiver_id": receiver_id,
+                        "logical_turn_id": continuation["turn_id"],
+                        "managed_handoff_continuation": True,
                     }
-                scheduled_message = continuation.get("message")
-                if scheduled_message is not None:
+                assigned_result, duplicate = create_child_assignment_result_message(
+                    sender_id,
+                    receiver_id,
+                    message,
+                    workflow_effect_id=effect["id"],
+                    workflow_turn_id=logical_turn_id,
+                )
+                if assigned_result is not None:
                     try:
                         inbox_service.check_and_send_pending_messages(receiver_id)
                     except Exception as exc:
-                        # The persisted Inbox/turn pair is authoritative.  A
-                        # later watchdog tick retries the same child turn.
-                        logger.warning("Immediate managed continuation delivery failed: %s", exc)
-                return {
-                    "success": True,
-                    "duplicate": bool(continuation.get("duplicate")),
-                    "message_id": scheduled_message.id if scheduled_message is not None else None,
-                    "sender_id": sender_id,
-                    "receiver_id": receiver_id,
-                    "logical_turn_id": continuation["turn_id"],
-                    "managed_handoff_continuation": True,
-                }
-            assigned_result, duplicate = create_child_assignment_result_message(
-                sender_id,
-                receiver_id,
-                message,
-                workflow_effect_id=effect["id"],
-                workflow_turn_id=logical_turn_id,
-            )
-            if assigned_result is not None:
-                try:
-                    inbox_service.check_and_send_pending_messages(receiver_id)
-                except Exception as exc:
-                    # Persistence is authoritative; retry delivery through the
-                    # normal watchdog/restart path rather than reopening the
-                    # child submission effect.
-                    logger.warning("Immediate assigned-result delivery failed: %s", exc)
-                return {
-                    "success": True,
-                    "duplicate": duplicate,
-                    "message_id": assigned_result.id,
-                    "sender_id": assigned_result.sender_id,
-                    "receiver_id": assigned_result.receiver_id,
-                    "result_id": assigned_result.result_id,
-                }
-            if duplicate:
-                return {
-                    "success": True,
-                    "ignored": True,
-                    "reason": "assigned callback was already closed or cancelled",
-                }
+                        # Persistence is authoritative; retry delivery through the
+                        # normal watchdog/restart path rather than reopening the
+                        # child submission effect.
+                        logger.warning("Immediate assigned-result delivery failed: %s", exc)
+                    return {
+                        "success": True,
+                        "duplicate": duplicate,
+                        "message_id": assigned_result.id,
+                        "sender_id": assigned_result.sender_id,
+                        "receiver_id": assigned_result.receiver_id,
+                        "result_id": assigned_result.result_id,
+                    }
+                if duplicate:
+                    return {
+                        "success": True,
+                        "ignored": True,
+                        "reason": "assigned callback was already closed or cancelled",
+                    }
         return _send_to_inbox(receiver_id, message)
     except Exception as e:
         return {"success": False, "error": str(e)}

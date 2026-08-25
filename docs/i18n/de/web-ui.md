@@ -1,7 +1,7 @@
 ---
 slug: web-ui
 source: docs/WEB_UI.md
-source_sha256: sha256:d3556d3674af5593090f679a3897b8b3a3bfe79b540c9e97ab4ffdf5f05e76d7
+source_sha256: sha256:dc45952406ae34d9be16d78c4e5b4a6f73d8862fe8b5fe6a557528cecaf45928
 ---
 
 # Die Web UI verwenden
@@ -34,7 +34,9 @@ Direkte URLs werden unterstützt. Der Browserverlauf sollte die gewählte Settin
 
 Statusbezeichnungen stammen aus dauerhafter Control-Plane-Wahrheit. **Processing** bedeutet, dass ein Turn aktiv ist; **Ready** bedeutet, dass die Provider-Laufzeit lebt und wirklich untätig ist. Warteschlangenbezeichnungen unterscheiden erschöpfte Provider-Kapazität, Child-Retirement-Sperren und allgemeine Workflow-Fortsetzung. Ein Owner-gated-Badge bleibt kategorisch, während das erweiterte Owner-Decision-Panel den konkreten dauerhaften Grund zeigt.
 
-Aktive und historische Sitzungen bleiben getrennte dauerhafte Laufzeiten. Das Löschen einer historischen Sitzung entfernt nur diese exakte berechtigte Laufzeit. Auch das Löschen eines beendeten Terminals prüft seine exakte Laufzeitidentität, Schreib-Lease, Workflow-/Ergebnisschutz und Sitzungsbeziehung vor der Bereinigung; mehrdeutiger oder aktiver Zustand bleibt geschützt.
+Aktive und historische Sitzungen bleiben getrennte dauerhafte Laufzeiten. Das Löschen einer historischen Sitzung entfernt nur diese exakte berechtigte Laufzeit. Auch das Löschen eines beendeten Terminals prüft seine exakte Laufzeitidentität, Schreib-Lease, Workflow-/Ergebnisschutz und Sitzungsbeziehung vor der Bereinigung; mehrdeutiger oder aktiver Zustand bleibt geschützt. Aufbewahrte Bereinigungsressourcen erzeugen keine falsche Ausführungssperre: Die exakte Laufzeit kann tombstoned werden, während die geschützte Dateisystemautorität für eine spätere Stilllegung verfügbar bleibt; dieselbe Löschung zu wiederholen ist sicher.
+
+Agenten innerhalb einer Sitzung verwenden stets ihre dauerhafte Erstellungsreihenfolge. Home und Agents bewahren diese Reihenfolge in List und Grid sowie über Aufklappen, Polling, Wiederverbinden, Neustart und Lebenszyklusänderungen hinweg. Status, ID, Provider, Profil, Aktivität und Aktualisierungszeit sind keine Sortierschlüssel für die Darstellung; ein neuer Agent wird an die Sitzung angehängt.
 
 ![Live-Ansicht des Agents-Status mit aus der öffentlichen Aufnahme entfernten lokalen Worktree-Pfaden](/media/screenshots/threadcells-agents.webp)
 
@@ -42,7 +44,9 @@ Aktive und historische Sitzungen bleiben getrennte dauerhafte Laufzeiten. Das L�
 
 Sensible Mutationen teilen ein Steuerelement **Unlock operator changes**. Fehlende, ungültige, gesperrte, entsperrte und abgelaufene Zustände sind getrennt. Die exakte Mindestlänge des Secrets beträgt fünf Zeichen und die standardmäßige authentifizierte Sitzung dauert fünf Minuten.
 
-Die UI sendet das Secret nur zum Entsperren, löscht es sofort und legt es niemals im Browser-Persistenzspeicher ab oder exportiert es. Kapazität, privilegierte Profil-/Provider-Änderungen, Telegram-Konfiguration/-Tests, Housekeeping-Ausführung und anwendbare Eigentümerstarts bleiben ohne Serversitzung gesperrt.
+Die UI sendet das Secret nur zum Entsperren, löscht es sofort und legt es niemals im Browser-Persistenzspeicher ab oder exportiert es. Kapazität, privilegierte Profil-/Provider-Änderungen, Telegram-Konfiguration/-Tests, Housekeeping-Ausführung, Full-Cleanup-Ausführung und anwendbare Eigentümerstarts bleiben ohne Serversitzung gesperrt.
+
+Settings → Housekeeping endet mit dem Gefahrenbereich **Delete all system files — Full Cleanup**. Seine schreibgeschützte Vorschau zeigt Schätzungen des freigebbaren Speichers nach Klasse, Schutzgründe, Ruhezustand, Releases/Worktrees und die Warnung, dass nur das aktive Release erhalten bleibt. Nach dem Entsperren ist das bestehende Bestätigungsmodal zwingend. Die Ausführung ist deaktiviert, solange ein Agent oder eine dateisystemverändernde Ausführung aktiv ist; der Server prüft diese Bedingung erneut, bevor er löscht. Das Ergebnis meldet geplante/tatsächliche Freigabe, übersprungene Elemente, Plattenzustand, aktives Release und Rollback-Verfügbarkeit.
 
 Folge [Betreiberautorisierung](OPERATOR_AUTHORIZATION.md), um den Verifier sicher bereitzustellen.
 
@@ -66,7 +70,7 @@ Die Docs-Navigation ist entlang der Lernreise gruppiert, durchsuchbar und auf br
 
 ## Full Output
 
-Full Output rendert aufbewahrten Provider-Text zur menschlichen Prüfung, nachdem ANSI/VT-Steuersequenzen und Terminal-Cursor-Manipulation entfernt wurden. Die Sanitization verhindert, dass Präsentationssteuerungen die sichtbare Historie überschreiben; sie interpretiert, führt aus oder zertifiziert den Provider-Text nicht.
+Full Output rendert aufbewahrten Provider-Text zur menschlichen Prüfung, nachdem ANSI/VT-Steuersequenzen und Terminal-Cursor-Manipulation entfernt wurden. Die Sanitization verhindert, dass Präsentationssteuerungen die sichtbare Historie überschreiben; sie interpretiert, führt aus oder zertifiziert den Provider-Text nicht. Wenn Full Cleanup das alte Log eines beendeten Agenten sicher entfernt, aber seine Metadaten aufbewahrt hat, meldet die Ansicht, dass die dauerhafte Ausgabe nicht verfügbar ist, statt einen Fehler oder erfundene Inhalte anzuzeigen.
 
 ## Als App installieren
 

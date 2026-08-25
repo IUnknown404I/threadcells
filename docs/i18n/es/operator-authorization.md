@@ -1,7 +1,7 @@
 ---
 slug: operator-authorization
 source: docs/OPERATOR_AUTHORIZATION.md
-source_sha256: sha256:55cf518ba75105911c8db6d4618c30b1ee63fa26645e7fc8cca063480385e50c
+source_sha256: sha256:543fc9c31e1ffe8e120aa726c819f0e9180d0f6ca92b28c9b4ce549d0025d4b1
 ---
 
 # Autorización del operador
@@ -72,6 +72,8 @@ El resultado esperado incluye `"configured": true` y `"authenticated": false` an
 En Settings, introduce el secreto y elige **Unlock operator changes**. La ventana autenticada predeterminada es de cinco minutos. La UI muestra la expiración y vuelve al estado bloqueado cuando la sesión termina.
 
 Las llamadas a Settings protegidas fallan mientras está bloqueado y tienen éxito durante la sesión autenticada. El navegador usa la cookie de sesión segura y de corta duración del servidor; no conserva el secreto de operador.
+
+Full Cleanup reutiliza exactamente esta autoridad. La vista previa sigue disponible como inspección de seguridad de solo lectura, mientras que la ejecución exige la sesión de operador vigente y la confirmación estándar de acción permanente. La confirmación no vuelve a pedir el secreto. No existe ningún secreto de limpieza separado, credencial en URL, valor en el almacenamiento del navegador ni copia duradera en texto plano; la caducidad, el nuevo bloqueo y los límites de frecuencia no cambian.
 
 ## Sustituir el secreto
 

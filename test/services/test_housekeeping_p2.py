@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from cli_agent_orchestrator.services.housekeeping import executor as housekeeping_executor
 from cli_agent_orchestrator.services.housekeeping.executor import (
     _execute_resource,
     execute_plan,
@@ -64,6 +65,177 @@ def _config(root: Path):
 
 def _age(path: Path, minutes: int):
     os.utime(path, (NOW - minutes * 60, NOW - minutes * 60))
+
+
+def test_post_validation_path_replacement_is_never_deleted(tmp_path, monkeypatch):
+    candidate_path = tmp_path / "state/cao/logs/archive"
+    candidate_path.mkdir(parents=True)
+    candidate_path.joinpath("original.log").write_text("original", encoding="utf-8")
+    fingerprint, size = candidate_fingerprint(candidate_path)
+    candidate = HousekeepingCandidate(
+        category="logs",
+        path=str(candidate_path),
+        canonical_identity=f"logs:{candidate_path}",
+        fingerprint=fingerprint,
+        bytes=size,
+        estimated_reclaim_bytes=size,
+        action="delete",
+        retention_reason="test",
+    )
+    plan = finalize_plan(
+        generated_at=NOW,
+        mode="weekly",
+        root=tmp_path,
+        candidates=[candidate],
+        warnings=[],
+    )
+    original_execute = housekeeping_executor._execute_candidate
+    saved_original = tmp_path / "saved-original"
+
+    def replace_after_validation(path, planned, **kwargs):
+        path.rename(saved_original)
+        path.mkdir()
+        path.joinpath("replacement.log").write_text("replacement", encoding="utf-8")
+        return original_execute(path, planned, **kwargs)
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping.executor._execute_candidate",
+        replace_after_validation,
+    )
+    report = execute_plan(
+        plan,
+        config=_config(tmp_path),
+        open_inventory=lambda: (set(), True),
+    )
+
+    assert report.ok is False
+    assert candidate_path.joinpath("replacement.log").read_text(encoding="utf-8") == "replacement"
+    assert saved_original.joinpath("original.log").read_text(encoding="utf-8") == "original"
+    assert report.executed == []
+
+
+def test_post_quarantine_replacement_is_never_deleted(tmp_path, monkeypatch):
+    candidate_path = tmp_path / "state/cao/logs/archive"
+    candidate_path.mkdir(parents=True)
+    candidate_path.joinpath("original.log").write_text("original", encoding="utf-8")
+    fingerprint, size = candidate_fingerprint(candidate_path)
+    candidate = HousekeepingCandidate(
+        category="logs",
+        path=str(candidate_path),
+        canonical_identity=f"logs:{candidate_path}",
+        fingerprint=fingerprint,
+        bytes=size,
+        estimated_reclaim_bytes=size,
+        action="delete",
+        retention_reason="test",
+    )
+    original_fingerprint = housekeeping_executor._descriptor_fingerprint
+    saved_original = candidate_path.parent / "saved-captured-original"
+
+    def replace_captured_after_fingerprint(descriptor):
+        result = original_fingerprint(descriptor)
+        quarantine = next(candidate_path.parent.glob(".threadcells-housekeeping-*"))
+        captured = quarantine / "candidate"
+        captured.rename(saved_original)
+        captured.mkdir()
+        captured.joinpath("replacement.log").write_text("replacement", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(
+        housekeeping_executor,
+        "_descriptor_fingerprint",
+        replace_captured_after_fingerprint,
+    )
+
+    with pytest.raises(RuntimeError, match="changed after quarantine"):
+        housekeeping_executor._execute_candidate(candidate_path, candidate)
+
+    assert saved_original.joinpath("original.log").read_text(encoding="utf-8") == "original"
+    quarantine = next(candidate_path.parent.glob(".threadcells-housekeeping-*"))
+    assert quarantine.joinpath("candidate/replacement.log").read_text(encoding="utf-8") == (
+        "replacement"
+    )
+
+
+def test_descriptor_fingerprint_matches_canonical_global_path_order(tmp_path):
+    candidate_path = tmp_path / "artifact"
+    candidate_path.joinpath("a").mkdir(parents=True)
+    candidate_path.joinpath("a/nested").write_text("nested", encoding="utf-8")
+    candidate_path.joinpath("a.txt").write_text("sibling", encoding="utf-8")
+    expected_fingerprint, expected_bytes = candidate_fingerprint(candidate_path)
+    descriptor = os.open(
+        candidate_path,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    try:
+        actual_fingerprint, actual_bytes, manifest = housekeeping_executor._descriptor_fingerprint(
+            descriptor
+        )
+    finally:
+        os.close(descriptor)
+
+    assert actual_fingerprint == expected_fingerprint
+    assert actual_bytes == expected_bytes
+    assert set(manifest) == {".", "a", "a/nested", "a.txt"}
+
+
+def test_post_fingerprint_child_replacement_is_never_deleted(tmp_path, monkeypatch):
+    candidate_path = tmp_path / "logs"
+    candidate_path.mkdir()
+    candidate_path.joinpath("original.log").write_text("original", encoding="utf-8")
+    fingerprint, size = candidate_fingerprint(candidate_path)
+    candidate = HousekeepingCandidate(
+        category="logs",
+        path=str(candidate_path),
+        canonical_identity=f"logs:{candidate_path}",
+        fingerprint=fingerprint,
+        bytes=size,
+        estimated_reclaim_bytes=size,
+        action="delete",
+        retention_reason="test",
+    )
+    original_fingerprint = housekeeping_executor._descriptor_fingerprint
+    saved_original = tmp_path / "saved-original.log"
+
+    def replace_child_after_fingerprint(descriptor):
+        result = original_fingerprint(descriptor)
+        quarantine = next(tmp_path.glob(".threadcells-housekeeping-*"))
+        captured_child = quarantine / "candidate/original.log"
+        captured_child.rename(saved_original)
+        captured_child.write_text("replacement", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(
+        housekeeping_executor,
+        "_descriptor_fingerprint",
+        replace_child_after_fingerprint,
+    )
+
+    with pytest.raises(RuntimeError, match="identity changed after fingerprint"):
+        housekeeping_executor._execute_candidate(candidate_path, candidate)
+
+    assert saved_original.read_text(encoding="utf-8") == "original"
+    quarantine = next(tmp_path.glob(".threadcells-housekeeping-*"))
+    assert quarantine.joinpath("candidate/original.log").read_text(encoding="utf-8") == (
+        "replacement"
+    )
+
+
+def test_privileged_quarantine_has_no_unprivileged_fallback(tmp_path):
+    candidate_path = tmp_path / "logs"
+    candidate_path.mkdir()
+    candidate_path.joinpath("original.log").write_text("original", encoding="utf-8")
+    fingerprint, _size = candidate_fingerprint(candidate_path)
+
+    with pytest.raises(RuntimeError, match="privileged quarantine authority is unavailable"):
+        housekeeping_executor._quarantine_and_delete(
+            candidate_path,
+            fingerprint,
+            exclusive_untrusted_uid=os.getuid(),
+        )
+
+    quarantine = next(tmp_path.glob(".threadcells-housekeeping-*"))
+    assert quarantine.joinpath("candidate/original.log").read_text(encoding="utf-8") == ("original")
 
 
 def _plan(root: Path, monkeypatch, *, mode="weekly"):
@@ -1007,6 +1179,135 @@ def test_release_gc_preserves_active_rollback_and_backups_and_removes_only_stale
     assert report.ok is True
     assert active.exists() and rollback.exists() and backup.exists()
     assert not stale.exists()
+
+
+def test_full_cleanup_preserves_only_active_release_and_reconciles_metadata(tmp_path, monkeypatch):
+    active = _release(tmp_path, "active", minutes=300)
+    rollback = _release(tmp_path, "rollback", minutes=301)
+    recovery = _release(tmp_path, "recovery", minutes=302)
+    stale = _release(tmp_path, "stale", minutes=303)
+    config = _config(tmp_path)
+    metadata = Path(config["release_metadata"])
+    metadata.parent.mkdir(parents=True, exist_ok=True)
+    metadata.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "active_release": str(active.resolve()),
+                "rollback_releases": [
+                    str(rollback.resolve()),
+                    str(recovery.resolve()),
+                ],
+                "candidate_releases": [str(stale.resolve())],
+            }
+        ),
+        encoding="utf-8",
+    )
+    Path(config["active_release_link"]).symlink_to(active, target_is_directory=True)
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.list_all_terminals", lambda: [])
+    settings = default_settings(config)
+    settings["policy"]["releases"]["enabled"] = False
+
+    plan = build_plan(
+        root=tmp_path,
+        config=config,
+        settings=settings,
+        mode="full",
+        now=NOW,
+        open_inventory=lambda: (set(), True),
+    )
+    by_name = {
+        Path(item.path).name: item for item in plan.candidates if item.category == "releases"
+    }
+    assert by_name["active"].protection_reason == "ACTIVE_RELEASE"
+    assert all(by_name[name].action == "delete" for name in ("rollback", "recovery", "stale"))
+
+    report = execute_plan(
+        plan,
+        config=config,
+        settings=settings,
+        open_inventory=lambda: (set(), True),
+        full_cleanup=True,
+        lifecycle_fence_held=True,
+    )
+
+    assert report.ok is True
+    assert report.active_release == str(active.resolve())
+    assert report.rollback_available is False
+    assert active.is_dir()
+    assert Path(config["active_release_link"]).resolve(strict=True) == active.resolve()
+    assert not rollback.exists() and not recovery.exists() and not stale.exists()
+    assert json.loads(metadata.read_text(encoding="utf-8")) == {
+        "schema_version": 1,
+        "active_release": str(active.resolve()),
+        "rollback_releases": [],
+        "candidate_releases": [],
+    }
+
+    replay = build_plan(
+        root=tmp_path,
+        config=config,
+        settings=settings,
+        mode="full",
+        now=NOW,
+        open_inventory=lambda: (set(), True),
+    )
+    second = execute_plan(
+        replay,
+        config=config,
+        settings=settings,
+        open_inventory=lambda: (set(), True),
+        full_cleanup=True,
+        lifecycle_fence_held=True,
+    )
+    assert second.ok is True
+    assert second.rollback_available is False
+    assert active.is_dir()
+
+
+def test_full_cleanup_replay_still_requires_release_staging_lock(tmp_path, monkeypatch):
+    active = _release(tmp_path, "active", minutes=300)
+    config = _config(tmp_path)
+    metadata = Path(config["release_metadata"])
+    metadata.parent.mkdir(parents=True, exist_ok=True)
+    original = {
+        "schema_version": 1,
+        "active_release": str(active.resolve()),
+        "rollback_releases": [],
+        "candidate_releases": [],
+    }
+    metadata.write_text(json.dumps(original), encoding="utf-8")
+    Path(config["active_release_link"]).symlink_to(active, target_is_directory=True)
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.list_all_terminals", lambda: [])
+    settings = default_settings(config)
+    plan = build_plan(
+        root=tmp_path,
+        config=config,
+        settings=settings,
+        mode="full",
+        now=NOW,
+        open_inventory=lambda: (set(), True),
+    )
+    assert not [
+        item for item in plan.candidates if item.category == "releases" and item.action == "delete"
+    ]
+
+    with Path(config["release_staging_lock"]).open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        report = execute_plan(
+            plan,
+            config=config,
+            settings=settings,
+            open_inventory=lambda: (set(), True),
+            full_cleanup=True,
+            lifecycle_fence_held=True,
+        )
+
+    assert report.ok is False
+    assert report.active_release is None
+    assert report.rollback_available is None
+    assert json.loads(metadata.read_text(encoding="utf-8")) == original
+    assert any(item["reason_code"] == "RELEASE_STAGING_BUSY" for item in report.failures)
 
 
 def test_active_link_target_remains_protected_after_candidate_metadata_eviction(

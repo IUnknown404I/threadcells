@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from cli_agent_orchestrator.api.main import app
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.services import terminal_service
+from cli_agent_orchestrator.services.operations_service import AdmissionDenied
 
 
 class TestWorkingDirectoryEndpoint:
@@ -500,6 +501,25 @@ class TestCreateInboxMessageEndpoint:
             )
 
             assert response.status_code == 404
+
+    def test_create_inbox_message_defers_while_full_cleanup_owns_admission(self, client):
+        """Queued provider work cannot race the final Full Cleanup idle check."""
+        denied = AdmissionDenied("ADMISSION_FENCE_TIMEOUT", {"eligible": False})
+        with (
+            patch(
+                "cli_agent_orchestrator.services.operations_service.workflow_execution_admission_fence",
+                side_effect=denied,
+            ),
+            patch("cli_agent_orchestrator.api.main.create_inbox_message") as mock_create,
+        ):
+            response = client.post(
+                "/terminals/abcd1234/inbox/messages",
+                json={"sender_id": "sender1", "message": "hello"},
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["reason_code"] == "ADMISSION_FENCE_TIMEOUT"
+        mock_create.assert_not_called()
 
     def test_create_inbox_message_rejects_legacy_query_payload(self, client):
         """Inbox text is accepted only from the JSON body, never from the URL."""

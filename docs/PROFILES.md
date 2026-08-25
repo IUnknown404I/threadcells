@@ -24,9 +24,11 @@ ThreadCells ships immutable profiles for common roles, including everyday and st
 
 Examples:
 
-- `supervisor_terra_medium`: the everyday supervisor for ordinary decomposition and integration.
-- `supervisor_sol_medium`: stronger orchestration for important or cross-module work.
-- `developer_terra_medium` and `developer_sol_medium`: bounded implementation roles.
+- `supervisor_terra_medium`: the default ongoing orchestrator for ordinary and medium-risk workflows; it decomposes, delegates, reviews, accepts, and integrates.
+- `supervisor_sol_medium`: the orchestration-first supervisor for risky, cross-module, architecture-sensitive, or lifecycle-sensitive workflows.
+- `developer_terra_medium`: routine, bounded, low-ambiguity implementation.
+- `developer_terra_high`: important product work, difficult bounded defects and refactors, and public semantic quality.
+- `developer_sol_medium`: reasoning-heavy cross-subsystem and subtle invariant work.
 - `reviewer_sol_high`: independent review for risky or integrated changes.
 - `critical_sol_xhigh_owner`: an exceptional owner-executor profile with a separate authorization boundary.
 
@@ -46,6 +48,29 @@ Use the least specialized profile that can reliably own the task:
 | Critical frontier owner execution | owner-authorized XHigh only |
 
 More reasoning and broader authority cost capacity and increase consequence. They should reflect the task, not become defaults.
+
+A Sol supervisor does not imply a Sol developer. It should still route routine
+implementation to Terra developers and reserve `developer_sol_medium` for work
+whose correctness depends on subtle cross-system reasoning.
+
+## Retry and escalation
+
+ThreadCells classifies failed implementation attempts before selecting another
+agent:
+
+| Failure class | Canonical response |
+| --- | --- |
+| `OPERATIONAL_FAILURE` | A same-tier retry may be valid. |
+| `MECHANICAL_INCOMPLETE` | Allow one bounded same-tier correction. |
+| `SEMANTIC_QUALITY_FAILURE` | Escalate the implementation tier; never perform a third same-tier semantic attempt. |
+| `BOUNDARY_COMPLEXITY_UNDERESTIMATED` | Select a stronger developer. |
+| `CRITICAL_SYSTEMIC_BOUNDARY` | Use owner-authorized `critical_sol_xhigh_owner`. |
+
+The normal escalation path is `developer_terra_medium` →
+`developer_terra_high` → `developer_sol_medium`. XHigh is reserved for genuinely
+critical systemic authority such as security, exactly-once concurrency,
+destructive Housekeeping, migrations, or dangerous recovery. Passing tests are
+necessary evidence, but do not by themselves prove semantic quality.
 
 ## Resolved preview
 

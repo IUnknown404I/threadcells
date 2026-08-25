@@ -1,7 +1,7 @@
 ---
 slug: upgrading
 source: docs/UPGRADING.md
-source_sha256: sha256:583ec58e621329fd7dc9914a0c29c18a7f12bee09808f2f18908fe4d972536cf
+source_sha256: sha256:9f73c3caf0e5c41d2ea38998c5d5da2f41091658ba94c3c36095164390f96bfe
 ---
 # ThreadCells のアップグレード
 
@@ -22,7 +22,7 @@ source_sha256: sha256:583ec58e621329fd7dc9914a0c29c18a7f12bee09808f2f18908fe4d97
 
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
-candidate="$PWD/threadcells-candidate/threadcells-0.2.0a1-local"
+candidate="$PWD/threadcells-candidate/threadcells-0.3.0a1-local"
 python3 scripts/verify_local_candidate.py --candidate "$candidate"
 ```
 
@@ -63,5 +63,7 @@ python3 scripts/verify_local_candidate.py --candidate "$candidate"
 5. スキーマ／データ互換性が必要とする場合にのみ、アップグレード前のデータベースを復元する。
 
 ロールバックを模倣するために、破壊的な Git reset を使ったり、新しいランタイム証拠を削除したりしてはいけません。
+
+明示的に確認された Full Cleanup は、通常のローカルリリース保持の例外です。デプロイ時に選択されたロールバックを含む、証明済みの非アクティブなリリースをすべて削除し、アクティブな不変リリースだけを残します。アップグレード受け入れ中や、いずれかのエージェントが実行中のときに実行してはいけません。Full Cleanup 成功後にロールバック可用性を戻すには、別の検証済み不変リリースをステージングしてください。未検証ディレクトリーから再構築してはいけません。
 
 [ローカルデプロイメント](DEPLOYMENT.md)と[バックアップと復元](BACKUP_AND_RESTORE.md)を参照してください。

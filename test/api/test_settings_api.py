@@ -133,6 +133,10 @@ class TestSetAgentDirsEndpoint:
                 "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
                 return_value=["/existing/extra"],
             ),
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+                return_value=updated_dirs,
+            ),
         ):
             response = client.post(
                 "/settings/agent-dirs",
@@ -154,6 +158,10 @@ class TestSetAgentDirsEndpoint:
             patch(
                 "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
                 return_value=["/new/extra"],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+                return_value={"codex": "/provider/codex"},
             ),
         ):
             response = client.post(
@@ -187,6 +195,10 @@ class TestSetAgentDirsEndpoint:
                 "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
                 return_value=["/extra1"],
             ),
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+                return_value=updated_dirs,
+            ),
         ):
             response = client.post(
                 "/settings/agent-dirs",
@@ -203,9 +215,15 @@ class TestSetAgentDirsEndpoint:
 
     def test_empty_body_returns_defaults(self, client):
         """POST /settings/agent-dirs with empty body returns empty agent_dirs and existing extra."""
-        with patch(
-            "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
-            return_value=[],
+        with (
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+                return_value=[],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+                return_value={},
+            ),
         ):
             response = client.post("/settings/agent-dirs", json={})
 
@@ -213,3 +231,21 @@ class TestSetAgentDirsEndpoint:
         data = response.json()
         assert data["agent_dirs"] == {}
         assert data["extra_dirs"] == []
+
+    def test_empty_agent_dirs_is_an_explicit_update(self, client):
+        """An empty provider map is not confused with an omitted field."""
+        with (
+            patch("cli_agent_orchestrator.services.settings_service.set_agent_dirs") as setter,
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+                return_value={},
+            ),
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+                return_value=[],
+            ),
+        ):
+            response = client.post("/settings/agent-dirs", json={"agent_dirs": {}})
+
+        assert response.status_code == 200
+        setter.assert_called_once_with({})

@@ -120,5 +120,9 @@ Stage into a candidate filesystem, build/install the wheel in a new versioned
 virtualenv, validate it, then atomically switch the configured `cao*` compatibility
 links using the established deployment procedure. Install the staged root-owned
 systemd unit files, run `systemctl daemon-reload`, enable both timers, and restart
-only `agent-control-cao.service`. Preserve the current runtime as the known-good
-rollback and do not delete backups or unclassified historical deployments.
+only `agent-control-cao.service`. Enable and start
+`agent-control-full-cleanup.socket`, then require it to be active and its
+`/run/threadcells/full-cleanup.sock` endpoint to be an `agentctl:agentctl` mode
+`0600` Unix socket before accepting the deployment. Preserve the current runtime
+as the known-good rollback and do not delete backups or unclassified historical
+deployments.

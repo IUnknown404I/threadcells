@@ -1,7 +1,7 @@
 ---
 slug: security-model
 source: docs/SECURITY_MODEL.md
-source_sha256: sha256:6305e6199bae4706af6ed41e99eb0465ed0877bff4e83a7b1df57019f1a3383c
+source_sha256: sha256:3289f7f4f98e1df65f02b4331233327e3adb0e0d7b0b56cffe5ef04b2b64cfe9
 ---
 # Modelo de seguridad
 
@@ -58,6 +58,10 @@ No incluya secretos de operador/proveedor/Telegram en texto sin cifrar en reposi
 ## Operaciones destructivas
 
 El housekeeping se planifica primero y falla de forma cerrada. Los recursos desconocidos, ilegibles, abiertos, activos, referenciados, con identidad modificada o con metadatos incompletos permanecen protegidos. Las copias de seguridad nunca se eliminan automáticamente.
+
+Full Cleanup es un modo de retención más agresivo dentro de la misma autoridad de Housekeeping, no un subsistema de eliminación separado. Reutiliza la sesión de operador del servidor y la confirmación de acción permanente, no acepta ninguna ruta del sistema de archivos seleccionada por el llamador, se serializa con la admisión de lanzamientos/proveedores/Heavy y vuelve a validar un ciclo de vida completamente inactivo inmediatamente antes de la mutación. La release activa, el estado de SQLite, la autoridad de continuación de agentes Ready, las credenciales/estado de proveedores, la autoridad actual sobre código fuente/herramientas y los recursos ambiguos permanecen protegidos. Las releases locales de rollback inactivas demostradas solo se eliminan intencionadamente mediante esta operación explícita.
+
+La eliminación basada en rutas se limita al root helper activado por socket. Este vuelve a autenticar la misma autoridad del operador, solo acepta un ID de plan canónico exacto, exige que el proceso del plano de control mantenga todos los límites de admisión y bloquea las identidades de los directorios en cuarentena frente a sustituciones del usuario de runtime antes de la eliminación relativa a descriptores. La API sin privilegios no ofrece ninguna operación de ruta arbitraria ni un fallback más débil.
 
 El despliegue conserva un runtime de reversión y una copia de seguridad de la base de datos. La publicación, la exposición pública a la red y los cambios destructivos del historial siguen siendo decisiones independientes del propietario.
 

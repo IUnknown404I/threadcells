@@ -1,6 +1,6 @@
 ---
 name: developer_terra_high
-description: "Complex defects, debugging, and large bounded refactors."
+description: "Important product work and difficult bounded defects or refactors."
 provider: codex
 role: developer
 execution_mode: executor

@@ -70,6 +70,80 @@ def test_stable_identity_separates_reused_session_names(monkeypatch):
         raise AssertionError("a reused raw session name must remain ambiguous")
 
 
+def test_undeleted_legacy_session_resolves_by_raw_name(monkeypatch):
+    _install_database(monkeypatch)
+    legacy = _terminal("legacy", "placeholder", "cao-legacy", "/work/legacy")
+    legacy.session_id = None
+    with database.SessionLocal() as db:
+        db.add(legacy)
+        db.commit()
+
+    resolved = database.resolve_session_lifetime("cao-legacy")
+
+    assert resolved is not None
+    assert resolved["session_id"] == "legacy:cao-legacy"
+    assert resolved["terminals"][0]["id"] == "legacy"
+
+
+def test_unrelated_receipt_does_not_hide_legacy_raw_name(monkeypatch):
+    _install_database(monkeypatch)
+    legacy = _terminal("legacy", "placeholder", "cao-legacy", "/work/legacy")
+    legacy.session_id = None
+    with database.SessionLocal() as db:
+        db.add_all(
+            [
+                legacy,
+                SessionDeletionReceiptModel(
+                    session_id="unrelated-lifetime",
+                    session_name="cao-unrelated",
+                    retained_resources_json="[]",
+                ),
+            ]
+        )
+        db.commit()
+
+    resolved = database.resolve_session_lifetime("cao-legacy")
+
+    assert resolved is not None
+    assert resolved["session_id"] == "legacy:cao-legacy"
+    assert resolved["terminals"][0]["id"] == "legacy"
+
+
+def test_existing_receipt_schema_adds_replayable_retained_resources(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    SessionDeletionReceiptModel.__table__.drop(bind=engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE session_deletion_receipts ("
+            "session_id VARCHAR PRIMARY KEY, session_name VARCHAR NOT NULL, "
+            "deleted_at DATETIME NOT NULL)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO session_deletion_receipts "
+            "(session_id, session_name, deleted_at) "
+            "VALUES ('legacy-receipt', 'cao-deleted', CURRENT_TIMESTAMP)"
+        )
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
+    monkeypatch.setattr(database, "_ensure_terminal_worktree_authority_schema", lambda: None)
+    monkeypatch.setattr(database, "_ensure_usage_schema", lambda: None)
+
+    resolved = database.resolve_session_lifetime("legacy-receipt")
+
+    assert resolved is not None
+    assert resolved["deleted"] is True
+    assert resolved["retained_resources"] == []
+    with engine.connect() as connection:
+        columns = {
+            row[1]
+            for row in connection.exec_driver_sql(
+                "PRAGMA table_info(session_deletion_receipts)"
+            ).fetchall()
+        }
+    assert "retained_resources_json" in columns
+
+
 def test_exact_lifetime_delete_preserves_reused_name_and_is_idempotent(monkeypatch):
     _install_database(monkeypatch)
     with database.SessionLocal() as db:
@@ -90,8 +164,20 @@ def test_exact_lifetime_delete_preserves_reused_name_and_is_idempotent(monkeypat
         "lifetime-old", "cao-reused", expected_terminal_ids=["old"]
     )
 
-    assert first == {"deleted": 1, "already_deleted": False}
-    assert second == {"deleted": 0, "already_deleted": True}
+    assert first == {
+        "deleted": 1,
+        "logical_deleted": 1,
+        "retained": 0,
+        "retained_resources": [],
+        "already_deleted": False,
+    }
+    assert second == {
+        "deleted": 0,
+        "logical_deleted": 0,
+        "retained": 0,
+        "retained_resources": [],
+        "already_deleted": True,
+    }
     with database.SessionLocal() as db:
         assert [row.id for row in db.query(TerminalModel).all()] == ["new"]
         assert [row.terminal_id for row in db.query(WorktreeWriterLeaseModel).all()] == ["new"]
@@ -108,6 +194,59 @@ def test_exact_lifetime_delete_preserves_reused_name_and_is_idempotent(monkeypat
         pass
     else:
         raise AssertionError("a raw name reused after deletion must remain ambiguous")
+
+
+def test_exact_lifetime_tombstone_hides_retained_cleanup_authority(monkeypatch):
+    _install_database(monkeypatch)
+    with database.SessionLocal() as db:
+        db.add_all(
+            [
+                _terminal("clean", "lifetime", "cao-retained", "/work/clean"),
+                _terminal("protected", "lifetime", "cao-retained", "/work/protected"),
+                WorktreeWriterLeaseModel(
+                    canonical_worktree="/work/protected", terminal_id="protected"
+                ),
+            ]
+        )
+        db.commit()
+
+    result = database.delete_terminals_by_session_lifetime(
+        "lifetime",
+        "cao-retained",
+        expected_terminal_ids=["clean", "protected"],
+        retained_resources=[{"terminal_id": "protected", "reason_code": "MANAGED_WORKTREE_DIRTY"}],
+    )
+    replay = database.delete_terminals_by_session_lifetime(
+        "lifetime",
+        "cao-retained",
+        expected_terminal_ids=["clean", "protected"],
+    )
+
+    assert result == {
+        "deleted": 1,
+        "logical_deleted": 2,
+        "retained": 1,
+        "retained_resources": [
+            {"terminal_id": "protected", "reason_code": "MANAGED_WORKTREE_DIRTY"}
+        ],
+        "already_deleted": False,
+    }
+    assert replay == {
+        "deleted": 0,
+        "logical_deleted": 0,
+        "retained": 1,
+        "retained_resources": [
+            {"terminal_id": "protected", "reason_code": "MANAGED_WORKTREE_DIRTY"}
+        ],
+        "already_deleted": True,
+    }
+    resolved = database.resolve_session_lifetime("lifetime")
+    assert resolved["deleted"] is True
+    assert resolved["retained_resources"] == result["retained_resources"]
+    with database.SessionLocal() as db:
+        assert db.get(TerminalModel, "clean") is None
+        assert db.get(TerminalModel, "protected") is not None
+        assert db.query(WorktreeWriterLeaseModel).count() == 0
 
 
 def test_exact_exited_terminal_delete_reconciles_stale_leases_and_is_idempotent(monkeypatch):

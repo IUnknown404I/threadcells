@@ -205,7 +205,7 @@ export function FlowsPanel() {
     setDeleting(true)
     try {
       await api.deleteFlow(pendingDelete.name)
-      showSnackbar({ type: 'success', message: `Flow "${pendingDelete.name}" deleted` })
+      showSnackbar({ type: 'success', message: `Flow "${pendingDelete.name}" removed from ThreadCells` })
       await fetchFlows(true)
     } catch (e: any) {
       showSnackbar({ type: 'error', message: e.message || 'Failed to delete flow' })
@@ -490,7 +490,7 @@ export function FlowsPanel() {
       <ConfirmModal
         open={!!pendingDelete}
         title="Delete Flow"
-        message="This will permanently remove the flow and its schedule. This action cannot be undone."
+        message="This removes the flow registration and schedule from ThreadCells. Its source definition file is retained."
         details={pendingDelete ? [
           { label: 'Name', value: pendingDelete.name },
           { label: 'Schedule', value: pendingDelete.schedule },

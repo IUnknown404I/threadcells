@@ -277,7 +277,7 @@ describe('ConfirmModal', () => {
         onCancel={() => {}}
       />
     )
-    const button = screen.getByText('Closing...').closest('button')
+    const button = screen.getByText('Working…').closest('button')
     expect(button).toBeDisabled()
   })
 })
@@ -338,6 +338,21 @@ describe('OutputViewer fullscreen', () => {
     expect(screen.getByText(/long output/)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Exit fullscreen' }))
     expect(screen.getByText(/long output/)).toBeInTheDocument()
+  })
+
+  it('shows a truthful cleaned-output state for retained history', async () => {
+    vi.mocked(api.getTerminalOutput).mockResolvedValueOnce({
+      output: '',
+      mode: 'last',
+      availability: 'unavailable',
+      reason_code: 'DURABLE_OUTPUT_UNAVAILABLE',
+    })
+
+    render(<OutputViewer terminalId="terminal-cleaned" onClose={() => {}} />)
+
+    expect(await screen.findByText('Output unavailable')).toBeInTheDocument()
+    expect(screen.getByText(/durable log may have been cleaned by Housekeeping/)).toBeInTheDocument()
+    expect(screen.queryByText('No output available')).not.toBeInTheDocument()
   })
 })
 

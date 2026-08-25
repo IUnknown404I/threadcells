@@ -45,4 +45,18 @@ describe('Create Flow canonical defaults and profile selection', () => {
     await waitFor(() => expect(create).toHaveBeenCalledWith({ name: 'daily-review', schedule: '0 * * * *', agent_profile: profile.name, provider: 'codex', prompt_template: 'Review the repository.' }))
     expect(screen.queryByPlaceholderText('e.g. developer')).not.toBeInTheDocument()
   })
+
+  it('truthfully describes registry removal and retained source definitions', async () => {
+    setup()
+    const remove = vi.spyOn(api, 'deleteFlow').mockResolvedValue({ success: true } as never)
+    render(<FlowsPanel />)
+    await screen.findByText('existing-flow')
+
+    fireEvent.click(screen.getByTitle('Delete flow'))
+    const dialog = screen.getByRole('dialog', { name: 'Delete Flow' })
+    expect(dialog).toHaveTextContent('This removes the flow registration and schedule from ThreadCells. Its source definition file is retained.')
+    fireEvent.click(screen.getByRole('button', { name: 'Delete Flow' }))
+
+    await waitFor(() => expect(remove).toHaveBeenCalledWith('existing-flow'))
+  })
 })

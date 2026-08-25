@@ -1,6 +1,6 @@
 ---
 name: developer_sol_medium
-description: "Precise implementation with unusually high reasoning density."
+description: "Reasoning-heavy cross-subsystem and subtle invariant implementation."
 provider: codex
 role: developer
 execution_mode: executor

@@ -30,17 +30,17 @@ APPROVED_ACTIVE_PROFILE_METADATA = [
     },
     {
         "name": "developer_sol_medium",
-        "description": "Precise implementation with unusually high reasoning density.",
+        "description": "Reasoning-heavy cross-subsystem and subtle invariant implementation.",
         "source": "built-in",
     },
     {
         "name": "developer_terra_high",
-        "description": "Complex defects, debugging, and large bounded refactors.",
+        "description": "Important product work and difficult bounded defects or refactors.",
         "source": "built-in",
     },
     {
         "name": "developer_terra_medium",
-        "description": "Primary everyday development.",
+        "description": "Routine, bounded, low-ambiguity production implementation.",
         "source": "built-in",
     },
     {
@@ -85,7 +85,7 @@ APPROVED_ACTIVE_PROFILE_METADATA = [
     },
     {
         "name": "supervisor_terra_medium",
-        "description": "Primary ongoing orchestrator.",
+        "description": "Default everyday orchestrator for ordinary workflows.",
         "source": "built-in",
     },
     {

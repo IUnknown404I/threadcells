@@ -1,7 +1,7 @@
 ---
 slug: release-process
 source: docs/RELEASE_PROCESS.md
-source_sha256: sha256:d371b270c8f6ecb2c5c57cac578995bbaad165e6ad12041b06db126d4fdd149e
+source_sha256: sha256:d29545876d24bcb5241d2bdfb0a418fa9eb4ec740b2d26ab04fdec9f5dcab5ae
 ---
 # リリースプロセス
 
@@ -35,6 +35,7 @@ ThreadCells は通常の SemVer prerelease 順序に従います。alpha プレ�
 - `v0.1.0-alpha.1` は最初の公開 alpha でした。
 - `v0.1.0-alpha.2` は不変の公開済み技術プレビューです。
 - `v0.2.0-alpha.1` は統合された多言語・信頼性リリースラインです。
+- `v0.3.0-alpha.1` では、ライフサイクル整合性、永続的な作成順序、Full Cleanup、および体系的なルーティングポリシーが追加されます。
 - 同じリリースライン内で後続の公開を行う場合は alpha シーケンスのみを増やし、新たな製品輪郭ではセマンティックバージョンを意図的に増やします。
 
 既存のタグを移動してはいけません。リポジトリガバナンスの変更だけではバージョン更新やリリースの契機になりません。次の意味のある実装輪郭が公開準備できたときに限り、すべての正規バージョン表記サーフェスをまとめて更新します。

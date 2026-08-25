@@ -1,7 +1,7 @@
 ---
 slug: operations
 source: docs/OPERATIONS.md
-source_sha256: sha256:c1b5d152c38e373d316a3a27b417872f4f6943ad591e69ed7eeb9cf3e030ec27
+source_sha256: sha256:dc01111a81e6386ac3ffc8d2203e01f18caa175e4bb781ca451ac5f8d939c392
 ---
 
 # Operaciones
@@ -50,7 +50,9 @@ Use Graceful Exit para el ciclo de vida del proveedor. Matar tmux o eliminar fil
 
 Un hijo que ha salido no es desechable de inmediato. Confirme que su resultado duradero se haya entregado, leído, incorporado y confirmado. Después retire sus recursos de runtime conservando el historial.
 
-**Add Agent** se dirige a la vida útil estable de la sesión seleccionada. La eliminación de sesiones históricas y de terminales finalizados se dirige a identidades duraderas exactas y se rechaza mientras permanezcan un runtime activo, un flujo de trabajo abierto o de recuperación, un writer lease, un resultado pendiente u otra relación protegida.
+**Add Agent** se dirige a la vida útil estable de la sesión seleccionada. La eliminación de sesiones históricas y de terminales finalizados se dirige a identidades duraderas exactas y se rechaza mientras permanezcan un runtime activo, un flujo de trabajo abierto o de recuperación, un writer lease, un resultado pendiente u otra dependencia genuina del ciclo de vida. Los registros retenidos, los worktrees de limpieza protegidos y las reclamaciones de limpieza posteriores a la salida no impiden por sí solos la eliminación lógica: ThreadCells conserva la autoridad sobre los recursos, marca con una lápida la sesión exacta y hace que los reintentos sean idempotentes. Una eliminación bloqueada devuelve el conflicto específico del ciclo de vida en vez de un error genérico de recurso ausente o del servidor.
+
+Dentro de una sesión, Home y Agents conservan la secuencia duradera de creación de agentes del backend en las vistas List y Grid. El estado, el proveedor, el perfil, la actividad, el sondeo, la reconexión y el reinicio no reordenan los agentes; un agente recién creado se añade después de los anteriores.
 
 Un mensaje final del proveedor no cierra una misión abierta. Complete explícitamente un flujo de trabajo de nivel superior solo después de terminar todo el trabajo autorizado por el propietario. Use la puerta del propietario solo ante un límite real de decisión.
 
@@ -70,7 +72,7 @@ Evite registrar prompts o valores que contengan credenciales. Los errores públi
 
 Housekeeping siempre empieza por un plan. Inspeccione la lista de candidatos del dry-run y la identidad del plan, y después ejecute explícitamente el plan exacto. El ejecutor reconstruye la protección actual y vuelve a validar cada candidato antes de mutar. Puede retirar runtimes de terminal cerrados probados y worktrees reconocidos pendientes de limpieza sin borrar el historial duradero.
 
-Las copias de seguridad son solo de inventario y nunca se eliminan automáticamente. Los recursos desconocidos o activos permanecen protegidos. Consulte [Housekeeping](HOUSEKEEPING.md).
+Las copias de seguridad son solo de inventario y nunca se eliminan automáticamente. Los recursos desconocidos o activos permanecen protegidos. Full Cleanup es una acción de operador confirmada por separado que solo se ejecuta mientras todos los agentes están inactivos, conserva la autoridad de continuación de los agentes Ready y elimina intencionadamente cada release local inactiva demostrada, por lo que el rollback local deja de estar disponible. Consulte [Housekeeping](HOUSEKEEPING.md).
 
 ## Disciplina de cambios de producción
 

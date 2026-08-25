@@ -13,6 +13,7 @@ from cli_agent_orchestrator.services.session_service import (
     list_sessions,
     resolve_session_authority,
 )
+from cli_agent_orchestrator.services.terminal_service import ManagedWorktreeCleanupError
 
 
 class TestListSessions:
@@ -100,11 +101,17 @@ class TestListSessions:
             list_sessions()
 
 
-def _durable_session(*, lifecycle: str = "running", deleted: bool = False):
+def _durable_session(
+    *,
+    lifecycle: str = "running",
+    deleted: bool = False,
+    retained_resources: list[dict[str, str]] | None = None,
+):
     return {
         "session_id": "session-lifetime-1",
         "session_name": "cao-test",
         "deleted": deleted,
+        "retained_resources": retained_resources or [],
         "terminals": (
             []
             if deleted
@@ -216,46 +223,42 @@ class TestDeleteSession:
             patch("cli_agent_orchestrator.services.session_service.provider_manager"),
             patch(
                 "cli_agent_orchestrator.services.session_service.delete_terminals_by_session_lifetime",
-                return_value={"deleted": len(durable["terminals"]), "already_deleted": False},
+                return_value={
+                    "deleted": len(durable["terminals"]),
+                    "logical_deleted": len(durable["terminals"]),
+                    "retained": 0,
+                    "retained_resources": [],
+                    "already_deleted": False,
+                },
             ),
             patch("cli_agent_orchestrator.services.inbox_service.wake_provider_execution_queue"),
         )
 
-    @patch("cli_agent_orchestrator.services.session_service.mark_terminal_runtime_exited")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_live_session_deletes_exact_lifetime(self, mock_tmux, mark_exited):
-        mock_tmux.session_exists.side_effect = [True, True, True, False]
-        mock_tmux.get_session_windows.return_value = _runtime_windows()
-        mock_tmux.exact_runtime_target.side_effect = _runtime_target
-        mock_tmux.kill_session.return_value = True
+    def test_live_session_is_truthfully_blocked_before_mutation(self, mock_tmux):
+        mock_tmux.session_exists.return_value = True
         contexts = self._patch_common(_durable_session())
         with (
             contexts[0] as resolve,
-            contexts[1],
+            contexts[1] as prepare,
             contexts[2] as cancel,
-            contexts[3],
-            contexts[4],
+            contexts[3] as validate,
+            contexts[4] as cleanup,
             contexts[5] as providers,
             contexts[6] as delete,
             contexts[7],
         ):
-            result = delete_session("session-lifetime-1")
+            with pytest.raises(SessionLifecycleError) as error:
+                delete_session("session-lifetime-1")
 
-        assert result == {
-            "deleted": ["cao-test"],
-            "errors": [],
-            "already_deleted": False,
-        }
+        assert error.value.reason_code == "SESSION_RUNTIME_ACTIVE"
         resolve.assert_called_once_with("session-lifetime-1")
-        mock_tmux.kill_session.assert_called_once_with("cao-test")
-        delete.assert_called_once_with(
-            "session-lifetime-1",
-            "cao-test",
-            expected_terminal_ids=["terminal1", "terminal2"],
-        )
-        assert providers.cleanup_provider.call_count == 2
-        assert cancel.call_count == 2
-        assert mark_exited.call_count == 2
+        prepare.assert_not_called()
+        cancel.assert_not_called()
+        validate.assert_not_called()
+        cleanup.assert_not_called()
+        providers.cleanup_provider.assert_not_called()
+        delete.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.session_service.retire_exited_terminal_runtime")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
@@ -282,17 +285,71 @@ class TestDeleteSession:
             "session-lifetime-1",
             "cao-test",
             expected_terminal_ids=["terminal1", "terminal2"],
+            retained_resources=[],
+        )
+
+    @patch("cli_agent_orchestrator.services.session_service.retire_exited_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_historical_session_tombstones_while_retaining_protected_worktree(
+        self, mock_tmux, retire
+    ):
+        mock_tmux.session_exists.return_value = False
+        retire.return_value = True
+        contexts = self._patch_common(_durable_session(lifecycle="exited"))
+        with (
+            contexts[0],
+            contexts[1],
+            contexts[2],
+            contexts[3] as validate,
+            contexts[4] as cleanup,
+            contexts[5],
+            contexts[6] as delete,
+            contexts[7],
+        ):
+            validate.side_effect = [
+                None,
+                ManagedWorktreeCleanupError("MANAGED_WORKTREE_DIRTY"),
+            ]
+            delete.return_value = {
+                "deleted": 1,
+                "logical_deleted": 2,
+                "retained": 1,
+                "retained_resources": [
+                    {"terminal_id": "terminal2", "reason_code": "MANAGED_WORKTREE_DIRTY"}
+                ],
+                "already_deleted": False,
+            }
+            result = delete_session("session-lifetime-1")
+
+        assert result["deleted"] == ["cao-test"]
+        assert result["retained_resources"] == [
+            {"terminal_id": "terminal2", "reason_code": "MANAGED_WORKTREE_DIRTY"}
+        ]
+        cleanup.assert_called_once_with(_durable_session(lifecycle="exited")["terminals"][0])
+        delete.assert_called_once_with(
+            "session-lifetime-1",
+            "cao-test",
+            expected_terminal_ids=["terminal1", "terminal2"],
+            retained_resources=[
+                {"terminal_id": "terminal2", "reason_code": "MANAGED_WORKTREE_DIRTY"}
+            ],
         )
 
     @patch("cli_agent_orchestrator.services.session_service.resolve_session_lifetime")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
     def test_repeated_deletion_uses_durable_receipt(self, mock_tmux, resolve):
-        resolve.return_value = _durable_session(deleted=True)
+        retained = [{"terminal_id": "terminal2", "reason_code": "MANAGED_WORKTREE_DIRTY"}]
+        resolve.return_value = _durable_session(deleted=True, retained_resources=retained)
         mock_tmux.session_exists.return_value = False
 
         result = delete_session("session-lifetime-1")
 
-        assert result == {"deleted": [], "errors": [], "already_deleted": True}
+        assert result == {
+            "deleted": [],
+            "errors": [],
+            "already_deleted": True,
+            "retained_resources": retained,
+        }
 
     @patch("cli_agent_orchestrator.services.session_service.retire_exited_terminal_runtime")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
@@ -316,31 +373,6 @@ class TestDeleteSession:
         assert error.value.reason_code == "SESSION_RUNTIME_AUTHORITY_UNPROVEN"
         delete.assert_not_called()
 
-    @pytest.mark.parametrize("kill_result", [True, False])
-    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_unconfirmed_live_death_retains_metadata(self, mock_tmux, kill_result):
-        mock_tmux.session_exists.side_effect = [True, True, True, None]
-        mock_tmux.get_session_windows.return_value = _runtime_windows()
-        mock_tmux.exact_runtime_target.side_effect = _runtime_target
-        mock_tmux.kill_session.return_value = kill_result
-        contexts = self._patch_common(_durable_session())
-        with (
-            contexts[0],
-            contexts[1],
-            contexts[2],
-            contexts[3],
-            contexts[4],
-            contexts[5],
-            contexts[6] as delete,
-            contexts[7],
-        ):
-            with pytest.raises(SessionLifecycleError) as error:
-                delete_session("session-lifetime-1")
-
-        assert error.value.reason_code == "SESSION_DEATH_UNCONFIRMED"
-        assert error.value.inventory_uncertain is True
-        delete.assert_not_called()
-
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
     def test_reused_live_name_is_protected_before_any_mutation(self, mock_tmux):
         mock_tmux.session_exists.return_value = True
@@ -362,7 +394,7 @@ class TestDeleteSession:
             with pytest.raises(SessionLifecycleError) as error:
                 delete_session("session-lifetime-1")
 
-        assert error.value.reason_code == "SESSION_RUNTIME_AUTHORITY_DIVERGED"
+        assert error.value.reason_code == "SESSION_RUNTIME_ACTIVE"
         prepare.assert_not_called()
         cancel.assert_not_called()
         cleanup.assert_not_called()
@@ -392,7 +424,7 @@ class TestDeleteSession:
             with pytest.raises(SessionLifecycleError) as error:
                 delete_session("session-lifetime-1")
 
-        assert error.value.reason_code == "SESSION_RUNTIME_AUTHORITY_DIVERGED"
+        assert error.value.reason_code == "SESSION_RUNTIME_ACTIVE"
         prepare.assert_not_called()
         cancel.assert_not_called()
         cleanup.assert_not_called()

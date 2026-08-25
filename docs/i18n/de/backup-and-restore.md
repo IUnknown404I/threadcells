@@ -1,7 +1,7 @@
 ---
 slug: backup-and-restore
 source: docs/BACKUP_AND_RESTORE.md
-source_sha256: sha256:3e62f0b30f78fa32bfab783c5fa15e89b9646e2c6de211b8c8ddec3b05b53da1
+source_sha256: sha256:d5f0fb66a4513e8c56a811e1e21c5384f39831b8729af46e22b67896a79e3a66
 ---
 # Backup und Wiederherstellung
 
@@ -79,3 +79,5 @@ Prüfen Sie nach der Wiederherstellung:
 - aktive/Rollback-Releases bleiben korrekt identifiziert.
 
 Backups sind vor automatischem Housekeeping geschützt. Wenden Sie eine separate, geprüfte Aufbewahrungsrichtlinie auf Backup-Speicher an.
+
+Full Cleanup ersetzt keine Backup-Aufbewahrung. Es schützt die kanonische Datenbank und jedes Backup, dessen Entbehrlichkeit nicht nachgewiesen ist, entfernt aber absichtlich jedes inaktive lokale Release und jeden Rollback, der durch vertrauenswürdige Release-Metadaten dargestellt wird. Vergewissern Sie sich vor der Autorisierung, dass jeder benötigte Wiederherstellungspunkt außerhalb der lokalen Release-Menge existiert und auf Integrität geprüft wurde. Danach muss der Operator damit rechnen, dass lokaler Rollback nicht verfügbar ist, bis ein weiteres verifiziertes Release bereitgestellt wird.

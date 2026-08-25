@@ -210,7 +210,12 @@ def verify(candidate: Path) -> list[str]:
                 errors.append("wheel entry-point metadata is unavailable")
             else:
                 entry_text = wheel.read(entry_points[0]).decode("utf-8")
-                for executable in ("threadcells", "threadcells-server", "threadcells-housekeeping"):
+                for executable in (
+                    "threadcells",
+                    "threadcells-server",
+                    "threadcells-housekeeping",
+                    "threadcells-full-cleanup-helper",
+                ):
                     if f"{executable} =" not in entry_text:
                         errors.append(f"wheel is missing entry point: {executable}")
             api_source = "cli_agent_orchestrator/api/main.py"

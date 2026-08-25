@@ -1,12 +1,18 @@
 import hashlib
+import importlib.util
 import json
 import os
+import pwd
 import re
 import shutil
+import socket
 import subprocess
 import sys
+from argparse import Namespace
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
+
+import pytest
 
 SOURCE = Path(__file__).parents[1]
 
@@ -21,6 +27,69 @@ def _project_version() -> str:
 
 
 PROJECT_VERSION = _project_version()
+
+
+def _stage_module():
+    path = SOURCE / "deployment/stage-ops-p1.py"
+    spec = importlib.util.spec_from_file_location("threadcells_stage_ops_p1", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_live_staging_activates_and_verifies_full_cleanup_socket(tmp_path):
+    stage = _stage_module()
+    socket_path = tmp_path / "full-cleanup.sock"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(str(socket_path))
+        socket_path.chmod(0o600)
+        owner = socket_path.stat()
+        commands = []
+
+        def run(command, **kwargs):
+            commands.append((command, kwargs))
+            return Namespace(returncode=0)
+
+        stage._activate_full_cleanup_socket(
+            socket_path,
+            expected_owner=(owner.st_uid, owner.st_gid),
+            runner=run,
+        )
+
+    assert [command for command, _kwargs in commands] == [
+        ("systemctl", "daemon-reload"),
+        (
+            "systemctl",
+            "enable",
+            "--now",
+            "agent-control-full-cleanup.socket",
+        ),
+        (
+            "systemctl",
+            "is-active",
+            "--quiet",
+            "agent-control-full-cleanup.socket",
+        ),
+    ]
+    assert all(
+        kwargs == {"text": True, "capture_output": True, "check": False}
+        for _command, kwargs in commands
+    )
+
+
+def test_live_staging_rejects_missing_full_cleanup_socket(tmp_path):
+    stage = _stage_module()
+
+    def run(_command, **_kwargs):
+        return Namespace(returncode=0)
+
+    with pytest.raises(SystemExit, match="FULL_CLEANUP_SOCKET_NOT_LISTENING"):
+        stage._activate_full_cleanup_socket(
+            tmp_path / "missing.sock",
+            expected_owner=(os.getuid(), os.getgid()),
+            runner=run,
+        )
 
 
 def _tree_hash(root: Path) -> str:
@@ -52,6 +121,7 @@ def _local_wheel(destination: Path, *, web_assets: dict[str, bytes] | None = Non
         "threadcells-resource-status",
         "threadcells-heavy-run",
         "threadcells-housekeeping",
+        "threadcells-full-cleanup-helper",
     )
     with ZipFile(wheel, "w", compression=ZIP_DEFLATED) as archive:
         for relative in (
@@ -89,6 +159,7 @@ def _local_wheel(destination: Path, *, web_assets: dict[str, bytes] | None = Non
 
 def test_stage_ops_p1_is_dry_run_capable_and_idempotent(tmp_path):
     agent_root = tmp_path / "srv/agent-control"
+    runtime_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
     system_root = tmp_path
     policy = agent_root / "policy/ORCHESTRATION.md"
     policy.parent.mkdir(parents=True)
@@ -142,6 +213,13 @@ def test_stage_ops_p1_is_dry_run_capable_and_idempotent(tmp_path):
         "threadcells-ci-venv-",
         "threadcells-ci-wheel-",
     ]
+    artifact_roots = {item["path"]: item for item in config["full_cleanup_artifact_roots"]}
+    temporary_artifacts = artifact_roots[str(agent_root.resolve() / "tmp")]
+    assert "threadcells-" in temporary_artifacts["owned_prefixes"]
+    assert "cao-" in temporary_artifacts["owned_prefixes"]
+    package_artifacts = artifact_roots[str(runtime_home / ".cache")]
+    assert package_artifacts["owned_names"] == ["pip", "pnpm"]
+    assert package_artifacts["process_names"] == {"pip": "pip", "pnpm": "pnpm"}
     package_caches = {item["name"]: item for item in config["package_caches"]}
     assert package_caches["uv-agent-control"]["path"] == str(agent_root.resolve() / "cache")
     assert package_caches["uv-agent-control"]["full_reclaim"] is True
@@ -167,12 +245,41 @@ def test_stage_ops_p1_is_dry_run_capable_and_idempotent(tmp_path):
     assert "Do not artificially split one coherent implementation" in staged_policy
     assert "never launch two heavy jobs concurrently" in staged_policy
     for unit in (
+        "agent-control-full-cleanup.socket",
+        "agent-control-full-cleanup@.service",
         "agent-control-housekeeping.service",
         "agent-control-housekeeping.timer",
         "agent-control-housekeeping-weekly.service",
         "agent-control-housekeeping-weekly.timer",
     ):
         assert (system_root / "etc/systemd/system" / unit).is_file()
+    full_cleanup_socket = (
+        system_root / "etc/systemd/system/agent-control-full-cleanup.socket"
+    ).read_text()
+    assert "ListenStream=/run/threadcells/full-cleanup.sock" in full_cleanup_socket
+    assert "SocketUser=agentctl" in full_cleanup_socket
+    assert "SocketGroup=agentctl" in full_cleanup_socket
+    assert "SocketMode=0600" in full_cleanup_socket
+    assert "Accept=yes" in full_cleanup_socket
+    full_cleanup_helper = (
+        system_root / "etc/systemd/system/agent-control-full-cleanup@.service"
+    ).read_text()
+    assert "User=root" in full_cleanup_helper
+    assert "Group=root" in full_cleanup_helper
+    assert "EnvironmentFile=/etc/agent-control/cao.env" in full_cleanup_helper
+    assert (
+        "ExecStart=/var/lib/threadcells/active/runtime/bin/threadcells-full-cleanup-helper"
+        in full_cleanup_helper
+    )
+    assert "StandardInput=socket" in full_cleanup_helper
+    assert "StandardOutput=socket" in full_cleanup_helper
+    assert "NoNewPrivileges=true" in full_cleanup_helper
+    assert "RestrictAddressFamilies=AF_UNIX" in full_cleanup_helper
+    socket_enablement = (
+        system_root / "etc/systemd/system/sockets.target.wants/agent-control-full-cleanup.socket"
+    )
+    assert socket_enablement.is_symlink()
+    assert socket_enablement.readlink() == Path("../agent-control-full-cleanup.socket")
     for unit in (
         "agent-control-housekeeping.service",
         "agent-control-housekeeping-weekly.service",
@@ -196,14 +303,15 @@ def test_stage_ops_p1_is_dry_run_capable_and_idempotent(tmp_path):
         system_root / "etc/systemd/system/agent-control-cao.service.d/threadcells-runtime.conf"
     )
     assert runtime_dropin.is_file()
-    assert "Environment=PYTHONDONTWRITEBYTECODE=1" in runtime_dropin.read_text()
-    assert (
-        "ExecStart=/var/lib/threadcells/active/runtime/bin/cao-server" in runtime_dropin.read_text()
-    )
+    runtime_dropin_text = runtime_dropin.read_text()
+    assert "Environment=PYTHONDONTWRITEBYTECODE=1" in runtime_dropin_text
+    assert "User=root" not in runtime_dropin_text
+    assert "threadcells-release-admin" not in runtime_dropin_text
+    assert "SupplementaryGroups=" not in runtime_dropin_text
+    assert "ExecStart=/var/lib/threadcells/active/runtime/bin/cao-server" in runtime_dropin_text
     assert (
         "THREADCELLS_MCP_SERVER_COMMAND="
-        "/var/lib/threadcells/active/runtime/bin/threadcells-mcp-server"
-        in runtime_dropin.read_text()
+        "/var/lib/threadcells/active/runtime/bin/threadcells-mcp-server" in runtime_dropin_text
     )
     mcp_launcher = agent_root / "bin/threadcells-mcp-server"
     assert mcp_launcher.is_symlink()

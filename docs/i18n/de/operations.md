@@ -1,7 +1,7 @@
 ---
 slug: operations
 source: docs/OPERATIONS.md
-source_sha256: sha256:c1b5d152c38e373d316a3a27b417872f4f6943ad591e69ed7eeb9cf3e030ec27
+source_sha256: sha256:dc01111a81e6386ac3ffc8d2203e01f18caa175e4bb781ca451ac5f8d939c392
 ---
 # Betrieb
 
@@ -49,7 +49,9 @@ Verwenden Sie Graceful Exit für den Provider-Lebenszyklus. Das Beenden von tmux
 
 Ein beendetes Child ist nicht sofort entbehrlich. Bestätigen Sie, dass sein dauerhaftes Ergebnis zugestellt, gelesen, eingearbeitet und bestätigt wurde. Legen Sie anschließend seine Laufzeitressourcen still, während die Historie erhalten bleibt.
 
-**Add Agent** zielt auf die stabile Lebensdauer der ausgewählten Sitzung. Das Löschen historischer Sitzungen und beendeter Terminals zielt auf exakte dauerhafte Identitäten und wird abgelehnt, solange eine aktive Laufzeit, ein offener/Wiederherstellungs-Workflow, ein Writer-Lease, ein ausstehendes Ergebnis oder eine andere geschützte Beziehung besteht.
+**Add Agent** zielt auf die stabile Lebensdauer der ausgewählten Sitzung. Das Löschen historischer Sitzungen und beendeter Terminals zielt auf exakte dauerhafte Identitäten und wird abgelehnt, solange eine aktive Laufzeit, ein offener/Wiederherstellungs-Workflow, ein Writer-Lease, ein ausstehendes Ergebnis oder eine andere echte Lebenszyklusabhängigkeit besteht. Aufbewahrte Logs, geschützte Cleanup-Worktrees und Bereinigungsansprüche nach dem Beenden verhindern die logische Löschung nicht für sich allein: ThreadCells bewahrt die Ressourcenautorität, tombstoned die exakte Sitzung und macht Wiederholungen idempotent. Eine blockierte Löschung meldet den spezifischen Lebenszykluskonflikt statt eines generischen Fehlers wegen fehlender Ressource oder eines Serverfehlers.
+
+Innerhalb einer Sitzung bewahren Home und Agents die dauerhafte Erstellungsreihenfolge des Backends in List- und Grid-Ansichten. Status, Provider, Profil, Aktivität, Polling, Wiederverbinden und Neustart sortieren Agenten nicht um; ein neu erstellter Agent wird hinter den älteren angefügt.
 
 Ein Provider-Finale schließt keine offene Mission. Schließen Sie einen Top-Level-Workflow explizit erst ab, wenn alle owner-autorisierten Arbeiten beendet sind. Verwenden Sie ein Owner Gate nur für eine echte Entscheidungsgrenze.
 
@@ -69,7 +71,7 @@ Vermeiden Sie das Protokollieren von Prompts oder Werten mit Zugangsdaten. Öffe
 
 Housekeeping erfolgt immer zuerst als Plan. Prüfen Sie die Kandidatenliste des Dry-Runs und die Planidentität, führen Sie dann den exakten Plan ausdrücklich aus. Der Executor baut den aktuellen Schutz neu auf und validiert jeden Kandidaten vor einer Mutation erneut. Er kann nachweislich geschlossene Terminal-Laufzeiten und bestätigte, zur Bereinigung ausstehende Worktrees stilllegen, ohne dauerhafte Historie zu löschen.
 
-Backups sind nur Inventar und werden niemals automatisch gelöscht. Unbekannte oder aktive Ressourcen bleiben geschützt. Siehe [Housekeeping](HOUSEKEEPING.md).
+Backups sind nur Inventar und werden niemals automatisch gelöscht. Unbekannte oder aktive Ressourcen bleiben geschützt. Full Cleanup ist eine separat bestätigte Operatoraktion, die nur ausgeführt wird, während alle Agenten untätig sind, die Fortsetzungsautorität von Ready-Agenten bewahrt und absichtlich jedes nachweislich inaktive lokale Release entfernt, sodass lokaler Rollback nicht mehr verfügbar ist. Siehe [Housekeeping](HOUSEKEEPING.md).
 
 ## Disziplin bei Produktionsänderungen
 

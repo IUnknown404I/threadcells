@@ -13,6 +13,8 @@
   "memory_pressure_full_red_avg10": 1.0,
   "pressure_recovery_timeout_seconds": 30,
   "subprocess_timeout_seconds": 20,
+  "full_cleanup_helper_timeout_seconds": 1800,
+  "full_cleanup_helper_socket": "/run/threadcells/full-cleanup.sock",
   "context_launch_lock_timeout_seconds": 120,
   "heavy_slot_wait_timeout_seconds": 3600,
   "log_compress_after_minutes": 1440,
@@ -52,6 +54,7 @@
   "worktree_durable_refs": [],
   "reproducible_cache_roots": [],
   "reproducible_cache_owned_prefixes": [],
+  "full_cleanup_artifact_roots": [],
   "reproducible_cache_retain_minutes": 1440,
   "protected_inventory_roots": [],
   "package_caches": [

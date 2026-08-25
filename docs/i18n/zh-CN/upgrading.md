@@ -1,7 +1,7 @@
 ---
 slug: upgrading
 source: docs/UPGRADING.md
-source_sha256: sha256:583ec58e621329fd7dc9914a0c29c18a7f12bee09808f2f18908fe4d972536cf
+source_sha256: sha256:9f73c3caf0e5c41d2ea38998c5d5da2f41091658ba94c3c36095164390f96bfe
 ---
 # 升级 ThreadCells
 
@@ -22,7 +22,7 @@ source_sha256: sha256:583ec58e621329fd7dc9914a0c29c18a7f12bee09808f2f18908fe4d97
 
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
-candidate="$PWD/threadcells-candidate/threadcells-0.2.0a1-local"
+candidate="$PWD/threadcells-candidate/threadcells-0.3.0a1-local"
 python3 scripts/verify_local_candidate.py --candidate "$candidate"
 ```
 
@@ -63,5 +63,7 @@ python3 scripts/verify_local_candidate.py --candidate "$candidate"
 5. 仅在 schema/数据兼容性要求时恢复升级前数据库。
 
 不要使用破坏性的 Git reset，也不要删除较新的运行时证据来模拟回滚。
+
+明确确认的 Full Cleanup 是普通本地发布保留策略的例外：它会移除所有已证实不活跃的发布版本，包括部署期间选定的回滚，并且只留下活跃的不可变发布版本。升级验收期间或任何智能体正在执行时都不要运行它。Full Cleanup 成功后，只能通过暂存另一个已验证的不可变发布版本来恢复回滚能力；绝不要从未验证目录中重建回滚。
 
 请参阅[本地部署](DEPLOYMENT.md)和[备份与恢复](BACKUP_AND_RESTORE.md)。

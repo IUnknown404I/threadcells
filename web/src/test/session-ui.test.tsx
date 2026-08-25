@@ -596,10 +596,11 @@ describe('session creation and canonical ordering', () => {
 
   it('keeps Home List/Grid in the status row and switches the same ordered agents', async () => {
     const terminals = [
-      { id: 'summary-terminal-a', tmux_session: 'cao-summary', tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null },
-      { id: 'summary-terminal-b', tmux_session: 'cao-summary', tmux_window: '1', provider: 'codex', agent_profile: 'reviewer', last_active: null },
+      { id: 'z-created-first', tmux_session: 'cao-summary', tmux_window: '0', provider: 'codex', agent_profile: 'developer_sol_medium', last_active: '100' },
+      { id: 'a-created-second', tmux_session: 'cao-summary', tmux_window: '1', provider: 'claude_code', agent_profile: 'reviewer_sol_high', last_active: '999' },
+      { id: 'm-created-third', tmux_session: 'cao-summary', tmux_window: '2', provider: 'kiro_cli', agent_profile: 'developer_terra_medium', last_active: '200' },
     ]
-    useStore.setState({ sessions: [session('cao-summary', '100')], terminalStatuses: { 'summary-terminal-a': 'WORKFLOW_ACTIVE::Processing', 'summary-terminal-b': 'WORKFLOW_OWNER_GATE::Ready' } })
+    useStore.setState({ sessions: [session('cao-summary', '100')], terminalStatuses: { 'z-created-first': 'WORKFLOW_TERMINAL::Exited', 'a-created-second': 'WORKFLOW_OWNER_GATE::Ready', 'm-created-third': 'WORKFLOW_ACTIVE::Processing' } })
     vi.spyOn(api, 'getSession').mockResolvedValue({ session: session('cao-summary', '100'), terminals })
     render(<DashboardHome onNavigate={() => {}} />)
 
@@ -614,7 +615,7 @@ describe('session creation and canonical ordering', () => {
 
     expect(header).toHaveClass('grid', 'grid-cols-[minmax(0,1fr)_auto]', 'sm:grid-cols-[minmax(0,1fr)_auto_auto]')
     expect(within(header).getByTestId('session-title-row-cao-summary')).toHaveClass('col-span-2', 'sm:col-span-1')
-    expect(within(header).getByTestId('session-metadata-cao-summary')).toContainElement(within(header).getByText('2 agents'))
+    expect(within(header).getByTestId('session-metadata-cao-summary')).toContainElement(within(header).getByText('3 agents'))
     expect(actions).toContainElement(within(header).getByRole('button', { name: 'Delete summary' }))
     expect(actions).toHaveClass('col-span-2', 'flex-wrap', 'justify-end', 'sm:col-span-1', 'sm:flex-nowrap')
     expect(within(actions).queryByRole('group', { name: 'Agent layout' })).not.toBeInTheDocument()
@@ -631,8 +632,9 @@ describe('session creation and canonical ordering', () => {
     const renderedAgentIds = () => within(screen.getByTestId('session-agent-container'))
       .getAllByTestId(/^agent-detail-card-/)
       .map(card => card.getAttribute('data-testid'))
-    expect(renderedAgentIds()).toEqual(['agent-detail-card-summary-terminal-a', 'agent-detail-card-summary-terminal-b'])
-    for (const terminalId of ['summary-terminal-a', 'summary-terminal-b']) {
+    const expectedOrder = ['agent-detail-card-z-created-first', 'agent-detail-card-a-created-second', 'agent-detail-card-m-created-third']
+    expect(renderedAgentIds()).toEqual(expectedOrder)
+    for (const terminalId of ['z-created-first', 'a-created-second', 'm-created-third']) {
       const card = screen.getByTestId(`agent-detail-card-${terminalId}`)
       expect(within(card).getByTitle('Inbox')).toBeInTheDocument()
       expect(within(card).getByTitle('Output')).toBeInTheDocument()
@@ -644,13 +646,13 @@ describe('session creation and canonical ordering', () => {
     fireEvent.click(grid)
     expect(grid).toHaveAttribute('aria-pressed', 'true')
     expect(screen.getByTestId('session-agent-container')).toHaveClass('space-y-2', 'md:grid', 'md:grid-cols-2')
-    expect(renderedAgentIds()).toEqual(['agent-detail-card-summary-terminal-a', 'agent-detail-card-summary-terminal-b'])
+    expect(renderedAgentIds()).toEqual(expectedOrder)
 
     fireEvent.click(list)
     expect(list).toHaveAttribute('aria-pressed', 'true')
     expect(screen.getByTestId('session-agent-container')).toHaveClass('space-y-2')
     expect(screen.getByTestId('session-agent-container')).not.toHaveClass('md:grid')
-    expect(renderedAgentIds()).toEqual(['agent-detail-card-summary-terminal-a', 'agent-detail-card-summary-terminal-b'])
+    expect(renderedAgentIds()).toEqual(expectedOrder)
 
     fireEvent.click(within(header).getByRole('button', { name: 'Delete summary' }))
     expect(screen.getByRole('heading', { name: 'Delete Session' })).toBeInTheDocument()
@@ -661,8 +663,9 @@ describe('session creation and canonical ordering', () => {
     const sessionA = session('cao-layout-a', '200')
     const sessionB = session('cao-layout-b', '100')
     const terminals = (prefix: string) => [
-      { id: `${prefix}-terminal-a`, tmux_session: prefix, tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null },
-      { id: `${prefix}-terminal-b`, tmux_session: prefix, tmux_window: '1', provider: 'codex', agent_profile: 'reviewer', last_active: null },
+      { id: `z-${prefix}-first`, tmux_session: prefix, tmux_window: '0', provider: 'codex', agent_profile: 'developer_sol_medium', last_active: '100' },
+      { id: `a-${prefix}-second`, tmux_session: prefix, tmux_window: '1', provider: 'claude_code', agent_profile: 'reviewer_sol_high', last_active: '999' },
+      { id: `m-${prefix}-third`, tmux_session: prefix, tmux_window: '2', provider: 'kiro_cli', agent_profile: 'developer_terra_medium', last_active: '200' },
     ]
     vi.spyOn(api, 'getSession').mockImplementation(async name => ({
       session: name === sessionA.name ? sessionA : sessionB,
@@ -684,16 +687,32 @@ describe('session creation and canonical ordering', () => {
     fireEvent.click(within(aCard).getByRole('button', { name: `Expand ${sessionDisplayName(sessionA.name)}` }))
     const aContainer = await screen.findByTestId(`agent-session-agent-container-${sessionA.id}`)
     expect(aContainer).toHaveClass('md:grid', 'md:grid-cols-2')
-    expect(within(aContainer).getAllByTestId(/^agent-detail-card-/)).toHaveLength(2)
+    const cardOrder = (container: HTMLElement) => within(container).getAllByTestId(/^agent-detail-card-/).map(card => card.getAttribute('data-testid'))
+    expect(cardOrder(aContainer)).toEqual([
+      `agent-detail-card-z-${sessionA.name}-first`,
+      `agent-detail-card-a-${sessionA.name}-second`,
+      `agent-detail-card-m-${sessionA.name}-third`,
+    ])
 
     fireEvent.click(within(bCard).getByRole('button', { name: `Expand ${sessionDisplayName(sessionB.name)}` }))
     const bContainer = await screen.findByTestId(`agent-session-agent-container-${sessionB.id}`)
     expect(bContainer).toHaveClass('space-y-2')
     expect(bContainer).not.toHaveClass('md:grid')
+    expect(cardOrder(bContainer)).toEqual([
+      `agent-detail-card-z-${sessionB.name}-first`,
+      `agent-detail-card-a-${sessionB.name}-second`,
+      `agent-detail-card-m-${sessionB.name}-third`,
+    ])
     expect(within(bActions).getByRole('button', { name: 'List view' })).toHaveAttribute('aria-pressed', 'true')
 
     fireEvent.click(within(aCard).getByRole('button', { name: `Expand ${sessionDisplayName(sessionA.name)}` }))
-    expect(await screen.findByTestId(`agent-session-agent-container-${sessionA.id}`)).toHaveClass('md:grid', 'md:grid-cols-2')
+    const reopenedA = await screen.findByTestId(`agent-session-agent-container-${sessionA.id}`)
+    expect(reopenedA).toHaveClass('md:grid', 'md:grid-cols-2')
+    expect(cardOrder(reopenedA)).toEqual([
+      `agent-detail-card-z-${sessionA.name}-first`,
+      `agent-detail-card-a-${sessionA.name}-second`,
+      `agent-detail-card-m-${sessionA.name}-third`,
+    ])
     expect(useStore.getState().sessions.map(item => ({ id: item.id, status: item.status }))).toEqual([
       { id: sessionA.id, status: 'active' },
       { id: sessionB.id, status: 'active' },
@@ -876,7 +895,7 @@ describe('session deletion confirmation', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
     useStore.setState({
-      sessions: [{ ...session('lifetime-delete-me', '100'), name: 'cao-delete-me' }],
+      sessions: [{ ...session('lifetime-delete-me', '100'), name: 'cao-delete-me', status: 'history' }],
       activeSession: null,
       activeSessionDetail: null,
       terminalStatuses: {},

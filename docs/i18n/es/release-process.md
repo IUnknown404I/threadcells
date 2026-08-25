@@ -1,7 +1,7 @@
 ---
 slug: release-process
 source: docs/RELEASE_PROCESS.md
-source_sha256: sha256:d371b270c8f6ecb2c5c57cac578995bbaad165e6ad12041b06db126d4fdd149e
+source_sha256: sha256:d29545876d24bcb5241d2bdfb0a418fa9eb4ec740b2d26ab04fdec9f5dcab5ae
 ---
 # Proceso de lanzamiento
 
@@ -35,6 +35,7 @@ ThreadCells sigue el orden normal de prerelease de SemVer. Durante la vista prev
 - `v0.1.0-alpha.1` fue el primer lanzamiento alpha público.
 - `v0.1.0-alpha.2` es una vista previa técnica publicada e inmutable.
 - `v0.2.0-alpha.1` es la línea de lanzamiento consolidada de multilingüismo y fiabilidad.
+- `v0.3.0-alpha.1` añade coherencia de ciclo de vida, orden de creación duradero, Full Cleanup y una política de enrutamiento sistémica.
 - Una publicación posterior en la misma línea de lanzamiento incrementa solo la secuencia alpha; un nuevo contorno de producto incrementa deliberadamente la versión semántica.
 
 Nunca mueva una etiqueta existente. Los cambios de gobierno del repositorio por sí solos no desencadenan un aumento de versión ni un lanzamiento. Actualice todas las superficies canónicas que contienen versiones de forma conjunta solo cuando el siguiente contorno de implementación significativo esté listo para publicarse.

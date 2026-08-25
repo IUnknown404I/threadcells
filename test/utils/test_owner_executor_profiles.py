@@ -25,6 +25,8 @@ def test_sol_supervisor_is_orchestrator_not_owner_executor():
     assert profile.owner_authorization_required is False
     assert "delegate substantive production implementation" in profile.system_prompt.lower()
     assert "critical_sol_xhigh_owner" in profile.system_prompt
+    assert "developer_terra_medium" in profile.system_prompt
+    assert "third same-tier semantic attempt" in profile.system_prompt
 
 
 def test_critical_profile_is_privileged_owner_executor():
@@ -109,6 +111,27 @@ def test_routing_catalog_separates_power_from_execution_role():
     assert critical["execution_mode"] == "owner_executor"
     assert critical["owner_authorization_required"] is True
     assert critical["automatic_escalation"] is False
+    assert catalog["implementation_routing"] == {
+        "routine_bounded": "developer_terra_medium",
+        "important_product_or_difficult_bounded": "developer_terra_high",
+        "reasoning_dense_cross_subsystem": "developer_sol_medium",
+        "critical_systemic": "critical_sol_xhigh_owner",
+    }
+    assert catalog["retry_policy"] == {
+        "OPERATIONAL_FAILURE": {"action": "same_tier_retry_allowed"},
+        "MECHANICAL_INCOMPLETE": {"action": "one_bounded_same_tier_correction_allowed"},
+        "SEMANTIC_QUALITY_FAILURE": {
+            "action": "escalate_implementation_tier",
+            "maximum_same_tier_semantic_attempts": 2,
+        },
+        "BOUNDARY_COMPLEXITY_UNDERESTIMATED": {"action": "stronger_developer"},
+        "CRITICAL_SYSTEMIC_BOUNDARY": {"action": "owner_authorized_xhigh"},
+    }
+    assert catalog["escalation_path"] == [
+        "developer_terra_medium",
+        "developer_terra_high",
+        "developer_sol_medium",
+    ]
 
 
 def test_packaged_profile_files_are_the_canonical_named_resources():

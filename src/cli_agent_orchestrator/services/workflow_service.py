@@ -125,7 +125,12 @@ class _ProviderReconnectClaimHeartbeat:
 
 def record_external_input(root_terminal_id: str) -> int:
     """Create the durable root turn before an API-originated user prompt."""
-    turn_id = start_workflow_input(root_terminal_id)
+    from cli_agent_orchestrator.services.operations_service import (
+        workflow_execution_admission_fence,
+    )
+
+    with workflow_execution_admission_fence():
+        turn_id = start_workflow_input(root_terminal_id)
     if turn_id is None:
         raise RuntimeError(f"Could not create workflow turn for {root_terminal_id}")
     return turn_id
@@ -133,7 +138,12 @@ def record_external_input(root_terminal_id: str) -> int:
 
 def prepare_external_input(root_terminal_id: str, payload: str) -> dict:
     """Persist a user/scheduled input, deferring behind runtime recovery."""
-    prepared = prepare_workflow_input(root_terminal_id, payload)
+    from cli_agent_orchestrator.services.operations_service import (
+        workflow_execution_admission_fence,
+    )
+
+    with workflow_execution_admission_fence():
+        prepared = prepare_workflow_input(root_terminal_id, payload)
     if prepared is None:
         raise RuntimeError(f"Could not create workflow turn for {root_terminal_id}")
     return prepared
@@ -203,7 +213,7 @@ def _continuation_message(kind: str, payload: str, turn_id: int) -> str:
     return f"{envelope}{payload}"
 
 
-def reconcile_root_workflow(
+def _reconcile_root_workflow_with_admission(
     root_terminal_id: str,
     registry: PluginRegistry | None = None,
     now: datetime | None = None,
@@ -429,6 +439,30 @@ def reconcile_root_workflow(
         )
         requeue_workflow_turn(turn["id"], turn["claim_token"], turn["claim_generation"], now=now)
         return False
+
+
+def reconcile_root_workflow(
+    root_terminal_id: str,
+    registry: PluginRegistry | None = None,
+    now: datetime | None = None,
+    pending_inbox: bool | None = None,
+    pending_reconnect: bool | None = None,
+) -> bool:
+    """Reconcile one root while fencing Full Cleanup workflow admission."""
+    from cli_agent_orchestrator.services.operations_service import (
+        workflow_execution_admission_fence,
+    )
+
+    with workflow_execution_admission_fence(nonblocking=True) as admitted:
+        if not admitted:
+            return False
+        return _reconcile_root_workflow_with_admission(
+            root_terminal_id,
+            registry=registry,
+            now=now,
+            pending_inbox=pending_inbox,
+            pending_reconnect=pending_reconnect,
+        )
 
 
 def reconcile_open_workflows(

@@ -213,6 +213,91 @@ describe('Control-plane settings routes', () => {
     await waitFor(() => expect(run).toHaveBeenCalledWith('frequent', false, planId))
   })
 
+  it('previews and confirms Full Cleanup through the existing operator authority', async () => {
+    vi.spyOn(api, 'getHousekeepingSettings').mockResolvedValue(housekeepingSettings())
+    vi.spyOn(api, 'getHousekeepingReport').mockResolvedValue({ status: 'never_run' })
+    vi.spyOn(api, 'getOperatorSession').mockResolvedValue(operatorStatus(true))
+    vi.spyOn(api, 'getOrchestrationCapacity').mockResolvedValue(housekeepingCapacity())
+    const planId = 'f'.repeat(64)
+    const preview = vi.spyOn(api, 'getFullCleanupPlan').mockResolvedValue({
+      schema_version: 1,
+      plan_id: planId,
+      generated_at: 100,
+      mode: 'full',
+      root: '/fixture',
+      reclaimable_bytes: 4096,
+      class_summaries: {
+        releases: { candidate_count: 2, actionable_count: 1, reclaimable_bytes: 3072, preserved_count: 1, preserved_bytes: 1024, protection_reasons: { ACTIVE_RELEASE: 1 } },
+        logs: { candidate_count: 1, actionable_count: 1, reclaimable_bytes: 1024, preserved_count: 0, preserved_bytes: 0, protection_reasons: {} },
+      },
+      warnings: [],
+      candidates: [
+        { canonical_identity: 'release:old', category: 'releases', action: 'delete', bytes: 3072, estimated_reclaim_bytes: 3072, retention_reason: 'full_cleanup_non_active_release', protection_reason: null },
+        { canonical_identity: 'release:active', category: 'releases', action: 'preserve', bytes: 1024, estimated_reclaim_bytes: 0, retention_reason: 'protected', protection_reason: 'ACTIVE_RELEASE' },
+        { canonical_identity: 'log:old', category: 'logs', action: 'delete', bytes: 1024, estimated_reclaim_bytes: 1024, retention_reason: 'full_cleanup_closed_log', protection_reason: null },
+      ],
+      idle_gate: { eligible: true, reason_code: null, blockers: [], ready_agents: 2, exited_agents: 1 },
+      release_state: { metadata_certain: true, active_release: '/releases/active', active_release_candidates: ['/releases/active'], protected_non_active_releases: 0, active_only_expected: true, releases_to_delete: 1, rollback_releases_to_delete: 1, rollback_available: true },
+    })
+    const run = vi.spyOn(api, 'runFullCleanup').mockResolvedValue({
+      ok: true, full_cleanup: true, reclaimable_bytes: 4096, planned_candidates: 2,
+      freed_bytes: 4096, disk_before: 8192, disk_after: 12288,
+      observed_disk_free_delta: 4096, rollback_available: false,
+      active_release: '/releases/active', releases_removed: 1, worktrees_retired: 1,
+      cache_pruned: 1, reproducible_caches_removed: 1, browser_revisions_removed: 0,
+      ephemeral_resources_removed: 1, logs_deleted: 1,
+      reclaimed_bytes_by_class: { releases: 3072, logs: 1024 },
+      protected_resources: [{ canonical_identity: 'backups:/fixture/backups', category: 'backups', bytes: 8192, reason: 'BACKUP_PROTECTED' }],
+      execution_skips: [{ candidate: 'release:raced', reason_code: 'CANDIDATE_CHANGED' }],
+      execution_failures: [], warnings: [], completed_with_issues: true,
+    })
+
+    render(<ControlPlaneSettings section="housekeeping" navigate={() => {}} />)
+    await screen.findByRole('heading', { name: 'Housekeeping' })
+    expect(screen.getByRole('heading', { name: 'Delete all system files — Full Cleanup' })).toBeInTheDocument()
+    expect(screen.getByText('Only the active local ThreadCells release will remain. Local rollback will be removed.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Delete all proven-safe system files' })).toBeDisabled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Build Full Cleanup preview' }))
+    await waitFor(() => expect(preview).toHaveBeenCalledTimes(1))
+    expect(await screen.findByText('release:old')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Delete all proven-safe system files' })).not.toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Delete all proven-safe system files' }))
+
+    const dialog = screen.getByRole('dialog', { name: 'Permanently run Full Cleanup?' })
+    expect(dialog).toHaveTextContent('Local rollback will be unavailable afterward')
+    expect(dialog).toHaveTextContent('Ready agents keep the state they need to continue')
+    expect(within(dialog).queryByLabelText(/secret|password/i)).not.toBeInTheDocument()
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Run permanent Full Cleanup' }))
+    await waitFor(() => expect(run).toHaveBeenCalledWith(planId))
+    expect(await screen.findByText('/releases/active')).toBeInTheDocument()
+    expect(screen.getByText('Rollback: none')).toBeInTheDocument()
+    expect(screen.getByText(/backups:\/fixture\/backups: BACKUP_PROTECTED · backups · 8.0 KiB/)).toBeInTheDocument()
+    expect(screen.getByText(/release:raced: CANDIDATE_CHANGED/)).toBeInTheDocument()
+  })
+
+  it('shows the authoritative Full Cleanup idle blocker', async () => {
+    vi.spyOn(api, 'getHousekeepingSettings').mockResolvedValue(housekeepingSettings())
+    vi.spyOn(api, 'getHousekeepingReport').mockResolvedValue({ status: 'never_run' })
+    vi.spyOn(api, 'getOperatorSession').mockResolvedValue(operatorStatus(true))
+    vi.spyOn(api, 'getOrchestrationCapacity').mockResolvedValue(housekeepingCapacity())
+    vi.spyOn(api, 'getFullCleanupPlan').mockResolvedValue({
+      schema_version: 1, plan_id: 'e'.repeat(64), generated_at: 100, mode: 'full', root: '/fixture', reclaimable_bytes: 100,
+      class_summaries: {}, warnings: [],
+      candidates: [{ canonical_identity: 'log:old', category: 'logs', action: 'delete', bytes: 100, estimated_reclaim_bytes: 100, retention_reason: 'full_cleanup_closed_log', protection_reason: null }],
+      idle_gate: { eligible: false, reason_code: 'FULL_CLEANUP_NOT_IDLE', blockers: [{ terminal_id: 'agent-working', reason_code: 'AGENT_EXECUTION_NOT_IDLE' }], ready_agents: 0, exited_agents: 0 },
+      release_state: { metadata_certain: true, active_release: '/releases/active', active_release_candidates: ['/releases/active'], protected_non_active_releases: 0, active_only_expected: true, releases_to_delete: 0, rollback_releases_to_delete: 0, rollback_available: false },
+    })
+
+    render(<ControlPlaneSettings section="housekeeping" navigate={() => {}} />)
+    await screen.findByRole('heading', { name: 'Housekeeping' })
+    fireEvent.click(screen.getByRole('button', { name: 'Build Full Cleanup preview' }))
+
+    expect(await screen.findByText(/Full Cleanup is blocked until every agent is Ready or Exited/)).toBeInTheDocument()
+    expect(screen.getByText(/Agent agent-working: AGENT EXECUTION NOT IDLE/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Delete all proven-safe system files' })).toBeDisabled()
+  })
+
   it('explains why an otherwise executable inspected plan is disabled', async () => {
     vi.spyOn(api, 'getHousekeepingSettings').mockResolvedValue(housekeepingSettings())
     vi.spyOn(api, 'getHousekeepingReport').mockResolvedValue({ status: 'never_run' })
@@ -318,7 +403,8 @@ describe('Control-plane settings routes', () => {
       duration_seconds: 2.5, freed_bytes: 1536, logs_compressed: 2, logs_deleted: 1,
       reclaimed_bytes_by_class: { logs: 1024, package_cache: 512 }, observed_disk_free_delta: 2048,
       attachments_deleted: 0, ephemeral_resources_removed: 1, browser_revisions_removed: 0,
-      cache_pruned: 1, skipped_open: 1, skipped_unknown: 0,
+      cache_pruned: 1,
+      protected_resources: [{ canonical_identity: 'logs:/protected/current.log', category: 'logs', bytes: 256, reason: 'OPEN_BY_RUNTIME' }],
       execution_failures: [{ reason_code: 'FINGERPRINT_CHANGED' }], warnings: ['metadata_unknown'],
     })
     vi.spyOn(api, 'getOperatorSession').mockResolvedValue(operatorStatus())

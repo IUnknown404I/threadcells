@@ -24,6 +24,7 @@ from cli_agent_orchestrator.providers.codex import (
 )
 from cli_agent_orchestrator.services.terminal_service import (
     OutputMode,
+    TerminalOutputUnavailable,
     _active_worktree_lanes,
     _canonical_worktree,
     _create_terminal_after_admission,
@@ -2349,6 +2350,25 @@ class TestGetOutput:
 
         with pytest.raises(ValueError, match="not found"):
             get_output("nonexistent")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_exited_terminal_reports_cleaned_durable_output_truthfully(
+        self, mock_get_metadata, mock_tmux, tmp_path, monkeypatch
+    ):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "developer-abcd",
+            "runtime_lifecycle": "exited",
+        }
+        mock_tmux.get_history.side_effect = RuntimeError("runtime absent")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR",
+            tmp_path,
+        )
+
+        with pytest.raises(TerminalOutputUnavailable):
+            get_output("test1234", OutputMode.FULL)
 
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")

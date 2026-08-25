@@ -1,7 +1,7 @@
 ---
 slug: profiles
 source: docs/PROFILES.md
-source_sha256: sha256:2bef7848e092db4dfc8e667bf98ea781cbae3ac77e80f02e25cc2500c7ad7776
+source_sha256: sha256:c378cfce9445d9171027ab61113863019c5478942bbdf218c8cdd1a6a608c552
 ---
 
 # Profile
@@ -30,9 +30,11 @@ ThreadCells liefert unveränderliche Profile für häufige Rollen, einschließli
 
 Beispiele:
 
-- `supervisor_terra_medium`: der alltägliche Supervisor für gewöhnliche Zerlegung und Integration.
-- `supervisor_sol_medium`: stärkere Orchestrierung für wichtige oder modulübergreifende Arbeit.
-- `developer_terra_medium` und `developer_sol_medium`: Rollen für abgegrenzte Implementierung.
+- `supervisor_terra_medium`: der standardmäßige fortlaufende Orchestrator für gewöhnliche und mittelriskante Workflows; er zerlegt, delegiert, prüft, akzeptiert und integriert.
+- `supervisor_sol_medium`: der auf Orchestrierung ausgerichtete Supervisor für riskante, modulübergreifende, architektursensitive oder lebenszyklussensitive Workflows.
+- `developer_terra_medium`: routinemäßige, abgegrenzte Implementierung mit geringer Mehrdeutigkeit.
+- `developer_terra_high`: wichtige Produktarbeit, schwierige abgegrenzte Defekte und Refactorings sowie öffentliche semantische Qualität.
+- `developer_sol_medium`: reasoning-intensive, subsystemübergreifende Arbeit und Arbeit an subtilen Invarianten.
 - `reviewer_sol_high`: unabhängige Überprüfung für riskante oder integrierte Änderungen.
 - `critical_sol_xhigh_owner`: ein außergewöhnliches Owner-Ausführerprofil mit separater Autoritätsgrenze.
 
@@ -52,6 +54,22 @@ Verwenden Sie das am wenigsten spezialisierte Profil, das die Aufgabe zuverläss
 | Kritische Frontier-Owner-Ausführung | nur Owner-autorisierte XHigh |
 
 Mehr Reasoning und weitergehende Autorität kosten Kapazität und erhöhen die Folgen. Sie sollten die Aufgabe widerspiegeln und nicht zum Standard werden.
+
+Ein Sol-Supervisor impliziert keinen Sol-Entwickler. Er soll routinemäßige Implementierung weiterhin an Terra-Entwickler weiterleiten und `developer_sol_medium` für Arbeiten reservieren, deren Korrektheit von subtiler systemübergreifender Analyse abhängt.
+
+## Wiederholung und Eskalation
+
+ThreadCells klassifiziert fehlgeschlagene Implementierungsversuche, bevor ein weiterer Agent ausgewählt wird:
+
+| Fehlerklasse | Kanonische Reaktion |
+| --- | --- |
+| `OPERATIONAL_FAILURE` | Eine Wiederholung auf derselben Stufe kann sinnvoll sein. |
+| `MECHANICAL_INCOMPLETE` | Eine abgegrenzte Korrektur auf derselben Stufe zulassen. |
+| `SEMANTIC_QUALITY_FAILURE` | Implementierungsstufe eskalieren; niemals einen dritten semantischen Versuch auf derselben Stufe durchführen. |
+| `BOUNDARY_COMPLEXITY_UNDERESTIMATED` | Einen stärkeren Entwickler auswählen. |
+| `CRITICAL_SYSTEMIC_BOUNDARY` | Owner-autorisierten `critical_sol_xhigh_owner` verwenden. |
+
+Der normale Eskalationspfad lautet `developer_terra_medium` → `developer_terra_high` → `developer_sol_medium`. XHigh bleibt wirklich kritischer systemischer Autorität vorbehalten, etwa Sicherheit, Exactly-once-Concurrency, destruktivem Housekeeping, Migrationen oder gefährlicher Wiederherstellung. Bestehende Tests sind notwendige Nachweise, beweisen für sich allein jedoch keine semantische Qualität.
 
 ## Aufgelöste Vorschau
 

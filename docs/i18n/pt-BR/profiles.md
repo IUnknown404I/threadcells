@@ -1,7 +1,7 @@
 ---
 slug: profiles
 source: docs/PROFILES.md
-source_sha256: sha256:2bef7848e092db4dfc8e667bf98ea781cbae3ac77e80f02e25cc2500c7ad7776
+source_sha256: sha256:c378cfce9445d9171027ab61113863019c5478942bbdf218c8cdd1a6a608c552
 ---
 
 # Perfis
@@ -30,9 +30,11 @@ O ThreadCells inclui perfis imutáveis para papéis comuns, inclusive supervisor
 
 Exemplos:
 
-- `supervisor_terra_medium`: o supervisor cotidiano para decomposição e integração comuns.
-- `supervisor_sol_medium`: orquestração mais forte para trabalho importante ou entre módulos.
-- `developer_terra_medium` e `developer_sol_medium`: papéis de implementação delimitada.
+- `supervisor_terra_medium`: o orquestrador contínuo padrão para fluxos de trabalho comuns e de risco médio; ele decompõe, delega, revisa, aceita e integra.
+- `supervisor_sol_medium`: o supervisor orientado à orquestração para fluxos de trabalho arriscados, entre módulos, sensíveis à arquitetura ou ao ciclo de vida.
+- `developer_terra_medium`: implementação rotineira, delimitada e de baixa ambiguidade.
+- `developer_terra_high`: trabalho importante de produto, defeitos e refatorações difíceis porém delimitados, e qualidade semântica pública.
+- `developer_sol_medium`: trabalho entre subsistemas que exige raciocínio intenso e envolve invariantes sutis.
 - `reviewer_sol_high`: revisão independente para mudanças arriscadas ou integradas.
 - `critical_sol_xhigh_owner`: um perfil excepcional de proprietário-executor com limite de autorização separado.
 
@@ -52,6 +54,22 @@ Use o perfil menos especializado que possa assumir a tarefa de maneira confiáve
 | Execução crítica de proprietário de fronteira | somente XHigh autorizado pelo proprietário |
 
 Mais raciocínio e autoridade mais ampla consomem capacidade e aumentam as consequências. Eles devem refletir a tarefa, não se tornar padrões.
+
+Um supervisor Sol não implica um desenvolvedor Sol. Ele ainda deve encaminhar a implementação rotineira a desenvolvedores Terra e reservar `developer_sol_medium` para trabalho cuja correção dependa de raciocínio sutil entre sistemas.
+
+## Repetição e escalonamento
+
+O ThreadCells classifica as tentativas de implementação que falharam antes de selecionar outro agente:
+
+| Classe de falha | Resposta canônica |
+| --- | --- |
+| `OPERATIONAL_FAILURE` | Uma nova tentativa no mesmo nível pode ser válida. |
+| `MECHANICAL_INCOMPLETE` | Permita uma correção delimitada no mesmo nível. |
+| `SEMANTIC_QUALITY_FAILURE` | Eleve o nível de implementação; nunca faça uma terceira tentativa semântica no mesmo nível. |
+| `BOUNDARY_COMPLEXITY_UNDERESTIMATED` | Selecione um desenvolvedor mais forte. |
+| `CRITICAL_SYSTEMIC_BOUNDARY` | Use `critical_sol_xhigh_owner` autorizado pelo proprietário. |
+
+O caminho normal de escalonamento é `developer_terra_medium` → `developer_terra_high` → `developer_sol_medium`. XHigh é reservado para autoridade sistêmica realmente crítica, como segurança, concorrência de execução exata, Housekeeping destrutivo, migrações ou recuperação perigosa. Testes aprovados são evidência necessária, mas não comprovam por si só a qualidade semântica.
 
 ## Prévia resolvida
 

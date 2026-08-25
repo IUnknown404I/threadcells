@@ -1,7 +1,7 @@
 import json
 from datetime import datetime, timedelta
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.clients import database
@@ -11,6 +11,7 @@ from cli_agent_orchestrator.clients.database import (
     ChildAssignmentModel,
     DelegationResultModel,
     ProviderExecutionLeaseModel,
+    SessionDeletionReceiptModel,
     TerminalModel,
     WorkflowModel,
     WorkflowTurnModel,
@@ -674,6 +675,84 @@ def test_session_lifetime_filter_never_coalesces_reused_tmux_name(monkeypatch):
     assert [item["id"] for item in new_agents["items"]] == ["new"]
 
 
+def test_projection_lazily_creates_session_receipt_table_for_older_schema(monkeypatch):
+    engine = _install_database(monkeypatch)
+    SessionDeletionReceiptModel.__table__.drop(bind=engine)
+    with database.SessionLocal() as db:
+        db.add(
+            TerminalModel(
+                id="legacy-projection",
+                tmux_session="cao-legacy-projection",
+                session_id=None,
+                tmux_window="legacy-projection",
+                provider="codex",
+                runtime_lifecycle="exited",
+            )
+        )
+        db.commit()
+
+    agents = ui_read_model_service.list_agent_summaries(limit=10)
+
+    assert [item["id"] for item in agents["items"]] == ["legacy-projection"]
+    assert inspect(engine).has_table("session_deletion_receipts")
+
+
+def test_real_terminal_creation_assigns_durable_append_order(monkeypatch):
+    _install_database(monkeypatch)
+    lifetime = "lifetime-created-order"
+    session_name = "cao-created-order"
+    for terminal_id, provider, profile in (
+        ("z-first", "codex", "developer_terra_medium"),
+        ("a-second", "claude_code", "developer_terra_high"),
+        ("m-third", "codex", "developer_sol_medium"),
+    ):
+        database.create_terminal(
+            terminal_id,
+            session_name,
+            terminal_id,
+            provider,
+            agent_profile=profile,
+            session_lifetime_id=lifetime,
+        )
+    now = datetime(2026, 8, 25, 12, 0, 0)
+    with database.SessionLocal() as db:
+        rows = {row.id: row for row in db.query(TerminalModel).all()}
+        rows["z-first"].runtime_lifecycle = "exited"
+        rows["z-first"].last_active = now + timedelta(days=3)
+        rows["a-second"].runtime_lifecycle = "running"
+        rows["a-second"].last_active = now + timedelta(hours=7)
+        rows["m-third"].runtime_lifecycle = "exited"
+        rows["m-third"].last_active = now
+        db.commit()
+
+    first_page = ui_read_model_service.list_agent_summaries(limit=2, session_id=lifetime)
+    second_page = ui_read_model_service.list_agent_summaries(limit=2, offset=2, session_id=lifetime)
+    assert [item["id"] for item in first_page["items"]] == ["z-first", "a-second"]
+    assert [item["id"] for item in second_page["items"]] == ["m-third"]
+
+    database.create_terminal(
+        "b-fourth",
+        session_name,
+        "b-fourth",
+        "claude_code",
+        agent_profile="developer_terra_medium",
+        session_lifetime_id=lifetime,
+    )
+    with database.SessionLocal() as db:
+        fourth = db.get(TerminalModel, "b-fourth")
+        fourth.runtime_lifecycle = "running"
+        fourth.last_active = now - timedelta(days=2)
+        db.commit()
+
+    refreshed = ui_read_model_service.list_agent_summaries(limit=10, session_id=lifetime)
+    assert [item["id"] for item in refreshed["items"]] == [
+        "z-first",
+        "a-second",
+        "m-third",
+        "b-fourth",
+    ]
+
+
 def test_session_agents_and_boundaries_use_durable_creation_order(monkeypatch):
     _install_database(monkeypatch)
     now = datetime(2026, 8, 21, 8, 0, 0)
@@ -733,3 +812,29 @@ def test_session_agents_and_boundaries_use_durable_creation_order(monkeypatch):
     ]
     assert refreshed_session["first_agent"]["id"] == "z-created-first"
     assert refreshed_session["last_agent"]["id"] == "m-created-last"
+
+    with database.SessionLocal() as db:
+        db.add(
+            TerminalModel(
+                id="b-created-fourth",
+                tmux_session="cao-natural-order",
+                session_id="lifetime-natural-order",
+                tmux_window="fourth",
+                provider="claude_code",
+                agent_profile="developer_terra_high",
+                runtime_lifecycle="running",
+                creation_order=40,
+                last_active=now - timedelta(days=1),
+            )
+        )
+        db.commit()
+
+    appended = ui_read_model_service.list_agent_summaries(
+        limit=10, session_id="lifetime-natural-order"
+    )
+    assert [item["id"] for item in appended["items"]] == [
+        "z-created-first",
+        "a-created-second",
+        "m-created-last",
+        "b-created-fourth",
+    ]

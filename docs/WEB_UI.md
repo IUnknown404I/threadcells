@@ -28,7 +28,9 @@ Direct URLs are supported. Browser history should preserve the selected Settings
 
 Status labels come from durable control-plane truth. **Processing** means a turn is active; **Ready** means the provider runtime is alive and genuinely idle. Queued labels distinguish provider-capacity exhaustion, child-retirement barriers, and general workflow continuation. An owner-gated badge remains categorical, while the expanded Owner Decision panel shows the concrete durable reason.
 
-Active and historical sessions remain separate durable lifetimes. Deleting a historical session removes only that exact eligible lifetime. Deleting an exited terminal likewise checks its exact runtime identity, writer lease, workflow/result protection, and session relationship before cleanup; ambiguous or active state remains protected.
+Active and historical sessions remain separate durable lifetimes. Deleting a historical session removes only that exact eligible lifetime. Deleting an exited terminal likewise checks its exact runtime identity, writer lease, workflow/result protection, and session relationship before cleanup; ambiguous or active state remains protected. Retained cleanup resources do not create a false execution blocker: the exact lifetime can be tombstoned while protected filesystem authority remains available for later retirement, and repeating the same deletion is safe.
+
+Agents inside a session always use their durable creation sequence. Home and Agents preserve that same order in List and Grid, across expansion, polling, reconnect, restart, and lifecycle changes. Status, ID, provider, profile, activity, and updated time are not presentation sort keys; a new agent appends to the session.
 
 ![Live Agents status view with local worktree paths removed from the public capture](/media/screenshots/threadcells-agents.webp)
 
@@ -36,7 +38,9 @@ Active and historical sessions remain separate durable lifetimes. Deleting a his
 
 Sensitive mutations share one **Unlock operator changes** control. Missing, invalid, locked, unlocked, and expired states are distinct. The exact minimum secret length is five characters, and the default authenticated session lasts five minutes.
 
-The UI sends the secret only for unlock, clears it immediately, and never puts it in browser persistence or exports. Capacity, privileged profile/provider changes, Telegram configuration/tests, Housekeeping execution, and applicable owner launches remain locked without the server session.
+The UI sends the secret only for unlock, clears it immediately, and never puts it in browser persistence or exports. Capacity, privileged profile/provider changes, Telegram configuration/tests, Housekeeping execution, Full Cleanup execution, and applicable owner launches remain locked without the server session.
+
+Settings → Housekeeping ends with the **Delete all system files — Full Cleanup** danger block. Its read-only preview shows reclaim estimates by class, protected reasons, idle status, releases/worktrees, and the warning that only the active release will remain. The existing confirmation modal is mandatory after unlock. Execution is disabled while any agent or filesystem-mutating execution is active, and the server rechecks that condition before deleting. The result reports planned/actual reclaim, skips, disk state, active release, and rollback availability.
 
 Follow [Operator authorization](OPERATOR_AUTHORIZATION.md) to provision the verifier safely.
 
@@ -60,7 +64,7 @@ Docs navigation is grouped by the learning journey, searchable, and accompanied 
 
 ## Full Output
 
-Full Output renders retained provider text for human inspection after stripping ANSI/VT control sequences and terminal cursor manipulation. Sanitization prevents presentation controls from rewriting the visible history; it does not reinterpret, execute, or certify the provider's text.
+Full Output renders retained provider text for human inspection after stripping ANSI/VT control sequences and terminal cursor manipulation. Sanitization prevents presentation controls from rewriting the visible history; it does not reinterpret, execute, or certify the provider's text. If Full Cleanup safely removed an exited agent's old log while retaining its metadata, the viewer reports that durable output is unavailable instead of showing an error or fabricated content.
 
 ## Install as an app
 

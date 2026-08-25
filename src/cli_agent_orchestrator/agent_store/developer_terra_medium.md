@@ -1,6 +1,6 @@
 ---
 name: developer_terra_medium
-description: "Primary everyday development."
+description: "Routine, bounded, low-ambiguity production implementation."
 provider: codex
 role: developer
 execution_mode: executor

@@ -74,3 +74,5 @@ After restore, verify:
 - active/rollback releases remain correctly identified.
 
 Backups are protected from automatic Housekeeping. Apply a separate, reviewed retention policy to backup storage.
+
+Full Cleanup does not replace backup retention. It protects the canonical database and any backup whose disposability is not proven, but deliberately removes every inactive local release and rollback represented by trusted release metadata. Before authorizing it, confirm that any recovery point you require exists outside the local release set and is integrity-checked. Afterward, the operator must expect local rollback to be unavailable until another verified release is staged.

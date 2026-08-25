@@ -35,6 +35,7 @@ ThreadCells is a technical preview focused on trustworthy local operations for c
 - Recovery reconciles durable state with external tmux/provider processes but cannot make a non-idempotent external command reversible.
 - Backups and restore require operator discipline and should be rehearsed.
 - Housekeeping intentionally leaves ambiguous artifacts in place.
+- Full Cleanup is maximum proven-safe reclaim, not a guarantee that every large file is disposable. It requires all agents to be idle, may retain ambiguous tools/backups/worktrees, and deliberately leaves no local release rollback after successful inactive-release cleanup.
 - Publication and remote release automation are intentionally not part of ordinary local deployment.
 
 Evaluate ThreadCells on non-critical repositories first, keep verified backups, and inspect agent output before consequential actions.

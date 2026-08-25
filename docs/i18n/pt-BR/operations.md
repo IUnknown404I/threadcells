@@ -1,7 +1,7 @@
 ---
 slug: operations
 source: docs/OPERATIONS.md
-source_sha256: sha256:c1b5d152c38e373d316a3a27b417872f4f6943ad591e69ed7eeb9cf3e030ec27
+source_sha256: sha256:dc01111a81e6386ac3ffc8d2203e01f18caa175e4bb781ca451ac5f8d939c392
 ---
 # Operações
 
@@ -49,7 +49,9 @@ Use Graceful Exit para o ciclo de vida do provedor. Encerrar o tmux à força ou
 
 Um filho encerrado não é imediatamente descartável. Confirme que seu resultado durável foi entregue, lido, incorporado e confirmado. Em seguida, retire seus recursos de runtime, mantendo o histórico.
 
-**Add Agent** destina-se ao ciclo de vida estável da sessão selecionada. A exclusão de sessão histórica e a exclusão de terminal encerrado visam identidades duráveis exatas e são rejeitadas enquanto houver um runtime ativo, fluxo de trabalho aberto/em recuperação, concessão de escrita, resultado pendente ou outra relação protegida.
+**Add Agent** destina-se ao ciclo de vida estável da sessão selecionada. A exclusão de sessão histórica e a exclusão de terminal encerrado visam identidades duráveis exatas e são rejeitadas enquanto houver um runtime ativo, fluxo de trabalho aberto/em recuperação, concessão de escrita, resultado pendente ou outra dependência genuína de ciclo de vida. Logs retidos, worktrees de limpeza protegidos e reivindicações de limpeza pós-encerramento não impedem, por si só, a exclusão lógica: o ThreadCells preserva a autoridade sobre o recurso, tombstona a sessão exata e torna as novas tentativas idempotentes. Uma exclusão bloqueada retorna o conflito específico de ciclo de vida em vez de um erro genérico de recurso ausente ou do servidor.
+
+Dentro de uma sessão, Home e Agents preservam a sequência durável de criação de agentes do backend nas visualizações List e Grid. Status, provedor, perfil, atividade, polling, reconexão e reinício não reordenam os agentes; um agente recém-criado é acrescentado após os anteriores.
 
 O encerramento de um provedor não fecha uma missão aberta. Conclua explicitamente um fluxo de trabalho de nível superior somente após terminar todo o trabalho autorizado pelo proprietário. Use o bloqueio de proprietário apenas para um limite de decisão genuíno.
 
@@ -69,7 +71,7 @@ Evite registrar prompts ou valores que contenham credenciais. Os erros públicos
 
 O Housekeeping sempre segue o plano primeiro. Inspecione a lista de candidatos da simulação e a identidade do plano e, em seguida, execute explicitamente o plano exato. O executor recompõe a proteção atual e revalida cada candidato antes da mutação. Ele pode retirar runtimes de terminais comprovadamente encerrados e worktrees com limpeza pendente já reconhecida sem apagar o histórico durável.
 
-Os backups são apenas de inventário e nunca são excluídos automaticamente. Recursos desconhecidos ou ativos permanecem protegidos. Veja [Housekeeping](HOUSEKEEPING.md).
+Os backups são apenas de inventário e nunca são excluídos automaticamente. Recursos desconhecidos ou ativos permanecem protegidos. O Full Cleanup é uma ação de operador confirmada separadamente que só é executada enquanto todos os agentes estão ociosos, preserva a autoridade de continuação dos agentes Ready e remove intencionalmente cada release local inativa comprovada, tornando o rollback local indisponível. Veja [Housekeeping](HOUSEKEEPING.md).
 
 ## Disciplina de mudanças em produção
 

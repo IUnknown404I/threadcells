@@ -773,7 +773,7 @@ export function AgentPanel({
       <ConfirmModal
         open={!!pendingDeleteSession}
         title="Delete Session"
-        message="This will permanently delete this session and all of its terminals. This action cannot be undone."
+        message="This removes the historical session from ThreadCells. Protected filesystem resources and their cleanup authority remain intact. This action cannot be undone."
         details={pendingDeleteSession ? [
           { label: 'Session', value: sessionDisplayName(pendingDeleteSession.name) },
           { label: 'Status', value: pendingDeleteSession.status },

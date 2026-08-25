@@ -1,7 +1,7 @@
 ---
 slug: troubleshooting
 source: docs/TROUBLESHOOTING.md
-source_sha256: sha256:5e66928bd64c8837b5480d71160eb1548dbe9369be3069800fcf18e0f1e99836
+source_sha256: sha256:f6ed11a9ba51cf79c46f46c4e50ce638862a009bcbc3323f875bccfc49ed14a2
 ---
 # Solução de problemas
 
@@ -86,6 +86,12 @@ Settings → About, rodapé de Docs, manifesto do candidato e revisão dos ativo
 ## Pressão de disco ou Housekeeping não consegue recuperar espaço
 
 Inspecione um plano de execução simulada do Housekeeping. Itens protegidos, ativos, desconhecidos, de backup, atuais e de rollback são retidos intencionalmente. Resolva a referência/do proprietário informada ou expanda o disco com segurança; nunca exclua recursivamente a raiz de runtime.
+
+Para obter a recuperação máxima comprovadamente segura, inspecione a prévia separada do Full Cleanup. A execução permanece bloqueada até que todos os agentes estejam ociosos de forma autoritativa e nenhum provedor, trabalho Heavy, mutação enfileirada ou operação de runtime esteja ativo. Não encerre agentes Ready nem enfraqueça essa barreira: o estado de continuação deles permanece protegido. O Full Cleanup remove todas as releases locais inativas comprovadas, portanto confirme que perder o rollback local é aceitável. Ferramentas ambíguas protegidas, backups, autoridade de código-fonte, worktrees sujos ou não publicados e caminhos desconhecidos são entradas esperadas do relatório, não motivos para excluí-los manualmente.
+
+## Full Output informa que a saída foi limpa
+
+Um agente histórico Exited pode permanecer no SQLite depois que o Full Cleanup remove seu log durável antigo. Esse é um estado verdadeiro de metadados retidos: Sessions e Agents continuam utilizáveis, enquanto Full Output informa `DURABLE_OUTPUT_UNAVAILABLE`. A saída de agentes atuais e Ready está protegida. Restaure a partir de um backup retido se o texto histórico for necessário; não invente nem reanexe outro log.
 
 ## O terminal no navegador não se reconecta após a reinicialização
 

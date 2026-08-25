@@ -67,6 +67,8 @@ In Settings, enter the secret and choose **Unlock operator changes**. The defaul
 
 Protected settings calls fail while locked and succeed during the authenticated session. The browser uses the server's short-lived secure session cookie; it does not persist the operator secret.
 
+Full Cleanup reuses this exact authority. Preview remains available as a read-only safety inspection, while execution requires the current operator session plus the standard permanent-action confirmation. The confirmation never asks for the secret again. No separate cleanup secret, URL credential, browser-storage value, or durable plaintext copy exists; expiry, relock, and rate limits are unchanged.
+
 ## Replace the secret
 
 Create a new verifier at a temporary administrative path, validate its ownership and permissions, then atomically replace the configured file and restart ThreadCells. Existing operator sessions should be treated as invalid after replacement.

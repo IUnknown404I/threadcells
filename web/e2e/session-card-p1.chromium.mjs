@@ -150,9 +150,14 @@ try {
 
     const fewSummary = fewCard.getByLabel('Session status')
     const fewActions = fewHeader.getByTestId(`session-actions-${fewSession.id}`)
-    const agentLayout = fewActions.getByRole('group', { name: 'Agent layout' })
+    const agentLayout = fewSummary.getByRole('group', { name: 'Agent layout' })
     assert.equal(await agentLayout.isVisible(), true, `session List/Grid controls must remain available at ${width}px`)
-    assert.equal(await fewSummary.getByRole('group', { name: 'Agent layout' }).count(), 0, 'layout controls must not remain in the status strip')
+    assert.equal(await fewActions.getByRole('group', { name: 'Agent layout' }).count(), 0, 'layout controls must not remain in the Home action row')
+    assert.equal(await fewSummary.evaluate((summary, sessionId) => {
+      const badges = summary.querySelector(`[data-testid="session-status-badges-${sessionId}"]`)
+      const actions = summary.querySelector(`[data-testid="session-status-actions-${sessionId}"]`)
+      return Boolean(badges && actions && (badges.compareDocumentPosition(actions) & Node.DOCUMENT_POSITION_FOLLOWING))
+    }, fewSession.id), true, 'Home layout controls must follow the status badges')
     await agentLayout.getByRole('button', { name: 'List view' }).click()
     assert.equal(await agentLayout.getByRole('button', { name: 'List view' }).getAttribute('aria-pressed'), 'true')
     if (width < 768) {
@@ -166,7 +171,7 @@ try {
     await fewCard.screenshot({ path: `${evidenceDir}/${width}-few-expanded-list.png` })
     await longCard.screenshot({ path: `${evidenceDir}/${width}-many-expanded-list.png` })
 
-    const longLayout = longActions.getByRole('group', { name: 'Agent layout' })
+    const longLayout = longCard.getByLabel('Session status').getByRole('group', { name: 'Agent layout' })
     await longLayout.getByRole('button', { name: 'Grid view' }).click()
     assert.equal(await longLayout.getByRole('button', { name: 'Grid view' }).getAttribute('aria-pressed'), 'true')
     const gridEvidence = await longCard.getByTestId('session-agent-container').evaluate(node => ({
@@ -195,8 +200,42 @@ try {
     }
     await longCard.screenshot({ path: `${evidenceDir}/${width}-many-collapsed-grid.png` })
     await longHeader.getByRole('button', { name: `Expand ${displayName(longSession)}`, exact: true }).press('Enter')
+
+    await page.getByRole('link', { name: 'Agents' }).click()
+    const agentSession = page.getByTestId(`agent-session-${longSession.id}`)
+    const otherSession = page.getByTestId(`agent-session-${fewSession.id}`)
+    await agentSession.waitFor()
+    const agentActions = agentSession.getByTestId(`agent-session-actions-${longSession.id}`)
+    const agentsLayout = agentActions.getByRole('group', { name: 'Agent layout' })
+    assert.equal(await agentsLayout.isVisible(), true, `Agents List/Grid controls must remain available at ${width}px`)
+    assert.equal(await otherSession.getByRole('button', { name: 'List view' }).getAttribute('aria-pressed'), 'true', 'another session must retain its own List preference')
+    await agentsLayout.getByRole('button', { name: 'Grid view' }).click()
+    assert.equal(await agentSession.getByTestId(`agent-session-detail-${longSession.id}`).count(), 0, 'changing a collapsed session preference must not expand it')
+    await agentSession.getByRole('button', { name: `Expand ${displayName(longSession)}` }).click()
+    const agentContainer = agentSession.getByTestId(`agent-session-agent-container-${longSession.id}`)
+    await agentContainer.waitFor()
+    const agentsGridEvidence = await agentContainer.evaluate(node => ({
+      display: getComputedStyle(node).display,
+      columns: getComputedStyle(node).gridTemplateColumns.split(' ').filter(Boolean).length,
+      agentIds: Array.from(node.querySelectorAll('[data-testid^="agent-detail-card-"]')).map(card => card.getAttribute('data-testid')),
+    }))
+    assert.deepEqual(agentsGridEvidence.agentIds, Array.from({ length: 12 }, (_, index) => `agent-detail-card-${longSession.id}-terminal-${index}`), `Agents Grid changed durable agent order at ${width}px`)
+    if (width < 768) {
+      assert.equal(agentsGridEvidence.display, 'block', 'Agents mobile Grid preference must remain one physical column')
+    } else {
+      assert.equal(agentsGridEvidence.display, 'grid', `Agents Grid must use CSS grid at ${width}px`)
+      assert.equal(agentsGridEvidence.columns, 2, `Agents Grid must render two columns at ${width}px`)
+    }
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth), 0, `Agents horizontal overflow at ${width}px`)
+    await agentSession.screenshot({ path: `${evidenceDir}/${width}-agents-grid.png` })
+    await agentsLayout.getByRole('button', { name: 'List view' }).click()
+    assert.equal(await agentContainer.evaluate(node => getComputedStyle(node).display), 'block', `Agents List must use the compact list flow at ${width}px`)
+    assert.equal(await agentSession.locator(':scope > div').first().getByText('active', { exact: true }).count(), 1, 'layout toggling must not change session lifecycle state')
+
+    await page.getByRole('link', { name: 'Home' }).click()
+    await page.getByTestId(`session-header-${longSession.id}`).waitFor()
   }
-  console.log(JSON.stringify({ evidenceDir, widths: [1440, 834, 390], assertions: ['no horizontal overflow', 'long title remains single-line', 'responsive session-header controls', 'mobile List/Grid available', 'mobile canonical single-column layout', 'tablet/desktop two-column Grid', 'stable agent order and actions', 'polling preserves view preference', 'status-only badges', 'owner reason dedicated panel', 'First/Last/Total aggregation', 'emerald expanded surface', 'gray collapsed surface', 'title keyboard expansion'] }))
+  console.log(JSON.stringify({ evidenceDir, widths: [1440, 834, 390], assertions: ['no horizontal overflow', 'Home List/Grid follows status badges', 'Home action row excludes layout controls', 'responsive session-header controls', 'mobile canonical single-column layout', 'tablet/desktop two-column Grid', 'Agents session-local List/Grid', 'Agents lifecycle state unchanged', 'stable agent order and actions', 'polling preserves view preference', 'status-only badges', 'owner reason dedicated panel', 'First/Last/Total aggregation', 'emerald expanded surface', 'gray collapsed surface', 'title keyboard expansion'] }))
 } finally {
   await browser?.close()
   await new Promise(resolve => server.close(resolve))

@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react'
 import { SessionBoundaryAgent, SessionSummary } from '../api'
 import { lifecycleBadgeStatus, StatusBadge } from './StatusBadge'
 
@@ -66,7 +67,7 @@ function BoundaryStatus({
   )
 }
 
-export function SessionStatusSummary({ session }: { session: SessionSummary }) {
+export function SessionStatusSummary({ session, trailing }: { session: SessionSummary; trailing?: ReactNode }) {
   const activities = orderedEntries(session.activity_counts, ACTIVITY_ORDER)
   const workflows = workflowCounts(session.workflow_counts)
   return (
@@ -97,6 +98,7 @@ export function SessionStatusSummary({ session }: { session: SessionSummary }) {
           ))}
           {!activities.length && !workflows.length && <span className="text-xs text-gray-400">No agents yet</span>}
         </div>
+        {trailing && <div data-testid={`session-status-actions-${session.id}`} className="ml-auto inline-flex shrink-0 items-center">{trailing}</div>}
       </div>
     </div>
   )

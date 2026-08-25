@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 from pathlib import Path
@@ -350,6 +351,7 @@ def main() -> None:
         raise SystemExit(f"refusing to overwrite existing output: {args.output}")
     if command("git", "status", "--porcelain", capture_output=True).stdout:
         raise SystemExit("candidate must be built from a clean committed tree")
+    command(sys.executable, "scripts/validate_localizations.py")
     revision = command("git", "rev-parse", "HEAD", capture_output=True).stdout.strip()
     epoch = int(
         command("git", "show", "-s", "--format=%ct", "HEAD", capture_output=True).stdout.strip()

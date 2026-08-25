@@ -351,6 +351,7 @@ def test_release_builder_and_public_config_are_host_neutral_and_offline() -> Non
 
     builder = (ROOT / "scripts/build_local_candidate.py").read_text(encoding="utf-8")
     assert '"uv",\n            "build",\n            "--offline"' in builder
+    assert 'command(sys.executable, "scripts/validate_localizations.py")' in builder
     hook = (ROOT / "hatch_build.py").read_text(encoding="utf-8")
     assert 'os.environ.get("THREADCELLS_SOURCE_REVISION")' in hook
     assert 'install.extend(("--offline", "--ignore-scripts"))' in hook

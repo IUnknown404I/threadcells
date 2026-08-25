@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta
 
 from sqlalchemy import create_engine, event
@@ -7,17 +8,20 @@ from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import (
     Base,
     CapacitySettingsModel,
+    ChildAssignmentModel,
+    DelegationResultModel,
     ProviderExecutionLeaseModel,
     TerminalModel,
     WorkflowModel,
     WorkflowTurnModel,
     WorkflowTurnReceiptModel,
+    WorktreeWriterLeaseModel,
 )
 from cli_agent_orchestrator.services import ui_read_model_service
 
 
-def _install_database(monkeypatch):
-    engine = create_engine("sqlite:///:memory:")
+def _install_database(monkeypatch, url="sqlite:///:memory:"):
+    engine = create_engine(url)
     Base.metadata.create_all(engine)
     monkeypatch.setattr(database, "engine", engine)
     monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
@@ -32,6 +36,102 @@ def _install_database(monkeypatch):
     ):
         monkeypatch.setattr(database, name, lambda: None)
     return engine
+
+
+def _seed_retirement_projection(*, parent: str, children: tuple[tuple[str, str], ...]) -> None:
+    """Persist completed history with cleanup claims at distinct runtime boundaries."""
+    now = datetime(2026, 8, 25, 10, 0, 0)
+    with database.SessionLocal() as db:
+        db.add(
+            TerminalModel(
+                id=parent,
+                tmux_session="cao-retirement",
+                session_id="lifetime-retirement",
+                tmux_window=parent,
+                provider="codex",
+                runtime_lifecycle="running",
+                last_active=now,
+            )
+        )
+        db.add(
+            WorkflowModel(
+                root_terminal_id=parent,
+                status="terminal",
+                terminal_reason="completed parent",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        for index, (child, lifecycle) in enumerate(children):
+            worktree = f"/protected/history/{child}"
+            db.add(
+                TerminalModel(
+                    id=child,
+                    tmux_session="cao-retirement",
+                    session_id="lifetime-retirement",
+                    tmux_window=child,
+                    provider="codex",
+                    runtime_lifecycle=lifecycle,
+                    runtime_exited_at=now if lifecycle == "exited" else None,
+                    launch_worktree=worktree,
+                    managed_worktree_kind="task",
+                    managed_worktree_source="/protected/source",
+                    managed_worktree_branch=f"cao/task/{child}",
+                    managed_worktree_commit=f"{index + 1:040x}",
+                    last_active=now,
+                )
+            )
+            db.add(
+                WorkflowModel(
+                    root_terminal_id=child,
+                    status="terminal",
+                    terminal_reason="completed child",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            intent = {
+                "version": 1,
+                "terminal_id": child,
+                "managed": True,
+                "id": child,
+                "launch_worktree": worktree,
+                "managed_worktree_kind": "task",
+                "managed_worktree_source": "/protected/source",
+                "managed_worktree_branch": f"cao/task/{child}",
+                "managed_worktree_commit": f"{index + 1:040x}",
+            }
+            assignment = ChildAssignmentModel(
+                parent_terminal_id=parent,
+                child_terminal_id=child,
+                status="result_acknowledged",
+                retirement_claim_token=f"claim-{child}",
+                retirement_claimed_at=now,
+                retirement_exit_dispatched_at=now,
+                retirement_cleanup_intent=json.dumps(intent, sort_keys=True, separators=(",", ":")),
+                retirement_cleanup_completed_at=None,
+                retirement_completed_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(assignment)
+            db.flush()
+            db.add(
+                DelegationResultModel(
+                    id=f"result-{child}",
+                    child_assignment_id=assignment.id,
+                    schema_version=1,
+                    delegation_kind="assign",
+                    parent_terminal_id=parent,
+                    child_terminal_id=child,
+                    authorship="child_terminal_capture",
+                    status="complete",
+                    created_at=now,
+                    finalized_at=now,
+                    updated_at=now,
+                )
+            )
+        db.commit()
 
 
 def _seed_history(session_count: int, terminal_count: int) -> None:
@@ -423,6 +523,124 @@ def test_execution_wait_labels_and_owner_reason_are_exact_durable_mappings(monke
     }
     assert items["continuation"]["activity"] == "processing"
     assert items["continuation"]["execution_state"] == "processing"
+
+
+def test_completed_parent_does_not_wait_for_post_exit_resource_cleanup_after_restart(
+    monkeypatch, tmp_path
+):
+    state_path = tmp_path / "retirement-projection.db"
+    engine = _install_database(monkeypatch, f"sqlite:///{state_path}")
+    parent = "completed-parent"
+    children = (("exited-child-a", "exited"), ("exited-child-b", "exited"))
+    _seed_retirement_projection(parent=parent, children=children)
+
+    assert database.get_parent_completion_barrier(parent) == (0, 0)
+    assert database.get_terminal_execution_projection(parent) == {
+        "active_turn": False,
+        "wait_reason": None,
+    }
+    before_restart = {
+        item["id"]: item for item in ui_read_model_service.list_agent_summaries(limit=20)["items"]
+    }
+    assert before_restart[parent]["activity"] == "ready"
+    assert before_restart[parent]["execution_state"] == "ready"
+    assert before_restart[parent]["workflow_state"] == "completed"
+    assert {
+        item["child_terminal_id"] for item in database.list_pending_child_retirement_cleanups()
+    } == {child for child, _lifecycle in children}
+
+    # A same-state restart must deterministically rebuild the same operational
+    # projection without consuming cleanup authority or historical evidence.
+    engine.dispose()
+    restarted_engine = _install_database(monkeypatch, f"sqlite:///{state_path}")
+    try:
+        for _attempt in range(2):
+            assert database.get_terminal_execution_projection(parent)["wait_reason"] is None
+            after_restart = {
+                item["id"]: item
+                for item in ui_read_model_service.list_agent_summaries(limit=20)["items"]
+            }
+            assert after_restart[parent]["execution_state"] == "ready"
+            assert after_restart[parent]["workflow_state"] == "completed"
+        with database.SessionLocal() as db:
+            assert db.query(ChildAssignmentModel).filter_by(parent_terminal_id=parent).count() == 2
+            assert db.query(DelegationResultModel).filter_by(parent_terminal_id=parent).count() == 2
+            assert (
+                db.query(ChildAssignmentModel)
+                .filter(
+                    ChildAssignmentModel.parent_terminal_id == parent,
+                    ChildAssignmentModel.retirement_claim_token.is_not(None),
+                    ChildAssignmentModel.retirement_cleanup_completed_at.is_(None),
+                )
+                .count()
+                == 2
+            )
+            assert (
+                db.query(TerminalModel)
+                .filter(TerminalModel.id.in_([child for child, _lifecycle in children]))
+                .count()
+                == 2
+            )
+    finally:
+        restarted_engine.dispose()
+
+
+def test_real_child_retirement_dependency_clears_only_after_durable_exit(monkeypatch):
+    _install_database(monkeypatch)
+    parent, child = "waiting-parent", "running-child"
+    _seed_retirement_projection(parent=parent, children=((child, "running"),))
+
+    assert database.get_parent_completion_barrier(parent) == (0, 0)
+    assert database.get_terminal_execution_projection(parent)["wait_reason"] == ("child_retirement")
+    waiting = {
+        item["id"]: item for item in ui_read_model_service.list_agent_summaries(limit=20)["items"]
+    }
+    assert waiting[parent]["execution_state"] == "waiting_child_retirement"
+    assert waiting[parent]["workflow_state"] == "completed"
+
+    # This is the late-exit race: the parent workflow is already terminal, but
+    # runtime reconciliation now durably proves that the child no longer owns
+    # execution. Resource cleanup remains fail-closed and independently retryable.
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, child)
+        assert terminal is not None
+        terminal.runtime_lifecycle = "exited"
+        terminal.runtime_exited_at = datetime(2026, 8, 25, 10, 1, 0)
+        db.add(ProviderExecutionLeaseModel(terminal_id=child, workflow_turn_id=999_999))
+        db.add(
+            WorktreeWriterLeaseModel(
+                canonical_worktree=f"/protected/history/{child}", terminal_id=child
+            )
+        )
+        db.commit()
+
+    # An exited label alone cannot override a still-live provider/writer
+    # authority. Canonical runtime reconciliation releases both atomically.
+    assert database.get_terminal_execution_projection(parent)["wait_reason"] == ("child_retirement")
+    lease_blocked = {
+        item["id"]: item for item in ui_read_model_service.list_agent_summaries(limit=20)["items"]
+    }
+    assert lease_blocked[parent]["execution_state"] == "waiting_child_retirement"
+    with database.SessionLocal() as db:
+        db.query(ProviderExecutionLeaseModel).filter_by(terminal_id=child).delete()
+        db.query(WorktreeWriterLeaseModel).filter_by(terminal_id=child).delete()
+        db.commit()
+
+    for _attempt in range(2):
+        assert database.get_terminal_execution_projection(parent)["wait_reason"] is None
+        reconciled = {
+            item["id"]: item
+            for item in ui_read_model_service.list_agent_summaries(limit=20)["items"]
+        }
+        assert reconciled[parent]["execution_state"] == "ready"
+        assert reconciled[parent]["workflow_state"] == "completed"
+    with database.SessionLocal() as db:
+        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id=child).one()
+        result = db.query(DelegationResultModel).filter_by(child_assignment_id=assignment.id).one()
+        assert assignment.retirement_claim_token == f"claim-{child}"
+        assert assignment.retirement_cleanup_completed_at is None
+        assert result.status == "complete"
+        assert db.get(TerminalModel, child) is not None
 
 
 def test_session_lifetime_filter_never_coalesces_reused_tmux_name(monkeypatch):

@@ -27,7 +27,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, aliased, declarative_base, sessionmaker
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
@@ -3418,9 +3418,23 @@ WITH selected_terminals AS MATERIALIZED (
     FROM child_assignments ca JOIN selected_terminals st ON st.id = ca.child_terminal_id
 ), relation_states AS (
     SELECT ar.*, dr.status AS result_status,
+           -- The claim continues to protect post-exit resource cleanup, but
+           -- only a child that might still own runtime or lease authority
+           -- blocks execution.
            CASE WHEN ca.retirement_claim_token IS NOT NULL
                       AND ca.retirement_cleanup_completed_at IS NULL
-                THEN 1 ELSE 0 END AS retirement_pending,
+                      AND (
+                        COALESCE(retiring_child.runtime_lifecycle, 'starting') != 'exited'
+                        OR EXISTS (
+                          SELECT 1 FROM provider_execution_leases retiring_execution
+                          WHERE retiring_execution.terminal_id = ca.child_terminal_id
+                        )
+                        OR EXISTS (
+                          SELECT 1 FROM worktree_writer_leases retiring_writer
+                          WHERE retiring_writer.terminal_id = ca.child_terminal_id
+                        )
+                      )
+                THEN 1 ELSE 0 END AS retirement_execution_pending,
            CASE
              WHEN dr.status = 'incomplete' THEN 'incomplete'
              WHEN ar.status IN ('result_failed', 'handoff_result_failed') THEN 'failed'
@@ -3446,6 +3460,7 @@ WITH selected_terminals AS MATERIALIZED (
            END AS relation_priority
     FROM assignment_relations ar
     JOIN child_assignments ca ON ca.id = ar.assignment_id
+    LEFT JOIN terminals retiring_child ON retiring_child.id = ca.child_terminal_id
     LEFT JOIN delegation_results dr ON dr.child_assignment_id = ar.assignment_id
 ), latest_relations AS (
     SELECT *, ROW_NUMBER() OVER (
@@ -3492,7 +3507,8 @@ WITH selected_terminals AS MATERIALIZED (
                   THEN 'processing'
              WHEN t.runtime_operation_kind = 'retire'
                   OR EXISTS (SELECT 1 FROM relation_states rr
-                             WHERE rr.terminal_id = t.id AND rr.retirement_pending = 1)
+                             WHERE rr.terminal_id = t.id
+                               AND rr.retirement_execution_pending = 1)
                   THEN 'waiting_child_retirement'
              WHEN (EXISTS (
                SELECT 1 FROM workflows qw JOIN workflow_turns qt ON qt.workflow_id = qw.id
@@ -6130,13 +6146,41 @@ def get_terminal_execution_projection(terminal_id: str) -> Dict[str, Any]:
                 unadmitted_waiting = not active_turn
         if active_turn:
             return {"active_turn": True, "wait_reason": None}
+        # A durable cleanup claim protects exact worktree/history authority
+        # after provider exit. It is an execution dependency only until the
+        # assigned child is durably exited and its runtime-owned leases are
+        # gone (or while any of that authority is unknown).
+        retiring_child = aliased(TerminalModel)
+        retiring_execution = aliased(ProviderExecutionLeaseModel)
+        retiring_writer = aliased(WorktreeWriterLeaseModel)
+        relation_filters = [
+            (ChildAssignmentModel.parent_terminal_id == terminal_id)
+            & (
+                retiring_child.id.is_(None)
+                | retiring_child.runtime_lifecycle.is_(None)
+                | (retiring_child.runtime_lifecycle != "exited")
+                | retiring_execution.terminal_id.is_not(None)
+                | retiring_writer.terminal_id.is_not(None)
+            )
+        ]
+        if terminal.runtime_lifecycle != "exited":
+            relation_filters.append(ChildAssignmentModel.child_terminal_id == terminal_id)
         retirement_pending = terminal.runtime_operation_kind == "retire" or bool(
             db.query(ChildAssignmentModel.id)
+            .outerjoin(
+                retiring_child,
+                retiring_child.id == ChildAssignmentModel.child_terminal_id,
+            )
+            .outerjoin(
+                retiring_execution,
+                retiring_execution.terminal_id == ChildAssignmentModel.child_terminal_id,
+            )
+            .outerjoin(
+                retiring_writer,
+                retiring_writer.terminal_id == ChildAssignmentModel.child_terminal_id,
+            )
             .filter(
-                (
-                    (ChildAssignmentModel.child_terminal_id == terminal_id)
-                    | (ChildAssignmentModel.parent_terminal_id == terminal_id)
-                ),
+                or_(*relation_filters),
                 ChildAssignmentModel.retirement_claim_token.is_not(None),
                 ChildAssignmentModel.retirement_cleanup_completed_at.is_(None),
             )

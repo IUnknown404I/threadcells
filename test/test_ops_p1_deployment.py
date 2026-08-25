@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -8,6 +9,18 @@ from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 SOURCE = Path(__file__).parents[1]
+
+
+def _project_version() -> str:
+    text = (SOURCE / "pyproject.toml").read_text(encoding="utf-8")
+    project = re.search(r"^\[project\]\s*$([\s\S]*?)(?=^\[|\Z)", text, re.MULTILINE)
+    assert project is not None
+    version = re.search(r'^version\s*=\s*"([^"]+)"\s*$', project.group(1), re.MULTILINE)
+    assert version is not None
+    return version.group(1)
+
+
+PROJECT_VERSION = _project_version()
 
 
 def _tree_hash(root: Path) -> str:
@@ -24,8 +37,8 @@ def _tree_hash(root: Path) -> str:
 def _local_wheel(destination: Path, *, web_assets: dict[str, bytes] | None = None) -> Path:
     """Make a deterministic wheel with the ThreadCells distribution identity."""
     destination.mkdir(parents=True, exist_ok=True)
-    wheel = destination / "threadcells-0.1.0a2-py3-none-any.whl"
-    dist_info = "threadcells-0.1.0a2.dist-info"
+    wheel = destination / f"threadcells-{PROJECT_VERSION}-py3-none-any.whl"
+    dist_info = f"threadcells-{PROJECT_VERSION}.dist-info"
     scripts = (
         "cao",
         "cao-server",
@@ -59,7 +72,7 @@ def _local_wheel(destination: Path, *, web_assets: dict[str, bytes] | None = Non
             archive.writestr(f"cli_agent_orchestrator/web_ui/{relative}", content)
         archive.writestr(
             f"{dist_info}/METADATA",
-            "Metadata-Version: 2.1\nName: threadcells\nVersion: 0.1.0a2\n",
+            "Metadata-Version: 2.1\n" "Name: threadcells\n" f"Version: {PROJECT_VERSION}\n",
         )
         archive.writestr(
             f"{dist_info}/WHEEL",

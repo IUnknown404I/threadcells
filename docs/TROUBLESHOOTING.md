@@ -50,6 +50,10 @@ Read the gate reason. Provide the requested decision only if it is a genuine pub
 
 Confirm the child recorded a durable result and that it was delivered to the correct parent. The parent must read/use the immutable result, then acknowledge incorporation. Restart replay may deliver an unacknowledged result again; do not apply it twice.
 
+## New owner input stays queued behind a closed workflow
+
+Restart the supported runtime once and inspect the exact workflow and Inbox identities. Current builds reconcile a pending ordinary Inbox transport whose bound workflow is no longer open, then allow the newer open owner turn to continue. Do not rebind or manually edit the Inbox row; retain the database and report a defect if the stale transport remains pending or any payload crosses workflow identity.
+
 ## Operator authorization not configured
 
 Confirm `THREADCELLS_OPERATOR_VERIFIER_FILE` reaches the real server process and restart. If configuration is invalid, check schema, absolute/canonical path, file owner/mode, readability, and every parent directory. The service account must not own or be able to replace the verifier.

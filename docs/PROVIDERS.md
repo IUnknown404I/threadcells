@@ -33,6 +33,23 @@ The current build registers these adapters:
 
 Registration is factual product support, not an instruction to install every CLI. Install only providers you intend to use, using that provider's official instructions and authentication workflow.
 
+## Compatibility matrix
+
+This matrix describes the adapter contract in this release, not a promise that every external CLI version or account is ready on a particular host. **Supported** means the adapter implements the capability directly, **Conditional** means behavior depends on the provider CLI or session mode, and **Not reported** means ThreadCells does not invent the data.
+
+| Provider | Start/cancel | Resume and persistence | Structured completion | Usage telemetry | Model/reasoning controls | Readiness probe |
+| --- | --- | --- | --- | --- | --- | --- |
+| Codex | Supported | Conditional resume; supported persistence | Conditional | Supported provider-native token fields | Supported | Command, version, and authentication |
+| Claude Code | Supported | Conditional | Conditional | Conditional provider-native fields | Model selection supported; other controls adapter-dependent | Command, version, and authentication |
+| Amazon Q Developer | Supported | Conditional | Conditional | Not reported | Conditional | Command and version; authentication unverified |
+| Gemini CLI | Supported | Conditional | Conditional | Not reported | Conditional | Command and version; authentication unverified |
+| GitHub Copilot CLI | Supported | Conditional | Conditional | Not reported | Conditional | Command and version; authentication unverified |
+| Kimi CLI | Supported | Conditional | Conditional | Not reported | Conditional | Command and version; authentication unverified |
+| Kiro CLI | Supported | Conditional | Conditional | Not reported | Conditional | Command and version; authentication unverified |
+| OpenCode CLI | Supported | Conditional | Conditional | Not reported | Conditional | Command and version; authentication unverified |
+
+Codex is the reference and release-acceptance provider. Other built-in adapters remain usable when their public preflight is launchable, but provider-native behavior and authentication can vary. The live Settings capability view is authoritative for an installed build.
+
 ## Availability labels
 
 ThreadCells normalizes preflight into five operator-facing states:

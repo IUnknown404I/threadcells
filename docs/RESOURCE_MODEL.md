@@ -86,6 +86,8 @@ Heavy inventory continues counting active higher-numbered slots after a reductio
 
 A completed child's result must be recorded, delivered, incorporated, and acknowledged before resource retirement. History remains after runtime capacity is released.
 
+Admission is rechecked at launch and continuation boundaries. A queued provider turn starts when a provider slot becomes available. Provider completion releases only provider execution capacity; it does not close an open workflow, discard its callback, or free a delegated Work context that still owns durable work.
+
 ## Configure and observe
 
 Use Settings → Orchestration Capacity for current use, limits, recommendations, and draining state. Capacity changes are protected by [Operator authorization](OPERATOR_AUTHORIZATION.md) and are audited.

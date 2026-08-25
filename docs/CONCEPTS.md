@@ -16,7 +16,7 @@ The terminal can exit while its durable result remains. Conversely, a terminal t
 
 ## Session
 
-A **session** is ThreadCells's durable record of an agent run: identity, lifecycle, terminal, provider, profile, project, usage, and result relationships. Sessions let Statistics and workflows reason about runs that are active, completed, or retained.
+A **session** is ThreadCells's durable lifetime for one related group of agent runs: identity, lifecycle, terminals, providers, profiles, project, usage, and result relationships. **Add Agent** adds a terminal to that exact session lifetime instead of inferring membership from a reused display name. Sessions let Statistics and workflows reason about runs that are active, completed, historical, or retained.
 
 ## Project
 
@@ -88,9 +88,13 @@ An **owner gate** pauses autonomous continuation because the next decision requi
 
 An ordinary model turn ending or a difficult implementation step is not an owner gate.
 
-## Three kinds of capacity
+## Four kinds of capacity
 
-ThreadCells separates three capacity limits because they constrain different parts of the machine.
+ThreadCells separates four capacity limits because they constrain different parts of the machine.
+
+### Resident supervisor
+
+A top-level supervisor or owner remains available to receive callbacks and continue its workflow. Residency is distinct from active model execution and delegated Work capacity.
 
 ### Provider execution
 
@@ -104,7 +108,7 @@ A delegated coding context currently owns work. It may hold a worktree and write
 
 A build, Chromium run, large test suite, or similarly expensive host task occupies a heavy slot. CPU, memory, and I/O pressure constrain it.
 
-One agent can hold a work context while not using a provider or heavy slot. Raising every limit together can therefore overload the host without making the workflow faster. See [Capacity and resource model](RESOURCE_MODEL.md).
+One resident supervisor can wait without using a provider slot, and one delegated agent can hold a Work context without using a provider or heavy slot. Raising every limit together can therefore overload the host without making the workflow faster. See [Capacity and resource model](RESOURCE_MODEL.md).
 
 ## A complete example
 

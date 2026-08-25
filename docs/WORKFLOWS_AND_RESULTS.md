@@ -49,6 +49,8 @@ A result normally includes a concise summary, changed files, checks performed, r
 
 Delivery is at-least-once. If the parent restarts before acknowledging a delivered result, ThreadCells can deliver it again. The parent should use the immutable result identity to avoid incorporating the same work twice.
 
+Inbox delivery is FIFO within a terminal and bound to the exact workflow and logical turn that created it. A pending transport is delivery state, not authority to move a payload or result to another workflow. If its bound workflow is no longer open, ThreadCells terminalizes that stale transport and lets newer open owner work proceed without rebinding the payload, workflow, delivery, receipt, or effect identity. The same reconciliation runs after restart and is idempotent.
+
 ## Provider completion versus workflow completion
 
 A provider turn ends whenever the model returns control. The mission may still have eligible work: another test, a pending child, a correction pass, or a deployment step.
@@ -71,6 +73,8 @@ Do not use an owner gate merely because work is slow, a test failed, or one prov
 ## Recovery
 
 On restart, ThreadCells reconstructs workflow ownership from durable state. Delivered-but-unacknowledged results remain available. A waiting handoff can be resumed against the same child instead of launching a duplicate. Once a newer logical turn is admitted for an open workflow, an older pending continuation is durably superseded and cannot later replay as independent work after compaction or interruption.
+
+Direct completion, failure, cancellation, owner-gating, child terminalization, and central protected-workflow cancellation fence pending Inbox transports in the same database transaction. This prevents a terminal transition from leaving ordinary delivery state that can suppress a later owner turn.
 
 A same-build service restart keeps the provider-side control connection compatible. After a promoted build changes privileged orchestration code, an old connection is fenced before it can create an effect. If the active identity is temporarily unavailable during restart, the operation is rejected without an effect and retried after the service returns. For Codex, ThreadCells binds the exact provider conversation to the managed terminal and runtime generation at launch readiness, then persists that identity as reconnect authority. Other open rollout files cannot make that managed terminal ambiguous. A missing, stale, wrong, or unprovable identity fails closed before provider dispatch. The durable resume identity makes a service restart safe even between exit and relaunch. Input transport, reconnect and retirement share one durable per-terminal mutation claim, so text cannot be pasted into the reconnect shell gap and a stale reconnect cannot relaunch after retirement wins. The already durable logical turn is retried rather than replaced.
 

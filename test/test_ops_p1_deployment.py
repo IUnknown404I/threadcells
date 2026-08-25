@@ -570,6 +570,73 @@ def test_stage_ops_p1_reinstalls_local_wheel_into_immutable_candidate_runtime(tm
         "--test-unprivileged-promotion",
     ]
     active_link = release_state_root / "active"
+
+    # A new release may add an executable that cannot exist in a previously
+    # staged active, rollback, or candidate release. Preserve those verified
+    # legacy releases without weakening the executable contract for the new
+    # promotion target.
+    def make_legacy_release(name: str, state: str) -> Path:
+        release = release_root / name
+        runtime_bin = release / "runtime/bin"
+        runtime_bin.mkdir(parents=True)
+        for directory in (release, release / "runtime", runtime_bin):
+            directory.chmod(0o775)
+        for executable in ("cao-server", "cao-housekeeping", "threadcells-mcp-server"):
+            path = runtime_bin / executable
+            path.write_text("#!/bin/sh\n", encoding="utf-8")
+            path.chmod(0o755)
+        marker = release / ".threadcells-release.json"
+        marker.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "release_id": name,
+                    "source_commit": "legacy-commit",
+                    "state": state,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        marker.chmod(0o644)
+        return release
+
+    legacy_active = make_legacy_release("legacy-active", "active")
+    legacy_candidate = make_legacy_release("legacy-candidate", "candidate")
+    metadata["active_release"] = str(legacy_active)
+    metadata["candidate_releases"] = [str(candidate_root.resolve()), str(legacy_candidate)]
+    release_metadata.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+    release_metadata.chmod(0o644)
+    active_link.symlink_to(legacy_active, target_is_directory=True)
+    legacy_dry_promotion = subprocess.run(
+        [*promote_command, "--rollback-root", str(legacy_active), "--dry-run"],
+        capture_output=True,
+        text=True,
+    )
+    assert legacy_dry_promotion.returncode == 0, legacy_dry_promotion.stderr
+    assert "OPS_P1_PROMOTE_DRY_RUN" in legacy_dry_promotion.stdout
+    assert active_link.resolve() == legacy_active.resolve()
+    helper = candidate_root / "runtime/bin/threadcells-full-cleanup-helper"
+    missing_helper = helper.with_name(f"{helper.name}.missing")
+    helper.rename(missing_helper)
+    rejected_current_candidate = subprocess.run(
+        [*promote_command, "--rollback-root", str(legacy_active), "--dry-run"],
+        capture_output=True,
+        text=True,
+    )
+    assert rejected_current_candidate.returncode != 0
+    assert "RELEASE_RUNTIME_INVALID" in (
+        rejected_current_candidate.stdout + rejected_current_candidate.stderr
+    )
+    missing_helper.rename(helper)
+    active_link.unlink()
+    metadata["active_release"] = None
+    metadata["candidate_releases"] = [str(candidate_root.resolve())]
+    release_metadata.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+    release_metadata.chmod(0o644)
+    shutil.rmtree(legacy_active)
+    shutil.rmtree(legacy_candidate)
+
     outside_active = tmp_path / "outside-active"
     outside_active.mkdir()
     active_link.symlink_to(outside_active, target_is_directory=True)

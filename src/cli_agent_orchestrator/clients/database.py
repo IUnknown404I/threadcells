@@ -725,6 +725,10 @@ class WorkflowTurnModel(Base):
     provider_reconnect_requested_at = Column(DateTime, nullable=True)
     provider_reconnect_claim_token = Column(String, nullable=True)
     provider_reconnect_resume_identity = Column(String, nullable=True)
+    # An execution-resume turn transfers authority away from an interrupted
+    # admitted turn without reusing that turn's receipt.  The parent link is
+    # audit history; the workflow's active_turn_id remains the live fence.
+    resume_parent_turn_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now)
 
@@ -792,6 +796,12 @@ class WorkflowTurnReceiptModel(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     workflow_turn_id = Column(Integer, nullable=False)
     receiver_terminal_id = Column(String, nullable=False)
+    # Only the model execution that received this opaque capability may
+    # transfer an interrupted turn to a fresh admitted continuation. Store
+    # only its digest and consume it exactly once.
+    resume_token_sha256 = Column(String, nullable=True)
+    resumed_by_turn_id = Column(Integer, nullable=True)
+    resumed_at = Column(DateTime, nullable=True)
     consumed_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
@@ -2255,6 +2265,17 @@ def _migrate_workflow_turn_columns() -> None:
             conn.execute(
                 "ALTER TABLE workflow_turns " "ADD COLUMN provider_reconnect_resume_identity TEXT"
             )
+        if "resume_parent_turn_id" not in columns:
+            conn.execute("ALTER TABLE workflow_turns ADD COLUMN resume_parent_turn_id INTEGER")
+        receipt_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(workflow_turn_receipts)")
+        }
+        if "resume_token_sha256" not in receipt_columns:
+            conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resume_token_sha256 TEXT")
+        if "resumed_by_turn_id" not in receipt_columns:
+            conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resumed_by_turn_id INTEGER")
+        if "resumed_at" not in receipt_columns:
+            conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resumed_at DATETIME")
         conn.commit()
         conn.close()
     except Exception as exc:
@@ -5205,6 +5226,7 @@ TURN_CLAIMED = "claimed"
 TURN_SENT = "sent"
 TURN_FINISHED = "finished"
 TURN_CANCELLED = "cancelled"
+WORKFLOW_EXECUTION_RESUME_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{40,64}$")
 # A provider-final observation for a turn whose receiver never admitted the
 # envelope is not progress.  Keep this distinct from ``None`` (no workflow or
 # no sendable turn) so callers and deterministic tests can prove that the
@@ -6439,17 +6461,20 @@ def claim_handoff_result_batch_for_inbox(
         }
 
 
-def claim_workflow_turn_receipt(
-    receiver_terminal_id: str, logical_turn_id: int, now: Optional[datetime] = None
-) -> bool:
-    """Atomically admit one receiver-side logical turn before model work.
+def claim_or_resume_workflow_turn_receipt(
+    receiver_terminal_id: str,
+    logical_turn_id: int,
+    resume_token: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Admit a new turn or transfer an interrupted admitted execution.
 
     A sender can die after tmux accepts a continuation and retry the same
-    stable ``logical-turn`` envelope.  This receipt deliberately records the
-    *receiver's* one semantic admission, independent of any physical sends.
-    There is no lease to reclaim: once model work has been admitted it is an
-    irreversible effect, so a duplicate must be rejected rather than allowed
-    to create a second supervisor turn.
+    stable ``logical-turn`` envelope. A replay without the opaque resume token
+    is always rejected. If the admitted model execution itself is interrupted,
+    its one-use token transfers authority to a new durable logical turn. This
+    fences the old execution through ``active_turn_id`` while keeping every
+    prior effect key visible in the resumed turn.
 
     The eligibility update and receipt insert share one write transaction. A
     terminal transition that wins first makes the update fail; a receipt that
@@ -6459,6 +6484,7 @@ def claim_workflow_turn_receipt(
     _ensure_workflow_schema()
     now = now or datetime.now()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         existing = (
             db.query(WorkflowTurnReceiptModel)
             .filter(
@@ -6468,7 +6494,106 @@ def claim_workflow_turn_receipt(
             .first()
         )
         if existing is not None:
-            return False
+            workflow = _open_workflow(db, receiver_terminal_id, create=False)
+            token_digest = (
+                hashlib.sha256(resume_token.encode("utf-8", "strict")).hexdigest()
+                if resume_token
+                and WORKFLOW_EXECUTION_RESUME_TOKEN_PATTERN.fullmatch(resume_token) is not None
+                else None
+            )
+            if (
+                workflow is None
+                or workflow.status != WORKFLOW_OPEN
+                or workflow.active_turn_id != logical_turn_id
+                or existing.resumed_by_turn_id is not None
+                or not token_digest
+                or not existing.resume_token_sha256
+                or not hmac.compare_digest(str(existing.resume_token_sha256), token_digest)
+            ):
+                db.rollback()
+                return {"accepted": False, "reason": "duplicate_or_closed_workflow"}
+            interrupted = db.get(WorkflowTurnModel, logical_turn_id)
+            if (
+                interrupted is None
+                or interrupted.workflow_id != workflow.id
+                or interrupted.state != TURN_SENT
+            ):
+                db.rollback()
+                return {"accepted": False, "reason": "duplicate_or_closed_workflow"}
+
+            resumed = WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="execution_resume",
+                dedupe_key=f"execution-resume:{logical_turn_id}",
+                payload="Resume interrupted admitted model execution.",
+                state=TURN_SENT,
+                attempt_count=0,
+                claim_generation=0,
+                provider_processing_observed_at=now,
+                resume_parent_turn_id=logical_turn_id,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(resumed)
+            db.flush()
+
+            # A fresh logical turn fences the interrupted model invocation.
+            # Mirror its effect ledger so retrying an already-completed or
+            # indeterminate operation cannot acquire a new capability merely
+            # because execution resumed. Only proven pre-effect rejections
+            # remain reclaimable.
+            prior_effects = (
+                db.query(WorkflowEffectModel)
+                .filter(
+                    WorkflowEffectModel.workflow_id == workflow.id,
+                    WorkflowEffectModel.workflow_turn_id == logical_turn_id,
+                )
+                .all()
+            )
+            for prior in prior_effects:
+                db.add(
+                    WorkflowEffectModel(
+                        workflow_id=workflow.id,
+                        workflow_turn_id=resumed.id,
+                        effect_kind=prior.effect_kind,
+                        effect_key=prior.effect_key,
+                        state=("indeterminate" if prior.state == "claimed" else prior.state),
+                        claim_token=uuid.uuid4().hex,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+
+            next_resume_token = secrets.token_urlsafe(32)
+            db.add(
+                WorkflowTurnReceiptModel(
+                    workflow_turn_id=resumed.id,
+                    receiver_terminal_id=receiver_terminal_id,
+                    resume_token_sha256=hashlib.sha256(
+                        next_resume_token.encode("utf-8", "strict")
+                    ).hexdigest(),
+                    consumed_at=now,
+                )
+            )
+            interrupted.state = TURN_FINISHED
+            interrupted.updated_at = now
+            existing.resumed_by_turn_id = resumed.id
+            existing.resumed_at = now
+            workflow.active_turn_id = resumed.id
+            workflow.updated_at = now
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                return {"accepted": False, "reason": "duplicate_or_closed_workflow"}
+            return {
+                "accepted": True,
+                "resumed": True,
+                "logical_turn_id": int(resumed.id),
+                "resumed_from_logical_turn_id": logical_turn_id,
+                "resume_token": next_resume_token,
+                "reason": "interrupted_execution_resumed",
+            }
 
         # Acquire a short write fence against terminal closure before adding
         # the unique receipt.  This is not a queue transition; it only proves
@@ -6489,11 +6614,15 @@ def claim_workflow_turn_receipt(
         )
         if eligible != 1:
             db.rollback()
-            return False
+            return {"accepted": False, "reason": "duplicate_or_closed_workflow"}
+        next_resume_token = secrets.token_urlsafe(32)
         db.add(
             WorkflowTurnReceiptModel(
                 workflow_turn_id=logical_turn_id,
                 receiver_terminal_id=receiver_terminal_id,
+                resume_token_sha256=hashlib.sha256(
+                    next_resume_token.encode("utf-8", "strict")
+                ).hexdigest(),
                 consumed_at=now,
             )
         )
@@ -6503,8 +6632,25 @@ def claim_workflow_turn_receipt(
             # A concurrent physical duplicate inserted the same durable
             # receipt. Its supervisor turn owns the only logical effect.
             db.rollback()
-            return False
-        return True
+            return {"accepted": False, "reason": "duplicate_or_closed_workflow"}
+        return {
+            "accepted": True,
+            "resumed": False,
+            "logical_turn_id": logical_turn_id,
+            "resume_token": next_resume_token,
+            "reason": "admitted",
+        }
+
+
+def claim_workflow_turn_receipt(
+    receiver_terminal_id: str, logical_turn_id: int, now: Optional[datetime] = None
+) -> bool:
+    """Backward-compatible boolean admission for internal callers and tests."""
+    return bool(
+        claim_or_resume_workflow_turn_receipt(receiver_terminal_id, logical_turn_id, now=now)[
+            "accepted"
+        ]
+    )
 
 
 def has_admitted_workflow_turn(receiver_terminal_id: str, logical_turn_id: int) -> bool:

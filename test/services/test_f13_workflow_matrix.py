@@ -38,6 +38,7 @@ from cli_agent_orchestrator.clients.database import (
     cancel_workflows_for_terminal,
     claim_handoff_child_result_direct,
     claim_handoff_result_batch_for_inbox,
+    claim_or_resume_workflow_turn_receipt,
     claim_workflow_effect,
     claim_workflow_turn,
     claim_workflow_turn_receipt,
@@ -53,6 +54,7 @@ from cli_agent_orchestrator.clients.database import (
     issue_workflow_input_binding,
     mark_child_assignment_result_delivered,
     mark_workflow_turn_sent,
+    mark_workflow_turn_sent_for_inbox,
     materialize_deferred_handoff_result_turn_for_inbox,
     observe_workflow_final,
     observe_workflow_processing,
@@ -220,17 +222,29 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
             "id INTEGER PRIMARY KEY, claim_generation INTEGER NOT NULL DEFAULT 0, "
             "claim_token TEXT, claim_expires_at DATETIME, transport_binding TEXT)"
         )
+        connection.execute(
+            "CREATE TABLE workflow_turn_receipts ("
+            "id INTEGER PRIMARY KEY, workflow_turn_id INTEGER NOT NULL, "
+            "receiver_terminal_id TEXT NOT NULL, consumed_at DATETIME NOT NULL)"
+        )
     monkeypatch.setattr(constants, "DATABASE_FILE", database_file)
 
     database._migrate_workflow_turn_columns()
 
     with sqlite3.connect(database_file) as connection:
         columns = {row[1] for row in connection.execute("PRAGMA table_info(workflow_turns)")}
+        receipt_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(workflow_turn_receipts)")
+        }
     assert "provider_processing_observed_at" in columns
     assert "provider_ready_observed_at" in columns
     assert "provider_reconnect_requested_at" in columns
     assert "provider_reconnect_claim_token" in columns
     assert "provider_reconnect_resume_identity" in columns
+    assert "resume_parent_turn_id" in columns
+    assert "resume_token_sha256" in receipt_columns
+    assert "resumed_by_turn_id" in receipt_columns
+    assert "resumed_at" in receipt_columns
 
 
 def _queue_inbox_workflow_turn(root: str, key: str = "inbox-result") -> tuple[int, int]:
@@ -2944,6 +2958,147 @@ def test_f13_receiver_receipt_restart_suppression_and_distinct_turns(workflow_db
     assert not claim_workflow_turn_receipt(root, first_id)
     assert activate_workflow_turn(root, second_id)
     assert claim_workflow_turn_receipt(root, second_id)
+
+
+def test_f13_interrupted_assigned_result_resumes_under_fresh_admitted_turn(
+    workflow_db, monkeypatch
+):
+    """A post-read interruption transfers authority and acknowledges once."""
+    parent, child = "parent-interrupted-result", "child-interrupted-result"
+    _start_admitted_input(parent)
+    assert register_child_assignment(parent, child)
+    notice, duplicate = create_child_assignment_result_message(
+        child,
+        parent,
+        "completed child result",
+        **_authorized_callback(child),
+    )
+    assert notice is not None and duplicate is False and notice.result_id is not None
+    callback = get_workflow_turn_for_inbox(notice.id)
+    assert callback is not None
+    assert activate_workflow_turn_for_inbox(notice.id) == callback["turn_id"]
+    assert mark_workflow_turn_sent_for_inbox(notice.id)
+    assert mark_child_assignment_result_delivered(notice.id)
+
+    monkeypatch.setenv("CAO_TERMINAL_ID", parent)
+    admitted = asyncio.run(mcp_server.claim_workflow_turn_receipt(callback["turn_id"]))
+    assert admitted["accepted"] is True
+    assert admitted["resumed"] is False
+    assert asyncio.run(mcp_server.read_delegation_result(callback["turn_id"], notice.result_id))[
+        "success"
+    ]
+
+    # A provider/model restart after the read retains the returned opaque
+    # capability. It does not reuse the old receipt or old logical authority.
+    workflow_db.dispose()
+    resumed = asyncio.run(
+        mcp_server.claim_workflow_turn_receipt(
+            callback["turn_id"], resume_token=admitted["resume_token"]
+        )
+    )
+    assert resumed["accepted"] is True
+    assert resumed["resumed"] is True
+    resumed_turn = resumed["logical_turn_id"]
+    assert resumed_turn != callback["turn_id"]
+    assert resumed["resumed_from_logical_turn_id"] == callback["turn_id"]
+    assert not asyncio.run(mcp_server.claim_workflow_turn_receipt(callback["turn_id"]))["accepted"]
+    assert asyncio.run(mcp_server.read_delegation_result(resumed_turn, notice.result_id))["success"]
+
+    acknowledged = asyncio.run(
+        mcp_server.acknowledge_assigned_result(
+            resumed_turn, result_id=notice.result_id, child_terminal_id=child
+        )
+    )
+    assert acknowledged["success"] is True
+    replay = asyncio.run(
+        mcp_server.acknowledge_assigned_result(
+            resumed_turn, result_id=notice.result_id, child_terminal_id=child
+        )
+    )
+    assert replay["success"] is False
+    assert replay["reason_code"] == "RESULT_ALREADY_ACKNOWLEDGED"
+    assert get_parent_completion_barrier(parent) == (0, 0)
+
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=parent).one()
+        old_turn = db.get(WorkflowTurnModel, callback["turn_id"])
+        new_turn = db.get(WorkflowTurnModel, resumed_turn)
+        assert workflow.active_turn_id == resumed_turn
+        assert old_turn.state == "finished"
+        assert new_turn.kind == "execution_resume"
+        assert new_turn.resume_parent_turn_id == callback["turn_id"]
+        assert (
+            db.query(WorkflowTurnReceiptModel)
+            .filter(
+                WorkflowTurnReceiptModel.workflow_turn_id.in_([callback["turn_id"], resumed_turn])
+            )
+            .count()
+            == 2
+        )
+        acknowledgement_effects = (
+            db.query(WorkflowEffectModel)
+            .filter(WorkflowEffectModel.effect_kind == "acknowledge_assignment")
+            .all()
+        )
+        assert len(acknowledgement_effects) == 1
+        assert acknowledgement_effects[0].state == "completed"
+        assert db.query(database.DelegationResultModel).filter_by(id=notice.result_id).count() == 1
+
+
+def test_f13_interrupted_owner_input_resume_fences_old_effects_and_concurrent_replay(
+    workflow_db, monkeypatch
+):
+    """Owner input uses the same one-use transfer without duplicating effects."""
+    root = "root-interrupted-owner-input"
+    turn_id = start_workflow_input(root)
+    assert turn_id is not None
+    monkeypatch.setenv("CAO_TERMINAL_ID", root)
+    admitted = asyncio.run(mcp_server.claim_workflow_turn_receipt(turn_id))
+    assert admitted["accepted"] is True
+    assert not claim_or_resume_workflow_turn_receipt(
+        root, turn_id, resume_token="not-a-valid-resume-capability"
+    )["accepted"]
+
+    with patch.object(mcp_server, "_send_message_impl", return_value={"success": True}):
+        assert asyncio.run(mcp_server.send_message(turn_id, "target", "payload"))["success"]
+
+    barrier = Barrier(2)
+
+    def resume():
+        barrier.wait()
+        return claim_or_resume_workflow_turn_receipt(
+            root, turn_id, resume_token=admitted["resume_token"]
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        attempts = list(executor.map(lambda _attempt: resume(), range(2)))
+    accepted = [attempt for attempt in attempts if attempt["accepted"]]
+    rejected = [attempt for attempt in attempts if not attempt["accepted"]]
+    assert len(accepted) == 1
+    assert len(rejected) == 1
+    resumed_turn = accepted[0]["logical_turn_id"]
+
+    # The completed send effect was mirrored into the new execution scope;
+    # neither the interrupted old turn nor the resumed turn can send it again.
+    with patch.object(mcp_server, "_send_message_impl", return_value={"success": True}) as send:
+        old = asyncio.run(mcp_server.send_message(turn_id, "target", "payload"))
+        duplicate = asyncio.run(mcp_server.send_message(resumed_turn, "target", "payload"))
+        distinct = asyncio.run(mcp_server.send_message(resumed_turn, "target-2", "new payload"))
+    assert old["success"] is False
+    assert old["reason_code"] == "DUPLICATE_EFFECT"
+    assert duplicate["success"] is False
+    assert duplicate["reason_code"] == "DUPLICATE_EFFECT"
+    assert distinct["success"] is True
+    assert send.call_count == 1
+
+    with database.SessionLocal() as db:
+        assert db.query(WorkflowTurnReceiptModel).count() == 2
+        assert db.query(WorkflowTurnModel).filter_by(kind="execution_resume").count() == 1
+        original_receipt = (
+            db.query(WorkflowTurnReceiptModel).filter_by(workflow_turn_id=turn_id).one()
+        )
+        assert original_receipt.resume_token_sha256 != admitted["resume_token"]
+        assert len(original_receipt.resume_token_sha256) == 64
 
 
 def test_f13_effect_ledger_requires_admitted_logical_turn_and_dedupes_restart(workflow_db):

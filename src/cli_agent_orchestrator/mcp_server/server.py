@@ -23,13 +23,9 @@ from cli_agent_orchestrator.clients.database import (
     claim_completed_assigned_child_retirement,
     claim_completed_handoff_child_retirement,
     claim_handoff_child_result_direct,
+    claim_or_resume_workflow_turn_receipt,
     claim_staged_handoff_result_direct,
     claim_workflow_effect,
-)
-from cli_agent_orchestrator.clients.database import (
-    claim_workflow_turn_receipt as claim_workflow_turn_receipt_record,
-)
-from cli_agent_orchestrator.clients.database import (
     complete_assigned_child_retirement,
     complete_child_retirement,
     create_assigned_child_completion_result_message,
@@ -2405,6 +2401,13 @@ async def claim_workflow_turn_receipt(
     logical_turn_id: int = Field(
         description="Current logical-turn ID from a CAO workflow input envelope"
     ),
+    resume_token: Optional[str] = Field(
+        default=None,
+        description=(
+            "Opaque token returned by the prior successful admission; provide it only when "
+            "that admitted model execution was interrupted before its work completed"
+        ),
+    ),
 ) -> Dict[str, Any]:
     """Admit the current workflow input before model-dependent work.
 
@@ -2416,13 +2419,11 @@ async def claim_workflow_turn_receipt(
     receiver_terminal_id = os.environ.get("CAO_TERMINAL_ID")
     if not receiver_terminal_id:
         return {"accepted": False, "error": "CAO_TERMINAL_ID is required"}
-    accepted = claim_workflow_turn_receipt_record(receiver_terminal_id, logical_turn_id)
-    return {
-        "accepted": accepted,
-        "logical_turn_id": logical_turn_id,
-        "receiver_terminal_id": receiver_terminal_id,
-        "reason": "admitted" if accepted else "duplicate_or_closed_workflow",
-    }
+    effective_resume_token = resume_token if isinstance(resume_token, str) else None
+    admission = claim_or_resume_workflow_turn_receipt(
+        receiver_terminal_id, logical_turn_id, resume_token=effective_resume_token
+    )
+    return {**admission, "receiver_terminal_id": receiver_terminal_id}
 
 
 @mcp.tool(description=LOAD_SKILL_TOOL_DESCRIPTION)

@@ -1608,10 +1608,15 @@ class TestSendTerminalInput:
             "[CAO workflow input: logical-turn=73]\n"
             "Before any model-dependent work, call "
             "claim_workflow_turn_receipt(logical_turn_id=73). "
+            "Preserve the returned resume_token across context compaction. If this "
+            "admitted model execution is interrupted before its work is complete, call "
+            "the same tool with that resume_token; a safe resume receives a new "
+            "logical_turn_id. "
             "If it returns accepted=false, this is a duplicate or a closed workflow: "
             "stop without creating another supervisor effect. Every privileged CAO "
             "operation (assign, handoff, send_message, acknowledgement, or workflow "
-            "terminal transition) must include logical_turn_id=73; the MCP runtime "
+            "terminal transition) must use the logical_turn_id returned by the successful "
+            "receipt call (normally 73); the MCP runtime "
             "rejects duplicate or unadmitted effects.\n\nhello world",
             registry=ANY,
             sender_id=None,
@@ -1763,10 +1768,15 @@ class TestSendTerminalInput:
             "[CAO workflow input: logical-turn=74]\n"
             "Before any model-dependent work, call "
             "claim_workflow_turn_receipt(logical_turn_id=74). "
+            "Preserve the returned resume_token across context compaction. If this "
+            "admitted model execution is interrupted before its work is complete, call "
+            "the same tool with that resume_token; a safe resume receives a new "
+            "logical_turn_id. "
             "If it returns accepted=false, this is a duplicate or a closed workflow: "
             "stop without creating another supervisor effect. Every privileged CAO "
             "operation (assign, handoff, send_message, acknowledgement, or workflow "
-            "terminal transition) must include logical_turn_id=74; the MCP runtime "
+            "terminal transition) must use the logical_turn_id returned by the successful "
+            "receipt call (normally 74); the MCP runtime "
             "rejects duplicate or unadmitted effects.\n\nhello world",
             registry=ANY,
             sender_id=None,

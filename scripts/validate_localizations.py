@@ -32,7 +32,7 @@ README_LABELS = {
     "de": "Deutsch",
     "ja": "日本語",
 }
-PLACEHOLDER = re.compile(r"\b(?:TODO|TBD|TRANSLATE(?:D|\s+ME)?|LOREM\s+IPSUM)\b", re.I)
+PLACEHOLDER = re.compile(r"\b(?:TODO|TBD|TRANSLATE(?:D|\s+ME)?)\b|(?i:\bLOREM\s+IPSUM\b)")
 FRONT_MATTER = re.compile(r"\A---\n(?P<header>.*?)\n---\n(?P<body>.*)\Z", re.S)
 HEADING = re.compile(r"^(#{1,4})\s+.+?\s*$", re.M)
 FENCE = re.compile(r"^```[^\n]*\n.*?^```\s*$", re.M | re.S)

@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "check": "npm run validate:i18n && npm run typecheck && npm run lint && npm run build",
-    "validate:i18n": "python3 ../scripts/validate_localizations.py",
+    "validate:i18n": "python3 ../scripts/validate_localizations.py && node scripts/validate-landing-locales.mjs",
     "test:browser": "node scripts/browser-smoke.mjs",
     "test:locales": "node scripts/locale-smoke.mjs",
     "test:links": "node scripts/check-links.mjs",

@@ -13,6 +13,7 @@ import { AgentViewMode, AgentFilterState, HOME_FILTER_LABELS, applyAgentFilterSt
 import { sessionDisplayName } from '../sessionDisplayName'
 import { providerIsAvailable, providerSelectOption } from '../providerAvailability'
 import { useAgentSummaryFeed, useNearViewport, useSessionSummaryFeed } from '../uiReadModels'
+import { AgentViewControls, type AgentViewLayout } from './AgentViewControls'
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })))
 
@@ -125,6 +126,7 @@ export function AgentPanel({
   const [deletingSession, setDeletingSession] = useState<string | null>(null)
   const deletingSessionRef = useRef(false)
   const [sessionSearch, setSessionSearch] = useState('')
+  const [sessionAgentViews, setSessionAgentViews] = useState<Record<string, AgentViewLayout>>({})
   const initialFilters = parseAgentFilterState(navigationSearch)
   const [agentViewMode, setAgentViewMode] = useState<AgentViewMode>(initialFilters.view)
   const [providerStatusFilters, setProviderStatusFilters] = useState<string[]>(initialFilters.providerStatuses)
@@ -433,7 +435,7 @@ export function AgentPanel({
     }
   }
 
-  const renderAgentCard = (terminal: AgentSummary, sessionName?: string) => (
+  const renderAgentCard = (terminal: AgentSummary, sessionName?: string, grid = false) => (
     <div key={terminal.id} data-testid={`agent-detail-card-${terminal.id}`} className="bg-gray-900/50 border border-gray-700/30 rounded-lg p-3 space-y-2">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 min-w-0">
@@ -444,7 +446,7 @@ export function AgentPanel({
           {terminal.agent_profile && <span className="text-xs text-emerald-400 truncate max-w-full" title={terminal.agent_profile}>{terminal.agent_profile}</span>}
           {sessionName && <span className="text-xs text-gray-600 truncate max-w-full" title={sessionDisplayName(sessionName)}>Session: {sessionDisplayName(sessionName)}</span>}
         </div>
-        <div className="grid grid-cols-2 sm:flex gap-2 w-full sm:w-auto">
+        <div className={`grid grid-cols-2 gap-2 w-full ${grid ? '' : 'sm:flex sm:w-auto'}`}>
           <button onClick={() => setInboxTerminalId(terminal.id)} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs font-medium rounded-lg transition-colors" title="View inbox"><Mail size={14} />Inbox</button>
           <button onClick={() => openTerminal(terminal.id, terminal.provider, terminal.agent_profile)} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium rounded-lg transition-colors" title="Open live terminal"><Monitor size={14} />Open Terminal</button>
           <button onClick={() => setOutputTerminalId(terminal.id)} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs font-medium rounded-lg transition-colors" title="View output"><FileText size={14} />Output</button>
@@ -535,7 +537,7 @@ export function AgentPanel({
       )}
 
       {activeSessionFeed.error && <p role="alert" className="text-xs text-red-300">Unable to refresh this session’s agent summary.</p>}
-      {activeSessionFeed.loading && activeSessionFeed.items.length === 0 ? <p className="text-sm text-gray-500">Loading agents…</p> : <div className="space-y-2">{activeSessionFeed.items.map(terminal => renderAgentCard(terminal))}</div>}
+      {activeSessionFeed.loading && activeSessionFeed.items.length === 0 ? <p className="text-sm text-gray-500">Loading agents…</p> : <div data-testid={`agent-session-agent-container-${session.id}`} className={sessionAgentViews[session.id] === 'grid' ? 'space-y-2 md:grid md:grid-cols-2 md:gap-2 md:space-y-0' : 'space-y-2'}>{activeSessionFeed.items.map(terminal => renderAgentCard(terminal, undefined, sessionAgentViews[session.id] === 'grid'))}</div>}
       {activeSessionFeed.nextOffset !== null && <div ref={activeAgentSentinelRef} className="flex justify-center pt-3"><button type="button" onClick={activeSessionFeed.loadMore} disabled={activeSessionFeed.loading} className="min-h-10 rounded-lg border border-gray-700 px-4 text-xs text-gray-300 hover:border-emerald-700 disabled:opacity-40">{activeSessionFeed.loading ? 'Loading…' : `Load more agents (${activeSessionFeed.items.length} of ${activeSessionFeed.total})`}</button></div>}
       {activeSessionFeed.limitReached && <p className="pt-3 text-center text-xs text-gray-500">Showing the 100 most recent agents in this session. Use the Status or Profile views to narrow older history.</p>}
     </div>
@@ -631,7 +633,8 @@ export function AgentPanel({
                         {s.status}
                       </span>
                     </div>
-                    <div className="flex items-center gap-2 self-end sm:self-auto shrink-0">
+                    <div data-testid={`agent-session-actions-${s.id}`} className="flex items-center gap-2 self-end sm:self-auto shrink-0" onClick={event => event.stopPropagation()}>
+                      <AgentViewControls value={sessionAgentViews[s.id] || 'list'} onChange={value => setSessionAgentViews(current => ({ ...current, [s.id]: value }))} />
                       <button
                         onClick={event => { event.stopPropagation(); setPendingDeleteSession(s) }}
                         className="min-w-11 min-h-11 inline-flex items-center justify-center text-gray-500 hover:text-red-400 transition-colors rounded-lg hover:bg-gray-800"

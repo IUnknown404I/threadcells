@@ -556,7 +556,7 @@ describe('session creation and canonical ordering', () => {
     expect(within(header).getByRole('button', { name: 'Collapse header using chevron' })).toBeInTheDocument()
   })
 
-  it('keeps session actions isolated and switches the same ordered agents from List to Grid', async () => {
+  it('keeps Home List/Grid in the status row and switches the same ordered agents', async () => {
     const terminals = [
       { id: 'summary-terminal-a', tmux_session: 'cao-summary', tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null },
       { id: 'summary-terminal-b', tmux_session: 'cao-summary', tmux_window: '1', provider: 'codex', agent_profile: 'reviewer', last_active: null },
@@ -568,17 +568,20 @@ describe('session creation and canonical ordering', () => {
     const header = await screen.findByTestId('session-header-cao-summary')
     const summary = screen.getByLabelText('Session status')
     const actions = within(header).getByTestId('session-actions-cao-summary')
-    const layoutControls = within(actions).getByRole('group', { name: 'Agent layout' })
-    const list = within(actions).getByRole('button', { name: 'List view' })
-    const grid = within(actions).getByRole('button', { name: 'Grid view' })
+    const statusActions = screen.getByTestId('session-status-actions-cao-summary')
+    const layoutControls = within(summary).getByRole('group', { name: 'Agent layout' })
+    const list = within(summary).getByRole('button', { name: 'List view' })
+    const grid = within(summary).getByRole('button', { name: 'Grid view' })
+    const statusBadges = screen.getByTestId('session-status-badges-cao-summary')
 
     expect(header).toHaveClass('grid', 'grid-cols-[minmax(0,1fr)_auto]', 'sm:grid-cols-[minmax(0,1fr)_auto_auto]')
     expect(within(header).getByTestId('session-title-row-cao-summary')).toHaveClass('col-span-2', 'sm:col-span-1')
     expect(within(header).getByTestId('session-metadata-cao-summary')).toContainElement(within(header).getByText('2 agents'))
     expect(actions).toContainElement(within(header).getByRole('button', { name: 'Delete summary' }))
     expect(actions).toHaveClass('col-span-2', 'flex-wrap', 'justify-end', 'sm:col-span-1', 'sm:flex-nowrap')
+    expect(within(actions).queryByRole('group', { name: 'Agent layout' })).not.toBeInTheDocument()
     expect(layoutControls).toHaveClass('inline-flex')
-    expect(within(summary).queryByRole('group', { name: 'Agent layout' })).not.toBeInTheDocument()
+    expect(statusBadges.compareDocumentPosition(statusActions) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
 
     fireEvent.click(within(header).getByRole('button', { name: 'Expand summary' }))
     expect(await within(header).findByRole('button', { name: 'Collapse summary' })).toBeInTheDocument()
@@ -614,6 +617,49 @@ describe('session creation and canonical ordering', () => {
     fireEvent.click(within(header).getByRole('button', { name: 'Delete summary' }))
     expect(screen.getByRole('heading', { name: 'Delete Session' })).toBeInTheDocument()
     expect(within(header).getByRole('button', { name: 'Collapse summary' })).toBeInTheDocument()
+  })
+
+  it('keeps Agents session List/Grid preferences local without changing session state', async () => {
+    const sessionA = session('cao-layout-a', '200')
+    const sessionB = session('cao-layout-b', '100')
+    const terminals = (prefix: string) => [
+      { id: `${prefix}-terminal-a`, tmux_session: prefix, tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null },
+      { id: `${prefix}-terminal-b`, tmux_session: prefix, tmux_window: '1', provider: 'codex', agent_profile: 'reviewer', last_active: null },
+    ]
+    vi.spyOn(api, 'getSession').mockImplementation(async name => ({
+      session: name === sessionA.name ? sessionA : sessionB,
+      terminals: terminals(name),
+    }) as never)
+    useStore.setState({ sessions: [sessionA, sessionB] })
+    render(<AgentPanel />)
+
+    const aCard = await screen.findByTestId(`agent-session-${sessionA.id}`)
+    const bCard = screen.getByTestId(`agent-session-${sessionB.id}`)
+    const aActions = within(aCard).getByTestId(`agent-session-actions-${sessionA.id}`)
+    const bActions = within(bCard).getByTestId(`agent-session-actions-${sessionB.id}`)
+
+    expect(within(aActions).getByRole('button', { name: 'List view' })).toHaveAttribute('aria-pressed', 'true')
+    expect(within(bActions).getByRole('button', { name: 'List view' })).toHaveAttribute('aria-pressed', 'true')
+    fireEvent.click(within(aActions).getByRole('button', { name: 'Grid view' }))
+    expect(screen.queryByTestId(`agent-session-detail-${sessionA.id}`)).not.toBeInTheDocument()
+
+    fireEvent.click(within(aCard).getByRole('button', { name: `Expand ${sessionDisplayName(sessionA.name)}` }))
+    const aContainer = await screen.findByTestId(`agent-session-agent-container-${sessionA.id}`)
+    expect(aContainer).toHaveClass('md:grid', 'md:grid-cols-2')
+    expect(within(aContainer).getAllByTestId(/^agent-detail-card-/)).toHaveLength(2)
+
+    fireEvent.click(within(bCard).getByRole('button', { name: `Expand ${sessionDisplayName(sessionB.name)}` }))
+    const bContainer = await screen.findByTestId(`agent-session-agent-container-${sessionB.id}`)
+    expect(bContainer).toHaveClass('space-y-2')
+    expect(bContainer).not.toHaveClass('md:grid')
+    expect(within(bActions).getByRole('button', { name: 'List view' })).toHaveAttribute('aria-pressed', 'true')
+
+    fireEvent.click(within(aCard).getByRole('button', { name: `Expand ${sessionDisplayName(sessionA.name)}` }))
+    expect(await screen.findByTestId(`agent-session-agent-container-${sessionA.id}`)).toHaveClass('md:grid', 'md:grid-cols-2')
+    expect(useStore.getState().sessions.map(item => ({ id: item.id, status: item.status }))).toEqual([
+      { id: sessionA.id, status: 'active' },
+      { id: sessionB.id, status: 'active' },
+    ])
   })
 
   it('shows one durable aggregate for a one-agent session even when the session status differs', async () => {

@@ -625,12 +625,15 @@ export function AgentPanel({
                           toggleSession()
                         }
                       }}
-                      className="flex items-center gap-3 min-w-0 w-full cursor-pointer rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+                      className="flex min-w-0 w-full cursor-pointer items-center gap-2 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 sm:gap-3"
                     >
-                      <Bot size={16} className="text-emerald-400" />
-                      <span className="text-sm text-gray-200 font-mono truncate min-w-0" title={displayName}>{displayName}</span>
-                      <span className={`text-xs px-2 py-0.5 rounded-full ${s.status === 'active' ? 'bg-emerald-900/50 text-emerald-400' : 'bg-gray-700 text-gray-400'}`}>
+                      <Bot size={16} className="shrink-0 text-emerald-400" />
+                      <span className="min-w-0 flex-1 truncate font-mono text-sm text-gray-200" title={displayName}>{displayName}</span>
+                      <span className={`shrink-0 rounded-full px-2 py-0.5 text-xs ${s.status === 'active' ? 'bg-emerald-900/50 text-emerald-400' : 'bg-gray-700 text-gray-400'}`}>
                         {s.status}
+                      </span>
+                      <span data-testid={`agent-session-count-${s.id}`} className="shrink-0 text-xs text-gray-500">
+                        Agents: {s.agent_count}
                       </span>
                     </div>
                     <div data-testid={`agent-session-actions-${s.id}`} className="flex items-center gap-2 self-end sm:self-auto shrink-0" onClick={event => event.stopPropagation()}>

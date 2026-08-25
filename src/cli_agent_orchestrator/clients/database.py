@@ -6482,6 +6482,7 @@ def claim_or_resume_workflow_turn_receipt(
     idempotent across restarts and duplicate arrivals.
     """
     _ensure_workflow_schema()
+    _ensure_provider_execution_schema()
     now = now or datetime.now()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
@@ -6536,6 +6537,38 @@ def claim_or_resume_workflow_turn_receipt(
             )
             db.add(resumed)
             db.flush()
+
+            # Provider capacity is execution authority for the active logical
+            # turn, not merely a terminal-wide counter.  Transfer an exact
+            # interrupted-turn lease under the same BEGIN IMMEDIATE fence as
+            # active_turn_id.  Releasing and reacquiring here would expose a
+            # capacity race; accepting a lease owned by any other turn would
+            # strand the resumed execution with split authority.
+            provider_lease = db.get(ProviderExecutionLeaseModel, receiver_terminal_id)
+            if provider_lease is not None:
+                if provider_lease.workflow_turn_id != logical_turn_id:
+                    db.rollback()
+                    return {
+                        "accepted": False,
+                        "reason": "provider_execution_lease_conflict",
+                    }
+                transferred = (
+                    db.query(ProviderExecutionLeaseModel)
+                    .filter(
+                        ProviderExecutionLeaseModel.terminal_id == receiver_terminal_id,
+                        ProviderExecutionLeaseModel.workflow_turn_id == logical_turn_id,
+                    )
+                    .update(
+                        {ProviderExecutionLeaseModel.workflow_turn_id: resumed.id},
+                        synchronize_session=False,
+                    )
+                )
+                if transferred != 1:
+                    db.rollback()
+                    return {
+                        "accepted": False,
+                        "reason": "provider_execution_lease_conflict",
+                    }
 
             # A fresh logical turn fences the interrupted model invocation.
             # Mirror its effect ledger so retrying an already-completed or
@@ -11307,7 +11340,7 @@ def acknowledge_child_assignment_result_outcome(
     parent_terminal_id: str,
     child_terminal_id: Optional[str] = None,
     result_id: Optional[str] = None,
-) -> Dict[str, Optional[str] | bool]:
+) -> Dict[str, Any]:
     """Apply one acknowledgement and return its durable typed outcome.
 
     The legacy boolean helper above remains for in-process compatibility. MCP
@@ -11340,16 +11373,29 @@ def acknowledge_child_assignment_result_outcome(
                 DelegationResultModel,
                 DelegationResultModel.child_assignment_id == ChildAssignmentModel.id,
             ).filter(DelegationResultModel.id == result_id)
-        elif child_terminal_id:
+        if child_terminal_id:
             query = query.filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
         assignment = query.first()
         if assignment is None:
             return {
                 "accepted": False,
-                "reason_code": "WRONG_DISPATCH_MODE",
+                "reason_code": (
+                    "RESULT_IDENTITY_MISMATCH"
+                    if result_id and child_terminal_id
+                    else "WRONG_DISPATCH_MODE"
+                ),
                 "workflow_state": parent_workflow.status,
                 "assignment_status": None,
             }
+        canonical_result = (
+            db.query(DelegationResultModel)
+            .filter(DelegationResultModel.child_assignment_id == assignment.id)
+            .first()
+        )
+        canonical_identity = {
+            "child_terminal_id": assignment.child_terminal_id,
+            "result_id": canonical_result.id if canonical_result is not None else None,
+        }
         if assignment.status in (
             ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
             ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value,
@@ -11359,6 +11405,7 @@ def acknowledge_child_assignment_result_outcome(
                 "reason_code": "RESULT_ALREADY_ACKNOWLEDGED",
                 "workflow_state": parent_workflow.status,
                 "assignment_status": assignment.status,
+                **canonical_identity,
             }
         if assignment.status in (
             ChildAssignmentStatus.RESULT_QUEUED.value,
@@ -11369,6 +11416,7 @@ def acknowledge_child_assignment_result_outcome(
                 "reason_code": "RESULT_NOT_DELIVERED",
                 "workflow_state": parent_workflow.status,
                 "assignment_status": assignment.status,
+                **canonical_identity,
             }
         if assignment.status not in (
             ChildAssignmentStatus.RESULT_DELIVERED.value,
@@ -11379,6 +11427,7 @@ def acknowledge_child_assignment_result_outcome(
                 "reason_code": "WRONG_DISPATCH_MODE",
                 "workflow_state": parent_workflow.status,
                 "assignment_status": assignment.status,
+                **canonical_identity,
             }
         assignment.status = (
             ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value
@@ -11392,6 +11441,7 @@ def acknowledge_child_assignment_result_outcome(
             "reason_code": None,
             "workflow_state": parent_workflow.status,
             "assignment_status": assignment.status,
+            **canonical_identity,
         }
 
 
@@ -11416,16 +11466,36 @@ def describe_child_assignment_acknowledgement(
                 DelegationResultModel,
                 DelegationResultModel.child_assignment_id == ChildAssignmentModel.id,
             ).filter(DelegationResultModel.id == result_id)
-        elif child_terminal_id:
-            query = query.filter_by(child_terminal_id=child_terminal_id)
+        if child_terminal_id:
+            query = query.filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
         assignment = query.first()
         if assignment is None:
-            return {"reason_code": "WRONG_DISPATCH_MODE", "workflow_state": workflow.status}
+            return {
+                "reason_code": (
+                    "RESULT_IDENTITY_MISMATCH"
+                    if result_id and child_terminal_id
+                    else "WRONG_DISPATCH_MODE"
+                ),
+                "workflow_state": workflow.status,
+            }
+        canonical_result = (
+            db.query(DelegationResultModel)
+            .filter(DelegationResultModel.child_assignment_id == assignment.id)
+            .first()
+        )
+        canonical_identity = {
+            "child_terminal_id": assignment.child_terminal_id,
+            "result_id": canonical_result.id if canonical_result is not None else None,
+        }
         if assignment.status in (
             ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
             ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value,
         ):
-            return {"reason_code": "RESULT_ALREADY_ACKNOWLEDGED", "workflow_state": workflow.status}
+            return {
+                "reason_code": "RESULT_ALREADY_ACKNOWLEDGED",
+                "workflow_state": workflow.status,
+                **canonical_identity,
+            }
         if assignment.status in (
             ChildAssignmentStatus.RESULT_QUEUED.value,
             ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value,
@@ -11434,8 +11504,13 @@ def describe_child_assignment_acknowledgement(
                 "reason_code": "RESULT_NOT_DELIVERED",
                 "workflow_state": workflow.status,
                 "assignment_status": assignment.status,
+                **canonical_identity,
             }
-        return {"reason_code": "WRONG_DISPATCH_MODE", "workflow_state": workflow.status}
+        return {
+            "reason_code": "WRONG_DISPATCH_MODE",
+            "workflow_state": workflow.status,
+            **canonical_identity,
+        }
 
 
 def requeue_unacknowledged_child_assignment_results() -> int:

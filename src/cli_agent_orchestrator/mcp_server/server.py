@@ -2044,12 +2044,28 @@ async def acknowledge_assigned_result(
     parent_terminal_id = os.environ.get("CAO_TERMINAL_ID")
     if not parent_terminal_id:
         return {"success": False, "error": "CAO_TERMINAL_ID is required to acknowledge a child"}
+    # FastMCP resolves Field defaults at the transport boundary.  Direct
+    # in-process callers used by the compatibility API see FieldInfo objects
+    # for omitted arguments, so normalize them before identity comparison.
+    child_terminal_id = child_terminal_id if isinstance(child_terminal_id, str) else None
+    result_id = result_id if isinstance(result_id, str) else None
     identity = result_id or child_terminal_id
     if not identity:
         return {"success": False, "error": "child_terminal_id or result_id is required"}
     replay = describe_child_assignment_acknowledgement(
         parent_terminal_id, child_terminal_id, result_id
     )
+    # A caller that supplies both immutable identities must prove they select
+    # one assignment before it can claim an acknowledgement effect.  This
+    # keeps a cross-child mismatch entirely inert and prevents the response
+    # from echoing an identity that was not mutated.
+    if replay.get("reason_code") == "RESULT_IDENTITY_MISMATCH":
+        return {
+            "success": False,
+            "accepted": False,
+            **replay,
+            "error": "result_id and child_terminal_id do not identify the same assignment.",
+        }
     # A same-turn acknowledgement replay has no new privileged side effect;
     # return its durable lifecycle reason before the generic effect dedupe.
     if replay.get("reason_code") == "RESULT_ALREADY_ACKNOWLEDGED" and has_admitted_workflow_turn(
@@ -2061,9 +2077,18 @@ async def acknowledge_assigned_result(
             **replay,
             "error": "The result was already acknowledged; no lifecycle mutation was repeated.",
         }
-    effect = _claim_privileged_effect(logical_turn_id, "acknowledge_assignment", identity)
+    canonical_identity = replay.get("result_id") or replay.get("child_terminal_id") or identity
+    effect = _claim_privileged_effect(
+        logical_turn_id,
+        "acknowledge_assignment",
+        str(canonical_identity),
+    )
     if effect is None:
-        return _privileged_effect_rejection(logical_turn_id, "acknowledge_assignment", identity)
+        return _privileged_effect_rejection(
+            logical_turn_id,
+            "acknowledge_assignment",
+            str(canonical_identity),
+        )
     outcome = acknowledge_child_assignment_result_outcome(
         parent_terminal_id, child_terminal_id, result_id
     )
@@ -2078,8 +2103,8 @@ async def acknowledge_assigned_result(
     return {
         "success": True,
         "parent_terminal_id": parent_terminal_id,
-        "child_terminal_id": child_terminal_id,
-        "result_id": result_id,
+        "child_terminal_id": outcome.get("child_terminal_id"),
+        "result_id": outcome.get("result_id"),
     }
 
 

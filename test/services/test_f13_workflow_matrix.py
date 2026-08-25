@@ -12,7 +12,7 @@ from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 import cli_agent_orchestrator.clients.database as database
@@ -76,7 +76,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
-from cli_agent_orchestrator.services import workflow_service
+from cli_agent_orchestrator.services import operations_service, workflow_service
 from cli_agent_orchestrator.services.inbox_service import (
     LogFileHandler,
     _dispatch_pending_messages_with_admission,
@@ -2979,6 +2979,7 @@ def test_f13_interrupted_assigned_result_resumes_under_fresh_admitted_turn(
     assert activate_workflow_turn_for_inbox(notice.id) == callback["turn_id"]
     assert mark_workflow_turn_sent_for_inbox(notice.id)
     assert mark_child_assignment_result_delivered(notice.id)
+    assert database.acquire_provider_execution(parent, callback["turn_id"], 1)
 
     monkeypatch.setenv("CAO_TERMINAL_ID", parent)
     admitted = asyncio.run(mcp_server.claim_workflow_turn_receipt(callback["turn_id"]))
@@ -3003,6 +3004,28 @@ def test_f13_interrupted_assigned_result_resumes_under_fresh_admitted_turn(
     assert resumed["resumed_from_logical_turn_id"] == callback["turn_id"]
     assert not asyncio.run(mcp_server.claim_workflow_turn_receipt(callback["turn_id"]))["accepted"]
     assert asyncio.run(mcp_server.read_delegation_result(resumed_turn, notice.result_id))["success"]
+    assert database.get_provider_execution_turn(parent) == resumed_turn
+    assert not database.release_provider_execution(parent, callback["turn_id"])
+
+    # The real blocking-handoff boundary can release the transferred lease,
+    # admit a child at capacity one, and reacquire for the fresh execution.
+    with patch.object(mcp_server.inbox_service, "wake_provider_execution_queue", return_value=0):
+        execution_terminal, suspended = mcp_server._suspend_provider_execution(resumed_turn)
+    assert (execution_terminal, suspended) == (parent, True)
+    waiter_turn = _start_admitted_input("resume-capacity-waiter")
+    assert database.acquire_provider_execution("resume-capacity-waiter", waiter_turn, 1)
+    assert database.release_provider_execution("resume-capacity-waiter", waiter_turn)
+
+    def acquire_resumed_execution(terminal_id: str, logical_turn_id: int) -> None:
+        assert database.acquire_provider_execution(terminal_id, logical_turn_id, 1)
+
+    monkeypatch.setattr(
+        operations_service,
+        "acquire_provider_execution_slot",
+        acquire_resumed_execution,
+    )
+    asyncio.run(mcp_server._resume_provider_execution(parent, resumed_turn, suspended))
+    assert database.get_provider_execution_turn(parent) == resumed_turn
 
     acknowledged = asyncio.run(
         mcp_server.acknowledge_assigned_result(
@@ -3010,6 +3033,8 @@ def test_f13_interrupted_assigned_result_resumes_under_fresh_admitted_turn(
         )
     )
     assert acknowledged["success"] is True
+    assert acknowledged["child_terminal_id"] == child
+    assert acknowledged["result_id"] == notice.result_id
     replay = asyncio.run(
         mcp_server.acknowledge_assigned_result(
             resumed_turn, result_id=notice.result_id, child_terminal_id=child
@@ -3042,7 +3067,134 @@ def test_f13_interrupted_assigned_result_resumes_under_fresh_admitted_turn(
         )
         assert len(acknowledgement_effects) == 1
         assert acknowledgement_effects[0].state == "completed"
+        assert acknowledgement_effects[0].effect_key == mcp_server._workflow_effect_key(
+            "acknowledge_assignment", notice.result_id
+        )
         assert db.query(database.DelegationResultModel).filter_by(id=notice.result_id).count() == 1
+
+
+def test_f13_resumed_acknowledgement_rejects_cross_child_identity_without_effect(
+    workflow_db, monkeypatch
+):
+    """A result and a different child cannot cross assignment identity."""
+    parent = "parent-resumed-identity-mismatch"
+    child_a = "child-resumed-identity-a"
+    child_b = "child-resumed-identity-b"
+    _start_admitted_input(parent)
+    assert register_child_assignment(parent, child_a)
+    assert register_child_assignment(parent, child_b)
+    notice, duplicate = create_child_assignment_result_message(
+        child_a,
+        parent,
+        "completed child A",
+        **_authorized_callback(child_a),
+    )
+    assert notice is not None and duplicate is False and notice.result_id is not None
+    callback = get_workflow_turn_for_inbox(notice.id)
+    assert callback is not None
+    assert activate_workflow_turn_for_inbox(notice.id) == callback["turn_id"]
+    assert mark_workflow_turn_sent_for_inbox(notice.id)
+    assert mark_child_assignment_result_delivered(notice.id)
+
+    monkeypatch.setenv("CAO_TERMINAL_ID", parent)
+    admitted = asyncio.run(mcp_server.claim_workflow_turn_receipt(callback["turn_id"]))
+    resumed = asyncio.run(
+        mcp_server.claim_workflow_turn_receipt(
+            callback["turn_id"], resume_token=admitted["resume_token"]
+        )
+    )
+    assert resumed["accepted"] is True and resumed["resumed"] is True
+    resumed_turn = resumed["logical_turn_id"]
+    barrier_before = get_parent_completion_barrier(parent)
+
+    mismatch = asyncio.run(
+        mcp_server.acknowledge_assigned_result(
+            resumed_turn,
+            result_id=notice.result_id,
+            child_terminal_id=child_b,
+        )
+    )
+    assert mismatch["success"] is False
+    assert mismatch["reason_code"] == "RESULT_IDENTITY_MISMATCH"
+    assert get_parent_completion_barrier(parent) == barrier_before
+    with database.SessionLocal() as db:
+        assignments = {
+            row.child_terminal_id: row.status
+            for row in db.query(database.ChildAssignmentModel).filter_by(parent_terminal_id=parent)
+        }
+        assert assignments == {
+            child_a: "result_delivered",
+            child_b: "awaiting_result",
+        }
+        assert (
+            db.query(WorkflowEffectModel).filter_by(effect_kind="acknowledge_assignment").count()
+            == 0
+        )
+
+    canonical = asyncio.run(
+        mcp_server.acknowledge_assigned_result(
+            resumed_turn,
+            result_id=notice.result_id,
+            child_terminal_id=child_a,
+        )
+    )
+    assert canonical["success"] is True
+    assert canonical["child_terminal_id"] == child_a
+    assert canonical["result_id"] == notice.result_id
+
+
+def test_f13_resume_commit_failure_retains_turn_receipt_and_provider_lease(
+    workflow_db, monkeypatch
+):
+    """The active turn and its capacity lease transfer in one transaction."""
+    root = "root-resume-commit-failure"
+    with database.SessionLocal() as db:
+        db.add(
+            TerminalModel(
+                id=root,
+                tmux_session=f"cao-{root}",
+                tmux_window="owner-0000",
+                provider="codex",
+                runtime_lifecycle="running",
+            )
+        )
+        db.commit()
+    turn_id = start_workflow_input(root)
+    assert turn_id is not None
+    monkeypatch.setenv("CAO_TERMINAL_ID", root)
+    admitted = asyncio.run(mcp_server.claim_workflow_turn_receipt(turn_id))
+    assert admitted["accepted"] is True
+    assert database.acquire_provider_execution(root, turn_id, 1)
+
+    def fail_commit(_session):
+        raise RuntimeError("injected resume commit failure")
+
+    event.listen(database.SessionLocal.class_, "before_commit", fail_commit)
+    try:
+        with pytest.raises(RuntimeError, match="injected resume commit failure"):
+            claim_or_resume_workflow_turn_receipt(
+                root,
+                turn_id,
+                resume_token=admitted["resume_token"],
+            )
+    finally:
+        event.remove(database.SessionLocal.class_, "before_commit", fail_commit)
+
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        receipt = db.query(WorkflowTurnReceiptModel).one()
+        assert workflow.active_turn_id == turn_id
+        assert receipt.resumed_by_turn_id is None
+        assert db.query(WorkflowTurnModel).filter_by(kind="execution_resume").count() == 0
+        assert db.get(database.ProviderExecutionLeaseModel, root).workflow_turn_id == turn_id
+
+    resumed = claim_or_resume_workflow_turn_receipt(
+        root,
+        turn_id,
+        resume_token=admitted["resume_token"],
+    )
+    assert resumed["accepted"] is True
+    assert database.get_provider_execution_turn(root) == resumed["logical_turn_id"]
 
 
 def test_f13_interrupted_owner_input_resume_fences_old_effects_and_concurrent_replay(
@@ -3058,6 +3210,30 @@ def test_f13_interrupted_owner_input_resume_fences_old_effects_and_concurrent_re
     assert not claim_or_resume_workflow_turn_receipt(
         root, turn_id, resume_token="not-a-valid-resume-capability"
     )["accepted"]
+
+    # Split provider authority is not silently adopted.  The valid token is
+    # left usable after this fail-closed attempt because the transaction made
+    # no receipt, turn, workflow, or lease mutation.
+    with database.SessionLocal() as db:
+        db.add(
+            database.ProviderExecutionLeaseModel(
+                terminal_id=root,
+                workflow_turn_id=turn_id + 1000,
+            )
+        )
+        db.commit()
+    conflict = claim_or_resume_workflow_turn_receipt(
+        root, turn_id, resume_token=admitted["resume_token"]
+    )
+    assert conflict == {
+        "accepted": False,
+        "reason": "provider_execution_lease_conflict",
+    }
+    with database.SessionLocal() as db:
+        assert db.query(WorkflowTurnModel).filter_by(kind="execution_resume").count() == 0
+        assert db.query(WorkflowTurnReceiptModel).count() == 1
+        db.query(database.ProviderExecutionLeaseModel).filter_by(terminal_id=root).delete()
+        db.commit()
 
     with patch.object(mcp_server, "_send_message_impl", return_value={"success": True}):
         assert asyncio.run(mcp_server.send_message(turn_id, "target", "payload"))["success"]

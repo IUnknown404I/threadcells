@@ -1,7 +1,7 @@
 ---
 slug: workflows-and-results
 source: docs/WORKFLOWS_AND_RESULTS.md
-source_sha256: sha256:7068aa3c7d3d2ab4211dd0799d398b26251e0e77e5320017d5d9f7e5ebe7520e
+source_sha256: sha256:d6a1133dbc73417c1e5cfc8d6b96037535cf4b5552bd094cbb4efad93351fc0a
 ---
 
 # Flujos de trabajo y resultados duraderos
@@ -79,6 +79,8 @@ No uses una puerta del propietario simplemente porque el trabajo sea lento, fall
 ## Recuperación
 
 Al reiniciar, ThreadCells reconstruye la propiedad del flujo de trabajo desde el estado duradero. Los resultados entregados pero no acusados siguen disponibles. Un handoff en espera puede reanudarse con el mismo hijo en vez de lanzar un duplicado. Una vez que se admite un turno lógico más nuevo para un flujo de trabajo abierto, una continuación pendiente más antigua queda sustituida de forma duradera y no puede reproducirse después como trabajo independiente tras una compactación o interrupción.
+
+Si la ejecución del proveedor o del modelo se interrumpe después de admitir su entrada lógica pero antes de terminar el trabajo requerido, ThreadCells la reanuda mediante un nuevo turno de continuación duradero en lugar de reproducir el receipt original. Los efectos completados siguen cercados, la propiedad de ejecución del proveedor acompaña al turno reanudado y el mismo resultado inmutable del hijo y la barrera de finalización siguen disponibles para incorporarlos y confirmarlos exactamente una vez.
 
 La finalización directa, el fallo, la cancelación, la puerta del propietario, la terminalización de hijos y la cancelación central de flujos de trabajo protegidos cercan los transportes pendientes de Inbox en la misma transacción de base de datos. Así se evita que una transición terminal deje un estado de entrega ordinario capaz de bloquear un turno posterior del propietario.
 

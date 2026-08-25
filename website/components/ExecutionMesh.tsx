@@ -32,7 +32,15 @@ export function ExecutionMesh({ locale = 'en' }: { locale?: Locale }) {
   const ja = locale === 'ja'
   const es = locale === 'es'
   const pt = locale === 'pt-BR'
-  const localizedNodes: MeshNode[] = pt ? [
+  const de = locale === 'de'
+  const localizedNodes: MeshNode[] = de ? [
+    { id: 'owner', label: 'OWNER', meta: 'Auftrag / Berechtigung', state: 'BEREIT', x: 8, y: 48 },
+    { id: 'supervisor', label: 'SUPERVISOR', meta: 'Workflow-Wurzel', state: 'LÄUFT', x: 34, y: 48 },
+    { id: 'worker-03', label: 'WORKER 03', meta: 'Kontext 02 / 02', state: 'LÄUFT', x: 61, y: 17 },
+    { id: 'worker-02', label: 'WORKER 02', meta: 'Kontext 01 / 02', state: 'ABGESCHLOSSEN', x: 61, y: 73 },
+    { id: 'reviewer', label: 'REVIEWER', meta: 'Abnahmeprüfung', state: 'BEREIT', x: 83, y: 34 },
+    { id: 'result', label: 'DAUERHAFTES ERGEBNIS', meta: 'Ergebnis · 8A17', state: 'GESPEICHERT', x: 83, y: 73 },
+  ] : pt ? [
     { id: 'owner', label: 'PROPRIETÁRIO', meta: 'intenção / autoridade', state: 'PRONTO', x: 8, y: 48 },
     { id: 'supervisor', label: 'SUPERVISOR', meta: 'raiz do fluxo', state: 'EM EXECUÇÃO', x: 34, y: 48 },
     { id: 'worker-03', label: 'EXECUTOR 03', meta: 'contexto 02 / 02', state: 'EM EXECUÇÃO', x: 61, y: 17 },
@@ -68,7 +76,11 @@ export function ExecutionMesh({ locale = 'en' }: { locale?: Locale }) {
     { id: 'reviewer', label: 'РЕВЬЮЕР', meta: 'точка приёмки', state: 'ГОТОВ', x: 83, y: 34 },
     { id: 'result', label: 'СОХРАНЁННЫЙ РЕЗУЛЬТАТ', meta: 'результат · 8A17', state: 'СОХРАНЁН', x: 83, y: 73 },
   ] : nodes
-  const meshCopy = pt ? {
+  const meshCopy = de ? {
+    title: 'AUSFÜHRUNG / tm-web-p1', live: 'AKTIV', state: 'Beispielhafter Workflow-Status',
+    sequenced: 'WORKFLOW EINGEREIHT', supervisor: 'SUPERVISOR', flow: 'Auftrag → Worker → Reviewer → dauerhaftes Ergebnis',
+    capacity: 'Beispielhafte Kapazitätstelemetrie', resident: 'RESIDENT', provider: 'PROVIDER', work: 'ARBEIT', heavy: 'RECHENINTENSIV',
+  } : pt ? {
     title: 'EXECUÇÃO / tm-web-p1', live: 'ATIVO', state: 'Estado ilustrativo do fluxo',
     sequenced: 'FLUXO SEQUENCIADO', supervisor: 'SUPERVISOR', flow: 'intenção → executores → revisor → resultado durável',
     capacity: 'Telemetria ilustrativa de capacidade', resident: 'RESIDENTE', provider: 'PROVEDOR', work: 'TRABALHO', heavy: 'PESADA',

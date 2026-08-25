@@ -3,6 +3,8 @@ import { getDocs } from '@/lib/docs'
 import { docsPath, locales, localizedPath } from '@/lib/locales'
 import { site } from '@/lib/site'
 
+export const dynamic = 'force-static'
+
 export default function sitemap(): MetadataRoute.Sitemap {
   if (!site.siteUrl) return []
   return locales.flatMap(locale => [

@@ -2,7 +2,13 @@ import type { Metadata } from 'next'
 import { notFound } from 'next/navigation'
 import { DocsIndex } from '@/components/DocsIndex'
 import { canonicalUrl } from '@/lib/site'
-import { docsPath, isLocale, localeCopy, locales } from '@/lib/locales'
+import { docsPath, isLocale, localeCopy, locales, translatedLocales } from '@/lib/locales'
+
+export const dynamicParams = false
+
+export function generateStaticParams() {
+  return translatedLocales.map(locale => ({ locale }))
+}
 
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }): Promise<Metadata> {
   const { locale } = await params

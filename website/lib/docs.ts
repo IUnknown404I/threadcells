@@ -126,6 +126,8 @@ function rewriteLinks(markdown: string, source: string, slugs: Map<string, strin
 const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as { documents: ManifestDocument[] }
 const sources = new Map(manifest.documents.map(item => [safeSource(item.source), item.slug]))
 const cache = new Map<Locale, PublicDoc[]>()
+const localizationPlaceholder = /(?<![\p{L}\p{N}_])(?:TODO|TBD|TRANSLATE(?:D|\s+ME)?)(?![\p{L}\p{N}_])/u
+const loremPlaceholder = /(?<![\p{L}\p{N}_])LOREM\s+IPSUM(?![\p{L}\p{N}_])/iu
 
 function loadDocs(locale: Locale): PublicDoc[] {
   const existing = cache.get(locale)
@@ -135,7 +137,7 @@ function loadDocs(locale: Locale): PublicDoc[] {
     const canonical = fs.readFileSync(source, 'utf8')
     if (/\bTODO\b/i.test(canonical) || /[\u0400-\u04ff]/.test(canonical)) throw new Error(`Public documentation validation failed: ${item.source}`)
     const original = locale === 'en' ? canonical : translatedMarkdown(locale, item, source)
-    if (/\b(?:TODO|TBD|TRANSLATE)\b/i.test(original)) throw new Error(`Public localization validation failed: ${locale}/${item.slug}`)
+    if (locale !== 'en' && (localizationPlaceholder.test(original) || loremPlaceholder.test(original))) throw new Error(`Public localization validation failed: ${locale}/${item.slug}`)
     return {
       ...item,
       locale,

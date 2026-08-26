@@ -227,8 +227,8 @@ export interface Terminal {
   session_name: string
   agent_profile: string | null
   status: string | null
-  execution_state?: 'ready' | 'processing' | 'queued_provider_execution' | 'waiting_child_retirement' | 'waiting_workflow_continuation' | 'exited' | null
-  execution_wait_reason?: 'provider_capacity' | 'child_retirement' | 'workflow_continuation' | null
+  execution_state?: 'ready' | 'processing' | 'queued_provider_execution' | 'waiting_child_retirement' | 'waiting_resource_recovery' | 'waiting_runtime_recovery' | 'waiting_workflow_continuation' | 'exited' | null
+  execution_wait_reason?: 'provider_capacity' | 'child_retirement' | 'resource_health' | 'runtime_recovery' | 'workflow_continuation' | null
   lifecycle?: TerminalLifecycle | null
   workflow_state?: 'open' | 'active' | 'waiting' | 'recoverable' | 'result_ready' | 'owner_gate' | 'completed' | 'incomplete' | 'failed' | 'cancelled' | null
   workflow_status?: string | null

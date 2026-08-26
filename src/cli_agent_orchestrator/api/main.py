@@ -2023,7 +2023,7 @@ def _send_server_bound_input(
         if (
             not composer_submission
             or turn_id is None
-            or not queue_workflow_input_for_provider(terminal_id, turn_id, raw_message)
+            or not queue_workflow_input_for_provider(terminal_id, turn_id, raw_message, reason_code)
         ):
             return None
         inbox_service.wake_provider_execution_queue(get_plugin_registry(request))
@@ -2067,9 +2067,12 @@ def _send_server_bound_input(
                         )
                     ),
                     "reason_code": (
-                        "TERMINAL_RUNTIME_OPERATION_BUSY"
-                        if prepared.get("queue_reason") == "runtime_recovery"
-                        else "WORKFLOW_CONTINUATION_PENDING" if prepared["queued"] else None
+                        prepared.get("reason_code")
+                        or (
+                            "TERMINAL_RUNTIME_OPERATION_BUSY"
+                            if prepared.get("queue_reason") == "runtime_recovery"
+                            else "WORKFLOW_CONTINUATION_PENDING" if prepared["queued"] else None
+                        )
                     ),
                 }
                 if composer_submission:
@@ -2087,9 +2090,12 @@ def _send_server_bound_input(
                         else "queued_provider_execution"
                     ),
                     "reason_code": (
-                        "TERMINAL_RUNTIME_OPERATION_BUSY"
-                        if runtime_recovery
-                        else "WORKFLOW_CONTINUATION_PENDING"
+                        prepared.get("reason_code")
+                        or (
+                            "TERMINAL_RUNTIME_OPERATION_BUSY"
+                            if runtime_recovery
+                            else "WORKFLOW_CONTINUATION_PENDING"
+                        )
                     ),
                 }
                 if composer_submission:
@@ -2125,7 +2131,7 @@ def _send_server_bound_input(
         return response
     except AdmissionDenied as e:
         if turn_id is None or not queue_workflow_input_for_provider(
-            terminal_id, turn_id, raw_message
+            terminal_id, turn_id, raw_message, e.reason_code
         ):
             raise _admission_http_exception(e)
         inbox_service.wake_provider_execution_queue(get_plugin_registry(request))

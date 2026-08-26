@@ -77,7 +77,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
-from cli_agent_orchestrator.services import operations_service, workflow_service
+from cli_agent_orchestrator.services import inbox_service, operations_service, workflow_service
 from cli_agent_orchestrator.services.inbox_service import (
     LogFileHandler,
     _dispatch_pending_messages_with_admission,
@@ -252,10 +252,13 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
     database._migrate_workflow_turn_columns()
 
     with sqlite3.connect(database_file) as connection:
+        workflow_columns = {row[1] for row in connection.execute("PRAGMA table_info(workflows)")}
         columns = {row[1] for row in connection.execute("PRAGMA table_info(workflow_turns)")}
         receipt_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(workflow_turn_receipts)")
         }
+    assert "resumed_from_owner_gate_workflow_id" in workflow_columns
+    assert "queue_reason" in columns
     assert "provider_processing_observed_at" in columns
     assert "provider_ready_observed_at" in columns
     assert "provider_reconnect_requested_at" in columns
@@ -893,6 +896,212 @@ def test_f13_transport_retry_owner_gate_fences_its_pending_inbox(workflow_db):
         assert db.get(WorkflowModel, db.get(WorkflowTurnModel, stale_turn).workflow_id).status == (
             "owner_gate"
         )
+
+
+def test_owner_gate_composer_successor_survives_predecessor_retry_exhaustion(workflow_db):
+    """A committed owner decision wins the race with its predecessor's third failure."""
+    root = "root-owner-composer-successor"
+    _start_admitted_input(root)
+    assert set_workflow_terminal_state(root, "owner_gate", "owner decision")
+
+    first = database.prepare_workflow_input(
+        root,
+        "first owner continuation",
+        request_id="06b70814-681a-42e4-b207-5f195b5cac26",
+        require_live_terminal=True,
+    )
+    assert first["queued"] is False
+    assert database.queue_workflow_input_for_provider(
+        root, first["turn_id"], "first owner continuation", "PROVIDER_TRANSPORT_RETRY_PENDING"
+    )
+    now = datetime(2026, 8, 26, 12, 15, 52)
+    for attempt_at in (now, now + timedelta(seconds=1)):
+        claim = claim_workflow_turn(root, now=attempt_at)
+        assert claim is not None and claim["id"] == first["turn_id"]
+        assert requeue_workflow_turn(
+            claim["id"], claim["claim_token"], claim["claim_generation"], now=attempt_at
+        )
+
+    third_at = now + timedelta(seconds=3)
+    third = claim_workflow_turn(root, now=third_at)
+    assert third is not None and third["id"] == first["turn_id"]
+    successor = database.prepare_workflow_input(
+        root,
+        "the owner decision that raced the third failure",
+        request_id="b1fda06a-a5af-49d1-b039-c93b919071fd",
+        require_live_terminal=True,
+    )
+    assert successor["queued"] is True
+    assert successor["queue_reason"] == "workflow_predecessor"
+
+    assert requeue_workflow_turn(
+        third["id"],
+        third["claim_token"],
+        third["claim_generation"],
+        now=third_at,
+    )
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).order_by(WorkflowModel.id.desc()).first()
+        assert workflow.status == "open"
+        assert workflow.active_turn_id == successor["turn_id"]
+        assert workflow.resumed_from_owner_gate_workflow_id is not None
+        assert db.get(WorkflowTurnModel, first["turn_id"]).state == "cancelled"
+        queued = db.get(WorkflowTurnModel, successor["turn_id"])
+        assert queued.state == "queued"
+        assert queued.attempt_count == 0
+
+    claimed_successor = claim_workflow_turn(root, now=third_at)
+    assert claimed_successor is not None
+    assert claimed_successor["id"] == successor["turn_id"]
+    assert claim_workflow_turn(root, now=third_at) is None
+
+
+def test_resource_admission_deferral_never_consumes_transport_retry_budget(workflow_db):
+    root = "root-red-admission-deferral"
+    _start_admitted_input(root)
+    assert set_workflow_terminal_state(root, "owner_gate", "owner decision")
+    prepared = database.prepare_workflow_input(
+        root,
+        "recover while disk pressure is red",
+        request_id="53918e86-02af-4b8f-869a-20b68a8ee4dc",
+        require_live_terminal=True,
+    )
+    assert database.queue_workflow_input_for_provider(
+        root, prepared["turn_id"], "recover while disk pressure is red"
+    )
+    now = datetime(2026, 8, 26, 12, 30, 0)
+
+    for attempt in range(5):
+        attempt_at = now + timedelta(seconds=attempt * 2)
+        claim = claim_workflow_turn(root, now=attempt_at)
+        assert claim is not None and claim["id"] == prepared["turn_id"]
+        assert requeue_workflow_turn(
+            claim["id"],
+            claim["claim_token"],
+            claim["claim_generation"],
+            now=attempt_at,
+            admission_reason_code="RESOURCE_HEALTH_REJECTED",
+        )
+
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).order_by(WorkflowModel.id.desc()).first()
+        turn = db.get(WorkflowTurnModel, prepared["turn_id"])
+        assert workflow.status == "open"
+        assert workflow.active_turn_id == prepared["turn_id"]
+        assert turn.state == "queued"
+        assert turn.attempt_count == 0
+        assert turn.claim_generation == 5
+        assert turn.queue_reason == "RESOURCE_HEALTH_REJECTED"
+
+
+def test_restart_reopens_only_exact_stranded_owner_composer_successor(workflow_db):
+    root = "root-restart-owner-successor"
+    _ensure_running_test_terminal(root)
+    now = datetime(2026, 8, 26, 12, 45, 0)
+    with database.SessionLocal() as db:
+        prior = WorkflowModel(root_terminal_id=root, status="owner_gate")
+        stranded = WorkflowModel(
+            root_terminal_id=root,
+            status="owner_gate",
+            terminal_reason="bounded continuation transport retry guard",
+        )
+        db.add_all([prior, stranded])
+        db.flush()
+        cancelled = WorkflowTurnModel(
+            workflow_id=stranded.id,
+            kind="external_input",
+            dedupe_key="external_request:cancelled-head",
+            state="cancelled",
+            attempt_count=3,
+        )
+        queued = WorkflowTurnModel(
+            workflow_id=stranded.id,
+            kind="external_input",
+            dedupe_key="external_request:exact-successor",
+            payload="recover me once",
+            state="queued",
+        )
+        db.add_all([cancelled, queued])
+        db.flush()
+        stranded.active_turn_id = cancelled.id
+        prior_id = prior.id
+        queued_id = queued.id
+        db.commit()
+
+    assert database.reconcile_owner_gated_workflow_successors(now=now) == [root]
+    assert database.reconcile_owner_gated_workflow_successors(now=now) == []
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).order_by(WorkflowModel.id.desc()).first()
+        assert workflow.status == "open"
+        assert workflow.active_turn_id == queued_id
+        assert workflow.resumed_from_owner_gate_workflow_id == prior_id
+        assert workflow.terminal_reason is None
+        assert db.get(WorkflowTurnModel, queued_id).state == "queued"
+
+    claim = claim_workflow_turn(root, now=now)
+    assert claim is not None and claim["id"] == queued_id
+    assert claim_workflow_turn(root, now=now) is None
+
+
+def test_provider_queue_restart_recovery_sends_stranded_owner_successor_once(
+    workflow_db, monkeypatch
+):
+    root = "root-restart-owner-successor-send"
+    _ensure_running_test_terminal(root)
+    with database.SessionLocal() as db:
+        prior = WorkflowModel(root_terminal_id=root, status="owner_gate")
+        stranded = WorkflowModel(
+            root_terminal_id=root,
+            status="owner_gate",
+            terminal_reason="bounded continuation transport retry guard",
+        )
+        db.add_all([prior, stranded])
+        db.flush()
+        cancelled = WorkflowTurnModel(
+            workflow_id=stranded.id,
+            kind="external_input",
+            dedupe_key="external_request:cancelled-restart-head",
+            state="cancelled",
+            attempt_count=3,
+        )
+        queued = WorkflowTurnModel(
+            workflow_id=stranded.id,
+            kind="external_input",
+            dedupe_key="external_request:queued-restart-successor",
+            payload="deliver the existing owner continuation",
+            state="queued",
+        )
+        db.add_all([cancelled, queued])
+        db.flush()
+        stranded.active_turn_id = cancelled.id
+        queued_id = queued.id
+        db.commit()
+
+    send = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        workflow_service.terminal_service,
+        "get_terminal",
+        lambda *_: {"lifecycle": "running", "status": TerminalStatus.IDLE.value},
+    )
+    monkeypatch.setattr(
+        workflow_service.terminal_service,
+        "provider_runtime_sidecar_reconnect_required",
+        lambda *_: False,
+    )
+    monkeypatch.setattr(workflow_service.terminal_service, "send_input", send)
+
+    assert inbox_service.reconcile_provider_execution_queue() == 1
+    assert inbox_service.reconcile_provider_execution_queue() == 0
+    assert send.call_count == 1
+    assert f"logical-turn={queued_id}" in send.call_args.args[1]
+    assert send.call_args.args[1].endswith("deliver the existing owner continuation")
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).order_by(WorkflowModel.id.desc()).first()
+        turn = db.get(WorkflowTurnModel, queued_id)
+        assert workflow.status == "open"
+        assert workflow.active_turn_id == queued_id
+        assert turn.state == "sent"
+        assert turn.attempt_count == 1
 
 
 def test_f13_authoritative_child_terminalization_fences_pending_inbox(workflow_db):

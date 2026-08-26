@@ -681,6 +681,10 @@ class WorkflowModel(Base):
     # A receipt supplied by model text is not a capability by itself: it must
     # match this server-owned transport binding.
     active_turn_id = Column(Integer, nullable=True)
+    # A deliberate owner input may reopen a prior owner gate.  Retain that
+    # provenance so the resident recovery turn can be distinguished from
+    # autonomous continuation when disk pressure is RED.
+    resumed_from_owner_gate_workflow_id = Column(Integer, nullable=True)
     terminal_reason = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now)
@@ -701,6 +705,9 @@ class WorkflowTurnModel(Base):
     inbox_message_id = Column(Integer, nullable=True, unique=True)
     attempt_count = Column(Integer, nullable=False, default=0)
     not_before = Column(DateTime, nullable=True)
+    # The stable reason an executable turn is waiting before provider
+    # transport.  This is diagnostic/read-model state, never authority.
+    queue_reason = Column(String, nullable=True)
     # A lease alone is insufficient: a worker can wake after its lease was
     # reclaimed and accidentally commit the next worker's attempt.  Every
     # claimant receives a fresh opaque token and monotonically increasing
@@ -2235,6 +2242,10 @@ def _migrate_workflow_turn_columns() -> None:
         workflow_columns = {row[1] for row in conn.execute("PRAGMA table_info(workflows)")}
         if "active_turn_id" not in workflow_columns:
             conn.execute("ALTER TABLE workflows ADD COLUMN active_turn_id INTEGER")
+        if "resumed_from_owner_gate_workflow_id" not in workflow_columns:
+            conn.execute(
+                "ALTER TABLE workflows " "ADD COLUMN resumed_from_owner_gate_workflow_id INTEGER"
+            )
         columns = {row[1] for row in conn.execute("PRAGMA table_info(workflow_turns)")}
         if "claim_generation" not in columns:
             conn.execute(
@@ -2245,6 +2256,8 @@ def _migrate_workflow_turn_columns() -> None:
             conn.execute("ALTER TABLE workflow_turns ADD COLUMN claim_token TEXT")
         if "claim_expires_at" not in columns:
             conn.execute("ALTER TABLE workflow_turns ADD COLUMN claim_expires_at DATETIME")
+        if "queue_reason" not in columns:
+            conn.execute("ALTER TABLE workflow_turns ADD COLUMN queue_reason TEXT")
         if "transport_binding" not in columns:
             conn.execute("ALTER TABLE workflow_turns ADD COLUMN transport_binding TEXT")
         if "provider_processing_observed_at" not in columns:
@@ -3597,6 +3610,18 @@ WITH selected_terminals AS MATERIALIZED (
                              WHERE rr.terminal_id = t.id
                                AND rr.retirement_execution_pending = 1)
                   THEN 'waiting_child_retirement'
+             WHEN EXISTS (
+               SELECT 1 FROM workflows qw JOIN workflow_turns qt ON qt.workflow_id = qw.id
+               WHERE qw.root_terminal_id = t.id AND qw.status = 'open'
+                 AND qt.state = 'queued' AND qt.queue_reason = 'RESOURCE_HEALTH_REJECTED'
+             ) THEN 'waiting_resource_recovery'
+             WHEN EXISTS (
+               SELECT 1 FROM workflows qw JOIN workflow_turns qt ON qt.workflow_id = qw.id
+               WHERE qw.root_terminal_id = t.id AND qw.status = 'open'
+                 AND qt.state = 'queued'
+                 AND qt.queue_reason IN ('TERMINAL_RUNTIME_OPERATION_BUSY',
+                                         'TERMINAL_RUNTIME_RECONNECT_PENDING')
+             ) THEN 'waiting_runtime_recovery'
              WHEN (EXISTS (
                SELECT 1 FROM workflows qw JOIN workflow_turns qt ON qt.workflow_id = qw.id
                WHERE qw.root_terminal_id = t.id AND qw.status = 'open' AND qt.state = 'queued'
@@ -5787,7 +5812,7 @@ def _prepare_workflow_input(
                 )
                 queued = executable_queue
                 db.commit()
-                return {
+                prepared = {
                     "accepted": True,
                     "turn_id": cast(int, existing.id),
                     "queued": queued,
@@ -5798,12 +5823,28 @@ def _prepare_workflow_input(
                     ),
                     "duplicate": True,
                 }
+                if queued and existing.queue_reason not in {
+                    None,
+                    "TERMINAL_RUNTIME_OPERATION_BUSY",
+                    "WORKFLOW_CONTINUATION_PENDING",
+                }:
+                    prepared["reason_code"] = existing.queue_reason
+                return prepared
         workflow = _open_workflow(db, root_terminal_id, create=True)
         assert workflow is not None
         if workflow.status != WORKFLOW_OPEN:
             # A deliberate new user input starts a new semantic workflow after
             # a prior terminal/owner/cancelled outcome.
-            workflow = WorkflowModel(root_terminal_id=root_terminal_id, status=WORKFLOW_OPEN)
+            prior_workflow = workflow
+            workflow = WorkflowModel(
+                root_terminal_id=root_terminal_id,
+                status=WORKFLOW_OPEN,
+                resumed_from_owner_gate_workflow_id=(
+                    cast(int, prior_workflow.id)
+                    if prior_workflow.status == WORKFLOW_OWNER_GATE
+                    else None
+                ),
+            )
             db.add(workflow)
             db.flush()
         runtime_owned = False
@@ -5842,6 +5883,11 @@ def _prepare_workflow_input(
             # interruption before receipt can replay this exact logical turn.
             payload=payload,
             state=TURN_QUEUED if queued else TURN_SENT,
+            queue_reason=(
+                "TERMINAL_RUNTIME_OPERATION_BUSY"
+                if runtime_owned
+                else "WORKFLOW_CONTINUATION_PENDING" if workflow_predecessor else None
+            ),
             transport_binding=transport_binding,
         )
         db.add(turn)
@@ -5869,6 +5915,12 @@ def _prepare_workflow_input(
                 else "workflow_predecessor" if workflow_predecessor else None
             ),
         }
+        if queued and turn.queue_reason not in {
+            None,
+            "TERMINAL_RUNTIME_OPERATION_BUSY",
+            "WORKFLOW_CONTINUATION_PENDING",
+        }:
+            prepared["reason_code"] = turn.queue_reason
         if request_id is not None or require_live_terminal:
             prepared.update({"accepted": True, "duplicate": False})
         return prepared
@@ -5909,7 +5961,10 @@ def start_workflow_input(root_terminal_id: str) -> Optional[int]:
 
 
 def queue_workflow_input_for_provider(
-    root_terminal_id: str, logical_turn_id: int, payload: str
+    root_terminal_id: str,
+    logical_turn_id: int,
+    payload: str,
+    reason_code: Optional[str] = None,
 ) -> bool:
     """Retain an unsent direct input in the existing workflow-turn queue."""
     _ensure_workflow_schema()
@@ -5932,6 +5987,7 @@ def queue_workflow_input_for_provider(
                 {
                     WorkflowTurnModel.payload: payload,
                     WorkflowTurnModel.state: TURN_QUEUED,
+                    WorkflowTurnModel.queue_reason: reason_code,
                     WorkflowTurnModel.claim_token: None,
                     WorkflowTurnModel.claim_expires_at: None,
                     WorkflowTurnModel.updated_at: datetime.now(),
@@ -6101,6 +6157,112 @@ def get_workflow_status(root_terminal_id: str) -> Optional[str]:
     with SessionLocal() as db:
         workflow = _open_workflow(db, root_terminal_id, create=False)
         return workflow.status if workflow is not None else None
+
+
+def is_owner_gate_resume_turn(root_terminal_id: str, logical_turn_id: int) -> bool:
+    """Return whether an explicit resident turn continues a prior owner gate."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        prior_owner_gate = aliased(WorkflowModel)
+        return (
+            db.query(WorkflowTurnModel.id)
+            .join(WorkflowModel, WorkflowTurnModel.workflow_id == WorkflowModel.id)
+            .join(
+                prior_owner_gate,
+                prior_owner_gate.id == WorkflowModel.resumed_from_owner_gate_workflow_id,
+            )
+            .filter(
+                WorkflowTurnModel.id == logical_turn_id,
+                WorkflowTurnModel.kind == "external_input",
+                WorkflowModel.root_terminal_id == root_terminal_id,
+                WorkflowModel.status == WORKFLOW_OPEN,
+                prior_owner_gate.root_terminal_id == root_terminal_id,
+                prior_owner_gate.status == WORKFLOW_OWNER_GATE,
+            )
+            .first()
+            is not None
+        )
+
+
+def reconcile_owner_gated_workflow_successors(now: Optional[datetime] = None) -> List[str]:
+    """Reopen latest owner gates which already contain an explicit queued successor.
+
+    A transport retry can exhaust immediately after a newer Composer request
+    commits behind the claimed head.  The newer request is the owner's durable
+    decision to continue; leaving it under an OWNER_GATE workflow makes it
+    impossible to claim.  This restart-safe transaction promotes that exact
+    row without creating a replacement turn or reviving Inbox callbacks.
+    """
+    _ensure_workflow_schema()
+    now = now or datetime.now()
+    reopened: List[str] = []
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        workflows = (
+            db.query(WorkflowModel)
+            .filter(WorkflowModel.status == WORKFLOW_OWNER_GATE)
+            .order_by(WorkflowModel.id.asc())
+            .all()
+        )
+        for workflow in workflows:
+            if (
+                db.query(WorkflowModel.id)
+                .filter(
+                    WorkflowModel.root_terminal_id == workflow.root_terminal_id,
+                    WorkflowModel.id > workflow.id,
+                )
+                .first()
+                is not None
+            ):
+                continue
+            terminal = db.get(TerminalModel, cast(str, workflow.root_terminal_id))
+            if terminal is None or terminal.runtime_lifecycle in ("exit_pending", "exited"):
+                continue
+            active = (
+                db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
+                if workflow.active_turn_id is not None
+                else None
+            )
+            if active is None or active.state != TURN_CANCELLED:
+                continue
+            successor = (
+                db.query(WorkflowTurnModel)
+                .filter(
+                    WorkflowTurnModel.workflow_id == workflow.id,
+                    WorkflowTurnModel.id > active.id,
+                    WorkflowTurnModel.kind == "external_input",
+                    WorkflowTurnModel.inbox_message_id.is_(None),
+                    WorkflowTurnModel.state == TURN_QUEUED,
+                )
+                .order_by(WorkflowTurnModel.id.asc())
+                .first()
+            )
+            if successor is None:
+                continue
+            if workflow.resumed_from_owner_gate_workflow_id is None:
+                prior_owner_gate = (
+                    db.query(WorkflowModel.id)
+                    .filter(
+                        WorkflowModel.root_terminal_id == workflow.root_terminal_id,
+                        WorkflowModel.id < workflow.id,
+                        WorkflowModel.status == WORKFLOW_OWNER_GATE,
+                    )
+                    .order_by(WorkflowModel.id.desc())
+                    .first()
+                )
+                if prior_owner_gate is not None:
+                    workflow.resumed_from_owner_gate_workflow_id = cast(int, prior_owner_gate[0])
+            workflow.status = WORKFLOW_OPEN
+            workflow.active_turn_id = successor.id
+            workflow.terminal_reason = None
+            workflow.no_progress_count = 0
+            workflow.updated_at = now
+            successor.queue_reason = "WORKFLOW_CONTINUATION_PENDING"
+            successor.not_before = None
+            successor.updated_at = now
+            reopened.append(cast(str, workflow.root_terminal_id))
+        db.commit()
+    return reopened
 
 
 def get_terminal_workflow_projection(terminal_id: str) -> Dict[str, Optional[str]]:
@@ -6470,22 +6632,29 @@ def get_terminal_execution_projection(terminal_id: str) -> Dict[str, Any]:
         )
         if retirement_pending:
             return {"active_turn": False, "wait_reason": "child_retirement"}
-        queued = (
-            unadmitted_waiting
-            or _terminal_has_pending_provider_reconnect(db, terminal_id)
-            or bool(
-                db.query(WorkflowTurnModel.id)
-                .join(WorkflowModel, WorkflowTurnModel.workflow_id == WorkflowModel.id)
-                .filter(
-                    WorkflowModel.root_terminal_id == terminal_id,
-                    WorkflowModel.status == WORKFLOW_OPEN,
-                    WorkflowTurnModel.state == TURN_QUEUED,
-                )
-                .first()
+        queued_row = (
+            db.query(WorkflowTurnModel)
+            .join(WorkflowModel, WorkflowTurnModel.workflow_id == WorkflowModel.id)
+            .filter(
+                WorkflowModel.root_terminal_id == terminal_id,
+                WorkflowModel.status == WORKFLOW_OPEN,
+                WorkflowTurnModel.state == TURN_QUEUED,
             )
+            .order_by(WorkflowTurnModel.id.asc())
+            .first()
         )
+        pending_reconnect = _terminal_has_pending_provider_reconnect(db, terminal_id)
+        queued = unadmitted_waiting or pending_reconnect or queued_row is not None
         if not queued:
             return {"active_turn": False, "wait_reason": None}
+        if queued_row is not None and queued_row.queue_reason == "RESOURCE_HEALTH_REJECTED":
+            return {"active_turn": False, "wait_reason": "resource_health"}
+        if pending_reconnect or (
+            queued_row is not None
+            and queued_row.queue_reason
+            in {"TERMINAL_RUNTIME_OPERATION_BUSY", "TERMINAL_RUNTIME_RECONNECT_PENDING"}
+        ):
+            return {"active_turn": False, "wait_reason": "runtime_recovery"}
         settings = db.get(CapacitySettingsModel, 1)
         if settings is not None and db.query(ProviderExecutionLeaseModel).count() >= int(
             settings.max_provider_executions
@@ -8625,6 +8794,7 @@ def mark_workflow_turn_sent(
             .update(
                 {
                     WorkflowTurnModel.state: TURN_SENT,
+                    WorkflowTurnModel.queue_reason: None,
                     WorkflowTurnModel.claim_token: None,
                     WorkflowTurnModel.claim_expires_at: None,
                     WorkflowTurnModel.updated_at: now,
@@ -8659,8 +8829,16 @@ def requeue_workflow_turn(
     claim_token: str,
     claim_generation: int,
     now: Optional[datetime] = None,
+    admission_reason_code: Optional[str] = None,
 ) -> bool:
-    """Retry only the live claimant's failed pre-send attempt."""
+    """Return only the live claimant to an executable durable state.
+
+    Operational admission deferrals are not provider transport failures and
+    therefore do not consume the bounded transport retry budget.  If a real
+    transport failure exhausts that budget while an explicit Composer
+    successor is already queued, promote that exact successor instead of
+    stranding it beneath an owner gate.
+    """
     _ensure_workflow_schema()
     now = now or datetime.now()
     with SessionLocal() as db:
@@ -8675,14 +8853,40 @@ def requeue_workflow_turn(
             WorkflowTurnModel.claim_expires_at: None,
             WorkflowTurnModel.updated_at: now,
         }
-        owner_gate = cast(int, turn.attempt_count) >= 3
+        admission_deferred = admission_reason_code is not None
+        owner_gate = not admission_deferred and cast(int, turn.attempt_count) >= 3
+        successor = None
+        if owner_gate:
+            successor = (
+                db.query(WorkflowTurnModel)
+                .filter(
+                    WorkflowTurnModel.workflow_id == workflow.id,
+                    WorkflowTurnModel.id > turn.id,
+                    WorkflowTurnModel.kind == "external_input",
+                    WorkflowTurnModel.inbox_message_id.is_(None),
+                    WorkflowTurnModel.state == TURN_QUEUED,
+                )
+                .order_by(WorkflowTurnModel.id.asc())
+                .first()
+            )
+        close_for_owner_gate = owner_gate and successor is None
         if owner_gate:
             values[WorkflowTurnModel.state] = TURN_CANCELLED
+            values[WorkflowTurnModel.queue_reason] = "PROVIDER_TRANSPORT_RETRY_EXHAUSTED"
         else:
             values[WorkflowTurnModel.state] = TURN_QUEUED
-            values[WorkflowTurnModel.not_before] = datetime.fromtimestamp(
-                now.timestamp() + 2 ** (turn.attempt_count - 1)
-            )
+            if admission_deferred:
+                # claim_workflow_turn increments before the policy probe. Put
+                # that accounting back so a long-lived RED/capacity wait can
+                # never masquerade as repeated transport breakage.
+                values[WorkflowTurnModel.attempt_count] = max(0, cast(int, turn.attempt_count) - 1)
+                values[WorkflowTurnModel.not_before] = datetime.fromtimestamp(now.timestamp() + 2)
+                values[WorkflowTurnModel.queue_reason] = admission_reason_code
+            else:
+                values[WorkflowTurnModel.not_before] = datetime.fromtimestamp(
+                    now.timestamp() + 2 ** (cast(int, turn.attempt_count) - 1)
+                )
+                values[WorkflowTurnModel.queue_reason] = "PROVIDER_TRANSPORT_RETRY_PENDING"
         requeued = (
             db.query(WorkflowTurnModel)
             .filter(
@@ -8698,13 +8902,24 @@ def requeue_workflow_turn(
             db.rollback()
             return False
         workflow_values: Dict[Any, Any] = {WorkflowModel.updated_at: now}
-        if owner_gate:
+        if close_for_owner_gate:
             workflow_values.update(
                 {
                     WorkflowModel.status: WORKFLOW_OWNER_GATE,
                     WorkflowModel.terminal_reason: "bounded continuation transport retry guard",
                 }
             )
+        elif successor is not None:
+            workflow_values.update(
+                {
+                    WorkflowModel.active_turn_id: successor.id,
+                    WorkflowModel.terminal_reason: None,
+                    WorkflowModel.no_progress_count: 0,
+                }
+            )
+            successor.queue_reason = "WORKFLOW_CONTINUATION_PENDING"
+            successor.not_before = None
+            successor.updated_at = now
         workflow_updated = (
             db.query(WorkflowModel)
             .filter(WorkflowModel.id == workflow.id, WorkflowModel.status == WORKFLOW_OPEN)
@@ -8713,10 +8928,10 @@ def requeue_workflow_turn(
         if workflow_updated != 1:
             db.rollback()
             return False
-        if owner_gate:
+        if close_for_owner_gate:
             _fail_closed_workflow_inbox_transports_in_transaction(db, workflow_id=int(workflow.id))
         db.commit()
-        if owner_gate:
+        if close_for_owner_gate:
             _dispatch_workflow_notification_fail_open(
                 str(workflow.root_terminal_id), "owner_attention", int(workflow.id)
             )

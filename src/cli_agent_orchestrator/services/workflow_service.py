@@ -444,7 +444,15 @@ def _reconcile_root_workflow_with_admission(
         logger.warning(
             "Workflow continuation %s failed for %s: %s", turn["id"], root_terminal_id, exc
         )
-        requeue_workflow_turn(turn["id"], turn["claim_token"], turn["claim_generation"], now=now)
+        from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+        requeue_workflow_turn(
+            turn["id"],
+            turn["claim_token"],
+            turn["claim_generation"],
+            now=now,
+            admission_reason_code=(exc.reason_code if isinstance(exc, AdmissionDenied) else None),
+        )
         return False
 
 

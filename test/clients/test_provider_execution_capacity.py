@@ -176,6 +176,124 @@ def test_operations_admission_uses_same_atomic_capacity_snapshot(capacity_db, mo
     }
 
 
+def test_owner_gate_composer_resume_is_recovery_safe_for_disk_only_red(capacity_db, monkeypatch):
+    initial = database.start_workflow_input("term-0")
+    assert initial is not None
+    assert database.set_workflow_terminal_state("term-0", "owner_gate", "owner decision")
+    resumed = database.prepare_workflow_input(
+        "term-0",
+        "recover the resident workflow",
+        request_id="ffebfd8c-cf1d-41a7-aa0e-0b584f7b9d6c",
+        require_live_terminal=True,
+    )
+    red_disk = {
+        "resource_state": "RED",
+        "reasons": ["ROOT_DISK_PRESSURE", "root_free_below_green"],
+    }
+    monkeypatch.setattr(operations_service, "get_resource_status", lambda _config: red_disk)
+
+    operations_service.acquire_provider_execution_slot(
+        "term-0",
+        resumed["turn_id"],
+        config={
+            "max_provider_executions": 3,
+            "lock_dir": str(capacity_db / "locks"),
+            "context_launch_lock_timeout_seconds": 1,
+        },
+    )
+
+    assert database.get_provider_execution_turn("term-0") == resumed["turn_id"]
+
+
+def test_owner_gate_composer_resume_still_fails_closed_for_non_disk_red(capacity_db, monkeypatch):
+    initial = database.start_workflow_input("term-0")
+    assert initial is not None
+    assert database.set_workflow_terminal_state("term-0", "owner_gate", "owner decision")
+    resumed = database.prepare_workflow_input(
+        "term-0",
+        "must wait for memory recovery",
+        request_id="e7cadb6f-0e76-45a6-9305-c4fef1a539e6",
+        require_live_terminal=True,
+    )
+    red_memory = {
+        "resource_state": "RED",
+        "reasons": ["critical_memory_pressure"],
+    }
+    monkeypatch.setattr(operations_service, "get_resource_status", lambda _config: red_memory)
+
+    with pytest.raises(operations_service.AdmissionDenied) as denied:
+        operations_service.acquire_provider_execution_slot(
+            "term-0",
+            resumed["turn_id"],
+            config={
+                "max_provider_executions": 3,
+                "lock_dir": str(capacity_db / "locks"),
+                "context_launch_lock_timeout_seconds": 1,
+            },
+        )
+
+    assert denied.value.reason_code == "RESOURCE_HEALTH_REJECTED"
+    assert database.get_provider_execution_turn("term-0") is None
+
+
+def test_disk_red_recovery_requires_same_terminal_owner_gate_provenance(capacity_db, monkeypatch):
+    initial = database.start_workflow_input("term-0")
+    assert initial is not None
+    assert database.set_workflow_terminal_state("term-0", "owner_gate", "owner decision")
+    resumed = database.prepare_workflow_input(
+        "term-0",
+        "must retain exact owner provenance",
+        request_id="282f4ec4-d87f-4679-86f4-6cf239d59ee0",
+        require_live_terminal=True,
+    )
+    with database.SessionLocal() as db:
+        unrelated = database.WorkflowModel(root_terminal_id="term-1", status="owner_gate")
+        db.add(unrelated)
+        db.flush()
+        current = (
+            db.query(database.WorkflowModel)
+            .filter_by(root_terminal_id="term-0")
+            .order_by(database.WorkflowModel.id.desc())
+            .first()
+        )
+        current.resumed_from_owner_gate_workflow_id = unrelated.id
+        db.commit()
+
+    monkeypatch.setattr(
+        operations_service,
+        "get_resource_status",
+        lambda _config: {
+            "resource_state": "RED",
+            "reasons": ["ROOT_DISK_PRESSURE", "root_free_below_green"],
+        },
+    )
+    with pytest.raises(operations_service.AdmissionDenied) as denied:
+        operations_service.acquire_provider_execution_slot(
+            "term-0",
+            resumed["turn_id"],
+            config={
+                "max_provider_executions": 3,
+                "lock_dir": str(capacity_db / "locks"),
+                "context_launch_lock_timeout_seconds": 1,
+            },
+        )
+
+    assert denied.value.reason_code == "RESOURCE_HEALTH_REJECTED"
+
+
+def test_resource_deferred_turn_has_truthful_durable_wait_projection(capacity_db):
+    turn_id = database.start_workflow_input("term-0")
+    assert turn_id is not None
+    assert database.queue_workflow_input_for_provider(
+        "term-0", turn_id, "wait safely", "RESOURCE_HEALTH_REJECTED"
+    )
+
+    assert database.get_terminal_execution_projection("term-0") == {
+        "active_turn": False,
+        "wait_reason": "resource_health",
+    }
+
+
 def test_runtime_release_wakes_queued_input_once_without_owner_resend(capacity_db, monkeypatch):
     message = database.create_inbox_message("owner", "term-0", "continue once")
     provider = SimpleNamespace(

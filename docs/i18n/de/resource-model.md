@@ -1,7 +1,7 @@
 ---
 slug: resource-model
 source: docs/RESOURCE_MODEL.md
-source_sha256: sha256:6eaee9cd5449ab9af23c8a9ce5b6687e73b301bb445da3e35de369a65fa05bb2
+source_sha256: sha256:50fdcf87c80a11bbd1e8d9c210e584f2640a388c71882bd4b2bf06af0b27f725
 ---
 
 # Kapazitäts- und Ressourcenmodell
@@ -74,6 +74,8 @@ Der Datenträgerstatus verwendet exakte Schwellen:
   Grund `DISK_CRITICAL`, während die datenträgerspezifische Projektion CRITICAL meldet.
 
 YELLOW fordert dazu auf, Wachstum zu prüfen und Housekeeping zu planen. RED kann riskante neue Arbeit ablehnen und wiederherstellungssichere Bereinigung zulassen. Unbekannter Zustand schlägt fehlgeschlossen fehl; ThreadCells nimmt nicht an, dass ein unlesbares Dateisystem gesund ist.
+
+Eine ausdrückliche Workflow-Composer-Entscheidung für einen bereits residenten Workflow im Owner-Gate ist auch unter ausschließlich datenträgerbedingtem RED ein enger Wiederherstellungspfad: Sie belegt normale Anbieter-Kapazität, erstellt aber keinen Work-Kontext. RED durch Speicher, PSI, unbekannte oder gemischte Gründe wird weiterhin fehlgeschlossen abgelehnt; der dauerhafte Zug zeigt stattdessen einen Wartegrund für die Ressourcenwiederherstellung an, ohne Transportwiederholungen zu verbrauchen.
 
 ## Draining nach einer Verringerung
 

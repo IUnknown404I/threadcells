@@ -1,7 +1,7 @@
 ---
 slug: resource-model
 source: docs/RESOURCE_MODEL.md
-source_sha256: sha256:6eaee9cd5449ab9af23c8a9ce5b6687e73b301bb445da3e35de369a65fa05bb2
+source_sha256: sha256:50fdcf87c80a11bbd1e8d9c210e584f2640a388c71882bd4b2bf06af0b27f725
 ---
 # 容量とリソースモデル
 
@@ -73,6 +73,8 @@ ThreadCells は、設定済みカウントとともにホストの圧迫を監�
   `DISK_CRITICAL` 理由を含みます。一方、ディスク固有の投影は CRITICAL と報告します。
 
 YELLOW は増加を調査して Housekeeping を計画する合図です。RED はリスクのある新しい作業を拒否し、復旧に安全なクリーンアップを受け入れることができます。不明な状態はフェイルクローズします。ThreadCells は読み取れないファイルシステムが正常だと仮定しません。
+
+すでに常駐しているオーナーゲート状態のワークフローに対する明示的な Workflow Composer の決定は、ディスクのみが原因の RED でも限定的な復旧経路になります。通常の Provider 容量は使用しますが、Work コンテキストは作成しません。メモリ、PSI、不明または複合的な RED は引き続きフェイルクローズし、永続ターンは転送再試行を消費せずにリソース復旧の待機理由を表示します。
 
 ## 削減後のドレイン
 

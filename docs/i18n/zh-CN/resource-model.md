@@ -1,7 +1,7 @@
 ---
 slug: resource-model
 source: docs/RESOURCE_MODEL.md
-source_sha256: sha256:6eaee9cd5449ab9af23c8a9ce5b6687e73b301bb445da3e35de369a65fa05bb2
+source_sha256: sha256:50fdcf87c80a11bbd1e8d9c210e584f2640a388c71882bd4b2bf06af0b27f725
 ---
 # 容量和资源模型
 
@@ -73,6 +73,8 @@ ThreadCells 会将主机压力与配置的计数一同观察。许多原生 CLI�
   `DISK_CRITICAL` 原因；磁盘专属投影报告 CRITICAL。
 
 YELLOW 提示应检查增长并计划 Housekeeping。RED 可拒绝有风险的新工作，并准入恢复安全的清理。未知状态会闭合失败；ThreadCells 不会假设不可读的文件系统是健康的。
+
+对于已驻留且处于所有者关卡的工作流，Workflow Composer 中的明确决定在仅由磁盘导致 RED 时也是一条范围受限的恢复路径：它占用普通 Provider 容量，但不会创建 Work 上下文。由内存、PSI、未知或混合原因导致的 RED 仍会按 fail-closed 原则拒绝；持久回合会显示资源恢复等待原因，而不会消耗传输重试次数。
 
 ## 降低限制后的排空
 

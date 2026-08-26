@@ -1,7 +1,7 @@
 ---
 slug: workflows-and-results
 source: docs/WORKFLOWS_AND_RESULTS.md
-source_sha256: sha256:d6a1133dbc73417c1e5cfc8d6b96037535cf4b5552bd094cbb4efad93351fc0a
+source_sha256: sha256:2075858d138b70bafe8c6605e1d77b69a0aafee4faaa8042ef3437e6ebae71ff
 ---
 
 # Flujos de trabajo y resultados duraderos
@@ -76,9 +76,13 @@ Usa una puerta del propietario cuando el siguiente paso necesite autoridad que l
 
 No uses una puerta del propietario simplemente porque el trabajo sea lento, falle una prueba o termine un turno de proveedor. Continúa primero cualquier trabajo independiente elegible.
 
+Un mensaje nuevo en Workflow Composer es la decisión del propietario que reanuda un flujo de trabajo residente elegible. ThreadCells conserva la procedencia de la puerta del propietario y admite exactamente una vez el turno duradero. Si la solicitud ya estaba en cola cuando su predecesor agotó los reintentos de transporte, el turno del propietario se promueve atómicamente en vez de quedar oculto bajo otra puerta. Una denegación transitoria de capacidad o de política de recursos deja un motivo de espera duradero y explícito, sin consumir el presupuesto de fallos de transporte.
+
 ## Recuperación
 
 Al reiniciar, ThreadCells reconstruye la propiedad del flujo de trabajo desde el estado duradero. Los resultados entregados pero no acusados siguen disponibles. Un handoff en espera puede reanudarse con el mismo hijo en vez de lanzar un duplicado. Una vez que se admite un turno lógico más nuevo para un flujo de trabajo abierto, una continuación pendiente más antigua queda sustituida de forma duradera y no puede reproducirse después como trabajo independiente tras una compactación o interrupción.
+
+La reconciliación al reiniciar también vuelve a abrir el flujo de trabajo más reciente en puerta del propietario cuando su cabecera de transporte cancelada ya tiene un sucesor explícito posterior de Composer. Promueve ese sucesor existente sin crear un turno de reemplazo y nunca usa esta reparación para revivir callbacks de Inbox ni terminales Exited.
 
 Si la ejecución del proveedor o del modelo se interrumpe después de admitir su entrada lógica pero antes de terminar el trabajo requerido, ThreadCells la reanuda mediante un nuevo turno de continuación duradero en lugar de reproducir el receipt original. Los efectos completados siguen cercados, la propiedad de ejecución del proveedor acompaña al turno reanudado y el mismo resultado inmutable del hijo y la barrera de finalización siguen disponibles para incorporarlos y confirmarlos exactamente una vez.
 

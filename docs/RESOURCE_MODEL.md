@@ -69,6 +69,8 @@ Disk status uses exact thresholds:
 
 YELLOW is a prompt to inspect growth and plan Housekeeping. RED can deny risky new work and admit recovery-safe cleanup. Unknown state fails closed; ThreadCells does not assume an unreadable filesystem is healthy.
 
+An explicit Workflow Composer decision for an already-resident owner-gated workflow is also a narrow recovery path under disk-only RED: it acquires ordinary Provider capacity but does not create a Work context. Memory, PSI, unknown, or mixed RED still rejects it, and the durable turn exposes a resource-recovery wait instead of consuming transport retries.
+
 ## Draining after a reduction
 
 Lowering a limit never kills active work. If current usage is above the new value, that category becomes **draining** and denies new admissions until active usage falls within the limit.

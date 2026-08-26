@@ -13,6 +13,8 @@ export function lifecycleBadgeStatus(
     : executionState === 'processing' ? 'Processing'
     : executionState === 'queued_provider_execution' ? 'WaitingProviderSlot'
     : executionState === 'waiting_child_retirement' ? 'WaitingChildRetirement'
+    : executionState === 'waiting_resource_recovery' ? 'WaitingResourceRecovery'
+    : executionState === 'waiting_runtime_recovery' ? 'WaitingRuntimeRecovery'
     : executionState === 'waiting_workflow_continuation' ? 'WaitingWorkflowContinuation'
     : providerStatus === 'processing' ? 'Processing' : 'Ready'
   return `WORKFLOW_${workflowState.toUpperCase()}::${provider}`
@@ -63,6 +65,8 @@ const STATUS_CONFIG: Record<string, StatusStyle> = {
   },
   WAITINGPROVIDERSLOT: { label: 'Queued · Waiting for provider slot', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
   WAITINGCHILDRETIREMENT: { label: 'Queued · Waiting for child retirement', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
+  WAITINGRESOURCERECOVERY: { label: 'Queued · Waiting for resource recovery', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
+  WAITINGRUNTIMERECOVERY: { label: 'Queued · Waiting for runtime recovery', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
   WAITINGWORKFLOWCONTINUATION: { label: 'Queued · Waiting for workflow continuation', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
   READY: {
     label: 'Ready',

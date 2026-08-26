@@ -60,6 +60,7 @@ from cli_agent_orchestrator.clients.database import (
     materialize_deferred_handoff_result_turn_for_inbox,
     reconcile_closed_workflow_inbox_transports,
     reconcile_exited_terminal_workflow_authorities,
+    reconcile_owner_gated_workflow_successors,
     reconcile_superseded_workflow_turns_for_restart,
     request_workflow_provider_reconnect,
     requeue_unacknowledged_child_assignment_results,
@@ -362,13 +363,15 @@ def _dispatch_pending_messages_with_admission(
         return True
     except Exception as e:
         logger.error(f"Failed to send message {message.id} to {terminal_id}: {e}")
+        from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
         if workflow_claim is not None:
             requeue_workflow_turn(
                 workflow_claim["id"],
                 workflow_claim["claim_token"],
                 workflow_claim["claim_generation"],
+                admission_reason_code=(e.reason_code if isinstance(e, AdmissionDenied) else None),
             )
-        from cli_agent_orchestrator.services.operations_service import AdmissionDenied
 
         if isinstance(e, AdmissionDenied) and e.reason_code in {
             "PROVIDER_EXECUTION_CAPACITY_EXHAUSTED",
@@ -444,6 +447,10 @@ def _reconcile_provider_execution_queue_with_admission(
         # Inbox work after the receiver had already crossed to Exited. Retire
         # that false authority before it can occupy the shared FIFO.
         reconcile_exited_terminal_workflow_authorities()
+        # A Composer successor committed just before its predecessor exhausted
+        # transport retries is the owner's durable decision to continue. Make
+        # that exact turn claimable before constructing the shared FIFO.
+        reconcile_owner_gated_workflow_successors()
         # Remove rows whose exact workflow has already closed before building
         # the merged queue. Otherwise that stale Inbox head suppresses the
         # same resident's queued OPEN-workflow turn for the whole scan. The

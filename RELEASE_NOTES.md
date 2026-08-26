@@ -7,6 +7,7 @@ ThreadCells `v0.3.0-alpha.2` is a corrective prerelease for the accepted `v0.3.0
 - Workflow Composer requests now carry a stable client request identity. The server persists each executable turn exactly once, retains the payload before provider transport, and safely replays the same turn after an interruption or runtime reconnect.
 - API and Web UI submission results distinguish immediate admission, durable queueing, runtime recovery, duplicate acceptance, and lifecycle conflicts. A generic green success message is no longer shown for input that is only queued.
 - A valid Ready resident terminal remains wakeable after normal completion, a prior completed workflow, runtime-generation change, or interrupted provider work. Distinct sequential inputs retain FIFO order without duplicate provider execution.
+- A Composer decision submitted from an owner gate now durably records its resume provenance. If it races an exhausted predecessor, ThreadCells promotes the exact queued successor rather than leaving it beneath a new owner gate; transient resource admission records an explicit wait reason without consuming transport retries. Disk-only RED may admit this narrow resident recovery path, while provider limits and every non-disk RED reason remain fail-closed.
 - Durable terminal exit now atomically closes executable workflows, cancels queued or claimed turns, terminally fails pending Inbox transport, releases provider and writer authority, and fences parent/child execution edges while preserving historical rows and results.
 - New Inbox or Composer input targeting an Exited terminal is rejected or retained only as failed, non-executable history. A rolling reconciliation repairs stale rows created by older runtimes before provider admission or Full Cleanup planning.
 - Unexpected-runtime-exit notifications are bound to the exact workflow that won the atomic cancellation transition, including a workflow replacement racing terminal exit.
@@ -16,7 +17,7 @@ ThreadCells `v0.3.0-alpha.2` is a corrective prerelease for the accepted `v0.3.0
 
 ## Lifecycle invariant
 
-A Ready resident terminal can receive valid new work through Workflow Composer without manual provider-terminal input or process recreation. An Exited terminal cannot acquire or retain executable provider, workflow, Inbox, writer, or filesystem-mutation authority. Durable history remains queryable in both cases.
+A Ready resident terminal can receive valid new work through Workflow Composer without manual provider-terminal input or process recreation. A durable owner-gate decision either resumes its exact turn or exposes why that turn is waiting; it cannot remain hidden beneath a closed workflow. An Exited terminal cannot acquire or retain executable provider, workflow, Inbox, writer, or filesystem-mutation authority. Durable history remains queryable in both cases.
 
 ## Install or upgrade
 

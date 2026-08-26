@@ -615,8 +615,20 @@ def acquire_provider_execution_slot(
 ) -> None:
     """Acquire provider-turn authority immediately before physical transport."""
     cfg = _canonical_capacity_config(config or load_operations_config())
-    status = require_resource_admission(cfg)
-    from cli_agent_orchestrator.clients.database import acquire_provider_execution_decision
+    from cli_agent_orchestrator.clients.database import (
+        acquire_provider_execution_decision,
+        is_owner_gate_resume_turn,
+    )
+
+    # An explicit owner decision for an already-resident workflow is the
+    # recovery channel for disk pressure itself.  It consumes no new Work
+    # context and remains subject to the provider limit.  Only disk-derived
+    # RED is bypassed; memory, PSI, unknown health, and mixed RED fail closed.
+    status = (
+        _recovery_safe_resource_status(cfg)
+        if is_owner_gate_resume_turn(terminal_id, workflow_turn_id)
+        else require_resource_admission(cfg)
+    )
 
     lock_dir = Path(str(cfg["lock_dir"]))
     lock_dir.mkdir(parents=True, exist_ok=True)
@@ -656,11 +668,12 @@ def set_capacity_settings(values: Mapping[str, Any], *, actor: str) -> dict[str,
     return updated
 
 
-def _recovery_safe_heavy_status(config: Mapping[str, Any]) -> dict[str, Any]:
-    """Admit only the disk-pressure recovery exception without recursion.
+def _recovery_safe_resource_status(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Admit only a disk-pressure recovery exception without recursion.
 
-    Housekeeping may need a heavy slot precisely while the root filesystem is
-    RED.  That exception must not turn memory or PSI RED into a global bypass.
+    Housekeeping or an explicit resident owner continuation may be needed
+    precisely while the root filesystem is RED.  That exception must not turn
+    memory, PSI, unknown, or mixed RED into a global bypass.
     Calling ``require_resource_admission`` here would recursively launch the
     same pressure recovery, so inspect the current projection directly.
     """
@@ -672,6 +685,11 @@ def _recovery_safe_heavy_status(config: Mapping[str, Any]) -> dict[str, Any]:
     if status.get("resource_state") == "RED" and (not reasons or non_disk_reasons):
         raise AdmissionDenied("RESOURCE_HEALTH_REJECTED", status)
     return status
+
+
+def _recovery_safe_heavy_status(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Compatibility name for the recovery-safe Housekeeping admission."""
+    return _recovery_safe_resource_status(config)
 
 
 @contextmanager

@@ -209,18 +209,28 @@ def _runtime_identity(runtime_user: str):
     original_euid = os.geteuid()
     original_egid = os.getegid()
     original_groups = os.getgroups()
+    original_home = os.environ.get("HOME")
     if original_euid != 0:
         raise FullCleanupHelperError("FULL_CLEANUP_HELPER_PRIVILEGE_REQUIRED")
     runtime_groups = os.getgrouplist(runtime_user, account.pw_gid)
     os.setgroups(runtime_groups)
     os.setegid(account.pw_gid)
     os.seteuid(account.pw_uid)
+    # The one-shot starts as root, but runtime configuration and database paths
+    # belong to the configured service account.  Rebind HOME before any lazy
+    # runtime imports so Path.home() cannot retain the privileged account's
+    # inaccessible state root after the effective identity is dropped.
+    os.environ["HOME"] = account.pw_dir
     try:
         yield account
     finally:
         os.seteuid(original_euid)
         os.setgroups(original_groups)
         os.setegid(original_egid)
+        if original_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = original_home
 
 
 def _handle_request(connection: socket.socket) -> dict[str, Any]:

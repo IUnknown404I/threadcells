@@ -3,7 +3,6 @@ import os
 import pwd
 import socket
 import threading
-from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -75,19 +74,28 @@ def test_helper_reauthenticates_existing_session_before_canonical_execution(monk
     authenticated = []
     executed = []
     inventory_calls = []
-    config = {"runtime_user": pwd.getpwuid(os.getuid()).pw_name}
+    runtime_account = pwd.getpwuid(os.getuid())
+    config = {"runtime_user": runtime_account.pw_name}
+    identity_transitions = []
+    monkeypatch.setenv("HOME", "/root")
     monkeypatch.setattr(os, "geteuid", lambda: 0)
     monkeypatch.setattr(
-        "cli_agent_orchestrator.services.full_cleanup_helper._runtime_identity",
-        lambda _user: nullcontext(),
+        os, "setgroups", lambda groups: identity_transitions.append(("groups", groups))
     )
+    monkeypatch.setattr(os, "setegid", lambda gid: identity_transitions.append(("egid", gid)))
+    monkeypatch.setattr(os, "seteuid", lambda uid: identity_transitions.append(("euid", uid)))
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.operations_service._load_legacy_operations_config",
         lambda: config,
     )
+
+    def load_runtime_config():
+        assert os.environ["HOME"] == runtime_account.pw_dir
+        return config
+
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.operations_service.load_operations_config",
-        lambda: config,
+        load_runtime_config,
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.full_cleanup_helper._peer_holds_full_cleanup_fences",
@@ -185,6 +193,13 @@ def test_helper_reauthenticates_existing_session_before_canonical_execution(monk
         client.close()
 
     assert authenticated == ["opaque"]
+    assert os.environ["HOME"] == "/root"
+    assert identity_transitions[0][0] == "groups"
+    assert identity_transitions[-3:] == [
+        ("euid", 0),
+        ("groups", os.getgroups()),
+        ("egid", os.getegid()),
+    ]
     assert len(executed) == 1
     assert executed[0][0].candidates == (path_candidate,)
     assert executed[0][1]["full_cleanup"] is True

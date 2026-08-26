@@ -6,7 +6,7 @@ Type=exec
 User=root
 Group=root
 WorkingDirectory=/srv/agent-control
-Environment=HOME=/root
+Environment=HOME=/home/agentctl
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PATH=/var/lib/threadcells/active/runtime/bin:/srv/agent-control/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EnvironmentFile=/etc/agent-control/cao.env

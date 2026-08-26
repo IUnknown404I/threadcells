@@ -59,7 +59,7 @@ From the repository root:
 
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
-candidate="$PWD/threadcells-candidate/threadcells-0.3.0a1-local"
+candidate="$PWD/threadcells-candidate/threadcells-0.3.0a2-local"
 python3 scripts/verify_local_candidate.py --candidate "$candidate"
 ```
 

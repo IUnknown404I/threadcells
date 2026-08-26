@@ -1,7 +1,7 @@
 ---
 slug: deployment
 source: docs/DEPLOYMENT.md
-source_sha256: sha256:102efc5fcdd5dd4c0459381d07a5bb5a20c23f7e6e76af9e3b4f9e882905b909
+source_sha256: sha256:952a25cc4d8f85fc4ea89cf2d7d9cb999316f9335209fc5a1598092827939f37
 ---
 # ローカルデプロイメント
 
@@ -14,7 +14,7 @@ ThreadCells のデプロイメントは、検証済みの不変候補をロー�
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
 python3 scripts/verify_local_candidate.py \
-  --candidate "$PWD/threadcells-candidate/threadcells-0.3.0a1-local"
+  --candidate "$PWD/threadcells-candidate/threadcells-0.3.0a2-local"
 ```
 
 候補には、同じリビジョン由来の Python コード、パッケージ化された Web アセット、許可リスト済み Docs バンドル、ビルド ID、チェックサム、リリースメタデータが含まれている必要があります。

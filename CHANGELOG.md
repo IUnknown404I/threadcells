@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0-alpha.2] - 2026-08-26
+
+### Fixed
+
+- Make Workflow Composer input durable and idempotent, preserve payloads for restart recovery, and report admitted, queued, duplicate, and recovery states truthfully in the API and Web UI.
+- Atomically fence workflow turns, Inbox transport, provider execution, and writer authority when a terminal exits; reject new executable input to Exited terminals and reconcile stale historical authority without deleting audit evidence.
+- Bind unexpected-runtime-exit notifications to the exact workflow cancelled by the atomic exit transition.
+
+### Safety
+
+- Preserve the opposite lifecycle guarantees together: Ready resident terminals remain wakeable, while Exited terminals cannot regain executable authority or block Full Cleanup idle truth.
+
 ## [0.3.0-alpha.1] - 2026-08-25
 
 ### Added
@@ -362,4 +374,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bump to v0.51.0, update method name (#31)
 
 - accept optional U+03BB (λ) after % in kiro and q CLIs (#44)
-

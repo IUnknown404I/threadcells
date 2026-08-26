@@ -1,7 +1,7 @@
 ---
 slug: deployment
 source: docs/DEPLOYMENT.md
-source_sha256: sha256:102efc5fcdd5dd4c0459381d07a5bb5a20c23f7e6e76af9e3b4f9e882905b909
+source_sha256: sha256:952a25cc4d8f85fc4ea89cf2d7d9cb999316f9335209fc5a1598092827939f37
 ---
 # 本地部署
 
@@ -14,7 +14,7 @@ ThreadCells 部署会将已验证的不可变候选版本提升到本地运行�
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
 python3 scripts/verify_local_candidate.py \
-  --candidate "$PWD/threadcells-candidate/threadcells-0.3.0a1-local"
+  --candidate "$PWD/threadcells-candidate/threadcells-0.3.0a2-local"
 ```
 
 候选版本应包含来自同一修订版本的 Python 代码、打包 Web 资源、allowlist 中的 Docs bundle、构建身份、校验和和发布元数据。

@@ -16,14 +16,14 @@ class TestServerConstants:
     def test_server_version_matches_release(self):
         from cli_agent_orchestrator.constants import SERVER_VERSION
 
-        assert SERVER_VERSION == "0.3.0-alpha.1"
+        assert SERVER_VERSION == "0.3.0-alpha.2"
 
     def test_package_metadata_matches_alpha_release(self):
         project = tomllib.loads(
             (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
         )["project"]
 
-        assert project["version"] == "0.3.0a1"
+        assert project["version"] == "0.3.0a2"
         assert "Development Status :: 3 - Alpha" in project["classifiers"]
         assert "Development Status :: 4 - Beta" not in project["classifiers"]
 

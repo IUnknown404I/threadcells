@@ -1,7 +1,7 @@
 ---
 slug: installation
 source: docs/INSTALLATION.md
-source_sha256: sha256:46aff338b12f623ad4b53af24c0b814206cd6f4ff5044bde2791fd27f93f9fc9
+source_sha256: sha256:a189b43dfe9b1b57700c30e1f4d29ecf8c1acf1ea30782bdfb8bc6cc89c2cdea
 ---
 # Установка
 
@@ -64,7 +64,7 @@ ThreadCells может регистрировать адаптеры, CLI кот
 
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
-candidate="$PWD/threadcells-candidate/threadcells-0.3.0a1-local"
+candidate="$PWD/threadcells-candidate/threadcells-0.3.0a2-local"
 python3 scripts/verify_local_candidate.py --candidate "$candidate"
 ```
 

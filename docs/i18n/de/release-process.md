@@ -1,7 +1,7 @@
 ---
 slug: release-process
 source: docs/RELEASE_PROCESS.md
-source_sha256: sha256:d29545876d24bcb5241d2bdfb0a418fa9eb4ec740b2d26ab04fdec9f5dcab5ae
+source_sha256: sha256:32ddd4290143495cfd2a5ecac89482b3a07edee43c35691465bfecea882ced0e
 ---
 # Release-Prozess
 
@@ -36,6 +36,7 @@ ThreadCells folgt der normalen SemVer-Prerelease-Reihenfolge. Während der Alpha
 - `v0.1.0-alpha.2` ist eine unveränderliche veröffentlichte technische Vorschau.
 - `v0.2.0-alpha.1` ist die konsolidierte Release-Linie für Mehrsprachigkeit und Zuverlässigkeit.
 - `v0.3.0-alpha.1` ergänzt Lifecycle-Konsistenz, dauerhafte Erstellungsreihenfolge, Full Cleanup und eine systemische Routing-Richtlinie.
+- `v0.3.0-alpha.2` korrigiert die Workflow-Composer-Zustellung und macht den Terminal-Exit für ausführbare Workflow-Autorität endgültig.
 - Eine spätere Veröffentlichung in derselben Release-Linie erhöht nur die Alpha-Sequenz; ein neuer Produkt-Umriss erhöht die semantische Version bewusst.
 
 Verschieben Sie niemals ein bestehendes Tag. Änderungen allein an der Repository-Governance lösen weder eine Versionsänderung noch ein Release aus. Aktualisieren Sie alle kanonischen versionstragenden Oberflächen gemeinsam erst dann, wenn der nächste wesentliche Implementierungs-Umriss für die Veröffentlichung bereit ist.

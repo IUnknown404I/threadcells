@@ -115,14 +115,35 @@ def _valid_verification_candidate(tmp_path: Path) -> Path:
     readme_checksum = hashlib.sha256((candidate / "README.md").read_bytes()).hexdigest()
     docs = candidate / "docs"
     docs.mkdir()
+    (docs / "ru").mkdir()
+    translated = docs / "ru" / "candidate.md"
+    translated.write_text("# Локализованный кандидат\n", encoding="utf-8")
+    translated_checksum = hashlib.sha256(translated.read_bytes()).hexdigest()
     (docs / "DOCS_MANIFEST.json").write_text(
-        json.dumps({"documents": [{"source": "README.md"}]}) + "\n", encoding="utf-8"
+        json.dumps({"documents": [{"slug": "candidate", "source": "README.md"}]}) + "\n",
+        encoding="utf-8",
     )
     (candidate / "web" / "public" / "docs-bundle.json").write_text(
         json.dumps(
             {
+                "schema": 2,
                 "commit": "a" * 40,
-                "documents": [{"source": "README.md", "sha256": readme_checksum}],
+                "locales": {
+                    "en": [
+                        {
+                            "slug": "candidate",
+                            "source": "README.md",
+                            "sha256": readme_checksum,
+                        }
+                    ],
+                    "ru": [
+                        {
+                            "slug": "candidate",
+                            "source": "README.md",
+                            "sha256": translated_checksum,
+                        }
+                    ],
+                },
             }
         )
         + "\n",
@@ -497,6 +518,17 @@ def test_candidate_verifier_rejects_tampered_brand_checksum_file(tmp_path: Path)
     assert "checksum mismatch: brand/SHA256SUMS" in errors
     assert "candidate manifest mismatch: brand/SHA256SUMS" in errors
     assert "brand checksum mismatch: ../web/public/brand-asset.txt" in errors
+
+
+def test_candidate_verifier_rejects_tampered_russian_document(tmp_path: Path) -> None:
+    candidate = _valid_verification_candidate(tmp_path)
+    (candidate / "docs" / "ru" / "candidate.md").write_text(
+        "# Повреждённый перевод\n", encoding="utf-8"
+    )
+
+    errors = _candidate_verifier_module().verify(candidate)
+
+    assert "packaged Russian documentation content mismatch: candidate" in errors
 
 
 def test_dependency_owner_packet_is_deterministic_and_non_clearance(tmp_path: Path) -> None:

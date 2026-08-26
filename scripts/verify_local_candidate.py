@@ -178,7 +178,11 @@ def verify(candidate: Path) -> list[str]:
     source_paths = {item["source"] for item in docs_manifest.get("documents", [])}
     if not source_paths or any(not (candidate / source).is_file() for source in source_paths):
         errors.append("candidate is missing an allowlisted documentation source")
-    bundled_documents = docs_bundle.get("documents", [])
+    schema = docs_bundle.get("schema", 1)
+    locales = docs_bundle.get("locales", {}) if schema == 2 else {}
+    bundled_documents = (
+        locales.get("en", []) if isinstance(locales, dict) else []
+    ) if schema == 2 else docs_bundle.get("documents", [])
     if not isinstance(bundled_documents, list):
         errors.append("packaged documentation bundle is malformed")
         bundled_documents = []
@@ -192,6 +196,21 @@ def verify(candidate: Path) -> list[str]:
         for source in source_paths:
             if bundled_by_source[source].get("sha256") != digest(candidate / source):
                 errors.append(f"packaged documentation content mismatch: {source}")
+    if schema == 2:
+        russian_documents = locales.get("ru", []) if isinstance(locales, dict) else []
+        manifest_slugs = {
+            item.get("slug") for item in docs_manifest.get("documents", []) if item.get("slug")
+        }
+        if not isinstance(russian_documents, list) or {
+            item.get("slug") for item in russian_documents if isinstance(item, dict)
+        } != manifest_slugs:
+            errors.append("packaged Russian documentation does not match the candidate manifest")
+        else:
+            russian_by_slug = {item["slug"]: item for item in russian_documents}
+            for slug in manifest_slugs:
+                source = candidate / "docs" / "ru" / f"{slug}.md"
+                if not source.is_file() or russian_by_slug[slug].get("sha256") != digest(source):
+                    errors.append(f"packaged Russian documentation content mismatch: {slug}")
     sbom = json.loads((candidate / "sbom.cdx.json").read_text(encoding="utf-8"))
     if sbom.get("bomFormat") != "CycloneDX" or not sbom.get("components"):
         errors.append("SBOM is not a populated CycloneDX inventory")

@@ -14,12 +14,12 @@ from cli_agent_orchestrator.services.full_cleanup_helper import (
     _handle_request,
     execute_via_privileged_helper,
 )
-from cli_agent_orchestrator.services.operator_auth_service import OperatorAuthUnavailable
 from cli_agent_orchestrator.services.housekeeping.executor import ExecutionReport
 from cli_agent_orchestrator.services.housekeeping.models import (
     HousekeepingCandidate,
     HousekeepingPlan,
 )
+from cli_agent_orchestrator.services.operator_auth_service import OperatorAuthUnavailable
 
 
 def test_privileged_helper_client_uses_bounded_unix_protocol(tmp_path):

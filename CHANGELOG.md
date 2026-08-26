@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Atomically fence workflow turns, Inbox transport, provider execution, and writer authority when a terminal exits; reject new executable input to Exited terminals and reconcile stale historical authority without deleting audit evidence.
 - Bind unexpected-runtime-exit notifications to the exact workflow cancelled by the atomic exit transition.
 - Keep filesystem-intensive Housekeeping plans alive beyond the ordinary Web request timeout, show deterministic plan/preview progress and product-safe errors, and serialize read-only inventory under the canonical Housekeeping lock.
-- Initialize the privileged Full Cleanup helper with the runtime account's canonical home so its fail-closed socket path can load runtime state before executing an owner-authorized plan.
+- Initialize the privileged Full Cleanup helper with the runtime account's canonical home and an explicit minimal capability bound for identity, ownership, permission, and signal operations before executing an owner-authorized plan.
 
 ### Safety
 

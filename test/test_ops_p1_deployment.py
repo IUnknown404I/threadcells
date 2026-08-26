@@ -275,7 +275,15 @@ def test_stage_ops_p1_is_dry_run_capable_and_idempotent(tmp_path):
     )
     assert "StandardInput=socket" in full_cleanup_helper
     assert "StandardOutput=socket" in full_cleanup_helper
-    assert "NoNewPrivileges=true" in full_cleanup_helper
+    assert "NoNewPrivileges=false" in full_cleanup_helper
+    assert "NoNewPrivileges=true" not in full_cleanup_helper
+    assert (
+        "CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID "
+        "CAP_SETUID" in full_cleanup_helper
+    )
+    assert "CAP_DAC_READ_SEARCH" not in full_cleanup_helper
+    assert "CAP_FOWNER" not in full_cleanup_helper
+    assert "RestrictSUIDSGID=true" in full_cleanup_helper
     assert "RestrictAddressFamilies=AF_UNIX" in full_cleanup_helper
     socket_enablement = (
         system_root / "etc/systemd/system/sockets.target.wants/agent-control-full-cleanup.socket"

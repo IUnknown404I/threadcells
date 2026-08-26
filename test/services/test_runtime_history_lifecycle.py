@@ -101,7 +101,7 @@ def test_positive_death_releases_runtime_ownership_but_preserves_history(lifecyc
     assert terminal_service.get_output("writer00") == "durable terminal output"
     assert get_inbox_messages("writer00")[0].message == "durable inbox history"
     assert get_delegation_result_for_assignment("writer00") is not None
-    assert get_workflow_status("writer00") == "open"
+    assert get_workflow_status("writer00") == "cancelled"
 
     _terminal("writer01", "cao-new", "/worktree-a", write_enabled=True)
     assert get_terminal_metadata("writer00") is not None

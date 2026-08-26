@@ -136,14 +136,21 @@ def record_external_input(root_terminal_id: str) -> int:
     return turn_id
 
 
-def prepare_external_input(root_terminal_id: str, payload: str) -> dict:
+def prepare_external_input(
+    root_terminal_id: str, payload: str, *, request_id: str | None = None
+) -> dict:
     """Persist a user/scheduled input, deferring behind runtime recovery."""
     from cli_agent_orchestrator.services.operations_service import (
         workflow_execution_admission_fence,
     )
 
     with workflow_execution_admission_fence():
-        prepared = prepare_workflow_input(root_terminal_id, payload)
+        prepared = prepare_workflow_input(
+            root_terminal_id,
+            payload,
+            request_id=request_id,
+            require_live_terminal=True,
+        )
     if prepared is None:
         raise RuntimeError(f"Could not create workflow turn for {root_terminal_id}")
     return prepared

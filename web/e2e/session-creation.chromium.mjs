@@ -59,7 +59,7 @@ const server = http.createServer((request, response) => {
     request.on('end', () => {
       deliveredMessage = JSON.parse(Buffer.concat(chunks).toString()).message
       resolveMessageDelivered()
-      json(response, { success: true })
+      json(response, { success: true, accepted: true, duplicate: false, turn_id: 74, queued: false, status: 'provider_admitted', reason_code: null })
     })
     return
   }

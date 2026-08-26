@@ -64,7 +64,7 @@ const server = http.createServer((request, response) => {
     request.on('end', () => {
       workflowInputs.push({ url: request.url, body: JSON.parse(Buffer.concat(chunks).toString()) })
       resolveWorkflowInput()
-      json(response, { success: true })
+      json(response, { success: true, accepted: true, duplicate: false, turn_id: 73, queued: false, status: 'provider_admitted', reason_code: null })
     })
     return
   }
@@ -224,6 +224,7 @@ try {
     'composer line one\ncomposer line two\n\nAttached terminal paths:\n- /runtime/terminal-attachments/e2e-terminal/attachment-1.md',
   )
   assert.equal(new URL(workflowInputs[0].url, origin).search, '', 'Composer message must not be serialized into the URI')
+  assert.match(workflowInputs[0].body.request_id, /^[0-9a-f-]{36}$/i, 'Composer submission must carry a stable request identity')
   await page.getByRole('button', { name: 'Send task' }).waitFor({ state: 'visible' })
   const composerSurface = page.getByTestId('workflow-composer-surface')
   const composerBox = await composerSurface.boundingBox()

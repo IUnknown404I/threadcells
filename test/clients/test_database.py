@@ -1001,6 +1001,7 @@ class TestFlowOperations:
         mock_session.__enter__ = MagicMock(return_value=mock_session)
         mock_session.__exit__ = MagicMock(return_value=False)
         mock_session_class.return_value = mock_session
+        mock_session.get.return_value = MagicMock(runtime_lifecycle="running")
 
         # Setup mock to update message attributes on refresh
         def mock_refresh(msg):

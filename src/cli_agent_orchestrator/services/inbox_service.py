@@ -59,6 +59,7 @@ from cli_agent_orchestrator.clients.database import (
     mark_workflow_turn_sent_for_inbox,
     materialize_deferred_handoff_result_turn_for_inbox,
     reconcile_closed_workflow_inbox_transports,
+    reconcile_exited_terminal_workflow_authorities,
     reconcile_superseded_workflow_turns_for_restart,
     request_workflow_provider_reconnect,
     requeue_unacknowledged_child_assignment_results,
@@ -439,6 +440,10 @@ def _reconcile_provider_execution_queue_with_admission(
     if not _provider_queue_reconcile_lock.acquire(blocking=False):
         return 0
     try:
+        # Rolling-upgrade repair: older runtimes could materialize ordinary
+        # Inbox work after the receiver had already crossed to Exited. Retire
+        # that false authority before it can occupy the shared FIFO.
+        reconcile_exited_terminal_workflow_authorities()
         # Remove rows whose exact workflow has already closed before building
         # the merged queue. Otherwise that stale Inbox head suppresses the
         # same resident's queued OPEN-workflow turn for the whole scan. The

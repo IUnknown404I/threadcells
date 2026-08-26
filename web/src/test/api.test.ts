@@ -21,12 +21,24 @@ describe('API wrapper', () => {
 
     const failure = api.deleteTerminal('terminal-id')
     await expect(failure).rejects.toMatchObject({
-      title: 'Операция недоступна',
+      title: 'Сначала завершите терминал',
+      description: 'Используйте корректное завершение и дождитесь, пока ThreadCells подтвердит остановку провайдера, прежде чем удалять историю терминала.',
       reasonCode: 'TERMINAL_RUNTIME_ACTIVE',
       status: 409,
     })
     await expect(failure).rejects.not.toThrow('private backend detail')
     expect(mockFetch).toHaveBeenCalledWith('/terminals/terminal-id', expect.objectContaining({ method: 'DELETE' }))
+  })
+
+  it('keeps exact Full Cleanup idle guidance in Russian reason-code copy', async () => {
+    localStorage.setItem(APP_LOCALE_STORAGE_KEY, 'ru')
+    mockResponse({ reason_code: 'FULL_CLEANUP_NOT_IDLE' }, 409)
+
+    await expect(api.runFullCleanup('a'.repeat(64))).rejects.toMatchObject({
+      title: 'Агенты ещё работают',
+      description: 'Полная очистка доступна, только когда каждый агент готов или завершён, а выполнения провайдера и тяжёлые операции простаивают.',
+      reasonCode: 'FULL_CLEANUP_NOT_IDLE',
+    })
   })
 
   function mockResponse(data: unknown, status = 200) {

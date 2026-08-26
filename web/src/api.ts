@@ -43,7 +43,7 @@ export interface WorkflowInputResponse {
   reason_code: string | null
 }
 
-const REASON_COPY: Record<string, [string, string]> = {
+const REASON_COPY = {
   WORKTREE_WRITER_LEASE_HELD: ['Working directory is locked', 'Another active write-capable agent is already using this working directory. Gracefully exit that agent or choose another working directory.'],
   WORKTREE_AUTHORITY_UNRECONCILED: ['Working directory needs attention', 'ThreadCells could not verify worktree authority. Reconcile the existing worktree before starting another writer.'],
   TOTAL_PROVIDER_CAPACITY_EXHAUSTED: ['Capacity limit reached', 'No compatible provider slot is currently available. Wait for an active agent to finish or choose another provider.'],
@@ -73,7 +73,41 @@ const REASON_COPY: Record<string, [string, string]> = {
   SESSION_RUNTIME_ACTIVE: ['Exit every agent first', 'A live or Ready agent still owns this session. Gracefully exit every agent before deleting the session.'],
   SESSION_RUNTIME_AUTHORITY_UNPROVEN: ['Session runtime authority is uncertain', 'ThreadCells could not prove that every historical runtime is gone, so the session remains protected.'],
   EXIT_PANE_AMBIGUOUS: ['Terminal exit needs attention', 'The terminal window has multiple panes. Resolve the terminal layout before trying Graceful Exit again.'],
-}
+} satisfies Record<string, [string, string]>
+
+type KnownReasonCode = keyof typeof REASON_COPY
+
+const REASON_COPY_RU = {
+  WORKTREE_WRITER_LEASE_HELD: ['Рабочая папка заблокирована', 'Эту рабочую папку уже использует другой активный агент с правом записи. Корректно завершите его или выберите другую рабочую папку.'],
+  WORKTREE_AUTHORITY_UNRECONCILED: ['Требуется проверить рабочую папку', 'ThreadCells не удалось подтвердить полномочия рабочего дерева. Согласуйте существующее рабочее дерево, прежде чем запускать другого агента с правом записи.'],
+  TOTAL_PROVIDER_CAPACITY_EXHAUSTED: ['Достигнут предел ёмкости', 'Сейчас нет свободного слота совместимого провайдера. Дождитесь завершения активного агента или выберите другого провайдера.'],
+  PROVIDER_EXECUTION_CAPACITY_EXHAUSTED: ['Ходы провайдера поставлены в очередь', 'Все слоты выполнения провайдера заняты. Эта задача продолжится автоматически после освобождения слота.'],
+  RESIDENT_SUPERVISOR_CAPACITY_EXHAUSTED: ['Достигнут предел резидентных супервизоров', 'Уже запущено пять резидентных супервизоров. Завершите одного из них перед запуском нового супервизора проекта.'],
+  PROJECT_SUPERVISOR_ALREADY_RESIDENT: ['Супервизор проекта уже запущен', 'Откройте или повторно используйте существующий супервизор этого проекта.'],
+  WORK_CONTEXT_CAPACITY_EXHAUSTED: ['Достигнут предел ёмкости', 'Сейчас нет свободного совместимого рабочего слота. Дождитесь завершения активной работы и повторите попытку.'],
+  RESOURCE_HEALTH_REJECTED: ['Ресурсы ThreadCells недоступны', 'ThreadCells временно отклонил новую работу из-за состояния ресурсов хоста. Дождитесь восстановления ресурсов.'],
+  CONTEXT_INVENTORY_UNAVAILABLE: ['Сведения о ёмкости недоступны', 'ThreadCells пока не может безопасно подтвердить доступную ёмкость выполнения. Дождитесь восстановления инвентаризации среды и повторите попытку.'],
+  ADMISSION_FENCE_TIMEOUT: ['Истекло время допуска', 'ThreadCells не успел безопасно зарезервировать слот. Повторите попытку чуть позже.'],
+  HEAVY_SLOT_WAIT_TIMEOUT: ['Достигнут предел ёмкости', 'Совместимый слот тяжёлой операции не освободился вовремя. Повторите попытку после завершения активной работы.'],
+  HOUSEKEEPING_PLAN_CHANGED: ['План обслуживания изменился', 'Проверенный план больше не соответствует текущему состоянию очистки. Постройте и проверьте новый план перед выполнением.'],
+  HOUSEKEEPING_BUSY: ['Обслуживание уже выполняется', 'Каноническая блокировка занята другой операцией обслуживания. Дождитесь её завершения и постройте новый план.'],
+  FULL_CLEANUP_ADMISSION_BUSY: ['Полную очистку нельзя запустить', 'Граница допуска агента занята. Дождитесь простоя агентов и постройте новый предпросмотр.'],
+  FULL_CLEANUP_NOT_IDLE: ['Агенты ещё работают', 'Полная очистка доступна, только когда каждый агент готов или завершён, а выполнения провайдера и тяжёлые операции простаивают.'],
+  FULL_CLEANUP_IDLE_INVENTORY_UNKNOWN: ['Не удалось подтвердить простой', 'ThreadCells не удалось подтвердить простой всех агентов и каналов выполнения, поэтому полная очистка заблокирована.'],
+  OPERATOR_AUTH_NOT_CONFIGURED: ['Авторизация оператора недоступна', 'Привилегированный помощник полной очистки не смог проверить настроенные полномочия оператора. Файлы не удалялись.'],
+  TERMINAL_RUNTIME_ACTIVE: ['Сначала завершите терминал', 'Используйте корректное завершение и дождитесь, пока ThreadCells подтвердит остановку провайдера, прежде чем удалять историю терминала.'],
+  TERMINAL_EXIT_PENDING: ['Терминал ещё завершается', 'ThreadCells пока не подтвердил остановку провайдера. Дождитесь согласования завершения, прежде чем удалять историю терминала.'],
+  TERMINAL_DEATH_UNCONFIRMED: ['Остановка терминала не подтверждена', 'ThreadCells не смог вывести из среды именно этот завершённый процесс, поэтому метаданные терминала остаются защищены.'],
+  TERMINAL_RUNTIME_AUTHORITY_UNCERTAIN: ['Полномочия терминала неясны', 'ThreadCells не удалось проверить точную идентичность среды терминала, поэтому метаданные остаются защищены.'],
+  TERMINAL_IDENTITY_CHANGED: ['Идентичность терминала изменилась', 'Во время удаления изменились полномочия терминала. Обновите данные и повторите попытку после согласования жизненного цикла.'],
+  TERMINAL_RUNTIME_NOT_WRITABLE: ['Агент завершён', 'Этот исторический агент не может получать новые задачи редактора рабочего процесса. Откройте готового агента.'],
+  WORKFLOW_INPUT_IDEMPOTENCY_CONFLICT: ['Задача рабочего процесса изменилась', 'Этот идентификатор повтора уже связан с другим текстом задачи. Измените черновик и отправьте его как новую задачу.'],
+  WORKFLOW_INPUT_NO_LONGER_EXECUTABLE: ['Задачу рабочего процесса больше нельзя выполнить', 'Этот идентификатор повтора относится к ходу, который закрылся до допуска. Отправьте текст ещё раз как новую задачу.'],
+  TERMINAL_WORKTREE_PROTECTED: ['Управляемое рабочее дерево сохранено', 'Историю терминала нельзя удалить: его управляемое рабочее дерево содержит состояние, которое должно оставаться восстанавливаемым.'],
+  SESSION_RUNTIME_ACTIVE: ['Сначала завершите всех агентов', 'В этой сессии остаётся активный или готовый агент. Корректно завершите всех агентов перед удалением сессии.'],
+  SESSION_RUNTIME_AUTHORITY_UNPROVEN: ['Полномочия среды сессии не подтверждены', 'ThreadCells не удалось подтвердить остановку всех исторических процессов, поэтому сессия остаётся защищена.'],
+  EXIT_PANE_AMBIGUOUS: ['Требуется проверить завершение терминала', 'В окне терминала несколько панелей. Исправьте структуру терминала и повторите корректное завершение.'],
+} satisfies Record<KnownReasonCode, [string, string]>
 
 type ErrorKeyPair = readonly [TranslationKey, TranslationKey]
 
@@ -139,8 +173,13 @@ export function normalizeApiError(status: number, body: ApiFailureBody | null, s
   const diagnosticId = typeof diagnosticValue === 'string' && /^[0-9a-f]{32}$/.test(diagnosticValue) ? diagnosticValue : undefined
   const locale = readStoredAppLocale()
   const translated = (reasonCode && REASON_KEYS[reasonCode] && localizedPair(REASON_KEYS[reasonCode])) || (STATUS_KEYS[status] && localizedPair(STATUS_KEYS[status]))
-  const englishKnown = locale === 'en' && reasonCode ? REASON_COPY[reasonCode] : undefined
-  const [title, description] = englishKnown || translated || [translate(locale, 'error.generic.title'), translate(locale, 'error.generic.body')]
+  const knownReasonCode = reasonCode && reasonCode in REASON_COPY ? reasonCode as KnownReasonCode : undefined
+  const reasonCopy = knownReasonCode
+    ? locale === 'ru'
+      ? REASON_COPY_RU[knownReasonCode]
+      : REASON_COPY[knownReasonCode]
+    : undefined
+  const [title, description] = reasonCopy || translated || [translate(locale, 'error.generic.title'), translate(locale, 'error.generic.body')]
   return new CaoApiError(title, description, status, reasonCode, diagnosticId)
 }
 

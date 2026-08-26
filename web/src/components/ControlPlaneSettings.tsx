@@ -226,6 +226,9 @@ const bytes = (value: unknown) => { const amount = Number(value || 0); if (amoun
 const unitValue = (minutes: number, unit: 'hours' | 'days' | 'count') => unit === 'hours' ? minutes / 60 : unit === 'days' ? minutes / 1440 : minutes
 const backendValue = (value: number, unit: 'hours' | 'days' | 'count') => Math.max(1, Math.round(value * (unit === 'hours' ? 60 : unit === 'days' ? 1440 : 1)))
 const humanInterval = (value: string, locale: string) => { const match = /^(\d+)([mhd])$/.exec(value); if (!match) return value; const units = locale === 'ru' ? { m: 'мин', h: 'ч', d: 'дн' } : { m: 'min', h: 'hr', d: 'day' }; return locale === 'ru' ? `Каждые ${match[1]} ${units[match[2] as keyof typeof units]}` : `Every ${match[1]} ${units[match[2] as keyof typeof units]}` }
+const WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'] as const
+type Weekday = (typeof WEEKDAYS)[number]
+const weekdayKey = (day: Weekday) => `housekeeping.weekday.${day}` as TranslationKey
 
 function housekeepingWarning(warning: string, t: (key: TranslationKey) => string): { message: string; diagnosticId?: string } {
   const [reason, ...detail] = warning.split(':')
@@ -581,7 +584,7 @@ function HousekeepingSettingsPage() {
 <Summary label={t('housekeeping.safelyReclaimable')} value={plan ? bytes(plan.reclaimable_bytes) : t('housekeeping.buildPlan')} detail={plan ? t('housekeeping.actionableCandidates', { count: actionable.length }) : t('housekeeping.noEstimate')} />
 <Summary label={t('housekeeping.currentState')} value={t(running ? 'housekeeping.running' : 'status.idle')} detail={t(running ? 'housekeeping.operationProgress' : 'housekeeping.noOperation')} />
 <Summary label={t('housekeeping.lastRun')} value={report?.status === 'never_run' ? t('housekeeping.never') : report ? t(report.ok === false || report.completed_with_issues ? 'housekeeping.completedIssues' : 'status.workflow.completed') : t('output.unavailable')} />
-<Summary label={t('housekeeping.nextRun')} value={humanInterval(settings.schedule.frequent, locale)} detail={`${settings.schedule.weekly} · ${t('housekeeping.pressureRecovery')}`} />
+<Summary label={t('housekeeping.nextRun')} value={humanInterval(settings.schedule.frequent, locale)} detail={`${t(weekdayKey(weekly[1] as Weekday))} ${weekly[2]} UTC · ${t('housekeeping.pressureRecovery')}`} />
 <Summary label={t('housekeeping.backups')} value={t('housekeeping.protected')} detail={t('housekeeping.inventoryOnly')} />
 </div>
 <OperatorAccessCard access={access}/>
@@ -628,7 +631,7 @@ function HousekeepingSettingsPage() {
 <legend className="text-sm font-medium text-gray-200">{t('housekeeping.weeklyMaintenance')}</legend>
 <p className="mt-1 text-xs text-gray-400">{t('housekeeping.weeklyHelp')}</p>
 <div className="mt-3 flex">
-<select aria-label={t('housekeeping.weeklyDay')} value={weekly[1]} onChange={event => setSettings({ ...settings, schedule: { ...settings.schedule, weekly: `${event.target.value} ${weekly[2]} UTC` } })} className="min-h-11 flex-1 rounded-l-lg border border-gray-700 bg-gray-950 px-2">{['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(day => <option key={day}>{day}</option>)}</select>
+<select aria-label={t('housekeeping.weeklyDay')} value={weekly[1]} onChange={event => setSettings({ ...settings, schedule: { ...settings.schedule, weekly: `${event.target.value} ${weekly[2]} UTC` } })} className="min-h-11 flex-1 rounded-l-lg border border-gray-700 bg-gray-950 px-2">{WEEKDAYS.map(day => <option key={day} value={day}>{t(weekdayKey(day))}</option>)}</select>
 <input aria-label={t('housekeeping.weeklyTime')} type="time" value={weekly[2]} onChange={event => setSettings({ ...settings, schedule: { ...settings.schedule, weekly: `${weekly[1]} ${event.target.value} UTC` } })} className="min-h-11 min-w-0 flex-1 rounded-r-lg border border-l-0 border-gray-700 bg-gray-950 px-2"/>
 </div>
 </fieldset>

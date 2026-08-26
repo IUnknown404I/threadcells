@@ -1,6 +1,6 @@
 const BASE = ''  // Vite proxy handles routing to backend
 
-type ApiFailureBody = { reason_code?: unknown; detail?: unknown; message?: unknown }
+type ApiFailureBody = { reason_code?: unknown; diagnostic_id?: unknown; detail?: unknown; message?: unknown }
 
 type TimeoutErrorCopy = {
   title: string
@@ -23,8 +23,9 @@ export class CaoApiError extends Error {
     public readonly description: string,
     public readonly status: number,
     public readonly reasonCode?: string,
+    public readonly diagnosticId?: string,
   ) {
-    const technical = [`HTTP ${status}`, reasonCode].filter(Boolean).join(' · ')
+    const technical = [`HTTP ${status}`, reasonCode, diagnosticId && `Diagnostic ${diagnosticId}`].filter(Boolean).join(' · ')
     super(`${title}: ${description}${technical ? `\n${technical}` : ''}`)
     this.name = 'CaoApiError'
   }
@@ -57,6 +58,7 @@ const REASON_COPY: Record<string, [string, string]> = {
   FULL_CLEANUP_ADMISSION_BUSY: ['Full Cleanup cannot start', 'An agent admission boundary is busy. Wait for agents to become idle, then build a fresh preview.'],
   FULL_CLEANUP_NOT_IDLE: ['Agents are still working', 'Full Cleanup is available only when every agent is Ready or Exited and no provider or Heavy execution is active.'],
   FULL_CLEANUP_IDLE_INVENTORY_UNKNOWN: ['Idle state could not be proven', 'ThreadCells could not prove that every agent and execution lane is idle, so Full Cleanup was blocked.'],
+  OPERATOR_AUTH_NOT_CONFIGURED: ['Operator authorization unavailable', 'The privileged Full Cleanup helper could not validate the configured operator authority. No files were deleted.'],
   TERMINAL_RUNTIME_ACTIVE: ['Exit terminal first', 'Use Graceful Exit and wait until ThreadCells confirms the provider has exited before deleting terminal history.'],
   TERMINAL_EXIT_PENDING: ['Terminal exit is pending', 'ThreadCells has not confirmed provider death yet. Wait for exit reconciliation before deleting terminal history.'],
   TERMINAL_DEATH_UNCONFIRMED: ['Terminal death is not confirmed', 'ThreadCells could not retire the exact exited runtime, so terminal metadata remains protected.'],
@@ -89,10 +91,12 @@ export function normalizeApiError(status: number, body: ApiFailureBody | null, s
   const structuredDetail = body?.detail && typeof body.detail === 'object' ? body.detail as ApiFailureBody : null
   const reasonValue = body?.reason_code ?? structuredDetail?.reason_code
   const reasonCode = typeof reasonValue === 'string' && reasonValue.trim() ? reasonValue.trim() : undefined
+  const diagnosticValue = body?.diagnostic_id ?? structuredDetail?.diagnostic_id
+  const diagnosticId = typeof diagnosticValue === 'string' && /^[0-9a-f]{32}$/.test(diagnosticValue) ? diagnosticValue : undefined
   const backendMessage = [structuredDetail?.message, structuredDetail?.detail, body?.detail, body?.message].find(value => typeof value === 'string' && value.trim()) as string | undefined
   const [title, fallback] = (reasonCode && REASON_COPY[reasonCode]) || STATUS_COPY[status] || ['Request failed', 'ThreadCells could not complete this operation. Try again shortly.']
   const description = reasonCode && REASON_COPY[reasonCode] ? fallback : backendMessage?.trim() || fallback || statusText || 'ThreadCells could not complete this operation. Try again shortly.'
-  return new CaoApiError(title, description, status, reasonCode)
+  return new CaoApiError(title, description, status, reasonCode, diagnosticId)
 }
 
 async function fetchJSON<T>(url: string, opts?: FetchJsonOptions): Promise<T> {

@@ -16,6 +16,8 @@ import socket
 import stat
 import struct
 import sys
+import traceback
+import uuid
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -29,6 +31,10 @@ _PLAN_ID = re.compile(r"[0-9a-f]{64}")
 
 class FullCleanupHelperError(RuntimeError):
     """The privileged one-shot rejected or could not execute an operation."""
+
+    def __init__(self, reason_code: str, *, diagnostic_id: str | None = None) -> None:
+        super().__init__(reason_code)
+        self.diagnostic_id = diagnostic_id
 
 
 def _receive_line(connection: socket.socket, limit: int) -> bytes:
@@ -108,7 +114,12 @@ def execute_via_privileged_helper(
         reason = response.get("reason_code")
         if not isinstance(reason, str) or not re.fullmatch(r"[A-Z0-9_]{3,96}", reason):
             reason = "FULL_CLEANUP_HELPER_REJECTED"
-        raise FullCleanupHelperError(reason)
+        diagnostic_id = response.get("diagnostic_id")
+        if not isinstance(diagnostic_id, str) or not re.fullmatch(
+            r"[0-9a-f]{32}", diagnostic_id
+        ):
+            diagnostic_id = None
+        raise FullCleanupHelperError(reason, diagnostic_id=diagnostic_id)
     report = response.get("report")
     if not isinstance(report, dict):
         raise FullCleanupHelperError("FULL_CLEANUP_HELPER_RESPONSE_INVALID")
@@ -123,12 +134,16 @@ def execute_via_privileged_helper(
 def _authenticate_request(request: Mapping[str, Any]) -> None:
     from cli_agent_orchestrator.clients.database import authenticate_operator_session
     from cli_agent_orchestrator.services.operator_auth_service import (
+        OperatorAuthUnavailable,
         authenticate_operator_secret,
         load_operator_verifier,
     )
 
     # Removing or invalidating the existing verifier closes this boundary too.
-    load_operator_verifier()
+    try:
+        load_operator_verifier()
+    except OperatorAuthUnavailable as exc:
+        raise FullCleanupHelperError("OPERATOR_AUTH_NOT_CONFIGURED") from exc
     session_token = request.get("operator_session_token")
     bearer_secret = request.get("operator_bearer_secret")
     if (isinstance(session_token, str)) == (isinstance(bearer_secret, str)):
@@ -345,6 +360,36 @@ def _handle_request(connection: socket.socket) -> dict[str, Any]:
     return {"schema_version": 1, "ok": True, "report": report.as_dict()}
 
 
+def _failure_response(exc: Exception) -> dict[str, Any]:
+    """Return a bounded public failure and preserve unexpected detail in journal."""
+    if isinstance(exc, FullCleanupHelperError) and re.fullmatch(
+        r"[A-Z0-9_]{3,96}", str(exc)
+    ):
+        response: dict[str, Any] = {
+            "schema_version": 1,
+            "ok": False,
+            "reason_code": str(exc),
+        }
+        if exc.diagnostic_id is not None:
+            response["diagnostic_id"] = exc.diagnostic_id
+        return response
+
+    diagnostic_id = uuid.uuid4().hex
+    print(
+        "ThreadCells Full Cleanup helper failed "
+        f"diagnostic_id={diagnostic_id} exception_type={type(exc).__module__}.{type(exc).__name__}",
+        file=sys.stderr,
+        flush=True,
+    )
+    traceback.print_exception(exc, file=sys.stderr)
+    return {
+        "schema_version": 1,
+        "ok": False,
+        "reason_code": "FULL_CLEANUP_HELPER_FAILED",
+        "diagnostic_id": diagnostic_id,
+    }
+
+
 def main() -> None:
     """Serve exactly one systemd-provided AF_UNIX connection and exit."""
     response: dict[str, Any]
@@ -354,10 +399,7 @@ def main() -> None:
             raise FullCleanupHelperError("FULL_CLEANUP_HELPER_PEER_REJECTED")
         response = _handle_request(connection)
     except Exception as exc:
-        reason = str(exc) if isinstance(exc, FullCleanupHelperError) else str(exc)
-        if not re.fullmatch(r"[A-Z0-9_]{3,96}", reason):
-            reason = "FULL_CLEANUP_HELPER_FAILED"
-        response = {"schema_version": 1, "ok": False, "reason_code": reason}
+        response = _failure_response(exc)
     try:
         connection.sendall(
             json.dumps(response, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"

@@ -9,9 +9,12 @@ import pytest
 
 from cli_agent_orchestrator.services.full_cleanup_helper import (
     FullCleanupHelperError,
+    _authenticate_request,
+    _failure_response,
     _handle_request,
     execute_via_privileged_helper,
 )
+from cli_agent_orchestrator.services.operator_auth_service import OperatorAuthUnavailable
 from cli_agent_orchestrator.services.housekeeping.executor import ExecutionReport
 from cli_agent_orchestrator.services.housekeeping.models import (
     HousekeepingCandidate,
@@ -67,6 +70,77 @@ def test_privileged_helper_client_uses_bounded_unix_protocol(tmp_path):
         "confirmed": True,
         "operator_session_token": "opaque-session-token",
     }
+
+
+def test_privileged_helper_client_preserves_safe_diagnostic_id(tmp_path):
+    socket_path = tmp_path / "full-cleanup.sock"
+
+    def serve():
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(socket_path))
+            server.listen(1)
+            ready.set()
+            connection, _address = server.accept()
+            with connection:
+                connection.makefile("rb").readline()
+                connection.sendall(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "ok": False,
+                            "reason_code": "FULL_CLEANUP_HELPER_FAILED",
+                            "diagnostic_id": "d" * 32,
+                        }
+                    ).encode()
+                    + b"\n"
+                )
+
+    ready = threading.Event()
+    worker = threading.Thread(target=serve)
+    worker.start()
+    ready.wait(timeout=1)
+    with pytest.raises(FullCleanupHelperError) as raised:
+        execute_via_privileged_helper(
+            expected_plan_id="a" * 64,
+            confirmed=True,
+            session_token="opaque-session-token",
+            config={
+                "full_cleanup_helper_socket": str(socket_path),
+                "full_cleanup_helper_timeout_seconds": 1,
+            },
+        )
+    worker.join(timeout=1)
+
+    assert str(raised.value) == "FULL_CLEANUP_HELPER_FAILED"
+    assert raised.value.diagnostic_id == "d" * 32
+
+
+def test_helper_reports_missing_operator_authority_before_execution(monkeypatch):
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.operator_auth_service.load_operator_verifier",
+        lambda: (_ for _ in ()).throw(OperatorAuthUnavailable("not configured")),
+    )
+
+    with pytest.raises(FullCleanupHelperError, match="^OPERATOR_AUTH_NOT_CONFIGURED$"):
+        _authenticate_request({"operator_session_token": "opaque"})
+
+
+def test_unexpected_helper_failure_gets_journal_diagnostic_id(capsys):
+    response = _failure_response(PermissionError(13, "denied", "/protected/resource"))
+
+    diagnostic_id = response["diagnostic_id"]
+    assert isinstance(diagnostic_id, str)
+    assert len(diagnostic_id) == 32
+    assert response == {
+        "schema_version": 1,
+        "ok": False,
+        "reason_code": "FULL_CLEANUP_HELPER_FAILED",
+        "diagnostic_id": diagnostic_id,
+    }
+    journal = capsys.readouterr().err
+    assert f"diagnostic_id={diagnostic_id}" in journal
+    assert "PermissionError" in journal
+    assert "/protected/resource" in journal
 
 
 def test_helper_reauthenticates_existing_session_before_canonical_execution(monkeypatch):

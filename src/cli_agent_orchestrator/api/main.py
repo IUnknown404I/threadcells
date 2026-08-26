@@ -1362,12 +1362,23 @@ async def run_full_cleanup_endpoint(
         return summary.as_dict()
     except (FullCleanupHelperError, RuntimeError) as exc:
         reason = str(exc)
+        diagnostic_id = (
+            exc.diagnostic_id
+            if isinstance(exc, FullCleanupHelperError)
+            and isinstance(exc.diagnostic_id, str)
+            and re.fullmatch(r"[0-9a-f]{32}", exc.diagnostic_id)
+            else None
+        )
+        detail = {"reason_code": reason}
+        if diagnostic_id is not None:
+            detail["diagnostic_id"] = diagnostic_id
         if not re.fullmatch(r"[A-Z0-9_]{3,96}", reason):
             reason = "FULL_CLEANUP_EXECUTION_FAILED"
+            detail["reason_code"] = reason
         if reason in {"HOUSEKEEPING_BUSY", "FULL_CLEANUP_ADMISSION_BUSY"}:
             raise HTTPException(
                 status_code=status.HTTP_423_LOCKED,
-                detail={"reason_code": reason},
+                detail=detail,
             ) from exc
         if reason in {
             "HOUSEKEEPING_PLAN_CHANGED",
@@ -1376,21 +1387,21 @@ async def run_full_cleanup_endpoint(
         }:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail={"reason_code": reason},
+                detail=detail,
             ) from exc
         if reason == "FULL_CLEANUP_CONFIRMATION_REQUIRED":
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail={"reason_code": reason},
+                detail=detail,
             ) from exc
         if reason == "OPERATOR_AUTHENTICATION_FAILED":
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail={"reason_code": reason},
+                detail=detail,
             ) from exc
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"reason_code": reason},
+            detail=detail,
         ) from exc
 
 

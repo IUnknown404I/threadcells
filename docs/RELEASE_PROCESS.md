@@ -31,6 +31,7 @@ ThreadCells follows normal SemVer prerelease ordering. During the alpha preview,
 - `v0.1.0-alpha.2` is an immutable published technical preview.
 - `v0.2.0-alpha.1` is the consolidated multilingual and reliability release line.
 - `v0.3.0-alpha.1` adds lifecycle consistency, durable creation order, Full Cleanup, and systemic routing policy.
+- `v0.3.0-alpha.2` corrects Workflow Composer delivery and makes terminal exit final for executable workflow authority.
 - A later publication in the same release line increments only the alpha sequence; a new product contour increments the semantic version deliberately.
 
 Never move an existing tag. Repository-governance changes alone do not trigger a version bump or release. Update all canonical version-bearing surfaces together only when the next meaningful implementation contour is ready for publication.

@@ -59,7 +59,7 @@ flowchart LR
 
 ## 安全性とプレビューの状態
 
-`0.3.0-alpha.1` 技術プレビューは、単一の Ubuntu/Debian Linux ホスト、ループバック優先のアクセス、Codex を中心としたセットアップをサポートします。ネイティブエージェントは強力なコマンドを実行できます。worktree はセキュリティサンドボックスではありません。評価前に[制限事項](docs/LIMITATIONS.md)を確認してください。
+`0.3.0-alpha.2` 技術プレビューは、単一の Ubuntu/Debian Linux ホスト、ループバック優先のアクセス、Codex を中心としたセットアップをサポートします。ネイティブエージェントは強力なコマンドを実行できます。worktree はセキュリティサンドボックスではありません。評価前に[制限事項](docs/LIMITATIONS.md)を確認してください。
 
 公開の `ghcr.io/iunknown404i/threadcells-release-bundle` OCI パッケージには、検証済みのリリースアーカイブと証跡が含まれます。これは配布成果物であり、Docker イメージやサポート対象のコンテナデプロイモードではありません。[リリースプロセス](docs/RELEASE_PROCESS.md)を参照してください。
 

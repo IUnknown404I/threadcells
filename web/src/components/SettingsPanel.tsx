@@ -5,6 +5,7 @@ import { Activity, FolderOpen, Save, Plus, X, RefreshCw, CheckCircle, Maximize2,
 import { ConfirmModal } from './ConfirmModal'
 import { OperatorAccessCard, useOperatorAccess } from './OperatorAccess'
 import { useI18n, type TranslationKey } from '../i18n'
+import { resourceStateTranslationKey } from './StatusBadge'
 
 const CAPACITY_FIELD_KEYS: Record<string, TranslationKey> = {
   max_resident_supervisors: 'settings.capacity.maxResident',
@@ -221,7 +222,7 @@ export function SettingsPanel() {
           </div>
           <div className="flex items-center gap-2">{capacity && (
             <span
-              aria-label={t('settings.capacity.health', { state: capacity.resource_state })}
+              aria-label={t('settings.capacity.health', { state: t(resourceStateTranslationKey(capacity.resource_state)) })}
               className={`text-xs font-semibold px-2.5 py-1 rounded-full ${
                 capacity.resource_state === 'GREEN'
                   ? 'bg-emerald-500/15 text-emerald-300'
@@ -230,7 +231,7 @@ export function SettingsPanel() {
                     : 'bg-red-500/15 text-red-300'
               }`}
             >
-              {capacity.resource_state}
+              {t(resourceStateTranslationKey(capacity.resource_state))}
             </span>
           )}<button type="button" onClick={openCapacity} className="min-h-11 rounded-lg border border-gray-700 px-3 text-xs text-gray-300 hover:border-emerald-600 hover:text-emerald-300">{t('settings.capacity.configure')}</button></div>
         </div>
@@ -241,7 +242,7 @@ export function SettingsPanel() {
           <div className="space-y-3">
             {capacity.reasons.length > 0 && (
               <section
-                aria-label={`${capacity.resource_state} resource health reasons`}
+                aria-label={t('settings.capacity.reasonAria', { state: t(resourceStateTranslationKey(capacity.resource_state)) })}
                 className={`rounded-lg border px-3 py-3 ${capacity.resource_state === 'RED' ? 'border-red-700/50 bg-red-950/20' : 'border-amber-700/50 bg-amber-950/20'}`}
               >
                 <h4 className={`text-xs font-semibold ${capacity.resource_state === 'RED' ? 'text-red-200' : 'text-amber-200'}`}>{t('settings.capacity.drivers')}</h4>
@@ -257,7 +258,7 @@ export function SettingsPanel() {
                 <CapacityItem label={t('settings.capacity.contexts')} value={`${capacity.work_contexts.active} / ${capacity.work_contexts.limit}`} detail={capacity.work_contexts.certain ? t('settings.capacity.contextDetail', { count: capacity.work_contexts.available, draining: capacity.work_contexts.draining ? t('settings.capacity.draining') : '' }) : t('settings.capacity.inventoryUnavailable')} />
                 <CapacityItem label={t('settings.capacity.heavy')} value={`${capacity.heavy_executions.active} / ${capacity.heavy_executions.limit}`} detail={`${t('settings.capacity.available', { count: capacity.heavy_executions.available })}${capacity.heavy_executions.draining ? t('settings.capacity.draining') : ''}`} />
                 <CapacityItem label={t('settings.capacity.memory')} value={`${capacity.memory.available_mib} MiB`} detail={t('settings.capacity.pressure', { value: capacity.memory_pressure.some_avg10 })} />
-                <CapacityItem label={t('settings.capacity.disk')} value={t('settings.capacity.used', { percent: capacity.root_disk.used_percent })} detail={t('settings.capacity.free', { state: capacity.root_disk.state ? `${capacity.root_disk.state} · ` : '', gib: capacity.root_disk.free_gib })} />
+                <CapacityItem label={t('settings.capacity.disk')} value={t('settings.capacity.used', { percent: capacity.root_disk.used_percent })} detail={t('settings.capacity.free', { state: capacity.root_disk.state ? `${t(resourceStateTranslationKey(capacity.root_disk.state))} · ` : '', gib: capacity.root_disk.free_gib })} />
                 {capacity.heavy_executions.waiting !== null && (
                   <CapacityItem label={t('settings.capacity.waiting')} value={String(capacity.heavy_executions.waiting)} detail={t('settings.capacity.kernelQueue')} />
                 )}

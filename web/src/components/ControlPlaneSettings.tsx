@@ -8,6 +8,7 @@ import { ConfirmModal } from './ConfirmModal'
 import { SettingsPanel } from './SettingsPanel'
 import { TelegramSettings } from './TelegramSettings'
 import { useI18n, type TranslationKey } from '../i18n'
+import { resourceStateTranslationKey } from './StatusBadge'
 
 export type SettingsSection = 'general' | 'profiles' | 'providers' | 'housekeeping' | 'telegram' | 'about'
 
@@ -275,7 +276,7 @@ function HousekeepingReport({ report, diskState }: { report: Record<string, any>
       <Summary label={t('housekeeping.completedAt')} value={completed} />
       <Summary label={t('housekeeping.duration')} value={duration} />
       <Summary label={t('housekeeping.reclaimedTotal')} value={bytes(report.freed_bytes)} detail={report.observed_disk_free_delta === undefined ? undefined : t('housekeeping.observedDelta', { size: bytes(report.observed_disk_free_delta) })} />
-      <Summary label={t('housekeeping.resultingHealth')} value={diskState} />
+      <Summary label={t('housekeeping.resultingHealth')} value={t(resourceStateTranslationKey(diskState))} />
     </div>
     {report.full_cleanup && <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
       <Summary label={t('housekeeping.plannedReclaim')} value={bytes(report.reclaimable_bytes)} detail={tp('resources', Number(report.planned_candidates || 0))} />
@@ -576,7 +577,7 @@ function HousekeepingSettingsPage() {
 <p className="mt-1 text-sm text-gray-400">{t('housekeeping.description')}</p>
 </div>
 <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-<Summary label={t('housekeeping.diskHealth')} value={diskState} detail={capacity ? t('housekeeping.diskUsed', { percent: used, gib: capacity.root_disk.free_gib }) : t('housekeeping.resourceUnavailable')} />
+<Summary label={t('housekeeping.diskHealth')} value={t(resourceStateTranslationKey(diskState))} detail={capacity ? t('housekeeping.diskUsed', { percent: used, gib: capacity.root_disk.free_gib }) : t('housekeeping.resourceUnavailable')} />
 <Summary label={t('housekeeping.safelyReclaimable')} value={plan ? bytes(plan.reclaimable_bytes) : t('housekeeping.buildPlan')} detail={plan ? t('housekeeping.actionableCandidates', { count: actionable.length }) : t('housekeeping.noEstimate')} />
 <Summary label={t('housekeeping.currentState')} value={t(running ? 'housekeeping.running' : 'status.idle')} detail={t(running ? 'housekeeping.operationProgress' : 'housekeeping.noOperation')} />
 <Summary label={t('housekeeping.lastRun')} value={report?.status === 'never_run' ? t('housekeeping.never') : report ? t(report.ok === false || report.completed_with_issues ? 'housekeeping.completedIssues' : 'status.workflow.completed') : t('output.unavailable')} />

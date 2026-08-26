@@ -126,6 +126,14 @@ export function sessionStatusTranslationKey(status: string | null | undefined): 
     : statusTranslationKey(status)
 }
 
+export function resourceStateTranslationKey(state: string | null | undefined): TranslationKey {
+  const normalized = state?.toLowerCase()
+  if (normalized === 'green' || normalized === 'yellow' || normalized === 'red' || normalized === 'critical') {
+    return `status.resource.${normalized}` as TranslationKey
+  }
+  return 'status.unknown'
+}
+
 export function StatusBadge({ status, workflowState }: { status: TerminalStatus, workflowState?: string | null }) {
   const { t } = useI18n()
   const [storedPrimary, providerDiagnostic] = typeof status === 'string' ? status.split('::', 2) : [status, undefined]

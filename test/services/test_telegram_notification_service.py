@@ -391,6 +391,49 @@ def test_completion_winning_before_cancellation_suppresses_failure(telegram_stat
         )
 
 
+def test_replacement_workflow_winning_exit_gets_exact_failure_notification(
+    telegram_state, monkeypatch
+):
+    _configure()
+    _workflow("replacement-race-root", project=None)
+    post = MagicMock(return_value=_response())
+    monkeypatch.setattr(telegram.requests, "post", post)
+    monkeypatch.setattr(terminal_service, "_runtime_death_observation", lambda *_args: True)
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", MagicMock())
+    monkeypatch.setattr(terminal_service, "_wake_queued_provider_execution", MagicMock())
+    original_exit = terminal_service.mark_terminal_runtime_exited_with_workflow_ids
+    with database.SessionLocal() as db:
+        old_workflow_id = db.query(WorkflowModel.id).scalar()
+
+    replacement_workflow_id = None
+
+    def replace_then_exit(root: str) -> tuple[bool, list[int]]:
+        nonlocal replacement_workflow_id
+        assert database.set_workflow_terminal_state(root, "terminal", "first completed")
+        with database.SessionLocal() as db:
+            replacement = WorkflowModel(root_terminal_id=root, status="open")
+            db.add(replacement)
+            db.commit()
+            replacement_workflow_id = replacement.id
+        return original_exit(root)
+
+    monkeypatch.setattr(
+        terminal_service,
+        "mark_terminal_runtime_exited_with_workflow_ids",
+        replace_then_exit,
+    )
+
+    assert terminal_service.reconcile_terminal_runtime("replacement-race-root") is True
+    assert replacement_workflow_id is not None
+    with database.SessionLocal() as db:
+        assert db.get(TelegramDeliveryModel, f"workflow:{old_workflow_id}:completed") is not None
+        assert (
+            db.get(TelegramDeliveryModel, f"workflow:{replacement_workflow_id}:failed") is not None
+        )
+        assert db.get(TelegramDeliveryModel, f"workflow:{old_workflow_id}:failed") is None
+    assert post.call_count == 2
+
+
 def test_failure_claim_stays_bound_when_a_new_workflow_opens_after_cancellation(
     telegram_state, monkeypatch
 ):

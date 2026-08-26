@@ -411,6 +411,55 @@ Simple prompt without variables.
 
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
+    @patch("cli_agent_orchestrator.services.flow_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_next_run")
+    @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
+    @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
+    def test_execute_flow_rejects_non_executable_terminal_admission(
+        self,
+        mock_db_get,
+        mock_update_times,
+        mock_update_next,
+        mock_gen_session,
+        mock_create_terminal,
+        mock_send_input,
+    ):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write(
+                '---\nname: rejected-flow\nschedule: "* * * * *"\n'
+                "agent_profile: developer\n---\nPrompt."
+            )
+            f.flush()
+            mock_db_get.return_value = Flow(
+                name="rejected-flow",
+                file_path=f.name,
+                schedule="* * * * *",
+                agent_profile="developer",
+                provider="kiro_cli",
+                enabled=True,
+                next_run=datetime.now(),
+            )
+        mock_gen_session.return_value = "cao-rejected-flow"
+        mock_create_terminal.return_value = MagicMock(id="terminal-rejected-flow")
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.workflow_service.prepare_external_input",
+                return_value={
+                    "accepted": False,
+                    "reason_code": "TERMINAL_RUNTIME_NOT_WRITABLE",
+                },
+            ),
+            pytest.raises(RuntimeError, match="TERMINAL_RUNTIME_NOT_WRITABLE"),
+        ):
+            execute_flow("rejected-flow")
+
+        mock_send_input.assert_not_called()
+        mock_update_times.assert_not_called()
+        mock_update_next.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.flow_service.send_input")
+    @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
     @patch(
         "cli_agent_orchestrator.services.flow_service.generate_session_name",
         return_value="flow-session",

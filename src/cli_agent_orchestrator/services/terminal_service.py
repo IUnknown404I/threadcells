@@ -52,7 +52,6 @@ from cli_agent_orchestrator.clients.database import (
     get_terminal_execution_projection,
     get_terminal_metadata,
     get_terminal_workflow_projection,
-    get_workflow_notification_context,
     get_workflow_provider_reconnect_runtime_ready,
     list_all_terminals,
     mark_handoff_child_input_received,
@@ -603,14 +602,13 @@ def reconcile_terminal_runtime(terminal_id: str, provider=None) -> bool | None:
     observation = _runtime_death_observation(metadata, provider)
     if observation is not True:
         return observation
-    notification_context = get_workflow_notification_context(terminal_id)
     exited, cancelled_workflow_ids = mark_terminal_runtime_exited_with_workflow_ids(terminal_id)
     if not exited:
         return None
     cancel_child_assignments_for_terminal(terminal_id)
     provider_manager.cleanup_provider(terminal_id)
     _wake_queued_provider_execution()
-    if notification_context and int(notification_context["workflow_id"]) in cancelled_workflow_ids:
+    if cancelled_workflow_ids:
         try:
             from cli_agent_orchestrator.services.telegram_notification_service import (
                 dispatch_workflow_notification,
@@ -619,7 +617,7 @@ def reconcile_terminal_runtime(terminal_id: str, provider=None) -> bool | None:
             dispatch_workflow_notification(
                 terminal_id,
                 "failed",
-                workflow_id=int(notification_context["workflow_id"]),
+                workflow_id=max(cancelled_workflow_ids),
             )
         except Exception:
             # Never interpolate exceptions that may contain a bot-token URL.

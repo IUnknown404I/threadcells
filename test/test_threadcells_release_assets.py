@@ -117,8 +117,17 @@ def _valid_verification_candidate(tmp_path: Path) -> Path:
     docs.mkdir()
     (docs / "ru").mkdir()
     translated = docs / "ru" / "candidate.md"
-    translated.write_text("# Локализованный кандидат\n", encoding="utf-8")
-    translated_checksum = hashlib.sha256(translated.read_bytes()).hexdigest()
+    translated_body = "# Локализованный кандидат\n"
+    translated.write_text(
+        "---\n"
+        "slug: candidate\n"
+        "source: README.md\n"
+        f"source_sha256: sha256:{readme_checksum}\n"
+        "---\n"
+        + translated_body,
+        encoding="utf-8",
+    )
+    translated_checksum = hashlib.sha256(translated_body.encode()).hexdigest()
     (docs / "DOCS_MANIFEST.json").write_text(
         json.dumps({"documents": [{"slug": "candidate", "source": "README.md"}]}) + "\n",
         encoding="utf-8",

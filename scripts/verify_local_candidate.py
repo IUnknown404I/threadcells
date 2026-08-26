@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -16,6 +17,11 @@ SCHEMA_NAMES = ("adapter-manifest", "capabilities", "profile", "provider-config"
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def translated_markdown_digest(path: Path) -> str | None:
+    match = re.fullmatch(r"---\n.*?\n---\n(?P<body>.*)", path.read_text(encoding="utf-8"), re.S)
+    return hashlib.sha256(match.group("body").encode()).hexdigest() if match else None
 
 
 def relative_path(root: Path, value: str) -> Path | None:
@@ -209,7 +215,11 @@ def verify(candidate: Path) -> list[str]:
             russian_by_slug = {item["slug"]: item for item in russian_documents}
             for slug in manifest_slugs:
                 source = candidate / "docs" / "ru" / f"{slug}.md"
-                if not source.is_file() or russian_by_slug[slug].get("sha256") != digest(source):
+                if (
+                    not source.is_file()
+                    or russian_by_slug[slug].get("sha256")
+                    != translated_markdown_digest(source)
+                ):
                     errors.append(f"packaged Russian documentation content mismatch: {slug}")
     sbom = json.loads((candidate / "sbom.cdx.json").read_text(encoding="utf-8"))
     if sbom.get("bomFormat") != "CycloneDX" or not sbom.get("components"):

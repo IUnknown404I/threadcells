@@ -706,6 +706,38 @@ class TestPublicControlPlaneApi:
         assert response.status_code == 409
         assert response.json()["detail"]["reason_code"] == "FULL_CLEANUP_NOT_IDLE"
 
+    def test_full_cleanup_preserves_safe_helper_diagnostic_id(self, client):
+        def run_service(**kwargs):
+            kwargs["privileged_cleanup_executor"]()
+
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main._require_operator",
+                return_value="operator_bearer",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.full_cleanup_helper.execute_via_privileged_helper",
+                side_effect=FullCleanupHelperError(
+                    "FULL_CLEANUP_HELPER_FAILED", diagnostic_id="e" * 32
+                ),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.housekeeping_service.run_full_cleanup",
+                side_effect=run_service,
+            ),
+        ):
+            response = client.post(
+                "/api/v1/housekeeping/full-cleanup/run",
+                json={"expected_plan_id": "a" * 64, "confirmed": True},
+                headers={"Authorization": "Bearer existing-secret"},
+            )
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == {
+            "reason_code": "FULL_CLEANUP_HELPER_FAILED",
+            "diagnostic_id": "e" * 32,
+        }
+
     def test_housekeeping_report_is_available_before_the_first_run(self, client, tmp_path):
         with patch(
             "cli_agent_orchestrator.api.main.load_operations_config",

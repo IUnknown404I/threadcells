@@ -10,6 +10,10 @@ Environment=HOME=/home/agentctl
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PATH=/var/lib/threadcells/active/runtime/bin:/srv/agent-control/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EnvironmentFile=/etc/agent-control/cao.env
+# This root-owned reference is the same existing operator authority used by
+# the Web/API service. The helper independently validates the verifier before
+# accepting the short-lived session carried by the socket request.
+Environment=THREADCELLS_OPERATOR_VERIFIER_FILE=/etc/agent-control/operator-verifier.json
 ExecStart=/var/lib/threadcells/active/runtime/bin/threadcells-full-cleanup-helper
 StandardInput=socket
 StandardOutput=socket

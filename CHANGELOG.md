@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bind unexpected-runtime-exit notifications to the exact workflow cancelled by the atomic exit transition.
 - Keep filesystem-intensive Housekeeping plans alive beyond the ordinary Web request timeout, show deterministic plan/preview progress and product-safe errors, and serialize read-only inventory under the canonical Housekeeping lock.
 - Initialize the privileged Full Cleanup helper with the runtime account's canonical home and an explicit minimal capability bound for identity, ownership, permission, and signal operations before executing an owner-authorized plan.
+- Bind the privileged Full Cleanup helper to the same root-provisioned operator verifier as the Web service and return a safe diagnostic ID for unexpected helper failures.
 - Report manual release cleanup without release-admin authority as protected, delete unreadable approved log files without requiring read access, and recover exact interrupted Housekeeping quarantine residue.
 
 ### Safety

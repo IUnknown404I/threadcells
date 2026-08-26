@@ -35,6 +35,14 @@ describe('CAO API error normalization', () => {
     expect(error.message).toContain('HTTP 503 · FUTURE_CAUSE')
   })
 
+  it('shows only a bounded helper diagnostic identifier with the safe product error', () => {
+    const diagnosticId = 'e'.repeat(32)
+    const error = normalizeApiError(503, { detail: { reason_code: 'FULL_CLEANUP_HELPER_FAILED', diagnostic_id: diagnosticId } })
+    expect(error.description).toContain('temporarily unable')
+    expect(error.diagnosticId).toBe(diagnosticId)
+    expect(error.message).toContain(`Diagnostic ${diagnosticId}`)
+  })
+
   it('shows a nested graceful-exit authority reason from FastAPI', () => {
     const error = normalizeApiError(409, { detail: { reason_code: 'EXIT_PANE_AMBIGUOUS', message: 'The terminal window has multiple panes' } })
     expect(error.description).toBe('The terminal window has multiple panes')

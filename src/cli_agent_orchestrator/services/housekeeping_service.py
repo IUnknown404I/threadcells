@@ -1136,6 +1136,21 @@ def plan_housekeeping(
     )
 
 
+def plan_housekeeping_serialized(
+    *,
+    config: Mapping[str, Any] | None = None,
+    mode: str,
+    now: float | None = None,
+    proc_root: Path = Path("/proc"),
+):
+    """Build one read-only plan without competing with another planner or execution."""
+    cfg = dict(config or load_operations_config())
+    lock_dir = Path(str(cfg["lock_dir"]))
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with _housekeeping_execution_lock(lock_dir):
+        return plan_housekeeping(config=cfg, mode=mode, now=now, proc_root=proc_root)
+
+
 def _full_cleanup_release_state(plan) -> dict[str, Any]:
     releases = [item for item in plan.candidates if item.category == "releases"]
     roles = {item.path: dict(item.attributes).get("release_role") for item in releases}
@@ -1178,6 +1193,20 @@ def plan_full_cleanup(
     result["idle_gate"] = full_cleanup_idle_gate(cfg)
     result["release_state"] = _full_cleanup_release_state(plan)
     return result
+
+
+def plan_full_cleanup_serialized(
+    *,
+    config: Mapping[str, Any] | None = None,
+    now: float | None = None,
+    proc_root: Path = Path("/proc"),
+) -> dict[str, Any]:
+    """Build one Full Cleanup preview under the canonical Housekeeping lock."""
+    cfg = dict(config or load_operations_config())
+    lock_dir = Path(str(cfg["lock_dir"]))
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with _housekeeping_execution_lock(lock_dir):
+        return plan_full_cleanup(config=cfg, now=now, proc_root=proc_root)
 
 
 def run_full_cleanup(

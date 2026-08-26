@@ -569,7 +569,7 @@ class TestPublicControlPlaneApi:
             "idle_gate": {"eligible": True, "blockers": []},
         }
         with patch(
-            "cli_agent_orchestrator.services.housekeeping_service.plan_full_cleanup",
+            "cli_agent_orchestrator.services.housekeeping_service.plan_full_cleanup_serialized",
             return_value=preview,
         ) as service:
             response = client.get("/api/v1/housekeeping/full-cleanup/plan")
@@ -577,6 +577,28 @@ class TestPublicControlPlaneApi:
         assert response.status_code == 200
         assert response.json() == preview
         service.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/api/v1/housekeeping/plan?mode=frequent",
+            "/api/v1/housekeeping/full-cleanup/plan",
+        ],
+    )
+    def test_housekeeping_plan_endpoints_report_canonical_lock_contention(self, client, path):
+        service = (
+            "plan_full_cleanup_serialized"
+            if "full-cleanup" in path
+            else "plan_housekeeping_serialized"
+        )
+        with patch(
+            f"cli_agent_orchestrator.services.housekeeping_service.{service}",
+            side_effect=RuntimeError("HOUSEKEEPING_BUSY"),
+        ):
+            response = client.get(path)
+
+        assert response.status_code == 423
+        assert response.json()["detail"]["reason_code"] == "HOUSEKEEPING_BUSY"
 
     def test_full_cleanup_execution_uses_operator_and_explicit_confirmation(self, client):
         plan_id = "b" * 64

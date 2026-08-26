@@ -10,6 +10,8 @@ ThreadCells `v0.3.0-alpha.2` is a corrective prerelease for the accepted `v0.3.0
 - Durable terminal exit now atomically closes executable workflows, cancels queued or claimed turns, terminally fails pending Inbox transport, releases provider and writer authority, and fences parent/child execution edges while preserving historical rows and results.
 - New Inbox or Composer input targeting an Exited terminal is rejected or retained only as failed, non-executable history. A rolling reconciliation repairs stale rows created by older runtimes before provider admission or Full Cleanup planning.
 - Unexpected-runtime-exit notifications are bound to the exact workflow that won the atomic cancellation transition, including a workflow replacement racing terminal exit.
+- Housekeeping dry-run plans and Full Cleanup previews use the established bounded long-operation window instead of the ordinary 10-second Web timeout. Both actions expose progress, prevent duplicate submissions, retain fail-closed execution controls, and translate timeout or network failures into operator-safe product errors.
+- Interactive inventory requests share the canonical Housekeeping lock with execution, so a disconnected client cannot start a competing planner; a retry receives an explicit busy state until the original read-only scan finishes.
 
 ## Lifecycle invariant
 

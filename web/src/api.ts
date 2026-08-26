@@ -2,6 +2,21 @@ const BASE = ''  // Vite proxy handles routing to backend
 
 type ApiFailureBody = { reason_code?: unknown; detail?: unknown; message?: unknown }
 
+type TimeoutErrorCopy = {
+  title: string
+  description: string
+  reasonCode: string
+}
+
+type FetchJsonOptions = RequestInit & {
+  timeoutMs?: number | null
+  timeoutError?: TimeoutErrorCopy
+}
+
+// Filesystem inventory shares the established bounded Full Cleanup helper window.
+// It must not inherit the 10-second timeout used by ordinary control-plane reads.
+export const HOUSEKEEPING_PLAN_TIMEOUT_MS = 1_800_000
+
 export class CaoApiError extends Error {
   constructor(
     public readonly title: string,
@@ -80,25 +95,50 @@ export function normalizeApiError(status: number, body: ApiFailureBody | null, s
   return new CaoApiError(title, description, status, reasonCode)
 }
 
-async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: number | null }): Promise<T> {
+async function fetchJSON<T>(url: string, opts?: FetchJsonOptions): Promise<T> {
   const controller = new AbortController()
   const externalSignal = opts?.signal
   const abortFromCaller = () => controller.abort(externalSignal?.reason)
   if (externalSignal?.aborted) abortFromCaller()
   else externalSignal?.addEventListener('abort', abortFromCaller, { once: true })
   const timeoutMs = opts?.timeoutMs === undefined ? 10000 : opts.timeoutMs
-  const timeout = timeoutMs === null ? undefined : setTimeout(() => controller.abort(), timeoutMs)
+  let timedOut = false
+  const timeout = timeoutMs === null ? undefined : setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, timeoutMs)
+  const { timeoutMs: _timeoutMs, timeoutError, ...requestOptions } = opts || {}
   try {
-    const res = await fetch(`${BASE}${url}`, { ...opts, signal: controller.signal })
+    const res = await fetch(`${BASE}${url}`, { ...requestOptions, signal: controller.signal })
     if (!res.ok) {
       const error = await res.json().catch(() => null) as ApiFailureBody | null
       throw normalizeApiError(res.status, error, res.statusText)
     }
     return res.json()
+  } catch (reason) {
+    if (timedOut) {
+      const copy = timeoutError || {
+        title: 'Request took too long',
+        description: 'ThreadCells could not complete the request in time. Try again.',
+        reasonCode: 'REQUEST_TIMEOUT',
+      }
+      throw new CaoApiError(copy.title, copy.description, 408, copy.reasonCode)
+    }
+    throw reason
   } finally {
     externalSignal?.removeEventListener('abort', abortFromCaller)
     if (timeout !== undefined) clearTimeout(timeout)
   }
+}
+
+function planningNetworkError(reason: unknown, preview: boolean): never {
+  if (reason instanceof CaoApiError || (reason as { name?: string })?.name === 'AbortError') throw reason
+  throw new CaoApiError(
+    preview ? 'Preview could not be built' : 'Plan could not be built',
+    'ThreadCells lost the connection while scanning resources. No files were deleted. Try again.',
+    0,
+    'HOUSEKEEPING_PLAN_NETWORK_ERROR',
+  )
 }
 
 export interface Session {
@@ -522,9 +562,37 @@ export const api = {
   getProviderAiPrompt: () => fetchJSON<{ prompt: string }>('/api/v1/providers/ai-prompt'),
   getHousekeepingSettings: () => fetchJSON<HousekeepingSettings>('/api/v1/housekeeping'),
   updateHousekeepingSettings: (data: HousekeepingSettings) => fetchJSON<HousekeepingSettings>('/api/v1/housekeeping', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }),
-  getHousekeepingPlan: (mode: HousekeepingMode) => fetchJSON<HousekeepingPlan>(`/api/v1/housekeeping/plan?mode=${mode}`),
+  getHousekeepingPlan: async (mode: HousekeepingMode, signal?: AbortSignal) => {
+    try {
+      return await fetchJSON<HousekeepingPlan>(`/api/v1/housekeeping/plan?mode=${mode}`, {
+        signal,
+        timeoutMs: HOUSEKEEPING_PLAN_TIMEOUT_MS,
+        timeoutError: {
+          title: 'Plan took too long to build',
+          description: 'ThreadCells could not finish the filesystem inventory in time. No files were deleted. Try again.',
+          reasonCode: 'HOUSEKEEPING_PLAN_TIMEOUT',
+        },
+      })
+    } catch (reason) {
+      planningNetworkError(reason, false)
+    }
+  },
   runHousekeeping: (mode: HousekeepingMode, dry_run: boolean, expectedPlanId?: string) => fetchJSON<Record<string, any>>('/api/v1/housekeeping/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, dry_run, expected_plan_id: expectedPlanId }), timeoutMs: null }),
-  getFullCleanupPlan: () => fetchJSON<FullCleanupPlan>('/api/v1/housekeeping/full-cleanup/plan'),
+  getFullCleanupPlan: async (signal?: AbortSignal) => {
+    try {
+      return await fetchJSON<FullCleanupPlan>('/api/v1/housekeeping/full-cleanup/plan', {
+        signal,
+        timeoutMs: HOUSEKEEPING_PLAN_TIMEOUT_MS,
+        timeoutError: {
+          title: 'Preview took too long to build',
+          description: 'ThreadCells could not finish the filesystem inventory in time. No files were deleted. Try again.',
+          reasonCode: 'HOUSEKEEPING_PLAN_TIMEOUT',
+        },
+      })
+    } catch (reason) {
+      planningNetworkError(reason, true)
+    }
+  },
   runFullCleanup: (expectedPlanId: string) => fetchJSON<Record<string, any>>('/api/v1/housekeeping/full-cleanup/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_plan_id: expectedPlanId, confirmed: true }), timeoutMs: null }),
   getHousekeepingReport: () => fetchJSON<Record<string, any>>('/api/v1/housekeeping/report'),
   getUsageStatistics: () => fetchJSON<UsageStatistics>('/usage/statistics'),

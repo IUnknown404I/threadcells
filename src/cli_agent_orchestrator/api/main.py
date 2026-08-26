@@ -1245,10 +1245,20 @@ async def get_housekeeping_plan_endpoint(
 ) -> Dict:
     from starlette.concurrency import run_in_threadpool
 
-    from cli_agent_orchestrator.services.housekeeping_service import plan_housekeeping
+    from cli_agent_orchestrator.services.housekeeping_service import (
+        plan_housekeeping_serialized,
+    )
 
-    plan = await run_in_threadpool(lambda: plan_housekeeping(mode=mode))
-    return plan.as_dict()
+    try:
+        plan = await run_in_threadpool(lambda: plan_housekeeping_serialized(mode=mode))
+        return plan.as_dict()
+    except RuntimeError as exc:
+        if str(exc) == "HOUSEKEEPING_BUSY":
+            raise HTTPException(
+                status_code=status.HTTP_423_LOCKED,
+                detail={"reason_code": "HOUSEKEEPING_BUSY"},
+            ) from exc
+        raise
 
 
 @app.post("/api/v1/housekeeping/run")
@@ -1294,9 +1304,19 @@ async def run_housekeeping_endpoint(
 async def get_full_cleanup_plan_endpoint() -> Dict:
     from starlette.concurrency import run_in_threadpool
 
-    from cli_agent_orchestrator.services.housekeeping_service import plan_full_cleanup
+    from cli_agent_orchestrator.services.housekeeping_service import (
+        plan_full_cleanup_serialized,
+    )
 
-    return await run_in_threadpool(plan_full_cleanup)
+    try:
+        return await run_in_threadpool(plan_full_cleanup_serialized)
+    except RuntimeError as exc:
+        if str(exc) == "HOUSEKEEPING_BUSY":
+            raise HTTPException(
+                status_code=status.HTTP_423_LOCKED,
+                detail={"reason_code": "HOUSEKEEPING_BUSY"},
+            ) from exc
+        raise
 
 
 @app.post("/api/v1/housekeeping/full-cleanup/run")

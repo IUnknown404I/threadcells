@@ -22,10 +22,13 @@ from cli_agent_orchestrator.services.housekeeping.models import (
 )
 from cli_agent_orchestrator.services.housekeeping.planner import build_plan
 from cli_agent_orchestrator.services.housekeeping_service import (
+    _housekeeping_execution_lock,
     _scheduled_mode_due,
     _write_schedule_receipt,
     housekeeping_main,
+    plan_full_cleanup_serialized,
     plan_housekeeping,
+    plan_housekeeping_serialized,
     run_housekeeping,
 )
 
@@ -65,6 +68,24 @@ def _config(root: Path):
 
 def _age(path: Path, minutes: int):
     os.utime(path, (NOW - minutes * 60, NOW - minutes * 60))
+
+
+@pytest.mark.parametrize(
+    "planner",
+    [
+        lambda config: plan_housekeeping_serialized(
+            config=config, mode="frequent", proc_root=Path("/not-used")
+        ),
+        lambda config: plan_full_cleanup_serialized(config=config, proc_root=Path("/not-used")),
+    ],
+)
+def test_interactive_plans_share_one_canonical_housekeeping_lock(tmp_path, planner):
+    config = _config(tmp_path)
+    lock_dir = Path(config["lock_dir"])
+
+    with _housekeeping_execution_lock(lock_dir):
+        with pytest.raises(RuntimeError, match="^HOUSEKEEPING_BUSY$"):
+            planner(config)
 
 
 def test_post_validation_path_replacement_is_never_deleted(tmp_path, monkeypatch):

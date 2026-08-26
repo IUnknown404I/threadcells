@@ -274,6 +274,11 @@ def execute_flow(name: str) -> bool:
         from cli_agent_orchestrator.services.operations_service import AdmissionDenied
 
         prepared = workflow_service.prepare_external_input(terminal.id, rendered_prompt)
+        if prepared.get("accepted") is False:
+            raise RuntimeError(
+                "Scheduled flow terminal could not accept provider workflow input: "
+                f"{prepared.get('reason_code', 'unknown')}"
+            )
         turn_id = prepared["turn_id"]
         if prepared["queued"]:
             db_update_flow_run_times(name, last_run=now, next_run=next_run)

@@ -40,7 +40,6 @@ from cli_agent_orchestrator.clients.database import (
     bind_terminal_provider_resume_identity,
     cancel_child_assignments_for_terminal,
     cancel_workflows_for_terminal,
-    cancel_workflows_for_terminal_with_ids,
     claim_terminal_runtime_exit,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
@@ -58,6 +57,7 @@ from cli_agent_orchestrator.clients.database import (
     list_all_terminals,
     mark_handoff_child_input_received,
     mark_terminal_runtime_exited,
+    mark_terminal_runtime_exited_with_workflow_ids,
     mark_terminal_runtime_running,
     mark_workflow_provider_reconnect_launch_dispatched,
     persist_terminal_result_snapshot,
@@ -604,9 +604,10 @@ def reconcile_terminal_runtime(terminal_id: str, provider=None) -> bool | None:
     if observation is not True:
         return observation
     notification_context = get_workflow_notification_context(terminal_id)
-    mark_terminal_runtime_exited(terminal_id)
+    exited, cancelled_workflow_ids = mark_terminal_runtime_exited_with_workflow_ids(terminal_id)
+    if not exited:
+        return None
     cancel_child_assignments_for_terminal(terminal_id)
-    cancelled_workflow_ids = cancel_workflows_for_terminal_with_ids(terminal_id)
     provider_manager.cleanup_provider(terminal_id)
     _wake_queued_provider_execution()
     if notification_context and int(notification_context["workflow_id"]) in cancelled_workflow_ids:

@@ -344,8 +344,8 @@ def test_graceful_exit_releases_only_after_positive_runtime_death(monkeypatch):
     )
     monkeypatch.setattr(
         terminal_service,
-        "mark_terminal_runtime_exited",
-        lambda terminal_id: exited.append(terminal_id) or True,
+        "mark_terminal_runtime_exited_with_workflow_ids",
+        lambda terminal_id: (exited.append(terminal_id) or True, []),
     )
     monkeypatch.setattr(terminal_service.tmux_client, "window_exists", lambda *_: True)
     monkeypatch.setattr(terminal_service.tmux_client, "get_pane_current_command", lambda *_: "bash")
@@ -383,8 +383,8 @@ def test_graceful_exit_uncertainty_keeps_pending_ownership(monkeypatch):
     exited = []
     monkeypatch.setattr(
         terminal_service,
-        "mark_terminal_runtime_exited",
-        lambda terminal_id: exited.append(terminal_id) or True,
+        "mark_terminal_runtime_exited_with_workflow_ids",
+        lambda terminal_id: (exited.append(terminal_id) or True, []),
     )
     monkeypatch.setattr(terminal_service.tmux_client, "window_exists", lambda *_: None)
     monkeypatch.setattr(

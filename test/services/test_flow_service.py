@@ -398,10 +398,15 @@ Simple prompt without variables.
         mock_terminal.id = "terminal-simple-flow"
         mock_create_terminal.return_value = mock_terminal
 
-        result = execute_flow("simple-flow")
+        with patch(
+            "cli_agent_orchestrator.services.workflow_service.prepare_external_input",
+            return_value={"accepted": True, "turn_id": 101, "queued": False},
+        ) as prepare:
+            result = execute_flow("simple-flow")
 
         assert result is True
         mock_create_terminal.assert_called_once()
+        prepare.assert_called_once_with("terminal-simple-flow", "Simple prompt without variables.")
         mock_send_input.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
@@ -440,6 +445,10 @@ Simple prompt without variables.
                 "cli_agent_orchestrator.services.flow_service.project_service.database.get_project",
                 return_value=None,
             ) as registry,
+            patch(
+                "cli_agent_orchestrator.services.workflow_service.prepare_external_input",
+                return_value={"accepted": True, "turn_id": 102, "queued": False},
+            ),
         ):
             assert execute_flow("historical") is True
         assert create.call_args.kwargs["working_directory"] == "/legacy/a"
@@ -482,9 +491,15 @@ Simple prompt without variables.
             "name": "Current",
             "path": "/current",
         }
-        with patch(
-            "cli_agent_orchestrator.services.flow_service.project_service.launch_context",
-            return_value=("/current", current),
+        with (
+            patch(
+                "cli_agent_orchestrator.services.flow_service.project_service.launch_context",
+                return_value=("/current", current),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.workflow_service.prepare_external_input",
+                return_value={"accepted": True, "turn_id": 103, "queued": False},
+            ),
         ):
             assert execute_flow("current") is True
         assert create.call_args.kwargs["working_directory"] == "/current"
@@ -550,7 +565,11 @@ Value is [[value]].
             mock_terminal.id = "terminal-scripted-flow"
             mock_create_terminal.return_value = mock_terminal
 
-            result = execute_flow("scripted-flow")
+            with patch(
+                "cli_agent_orchestrator.services.workflow_service.prepare_external_input",
+                return_value={"accepted": True, "turn_id": 104, "queued": False},
+            ):
+                result = execute_flow("scripted-flow")
 
             assert result is True
             mock_subprocess.assert_called_once()

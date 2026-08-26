@@ -4877,8 +4877,10 @@ def reconcile_terminal_context_roles_by_topology(*, dry_run: bool = False) -> in
         return len(changes)
 
 
-def mark_terminal_runtime_exited(terminal_id: str) -> bool:
-    """Atomically retire runtime and resumable ownership while preserving history.
+def mark_terminal_runtime_exited_with_workflow_ids(
+    terminal_id: str,
+) -> tuple[bool, List[int]]:
+    """Atomically retire runtime and return workflows cancelled by this transition.
 
     Callers must positively establish provider/tmux/process death first.  The
     terminal row, session association, logs, Inbox, results, and workflow rows
@@ -4895,21 +4897,28 @@ def mark_terminal_runtime_exited(terminal_id: str) -> bool:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal is None:
-            return False
+            db.rollback()
+            return False, []
         terminal.runtime_lifecycle = "exited"
         terminal.runtime_exited_at = terminal.runtime_exited_at or datetime.now()
         terminal.runtime_operation_kind = None
         terminal.runtime_operation_token = None
         terminal.runtime_operation_claimed_at = None
         terminal.runtime_operation_expires_at = None
-        _cancel_protected_workflows_in_transaction(
+        cancelled_workflow_ids = _cancel_protected_workflows_in_transaction(
             db,
             [terminal_id],
             reason="root terminal exited or deleted",
         )
         _release_or_transfer_worktree_writer_lease(db, terminal_id)
         db.commit()
-        return True
+        return True, cancelled_workflow_ids
+
+
+def mark_terminal_runtime_exited(terminal_id: str) -> bool:
+    """Atomically retire runtime and resumable ownership while preserving history."""
+    exited, _cancelled_workflow_ids = mark_terminal_runtime_exited_with_workflow_ids(terminal_id)
+    return exited
 
 
 def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:

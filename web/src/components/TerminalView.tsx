@@ -29,6 +29,14 @@ interface ComposerAttachment {
   path: string
 }
 
+function newWorkflowRequestId(): string {
+  if (typeof globalThis.crypto?.randomUUID === 'function') return globalThis.crypto.randomUUID()
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, token => {
+    const random = Math.floor(Math.random() * 16)
+    return (token === 'x' ? random : (random & 0x3) | 0x8).toString(16)
+  })
+}
+
 export function TerminalView({ terminalId, provider, agentProfile, onClose }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const terminalRef = useRef<Terminal | null>(null)
@@ -44,6 +52,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
   const [uploading, setUploading] = useState(false)
   const [sending, setSending] = useState(false)
   const activeUploadCountRef = useRef(0)
+  const composerRequestRef = useRef<{ message: string; requestId: string } | null>(null)
   const showSnackbar = useStore(state => state.showSnackbar)
 
   useEffect(() => {
@@ -349,12 +358,32 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       : `${draft}\n\nAttached terminal paths:\n${attachments.map(attachment => `- ${attachment.path}`).join('\n')}`
     setSending(true)
     try {
-      await api.sendWorkflowInput(terminalId, message)
+      const priorRequest = composerRequestRef.current
+      const requestId = priorRequest?.message === message
+        ? priorRequest.requestId
+        : newWorkflowRequestId()
+      composerRequestRef.current = { message, requestId }
+      const result = await api.sendWorkflowInput(terminalId, message, requestId)
+      if (!result.success || !result.accepted) throw new Error('Workflow input was not accepted')
       setDraft('')
       setAttachments([])
-      showSnackbar({ type: 'success', message: 'Workflow input sent' })
+      composerRequestRef.current = null
+      showSnackbar({
+        type: result.queued || result.duplicate ? 'info' : 'success',
+        message: result.queued
+          ? `Workflow input queued · turn ${result.turn_id}`
+          : result.duplicate
+            ? `Workflow input already accepted · turn ${result.turn_id}`
+            : `Workflow input admitted · turn ${result.turn_id}`,
+      })
       composerRef.current?.focus()
     } catch (error: any) {
+      if (
+        error?.reasonCode === 'WORKFLOW_INPUT_IDEMPOTENCY_CONFLICT'
+        || error?.reasonCode === 'WORKFLOW_INPUT_NO_LONGER_EXECUTABLE'
+      ) {
+        composerRequestRef.current = null
+      }
       showSnackbar({ type: 'error', message: error.message || 'Failed to send workflow input' })
     } finally {
       setSending(false)

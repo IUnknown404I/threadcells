@@ -15,6 +15,16 @@ export class CaoApiError extends Error {
   }
 }
 
+export interface WorkflowInputResponse {
+  success: boolean
+  accepted: boolean
+  duplicate: boolean
+  turn_id: number
+  queued: boolean
+  status: 'provider_admitted' | 'already_accepted' | 'queued_provider_execution' | 'queued_runtime_recovery' | 'failed'
+  reason_code: string | null
+}
+
 const REASON_COPY: Record<string, [string, string]> = {
   WORKTREE_WRITER_LEASE_HELD: ['Working directory is locked', 'Another active write-capable agent is already using this working directory. Gracefully exit that agent or choose another working directory.'],
   WORKTREE_AUTHORITY_UNRECONCILED: ['Working directory needs attention', 'ThreadCells could not verify worktree authority. Reconcile the existing worktree before starting another writer.'],
@@ -37,6 +47,9 @@ const REASON_COPY: Record<string, [string, string]> = {
   TERMINAL_DEATH_UNCONFIRMED: ['Terminal death is not confirmed', 'ThreadCells could not retire the exact exited runtime, so terminal metadata remains protected.'],
   TERMINAL_RUNTIME_AUTHORITY_UNCERTAIN: ['Terminal authority is uncertain', 'ThreadCells could not verify the exact terminal runtime identity, so metadata remains protected.'],
   TERMINAL_IDENTITY_CHANGED: ['Terminal identity changed', 'Terminal authority changed during deletion. Refresh and retry after lifecycle reconciliation.'],
+  TERMINAL_RUNTIME_NOT_WRITABLE: ['Agent has exited', 'This historical agent cannot receive new Workflow Composer input. Open a Ready agent instead.'],
+  WORKFLOW_INPUT_IDEMPOTENCY_CONFLICT: ['Workflow input changed', 'This retry identity is already bound to different workflow text. Edit the draft and submit it as a new task.'],
+  WORKFLOW_INPUT_NO_LONGER_EXECUTABLE: ['Workflow input is no longer executable', 'This retry identity belongs to a workflow turn that closed before admission. Submit the text again as a new task.'],
   TERMINAL_WORKTREE_PROTECTED: ['Managed worktree retained', 'ThreadCells cannot delete this terminal history because its managed worktree contains state that must remain recoverable.'],
   SESSION_RUNTIME_ACTIVE: ['Exit every agent first', 'A live or Ready agent still owns this session. Gracefully exit every agent before deleting the session.'],
   SESSION_RUNTIME_AUTHORITY_UNPROVEN: ['Session runtime authority is uncertain', 'ThreadCells could not prove that every historical runtime is gone, so the session remains protected.'],
@@ -562,11 +575,11 @@ export const api = {
     fetchJSON<{ output: string; mode: string; availability?: 'available' | 'unavailable'; reason_code?: string | null }>(`/terminals/${id}/output?mode=${mode}`),
   sendInput: (id: string, message: string) =>
     fetchJSON<{ success: boolean }>(`/terminals/${id}/input?message=${encodeURIComponent(message)}`, { method: 'POST' }),
-  sendWorkflowInput: (id: string, message: string) =>
-    fetchJSON<{ success: boolean }>(`/terminals/${id}/workflow-input`, {
+  sendWorkflowInput: (id: string, message: string, requestId: string) =>
+    fetchJSON<WorkflowInputResponse>(`/terminals/${id}/workflow-input`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message, request_id: requestId }),
     }),
   uploadTerminalImage: (id: string, image: File) =>
     fetchJSON<{ path: string }>(`/terminals/${id}/attachments/image`, {

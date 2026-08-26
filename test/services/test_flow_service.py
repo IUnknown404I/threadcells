@@ -398,11 +398,65 @@ Simple prompt without variables.
         mock_terminal.id = "terminal-simple-flow"
         mock_create_terminal.return_value = mock_terminal
 
-        result = execute_flow("simple-flow")
+        with patch(
+            "cli_agent_orchestrator.services.workflow_service.prepare_external_input",
+            return_value={"accepted": True, "turn_id": 101, "queued": False},
+        ) as prepare:
+            result = execute_flow("simple-flow")
 
         assert result is True
         mock_create_terminal.assert_called_once()
+        prepare.assert_called_once_with("terminal-simple-flow", "Simple prompt without variables.")
         mock_send_input.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.flow_service.send_input")
+    @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
+    @patch("cli_agent_orchestrator.services.flow_service.generate_session_name")
+    @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_next_run")
+    @patch("cli_agent_orchestrator.services.flow_service.db_update_flow_run_times")
+    @patch("cli_agent_orchestrator.services.flow_service.db_get_flow")
+    def test_execute_flow_rejects_non_executable_terminal_admission(
+        self,
+        mock_db_get,
+        mock_update_times,
+        mock_update_next,
+        mock_gen_session,
+        mock_create_terminal,
+        mock_send_input,
+    ):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write(
+                '---\nname: rejected-flow\nschedule: "* * * * *"\n'
+                "agent_profile: developer\n---\nPrompt."
+            )
+            f.flush()
+            mock_db_get.return_value = Flow(
+                name="rejected-flow",
+                file_path=f.name,
+                schedule="* * * * *",
+                agent_profile="developer",
+                provider="kiro_cli",
+                enabled=True,
+                next_run=datetime.now(),
+            )
+        mock_gen_session.return_value = "cao-rejected-flow"
+        mock_create_terminal.return_value = MagicMock(id="terminal-rejected-flow")
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.workflow_service.prepare_external_input",
+                return_value={
+                    "accepted": False,
+                    "reason_code": "TERMINAL_RUNTIME_NOT_WRITABLE",
+                },
+            ),
+            pytest.raises(RuntimeError, match="TERMINAL_RUNTIME_NOT_WRITABLE"),
+        ):
+            execute_flow("rejected-flow")
+
+        mock_send_input.assert_not_called()
+        mock_update_times.assert_not_called()
+        mock_update_next.assert_called_once()
 
     @patch("cli_agent_orchestrator.services.flow_service.send_input")
     @patch("cli_agent_orchestrator.services.flow_service.create_terminal")
@@ -440,6 +494,10 @@ Simple prompt without variables.
                 "cli_agent_orchestrator.services.flow_service.project_service.database.get_project",
                 return_value=None,
             ) as registry,
+            patch(
+                "cli_agent_orchestrator.services.workflow_service.prepare_external_input",
+                return_value={"accepted": True, "turn_id": 102, "queued": False},
+            ),
         ):
             assert execute_flow("historical") is True
         assert create.call_args.kwargs["working_directory"] == "/legacy/a"
@@ -482,9 +540,15 @@ Simple prompt without variables.
             "name": "Current",
             "path": "/current",
         }
-        with patch(
-            "cli_agent_orchestrator.services.flow_service.project_service.launch_context",
-            return_value=("/current", current),
+        with (
+            patch(
+                "cli_agent_orchestrator.services.flow_service.project_service.launch_context",
+                return_value=("/current", current),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.workflow_service.prepare_external_input",
+                return_value={"accepted": True, "turn_id": 103, "queued": False},
+            ),
         ):
             assert execute_flow("current") is True
         assert create.call_args.kwargs["working_directory"] == "/current"
@@ -550,7 +614,11 @@ Value is [[value]].
             mock_terminal.id = "terminal-scripted-flow"
             mock_create_terminal.return_value = mock_terminal
 
-            result = execute_flow("scripted-flow")
+            with patch(
+                "cli_agent_orchestrator.services.workflow_service.prepare_external_input",
+                return_value={"accepted": True, "turn_id": 104, "queued": False},
+            ):
+                result = execute_flow("scripted-flow")
 
             assert result is True
             mock_subprocess.assert_called_once()

@@ -1805,12 +1805,18 @@ class TestSendTerminalInput:
             )
             response = client.post(
                 "/terminals/abcd1234/workflow-input",
-                json={"message": "durable owner turn"},
+                json={
+                    "message": "durable owner turn",
+                    "request_id": "735a44c5-2455-4c54-826a-79331fe6cdb0",
+                },
             )
 
         assert response.status_code == 200
         assert response.json() == {
             "success": True,
+            "accepted": True,
+            "duplicate": False,
+            "turn_id": 77,
             "queued": True,
             "status": "queued_provider_execution",
             "reason_code": "TERMINAL_RUNTIME_OPERATION_BUSY",
@@ -1850,21 +1856,157 @@ class TestSendTerminalInput:
                     "queue_reason": "workflow_predecessor",
                 },
             ) as prepare,
+            patch(
+                "cli_agent_orchestrator.api.main.inbox_service.wake_provider_execution_queue"
+            ) as wake,
         ):
             response = client.post(
                 "/terminals/abcd1234/workflow-input",
-                json={"message": "after the child callback"},
+                json={
+                    "message": "after the child callback",
+                    "request_id": "b24c76b1-ec71-4a4a-824d-c8a9ad3e40a7",
+                },
             )
 
         assert response.status_code == 200
         assert response.json() == {
             "success": True,
+            "accepted": True,
+            "duplicate": False,
+            "turn_id": 78,
             "queued": True,
             "status": "queued_provider_execution",
             "reason_code": "WORKFLOW_CONTINUATION_PENDING",
         }
-        prepare.assert_called_once_with("abcd1234", "after the child callback")
+        prepare.assert_called_once_with(
+            "abcd1234",
+            "after the child callback",
+            request_id="b24c76b1-ec71-4a4a-824d-c8a9ad3e40a7",
+        )
         mock_svc.send_input.assert_not_called()
+        wake.assert_called_once()
+
+    def test_duplicate_composer_request_returns_same_turn_without_second_send(self, client):
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.workflow_service.prepare_external_input",
+                return_value={
+                    "accepted": True,
+                    "duplicate": True,
+                    "turn_id": 81,
+                    "queued": False,
+                    "queue_reason": None,
+                },
+            ) as prepare,
+        ):
+            response = client.post(
+                "/terminals/abcd1234/workflow-input",
+                json={
+                    "message": "one exact request",
+                    "request_id": "576f9e7c-83f0-46c5-b838-c7b8b7b3aa34",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": True,
+            "accepted": True,
+            "duplicate": True,
+            "turn_id": 81,
+            "queued": False,
+            "status": "already_accepted",
+            "reason_code": None,
+        }
+        prepare.assert_called_once_with(
+            "abcd1234",
+            "one exact request",
+            request_id="576f9e7c-83f0-46c5-b838-c7b8b7b3aa34",
+        )
+        mock_svc.send_input.assert_not_called()
+
+    def test_exited_terminal_composer_input_is_truthful_conflict(self, client):
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.workflow_service.prepare_external_input",
+                return_value={
+                    "accepted": False,
+                    "reason_code": "TERMINAL_RUNTIME_NOT_WRITABLE",
+                },
+            ),
+        ):
+            response = client.post(
+                "/terminals/abcd1234/workflow-input",
+                json={
+                    "message": "must not resurrect",
+                    "request_id": "39b91266-e0b8-456f-b597-2012079d86c9",
+                },
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["reason_code"] == "TERMINAL_RUNTIME_NOT_WRITABLE"
+        mock_svc.send_input.assert_not_called()
+
+    def test_closed_unreceipted_composer_retry_is_truthful_conflict(self, client):
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.workflow_service.prepare_external_input",
+                return_value={
+                    "accepted": False,
+                    "reason_code": "WORKFLOW_INPUT_NO_LONGER_EXECUTABLE",
+                },
+            ),
+        ):
+            response = client.post(
+                "/terminals/abcd1234/workflow-input",
+                json={
+                    "message": "closed before admission",
+                    "request_id": "e430a9aa-6cb2-4704-b2d7-c5e4cd067bda",
+                },
+            )
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["reason_code"] == "WORKFLOW_INPUT_NO_LONGER_EXECUTABLE"
+        mock_svc.send_input.assert_not_called()
+
+    def test_composer_transport_failure_returns_explicit_durable_recovery(self, client):
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.workflow_service.prepare_external_input",
+                return_value={"turn_id": 82, "queued": False},
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.queue_workflow_input_for_provider",
+                return_value=True,
+            ) as queue,
+            patch(
+                "cli_agent_orchestrator.api.main.inbox_service.wake_provider_execution_queue"
+            ) as wake,
+        ):
+            mock_svc.send_input.side_effect = RuntimeError("provider transport interrupted")
+            response = client.post(
+                "/terminals/abcd1234/workflow-input",
+                json={
+                    "message": "recover this exact submission",
+                    "request_id": "fdbd8a13-1d9f-4be4-94b8-9347f635dbba",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": True,
+            "accepted": True,
+            "duplicate": False,
+            "turn_id": 82,
+            "queued": True,
+            "status": "queued_runtime_recovery",
+            "reason_code": "PROVIDER_TRANSPORT_RETRY_PENDING",
+        }
+        queue.assert_called_once_with("abcd1234", 82, "recover this exact submission")
+        wake.assert_called_once()
 
     def test_public_orchestration_metadata_cannot_suppress_admission(self, client):
         """Public sender/type query values are ignored and cannot retain an old turn."""
@@ -1944,8 +2086,10 @@ class TestSendTerminalInput:
 
     def test_send_input_terminal_not_found(self, client):
         """POST /terminals/{id}/input returns 404 for nonexistent terminal."""
-        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.send_input.side_effect = ValueError("Terminal not found")
+        with patch(
+            "cli_agent_orchestrator.api.main.workflow_service.prepare_external_input",
+            return_value={"accepted": False, "reason_code": "TERMINAL_NOT_FOUND"},
+        ):
 
             response = client.post(
                 "/terminals/deadbeef/input",
@@ -1953,11 +2097,17 @@ class TestSendTerminalInput:
             )
 
         assert response.status_code == 404
-        assert "Terminal not found" in response.json()["detail"]
+        assert response.json()["detail"]["reason_code"] == "TERMINAL_NOT_FOUND"
 
     def test_send_input_server_error(self, client):
         """POST /terminals/{id}/input returns 500 on error."""
-        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.workflow_service.prepare_external_input",
+                return_value={"turn_id": 79, "queued": False},
+            ),
+        ):
             mock_svc.send_input.side_effect = Exception("TMux send failed")
 
             response = client.post(
@@ -1989,12 +2139,27 @@ class TestSendTerminalInput:
 
             response = client.post(
                 "/terminals/abcd1234/workflow-input",
-                json={"message": message},
+                json={
+                    "message": message,
+                    "request_id": "8a02dbb1-2e7c-426c-9398-568eeb20d5a4",
+                },
             )
 
         assert response.status_code == 200
-        assert response.json() == {"success": True}
-        record.assert_called_once_with("abcd1234", message)
+        assert response.json() == {
+            "success": True,
+            "accepted": True,
+            "duplicate": False,
+            "turn_id": 76,
+            "queued": False,
+            "status": "provider_admitted",
+            "reason_code": None,
+        }
+        record.assert_called_once_with(
+            "abcd1234",
+            message,
+            request_id="8a02dbb1-2e7c-426c-9398-568eeb20d5a4",
+        )
         delivered = mock_svc.send_input.call_args.args[1]
         assert "logical-turn=76" in delivered
         assert delivered.endswith(message)
@@ -2012,11 +2177,18 @@ class TestSendTerminalInput:
 
             response = client.post(
                 "/terminals/abcd1234/workflow-input?message=must-not-be-used",
-                json={"message": message},
+                json={
+                    "message": message,
+                    "request_id": "441b0093-cecd-4070-ad76-cb6615566bf0",
+                },
             )
 
         assert response.status_code == 200
-        record.assert_called_once_with("abcd1234", message)
+        record.assert_called_once_with(
+            "abcd1234",
+            message,
+            request_id="441b0093-cecd-4070-ad76-cb6615566bf0",
+        )
         assert mock_svc.send_input.call_args.args[1].endswith(message)
 
     def test_workflow_composer_rejects_empty_input_before_admission(self, client):

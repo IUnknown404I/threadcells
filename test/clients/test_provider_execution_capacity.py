@@ -1,4 +1,5 @@
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -36,6 +37,16 @@ def capacity_db(tmp_path, monkeypatch):
     Base.metadata.create_all(bind=engine)
     sessions = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     monkeypatch.setattr(database, "SessionLocal", sessions)
+
+    @contextmanager
+    def admitted_workflow_fence(*_args, **_kwargs):
+        yield True
+
+    monkeypatch.setattr(
+        operations_service,
+        "workflow_execution_admission_fence",
+        admitted_workflow_fence,
+    )
     with sessions() as db:
         for index in range(5):
             db.add(
@@ -290,6 +301,386 @@ def test_runtime_exit_commit_failure_retains_lifecycle_and_lease(capacity_db):
     ] == [("term-1", 401)]
 
 
+def test_runtime_exit_atomically_cancels_pending_inbox_and_workflow(capacity_db):
+    turn_id = database.start_workflow_input("term-0")
+    assert turn_id is not None
+    message = database.create_inbox_message("owner", "term-0", "must not outlive exit")
+    assert acquire_provider_execution("term-0", turn_id, 3)
+
+    assert mark_terminal_runtime_exited("term-0") is True
+
+    assert database.get_terminal_metadata("term-0")["runtime_lifecycle"] == "exited"
+    assert database.get_workflow_status("term-0") == "cancelled"
+    assert list_provider_execution_leases() == []
+    assert database.get_provider_execution_admission_queue() == []
+    with database.SessionLocal() as db:
+        assert db.get(InboxModel, message.id).status == "failed"
+
+
+def test_inbox_creation_and_runtime_exit_are_serialized(capacity_db):
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def create_message() -> None:
+        barrier.wait()
+        try:
+            database.create_inbox_message("owner", "term-0", "racing input")
+            outcomes.append("created")
+        except ValueError:
+            outcomes.append("rejected")
+
+    def exit_runtime() -> None:
+        barrier.wait()
+        outcomes.append("exited" if mark_terminal_runtime_exited("term-0") else "exit_failed")
+
+    creator = threading.Thread(target=create_message)
+    exiter = threading.Thread(target=exit_runtime)
+    creator.start()
+    exiter.start()
+    creator.join(3)
+    exiter.join(3)
+
+    assert "exited" in outcomes
+    assert "exit_failed" not in outcomes
+    assert len({"created", "rejected"} & set(outcomes)) == 1
+    assert database.get_terminal_metadata("term-0")["runtime_lifecycle"] == "exited"
+    assert database.get_pending_messages("term-0") == []
+    assert database.get_provider_execution_admission_queue() == []
+
+
+def test_inbox_creation_rejects_missing_receiver_without_orphan_row(capacity_db):
+    with pytest.raises(ValueError, match="not found"):
+        database.create_inbox_message("owner", "missing-terminal", "must not orphan")
+
+    with database.SessionLocal() as db:
+        assert db.query(InboxModel).count() == 0
+
+
+def test_reconcile_exited_terminal_workflow_authority_repairs_legacy_race(capacity_db):
+    assert mark_terminal_runtime_exited("term-0") is True
+    with database.SessionLocal() as db:
+        message = InboxModel(
+            sender_id="owner",
+            receiver_id="term-0",
+            message="legacy pending input",
+            status="pending",
+        )
+        workflow = database.WorkflowModel(root_terminal_id="term-0", status="open")
+        db.add_all([message, workflow])
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="inbox_message",
+            dedupe_key="inbox:legacy-exited",
+            inbox_message_id=message.id,
+            state="queued",
+        )
+        db.add(turn)
+        db.flush()
+        workflow_id = workflow.id
+        message_id = message.id
+        turn_id = turn.id
+        db.commit()
+
+    assert database.get_provider_execution_admission_queue()[0]["terminal_id"] == "term-0"
+    assert database.reconcile_exited_terminal_workflow_authorities() == 1
+
+    with database.SessionLocal() as db:
+        assert db.get(database.WorkflowModel, workflow_id).status == "cancelled"
+        assert db.get(InboxModel, message_id).status == "failed"
+        assert db.get(WorkflowTurnModel, turn_id).state == "cancelled"
+    assert database.get_provider_execution_admission_queue() == []
+
+
+def test_composer_request_is_durable_and_idempotent(capacity_db):
+    request_id = "33c0ce56-3400-4dc8-97dc-91529e2b6999"
+    first = database.prepare_workflow_input(
+        "term-0",
+        "durable Composer input",
+        request_id=request_id,
+        require_live_terminal=True,
+    )
+    duplicate = database.prepare_workflow_input(
+        "term-0",
+        "durable Composer input",
+        request_id=request_id,
+        require_live_terminal=True,
+    )
+
+    assert first == {
+        "accepted": True,
+        "duplicate": False,
+        "turn_id": first["turn_id"],
+        "queued": False,
+        "queue_reason": None,
+    }
+    assert duplicate == {
+        "accepted": True,
+        "duplicate": True,
+        "turn_id": first["turn_id"],
+        "queued": False,
+        "queue_reason": None,
+    }
+    with database.SessionLocal() as db:
+        turns = db.query(WorkflowTurnModel).all()
+        assert len(turns) == 1
+        assert turns[0].payload == "durable Composer input"
+
+
+def test_composer_request_identity_rejects_changed_payload(capacity_db):
+    request_id = "6fdba18b-10c2-4406-a169-b14684d395b2"
+    assert database.prepare_workflow_input(
+        "term-0", "first payload", request_id=request_id, require_live_terminal=True
+    )["accepted"]
+
+    conflict = database.prepare_workflow_input(
+        "term-0", "changed payload", request_id=request_id, require_live_terminal=True
+    )
+
+    assert conflict == {
+        "accepted": False,
+        "reason_code": "WORKFLOW_INPUT_IDEMPOTENCY_CONFLICT",
+    }
+    with database.SessionLocal() as db:
+        turns = db.query(WorkflowTurnModel).all()
+        assert len(turns) == 1
+        assert turns[0].payload == "first payload"
+
+
+def test_composer_retry_rejects_closed_unreceipted_turn(capacity_db):
+    request_id = "bc1c06b9-dfb0-4adb-8f72-547bf2aeaf67"
+    prepared = database.prepare_workflow_input(
+        "term-0",
+        "input that closed before admission",
+        request_id=request_id,
+        require_live_terminal=True,
+    )
+    assert database.cancel_workflows_for_terminal("term-0") == 1
+
+    retry = database.prepare_workflow_input(
+        "term-0",
+        "input that closed before admission",
+        request_id=request_id,
+        require_live_terminal=True,
+    )
+
+    assert retry == {
+        "accepted": False,
+        "reason_code": "WORKFLOW_INPUT_NO_LONGER_EXECUTABLE",
+    }
+    with database.SessionLocal() as db:
+        assert db.query(WorkflowTurnModel).count() == 1
+        assert db.get(WorkflowTurnModel, prepared["turn_id"]).state == "sent"
+
+
+def test_composer_retry_accepts_receipted_historical_turn(capacity_db):
+    request_id = "d0abdf4c-6c04-4adb-a3aa-66dd88dac850"
+    prepared = database.prepare_workflow_input(
+        "term-0",
+        "input whose execution was admitted",
+        request_id=request_id,
+        require_live_terminal=True,
+    )
+    assert database.claim_workflow_turn_receipt("term-0", prepared["turn_id"])
+    assert database.set_workflow_terminal_state("term-0", "terminal")
+
+    retry = database.prepare_workflow_input(
+        "term-0",
+        "input whose execution was admitted",
+        request_id=request_id,
+        require_live_terminal=True,
+    )
+
+    assert retry == {
+        "accepted": True,
+        "duplicate": True,
+        "turn_id": prepared["turn_id"],
+        "queued": False,
+        "queue_reason": None,
+    }
+    with database.SessionLocal() as db:
+        assert db.query(WorkflowTurnModel).count() == 1
+
+
+def test_composer_retry_rejects_cancelled_queued_turn(capacity_db):
+    first = database.prepare_workflow_input(
+        "term-0",
+        "active predecessor",
+        request_id="04aa2063-e6cf-4687-889a-f927eb76b1e5",
+        require_live_terminal=True,
+    )
+    request_id = "c89ca989-45ee-4a01-8afc-4c5c133bda89"
+    queued = database.prepare_workflow_input(
+        "term-0",
+        "queued input later cancelled",
+        request_id=request_id,
+        require_live_terminal=True,
+    )
+    assert first["queued"] is False
+    assert queued["queued"] is True
+    assert database.cancel_workflows_for_terminal("term-0") == 1
+
+    retry = database.prepare_workflow_input(
+        "term-0",
+        "queued input later cancelled",
+        request_id=request_id,
+        require_live_terminal=True,
+    )
+
+    assert retry == {
+        "accepted": False,
+        "reason_code": "WORKFLOW_INPUT_NO_LONGER_EXECUTABLE",
+    }
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowTurnModel, queued["turn_id"]).state == "cancelled"
+
+
+def test_distinct_composer_inputs_execute_in_creation_order_once(capacity_db, monkeypatch):
+    first = database.prepare_workflow_input(
+        "term-0",
+        "first sequential input",
+        request_id="d05dd16f-0936-456d-88d1-076ce0a8af66",
+        require_live_terminal=True,
+    )
+    second = database.prepare_workflow_input(
+        "term-0",
+        "second sequential input",
+        request_id="0f792d38-c09b-4a38-bf53-0dcc520d3fdf",
+        require_live_terminal=True,
+    )
+
+    assert first["queued"] is False
+    assert second["queued"] is True
+    assert second["queue_reason"] == "workflow_predecessor"
+    with database.SessionLocal() as db:
+        turns = db.query(WorkflowTurnModel).order_by(WorkflowTurnModel.id.asc()).all()
+        assert [(turn.id, turn.payload, turn.state) for turn in turns] == [
+            (first["turn_id"], "first sequential input", "sent"),
+            (second["turn_id"], "second sequential input", "queued"),
+        ]
+
+    assert database.claim_workflow_turn_receipt("term-0", first["turn_id"])
+    terminal_state = {"lifecycle": "running", "status": TerminalStatus.IDLE.value}
+    send = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        workflow_service.terminal_service, "get_terminal", lambda *_: terminal_state
+    )
+    monkeypatch.setattr(workflow_service.terminal_service, "send_input", send)
+
+    assert inbox_service.reconcile_provider_execution_queue() == 1
+    assert send.call_count == 1
+    assert f"logical-turn={second['turn_id']}" in send.call_args.args[1]
+    assert send.call_args.args[1].endswith("second sequential input")
+    terminal_state["status"] = TerminalStatus.PROCESSING.value
+    assert inbox_service.reconcile_provider_execution_queue() == 0
+    assert send.call_count == 1
+
+
+def test_composer_input_after_completed_workflow_starts_one_successor(capacity_db):
+    first = database.prepare_workflow_input(
+        "term-0",
+        "completed workflow input",
+        request_id="ace57046-5a8b-43a5-8a0d-58111d6510a2",
+        require_live_terminal=True,
+    )
+    assert database.set_workflow_terminal_state("term-0", "terminal")
+
+    successor = database.prepare_workflow_input(
+        "term-0",
+        "successor workflow input",
+        request_id="45ca7cbe-f8d4-466f-81ae-cc274734810c",
+        require_live_terminal=True,
+    )
+
+    assert successor["accepted"] is True
+    assert successor["queued"] is False
+    assert successor["turn_id"] != first["turn_id"]
+    with database.SessionLocal() as db:
+        assert db.query(database.WorkflowModel).count() == 2
+
+
+def test_interrupted_composer_send_requeues_same_payload_and_turn(capacity_db):
+    prepared = database.prepare_workflow_input(
+        "term-0",
+        "resume this exact input",
+        request_id="256fd05b-bb26-42d0-ad36-4c222177ab81",
+        require_live_terminal=True,
+    )
+
+    assert database.requeue_unadmitted_workflow_turns_for_restart() == 1
+
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, prepared["turn_id"])
+        assert turn.state == "queued"
+        assert turn.payload == "resume this exact input"
+    assert database.get_provider_execution_admission_queue() == [
+        {
+            "source": "workflow",
+            "terminal_id": "term-0",
+            "created_at": database.get_provider_execution_admission_queue()[0]["created_at"],
+            "source_id": prepared["turn_id"],
+        }
+    ]
+
+
+def test_composer_input_queued_during_runtime_reconnect_wakes_after_recovery(
+    capacity_db, monkeypatch
+):
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, "term-0")
+        terminal.runtime_operation_kind = "reconnect"
+        terminal.runtime_operation_token = "runtime-generation-reconnect"
+        terminal.runtime_operation_expires_at = datetime.now() + timedelta(minutes=1)
+        db.commit()
+
+    prepared = database.prepare_workflow_input(
+        "term-0",
+        "continue after runtime generation recovery",
+        request_id="610621f8-3bb1-420e-b07c-b04bb221e2ed",
+        require_live_terminal=True,
+    )
+    assert prepared["queued"] is True
+    assert prepared["queue_reason"] == "runtime_recovery"
+
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, "term-0")
+        terminal.runtime_operation_kind = None
+        terminal.runtime_operation_token = None
+        terminal.runtime_operation_expires_at = None
+        db.commit()
+    terminal_state = {"lifecycle": "running", "status": TerminalStatus.IDLE.value}
+    send = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        workflow_service.terminal_service, "get_terminal", lambda *_: terminal_state
+    )
+    monkeypatch.setattr(workflow_service.terminal_service, "send_input", send)
+
+    assert inbox_service.reconcile_provider_execution_queue() == 1
+    assert send.call_count == 1
+    assert f"logical-turn={prepared['turn_id']}" in send.call_args.args[1]
+    assert send.call_args.args[1].endswith("continue after runtime generation recovery")
+
+
+def test_exited_terminal_rejects_composer_without_workflow_authority(capacity_db):
+    assert mark_terminal_runtime_exited("term-0")
+
+    rejected = database.prepare_workflow_input(
+        "term-0",
+        "must not resurrect",
+        request_id="89858954-3df9-48f6-8fb7-6cf7a5fa53f6",
+        require_live_terminal=True,
+    )
+
+    assert rejected == {
+        "accepted": False,
+        "reason_code": "TERMINAL_RUNTIME_NOT_WRITABLE",
+    }
+    assert database.get_provider_execution_admission_queue() == []
+    with database.SessionLocal() as db:
+        assert db.query(database.WorkflowModel).count() == 0
+        assert db.query(WorkflowTurnModel).count() == 0
+
+
 def test_provider_admission_queue_merges_sources_by_durable_age(capacity_db):
     base = datetime(2026, 1, 1, 12, 0, 0)
     workflow_turns = []
@@ -353,8 +744,11 @@ def test_provider_admission_queue_prefers_explicit_inbox_for_same_resident(capac
     ]
 
 
-def test_provider_release_wakeup_dispatches_merged_sources_without_starvation(monkeypatch):
+def test_provider_release_wakeup_dispatches_merged_sources_without_starvation(
+    capacity_db, monkeypatch
+):
     order: list[tuple[str, str]] = []
+    monkeypatch.setattr(inbox_service, "reconcile_exited_terminal_workflow_authorities", lambda: 0)
     monkeypatch.setattr(
         inbox_service,
         "get_provider_execution_admission_queue",

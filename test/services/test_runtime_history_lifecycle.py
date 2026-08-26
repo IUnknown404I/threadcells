@@ -101,7 +101,7 @@ def test_positive_death_releases_runtime_ownership_but_preserves_history(lifecyc
     assert terminal_service.get_output("writer00") == "durable terminal output"
     assert get_inbox_messages("writer00")[0].message == "durable inbox history"
     assert get_delegation_result_for_assignment("writer00") is not None
-    assert get_workflow_status("writer00") == "open"
+    assert get_workflow_status("writer00") == "cancelled"
 
     _terminal("writer01", "cao-new", "/worktree-a", write_enabled=True)
     assert get_terminal_metadata("writer00") is not None
@@ -344,8 +344,8 @@ def test_graceful_exit_releases_only_after_positive_runtime_death(monkeypatch):
     )
     monkeypatch.setattr(
         terminal_service,
-        "mark_terminal_runtime_exited",
-        lambda terminal_id: exited.append(terminal_id) or True,
+        "mark_terminal_runtime_exited_with_workflow_ids",
+        lambda terminal_id: (exited.append(terminal_id) or True, []),
     )
     monkeypatch.setattr(terminal_service.tmux_client, "window_exists", lambda *_: True)
     monkeypatch.setattr(terminal_service.tmux_client, "get_pane_current_command", lambda *_: "bash")
@@ -383,8 +383,8 @@ def test_graceful_exit_uncertainty_keeps_pending_ownership(monkeypatch):
     exited = []
     monkeypatch.setattr(
         terminal_service,
-        "mark_terminal_runtime_exited",
-        lambda terminal_id: exited.append(terminal_id) or True,
+        "mark_terminal_runtime_exited_with_workflow_ids",
+        lambda terminal_id: (exited.append(terminal_id) or True, []),
     )
     monkeypatch.setattr(terminal_service.tmux_client, "window_exists", lambda *_: None)
     monkeypatch.setattr(

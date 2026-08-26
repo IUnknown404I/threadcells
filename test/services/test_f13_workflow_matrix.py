@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from threading import Barrier
 from unittest.mock import ANY, MagicMock, patch
@@ -100,14 +101,28 @@ def workflow_db(monkeypatch, tmp_path):
     Base.metadata.create_all(bind=engine)
     monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
     monkeypatch.setattr(database, "_child_assignment_schema_ready", True)
+    monkeypatch.setattr(mcp_server, "_SIDECAR_RUNTIME_GENERATION", TEST_TERMINAL_RUNTIME_GENERATION)
+    monkeypatch.setattr(
+        mcp_server,
+        "_active_runtime_generation",
+        lambda: TEST_TERMINAL_RUNTIME_GENERATION,
+    )
+
+    @contextmanager
+    def admitted_workflow_fence(*_args, **_kwargs):
+        yield True
+
+    monkeypatch.setattr(
+        operations_service,
+        "workflow_execution_admission_fence",
+        admitted_workflow_fence,
+    )
     yield engine
     engine.dispose()
 
 
 def _authorized_callback(child_id: str):
-    turn_id = start_workflow_input(child_id)
-    assert turn_id is not None
-    assert claim_workflow_turn_receipt(child_id, turn_id)
+    turn_id = _start_admitted_input(child_id)
     effect = claim_workflow_effect(child_id, turn_id, "send_message", "f13-callback")
     assert effect is not None
     return {"workflow_effect_id": effect["id"], "workflow_turn_id": turn_id}
@@ -123,8 +138,8 @@ def _confirmed_exit_result() -> ExitTerminalResult:
     )
 
 
-def _start_admitted_input(root: str) -> int:
-    """Create the initial provider turn and model its mandatory receipt."""
+def _ensure_running_test_terminal(root: str) -> None:
+    """Give workflow-only test roots the live receiver required in production."""
     with database.SessionLocal() as db:
         if db.get(TerminalModel, root) is None:
             db.add(
@@ -140,6 +155,11 @@ def _start_admitted_input(root: str) -> int:
                 )
             )
             db.commit()
+
+
+def _start_admitted_input(root: str) -> int:
+    """Create the initial provider turn and model its mandatory receipt."""
+    _ensure_running_test_terminal(root)
     turn_id = start_workflow_input(root)
     assert turn_id is not None
     assert claim_workflow_turn_receipt(root, turn_id)
@@ -249,6 +269,7 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
 
 def _queue_inbox_workflow_turn(root: str, key: str = "inbox-result") -> tuple[int, int]:
     """Build one real PENDING Inbox row paired to one queued workflow turn."""
+    _ensure_running_test_terminal(root)
     inbox = create_inbox_message("child-inbox", root, "durable Inbox B")
     turn_id, duplicate = queue_workflow_turn(
         root,
@@ -789,7 +810,7 @@ def test_f13_closed_ordinary_inbox_is_not_a_new_owner_input_predecessor(workflow
         owner_turn = db.get(WorkflowTurnModel, prepared["turn_id"])
         assert owner_turn is not None
         assert owner_turn.state == "sent"
-        assert owner_turn.payload is None
+        assert owner_turn.payload == owner_payload
         owner_workflow = db.get(WorkflowModel, owner_turn.workflow_id)
         assert owner_workflow is not None
         assert owner_workflow.status == "open"
@@ -3610,6 +3631,20 @@ def test_f13_historical_receipt_cannot_be_borrowed_by_a_later_model_turn(workflo
 def test_f13_public_assign_metadata_cannot_borrow_the_prior_admission(workflow_db, monkeypatch):
     """A forged public assign wake creates turn two and fences admitted turn one."""
     root = "f13a0012"
+    with database.SessionLocal() as db:
+        db.add(
+            TerminalModel(
+                id=root,
+                tmux_session=f"cao-{root}",
+                tmux_window="owner-0000",
+                provider="codex",
+                runtime_lifecycle="running",
+                runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
+                provider_resume_identity=TEST_CODEX_RESUME_IDENTITY,
+                provider_resume_runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
+            )
+        )
+        db.commit()
     first = start_workflow_input(root)
     assert first is not None
     monkeypatch.setenv("CAO_TERMINAL_ID", root)

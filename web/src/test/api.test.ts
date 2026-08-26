@@ -184,14 +184,17 @@ describe('API wrapper', () => {
   })
 
   it('sendWorkflowInput uses the explicit semantic workflow transport', async () => {
-    mockResponse({ success: true })
-    await api.sendWorkflowInput('t1', 'line one\nline two')
+    mockResponse({ success: true, accepted: true, duplicate: false, turn_id: 73, queued: false, status: 'provider_admitted', reason_code: null })
+    await api.sendWorkflowInput('t1', 'line one\nline two', '4042ff90-5a5c-45c2-9325-b6cbe38f6564')
     expect(mockFetch).toHaveBeenCalledWith(
       '/terminals/t1/workflow-input',
       expect.objectContaining({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: 'line one\nline two' }),
+        body: JSON.stringify({
+          message: 'line one\nline two',
+          request_id: '4042ff90-5a5c-45c2-9325-b6cbe38f6564',
+        }),
       })
     )
   })

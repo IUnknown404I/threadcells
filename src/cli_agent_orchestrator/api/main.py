@@ -18,6 +18,7 @@ from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional, cast
 from urllib.parse import unquote, urlsplit
+from uuid import UUID, uuid4
 
 from anyio import CapacityLimiter, to_thread
 from fastapi import (
@@ -181,7 +182,10 @@ async def _run_workflow_io(function, *args, **kwargs):
 class WorkflowInputRequest(BaseModel):
     """One user-authored Workflow Composer submission."""
 
+    model_config = ConfigDict(extra="forbid")
+
     message: str
+    request_id: UUID = Field(default_factory=uuid4)
 
 
 class InboxMessageRequest(BaseModel):
@@ -1435,6 +1439,10 @@ def _admission_http_exception(exc: AdmissionDenied) -> HTTPException:
         "OWNER_GRANT_ALREADY_CONSUMED": status.HTTP_403_FORBIDDEN,
         "OWNER_GRANT_SCOPE_MISMATCH": status.HTTP_403_FORBIDDEN,
         "ADMISSION_FENCE_TIMEOUT": status.HTTP_409_CONFLICT,
+        "TERMINAL_NOT_FOUND": status.HTTP_404_NOT_FOUND,
+        "TERMINAL_RUNTIME_NOT_WRITABLE": status.HTTP_409_CONFLICT,
+        "WORKFLOW_INPUT_IDEMPOTENCY_CONFLICT": status.HTTP_409_CONFLICT,
+        "WORKFLOW_INPUT_NO_LONGER_EXECUTABLE": status.HTTP_409_CONFLICT,
     }
     return HTTPException(
         status_code=status_by_reason.get(exc.reason_code, status.HTTP_503_SERVICE_UNAVAILABLE),
@@ -1967,7 +1975,13 @@ async def send_terminal_workflow_input(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="message is empty"
         )
-    return await run_in_threadpool(_send_server_bound_input, request, terminal_id, body.message)
+    return await run_in_threadpool(
+        _send_server_bound_input,
+        request,
+        terminal_id,
+        body.message,
+        request_id=str(body.request_id),
+    )
 
 
 def _send_server_bound_input(
@@ -1976,20 +1990,75 @@ def _send_server_bound_input(
     message: str,
     turn_id: Optional[int] = None,
     *,
+    request_id: Optional[str] = None,
     sender_id: Optional[str] = None,
     orchestration_type: Optional[OrchestrationType] = None,
 ) -> Dict:
     """Create the current admission immediately before one provider input."""
     raw_message = message
+    composer_submission = request_id is not None
+
+    def retain_composer_for_recovery(reason_code: str) -> Optional[Dict[str, Any]]:
+        """Turn an uncertain pre-receipt send into one explicit durable retry."""
+        if (
+            not composer_submission
+            or turn_id is None
+            or not queue_workflow_input_for_provider(terminal_id, turn_id, raw_message)
+        ):
+            return None
+        inbox_service.wake_provider_execution_queue(get_plugin_registry(request))
+        return {
+            "success": True,
+            "accepted": True,
+            "duplicate": False,
+            "turn_id": turn_id,
+            "queued": True,
+            "status": "queued_runtime_recovery",
+            "reason_code": reason_code,
+        }
+
     try:
         # The caller cannot select the logical turn. The public endpoint gets a
         # fresh one here; the internal route supplies an opaque, current binding.
         if turn_id is None:
-            prepared = workflow_service.prepare_external_input(terminal_id, raw_message)
+            prepared = (
+                workflow_service.prepare_external_input(
+                    terminal_id,
+                    raw_message,
+                    request_id=request_id,
+                )
+                if request_id is not None
+                else workflow_service.prepare_external_input(terminal_id, raw_message)
+            )
+            if prepared.get("accepted") is False:
+                raise AdmissionDenied(prepared["reason_code"], {})
             turn_id = prepared["turn_id"]
+            if prepared.get("duplicate"):
+                response = {
+                    "success": True,
+                    "queued": bool(prepared["queued"]),
+                    "status": (
+                        "queued_runtime_recovery"
+                        if prepared.get("queue_reason") == "runtime_recovery"
+                        else (
+                            "queued_provider_execution"
+                            if prepared["queued"]
+                            else "already_accepted"
+                        )
+                    ),
+                    "reason_code": (
+                        "TERMINAL_RUNTIME_OPERATION_BUSY"
+                        if prepared.get("queue_reason") == "runtime_recovery"
+                        else "WORKFLOW_CONTINUATION_PENDING" if prepared["queued"] else None
+                    ),
+                }
+                if composer_submission:
+                    response.update({"accepted": True, "duplicate": True, "turn_id": turn_id})
+                return response
             if prepared["queued"]:
                 runtime_recovery = prepared.get("queue_reason") != "workflow_predecessor"
-                return {
+                inbox_service.wake_provider_execution_queue(get_plugin_registry(request))
+                response = {
                     "success": True,
                     "queued": True,
                     "status": (
@@ -2003,6 +2072,9 @@ def _send_server_bound_input(
                         else "WORKFLOW_CONTINUATION_PENDING"
                     ),
                 }
+                if composer_submission:
+                    response.update({"accepted": True, "duplicate": False, "turn_id": turn_id})
+                return response
         message = workflow_service.admission_message(message, turn_id)
         success = terminal_service.send_input(
             terminal_id,
@@ -2012,21 +2084,49 @@ def _send_server_bound_input(
             orchestration_type=orchestration_type,
             logical_turn_id=turn_id,
         )
-        return {"success": success}
+        if not success:
+            retained = retain_composer_for_recovery("PROVIDER_TRANSPORT_RETRY_PENDING")
+            if retained is not None:
+                return retained
+        response = {
+            "success": success,
+        }
+        if composer_submission:
+            response.update(
+                {
+                    "accepted": success,
+                    "duplicate": False,
+                    "turn_id": turn_id,
+                    "queued": False,
+                    "status": "provider_admitted" if success else "failed",
+                    "reason_code": None,
+                }
+            )
+        return response
     except AdmissionDenied as e:
         if turn_id is None or not queue_workflow_input_for_provider(
             terminal_id, turn_id, raw_message
         ):
             raise _admission_http_exception(e)
-        return {
+        inbox_service.wake_provider_execution_queue(get_plugin_registry(request))
+        response = {
             "success": True,
             "queued": True,
             "status": "queued_provider_execution",
             "reason_code": e.reason_code,
         }
+        if composer_submission:
+            response.update({"accepted": True, "duplicate": False, "turn_id": turn_id})
+        return response
     except ValueError as e:
+        retained = retain_composer_for_recovery("TERMINAL_RUNTIME_RECOVERY_PENDING")
+        if retained is not None:
+            return retained
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
+        retained = retain_composer_for_recovery("PROVIDER_TRANSPORT_RETRY_PENDING")
+        if retained is not None:
+            return retained
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to send input: {str(e)}",

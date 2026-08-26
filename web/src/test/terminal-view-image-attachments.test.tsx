@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { api } from '../api'
+import { api, type WorkflowInputResponse } from '../api'
 import { TerminalView } from '../components/TerminalView'
 import { useStore } from '../store'
 
@@ -136,6 +136,17 @@ function deferred<T>() {
   return { promise, resolve }
 }
 
+const admittedWorkflowInput = (overrides: Partial<WorkflowInputResponse> = {}): WorkflowInputResponse => ({
+  success: true,
+  accepted: true,
+  duplicate: false,
+  turn_id: 73,
+  queued: false,
+  status: 'provider_admitted',
+  reason_code: null,
+  ...overrides,
+})
+
 describe('TerminalView image attachments', () => {
   const upload = vi.spyOn(api, 'uploadTerminalImage')
   const uploadFile = vi.spyOn(api, 'uploadTerminalFile')
@@ -163,7 +174,7 @@ describe('TerminalView image attachments', () => {
   }
 
   it('defaults to the Workflow Composer and submits one multiline workflow input on Ctrl+Enter', async () => {
-    sendWorkflowInput.mockResolvedValue({ success: true })
+    sendWorkflowInput.mockResolvedValue(admittedWorkflowInput())
     renderTerminal()
     const composer = screen.getByRole('textbox', { name: 'Workflow Composer' })
 
@@ -172,16 +183,75 @@ describe('TerminalView image attachments', () => {
     fireEvent.keyDown(composer, { key: 'Enter', ctrlKey: true })
 
     await waitFor(() => expect(sendWorkflowInput).toHaveBeenCalledTimes(1))
-    expect(sendWorkflowInput).toHaveBeenCalledWith('abcd1234', 'line one\nline two')
+    expect(sendWorkflowInput).toHaveBeenCalledWith(
+      'abcd1234',
+      'line one\nline two',
+      expect.any(String),
+    )
     expect(testState.sockets[0].send).not.toHaveBeenCalledWith(
       JSON.stringify({ type: 'input', data: 'line one\nline two' }),
     )
   })
 
+  it('reports a durable queued response as queued instead of sent', async () => {
+    sendWorkflowInput.mockResolvedValue(admittedWorkflowInput({
+      turn_id: 74,
+      queued: true,
+      status: 'queued_provider_execution',
+      reason_code: 'WORKFLOW_CONTINUATION_PENDING',
+    }))
+    renderTerminal()
+    const composer = screen.getByRole('textbox', { name: 'Workflow Composer' })
+
+    fireEvent.change(composer, { target: { value: 'follow the current turn' } })
+    fireEvent.keyDown(composer, { key: 'Enter', ctrlKey: true })
+
+    await waitFor(() => expect(useStore.getState().snackbar).toEqual({
+      type: 'info',
+      message: 'Workflow input queued · turn 74',
+    }))
+  })
+
+  it('reuses one request identity when the same draft is retried after a request error', async () => {
+    sendWorkflowInput
+      .mockRejectedValueOnce(new Error('connection interrupted'))
+      .mockResolvedValueOnce(admittedWorkflowInput({ turn_id: 75 }))
+    renderTerminal()
+    const composer = screen.getByRole('textbox', { name: 'Workflow Composer' })
+
+    fireEvent.change(composer, { target: { value: 'retry exactly once' } })
+    fireEvent.keyDown(composer, { key: 'Enter', ctrlKey: true })
+    await waitFor(() => expect(sendWorkflowInput).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(composer).not.toBeDisabled())
+    fireEvent.keyDown(composer, { key: 'Enter', ctrlKey: true })
+    await waitFor(() => expect(sendWorkflowInput).toHaveBeenCalledTimes(2))
+
+    expect(sendWorkflowInput.mock.calls[0][2]).toBe(sendWorkflowInput.mock.calls[1][2])
+  })
+
+  it('uses a new request identity after a closed-turn conflict', async () => {
+    sendWorkflowInput
+      .mockRejectedValueOnce(Object.assign(new Error('turn closed before admission'), {
+        reasonCode: 'WORKFLOW_INPUT_NO_LONGER_EXECUTABLE',
+      }))
+      .mockResolvedValueOnce(admittedWorkflowInput({ turn_id: 76 }))
+    renderTerminal()
+    const composer = screen.getByRole('textbox', { name: 'Workflow Composer' })
+
+    fireEvent.change(composer, { target: { value: 'submit as a fresh task' } })
+    fireEvent.keyDown(composer, { key: 'Enter', ctrlKey: true })
+    await waitFor(() => expect(sendWorkflowInput).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(composer).not.toBeDisabled())
+    fireEvent.keyDown(composer, { key: 'Enter', ctrlKey: true })
+    await waitFor(() => expect(sendWorkflowInput).toHaveBeenCalledTimes(2))
+
+    expect(sendWorkflowInput.mock.calls[0][2]).not.toBe(sendWorkflowInput.mock.calls[1][2])
+  })
+
   it('does not submit with Ctrl+Enter while a Composer attachment upload is pending', async () => {
     const pendingUpload = deferred<{ path: string }>()
     upload.mockReturnValue(pendingUpload.promise)
-    sendWorkflowInput.mockResolvedValue({ success: true })
+    sendWorkflowInput.mockResolvedValue(admittedWorkflowInput())
     renderTerminal()
     const composer = screen.getByRole('textbox', { name: 'Workflow Composer' })
 
@@ -198,6 +268,7 @@ describe('TerminalView image attachments', () => {
     await waitFor(() => expect(sendWorkflowInput).toHaveBeenCalledWith(
       'abcd1234',
       'review this image\n\nAttached terminal paths:\n- /runtime/terminal-attachments/abcd1234/image.png',
+      expect.any(String),
     ))
   })
 
@@ -207,7 +278,7 @@ describe('TerminalView image attachments', () => {
   ])('keeps both concurrent Composer uploads when %s resolves', async (_order, resolutionOrder) => {
     const uploads = [deferred<{ path: string }>(), deferred<{ path: string }>()]
     upload.mockImplementationOnce(() => uploads[0].promise).mockImplementationOnce(() => uploads[1].promise)
-    sendWorkflowInput.mockResolvedValue({ success: true })
+    sendWorkflowInput.mockResolvedValue(admittedWorkflowInput())
     renderTerminal()
     const composer = screen.getByRole('textbox', { name: 'Workflow Composer' })
     const surface = screen.getByTestId('workflow-composer-surface')
@@ -236,6 +307,7 @@ describe('TerminalView image attachments', () => {
     expect(sendWorkflowInput).toHaveBeenCalledWith(
       'abcd1234',
       `review both images\n\nAttached terminal paths:\n- ${paths[resolutionOrder[0]]}\n- ${paths[resolutionOrder[1]]}`,
+      expect.any(String),
     )
     await waitFor(() => expect(composer).toHaveValue(''))
     expect(screen.queryByRole('list', { name: 'Workflow attachments' })).not.toBeInTheDocument()
@@ -243,7 +315,7 @@ describe('TerminalView image attachments', () => {
 
   it('locks Composer mutations until a pending workflow send clears its submitted draft and attachments', async () => {
     upload.mockResolvedValue({ path: '/runtime/terminal-attachments/abcd1234/image.png' })
-    const pendingSend = deferred<{ success: boolean }>()
+    const pendingSend = deferred<WorkflowInputResponse>()
     sendWorkflowInput.mockReturnValue(pendingSend.promise)
     renderTerminal()
     const composer = screen.getByRole('textbox', { name: 'Workflow Composer' })
@@ -266,7 +338,7 @@ describe('TerminalView image attachments', () => {
     expect(composer).toHaveValue('submitted draft')
     expect(screen.getByRole('button', { name: 'Remove image.png' })).toBeDisabled()
 
-    pendingSend.resolve({ success: true })
+    pendingSend.resolve(admittedWorkflowInput())
     await waitFor(() => expect(composer).toHaveValue(''))
     expect(screen.queryByRole('list', { name: 'Workflow attachments' })).not.toBeInTheDocument()
   })
@@ -305,7 +377,7 @@ describe('TerminalView image attachments', () => {
 
   it('adds an opaque ZIP attachment to the Workflow Composer message', async () => {
     uploadFile.mockResolvedValue({ path: '/runtime/terminal-attachments/abcd1234/bundle.zip' })
-    const sendWorkflowInput = vi.spyOn(api, 'sendWorkflowInput').mockResolvedValue({ success: true })
+    const sendWorkflowInput = vi.spyOn(api, 'sendWorkflowInput').mockResolvedValue(admittedWorkflowInput())
     renderTerminal()
 
     fireEvent(screen.getByTestId('workflow-composer-surface'), fileEvent('drop', [file('application/x-zip-compressed', 1, 'bundle.zip')]))
@@ -318,6 +390,7 @@ describe('TerminalView image attachments', () => {
     await waitFor(() => expect(sendWorkflowInput).toHaveBeenCalledWith(
       'abcd1234',
       'inspect archive\n\nAttached terminal paths:\n- /runtime/terminal-attachments/abcd1234/bundle.zip',
+      expect.any(String),
     ))
   })
 

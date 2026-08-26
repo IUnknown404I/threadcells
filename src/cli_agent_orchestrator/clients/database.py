@@ -4877,42 +4877,60 @@ def reconcile_terminal_context_roles_by_topology(*, dry_run: bool = False) -> in
         return len(changes)
 
 
-def mark_terminal_runtime_exited(terminal_id: str) -> bool:
-    """Atomically retire runtime and provider ownership while preserving history.
+def mark_terminal_runtime_exited_with_workflow_ids(
+    terminal_id: str,
+) -> tuple[bool, List[int]]:
+    """Atomically retire runtime and return workflows cancelled by this transition.
 
     Callers must positively establish provider/tmux/process death first.  The
-    terminal row, session association, logs, Inbox, results, and workflows are
-    intentionally retained; runtime lifecycle and both runtime-owned leases
-    cross their terminal boundary in one transaction.
+    terminal row, session association, logs, Inbox, results, and workflow rows
+    are intentionally retained. Runtime lifecycle, both runtime-owned leases,
+    pending Inbox transport, and protected workflow authority cross their
+    terminal boundary in one transaction so a concurrent wake cannot reopen an
+    exited provider.
     """
     _ensure_terminal_worktree_authority_schema()
     _ensure_provider_execution_schema()
+    _ensure_child_assignment_schema()
+    _ensure_workflow_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal is None:
-            return False
+            db.rollback()
+            return False, []
         terminal.runtime_lifecycle = "exited"
         terminal.runtime_exited_at = terminal.runtime_exited_at or datetime.now()
         terminal.runtime_operation_kind = None
         terminal.runtime_operation_token = None
         terminal.runtime_operation_claimed_at = None
         terminal.runtime_operation_expires_at = None
-        _release_or_transfer_worktree_writer_lease(db, terminal_id)
-        execution = (
-            db.query(ProviderExecutionLeaseModel)
-            .filter(ProviderExecutionLeaseModel.terminal_id == terminal_id)
-            .first()
+        cancelled_workflow_ids = _cancel_protected_workflows_in_transaction(
+            db,
+            [terminal_id],
+            reason="root terminal exited or deleted",
         )
-        if execution is not None:
-            db.delete(execution)
+        _release_or_transfer_worktree_writer_lease(db, terminal_id)
         db.commit()
-        return True
+        return True, cancelled_workflow_ids
+
+
+def mark_terminal_runtime_exited(terminal_id: str) -> bool:
+    """Atomically retire runtime and resumable ownership while preserving history."""
+    exited, _cancelled_workflow_ids = mark_terminal_runtime_exited_with_workflow_ids(terminal_id)
+    return exited
 
 
 def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:
-    """Create inbox message with status=MessageStatus.PENDING."""
+    """Create pending Inbox transport only for a resumably live receiver."""
+    _ensure_terminal_worktree_authority_schema()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.get(TerminalModel, receiver_id)
+        if terminal is None:
+            raise ValueError(f"Terminal '{receiver_id}' not found")
+        if terminal.runtime_lifecycle in {"exit_pending", "exited"}:
+            raise ValueError(f"Terminal '{receiver_id}' is exited and cannot receive messages")
         inbox_msg = InboxModel(
             sender_id=sender_id,
             receiver_id=receiver_id,
@@ -4945,6 +4963,17 @@ def ensure_workflow_turn_for_inbox(message_id: int) -> Optional[int]:
             .first()
         )
         if inbox is None:
+            db.commit()
+            return None
+        terminal = db.get(TerminalModel, str(inbox.receiver_id))
+        if terminal is None or terminal.runtime_lifecycle in {"exit_pending", "exited"}:
+            inbox.status = MessageStatus.FAILED.value
+            if terminal is not None:
+                _cancel_protected_workflows_in_transaction(
+                    db,
+                    [str(inbox.receiver_id)],
+                    reason="root terminal exited or deleted",
+                )
             db.commit()
             return None
         existing = (
@@ -5254,6 +5283,28 @@ def _fail_closed_workflow_inbox_transports_in_transaction(
         db.query(InboxModel)
         .filter(
             InboxModel.id.in_(stale_ids),
+            InboxModel.status == MessageStatus.PENDING.value,
+        )
+        .update(
+            {InboxModel.status: MessageStatus.FAILED.value},
+            synchronize_session=False,
+        ),
+    )
+
+
+def _fail_pending_terminal_inbox_transports_in_transaction(
+    db: Any,
+    terminal_ids: Sequence[str],
+) -> int:
+    """Fail every undeliverable FIFO row after terminal runtime closure."""
+    normalized = list(dict.fromkeys(str(value) for value in terminal_ids if value))
+    if not normalized:
+        return 0
+    return cast(
+        int,
+        db.query(InboxModel)
+        .filter(
+            InboxModel.receiver_id.in_(normalized),
             InboxModel.status == MessageStatus.PENDING.value,
         )
         .update(
@@ -5635,6 +5686,8 @@ def _prepare_workflow_input(
     payload: Optional[str] = None,
     transport_binding: Optional[str] = None,
     defer_while_runtime_owned: bool = False,
+    request_id: Optional[str] = None,
+    require_live_terminal: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Persist one input without overtaking existing provider work.
 
@@ -5648,6 +5701,19 @@ def _prepare_workflow_input(
     _ensure_child_assignment_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.get(TerminalModel, root_terminal_id)
+        if require_live_terminal and terminal is None:
+            db.rollback()
+            return {
+                "accepted": False,
+                "reason_code": "TERMINAL_NOT_FOUND",
+            }
+        if terminal is not None and terminal.runtime_lifecycle in ("exit_pending", "exited"):
+            db.rollback()
+            return {
+                "accepted": False,
+                "reason_code": "TERMINAL_RUNTIME_NOT_WRITABLE",
+            }
         if not _retirement_quiescence_allows_commit(db, root_terminal_id):
             return None
         # Terminal workflow turns can leave their ordinary Inbox transport
@@ -5655,6 +5721,83 @@ def _prepare_workflow_input(
         # deliberate replacement workflow, and must never force the new owner
         # input into a queue that only the ineligible row can head.
         _fail_closed_workflow_inbox_transports_in_transaction(db, root_terminal_id)
+        dedupe_key = (
+            f"external_request:{request_id}"
+            if request_id is not None
+            else f"external:{datetime.now().isoformat()}:{id(db)}"
+        )
+        if request_id is not None:
+            existing = (
+                db.query(WorkflowTurnModel)
+                .join(WorkflowModel, WorkflowTurnModel.workflow_id == WorkflowModel.id)
+                .filter(
+                    WorkflowModel.root_terminal_id == root_terminal_id,
+                    WorkflowTurnModel.kind == "external_input",
+                    WorkflowTurnModel.dedupe_key == dedupe_key,
+                )
+                .order_by(WorkflowTurnModel.id.desc())
+                .first()
+            )
+            if existing is not None:
+                if existing.payload is not None and existing.payload != payload:
+                    db.rollback()
+                    return {
+                        "accepted": False,
+                        "reason_code": "WORKFLOW_INPUT_IDEMPOTENCY_CONFLICT",
+                    }
+                if existing.state == TURN_CANCELLED:
+                    db.rollback()
+                    return {
+                        "accepted": False,
+                        "reason_code": "WORKFLOW_INPUT_NO_LONGER_EXECUTABLE",
+                    }
+                existing_workflow = db.get(WorkflowModel, cast(int, existing.workflow_id))
+                receipted = (
+                    db.query(WorkflowTurnReceiptModel.id)
+                    .filter_by(
+                        workflow_turn_id=existing.id,
+                        receiver_terminal_id=root_terminal_id,
+                    )
+                    .first()
+                    is not None
+                )
+                current_sent = bool(
+                    existing_workflow
+                    and existing_workflow.status == WORKFLOW_OPEN
+                    and existing_workflow.active_turn_id == existing.id
+                    and existing.state == TURN_SENT
+                )
+                executable_queue = bool(
+                    existing_workflow
+                    and existing_workflow.status == WORKFLOW_OPEN
+                    and existing.state in (TURN_QUEUED, TURN_CLAIMED)
+                )
+                if not receipted and not current_sent and not executable_queue:
+                    db.rollback()
+                    return {
+                        "accepted": False,
+                        "reason_code": "WORKFLOW_INPUT_NO_LONGER_EXECUTABLE",
+                    }
+                runtime_recovery = bool(
+                    terminal
+                    and (
+                        terminal.runtime_operation_kind in ("reconnect", "retire")
+                        or _terminal_has_pending_provider_reconnect(db, root_terminal_id)
+                    )
+                )
+                queued = executable_queue
+                db.commit()
+                return {
+                    "accepted": True,
+                    "turn_id": cast(int, existing.id),
+                    "queued": queued,
+                    "queue_reason": (
+                        "runtime_recovery"
+                        if queued and runtime_recovery
+                        else "workflow_predecessor" if queued else None
+                    ),
+                    "duplicate": True,
+                }
         workflow = _open_workflow(db, root_terminal_id, create=True)
         assert workflow is not None
         if workflow.status != WORKFLOW_OPEN:
@@ -5666,12 +5809,10 @@ def _prepare_workflow_input(
         runtime_owned = False
         workflow_predecessor = False
         if defer_while_runtime_owned:
-            terminal = db.query(TerminalModel).filter(TerminalModel.id == root_terminal_id).first()
             runtime_owned = bool(
                 terminal
                 and (
-                    terminal.runtime_lifecycle in ("exit_pending", "exited")
-                    or terminal.runtime_operation_kind in ("reconnect", "retire")
+                    terminal.runtime_operation_kind in ("reconnect", "retire")
                     or _terminal_has_pending_provider_reconnect(db, root_terminal_id)
                 )
             )
@@ -5695,8 +5836,11 @@ def _prepare_workflow_input(
         turn = WorkflowTurnModel(
             workflow_id=workflow.id,
             kind="external_input",
-            dedupe_key=f"external:{datetime.now().isoformat()}:{id(workflow)}",
-            payload=payload if queued else None,
+            dedupe_key=dedupe_key,
+            # The provider transport is not the durable copy. Retain the
+            # operator-authored payload even for an immediate send so a server
+            # interruption before receipt can replay this exact logical turn.
+            payload=payload,
             state=TURN_QUEUED if queued else TURN_SENT,
             transport_binding=transport_binding,
         )
@@ -5716,7 +5860,7 @@ def _prepare_workflow_input(
             db.rollback()
             return None
         db.commit()
-        return {
+        prepared = {
             "turn_id": cast(int, turn.id),
             "queued": queued,
             "queue_reason": (
@@ -5725,6 +5869,9 @@ def _prepare_workflow_input(
                 else "workflow_predecessor" if workflow_predecessor else None
             ),
         }
+        if request_id is not None or require_live_terminal:
+            prepared.update({"accepted": True, "duplicate": False})
+        return prepared
 
 
 def _start_workflow_input(
@@ -5732,15 +5879,27 @@ def _start_workflow_input(
 ) -> Optional[int]:
     """Persist one input and optionally bind it to CAO's internal transport."""
     prepared = _prepare_workflow_input(root_terminal_id, transport_binding=transport_binding)
-    return cast(int, prepared["turn_id"]) if prepared is not None else None
+    return (
+        cast(int, prepared["turn_id"])
+        if prepared is not None and prepared.get("accepted") is not False
+        else None
+    )
 
 
-def prepare_workflow_input(root_terminal_id: str, payload: str) -> Optional[Dict[str, Any]]:
+def prepare_workflow_input(
+    root_terminal_id: str,
+    payload: str,
+    *,
+    request_id: Optional[str] = None,
+    require_live_terminal: bool = False,
+) -> Optional[Dict[str, Any]]:
     """Prepare a public/scheduled input, queueing behind runtime recovery."""
     return _prepare_workflow_input(
         root_terminal_id,
         payload=payload,
         defer_while_runtime_owned=True,
+        request_id=request_id,
+        require_live_terminal=require_live_terminal,
     )
 
 
@@ -8877,6 +9036,10 @@ def _cancel_protected_workflows_in_transaction(
         # A session/terminal removal can race a child callback. Fence every
         # active edge and provider execution in the same transaction.
         _cancel_parent_assignments(db, terminal_id, now)
+    # No pending transport can remain deliverable after an explicit terminal
+    # lifecycle cancellation. This also covers ordinary Inbox rows that raced
+    # exit before a workflow turn was materialized.
+    _fail_pending_terminal_inbox_transports_in_transaction(db, normalized)
     db.query(ProviderExecutionLeaseModel).filter(
         ProviderExecutionLeaseModel.terminal_id.in_(normalized)
     ).delete(synchronize_session=False)
@@ -8902,6 +9065,48 @@ def cancel_workflows_for_terminal_with_ids(terminal_id: str) -> List[int]:
 def cancel_workflows_for_terminal(terminal_id: str) -> int:
     """Cancel open workflows while preserving the established count contract."""
     return len(cancel_workflows_for_terminal_with_ids(terminal_id))
+
+
+def reconcile_exited_terminal_workflow_authorities() -> int:
+    """Cancel historical workflow/Inbox authority rooted at exited terminals.
+
+    Runtime exit now performs this transition atomically. This reconciliation
+    is the bounded rolling-upgrade repair for rows created by an older Inbox
+    wake after its separate exit transaction had already committed.
+    """
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_child_assignment_schema()
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        workflow_roots = {
+            str(row[0])
+            for row in db.query(WorkflowModel.root_terminal_id)
+            .join(TerminalModel, TerminalModel.id == WorkflowModel.root_terminal_id)
+            .filter(
+                TerminalModel.runtime_lifecycle == "exited",
+                WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+            )
+            .all()
+        }
+        inbox_roots = {
+            str(row[0])
+            for row in db.query(InboxModel.receiver_id)
+            .join(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
+            .filter(
+                TerminalModel.runtime_lifecycle == "exited",
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .all()
+        }
+        roots = sorted(workflow_roots | inbox_roots)
+        _cancel_protected_workflows_in_transaction(
+            db,
+            roots,
+            reason="root terminal exited or deleted",
+        )
+        db.commit()
+        return len(roots)
 
 
 def _orphaned_protected_workflow_authority_snapshot(

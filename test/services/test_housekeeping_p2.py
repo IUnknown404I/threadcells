@@ -26,8 +26,8 @@ from cli_agent_orchestrator.services.housekeeping_service import (
     _scheduled_mode_due,
     _write_schedule_receipt,
     housekeeping_main,
-    plan_housekeeping,
     plan_full_cleanup_serialized,
+    plan_housekeeping,
     plan_housekeeping_serialized,
     run_housekeeping,
 )

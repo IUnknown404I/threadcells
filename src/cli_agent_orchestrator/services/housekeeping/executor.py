@@ -322,11 +322,20 @@ def _quarantine_and_delete(
             destination_dir_fd=quarantine_fd,
         )
         captured = True
-        captured_fd = os.open(
+        captured_metadata = os.stat(
             captured_name,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
             dir_fd=quarantine_fd,
+            follow_symlinks=False,
         )
+        captured_flags = os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+        if stat.S_ISDIR(captured_metadata.st_mode):
+            captured_flags |= os.O_RDONLY | os.O_DIRECTORY
+        else:
+            # Deletion and fingerprint revalidation need inode identity, not
+            # read access. O_PATH keeps root-owned mode-0600 historical logs
+            # removable by the owner of their approved parent directory.
+            captured_flags |= os.O_PATH
+        captured_fd = os.open(captured_name, captured_flags, dir_fd=quarantine_fd)
         _require_descriptor_name(quarantine_fd, captured_name, captured_fd)
         current_fingerprint, before, manifest = _descriptor_fingerprint(captured_fd)
         if current_fingerprint != expected_fingerprint:

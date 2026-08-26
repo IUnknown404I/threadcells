@@ -63,6 +63,7 @@ def _config(root: Path):
         "release_staging_lock": str(release_lock),
         "release_admin_group": grp.getgrgid(os.getgid()).gr_name,
         "release_control_uid": os.getuid(),
+        "runtime_user": pwd.getpwuid(os.getuid()).pw_name,
     }
 
 
@@ -176,6 +177,61 @@ def test_post_quarantine_replacement_is_never_deleted(tmp_path, monkeypatch):
     assert quarantine.joinpath("candidate/replacement.log").read_text(encoding="utf-8") == (
         "replacement"
     )
+
+
+def test_unreadable_file_is_deleted_without_read_permission_after_quarantine(tmp_path):
+    candidate_path = tmp_path / "state/cao/logs/root-style.log.gz"
+    candidate_path.parent.mkdir(parents=True)
+    candidate_path.write_bytes(b"historical log")
+    candidate_path.chmod(0o000)
+    fingerprint, size = candidate_fingerprint(candidate_path)
+    candidate = HousekeepingCandidate(
+        category="logs",
+        path=str(candidate_path),
+        canonical_identity=f"logs:{candidate_path}",
+        fingerprint=fingerprint,
+        bytes=size,
+        estimated_reclaim_bytes=size,
+        action="delete",
+        retention_reason="test",
+    )
+
+    reclaimed = housekeeping_executor._execute_candidate(candidate_path, candidate)
+
+    assert reclaimed == size
+    assert not candidate_path.exists()
+    assert not list(candidate_path.parent.glob(".threadcells-housekeeping-*"))
+
+
+def test_interrupted_log_quarantine_is_replanned_and_reclaimed(tmp_path, monkeypatch):
+    quarantine = tmp_path / "state/cao/logs/.threadcells-housekeeping-crash"
+    quarantine.mkdir(parents=True, mode=0o700)
+    captured = quarantine / "candidate"
+    captured.write_bytes(b"captured historical log")
+    captured.chmod(0o000)
+
+    plan = _plan(tmp_path, monkeypatch, mode="pressure")
+    candidate = next(item for item in plan.candidates if item.path == str(quarantine.resolve()))
+    assert candidate.action == "delete"
+    assert candidate.retention_reason == "interrupted_housekeeping_quarantine"
+
+    report = execute_plan(plan, config=_config(tmp_path), open_inventory=lambda: (set(), True))
+
+    assert report.ok is True
+    assert not quarantine.exists()
+
+
+def test_ambiguous_log_quarantine_remains_protected(tmp_path, monkeypatch):
+    quarantine = tmp_path / "state/cao/logs/.threadcells-housekeeping-ambiguous"
+    quarantine.mkdir(parents=True, mode=0o700)
+    quarantine.joinpath("candidate").write_bytes(b"captured")
+    quarantine.joinpath("unexpected").write_bytes(b"unknown")
+
+    plan = _plan(tmp_path, monkeypatch, mode="pressure")
+    candidate = next(item for item in plan.candidates if item.path == str(quarantine.resolve()))
+
+    assert candidate.action == "preserve"
+    assert candidate.protection_reason == "HOUSEKEEPING_QUARANTINE_AMBIGUOUS"
 
 
 def test_descriptor_fingerprint_matches_canonical_global_path_order(tmp_path):
@@ -1548,6 +1604,46 @@ def test_replaced_release_lock_is_rejected_without_blocking_log_cleanup(tmp_path
     assert stale.exists()
     assert outside.read_text(encoding="utf-8") == "do not mutate"
     assert any(item["reason_code"] == "RELEASE_STAGING_LOCK_INVALID" for item in report.failures)
+
+
+def test_manual_plan_projects_missing_release_authority_as_protection(tmp_path, monkeypatch):
+    _release(tmp_path, "newest", minutes=200)
+    stale = _release(tmp_path, "stale", minutes=300)
+    config = _config(tmp_path)
+    metadata = Path(config["release_metadata"])
+    metadata.parent.mkdir(parents=True, exist_ok=True)
+    metadata.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "active_release": None,
+                "rollback_releases": [],
+                "candidate_releases": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.clients.database.list_all_terminals", lambda: [])
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping.planner._release_deletion_authority",
+        lambda *_args, **_kwargs: "RELEASE_ADMIN_GROUP_REQUIRED",
+    )
+    settings = default_settings(config)
+    settings["policy"]["releases"]["retain_count"] = 1
+
+    plan = build_plan(
+        root=tmp_path,
+        config=config,
+        settings=settings,
+        mode="weekly",
+        now=NOW,
+        open_inventory=lambda: (set(), True),
+    )
+
+    candidate = next(item for item in plan.candidates if item.path == str(stale.resolve()))
+    assert candidate.action == "preserve"
+    assert candidate.protection_reason == "RELEASE_ADMIN_GROUP_REQUIRED"
+    assert candidate.estimated_reclaim_bytes == 0
 
 
 def test_missing_release_authority_preserves_releases_without_blocking_log_cleanup(

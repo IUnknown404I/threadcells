@@ -11,10 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Make Workflow Composer input durable and idempotent, preserve payloads for restart recovery, and report admitted, queued, duplicate, and recovery states truthfully in the API and Web UI.
 - Resume owner-gated workflows from the exact accepted Composer turn, promote queued owner successors across transport-retry races, and keep resource-policy deferrals out of the transport-failure budget.
+- Carry owner-gate recovery and stale-sidecar reconnect provenance through the exact synthetic continuation so disk-only RED and runtime replacement cannot strand accepted resident work.
 - Atomically fence workflow turns, Inbox transport, provider execution, and writer authority when a terminal exits; reject new executable input to Exited terminals and reconcile stale historical authority without deleting audit evidence.
 - Bind unexpected-runtime-exit notifications to the exact workflow cancelled by the atomic exit transition.
 - Keep filesystem-intensive Housekeeping plans alive beyond the ordinary Web request timeout, show deterministic plan/preview progress and product-safe errors, and serialize read-only inventory under the canonical Housekeeping lock.
 - Initialize the privileged Full Cleanup helper with the runtime account's canonical home and an explicit minimal capability bound for identity, ownership, permission, and signal operations before executing an owner-authorized plan.
+- Report manual release cleanup without release-admin authority as protected, delete unreadable approved log files without requiring read access, and recover exact interrupted Housekeeping quarantine residue.
 
 ### Safety
 

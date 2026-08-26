@@ -266,6 +266,8 @@ def test_stage_ops_p1_is_dry_run_capable_and_idempotent(tmp_path):
     ).read_text()
     assert "User=root" in full_cleanup_helper
     assert "Group=root" in full_cleanup_helper
+    assert "Environment=HOME=/home/agentctl" in full_cleanup_helper
+    assert "Environment=HOME=/root" not in full_cleanup_helper
     assert "EnvironmentFile=/etc/agent-control/cao.env" in full_cleanup_helper
     assert (
         "ExecStart=/var/lib/threadcells/active/runtime/bin/threadcells-full-cleanup-helper"

@@ -6243,7 +6243,15 @@ def get_workflow_status(root_terminal_id: str) -> Optional[str]:
 
 
 def is_owner_gate_resume_turn(root_terminal_id: str, logical_turn_id: int) -> bool:
-    """Return whether an explicit resident turn continues a prior owner gate."""
+    """Return whether a resident turn continues a prior owner gate.
+
+    The owner's explicit ``external_input`` is the first recovery turn. If it
+    finishes while the workflow remains OPEN, its one synthetic ``open_final``
+    successor retains the same provenance and must remain able to make
+    progress under disk-only RED. No other synthetic workflow gains this
+    exception because the current workflow must still point at the same
+    terminal's durable OWNER_GATE predecessor.
+    """
     _ensure_workflow_schema()
     with SessionLocal() as db:
         prior_owner_gate = aliased(WorkflowModel)
@@ -6256,7 +6264,7 @@ def is_owner_gate_resume_turn(root_terminal_id: str, logical_turn_id: int) -> bo
             )
             .filter(
                 WorkflowTurnModel.id == logical_turn_id,
-                WorkflowTurnModel.kind == "external_input",
+                WorkflowTurnModel.kind.in_(("external_input", "open_final")),
                 WorkflowModel.root_terminal_id == root_terminal_id,
                 WorkflowModel.status == WORKFLOW_OPEN,
                 WorkflowModel.active_turn_id == logical_turn_id,
@@ -7477,6 +7485,61 @@ def mark_workflow_turn_sent_for_inbox(message_id: int) -> bool:
         return True
 
 
+def _provider_reconnect_receipt_turn(
+    db: Any,
+    workflow: WorkflowModel,
+    turn: WorkflowTurnModel,
+    root_terminal_id: str,
+) -> Optional[WorkflowTurnModel]:
+    """Resolve the admitted turn which authorizes one active reconnect.
+
+    A stale-sidecar marker can become visible only after the provider's final
+    observation has activated an unreceipted ``open_final``. In that exact
+    state the queued successor is the transport owner, while its finished,
+    receipted predecessor is the model-execution provenance. Bind the
+    relationship once and let the successor own reconnect state; this avoids
+    rolling ``active_turn_id`` backwards or manufacturing a receipt.
+    """
+    candidate = turn
+    if turn.state == TURN_QUEUED and turn.kind == "open_final":
+        predecessor_id = turn.resume_parent_turn_id
+        expected_prefix = "open-final:"
+        if predecessor_id is None and turn.dedupe_key.startswith(expected_prefix):
+            try:
+                predecessor_id = int(turn.dedupe_key[len(expected_prefix) :])
+            except ValueError:
+                return None
+        predecessor = db.get(WorkflowTurnModel, predecessor_id)
+        if (
+            predecessor is None
+            or predecessor.workflow_id != workflow.id
+            or predecessor.state != TURN_FINISHED
+            or turn.dedupe_key != f"open-final:{predecessor.id}"
+            or db.query(WorkflowTurnReceiptModel.id)
+            .filter_by(
+                workflow_turn_id=turn.id,
+                receiver_terminal_id=root_terminal_id,
+            )
+            .first()
+            is not None
+        ):
+            return None
+        if turn.resume_parent_turn_id is None:
+            turn.resume_parent_turn_id = predecessor.id
+        candidate = predecessor
+    elif turn.state not in (TURN_SENT, TURN_FINISHED):
+        return None
+    admitted = (
+        db.query(WorkflowTurnReceiptModel.id)
+        .filter_by(
+            workflow_turn_id=candidate.id,
+            receiver_terminal_id=root_terminal_id,
+        )
+        .first()
+    )
+    return candidate if admitted is not None else None
+
+
 def request_workflow_provider_reconnect(
     root_terminal_id: str, now: Optional[datetime] = None
 ) -> bool:
@@ -7484,10 +7547,9 @@ def request_workflow_provider_reconnect(
 
     The provider can surface the fence while its admitted model turn still
     owns an execution lease, or just after that turn's final observation has
-    durably queued (but not admitted) its successor. Persisting intent on that
-    same admitted turn prevents a later Inbox fast path or service restart
-    from losing the ordering barrier. The existing turn columns remain the
-    sole durable authority; no provider launch occurs here.
+    activated (but not admitted) its synthetic successor. In the latter case
+    the successor owns the reconnect episode while its exact receipted parent
+    supplies provenance. No provider launch occurs here.
     """
     _ensure_workflow_schema()
     now = now or datetime.now()
@@ -7498,22 +7560,10 @@ def request_workflow_provider_reconnect(
             db.rollback()
             return False
         turn = db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
-        if (
-            turn is None
-            or turn.workflow_id != workflow.id
-            or turn.state not in (TURN_SENT, TURN_FINISHED)
-        ):
+        if turn is None or turn.workflow_id != workflow.id:
             db.rollback()
             return False
-        admitted = (
-            db.query(WorkflowTurnReceiptModel.id)
-            .filter_by(
-                workflow_turn_id=turn.id,
-                receiver_terminal_id=root_terminal_id,
-            )
-            .first()
-        )
-        if admitted is None:
+        if _provider_reconnect_receipt_turn(db, workflow, turn, root_terminal_id) is None:
             db.rollback()
             return False
         if turn.provider_reconnect_requested_at is None:
@@ -7557,19 +7607,11 @@ def claim_workflow_provider_reconnect(
             db.rollback()
             return None
         active_turn_id = cast(int, workflow.active_turn_id)
-        admitted = (
-            db.query(WorkflowTurnReceiptModel)
-            .filter_by(
-                workflow_turn_id=active_turn_id,
-                receiver_terminal_id=root_terminal_id,
-            )
-            .first()
-        )
-        if admitted is None:
-            db.rollback()
-            return None
         active_turn = db.get(WorkflowTurnModel, active_turn_id)
-        if active_turn is None:
+        if (
+            active_turn is None
+            or _provider_reconnect_receipt_turn(db, workflow, active_turn, root_terminal_id) is None
+        ):
             db.rollback()
             return None
         authoritative_identity = (
@@ -7670,7 +7712,7 @@ def claim_workflow_provider_reconnect(
             .filter(
                 WorkflowTurnModel.id == active_turn_id,
                 WorkflowTurnModel.workflow_id == workflow.id,
-                WorkflowTurnModel.state.in_((TURN_SENT, TURN_FINISHED)),
+                WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_SENT, TURN_FINISHED)),
                 or_(
                     WorkflowTurnModel.provider_reconnect_requested_at.is_(None),
                     WorkflowTurnModel.provider_reconnect_claim_token.is_(None),
@@ -8629,6 +8671,7 @@ def observe_workflow_final(
                     dedupe_key=dedupe_key,
                     payload="Provider reported final while this workflow remains OPEN.",
                     state=TURN_QUEUED,
+                    resume_parent_turn_id=active_turn_id,
                     not_before=(
                         now
                         if delay_seconds == 0
@@ -8676,6 +8719,10 @@ def claim_workflow_turn(
         workflow = _open_workflow(db, root_terminal_id, create=False)
         if workflow is None or workflow.status != WORKFLOW_OPEN:
             return None
+        if workflow.active_turn_id is not None:
+            active = db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
+            if active is not None and active.provider_reconnect_requested_at is not None:
+                return None
         outstanding = _workflow_has_unadmitted_active_turn(db, workflow)
         inbox_predicate = (
             WorkflowTurnModel.inbox_message_id == inbox_message_id
@@ -8691,6 +8738,7 @@ def claim_workflow_turn(
                     WorkflowTurnModel.id == workflow.active_turn_id,
                     WorkflowTurnModel.workflow_id == workflow.id,
                     WorkflowTurnModel.state == TURN_QUEUED,
+                    WorkflowTurnModel.provider_reconnect_requested_at.is_(None),
                     inbox_predicate,
                     (WorkflowTurnModel.not_before.is_(None))
                     | (WorkflowTurnModel.not_before <= now),
@@ -8701,6 +8749,7 @@ def claim_workflow_turn(
             query = db.query(WorkflowTurnModel).filter(
                 WorkflowTurnModel.workflow_id == workflow.id,
                 WorkflowTurnModel.state == TURN_QUEUED,
+                WorkflowTurnModel.provider_reconnect_requested_at.is_(None),
                 inbox_predicate,
                 (WorkflowTurnModel.not_before.is_(None)) | (WorkflowTurnModel.not_before <= now),
             )

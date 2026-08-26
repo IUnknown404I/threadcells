@@ -205,6 +205,58 @@ def test_owner_gate_composer_resume_is_recovery_safe_for_disk_only_red(capacity_
     assert database.get_provider_execution_turn("term-0") == resumed["turn_id"]
 
 
+def test_owner_gate_open_final_recovery_is_safe_for_disk_only_red(capacity_db, monkeypatch):
+    initial = database.start_workflow_input("term-0")
+    assert initial is not None
+    assert database.set_workflow_terminal_state("term-0", "owner_gate", "owner decision")
+    resumed = database.prepare_workflow_input(
+        "term-0",
+        "recover the resident workflow",
+        request_id="628c4e0a-b3f0-4e91-986f-326109581cac",
+        require_live_terminal=True,
+    )
+    with database.SessionLocal() as db:
+        workflow = (
+            db.query(database.WorkflowModel)
+            .filter_by(root_terminal_id="term-0")
+            .order_by(database.WorkflowModel.id.desc())
+            .first()
+        )
+        successor = database.WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="open_final",
+            dedupe_key=f"open-final:{resumed['turn_id']}",
+            state="queued",
+            resume_parent_turn_id=resumed["turn_id"],
+        )
+        db.add(successor)
+        db.flush()
+        workflow.active_turn_id = successor.id
+        successor_id = successor.id
+        db.commit()
+
+    monkeypatch.setattr(
+        operations_service,
+        "get_resource_status",
+        lambda _config: {
+            "resource_state": "RED",
+            "reasons": ["ROOT_DISK_PRESSURE", "root_free_below_green"],
+        },
+    )
+
+    operations_service.acquire_provider_execution_slot(
+        "term-0",
+        successor_id,
+        config={
+            "max_provider_executions": 3,
+            "lock_dir": str(capacity_db / "locks"),
+            "context_launch_lock_timeout_seconds": 1,
+        },
+    )
+
+    assert database.get_provider_execution_turn("term-0") == successor_id
+
+
 def test_owner_gate_composer_resume_still_fails_closed_for_non_disk_red(capacity_db, monkeypatch):
     initial = database.start_workflow_input("term-0")
     assert initial is not None

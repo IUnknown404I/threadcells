@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import grp
 import json
 import os
 import pwd
 import re
 import shutil
+import stat
 import subprocess
 import zlib
 from concurrent.futures import ThreadPoolExecutor
@@ -1483,6 +1485,7 @@ def _plan_closed_terminal_runtimes(
 
 def _plan_logs(
     root: Path,
+    config: Mapping[str, Any],
     policy: Mapping[str, Any],
     protection: ProtectedSet,
     *,
@@ -1497,6 +1500,38 @@ def _plan_logs(
     result: list[HousekeepingCandidate] = []
     retention = int(policy["retain_minutes"])
     compress_after = int(policy["compress_after_minutes"])
+    try:
+        runtime_uid = pwd.getpwnam(str(config["runtime_user"])).pw_uid
+    except (KeyError, TypeError):
+        runtime_uid = -1
+    for quarantine in sorted(logs.rglob(".threadcells-housekeeping-*")):
+        try:
+            entries = list(quarantine.iterdir())
+            metadata = quarantine.lstat()
+            exact_residue = (
+                not quarantine.is_symlink()
+                and quarantine.is_dir()
+                and metadata.st_uid == runtime_uid
+                and stat.S_IMODE(metadata.st_mode) == 0o700
+                and len(entries) == 1
+                and entries[0].name == "candidate"
+                and not entries[0].is_symlink()
+            )
+            result.append(
+                _candidate(
+                    quarantine,
+                    category="logs",
+                    action="delete",
+                    retention_reason="interrupted_housekeeping_quarantine",
+                    protection=protection,
+                    forced_protection=(
+                        None if exact_residue else "HOUSEKEEPING_QUARANTINE_AMBIGUOUS"
+                    ),
+                    measure_preserved=not exact_residue,
+                )
+            )
+        except OSError:
+            continue
     for path in sorted(logs.rglob("*.log*")):
         try:
             if path.is_symlink() or not path.is_file():
@@ -1592,9 +1627,23 @@ def _release_marker(path: Path) -> bool:
     return False
 
 
+def _release_deletion_authority(config: Mapping[str, Any], *, full_cleanup: bool) -> str | None:
+    """Return why this planner cannot authorize ordinary release deletion."""
+    if full_cleanup or os.geteuid() == 0:
+        return None
+    try:
+        release_group = grp.getgrnam(str(config["release_admin_group"]))
+    except (KeyError, TypeError):
+        return "RELEASE_CONTROL_CONFIG_INVALID"
+    if release_group.gr_gid not in {os.getegid(), *os.getgroups()}:
+        return "RELEASE_ADMIN_GROUP_REQUIRED"
+    return None
+
+
 def _plan_releases(
     policy: Mapping[str, Any],
     protection: ProtectedSet,
+    config: Mapping[str, Any],
     *,
     now: float,
     full_cleanup: bool = False,
@@ -1603,6 +1652,7 @@ def _plan_releases(
         return []
     retention = int(policy["retain_minutes"])
     retain_count = int(policy["retain_count"])
+    release_authority_reason = _release_deletion_authority(config, full_cleanup=full_cleanup)
     directories: set[Path] = set()
     unknown_entries: set[Path] = set()
     for release_root in protection.release_roots:
@@ -1680,6 +1730,7 @@ def _plan_releases(
             action=action,
             retention_reason=reason,
             protection=protection,
+            forced_protection=(release_authority_reason if action == "delete" else None),
             measure_preserved=True,
             preserved_size=measured[path][0],
         )
@@ -1722,7 +1773,14 @@ def build_plan(
         full_cleanup=full_cleanup,
     )
     candidates = [
-        *_plan_logs(root, policy["logs"], protection, now=now, full_cleanup=full_cleanup),
+        *_plan_logs(
+            root,
+            config,
+            policy["logs"],
+            protection,
+            now=now,
+            full_cleanup=full_cleanup,
+        ),
         *_plan_attachments(
             root,
             policy["attachments"],
@@ -1756,6 +1814,7 @@ def build_plan(
             _plan_releases(
                 policy["releases"],
                 protection,
+                config,
                 now=now,
                 full_cleanup=full_cleanup,
             )

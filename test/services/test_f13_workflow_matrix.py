@@ -2454,6 +2454,7 @@ def test_f13_restart_recovers_fence_after_final_before_successor_admission(
         assert resume_identity == TEST_CODEX_RESUME_IDENTITY
         assert registry is None
         assert attempt_state == "reserved"
+        assert claim_workflow_turn(root, now=now) is None
         assert database.mark_workflow_provider_reconnect_launch_dispatched(
             root, turn_id, claim_token, attempt_token, now=now
         )
@@ -2493,6 +2494,101 @@ def test_f13_restart_recovers_fence_after_final_before_successor_admission(
     with database.SessionLocal() as db:
         successor = db.get(WorkflowTurnModel, successor_id)
         assert successor is not None and successor.state == "sent"
+
+
+@patch("cli_agent_orchestrator.services.workflow_service.terminal_service")
+def test_f13_reconnects_after_successor_was_resource_requeued_without_duplicate(
+    mock_terminal, workflow_db
+):
+    """A late stale-sidecar marker binds to the exact queued successor."""
+    root = "root-sidecar-post-resource-requeue"
+    predecessor_id = _start_admitted_input(root)
+    now = datetime(2026, 8, 26, 13, 44, 0)
+    successor_id = observe_workflow_final(root, now=now)
+    assert isinstance(successor_id, int)
+    claimed = claim_workflow_turn(root, now=now)
+    assert claimed is not None and claimed["id"] == successor_id
+    assert activate_workflow_turn(root, successor_id)
+    assert requeue_workflow_turn(
+        successor_id,
+        claimed["claim_token"],
+        claimed["claim_generation"],
+        now=now,
+        admission_reason_code="RESOURCE_HEALTH_REJECTED",
+    )
+    # Model the already-durable pre-fix row: its canonical dedupe edge is
+    # present, but the explicit audit parent was not populated yet.
+    with database.SessionLocal() as db:
+        successor = db.get(WorkflowTurnModel, successor_id)
+        assert successor is not None
+        successor.resume_parent_turn_id = None
+        db.commit()
+
+    mock_terminal.get_terminal.return_value = {
+        "status": TerminalStatus.COMPLETED.value,
+        "lifecycle": "running",
+    }
+    mock_terminal.provider_runtime_sidecar_reconnect_required.side_effect = [
+        True,
+        False,
+        False,
+    ]
+
+    def reconnect_request(
+        terminal_id,
+        turn_id,
+        resume_identity,
+        *,
+        registry,
+        claim_token,
+        attempt_token,
+        attempt_state,
+        side_effect_guard,
+    ):
+        assert terminal_id == root
+        assert turn_id == successor_id
+        assert resume_identity == TEST_CODEX_RESUME_IDENTITY
+        assert registry is None
+        assert attempt_state == "reserved"
+        assert claim_workflow_turn(root, now=now) is None
+        assert database.mark_workflow_provider_reconnect_launch_dispatched(
+            root, turn_id, claim_token, attempt_token, now=now
+        )
+        assert database.record_workflow_provider_reconnect_runtime_ready(
+            root,
+            attempt_token,
+            ACTIVE_RUNTIME_GENERATION,
+            4321,
+            987654,
+            now=now,
+        )
+        assert database.record_workflow_provider_reconnect_output_boundary(
+            root,
+            attempt_token,
+            11,
+            22,
+            333,
+            now=now,
+        )
+
+    mock_terminal.request_provider_runtime_sidecar_reconnect.side_effect = reconnect_request
+
+    assert workflow_service.reconcile_root_workflow(root, now=now) is False
+    assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=31)) is True
+    assert workflow_service.reconcile_root_workflow(root, now=now + timedelta(seconds=32)) is False
+
+    assert mock_terminal.request_provider_runtime_sidecar_reconnect.call_count == 1
+    assert mock_terminal.send_input.call_count == 1
+    with database.SessionLocal() as db:
+        predecessor = db.get(WorkflowTurnModel, predecessor_id)
+        successor = db.get(WorkflowTurnModel, successor_id)
+        attempts = db.query(WorkflowProviderReconnectAttemptModel).all()
+        assert predecessor is not None and predecessor.state == "finished"
+        assert successor is not None and successor.state == "sent"
+        assert successor.resume_parent_turn_id == predecessor_id
+        assert len(attempts) == 1
+        assert attempts[0].workflow_turn_id == successor_id
+        assert attempts[0].state == "succeeded"
 
 
 def test_f13_restart_repairs_backward_open_final_and_admits_new_input_once(workflow_db):

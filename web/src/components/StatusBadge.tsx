@@ -1,3 +1,5 @@
+import { useI18n, type TranslationKey } from '../i18n'
+
 type TerminalStatus = 'IDLE' | 'PROCESSING' | 'COMPLETED' | 'WAITING_USER_ANSWER' | 'ERROR' | string | null
 
 /** Build the UI badge value from the terminal-status API's durable projection. */
@@ -21,7 +23,7 @@ export function lifecycleBadgeStatus(
 }
 
 interface StatusStyle {
-  label: string
+  labelKey: TranslationKey
   dotClass: string
   bgClass: string
   textClass: string
@@ -30,76 +32,76 @@ interface StatusStyle {
 
 const STATUS_CONFIG: Record<string, StatusStyle> = {
   WORKFLOW_COMPLETED: {
-    label: 'Completed',
+    labelKey: 'status.workflow.completed',
     dotClass: 'bg-purple-400',
     bgClass: 'bg-purple-400/10',
     textClass: 'text-purple-400',
   },
-  WORKFLOW_ACTIVE: { label: 'In progress / Active', dotClass: 'bg-blue-400', bgClass: 'bg-blue-400/10', textClass: 'text-blue-400', pulse: true },
-  WORKFLOW_OPEN: { label: 'Open', dotClass: 'bg-blue-400', bgClass: 'bg-blue-400/10', textClass: 'text-blue-400' },
-  WORKFLOW_WAITING: { label: 'Waiting / Recoverable', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
-  WORKFLOW_RECOVERABLE: { label: 'Waiting / Recoverable', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
-  WORKFLOW_RESULT_READY: { label: 'Result ready', dotClass: 'bg-sky-400', bgClass: 'bg-sky-400/10', textClass: 'text-sky-400' },
-  WORKFLOW_OWNER_GATE: { label: 'Needs owner decision', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
-  WORKFLOW_CANCELLED: { label: 'Cancelled', dotClass: 'bg-red-400', bgClass: 'bg-red-400/10', textClass: 'text-red-400' },
-  WORKFLOW_INCOMPLETE: { label: 'Incomplete', dotClass: 'bg-red-400', bgClass: 'bg-red-400/10', textClass: 'text-red-400' },
-  WORKFLOW_FAILED: { label: 'Failed', dotClass: 'bg-red-400', bgClass: 'bg-red-400/10', textClass: 'text-red-400' },
+  WORKFLOW_ACTIVE: { labelKey: 'status.workflow.active', dotClass: 'bg-blue-400', bgClass: 'bg-blue-400/10', textClass: 'text-blue-400', pulse: true },
+  WORKFLOW_OPEN: { labelKey: 'status.workflow.open', dotClass: 'bg-blue-400', bgClass: 'bg-blue-400/10', textClass: 'text-blue-400' },
+  WORKFLOW_WAITING: { labelKey: 'status.workflow.waiting', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
+  WORKFLOW_RECOVERABLE: { labelKey: 'status.workflow.waiting', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
+  WORKFLOW_RESULT_READY: { labelKey: 'status.workflow.resultReady', dotClass: 'bg-sky-400', bgClass: 'bg-sky-400/10', textClass: 'text-sky-400' },
+  WORKFLOW_OWNER_GATE: { labelKey: 'status.workflow.ownerGate', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
+  WORKFLOW_CANCELLED: { labelKey: 'status.workflow.cancelled', dotClass: 'bg-red-400', bgClass: 'bg-red-400/10', textClass: 'text-red-400' },
+  WORKFLOW_INCOMPLETE: { labelKey: 'status.workflow.incomplete', dotClass: 'bg-red-400', bgClass: 'bg-red-400/10', textClass: 'text-red-400' },
+  WORKFLOW_FAILED: { labelKey: 'status.workflow.failed', dotClass: 'bg-red-400', bgClass: 'bg-red-400/10', textClass: 'text-red-400' },
   IDLE: {
-    label: 'Idle',
+    labelKey: 'status.idle',
     dotClass: 'bg-emerald-400',
     bgClass: 'bg-emerald-400/10',
     textClass: 'text-emerald-400',
   },
   PROCESSING: {
-    label: 'Processing',
+    labelKey: 'status.processing',
     dotClass: 'bg-blue-400',
     bgClass: 'bg-blue-400/10',
     textClass: 'text-blue-400',
     pulse: true,
   },
   QUEUED: {
-    label: 'Queued',
+    labelKey: 'status.queued',
     dotClass: 'bg-amber-400',
     bgClass: 'bg-amber-400/10',
     textClass: 'text-amber-400',
   },
-  WAITINGPROVIDERSLOT: { label: 'Queued · Waiting for provider slot', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
-  WAITINGCHILDRETIREMENT: { label: 'Queued · Waiting for child retirement', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
-  WAITINGRESOURCERECOVERY: { label: 'Queued · Waiting for resource recovery', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
-  WAITINGRUNTIMERECOVERY: { label: 'Queued · Waiting for runtime recovery', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
-  WAITINGWORKFLOWCONTINUATION: { label: 'Queued · Waiting for workflow continuation', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
+  WAITINGPROVIDERSLOT: { labelKey: 'status.waitingProvider', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
+  WAITINGCHILDRETIREMENT: { labelKey: 'status.waitingChildRetirement', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
+  WAITINGRESOURCERECOVERY: { labelKey: 'status.waitingResourceRecovery', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
+  WAITINGRUNTIMERECOVERY: { labelKey: 'status.waitingRuntimeRecovery', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
+  WAITINGWORKFLOWCONTINUATION: { labelKey: 'status.waitingWorkflowContinuation', dotClass: 'bg-amber-400', bgClass: 'bg-amber-400/10', textClass: 'text-amber-400' },
   READY: {
-    label: 'Ready',
+    labelKey: 'status.ready',
     dotClass: 'bg-emerald-400',
     bgClass: 'bg-emerald-400/10',
     textClass: 'text-emerald-400',
   },
   EXITED: {
-    label: 'Exited',
+    labelKey: 'status.exited',
     dotClass: 'bg-purple-400',
     bgClass: 'bg-purple-400/10',
     textClass: 'text-purple-400',
   },
   WORKFLOW_UNTRACKED: {
-    label: 'Untracked',
+    labelKey: 'status.untracked',
     dotClass: 'bg-gray-400',
     bgClass: 'bg-gray-400/10',
     textClass: 'text-gray-400',
   },
   COMPLETED: {
-    label: 'Provider Ready',
+    labelKey: 'status.providerReady',
     dotClass: 'bg-purple-400',
     bgClass: 'bg-purple-400/10',
     textClass: 'text-purple-400',
   },
   WAITING_USER_ANSWER: {
-    label: 'Awaiting Input',
+    labelKey: 'status.awaitingInput',
     dotClass: 'bg-amber-400',
     bgClass: 'bg-amber-400/10',
     textClass: 'text-amber-400',
   },
   ERROR: {
-    label: 'Error',
+    labelKey: 'status.error',
     dotClass: 'bg-red-400',
     bgClass: 'bg-red-400/10',
     textClass: 'text-red-400',
@@ -107,28 +109,40 @@ const STATUS_CONFIG: Record<string, StatusStyle> = {
 }
 
 const UNKNOWN_CONFIG: StatusStyle = {
-  label: 'Unknown',
+  labelKey: 'status.unknown',
   dotClass: 'bg-gray-500',
   bgClass: 'bg-gray-500/10',
   textClass: 'text-gray-500',
 }
 
+export function statusTranslationKey(status: string | null | undefined): TranslationKey {
+  const normalized = status?.toUpperCase()
+  return (normalized && (STATUS_CONFIG[normalized] || STATUS_CONFIG[normalized.replace(/_/g, '')])?.labelKey) || UNKNOWN_CONFIG.labelKey
+}
+
+export function sessionStatusTranslationKey(status: string | null | undefined): TranslationKey {
+  return status === 'active' ? 'status.session.active'
+    : status === 'history' ? 'status.session.history'
+    : statusTranslationKey(status)
+}
+
 export function StatusBadge({ status, workflowState }: { status: TerminalStatus, workflowState?: string | null }) {
+  const { t } = useI18n()
   const [storedPrimary, providerDiagnostic] = typeof status === 'string' ? status.split('::', 2) : [status, undefined]
   const normalized = workflowState ? `WORKFLOW_${workflowState.toUpperCase()}` : (storedPrimary ? storedPrimary.toUpperCase() : null)
   const config = (normalized && STATUS_CONFIG[normalized]) || UNKNOWN_CONFIG
 
   if (normalized?.startsWith('WORKFLOW_') && providerDiagnostic) {
     const activity = providerDiagnostic.toUpperCase()
-    const activityConfig = activity === 'PROCESSING' ? STATUS_CONFIG.PROCESSING : activity === 'QUEUED' ? STATUS_CONFIG.QUEUED : activity === 'EXITED' ? { ...STATUS_CONFIG.COMPLETED, label: 'Exited' } : STATUS_CONFIG[activity] || { ...STATUS_CONFIG.IDLE, label: 'Ready' }
-    return <span data-status-badge className="inline-flex flex-wrap items-center gap-1.5"><span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full ${activityConfig.bgClass}`}><span className={`w-2 h-2 rounded-full ${activityConfig.dotClass} ${activityConfig.pulse ? 'animate-pulse' : ''}`} /><span className={`text-xs font-medium ${activityConfig.textClass}`}>{activityConfig.label}</span></span><span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full ${config.bgClass} ${config.textClass}`}><span className="text-[10px]">Workflow ·</span><span className="text-xs font-medium">{config.label}</span></span></span>
+    const activityConfig = activity === 'PROCESSING' ? STATUS_CONFIG.PROCESSING : activity === 'QUEUED' ? STATUS_CONFIG.QUEUED : activity === 'EXITED' ? { ...STATUS_CONFIG.COMPLETED, labelKey: 'status.exited' as TranslationKey } : STATUS_CONFIG[activity] || { ...STATUS_CONFIG.IDLE, labelKey: 'status.ready' as TranslationKey }
+    return <span data-status-badge className="inline-flex flex-wrap items-center gap-1.5"><span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full ${activityConfig.bgClass}`}><span className={`w-2 h-2 rounded-full ${activityConfig.dotClass} ${activityConfig.pulse ? 'animate-pulse' : ''}`} /><span className={`text-xs font-medium ${activityConfig.textClass}`}>{t(activityConfig.labelKey)}</span></span><span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full ${config.bgClass} ${config.textClass}`}><span className="text-[10px]">{t('common.workflowPrefix')}</span><span className="text-xs font-medium">{t(config.labelKey)}</span></span></span>
   }
 
   return (
     <span data-status-badge className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full ${config.bgClass}`}>
       <span className={`w-2 h-2 rounded-full ${config.dotClass} ${config.pulse ? 'animate-pulse' : ''}`} />
-      <span className={`text-xs font-medium ${config.textClass}`}>{config.label}</span>
-      {providerDiagnostic && <span className="text-[10px] text-gray-500">Provider {providerDiagnostic}</span>}
+      <span className={`text-xs font-medium ${config.textClass}`}>{t(config.labelKey)}</span>
+      {providerDiagnostic && <span className="text-[10px] text-gray-500">{t('common.providerPrefix')} {providerDiagnostic}</span>}
     </span>
   )
 }

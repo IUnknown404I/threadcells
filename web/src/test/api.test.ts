@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { api, HOUSEKEEPING_PLAN_TIMEOUT_MS } from '../api'
+import { APP_LOCALE_STORAGE_KEY } from '../i18n'
 
 describe('API wrapper', () => {
   const mockFetch = vi.fn()
@@ -11,6 +12,21 @@ describe('API wrapper', () => {
   afterEach(() => {
     vi.useRealTimers()
     vi.restoreAllMocks()
+    localStorage.clear()
+  })
+
+  it('localizes known errors by stable reason code without translating machine identity', async () => {
+    localStorage.setItem(APP_LOCALE_STORAGE_KEY, 'ru')
+    mockResponse({ reason_code: 'TERMINAL_RUNTIME_ACTIVE', message: 'private backend detail' }, 409)
+
+    const failure = api.deleteTerminal('terminal-id')
+    await expect(failure).rejects.toMatchObject({
+      title: 'Операция недоступна',
+      reasonCode: 'TERMINAL_RUNTIME_ACTIVE',
+      status: 409,
+    })
+    await expect(failure).rejects.not.toThrow('private backend detail')
+    expect(mockFetch).toHaveBeenCalledWith('/terminals/terminal-id', expect.objectContaining({ method: 'DELETE' }))
   })
 
   function mockResponse(data: unknown, status = 200) {
@@ -348,14 +364,20 @@ describe('API wrapper', () => {
     expect(mockFetch).toHaveBeenCalledWith('/flows/my-flow', expect.objectContaining({ method: 'DELETE' }))
   })
 
-  it('throws the API detail on non-OK response', async () => {
+  it('uses product-safe generic copy instead of an unknown raw backend detail', async () => {
     mockFetch.mockResolvedValueOnce({
       ok: false,
       status: 400,
       statusText: 'Bad Request',
       json: () => Promise.resolve({ detail: "Session 'cao-duplicate' already exists" }),
     })
-    await expect(api.listSessions()).rejects.toThrow("Session 'cao-duplicate' already exists")
+    const failure = api.listSessions()
+    await expect(failure).rejects.toMatchObject({
+      title: 'Invalid request',
+      description: 'One or more submitted values are invalid. Review the form and try again.',
+      status: 400,
+    })
+    await expect(failure).rejects.not.toThrow("Session 'cao-duplicate' already exists")
   })
 
   it('exitTerminal sends POST', async () => {

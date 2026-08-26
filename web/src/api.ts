@@ -1,3 +1,5 @@
+import { readStoredAppLocale, translate, type TranslationKey } from './i18n'
+
 const BASE = ''  // Vite proxy handles routing to backend
 
 type ApiFailureBody = { reason_code?: unknown; diagnostic_id?: unknown; detail?: unknown; message?: unknown }
@@ -70,21 +72,63 @@ const REASON_COPY: Record<string, [string, string]> = {
   TERMINAL_WORKTREE_PROTECTED: ['Managed worktree retained', 'ThreadCells cannot delete this terminal history because its managed worktree contains state that must remain recoverable.'],
   SESSION_RUNTIME_ACTIVE: ['Exit every agent first', 'A live or Ready agent still owns this session. Gracefully exit every agent before deleting the session.'],
   SESSION_RUNTIME_AUTHORITY_UNPROVEN: ['Session runtime authority is uncertain', 'ThreadCells could not prove that every historical runtime is gone, so the session remains protected.'],
+  EXIT_PANE_AMBIGUOUS: ['Terminal exit needs attention', 'The terminal window has multiple panes. Resolve the terminal layout before trying Graceful Exit again.'],
 }
 
-const STATUS_COPY: Record<number, [string, string]> = {
-  400: ['Invalid request', 'One or more submitted values are invalid. Review the form and try again.'],
-  401: ['Not authorized', 'The current operation is not permitted.'],
-  403: ['Not authorized', 'The current operation is not permitted.'],
-  404: ['Resource not found', 'The requested session, terminal, agent, or resource no longer exists.'],
-  409: ['Conflict', 'The requested operation conflicts with the current ThreadCells state. Refresh and try again.'],
-  422: ['Invalid request', 'One or more submitted values are invalid. Review the form and try again.'],
-  423: ['Resource is locked', 'This resource is currently locked by another operation. Wait for it to finish or choose another resource.'],
-  429: ['Capacity limit reached', 'No compatible provider or work slot is currently available. Try again after active work finishes.'],
-  500: ['ThreadCells server error', 'The operation failed unexpectedly on the ThreadCells server. Try again shortly.'],
-  502: ['Provider unavailable', 'An upstream provider is currently unavailable. Try again shortly.'],
-  503: ['ThreadCells service unavailable', 'ThreadCells is temporarily unable to accept this operation. Try again shortly.'],
-  504: ['Provider timeout', 'The upstream provider did not respond in time. Try again shortly.'],
+type ErrorKeyPair = readonly [TranslationKey, TranslationKey]
+
+const STATUS_KEYS: Record<number, ErrorKeyPair> = {
+  400: ['error.invalid.title', 'error.invalid.body'],
+  401: ['error.unauthorized.title', 'error.unauthorized.body'],
+  403: ['error.unauthorized.title', 'error.unauthorized.body'],
+  404: ['error.notFound.title', 'error.notFound.body'],
+  409: ['error.conflict.title', 'error.conflict.body'],
+  422: ['error.invalid.title', 'error.invalid.body'],
+  423: ['error.locked.title', 'error.locked.body'],
+  429: ['error.capacity.title', 'error.capacity.body'],
+  500: ['error.server.title', 'error.server.body'],
+  502: ['error.providerUnavailable.title', 'error.providerUnavailable.body'],
+  503: ['error.serviceUnavailable.title', 'error.serviceUnavailable.body'],
+  504: ['error.providerTimeout.title', 'error.providerTimeout.body'],
+}
+
+// The stable reason code selects product-safe localized copy. The canonical
+// code itself remains unchanged in CaoApiError's technical suffix.
+const REASON_KEYS: Record<string, ErrorKeyPair> = {
+  WORKTREE_WRITER_LEASE_HELD: ['error.locked.title', 'error.locked.body'],
+  WORKTREE_AUTHORITY_UNRECONCILED: ['error.operationUnavailable', 'error.conflict.body'],
+  TOTAL_PROVIDER_CAPACITY_EXHAUSTED: ['error.capacity.title', 'error.capacity.body'],
+  PROVIDER_EXECUTION_CAPACITY_EXHAUSTED: ['error.capacity.title', 'error.capacity.body'],
+  RESIDENT_SUPERVISOR_CAPACITY_EXHAUSTED: ['error.capacity.title', 'error.capacity.body'],
+  PROJECT_SUPERVISOR_ALREADY_RESIDENT: ['error.conflict.title', 'error.conflict.body'],
+  WORK_CONTEXT_CAPACITY_EXHAUSTED: ['error.capacity.title', 'error.capacity.body'],
+  RESOURCE_HEALTH_REJECTED: ['error.serviceUnavailable.title', 'error.serviceUnavailable.body'],
+  CONTEXT_INVENTORY_UNAVAILABLE: ['error.serviceUnavailable.title', 'error.serviceUnavailable.body'],
+  ADMISSION_FENCE_TIMEOUT: ['error.timeout.title', 'error.timeout.body'],
+  HEAVY_SLOT_WAIT_TIMEOUT: ['error.timeout.title', 'error.capacity.body'],
+  HOUSEKEEPING_PLAN_CHANGED: ['error.conflict.title', 'error.conflict.body'],
+  HOUSEKEEPING_BUSY: ['error.locked.title', 'error.locked.body'],
+  FULL_CLEANUP_ADMISSION_BUSY: ['error.locked.title', 'error.locked.body'],
+  FULL_CLEANUP_NOT_IDLE: ['error.operationUnavailable', 'error.conflict.body'],
+  FULL_CLEANUP_IDLE_INVENTORY_UNKNOWN: ['error.operationUnavailable', 'error.serviceUnavailable.body'],
+  OPERATOR_AUTH_NOT_CONFIGURED: ['error.unauthorized.title', 'error.unauthorized.body'],
+  TERMINAL_RUNTIME_ACTIVE: ['error.operationUnavailable', 'error.conflict.body'],
+  TERMINAL_EXIT_PENDING: ['error.conflict.title', 'error.conflict.body'],
+  TERMINAL_DEATH_UNCONFIRMED: ['error.operationUnavailable', 'error.conflict.body'],
+  TERMINAL_RUNTIME_AUTHORITY_UNCERTAIN: ['error.operationUnavailable', 'error.conflict.body'],
+  TERMINAL_IDENTITY_CHANGED: ['error.conflict.title', 'error.conflict.body'],
+  TERMINAL_RUNTIME_NOT_WRITABLE: ['error.operationUnavailable', 'error.conflict.body'],
+  WORKFLOW_INPUT_IDEMPOTENCY_CONFLICT: ['error.conflict.title', 'error.conflict.body'],
+  WORKFLOW_INPUT_NO_LONGER_EXECUTABLE: ['error.operationUnavailable', 'error.conflict.body'],
+  TERMINAL_WORKTREE_PROTECTED: ['error.operationUnavailable', 'error.conflict.body'],
+  SESSION_RUNTIME_ACTIVE: ['error.operationUnavailable', 'error.conflict.body'],
+  SESSION_RUNTIME_AUTHORITY_UNPROVEN: ['error.operationUnavailable', 'error.conflict.body'],
+  EXIT_PANE_AMBIGUOUS: ['error.exitPaneAmbiguous.title', 'error.exitPaneAmbiguous.body'],
+}
+
+function localizedPair(pair: ErrorKeyPair): [string, string] {
+  const locale = readStoredAppLocale()
+  return [translate(locale, pair[0]), translate(locale, pair[1])]
 }
 
 export function normalizeApiError(status: number, body: ApiFailureBody | null, statusText = ''): CaoApiError {
@@ -93,9 +137,10 @@ export function normalizeApiError(status: number, body: ApiFailureBody | null, s
   const reasonCode = typeof reasonValue === 'string' && reasonValue.trim() ? reasonValue.trim() : undefined
   const diagnosticValue = body?.diagnostic_id ?? structuredDetail?.diagnostic_id
   const diagnosticId = typeof diagnosticValue === 'string' && /^[0-9a-f]{32}$/.test(diagnosticValue) ? diagnosticValue : undefined
-  const backendMessage = [structuredDetail?.message, structuredDetail?.detail, body?.detail, body?.message].find(value => typeof value === 'string' && value.trim()) as string | undefined
-  const [title, fallback] = (reasonCode && REASON_COPY[reasonCode]) || STATUS_COPY[status] || ['Request failed', 'ThreadCells could not complete this operation. Try again shortly.']
-  const description = reasonCode && REASON_COPY[reasonCode] ? fallback : backendMessage?.trim() || fallback || statusText || 'ThreadCells could not complete this operation. Try again shortly.'
+  const locale = readStoredAppLocale()
+  const translated = (reasonCode && REASON_KEYS[reasonCode] && localizedPair(REASON_KEYS[reasonCode])) || (STATUS_KEYS[status] && localizedPair(STATUS_KEYS[status]))
+  const englishKnown = locale === 'en' && reasonCode ? REASON_COPY[reasonCode] : undefined
+  const [title, description] = englishKnown || translated || [translate(locale, 'error.generic.title'), translate(locale, 'error.generic.body')]
   return new CaoApiError(title, description, status, reasonCode, diagnosticId)
 }
 
@@ -121,9 +166,10 @@ async function fetchJSON<T>(url: string, opts?: FetchJsonOptions): Promise<T> {
     return res.json()
   } catch (reason) {
     if (timedOut) {
+      const locale = readStoredAppLocale()
       const copy = timeoutError || {
-        title: 'Request took too long',
-        description: 'ThreadCells could not complete the request in time. Try again.',
+        title: translate(locale, 'error.timeout.title'),
+        description: translate(locale, 'error.timeout.body'),
         reasonCode: 'REQUEST_TIMEOUT',
       }
       throw new CaoApiError(copy.title, copy.description, 408, copy.reasonCode)
@@ -137,9 +183,10 @@ async function fetchJSON<T>(url: string, opts?: FetchJsonOptions): Promise<T> {
 
 function planningNetworkError(reason: unknown, preview: boolean): never {
   if (reason instanceof CaoApiError || (reason as { name?: string })?.name === 'AbortError') throw reason
+  const locale = readStoredAppLocale()
   throw new CaoApiError(
-    preview ? 'Preview could not be built' : 'Plan could not be built',
-    'ThreadCells lost the connection while scanning resources. No files were deleted. Try again.',
+    translate(locale, preview ? 'error.previewNetwork.title' : 'error.planNetwork.title'),
+    translate(locale, 'error.planNetwork.body'),
     0,
     'HOUSEKEEPING_PLAN_NETWORK_ERROR',
   )
@@ -567,13 +614,14 @@ export const api = {
   getHousekeepingSettings: () => fetchJSON<HousekeepingSettings>('/api/v1/housekeeping'),
   updateHousekeepingSettings: (data: HousekeepingSettings) => fetchJSON<HousekeepingSettings>('/api/v1/housekeeping', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }),
   getHousekeepingPlan: async (mode: HousekeepingMode, signal?: AbortSignal) => {
+    const locale = readStoredAppLocale()
     try {
       return await fetchJSON<HousekeepingPlan>(`/api/v1/housekeeping/plan?mode=${mode}`, {
         signal,
         timeoutMs: HOUSEKEEPING_PLAN_TIMEOUT_MS,
         timeoutError: {
-          title: 'Plan took too long to build',
-          description: 'ThreadCells could not finish the filesystem inventory in time. No files were deleted. Try again.',
+          title: translate(locale, 'error.planTimeout.title'),
+          description: translate(locale, 'error.planTimeout.body'),
           reasonCode: 'HOUSEKEEPING_PLAN_TIMEOUT',
         },
       })
@@ -583,13 +631,14 @@ export const api = {
   },
   runHousekeeping: (mode: HousekeepingMode, dry_run: boolean, expectedPlanId?: string) => fetchJSON<Record<string, any>>('/api/v1/housekeeping/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, dry_run, expected_plan_id: expectedPlanId }), timeoutMs: null }),
   getFullCleanupPlan: async (signal?: AbortSignal) => {
+    const locale = readStoredAppLocale()
     try {
       return await fetchJSON<FullCleanupPlan>('/api/v1/housekeeping/full-cleanup/plan', {
         signal,
         timeoutMs: HOUSEKEEPING_PLAN_TIMEOUT_MS,
         timeoutError: {
-          title: 'Preview took too long to build',
-          description: 'ThreadCells could not finish the filesystem inventory in time. No files were deleted. Try again.',
+          title: translate(locale, 'error.previewTimeout.title'),
+          description: translate(locale, 'error.planTimeout.body'),
           reasonCode: 'HOUSEKEEPING_PLAN_TIMEOUT',
         },
       })

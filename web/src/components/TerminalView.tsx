@@ -15,6 +15,7 @@ import {
 } from './terminal-image-attachments'
 import { InboxPanel } from './InboxPanel'
 import { OutputViewer } from './OutputViewer'
+import { translate, useI18n, type TranslationKey } from '../i18n'
 
 interface TerminalViewProps {
   terminalId: string
@@ -29,6 +30,16 @@ interface ComposerAttachment {
   path: string
 }
 
+function attachmentErrorCopy(error: string, t: (key: TranslationKey, params?: Record<string, string | number>) => string): string {
+  if (error === 'Drop one PNG, JPEG, or WebP image (up to 10 MiB)') return t('terminal.validation.oneImage')
+  if (error === 'Only PNG, JPEG, and WebP images can be attached') return t('terminal.validation.imageTypes')
+  if (error === 'Image must be 10 MiB or smaller') return t('terminal.validation.imageSize')
+  if (error === 'Drop one supported file (ZIP up to 25 MiB)') return t('terminal.validation.oneFile')
+  if (error === 'Supported file types: PNG, JPEG, WebP, MD, TXT, JSON, YAML, CSV, LOG, and ZIP') return t('terminal.validation.fileTypes')
+  const size = /^File must be ([0-9.]+) MiB or smaller$/.exec(error)
+  return size ? t('terminal.validation.fileSize', { size: size[1] }) : error
+}
+
 function newWorkflowRequestId(): string {
   if (typeof globalThis.crypto?.randomUUID === 'function') return globalThis.crypto.randomUUID()
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, token => {
@@ -38,6 +49,9 @@ function newWorkflowRequestId(): string {
 }
 
 export function TerminalView({ terminalId, provider, agentProfile, onClose }: TerminalViewProps) {
+  const { locale, t } = useI18n()
+  const localeRef = useRef(locale)
+  localeRef.current = locale
   const containerRef = useRef<HTMLDivElement>(null)
   const terminalRef = useRef<Terminal | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -137,10 +151,10 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         if (!attachment.path.startsWith('/')) throw new Error('Terminal attachment path must be absolute')
         // Deliberately no newline/Enter: the terminal editor remains in control of submission.
         sendTerminalAttachmentPath(ws, attachment.path)
-        showSnackbar({ type: 'success', message: 'File attached' })
+        showSnackbar({ type: 'success', message: translate(localeRef.current, 'terminal.fileAttached') })
       } catch {
         // Failed uploads leave normal keyboard/text input untouched.
-        showSnackbar({ type: 'error', message: 'Failed to attach file' })
+        showSnackbar({ type: 'error', message: translate(localeRef.current, 'terminal.attachFailed') })
       }
     }
 
@@ -190,7 +204,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         // becomes terminal input.
         const error = terminalImageValidationError(files)
         if (error) {
-          showSnackbar({ type: 'error', message: error })
+          showSnackbar({ type: 'error', message: attachmentErrorCopy(error, (key, params) => translate(localeRef.current, key, params)) })
           return
         }
         const image = supportedTerminalImage(files)
@@ -247,7 +261,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       const files = event.dataTransfer?.files ?? []
       const error = terminalFileValidationError(files)
       if (error) {
-        showSnackbar({ type: 'error', message: error })
+        showSnackbar({ type: 'error', message: attachmentErrorCopy(error, (key, params) => translate(localeRef.current, key, params)) })
         return
       }
       const file = supportedTerminalImage(files) ?? supportedTerminalTextFile(files)
@@ -299,7 +313,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
     if (sending) return
     const error = terminalFileValidationError([file])
     if (error) {
-      showSnackbar({ type: 'error', message: error })
+      showSnackbar({ type: 'error', message: attachmentErrorCopy(error, t) })
       return
     }
     activeUploadCountRef.current += 1
@@ -315,7 +329,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         path: attachment.path,
       }])
     } catch {
-      showSnackbar({ type: 'error', message: 'Failed to attach file' })
+      showSnackbar({ type: 'error', message: t('terminal.attachFailed') })
     } finally {
       activeUploadCountRef.current = Math.max(0, activeUploadCountRef.current - 1)
       setUploading(activeUploadCountRef.current > 0)
@@ -326,7 +340,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
     if (sending) return
     const error = terminalFileValidationError(files)
     if (error) {
-      showSnackbar({ type: 'error', message: error })
+      showSnackbar({ type: 'error', message: attachmentErrorCopy(error, t) })
       return
     }
     const file = selectedAttachment(files)
@@ -364,17 +378,17 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         : newWorkflowRequestId()
       composerRequestRef.current = { message, requestId }
       const result = await api.sendWorkflowInput(terminalId, message, requestId)
-      if (!result.success || !result.accepted) throw new Error('Workflow input was not accepted')
+      if (!result.success || !result.accepted) throw new Error(t('terminal.inputRejected'))
       setDraft('')
       setAttachments([])
       composerRequestRef.current = null
       showSnackbar({
         type: result.queued || result.duplicate ? 'info' : 'success',
         message: result.queued
-          ? `Workflow input queued · turn ${result.turn_id}`
+          ? t('terminal.inputQueued', { turn: result.turn_id })
           : result.duplicate
-            ? `Workflow input already accepted · turn ${result.turn_id}`
-            : `Workflow input admitted · turn ${result.turn_id}`,
+            ? t('terminal.inputDuplicate', { turn: result.turn_id })
+            : t('terminal.inputAdmitted', { turn: result.turn_id }),
       })
       composerRef.current?.focus()
     } catch (error: any) {
@@ -384,7 +398,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       ) {
         composerRequestRef.current = null
       }
-      showSnackbar({ type: 'error', message: error.message || 'Failed to send workflow input' })
+      showSnackbar({ type: 'error', message: error.message || t('terminal.inputFailed') })
     } finally {
       setSending(false)
     }
@@ -418,11 +432,11 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
           {agentProfile && <span className="text-xs text-emerald-400 bg-emerald-900/30 px-2 py-0.5 rounded">{agentProfile}</span>}
         </div>
         <div className="flex items-center gap-3">
-          <span className="text-[10px] text-gray-600">Click X to close</span>
+          <span className="text-[10px] text-gray-600">{t('terminal.closeHint')}</span>
           <button
             onClick={onClose}
             className="p-1 text-gray-500 hover:text-white transition-colors rounded"
-            title="Close terminal"
+            title={t('terminal.close')}
           >
             <X size={18} />
           </button>
@@ -433,7 +447,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         <div
           ref={containerRef}
           role="application"
-          aria-label={`Terminal ${terminalId}`}
+          aria-label={t('terminal.label', { id: terminalId })}
           data-cao-ui-bundle="CAO.UI.ATTACHMENTS.C5"
           style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 }}
         />
@@ -442,7 +456,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
             aria-hidden="true"
             className="pointer-events-none absolute inset-3 flex items-center justify-center rounded-lg border-2 border-dashed border-emerald-400 bg-emerald-950/80 text-sm font-medium text-emerald-200"
           >
-            Drop a file to attach
+            {t('terminal.dropAttach')}
           </div>
         )}
       </div>
@@ -465,29 +479,29 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
         >
           <div className="mb-2 flex items-center justify-between gap-3">
             <label htmlFor={`workflow-composer-${terminalId}`} className="text-sm font-medium text-gray-100">
-              Workflow Composer
+              {t('terminal.composer')}
             </label>
             <div className="flex items-center gap-1">
-              <button type="button" aria-label="Open Inbox" onClick={() => setInboxOpen(true)} className="inline-flex min-h-9 items-center gap-1 rounded px-2 text-xs text-gray-400 hover:bg-gray-800 hover:text-white" title="Open Inbox">
-                <Mail size={14} /><span className="hidden sm:inline">Inbox</span>
+              <button type="button" aria-label={t('terminal.openInbox')} onClick={() => setInboxOpen(true)} className="inline-flex min-h-9 items-center gap-1 rounded px-2 text-xs text-gray-400 hover:bg-gray-800 hover:text-white" title={t('terminal.openInbox')}>
+                <Mail size={14} /><span className="hidden sm:inline">{t('home.inbox')}</span>
               </button>
-              <button type="button" aria-label="Open Output" onClick={() => setOutputOpen(true)} className="inline-flex min-h-9 items-center gap-1 rounded px-2 text-xs text-gray-400 hover:bg-gray-800 hover:text-white" title="Open Output">
-                <FileText size={14} /><span className="hidden sm:inline">Output</span>
+              <button type="button" aria-label={t('terminal.openOutput')} onClick={() => setOutputOpen(true)} className="inline-flex min-h-9 items-center gap-1 rounded px-2 text-xs text-gray-400 hover:bg-gray-800 hover:text-white" title={t('terminal.openOutput')}>
+                <FileText size={14} /><span className="hidden sm:inline">{t('home.output')}</span>
               </button>
               <button
                 type="button"
-                aria-label="Raw Terminal"
+                aria-label={t('terminal.raw')}
                 onClick={openRawTerminal}
                 className="flex min-h-9 items-center gap-1 rounded px-2 text-xs text-gray-400 hover:bg-gray-800 hover:text-white"
               >
-                <span className="hidden sm:inline">Raw Terminal</span><ChevronDown size={14} />
+                <span className="hidden sm:inline">{t('terminal.raw')}</span><ChevronDown size={14} />
               </button>
             </div>
           </div>
           <textarea
             ref={composerRef}
             id={`workflow-composer-${terminalId}`}
-            aria-label="Workflow Composer"
+            aria-label={t('terminal.composer')}
             value={draft}
             onChange={event => {
               if (!sending) setDraft(event.target.value)
@@ -495,22 +509,22 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
             onKeyDown={onComposerKeyDown}
             onPaste={onComposerPaste}
             disabled={sending}
-            placeholder="Describe the work, add context, or paste a long prompt…"
+            placeholder={t('terminal.composerPlaceholder')}
             className="min-h-32 w-full resize-y rounded-lg border border-gray-700 bg-gray-950 px-3 py-2 font-mono text-sm text-gray-100 outline-none placeholder:text-gray-600 focus:border-emerald-500"
           />
           {isComposerDraggingFile && (
             <div className="mt-2 rounded border border-dashed border-emerald-400 bg-emerald-950/60 px-3 py-2 text-sm text-emerald-200">
-              Drop a file to attach to this workflow input
+              {t('terminal.dropComposer')}
             </div>
           )}
           {attachments.length > 0 && (
-            <ul aria-label="Workflow attachments" className="mt-2 space-y-1">
+            <ul aria-label={t('terminal.attachments')} className="mt-2 space-y-1">
               {attachments.map(attachment => (
                 <li key={attachment.id} className="flex items-center justify-between gap-3 rounded bg-gray-800 px-2 py-1 text-xs text-gray-300">
                   <span className="truncate" title={attachment.path}>{attachment.name}</span>
                   <button
                     type="button"
-                    aria-label={`Remove ${attachment.name}`}
+                    aria-label={t('terminal.removeAttachment', { name: attachment.name })}
                     onClick={() => {
                       if (!sending) setAttachments(current => current.filter(item => item.id !== attachment.id))
                     }}
@@ -538,18 +552,18 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
                 disabled={sending}
                 className="flex items-center gap-1.5 text-xs text-gray-300 hover:text-white disabled:opacity-50"
               >
-                <Paperclip size={14} /> {uploading ? 'Attaching…' : 'Attach file'}
+                <Paperclip size={14} /> {uploading ? t('terminal.attaching') : t('terminal.attachFile')}
               </button>
             </div>
             <div className="flex items-center gap-3">
-              <span className="hidden text-xs text-gray-500 sm:inline">Enter for newline · Ctrl/Cmd+Enter to send</span>
+              <span className="hidden text-xs text-gray-500 sm:inline">{t('terminal.keyboardHint')}</span>
               <button
                 type="button"
                 onClick={() => void submitWorkflowInput()}
                 disabled={sending || uploading || !draft.trim()}
                 className="flex items-center gap-1.5 rounded bg-emerald-600 px-3 py-2 text-xs font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
               >
-                <Send size={14} /> {sending ? 'Sending…' : 'Send task'}
+                <Send size={14} /> {sending ? t('common.sending') : t('terminal.sendTask')}
               </button>
             </div>
           </div>
@@ -557,7 +571,7 @@ export function TerminalView({ terminalId, provider, agentProfile, onClose }: Te
       ) : (
         <div className="shrink-0 border-t border-gray-700 bg-gray-900 px-4 py-2">
           <button type="button" onClick={() => setRawTerminalOpen(false)} className="text-xs text-gray-400 hover:text-white">
-            Return to Workflow Composer
+            {t('terminal.returnComposer')}
           </button>
         </div>
       )}

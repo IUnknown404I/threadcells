@@ -4,7 +4,7 @@ English is the canonical authority for ThreadCells public documentation, the roo
 
 ## Locale model
 
-Release locales are `en`, `ru`, `zh-CN`, `es`, `pt-BR`, `de`, and `ja`. Canonical Markdown remains in the source named by `docs/DOCS_MANIFEST.json`. Each non-English document lives at `docs/i18n/LOCALE/SLUG.md` and records:
+Release locales are `en`, `ru`, `zh-CN`, `es`, `pt-BR`, `de`, and `ja`. Canonical English Markdown remains in the source named by `docs/DOCS_MANIFEST.json`; policy-owned root documents keep their established paths. Each non-English document lives at `docs/LOCALE/SLUG.md` and records:
 
 ```yaml
 ---

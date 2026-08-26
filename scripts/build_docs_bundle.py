@@ -14,6 +14,7 @@ import json
 import os
 import re
 import subprocess
+import unicodedata
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +22,8 @@ MANIFEST = ROOT / "docs" / "DOCS_MANIFEST.json"
 PRIVATE_SEGMENTS = {"agents", "memory", "handoffs", ".git"}
 PRIVATE_MARKERS = ("private deployment path", "internal-only deployment")
 PUBLIC_REPOSITORY_BLOB = "https://github.com/IUnknown404I/threadcells/blob/main"
+APP_LOCALES = ("en", "ru")
+FRONT_MATTER = re.compile(r"\A---\n(?P<header>.*?)\n---\n(?P<body>.*)\Z", re.S)
 
 
 def git_identity() -> str:
@@ -48,7 +51,8 @@ def title(markdown: str, fallback: str) -> str:
 def headings(markdown: str) -> list[dict[str, str]]:
     rows = []
     for level, text in re.findall(r"^(#{2,4})\s+(.+?)\s*$", markdown, re.MULTILINE):
-        label = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+        normalized = unicodedata.normalize("NFKD", text.lower())
+        label = re.sub(r"[^\w]+", "-", normalized, flags=re.UNICODE).strip("-")
         rows.append({"level": str(len(level)), "text": text, "anchor": label})
     return rows
 
@@ -76,9 +80,31 @@ def rewrite_internal_links(markdown: str, source: Path, slugs: dict[Path, str]) 
     return re.sub(r"\]\(([^)]+)\)", replace, markdown)
 
 
-def build() -> dict:
-    manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
-    slugs = {(ROOT / item["source"]).resolve(): item["slug"] for item in manifest["documents"]}
+def translated_markdown(locale: str, item: dict, canonical_path: Path) -> str:
+    path = ROOT / "docs" / locale / f"{item['slug']}.md"
+    if not path.is_file():
+        raise ValueError(f"missing {locale} documentation translation: {item['slug']}")
+    value = path.read_text(encoding="utf-8")
+    match = FRONT_MATTER.fullmatch(value)
+    if not match:
+        raise ValueError(f"invalid {locale} documentation metadata: {item['slug']}")
+    metadata = {}
+    for line in match.group("header").splitlines():
+        key, separator, raw = line.partition(":")
+        if not separator or not key.strip() or not raw.strip():
+            raise ValueError(f"invalid {locale} documentation metadata: {item['slug']}")
+        metadata[key.strip()] = raw.strip()
+    expected = {
+        "slug": item["slug"],
+        "source": item["source"],
+        "source_sha256": f"sha256:{hashlib.sha256(canonical_path.read_bytes()).hexdigest()}",
+    }
+    if metadata != expected:
+        raise ValueError(f"stale or mismatched {locale} documentation translation: {item['slug']}")
+    return match.group("body")
+
+
+def build_locale(locale: str, manifest: dict, slugs: dict[Path, str]) -> list[dict]:
     docs = []
     for item in manifest["documents"]:
         source = item["source"]
@@ -88,11 +114,11 @@ def build() -> dict:
         path = ROOT / source
         if not path.is_file() or path.suffix.lower() != ".md":
             raise ValueError(f"missing Markdown source: {source}")
-        markdown = path.read_text(encoding="utf-8")
+        markdown = path.read_text(encoding="utf-8") if locale == "en" else translated_markdown(locale, item, path)
         lowered = markdown.lower()
         if "todo" in lowered or any(marker in lowered for marker in PRIVATE_MARKERS):
             raise ValueError(f"public-document validation failed: {source}")
-        if re.search(r"[\u0400-\u04ff]", markdown):
+        if locale == "en" and re.search(r"[\u0400-\u04ff]", markdown):
             raise ValueError(f"non-English public document: {source}")
         for target in re.findall(r"\]\(([^)#]+)(?:#[^)]+)?\)", markdown):
             if not re.match(r"^(?:https?://|mailto:)", target):
@@ -107,18 +133,24 @@ def build() -> dict:
         docs.append(
             {
                 **item,
-                "title": item.get("title") or title(markdown, item["slug"]),
+                "title": item.get("title") if locale == "en" and item.get("title") else title(markdown, item["slug"]),
                 "headings": headings(markdown),
                 "markdown": rewrite_internal_links(markdown, path, slugs),
                 "sha256": hashlib.sha256(markdown.encode()).hexdigest(),
             }
         )
+    return docs
+
+
+def build() -> dict:
+    manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    slugs = {(ROOT / item["source"]).resolve(): item["slug"] for item in manifest["documents"]}
     return {
-        "schema": 1,
+        "schema": 2,
         "product": "ThreadCells",
         "version": version(),
         "commit": git_identity(),
-        "documents": docs,
+        "locales": {locale: build_locale(locale, manifest, slugs) for locale in APP_LOCALES},
     }
 
 

@@ -175,7 +175,10 @@ def test_docs_bundle_renders_canonical_navigation(tmp_path: Path) -> None:
         check=True,
     )
     bundle = json.loads(output.read_text(encoding="utf-8"))
-    documents = {document["slug"]: document for document in bundle["documents"]}
+    assert bundle["schema"] == 2
+    assert set(bundle["locales"]) == {"en", "ru"}
+    documents = {document["slug"]: document for document in bundle["locales"]["en"]}
+    russian = {document["slug"]: document for document in bundle["locales"]["ru"]}
     assert {
         "overview",
         "installation",
@@ -190,6 +193,8 @@ def test_docs_bundle_renders_canonical_navigation(tmp_path: Path) -> None:
     } <= documents.keys()
     assert "owner-decisions" not in documents
     assert len(documents) == 32
+    assert russian.keys() == documents.keys()
+    assert russian["overview"]["title"] != documents["overview"]["title"]
     assert "](/docs/getting-started)" in documents["installation"]["markdown"]
     assert "](/media/screenshots/threadcells-home.webp)" in documents["web-ui"]["markdown"]
     assert (

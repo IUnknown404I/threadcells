@@ -413,7 +413,7 @@ describe('Control-plane settings routes', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Build Full Cleanup preview' }))
 
     expect(await screen.findByText(/Full Cleanup is blocked until every agent is Ready or Exited/)).toBeInTheDocument()
-    expect(screen.getByText(/Agent agent-working: AGENT EXECUTION NOT IDLE/)).toBeInTheDocument()
+    expect(screen.getByText(/Agent agent-working: AGENT_EXECUTION_NOT_IDLE/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Delete all proven-safe system files' })).toBeDisabled()
   })
 
@@ -537,10 +537,10 @@ describe('Control-plane settings routes', () => {
     expect(screen.getByText('2.5 seconds')).toBeInTheDocument()
     expect(screen.getByText('1.5 KiB')).toBeInTheDocument()
     expect(screen.getByText('logs')).toBeInTheDocument()
-    expect(screen.getByText('package cache')).toBeInTheDocument()
+    expect(screen.getByText('package_cache')).toBeInTheDocument()
     expect(screen.getByText('1 protected or skipped item')).toBeInTheDocument()
     expect(screen.getByText('FINGERPRINT_CHANGED')).toBeInTheDocument()
-    expect(screen.getByText('metadata unknown')).toBeInTheDocument()
+    expect(screen.getByText('metadata_unknown')).toBeInTheDocument()
     expect(screen.getByText('Raw report')).toBeInTheDocument()
   })
 

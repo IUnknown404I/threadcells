@@ -1,39 +1,31 @@
-# ThreadCells v0.3.0-alpha.2
+# ThreadCells v0.3.0-alpha.3
 
-ThreadCells `v0.3.0-alpha.2` is a corrective prerelease for the accepted `v0.3.0-alpha.1` production line. It repairs Workflow Composer delivery and makes durable terminal exit final for executable workflow authority. It remains an alpha technical preview for trusted operators on Linux hosts.
+ThreadCells `v0.3.0-alpha.3` adds English and opt-in Russian localization to the authenticated Web UI and makes the public site and authenticated Docs consume one canonical, manifest-governed Markdown corpus. It remains an alpha technical preview for trusted operators on Linux hosts.
 
 ## What changed
 
-- Workflow Composer requests now carry a stable client request identity. The server persists each executable turn exactly once, retains the payload before provider transport, and safely replays the same turn after an interruption or runtime reconnect.
-- API and Web UI submission results distinguish immediate admission, durable queueing, runtime recovery, duplicate acceptance, and lifecycle conflicts. A generic green success message is no longer shown for input that is only queued.
-- A valid Ready resident terminal remains wakeable after normal completion, a prior completed workflow, runtime-generation change, or interrupted provider work. Distinct sequential inputs retain FIFO order without duplicate provider execution.
-- A Composer decision submitted from an owner gate now durably records its resume provenance. If it races an exhausted predecessor, ThreadCells promotes the exact queued successor rather than leaving it beneath a new owner gate; transient resource admission records an explicit wait reason without consuming transport retries. Disk-only RED may admit this narrow resident recovery path, while provider limits and every non-disk RED reason remain fail-closed.
-- If a stale MCP sidecar is discovered after that owner turn has already produced its synthetic continuation, the continuation now binds to the exact finished, receipted predecessor, performs one deterministic runtime reconnect, and wakes once without Raw Terminal intervention.
-- Durable terminal exit now atomically closes executable workflows, cancels queued or claimed turns, terminally fails pending Inbox transport, releases provider and writer authority, and fences parent/child execution edges while preserving historical rows and results.
-- New Inbox or Composer input targeting an Exited terminal is rejected or retained only as failed, non-executable history. A rolling reconciliation repairs stale rows created by older runtimes before provider admission or Full Cleanup planning.
-- Unexpected-runtime-exit notifications are bound to the exact workflow that won the atomic cancellation transition, including a workflow replacement racing terminal exit.
-- Housekeeping dry-run plans and Full Cleanup previews use the established bounded long-operation window instead of the ordinary 10-second Web timeout. Both actions expose progress, prevent duplicate submissions, retain fail-closed execution controls, and translate timeout or network failures into operator-safe product errors.
-- Interactive inventory requests share the canonical Housekeeping lock with execution, so a disconnected client cannot start a competing planner; a retry receives an explicit busy state until the original read-only scan finishes.
-- The socket-activated Full Cleanup helper now binds lazy runtime state discovery to the configured runtime account's home and applies a minimal explicit capability bound for identity, ownership, permission, and signal operations, while preserving the existing operator, plan, idle-fence, and active-release checks.
-- The socket-activated Full Cleanup helper now receives the same root-provisioned operator-verifier reference as the Web service. Missing authorization configuration fails before planning or deletion with an explicit reason, while unexpected helper faults retain a safe diagnostic ID in the API and system journal.
-- Manual Housekeeping now presents release deletion as protected when its Web/API process intentionally lacks release-admin authority. Approved historical logs can be removed without read permission, and exact private quarantine residue from an interrupted cleanup is safely inventoried for retry; ambiguous residue remains protected.
-
-## Lifecycle invariant
-
-A Ready resident terminal can receive valid new work through Workflow Composer without manual provider-terminal input or process recreation. A durable owner-gate decision either resumes its exact turn or exposes why that turn is waiting; it cannot remain hidden beneath a closed workflow. An Exited terminal cannot acquire or retain executable provider, workflow, Inbox, writer, or filesystem-mutation authority. Durable history remains queryable in both cases.
+- The authenticated global header now includes the same shared language-selector primitive used by the public site. Authenticated P1 offers English and Русский; the independently available public site keeps all seven supported locales.
+- English remains the deterministic authenticated default. Russian is enabled only when the operator selects it, and the namespaced browser preference survives reloads. Browser, OS, IP, provider, and agent language are never auto-detected.
+- A typed `AppLocale` catalog provides interpolation, Russian plural categories through `Intl.PluralRules`, catalog and placeholder parity validation, safe English fallback, and one shared localized status mapping.
+- First-party authenticated chrome is localized across navigation, Home, Agents, Flows, Statistics, Docs, Settings, Orchestration Capacity, Housekeeping, Full Cleanup, Inbox, dialogs, controls, loading/empty/error states, tooltips, and accessible labels.
+- Known product-safe errors select localized copy by stable `reason_code`; reason codes and bounded diagnostic IDs remain canonical technical metadata. Unknown errors use localized generic copy instead of exposing raw browser or backend exceptions.
+- Inbox and terminal surroundings follow the selected UI locale, while prompts, durable messages, delegated results, provider output, raw terminal contents, API values, IDs, paths, profile/model/provider names, and machine fields remain unchanged.
+- Localized Docs and README sources now live under `docs/<locale>/`. Root `README.md` and the allowlisted manifest sources remain canonical English, and source-hash validation continues to reject stale translations.
+- Authenticated English and Russian Docs are generated from the same repository Markdown and `docs/DOCS_MANIFEST.json` used by the public seven-locale Docs site. Switching authenticated locale preserves the current slug and anchor.
 
 ## Install or upgrade
 
 For a new installation, follow [Quick Setup](QUICK_SETUP.md). Existing operators should follow [Upgrading](docs/UPGRADING.md): verify the exact tagged candidate, create and integrity-check a SQLite backup, preserve rollback during deployment acceptance, and activate only after health and workflow checks pass.
 
-The OCI artifact at `ghcr.io/iunknown404i/threadcells-release-bundle:v0.3.0-alpha.2` is a distribution bundle, not a Docker runtime image. Verify `BUNDLE-SHA256SUMS` and the archive checksum before using its contents. The established `latest-alpha` convenience tag may move to this release; no unqualified stable `latest` tag is published.
+The OCI artifact at `ghcr.io/iunknown404i/threadcells-release-bundle:v0.3.0-alpha.3` is a distribution bundle, not a Docker runtime image. Verify `BUNDLE-SHA256SUMS` and the archive checksum before using its contents. The established `latest-alpha` convenience tag may move to this release; no unqualified stable `latest` tag is published.
 
 ## Compatibility and limitations
 
 - Linux, tmux, Git, Python 3.10–3.14, and Node.js remain the supported operating foundation.
 - Codex remains the reference adapter. Other built-in adapters expose only capabilities supported by the installed provider version.
 - ThreadCells coordinates powerful local tools; worktrees are not security sandboxes and hostile multi-tenancy is unsupported.
-- All previous tags and published artifacts, including immutable `v0.3.0-alpha.1`, remain unchanged.
-- Full Cleanup still requires the existing operator unlock, a fresh fingerprinted preview, authoritative global idle state, and explicit permanent-action confirmation.
+- Authenticated localization in this P1 release is English and Russian only. Public Docs remain available in English, Russian, Simplified Chinese, Spanish, Brazilian Portuguese, German, and Japanese.
+- UI locale is presentation-only and never changes provider/model behavior or translates durable agent, provider, prompt, result, or machine content.
+- All previous tags and published artifacts remain unchanged.
 
 See the [public documentation](https://iunknown404i.github.io/threadcells/docs/) and [release process](docs/RELEASE_PROCESS.md) for the complete operating and distribution model.

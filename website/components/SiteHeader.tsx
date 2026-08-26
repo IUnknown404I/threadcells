@@ -5,6 +5,7 @@ import { usePathname } from 'next/navigation'
 import { Mark } from '@/components/Mark'
 import { assetPath, basePath, site } from '@/lib/site'
 import { docsPath, landingPath, localeCopy, locales, localizedPath, type Locale } from '@/lib/locales'
+import { LanguageSelector } from '../../web/src/components/LanguageSelector'
 
 export function SiteHeader({ locale = 'en', routePath = '/' }: { locale?: Locale; routePath?: string }) {
   const copy = localeCopy[locale]
@@ -28,12 +29,7 @@ export function SiteHeader({ locale = 'en', routePath = '/' }: { locale?: Locale
           <a href={assetPath(landingPath(locale, '#open-source'))}>{copy.nav[2]}</a>
         </nav>
         <div className="header-actions">
-          <details className="language-menu">
-            <summary aria-label={copy.language}>{copy.code}</summary>
-            <div role="menu" aria-label={copy.language}>
-              {locales.map(next => <a key={next} role="menuitem" href={localeHref(next)} hrefLang={localeCopy[next].htmlLang} aria-current={next === locale ? 'page' : undefined}>{localeCopy[next].name}</a>)}
-            </div>
-          </details>
+          <LanguageSelector locale={locale} label={copy.language} hrefFor={localeHref} options={locales.map(code => ({ code, short: localeCopy[code].short, name: localeCopy[code].name, htmlLang: localeCopy[code].htmlLang }))} />
           <a className="header-icon-link header-docs-link" href={assetPath(docsPath(locale))} aria-label={copy.docs}><Book /> <span>{copy.docs}</span></a>
           <a className="header-icon-link header-github-link" href={site.githubUrl} target="_blank" rel="noopener noreferrer" aria-label={`ThreadCells — ${copy.github}`}><Github /> <span>{copy.github}</span></a>
           <span className="system-state"><i /> {copy.systemReady}</span>

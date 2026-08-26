@@ -12,9 +12,11 @@ export function isAppLocale(value: unknown): value is AppLocale {
   return typeof value === 'string' && (appLocales as readonly string[]).includes(value)
 }
 
-export function readStoredAppLocale(storage: Pick<Storage, 'getItem'> | undefined = globalThis.localStorage): AppLocale {
+export function readStoredAppLocale(storage?: Pick<Storage, 'getItem'>): AppLocale {
   try {
-    const value = storage?.getItem(APP_LOCALE_STORAGE_KEY)
+    // Accessing window.localStorage can itself throw (for example when browser
+    // storage is denied), so resolve the default inside the guarded boundary.
+    const value = (storage ?? globalThis.localStorage)?.getItem(APP_LOCALE_STORAGE_KEY)
     return isAppLocale(value) ? value : 'en'
   } catch {
     return 'en'

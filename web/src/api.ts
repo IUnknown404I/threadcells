@@ -174,7 +174,14 @@ async function fetchJSON<T>(url: string, opts?: FetchJsonOptions): Promise<T> {
       }
       throw new CaoApiError(copy.title, copy.description, 408, copy.reasonCode)
     }
-    throw reason
+    if (reason instanceof CaoApiError || (reason as { name?: string })?.name === 'AbortError') throw reason
+    const locale = readStoredAppLocale()
+    throw new CaoApiError(
+      translate(locale, 'error.generic.title'),
+      translate(locale, 'error.generic.body'),
+      0,
+      'REQUEST_NETWORK_ERROR',
+    )
   } finally {
     externalSignal?.removeEventListener('abort', abortFromCaller)
     if (timeout !== undefined) clearTimeout(timeout)
@@ -182,7 +189,8 @@ async function fetchJSON<T>(url: string, opts?: FetchJsonOptions): Promise<T> {
 }
 
 function planningNetworkError(reason: unknown, preview: boolean): never {
-  if (reason instanceof CaoApiError || (reason as { name?: string })?.name === 'AbortError') throw reason
+  if (reason instanceof CaoApiError && reason.reasonCode !== 'REQUEST_NETWORK_ERROR') throw reason
+  if ((reason as { name?: string })?.name === 'AbortError') throw reason
   const locale = readStoredAppLocale()
   throw new CaoApiError(
     translate(locale, preview ? 'error.previewNetwork.title' : 'error.planNetwork.title'),

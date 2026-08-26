@@ -47,6 +47,21 @@ describe('authenticated application locale contract', () => {
     expect(screen.getByLabelText('locale')).toHaveTextContent('en')
   })
 
+  it('falls back to English when access to browser storage is denied', () => {
+    const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+    Object.defineProperty(globalThis, 'localStorage', {
+      configurable: true,
+      get: () => { throw new DOMException('denied', 'SecurityError') },
+    })
+    try {
+      expect(readStoredAppLocale()).toBe('en')
+      render(<I18nProvider><LocaleProbe /></I18nProvider>)
+      expect(screen.getByLabelText('locale')).toHaveTextContent('en')
+    } finally {
+      if (descriptor) Object.defineProperty(globalThis, 'localStorage', descriptor)
+    }
+  })
+
   it('switches immediately and persists the opt-in Russian preference across reloads', () => {
     const first = render(<I18nProvider><LocaleProbe /></I18nProvider>)
     fireEvent.click(screen.getByRole('button', { name: 'Русский' }))

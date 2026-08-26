@@ -136,6 +136,20 @@ describe('API wrapper', () => {
     })
   })
 
+  it('maps an ordinary network failure to localized product copy', async () => {
+    localStorage.setItem(APP_LOCALE_STORAGE_KEY, 'ru')
+    mockFetch.mockRejectedValueOnce(new TypeError('Failed to fetch private.internal'))
+
+    const failure = api.listSessions()
+    await expect(failure).rejects.toMatchObject({
+      title: 'Не удалось выполнить запрос',
+      description: 'ThreadCells не удалось выполнить операцию. Повторите попытку чуть позже.',
+      reasonCode: 'REQUEST_NETWORK_ERROR',
+      status: 0,
+    })
+    await expect(failure).rejects.not.toThrow('private.internal')
+  })
+
   it('createSession includes working directory when provided', async () => {
     mockResponse({ id: 't1' })
     await api.createSession('kiro_cli', 'developer', undefined, '/home/user/project')

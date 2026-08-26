@@ -123,8 +123,7 @@ def _valid_verification_candidate(tmp_path: Path) -> Path:
         "slug: candidate\n"
         "source: README.md\n"
         f"source_sha256: sha256:{readme_checksum}\n"
-        "---\n"
-        + translated_body,
+        "---\n" + translated_body,
         encoding="utf-8",
     )
     translated_checksum = hashlib.sha256(translated_body.encode()).hexdigest()

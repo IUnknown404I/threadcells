@@ -115,9 +115,7 @@ def execute_via_privileged_helper(
         if not isinstance(reason, str) or not re.fullmatch(r"[A-Z0-9_]{3,96}", reason):
             reason = "FULL_CLEANUP_HELPER_REJECTED"
         diagnostic_id = response.get("diagnostic_id")
-        if not isinstance(diagnostic_id, str) or not re.fullmatch(
-            r"[0-9a-f]{32}", diagnostic_id
-        ):
+        if not isinstance(diagnostic_id, str) or not re.fullmatch(r"[0-9a-f]{32}", diagnostic_id):
             diagnostic_id = None
         raise FullCleanupHelperError(reason, diagnostic_id=diagnostic_id)
     report = response.get("report")
@@ -362,9 +360,7 @@ def _handle_request(connection: socket.socket) -> dict[str, Any]:
 
 def _failure_response(exc: Exception) -> dict[str, Any]:
     """Return a bounded public failure and preserve unexpected detail in journal."""
-    if isinstance(exc, FullCleanupHelperError) and re.fullmatch(
-        r"[A-Z0-9_]{3,96}", str(exc)
-    ):
+    if isinstance(exc, FullCleanupHelperError) and re.fullmatch(r"[A-Z0-9_]{3,96}", str(exc)):
         response: dict[str, Any] = {
             "schema_version": 1,
             "ok": False,

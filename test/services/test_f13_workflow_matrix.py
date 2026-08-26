@@ -1043,6 +1043,106 @@ def test_restart_reopens_only_exact_stranded_owner_composer_successor(workflow_d
     assert claim_workflow_turn(root, now=now) is None
 
 
+def test_new_composer_input_cannot_overtake_owner_successor_before_recovery_tick(
+    workflow_db,
+):
+    root = "root-owner-successor-before-recovery"
+    _ensure_running_test_terminal(root)
+    now = datetime(2026, 8, 26, 12, 46, 0)
+    with database.SessionLocal() as db:
+        prior = WorkflowModel(root_terminal_id=root, status="owner_gate")
+        stranded = WorkflowModel(
+            root_terminal_id=root,
+            status="owner_gate",
+            terminal_reason="bounded continuation transport retry guard",
+        )
+        db.add_all([prior, stranded])
+        db.flush()
+        cancelled = WorkflowTurnModel(
+            workflow_id=stranded.id,
+            kind="external_input",
+            dedupe_key="external_request:cancelled-before-new-input",
+            state="cancelled",
+            attempt_count=3,
+        )
+        accepted_first = WorkflowTurnModel(
+            workflow_id=stranded.id,
+            kind="external_input",
+            dedupe_key="external_request:accepted-before-recovery",
+            payload="execute me first",
+            state="queued",
+        )
+        db.add_all([cancelled, accepted_first])
+        db.flush()
+        stranded.active_turn_id = cancelled.id
+        stranded_id = stranded.id
+        accepted_first_id = accepted_first.id
+        db.commit()
+
+    accepted_second = database.prepare_workflow_input(
+        root,
+        "execute me second",
+        request_id="87ae188d-50fe-4abe-a3c5-15fc0d2df705",
+        require_live_terminal=True,
+    )
+
+    assert accepted_second["queued"] is True
+    assert accepted_second["queue_reason"] == "workflow_predecessor"
+    with database.SessionLocal() as db:
+        workflows = db.query(WorkflowModel).filter_by(root_terminal_id=root).all()
+        assert len(workflows) == 2
+        current = db.get(WorkflowModel, stranded_id)
+        assert current.status == "open"
+        assert current.active_turn_id == accepted_first_id
+        second = db.get(WorkflowTurnModel, accepted_second["turn_id"])
+        assert second.workflow_id == stranded_id
+        assert second.state == "queued"
+        assert second.queue_reason == "WORKFLOW_CONTINUATION_PENDING"
+
+    first_claim = claim_workflow_turn(root, now=now)
+    assert first_claim is not None and first_claim["id"] == accepted_first_id
+    assert mark_workflow_turn_sent(
+        first_claim["id"],
+        first_claim["claim_token"],
+        first_claim["claim_generation"],
+        now=now,
+    )
+    assert claim_workflow_turn_receipt(root, accepted_first_id, now=now)
+    assert observe_workflow_final(root, now=now + timedelta(seconds=1)) is not None
+
+    second_claim = claim_workflow_turn(root, now=now + timedelta(seconds=1))
+    assert second_claim is not None and second_claim["id"] == accepted_second["turn_id"]
+    assert activate_workflow_turn(root, second_claim["id"])
+    assert claim_workflow_turn(root, now=now + timedelta(seconds=1)) is None
+    assert mark_workflow_turn_sent(
+        second_claim["id"],
+        second_claim["claim_token"],
+        second_claim["claim_generation"],
+        now=now + timedelta(seconds=1),
+    )
+    assert claim_workflow_turn_receipt(
+        root, accepted_second["turn_id"], now=now + timedelta(seconds=1)
+    )
+    assert not claim_workflow_turn_receipt(
+        root, accepted_second["turn_id"], now=now + timedelta(seconds=1)
+    )
+    assert observe_workflow_final(root, now=now + timedelta(seconds=2)) is not None
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowTurnModel, accepted_first_id).state == "finished"
+        assert db.get(WorkflowTurnModel, accepted_second["turn_id"]).state == "finished"
+        receipts = (
+            db.query(WorkflowTurnReceiptModel)
+            .filter(
+                WorkflowTurnReceiptModel.receiver_terminal_id == root,
+                WorkflowTurnReceiptModel.workflow_turn_id.in_(
+                    (accepted_first_id, accepted_second["turn_id"])
+                ),
+            )
+            .count()
+        )
+        assert receipts == 2
+
+
 def test_provider_queue_restart_recovery_sends_stranded_owner_successor_once(
     workflow_db, monkeypatch
 ):

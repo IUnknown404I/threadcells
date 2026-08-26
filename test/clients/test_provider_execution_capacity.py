@@ -281,6 +281,39 @@ def test_disk_red_recovery_requires_same_terminal_owner_gate_provenance(capacity
     assert denied.value.reason_code == "RESOURCE_HEALTH_REJECTED"
 
 
+def test_disk_red_owner_resume_provenance_requires_current_active_turn(capacity_db):
+    initial = database.start_workflow_input("term-0")
+    assert initial is not None
+    assert database.set_workflow_terminal_state("term-0", "owner_gate", "owner decision")
+    resumed = database.prepare_workflow_input(
+        "term-0",
+        "the active owner continuation",
+        request_id="b47287d0-dd6e-4862-9192-dc942d2ca29b",
+        require_live_terminal=True,
+    )
+    assert database.is_owner_gate_resume_turn("term-0", resumed["turn_id"])
+
+    with database.SessionLocal() as db:
+        workflow = (
+            db.query(database.WorkflowModel)
+            .filter_by(root_terminal_id="term-0")
+            .order_by(database.WorkflowModel.id.desc())
+            .first()
+        )
+        later = database.WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="external_request:later-active-owner-input",
+            state="queued",
+        )
+        db.add(later)
+        db.flush()
+        workflow.active_turn_id = later.id
+        db.commit()
+
+    assert not database.is_owner_gate_resume_turn("term-0", resumed["turn_id"])
+
+
 def test_resource_deferred_turn_has_truthful_durable_wait_projection(capacity_db):
     turn_id = database.start_workflow_input("term-0")
     assert turn_id is not None

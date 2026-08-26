@@ -5705,6 +5705,61 @@ def _retirement_quiescence_allows_commit(db, terminal_id: str) -> bool:
     )
 
 
+def _resume_owner_gated_successor_in_transaction(
+    db: Any, workflow: WorkflowModel, now: datetime
+) -> Optional[WorkflowTurnModel]:
+    """Promote one already-accepted explicit successor without minting a turn.
+
+    Composer persists behind the active transport fence.  If that predecessor
+    exhausts its retry budget immediately afterward, the workflow can become
+    owner-gated with the newer explicit input still queued.  Every writer uses
+    ``BEGIN IMMEDIATE`` before this helper, so promoting here also prevents a
+    later Composer request from creating a newer workflow and overtaking the
+    accepted successor before the background reconciler runs.
+    """
+    if workflow.status != WORKFLOW_OWNER_GATE or workflow.active_turn_id is None:
+        return None
+    active = db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
+    if active is None or active.workflow_id != workflow.id or active.state != TURN_CANCELLED:
+        return None
+    successor = (
+        db.query(WorkflowTurnModel)
+        .filter(
+            WorkflowTurnModel.workflow_id == workflow.id,
+            WorkflowTurnModel.id > active.id,
+            WorkflowTurnModel.kind == "external_input",
+            WorkflowTurnModel.inbox_message_id.is_(None),
+            WorkflowTurnModel.state == TURN_QUEUED,
+        )
+        .order_by(WorkflowTurnModel.id.asc())
+        .first()
+    )
+    if successor is None:
+        return None
+    if workflow.resumed_from_owner_gate_workflow_id is None:
+        prior_owner_gate = (
+            db.query(WorkflowModel.id)
+            .filter(
+                WorkflowModel.root_terminal_id == workflow.root_terminal_id,
+                WorkflowModel.id < workflow.id,
+                WorkflowModel.status == WORKFLOW_OWNER_GATE,
+            )
+            .order_by(WorkflowModel.id.desc())
+            .first()
+        )
+        if prior_owner_gate is not None:
+            workflow.resumed_from_owner_gate_workflow_id = cast(int, prior_owner_gate[0])
+    workflow.status = WORKFLOW_OPEN
+    workflow.active_turn_id = successor.id
+    workflow.terminal_reason = None
+    workflow.no_progress_count = 0
+    workflow.updated_at = now
+    successor.queue_reason = "WORKFLOW_CONTINUATION_PENDING"
+    successor.not_before = None
+    successor.updated_at = now
+    return cast(WorkflowTurnModel, successor)
+
+
 def _prepare_workflow_input(
     root_terminal_id: str,
     *,
@@ -5833,20 +5888,26 @@ def _prepare_workflow_input(
         workflow = _open_workflow(db, root_terminal_id, create=True)
         assert workflow is not None
         if workflow.status != WORKFLOW_OPEN:
-            # A deliberate new user input starts a new semantic workflow after
-            # a prior terminal/owner/cancelled outcome.
-            prior_workflow = workflow
-            workflow = WorkflowModel(
-                root_terminal_id=root_terminal_id,
-                status=WORKFLOW_OPEN,
-                resumed_from_owner_gate_workflow_id=(
-                    cast(int, prior_workflow.id)
-                    if prior_workflow.status == WORKFLOW_OWNER_GATE
-                    else None
-                ),
+            resumed_successor = _resume_owner_gated_successor_in_transaction(
+                db, workflow, datetime.now()
             )
-            db.add(workflow)
-            db.flush()
+            if resumed_successor is None:
+                # A deliberate new user input starts a new semantic workflow
+                # after a prior terminal/owner/cancelled outcome.  A recoverable
+                # queued successor is reopened above instead, in this same
+                # writer transaction, so this newer input cannot overtake it.
+                prior_workflow = workflow
+                workflow = WorkflowModel(
+                    root_terminal_id=root_terminal_id,
+                    status=WORKFLOW_OPEN,
+                    resumed_from_owner_gate_workflow_id=(
+                        cast(int, prior_workflow.id)
+                        if prior_workflow.status == WORKFLOW_OWNER_GATE
+                        else None
+                    ),
+                )
+                db.add(workflow)
+                db.flush()
         runtime_owned = False
         workflow_predecessor = False
         if defer_while_runtime_owned:
@@ -6176,6 +6237,7 @@ def is_owner_gate_resume_turn(root_terminal_id: str, logical_turn_id: int) -> bo
                 WorkflowTurnModel.kind == "external_input",
                 WorkflowModel.root_terminal_id == root_terminal_id,
                 WorkflowModel.status == WORKFLOW_OPEN,
+                WorkflowModel.active_turn_id == logical_turn_id,
                 prior_owner_gate.root_terminal_id == root_terminal_id,
                 prior_owner_gate.status == WORKFLOW_OWNER_GATE,
             )
@@ -6218,48 +6280,9 @@ def reconcile_owner_gated_workflow_successors(now: Optional[datetime] = None) ->
             terminal = db.get(TerminalModel, cast(str, workflow.root_terminal_id))
             if terminal is None or terminal.runtime_lifecycle in ("exit_pending", "exited"):
                 continue
-            active = (
-                db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
-                if workflow.active_turn_id is not None
-                else None
-            )
-            if active is None or active.state != TURN_CANCELLED:
-                continue
-            successor = (
-                db.query(WorkflowTurnModel)
-                .filter(
-                    WorkflowTurnModel.workflow_id == workflow.id,
-                    WorkflowTurnModel.id > active.id,
-                    WorkflowTurnModel.kind == "external_input",
-                    WorkflowTurnModel.inbox_message_id.is_(None),
-                    WorkflowTurnModel.state == TURN_QUEUED,
-                )
-                .order_by(WorkflowTurnModel.id.asc())
-                .first()
-            )
+            successor = _resume_owner_gated_successor_in_transaction(db, workflow, now)
             if successor is None:
                 continue
-            if workflow.resumed_from_owner_gate_workflow_id is None:
-                prior_owner_gate = (
-                    db.query(WorkflowModel.id)
-                    .filter(
-                        WorkflowModel.root_terminal_id == workflow.root_terminal_id,
-                        WorkflowModel.id < workflow.id,
-                        WorkflowModel.status == WORKFLOW_OWNER_GATE,
-                    )
-                    .order_by(WorkflowModel.id.desc())
-                    .first()
-                )
-                if prior_owner_gate is not None:
-                    workflow.resumed_from_owner_gate_workflow_id = cast(int, prior_owner_gate[0])
-            workflow.status = WORKFLOW_OPEN
-            workflow.active_turn_id = successor.id
-            workflow.terminal_reason = None
-            workflow.no_progress_count = 0
-            workflow.updated_at = now
-            successor.queue_reason = "WORKFLOW_CONTINUATION_PENDING"
-            successor.not_before = None
-            successor.updated_at = now
             reopened.append(cast(str, workflow.root_terminal_id))
         db.commit()
     return reopened

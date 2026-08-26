@@ -5719,6 +5719,19 @@ def _resume_owner_gated_successor_in_transaction(
     """
     if workflow.status != WORKFLOW_OWNER_GATE or workflow.active_turn_id is None:
         return None
+    if (
+        db.query(WorkflowModel.id)
+        .filter(
+            WorkflowModel.root_terminal_id == workflow.root_terminal_id,
+            WorkflowModel.id > workflow.id,
+        )
+        .first()
+        is not None
+    ):
+        # A pre-fix database may already contain newer workflow authority.
+        # Never reopen the historical workflow beside it; its old request is
+        # non-executable and must not create a second OPEN authority.
+        return None
     active = db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
     if active is None or active.workflow_id != workflow.id or active.state != TURN_CANCELLED:
         return None

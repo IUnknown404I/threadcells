@@ -1223,6 +1223,78 @@ def test_exact_composer_retry_reopens_same_owner_successor_before_recovery_tick(
     assert claim_workflow_turn(root) is None
 
 
+def test_historical_owner_successor_retry_cannot_reopen_beside_newer_workflow(
+    workflow_db,
+):
+    root = "root-historical-owner-successor-duplicate"
+    request_id = "a34c1158-c653-45fa-bf8b-03d1bbfbf8ee"
+    payload = "historical accepted request"
+    _ensure_running_test_terminal(root)
+    with database.SessionLocal() as db:
+        prior = WorkflowModel(root_terminal_id=root, status="owner_gate")
+        stranded = WorkflowModel(
+            root_terminal_id=root,
+            status="owner_gate",
+            terminal_reason="bounded continuation transport retry guard",
+        )
+        newer = WorkflowModel(root_terminal_id=root, status="open")
+        db.add_all([prior, stranded, newer])
+        db.flush()
+        cancelled = WorkflowTurnModel(
+            workflow_id=stranded.id,
+            kind="external_input",
+            dedupe_key="external_request:historical-cancelled-head",
+            state="cancelled",
+            attempt_count=3,
+        )
+        historical = WorkflowTurnModel(
+            workflow_id=stranded.id,
+            kind="external_input",
+            dedupe_key=f"external_request:{request_id}",
+            payload=payload,
+            state="queued",
+        )
+        current = WorkflowTurnModel(
+            workflow_id=newer.id,
+            kind="external_input",
+            dedupe_key="external_request:newer-current-authority",
+            payload="newer authority",
+            state="sent",
+        )
+        db.add_all([cancelled, historical, current])
+        db.flush()
+        stranded.active_turn_id = cancelled.id
+        newer.active_turn_id = current.id
+        stranded_id = stranded.id
+        historical_id = historical.id
+        newer_id = newer.id
+        current_id = current.id
+        turn_count = db.query(WorkflowTurnModel).count()
+        db.commit()
+
+    duplicate = database.prepare_workflow_input(
+        root,
+        payload,
+        request_id=request_id,
+        require_live_terminal=True,
+    )
+
+    assert duplicate == {
+        "accepted": False,
+        "reason_code": "WORKFLOW_INPUT_NO_LONGER_EXECUTABLE",
+    }
+    with database.SessionLocal() as db:
+        historical_workflow = db.get(WorkflowModel, stranded_id)
+        current_workflow = db.get(WorkflowModel, newer_id)
+        assert historical_workflow.status == "owner_gate"
+        assert historical_workflow.active_turn_id != historical_id
+        assert db.get(WorkflowTurnModel, historical_id).state == "queued"
+        assert current_workflow.status == "open"
+        assert current_workflow.active_turn_id == current_id
+        assert db.query(WorkflowModel).filter_by(root_terminal_id=root, status="open").count() == 1
+        assert db.query(WorkflowTurnModel).count() == turn_count
+
+
 def test_provider_queue_restart_recovery_sends_stranded_owner_successor_once(
     workflow_db, monkeypatch
 ):

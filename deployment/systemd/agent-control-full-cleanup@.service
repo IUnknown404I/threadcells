@@ -15,10 +15,11 @@ StandardInput=socket
 StandardOutput=socket
 StandardError=journal
 # The one-shot must enter and leave the runtime account around trusted state
-# reads.  Keep that set*id transition available while bounding root to the
-# exact filesystem, signal, and identity capabilities used by the executor.
+# reads.  Keep only the identity, ownership, permission-bypass, and signal
+# capabilities used by the executor; no handle-based or owner-bypass power is
+# needed because mutable objects are root-owned before mode/timestamp changes.
 NoNewPrivileges=false
-CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_KILL CAP_SETGID CAP_SETUID
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_KILL CAP_SETGID CAP_SETUID
 RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_UNIX
 UMask=0077

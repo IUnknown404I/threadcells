@@ -12,7 +12,7 @@ ThreadCells `v0.3.0-alpha.2` is a corrective prerelease for the accepted `v0.3.0
 - Unexpected-runtime-exit notifications are bound to the exact workflow that won the atomic cancellation transition, including a workflow replacement racing terminal exit.
 - Housekeeping dry-run plans and Full Cleanup previews use the established bounded long-operation window instead of the ordinary 10-second Web timeout. Both actions expose progress, prevent duplicate submissions, retain fail-closed execution controls, and translate timeout or network failures into operator-safe product errors.
 - Interactive inventory requests share the canonical Housekeeping lock with execution, so a disconnected client cannot start a competing planner; a retry receives an explicit busy state until the original read-only scan finishes.
-- The socket-activated Full Cleanup helper now binds lazy runtime state discovery to the configured runtime account's home and limits its root process to the capabilities required for identity transitions and protected cleanup, while preserving the existing operator, plan, idle-fence, and active-release checks.
+- The socket-activated Full Cleanup helper now binds lazy runtime state discovery to the configured runtime account's home and applies a minimal explicit capability bound for identity, ownership, permission, and signal operations, while preserving the existing operator, plan, idle-fence, and active-release checks.
 
 ## Lifecycle invariant
 

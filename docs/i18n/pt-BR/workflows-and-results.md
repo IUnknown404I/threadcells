@@ -1,7 +1,7 @@
 ---
 slug: workflows-and-results
 source: docs/WORKFLOWS_AND_RESULTS.md
-source_sha256: sha256:d6a1133dbc73417c1e5cfc8d6b96037535cf4b5552bd094cbb4efad93351fc0a
+source_sha256: sha256:2075858d138b70bafe8c6605e1d77b69a0aafee4faaa8042ef3437e6ebae71ff
 ---
 
 # Fluxos de trabalho e resultados duráveis
@@ -76,9 +76,13 @@ Use um bloqueio do proprietário quando a próxima etapa precisar de autoridade 
 
 Não use um bloqueio do proprietário apenas porque o trabalho está lento, um teste falhou ou um turno de provedor terminou. Primeiro continue qualquer trabalho independente elegível.
 
+Uma nova mensagem no Workflow Composer é a decisão do proprietário que retoma um fluxo de trabalho residente elegível. O ThreadCells preserva a proveniência do bloqueio do proprietário e admite exatamente uma vez o turno durável. Se a solicitação já estava na fila quando o antecessor esgotou as tentativas de transporte, o turno do proprietário é promovido atomicamente em vez de ficar oculto sob outro bloqueio. Uma negação transitória de capacidade ou política de recursos deixa um motivo de espera durável e explícito, sem consumir o orçamento de falhas de transporte.
+
 ## Recuperação
 
 Na reinicialização, o ThreadCells reconstrói a propriedade do fluxo de trabalho a partir do estado durável. Resultados entregues, mas não reconhecidos, permanecem disponíveis. Um handoff em espera pode ser retomado contra o mesmo filho em vez de iniciar um duplicado. Quando um turno lógico mais novo é admitido para um fluxo de trabalho aberto, uma continuação pendente mais antiga é duravelmente substituída e não pode depois ser repetida como trabalho independente após compactação ou interrupção.
+
+A reconciliação na reinicialização também reabre o fluxo de trabalho mais recente em bloqueio do proprietário quando sua cabeça de transporte cancelada já possui um sucessor explícito posterior do Composer. Ela promove esse sucessor existente sem criar um turno substituto e nunca usa esse reparo para reviver callbacks do Inbox ou terminais Exited.
 
 Se a execução do provedor/modelo for interrompida depois que sua entrada lógica foi admitida, mas antes que o trabalho necessário termine, o ThreadCells retoma por um novo turno de continuação durável em vez de repetir o recibo original. Efeitos concluídos permanecem isolados, a propriedade da execução de provedor segue o turno retomado, e o mesmo resultado imutável de filho e barreira de conclusão permanecem disponíveis para incorporação e reconhecimento exatamente uma vez.
 

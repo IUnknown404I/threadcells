@@ -1,7 +1,7 @@
 ---
 slug: workflows-and-results
 source: docs/WORKFLOWS_AND_RESULTS.md
-source_sha256: sha256:d6a1133dbc73417c1e5cfc8d6b96037535cf4b5552bd094cbb4efad93351fc0a
+source_sha256: sha256:2075858d138b70bafe8c6605e1d77b69a0aafee4faaa8042ef3437e6ebae71ff
 ---
 
 # Workflows und dauerhafte Ergebnisse
@@ -76,9 +76,13 @@ Verwenden Sie ein Owner-Gate, wenn der nächste Schritt Autorität benötigt, di
 
 Verwenden Sie ein Owner-Gate nicht nur, weil die Arbeit langsam ist, ein Test fehlgeschlagen ist oder ein Anbieterzug geendet hat. Führen Sie zuerst alle unabhängige zulässige Arbeit fort.
 
+Eine neue Nachricht im Workflow Composer ist die Owner-Entscheidung, die einen berechtigten residenten Workflow fortsetzt. ThreadCells speichert die Herkunft vom Owner-Gate und lässt genau den dauerhaften Zug einmal zu. Wenn die Anfrage bereits eingereiht war, als ihr Vorgänger die Transportwiederholungen ausgeschöpft hat, wird der Owner-Zug atomar hochgestuft statt unter einem weiteren Owner-Gate verborgen. Eine vorübergehende Kapazitäts- oder Ressourcenrichtlinien-Ablehnung hinterlässt einen ausdrücklichen dauerhaften Wartegrund und verbraucht nicht das Transportfehlerbudget.
+
 ## Wiederherstellung
 
 Beim Neustart rekonstruiert ThreadCells die Workflow-Ownership aus dauerhaftem Zustand. Zugestellte, aber nicht bestätigte Ergebnisse bleiben verfügbar. Ein wartender Handoff kann gegen dasselbe Child fortgesetzt werden, statt ein Duplikat zu starten. Sobald ein neuerer logischer Zug für einen offenen Workflow zugelassen wird, wird eine ältere ausstehende Fortsetzung dauerhaft ersetzt und kann nach Kompaktierung oder Unterbrechung nicht später als unabhängige Arbeit wiedergegeben werden.
+
+Die Neustartabstimmung öffnet außerdem den neuesten Workflow im Owner-Gate erneut, wenn sein abgebrochener Transportkopf bereits einen späteren ausdrücklichen Composer-Nachfolger hat. Sie stuft diesen vorhandenen Nachfolger hoch, ohne einen Ersatzzug zu erstellen, und verwendet diese Reparatur nie zur Wiederbelebung von Inbox-Callbacks oder Exited-Terminals.
 
 Wenn die Anbieter-/Modellausführung unterbrochen wird, nachdem ihre logische Eingabe zugelassen wurde, aber bevor die erforderliche Arbeit beendet ist, setzt ThreadCells über einen neuen dauerhaften Fortsetzungszug fort, statt das ursprüngliche Receipt wiederzugeben. Abgeschlossene Effekte bleiben eingezäunt, die Ownership der Anbieterausführung folgt dem fortgesetzten Zug und dasselbe unveränderliche Child-Ergebnis und dieselbe Abschlussbarriere bleiben zur Übernahme und genau-einmaligen Bestätigung verfügbar.
 

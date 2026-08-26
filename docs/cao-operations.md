@@ -8,8 +8,10 @@ canonical persisted row; legacy files are not a competing capacity authority.
 Use `cao-resource-status` for a compact verdict or
 `cao-resource-status --json` for the complete projection. `GREEN` and `YELLOW`
 permit admission; `RED` denies new managed contexts and heavy starts after one
-bounded housekeeping recovery and recheck. A full heavy slot is ordinary busy
-capacity and does not change resource health.
+bounded housekeeping recovery and recheck. An explicit Composer decision that
+resumes an already-resident owner gate may proceed under disk-only RED while
+remaining subject to Provider capacity; non-disk RED still fails closed. A full
+heavy slot is ordinary busy capacity and does not change resource health.
 
 Capacity is explicit in four dimensions. The recommended small-host values are
 resident supervisors `5` (persistent

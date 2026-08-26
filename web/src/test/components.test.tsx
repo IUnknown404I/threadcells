@@ -76,6 +76,8 @@ describe('StatusBadge', () => {
 
   it.each([
     ['waiting_child_retirement', 'Queued · Waiting for child retirement'],
+    ['waiting_resource_recovery', 'Queued · Waiting for resource recovery'],
+    ['waiting_runtime_recovery', 'Queued · Waiting for runtime recovery'],
     ['waiting_workflow_continuation', 'Queued · Waiting for workflow continuation'],
   ])('renders the exact durable wait mapping %s', (executionState, label) => {
     render(

@@ -1797,7 +1797,9 @@ class TestSendTerminalInput:
             "status": "queued_provider_execution",
             "reason_code": "PROVIDER_EXECUTION_CAPACITY_EXHAUSTED",
         }
-        queue.assert_called_once_with("abcd1234", 76, "durable task")
+        queue.assert_called_once_with(
+            "abcd1234", 76, "durable task", "PROVIDER_EXECUTION_CAPACITY_EXHAUSTED"
+        )
 
     def test_runtime_busy_queue_does_not_claim_capacity_exhaustion(self, client):
         from cli_agent_orchestrator.services.operations_service import AdmissionDenied
@@ -1843,7 +1845,9 @@ class TestSendTerminalInput:
             "status": "queued_provider_execution",
             "reason_code": "TERMINAL_RUNTIME_OPERATION_BUSY",
         }
-        queue.assert_called_once_with("abcd1234", 77, "durable owner turn")
+        queue.assert_called_once_with(
+            "abcd1234", 77, "durable owner turn", "TERMINAL_RUNTIME_OPERATION_BUSY"
+        )
 
     def test_runtime_recovery_queues_external_input_without_physical_send(self, client):
         with (
@@ -1947,6 +1951,41 @@ class TestSendTerminalInput:
         )
         mock_svc.send_input.assert_not_called()
 
+    def test_duplicate_composer_request_reports_its_durable_resource_wait(self, client):
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.workflow_service.prepare_external_input",
+                return_value={
+                    "accepted": True,
+                    "duplicate": True,
+                    "turn_id": 81,
+                    "queued": True,
+                    "queue_reason": "workflow_predecessor",
+                    "reason_code": "RESOURCE_HEALTH_REJECTED",
+                },
+            ),
+        ):
+            response = client.post(
+                "/terminals/abcd1234/workflow-input",
+                json={
+                    "message": "one exact request",
+                    "request_id": "576f9e7c-83f0-46c5-b838-c7b8b7b3aa34",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": True,
+            "accepted": True,
+            "duplicate": True,
+            "turn_id": 81,
+            "queued": True,
+            "status": "queued_provider_execution",
+            "reason_code": "RESOURCE_HEALTH_REJECTED",
+        }
+        mock_svc.send_input.assert_not_called()
+
     def test_exited_terminal_composer_input_is_truthful_conflict(self, client):
         with (
             patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
@@ -2027,7 +2066,12 @@ class TestSendTerminalInput:
             "status": "queued_runtime_recovery",
             "reason_code": "PROVIDER_TRANSPORT_RETRY_PENDING",
         }
-        queue.assert_called_once_with("abcd1234", 82, "recover this exact submission")
+        queue.assert_called_once_with(
+            "abcd1234",
+            82,
+            "recover this exact submission",
+            "PROVIDER_TRANSPORT_RETRY_PENDING",
+        )
         wake.assert_called_once()
 
     def test_public_orchestration_metadata_cannot_suppress_admission(self, client):

@@ -1,7 +1,7 @@
 ---
 slug: resource-model
 source: docs/RESOURCE_MODEL.md
-source_sha256: sha256:6eaee9cd5449ab9af23c8a9ce5b6687e73b301bb445da3e35de369a65fa05bb2
+source_sha256: sha256:50fdcf87c80a11bbd1e8d9c210e584f2640a388c71882bd4b2bf06af0b27f725
 ---
 
 # Capacidad y modelo de recursos
@@ -74,6 +74,8 @@ El estado del disco usa umbrales exactos:
   motivo `DISK_CRITICAL`, mientras que la proyección específica de disco informa CRITICAL.
 
 YELLOW es una indicación para inspeccionar el crecimiento y planificar Housekeeping. RED puede denegar trabajo nuevo arriesgado y admitir limpieza segura para recuperación. El estado desconocido falla de forma cerrada; ThreadCells no supone que un sistema de archivos ilegible esté saludable.
+
+Una decisión explícita de Workflow Composer para un flujo de trabajo ya residente en una puerta del propietario también es una vía estrecha de recuperación cuando RED se debe únicamente al disco: consume capacidad normal de Provider, pero no crea un contexto Work. RED por memoria, PSI, motivos desconocidos o mixtos sigue fallando de forma cerrada; el turno duradero muestra un motivo de espera por recuperación de recursos sin consumir reintentos de transporte.
 
 ## Drenaje tras una reducción
 

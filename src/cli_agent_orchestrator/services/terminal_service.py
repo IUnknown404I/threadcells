@@ -1695,9 +1695,17 @@ def get_terminal(terminal_id: str) -> Dict:
                         "waiting_child_retirement"
                         if wait_reason == "child_retirement"
                         else (
-                            "waiting_workflow_continuation"
-                            if wait_reason == "workflow_continuation"
-                            else "ready"
+                            "waiting_resource_recovery"
+                            if wait_reason == "resource_health"
+                            else (
+                                "waiting_runtime_recovery"
+                                if wait_reason == "runtime_recovery"
+                                else (
+                                    "waiting_workflow_continuation"
+                                    if wait_reason == "workflow_continuation"
+                                    else "ready"
+                                )
+                            )
                         )
                     )
                 )

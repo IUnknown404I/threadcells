@@ -45,7 +45,7 @@ class Terminal(BaseModel):
     )
     execution_state: Optional[str] = Field(
         None,
-        description="Provider execution projection: ready, processing, or queued_provider_execution",
+        description="Provider execution projection: ready, processing, or a durable wait reason",
     )
     lifecycle: Optional[TerminalLifecycle] = Field(
         None, description="Provider-process lifecycle; independent of persistent tmux panes"

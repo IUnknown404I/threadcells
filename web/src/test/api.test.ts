@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { api } from '../api'
+import { api, HOUSEKEEPING_PLAN_TIMEOUT_MS } from '../api'
 
 describe('API wrapper', () => {
   const mockFetch = vi.fn()
@@ -9,6 +9,7 @@ describe('API wrapper', () => {
   })
 
   afterEach(() => {
+    vi.useRealTimers()
     vi.restoreAllMocks()
   })
 
@@ -72,6 +73,51 @@ describe('API wrapper', () => {
     resolveResponse({ ok: true, json: () => Promise.resolve({ id: 't1' }) })
     await expect(creating).resolves.toEqual({ id: 't1' })
     vi.useRealTimers()
+  })
+
+  it.each([
+    ['normal plan', () => api.getHousekeepingPlan('frequent')],
+    ['Full Cleanup preview', () => api.getFullCleanupPlan()],
+  ])('keeps a slow %s request alive beyond the ordinary 10-second timeout', async (_label, requestPlan) => {
+    vi.useFakeTimers()
+    let resolveResponse!: (value: unknown) => void
+    mockFetch.mockImplementationOnce(() => new Promise(resolve => { resolveResponse = resolve }))
+
+    const planning = requestPlan()
+    const request = mockFetch.mock.calls[0][1]
+    await vi.advanceTimersByTimeAsync(10_001)
+
+    expect(request.signal.aborted).toBe(false)
+    resolveResponse({ ok: true, json: () => Promise.resolve({ plan_id: 'a'.repeat(64) }) })
+    await expect(planning).resolves.toMatchObject({ plan_id: 'a'.repeat(64) })
+    vi.useRealTimers()
+  })
+
+  it('maps the bounded Full Cleanup planning timeout to product copy', async () => {
+    vi.useFakeTimers()
+    mockFetch.mockImplementationOnce((_url: string, options: RequestInit) => new Promise((_resolve, reject) => {
+      options.signal?.addEventListener('abort', () => reject(new DOMException('signal is aborted without reason', 'AbortError')), { once: true })
+    }))
+
+    const planning = api.getFullCleanupPlan()
+    const rejected = expect(planning).rejects.toMatchObject({
+      title: 'Preview took too long to build',
+      description: 'ThreadCells could not finish the filesystem inventory in time. No files were deleted. Try again.',
+      reasonCode: 'HOUSEKEEPING_PLAN_TIMEOUT',
+    })
+    await vi.advanceTimersByTimeAsync(HOUSEKEEPING_PLAN_TIMEOUT_MS)
+    await rejected
+    vi.useRealTimers()
+  })
+
+  it('maps a planning network failure without exposing raw browser errors', async () => {
+    mockFetch.mockRejectedValueOnce(new TypeError('signal is aborted without reason'))
+
+    await expect(api.getHousekeepingPlan('weekly')).rejects.toMatchObject({
+      title: 'Plan could not be built',
+      description: 'ThreadCells lost the connection while scanning resources. No files were deleted. Try again.',
+      reasonCode: 'HOUSEKEEPING_PLAN_NETWORK_ERROR',
+    })
   })
 
   it('createSession includes working directory when provided', async () => {
@@ -144,7 +190,7 @@ describe('API wrapper', () => {
 
     mockResponse({ mode: 'full', plan_id: planId })
     await api.getFullCleanupPlan()
-    expect(mockFetch).toHaveBeenCalledWith('/api/v1/housekeeping/full-cleanup/plan', expect.any(Object))
+    expect(mockFetch).toHaveBeenCalledWith('/api/v1/housekeeping/full-cleanup/plan', expect.objectContaining({ signal: expect.any(AbortSignal) }))
 
     mockResponse({ ok: true })
     await api.runFullCleanup(planId)

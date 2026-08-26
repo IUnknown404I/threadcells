@@ -57,6 +57,20 @@ describe('Control-plane settings routes', () => {
     ...overrides,
   })
 
+  const fullCleanupPlan = () => ({
+    schema_version: 1,
+    plan_id: 'f'.repeat(64),
+    generated_at: 100,
+    mode: 'full' as const,
+    root: '/fixture',
+    reclaimable_bytes: 1024,
+    class_summaries: { logs: { candidate_count: 1, actionable_count: 1, reclaimable_bytes: 1024, preserved_count: 0, preserved_bytes: 0, protection_reasons: {} } },
+    warnings: [],
+    candidates: [{ canonical_identity: 'log:old', category: 'logs', action: 'delete' as const, bytes: 1024, estimated_reclaim_bytes: 1024, retention_reason: 'full_cleanup_closed_log', protection_reason: null }],
+    idle_gate: { eligible: true, reason_code: null, blockers: [], ready_agents: 1, exited_agents: 1 },
+    release_state: { metadata_certain: true, active_release: '/releases/active', active_release_candidates: ['/releases/active'], protected_non_active_releases: 0, active_only_expected: true, releases_to_delete: 0, rollback_releases_to_delete: 0, rollback_available: false },
+  })
+
   it('keeps Housekeeping penultimate and routes through the canonical settings navigation', async () => {
     const navigate = vi.fn()
     vi.spyOn(api, 'getProviderSettings').mockResolvedValue({
@@ -199,7 +213,7 @@ describe('Control-plane settings routes', () => {
     expect(screen.queryByDisplayValue('10080')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Execute inspected plan safely' })).toBeDisabled()
     fireEvent.click(screen.getByRole('button', { name: 'Build dry-run plan' }))
-    await waitFor(() => expect(plan).toHaveBeenCalledWith('frequent'))
+    await waitFor(() => expect(plan).toHaveBeenCalledWith('frequent', expect.any(AbortSignal)))
     expect((await screen.findAllByText('100 B')).length).toBeGreaterThan(0)
     expect(screen.getByText('logs:item')).toBeInTheDocument()
     expect(within(screen.getByText('Protected / skipped').parentElement as HTMLElement).getByText('1')).toBeInTheDocument()
@@ -211,6 +225,111 @@ describe('Control-plane settings routes', () => {
     expect(screen.getByRole('button', { name: 'Execute inspected plan safely' })).not.toBeDisabled()
     fireEvent.click(screen.getByRole('button', { name: 'Execute inspected plan safely' }))
     await waitFor(() => expect(run).toHaveBeenCalledWith('frequent', false, planId))
+  })
+
+  it('keeps one normal plan visibly loading through operator polling and prevents duplicates', async () => {
+    const operatorPoll: { current: (() => void) | null } = { current: null }
+    vi.spyOn(window, 'setInterval').mockImplementation(((handler: TimerHandler, timeout?: number) => {
+      if (timeout === 15_000 && typeof handler === 'function') operatorPoll.current = handler as () => void
+      return 1
+    }) as typeof window.setInterval)
+    vi.spyOn(api, 'getHousekeepingSettings').mockResolvedValue(housekeepingSettings())
+    vi.spyOn(api, 'getHousekeepingReport').mockResolvedValue({ status: 'never_run' })
+    const operator = vi.spyOn(api, 'getOperatorSession').mockResolvedValue(operatorStatus(true))
+    vi.spyOn(api, 'getOrchestrationCapacity').mockResolvedValue(housekeepingCapacity())
+    let resolvePlan!: (value: ReturnType<typeof inspectedPlan>) => void
+    const request = vi.spyOn(api, 'getHousekeepingPlan').mockImplementation(() => new Promise(resolve => { resolvePlan = resolve }))
+
+    render(<ControlPlaneSettings section="housekeeping" navigate={() => {}} />)
+    await screen.findByRole('heading', { name: 'Housekeeping' })
+    fireEvent.click(screen.getByRole('button', { name: 'Build dry-run plan' }))
+
+    const building = screen.getByRole('button', { name: 'Building plan…' })
+    expect(building).toBeDisabled()
+    expect(building).toHaveAttribute('aria-busy', 'true')
+    expect(screen.getByRole('status')).toHaveTextContent('Scanning filesystem resources and safety authority. This may take a while.')
+    expect(screen.getByRole('button', { name: 'Build Full Cleanup preview' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Execute inspected plan safely' })).toBeDisabled()
+    fireEvent.click(building)
+    expect(request).toHaveBeenCalledTimes(1)
+
+    operatorPoll.current?.()
+    await waitFor(() => expect(operator).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('button', { name: 'Building plan…' })).toBeDisabled()
+
+    resolvePlan(inspectedPlan())
+    expect(await screen.findByText('logs:item')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Build dry-run plan' })).not.toBeDisabled()
+  })
+
+  it('keeps one Full Cleanup preview visibly loading and execution fail-closed', async () => {
+    vi.spyOn(api, 'getHousekeepingSettings').mockResolvedValue(housekeepingSettings())
+    vi.spyOn(api, 'getHousekeepingReport').mockResolvedValue({ status: 'never_run' })
+    vi.spyOn(api, 'getOperatorSession').mockResolvedValue(operatorStatus(true))
+    vi.spyOn(api, 'getOrchestrationCapacity').mockResolvedValue(housekeepingCapacity())
+    let resolvePlan!: (value: ReturnType<typeof fullCleanupPlan>) => void
+    const request = vi.spyOn(api, 'getFullCleanupPlan').mockImplementation(() => new Promise(resolve => { resolvePlan = resolve }))
+
+    render(<ControlPlaneSettings section="housekeeping" navigate={() => {}} />)
+    await screen.findByRole('heading', { name: 'Housekeeping' })
+    fireEvent.click(screen.getByRole('button', { name: 'Build Full Cleanup preview' }))
+
+    const building = screen.getByRole('button', { name: 'Building preview…' })
+    expect(building).toBeDisabled()
+    expect(building).toHaveAttribute('aria-busy', 'true')
+    expect(screen.getByRole('status')).toHaveTextContent('Scanning releases, worktrees, caches and protected resources. This may take a while.')
+    expect(screen.getByRole('button', { name: 'Build dry-run plan' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Delete all proven-safe system files' })).toBeDisabled()
+    fireEvent.click(building)
+    expect(request).toHaveBeenCalledTimes(1)
+
+    resolvePlan(fullCleanupPlan())
+    expect(await screen.findByText('log:old')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Build Full Cleanup preview' })).not.toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Delete all proven-safe system files' })).not.toBeDisabled()
+  })
+
+  it('shows product timeout copy and never the raw browser abort message', async () => {
+    vi.spyOn(api, 'getHousekeepingSettings').mockResolvedValue(housekeepingSettings())
+    vi.spyOn(api, 'getHousekeepingReport').mockResolvedValue({ status: 'never_run' })
+    vi.spyOn(api, 'getOperatorSession').mockResolvedValue(operatorStatus(true))
+    vi.spyOn(api, 'getOrchestrationCapacity').mockResolvedValue(housekeepingCapacity())
+    vi.spyOn(api, 'getFullCleanupPlan').mockRejectedValue(new CaoApiError(
+      'Preview took too long to build',
+      'ThreadCells could not finish the filesystem inventory in time. No files were deleted. Try again.',
+      408,
+      'HOUSEKEEPING_PLAN_TIMEOUT',
+    ))
+
+    render(<ControlPlaneSettings section="housekeeping" navigate={() => {}} />)
+    await screen.findByRole('heading', { name: 'Housekeeping' })
+    fireEvent.click(screen.getByRole('button', { name: 'Build Full Cleanup preview' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Preview took too long to build. ThreadCells could not finish the filesystem inventory in time. No files were deleted. Try again.')
+    expect(alert).not.toHaveTextContent('signal is aborted without reason')
+    expect(screen.getByRole('button', { name: 'Build Full Cleanup preview' })).not.toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Delete all proven-safe system files' })).toBeDisabled()
+  })
+
+  it('aborts an in-flight plan on unmount without applying stale state', async () => {
+    vi.spyOn(api, 'getHousekeepingSettings').mockResolvedValue(housekeepingSettings())
+    vi.spyOn(api, 'getHousekeepingReport').mockResolvedValue({ status: 'never_run' })
+    vi.spyOn(api, 'getOperatorSession').mockResolvedValue(operatorStatus(true))
+    vi.spyOn(api, 'getOrchestrationCapacity').mockResolvedValue(housekeepingCapacity())
+    let signal: AbortSignal | undefined
+    vi.spyOn(api, 'getHousekeepingPlan').mockImplementation((_mode, requestSignal) => {
+      signal = requestSignal
+      return new Promise((_resolve, reject) => requestSignal?.addEventListener('abort', () => reject(new DOMException('Unmounted', 'AbortError')), { once: true }))
+    })
+
+    const view = render(<ControlPlaneSettings section="housekeeping" navigate={() => {}} />)
+    await screen.findByRole('heading', { name: 'Housekeeping' })
+    fireEvent.click(screen.getByRole('button', { name: 'Build dry-run plan' }))
+    expect(screen.getByRole('button', { name: 'Building plan…' })).toBeDisabled()
+
+    view.unmount()
+    expect(signal?.aborted).toBe(true)
   })
 
   it('previews and confirms Full Cleanup through the existing operator authority', async () => {

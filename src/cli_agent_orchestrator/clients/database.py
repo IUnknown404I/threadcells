@@ -5832,6 +5832,15 @@ def _prepare_workflow_input(
                         "reason_code": "WORKFLOW_INPUT_NO_LONGER_EXECUTABLE",
                     }
                 existing_workflow = db.get(WorkflowModel, cast(int, existing.workflow_id))
+                if existing_workflow is not None:
+                    # A retry of the stable request can arrive before the
+                    # background queue's first recovery tick. Reopen the exact
+                    # accepted FIFO here, under the same writer transaction,
+                    # before deciding whether its original turn is executable.
+                    # Payload conflicts and terminal rows remain rejected above.
+                    _resume_owner_gated_successor_in_transaction(
+                        db, existing_workflow, datetime.now()
+                    )
                 receipted = (
                     db.query(WorkflowTurnReceiptModel.id)
                     .filter_by(

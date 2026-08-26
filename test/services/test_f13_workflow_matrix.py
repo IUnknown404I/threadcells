@@ -1143,6 +1143,86 @@ def test_new_composer_input_cannot_overtake_owner_successor_before_recovery_tick
         assert receipts == 2
 
 
+def test_exact_composer_retry_reopens_same_owner_successor_before_recovery_tick(
+    workflow_db,
+):
+    root = "root-owner-successor-duplicate-before-recovery"
+    request_id = "bb971146-c08e-4ec6-966d-c8193629c58c"
+    payload = "execute this accepted request exactly once"
+    _ensure_running_test_terminal(root)
+    with database.SessionLocal() as db:
+        prior = WorkflowModel(root_terminal_id=root, status="owner_gate")
+        stranded = WorkflowModel(
+            root_terminal_id=root,
+            status="owner_gate",
+            terminal_reason="bounded continuation transport retry guard",
+        )
+        db.add_all([prior, stranded])
+        db.flush()
+        cancelled = WorkflowTurnModel(
+            workflow_id=stranded.id,
+            kind="external_input",
+            dedupe_key="external_request:cancelled-before-duplicate",
+            state="cancelled",
+            attempt_count=3,
+        )
+        accepted = WorkflowTurnModel(
+            workflow_id=stranded.id,
+            kind="external_input",
+            dedupe_key=f"external_request:{request_id}",
+            payload=payload,
+            state="queued",
+        )
+        db.add_all([cancelled, accepted])
+        db.flush()
+        stranded.active_turn_id = cancelled.id
+        stranded_id = stranded.id
+        accepted_id = accepted.id
+        turn_count = db.query(WorkflowTurnModel).count()
+        db.commit()
+
+    conflict = database.prepare_workflow_input(
+        root,
+        "different payload must not borrow the stable request",
+        request_id=request_id,
+        require_live_terminal=True,
+    )
+    assert conflict == {
+        "accepted": False,
+        "reason_code": "WORKFLOW_INPUT_IDEMPOTENCY_CONFLICT",
+    }
+    with database.SessionLocal() as db:
+        unchanged = db.get(WorkflowModel, stranded_id)
+        assert unchanged.status == "owner_gate"
+        assert unchanged.active_turn_id != accepted_id
+        assert db.query(WorkflowTurnModel).count() == turn_count
+
+    duplicate = database.prepare_workflow_input(
+        root,
+        payload,
+        request_id=request_id,
+        require_live_terminal=True,
+    )
+
+    assert duplicate == {
+        "accepted": True,
+        "turn_id": accepted_id,
+        "queued": True,
+        "queue_reason": "workflow_predecessor",
+        "duplicate": True,
+    }
+    with database.SessionLocal() as db:
+        current = db.get(WorkflowModel, stranded_id)
+        assert current.status == "open"
+        assert current.active_turn_id == accepted_id
+        assert db.get(WorkflowTurnModel, accepted_id).state == "queued"
+        assert db.query(WorkflowTurnModel).count() == turn_count
+
+    claim = claim_workflow_turn(root)
+    assert claim is not None and claim["id"] == accepted_id
+    assert claim_workflow_turn(root) is None
+
+
 def test_provider_queue_restart_recovery_sends_stranded_owner_successor_once(
     workflow_db, monkeypatch
 ):

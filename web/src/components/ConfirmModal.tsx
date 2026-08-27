@@ -1,5 +1,6 @@
 import { ReactNode, useEffect, useRef } from 'react'
 import { AlertTriangle, Loader2, X } from 'lucide-react'
+import { useI18n } from '../i18n'
 
 interface ConfirmModalProps {
   open: boolean
@@ -20,14 +21,15 @@ export function ConfirmModal({
   title,
   message,
   details,
-  confirmLabel = 'Confirm',
-  cancelLabel = 'Cancel',
+  confirmLabel,
+  cancelLabel,
   variant = 'danger',
   loading = false,
   onConfirm,
   onCancel,
   children,
 }: ConfirmModalProps) {
+  const { t } = useI18n()
   const cancelRef = useRef<HTMLButtonElement>(null)
 
   useEffect(() => {
@@ -65,7 +67,7 @@ export function ConfirmModal({
             <h3 className="text-base font-semibold text-white">{title}</h3>
             <p className="text-sm text-gray-400 mt-1">{message}</p>
           </div>
-          <button onClick={onCancel} className="shrink-0 min-w-11 min-h-11 inline-flex items-center justify-center text-gray-500 hover:text-white rounded-lg transition-colors hover:bg-gray-800">
+          <button aria-label={t('common.close')} onClick={onCancel} className="shrink-0 min-w-11 min-h-11 inline-flex items-center justify-center text-gray-500 hover:text-white rounded-lg transition-colors hover:bg-gray-800">
             <X size={16} />
           </button>
         </div>
@@ -91,7 +93,7 @@ export function ConfirmModal({
             disabled={loading}
             className="min-h-11 px-4 py-2 text-sm font-medium text-gray-300 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors focus:outline-none focus:ring-2 focus:ring-gray-500"
           >
-            {cancelLabel}
+            {cancelLabel || t('common.cancel')}
           </button>
           <button
             onClick={onConfirm}
@@ -99,7 +101,7 @@ export function ConfirmModal({
             className={`min-h-11 justify-center px-4 py-2 text-sm font-medium text-white rounded-lg transition-all focus:outline-none focus:ring-2 disabled:opacity-60 flex items-center gap-2 ${colors.btn}`}
           >
             {loading && <Loader2 size={14} className="animate-spin" />}
-            {loading ? 'Working…' : confirmLabel}
+            {loading ? t('common.working') : confirmLabel || t('common.confirm')}
           </button>
         </div>
       </div>

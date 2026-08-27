@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -16,12 +17,12 @@ LOCALES = ("en", "ru", "zh-CN", "es", "pt-BR", "de", "ja")
 TRANSLATED_LOCALES = LOCALES[1:]
 README_FILES = {
     "en": "README.md",
-    "ru": "README.ru.md",
-    "zh-CN": "README.zh-CN.md",
-    "es": "README.es.md",
-    "pt-BR": "README.pt-BR.md",
-    "de": "README.de.md",
-    "ja": "README.ja.md",
+    "ru": "docs/ru/README.md",
+    "zh-CN": "docs/zh-CN/README.md",
+    "es": "docs/es/README.md",
+    "pt-BR": "docs/pt-BR/README.md",
+    "de": "docs/de/README.md",
+    "ja": "docs/ja/README.md",
 }
 README_LABELS = {
     "en": "English",
@@ -111,7 +112,7 @@ def validate_translation(
     slug = str(document["slug"])
     source_name = str(document["source"])
     source_path = ROOT / source_name
-    path = ROOT / "docs" / "i18n" / locale / f"{slug}.md"
+    path = ROOT / "docs" / locale / f"{slug}.md"
     relative = path.relative_to(ROOT)
     if not path.is_file():
         return [f"{relative}: missing translation"]
@@ -187,8 +188,9 @@ def validate_readmes() -> list[str]:
         for target_locale, target in README_FILES.items():
             if target_locale == locale:
                 continue
-            if f"]({target})" not in first_block:
-                errors.append(f"{filename}: selector does not link {target}")
+            relative_target = Path(os.path.relpath(ROOT / target, path.parent)).as_posix()
+            if f"]({relative_target})" not in first_block:
+                errors.append(f"{filename}: selector does not link {relative_target}")
         if PLACEHOLDER.search(value):
             errors.append(f"{filename}: placeholder text is not allowed")
         if heading_levels(value) != canonical_levels:
@@ -216,10 +218,10 @@ def validate() -> tuple[list[str], dict[str, str]]:
             fingerprints[slug] = digest(path)
     expected_names = {f"{slug}.md" for slug in slugs}
     for locale in TRANSLATED_LOCALES:
-        root = ROOT / "docs" / "i18n" / locale
-        actual_names = {path.name for path in root.glob("*.md")} if root.is_dir() else set()
+        root = ROOT / "docs" / locale
+        actual_names = {path.name for path in root.glob("*.md") if path.name != "README.md"} if root.is_dir() else set()
         for unknown in sorted(actual_names - expected_names):
-            errors.append(f"docs/i18n/{locale}/{unknown}: unknown translated slug")
+            errors.append(f"docs/{locale}/{unknown}: unknown translated slug")
         if len(fingerprints) == len(slugs):
             for document in documents:
                 errors.extend(

@@ -1,13 +1,14 @@
 {
   "name": "threadcells-web",
   "private": true,
-  "version": "0.3.0-alpha.2",
+  "version": "0.3.0-alpha.3",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build:docs": "python3 ../scripts/build_docs_bundle.py --output public/docs-bundle.json",
     "build": "npm run build:docs && tsc && vite build",
     "preview": "vite preview",
+    "audit:i18n": "node scripts/audit-authenticated-ui-strings.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e:terminal-paste": "node e2e/terminal-paste.chromium.mjs",
@@ -29,7 +30,8 @@
     "test:e2e:threadcells-release-p2": "node e2e/threadcells-release-p2.chromium.mjs",
     "test:e2e:primary-navigation": "node e2e/primary-navigation.chromium.mjs",
     "test:e2e:touch-scroll": "node e2e/touch-scroll-regression.chromium.mjs",
-    "test:e2e:settings-final": "node e2e/settings-final-acceptance.chromium.mjs"
+    "test:e2e:settings-final": "node e2e/settings-final-acceptance.chromium.mjs",
+    "test:e2e:i18n-p1": "node e2e/i18n-p1.chromium.mjs"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",

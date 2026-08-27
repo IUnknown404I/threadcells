@@ -85,7 +85,7 @@ function sourceFingerprint(source: string) {
 }
 
 function translatedMarkdown(locale: Locale, item: ManifestDocument, canonicalSource: string) {
-  const translation = path.join(productRoot, 'docs', 'i18n', locale, `${item.slug}.md`)
+  const translation = path.join(productRoot, 'docs', locale, `${item.slug}.md`)
   if (!fs.existsSync(translation)) throw new Error(`Missing ${locale} documentation translation: ${item.slug}`)
   const value = fs.readFileSync(translation, 'utf8')
   const match = value.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/)

@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import { DocsPanel } from '../components/DocsPanel'
+import { I18nProvider, useI18n } from '../i18n'
 
 const bundle = { product: 'ThreadCells', version: '0.1.0a1', commit: 'abcdef0123456789', documents: [
   { slug: 'getting-started', group: 'Getting started', order: 1, title: 'Quick setup', markdown: '# Quick setup\n\nUse `threadcells`.\n\n```bash\nthreadcells --help\n```', headings: [] },
@@ -26,5 +27,34 @@ describe('DocsPanel', () => {
     expect(screen.getByRole('list')).toBeInTheDocument()
     expect(screen.getByText('No raw HTML.').tagName).toBe('STRONG')
     expect(screen.getByRole('button', { name: /previous quick setup/i })).toBeInTheDocument()
+  })
+
+  it('renders en and ru from the same packaged slug and preserves its URL and anchor on locale switch', async () => {
+    const localizedBundle = {
+      schema: 2,
+      product: 'ThreadCells',
+      version: '0.3.0a3',
+      commit: 'abcdef0123456789',
+      locales: {
+        en: [{ slug: 'getting-started', group: 'Getting started', order: 1, title: 'Quick setup', markdown: '# Quick setup\n\nEnglish body.', headings: [] }],
+        ru: [{ slug: 'getting-started', group: 'Getting started', order: 1, title: 'Быстрый старт', markdown: '# Быстрый старт\n\nРусский текст.', headings: [] }],
+      },
+    }
+    function Switcher() {
+      const { setLocale } = useI18n()
+      return <button type="button" onClick={() => setLocale('ru')}>Русский</button>
+    }
+    localStorage.clear()
+    history.replaceState({}, '', '/docs/getting-started#install')
+    vi.stubGlobal('scrollTo', vi.fn())
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => localizedBundle }))
+    render(<I18nProvider><Switcher/><DocsPanel /></I18nProvider>)
+    await screen.findByRole('heading', { name: 'Quick setup' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Русский' }))
+    expect(await screen.findByRole('heading', { name: 'Быстрый старт' })).toBeInTheDocument()
+    expect(screen.getByText('Русский текст.')).toBeInTheDocument()
+    expect(location.pathname).toBe('/docs/getting-started')
+    expect(location.hash).toBe('#install')
   })
 })

@@ -12,6 +12,8 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
+import pytest
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10 compatibility
@@ -115,14 +117,43 @@ def _valid_verification_candidate(tmp_path: Path) -> Path:
     readme_checksum = hashlib.sha256((candidate / "README.md").read_bytes()).hexdigest()
     docs = candidate / "docs"
     docs.mkdir()
+    (docs / "ru").mkdir()
+    translated = docs / "ru" / "candidate.md"
+    translated_body = "# Локализованный кандидат\n"
+    translated.write_text(
+        "---\n"
+        "slug: candidate\n"
+        "source: README.md\n"
+        f"source_sha256: sha256:{readme_checksum}\n"
+        "---\n" + translated_body,
+        encoding="utf-8",
+    )
+    translated_checksum = hashlib.sha256(translated_body.encode()).hexdigest()
     (docs / "DOCS_MANIFEST.json").write_text(
-        json.dumps({"documents": [{"source": "README.md"}]}) + "\n", encoding="utf-8"
+        json.dumps({"documents": [{"slug": "candidate", "source": "README.md"}]}) + "\n",
+        encoding="utf-8",
     )
     (candidate / "web" / "public" / "docs-bundle.json").write_text(
         json.dumps(
             {
+                "schema": 2,
                 "commit": "a" * 40,
-                "documents": [{"source": "README.md", "sha256": readme_checksum}],
+                "locales": {
+                    "en": [
+                        {
+                            "slug": "candidate",
+                            "source": "README.md",
+                            "sha256": readme_checksum,
+                        }
+                    ],
+                    "ru": [
+                        {
+                            "slug": "candidate",
+                            "source": "README.md",
+                            "sha256": translated_checksum,
+                        }
+                    ],
+                },
             }
         )
         + "\n",
@@ -175,7 +206,10 @@ def test_docs_bundle_renders_canonical_navigation(tmp_path: Path) -> None:
         check=True,
     )
     bundle = json.loads(output.read_text(encoding="utf-8"))
-    documents = {document["slug"]: document for document in bundle["documents"]}
+    assert bundle["schema"] == 2
+    assert set(bundle["locales"]) == {"en", "ru"}
+    documents = {document["slug"]: document for document in bundle["locales"]["en"]}
+    russian = {document["slug"]: document for document in bundle["locales"]["ru"]}
     assert {
         "overview",
         "installation",
@@ -190,6 +224,8 @@ def test_docs_bundle_renders_canonical_navigation(tmp_path: Path) -> None:
     } <= documents.keys()
     assert "owner-decisions" not in documents
     assert len(documents) == 32
+    assert russian.keys() == documents.keys()
+    assert russian["overview"]["title"] != documents["overview"]["title"]
     assert "](/docs/getting-started)" in documents["installation"]["markdown"]
     assert "](/media/screenshots/threadcells-home.webp)" in documents["web-ui"]["markdown"]
     assert (
@@ -492,6 +528,80 @@ def test_candidate_verifier_rejects_tampered_brand_checksum_file(tmp_path: Path)
     assert "checksum mismatch: brand/SHA256SUMS" in errors
     assert "candidate manifest mismatch: brand/SHA256SUMS" in errors
     assert "brand checksum mismatch: ../web/public/brand-asset.txt" in errors
+
+
+def test_candidate_verifier_rejects_tampered_russian_document(tmp_path: Path) -> None:
+    candidate = _valid_verification_candidate(tmp_path)
+    translation = candidate / "docs" / "ru" / "candidate.md"
+    translation.write_text(
+        translation.read_text(encoding="utf-8").replace(
+            "# Локализованный кандидат", "# Повреждённый перевод"
+        ),
+        encoding="utf-8",
+    )
+
+    errors = _candidate_verifier_module().verify(candidate)
+
+    assert "packaged Russian documentation content mismatch: candidate" in errors
+
+
+@pytest.mark.parametrize(
+    "front_matter",
+    [
+        "slug: forged\nsource: README.md\nsource_sha256: sha256:{digest}",
+        "slug: candidate\nsource: OTHER.md\nsource_sha256: sha256:{digest}",
+        "slug: candidate\nsource: README.md\nsource_sha256: sha256:{zeros}",
+        "slug: candidate\nslug: duplicate\nsource: README.md\nsource_sha256: sha256:{digest}",
+        "slug: candidate\nsource: README.md\nsource_sha256: sha256:{digest}\nextra: value",
+    ],
+)
+def test_candidate_verifier_rejects_forged_russian_metadata(
+    tmp_path: Path, front_matter: str
+) -> None:
+    candidate = _valid_verification_candidate(tmp_path)
+    canonical_digest = hashlib.sha256((candidate / "README.md").read_bytes()).hexdigest()
+    translation = candidate / "docs" / "ru" / "candidate.md"
+    translation.write_text(
+        "---\n"
+        + front_matter.format(digest=canonical_digest, zeros="0" * 64)
+        + "\n---\n# Локализованный кандидат\n",
+        encoding="utf-8",
+    )
+    _candidate_builder_module().write_metadata(
+        candidate,
+        revision="a" * 40,
+        version="0.1.0",
+        components=[{"type": "application", "name": "threadcells", "version": "0.1.0"}],
+        node_licenses={},
+    )
+
+    errors = _candidate_verifier_module().verify(candidate)
+
+    assert "packaged Russian documentation metadata mismatch: candidate" in errors
+
+
+@pytest.mark.parametrize("unsupported_schema", [1, 3])
+def test_candidate_verifier_rejects_unsupported_docs_bundle_schema(
+    tmp_path: Path, unsupported_schema: int
+) -> None:
+    candidate = _valid_verification_candidate(tmp_path)
+    bundle_path = candidate / "web" / "public" / "docs-bundle.json"
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    bundle["schema"] = unsupported_schema
+    bundle["documents"] = bundle["locales"]["en"]
+    bundle.pop("locales")
+    bundle_path.write_text(json.dumps(bundle) + "\n", encoding="utf-8")
+    _candidate_builder_module().write_metadata(
+        candidate,
+        revision="a" * 40,
+        version="0.1.0",
+        components=[{"type": "application", "name": "threadcells", "version": "0.1.0"}],
+        node_licenses={},
+    )
+
+    errors = _candidate_verifier_module().verify(candidate)
+
+    assert "unsupported packaged documentation bundle schema" in errors
 
 
 def test_dependency_owner_packet_is_deterministic_and_non_clearance(tmp_path: Path) -> None:

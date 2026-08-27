@@ -1,5 +1,8 @@
 import { create } from 'zustand'
 import { api, OwnerLaunchGrant, Session, SessionDetail, TerminalMeta } from './api'
+import { readStoredAppLocale, translate } from './i18n'
+
+const appText = (key: Parameters<typeof translate>[1], params?: Parameters<typeof translate>[2]) => translate(readStoredAppLocale(), key, params)
 
 // Only trigger React re-renders when data actually changed
 function jsonEqual(a: unknown, b: unknown): boolean {
@@ -76,10 +79,10 @@ export const useStore = create<Store>((set, get) => ({
       } else {
         await api.createSession(provider, agentProfile, sessionName, workingDirectory)
       }
-      get().showSnackbar({ type: 'success', message: 'Session created' })
+      get().showSnackbar({ type: 'success', message: appText('store.sessionCreated') })
       await get().fetchSessions()
     } catch (e: any) {
-      get().showSnackbar({ type: 'error', message: e.message || 'Failed to create session' })
+      get().showSnackbar({ type: 'error', message: e.message || appText('store.createFailed') })
       throw e
     }
   },
@@ -87,13 +90,13 @@ export const useStore = create<Store>((set, get) => ({
   deleteSession: async (name) => {
     try {
       await api.deleteSession(name)
-      get().showSnackbar({ type: 'success', message: `Deleted ${name}` })
+      get().showSnackbar({ type: 'success', message: appText('store.sessionDeleted', { name }) })
       if (get().activeSession === name) {
         set({ activeSession: null, activeSessionDetail: null })
       }
       await get().fetchSessions()
     } catch (e: any) {
-      get().showSnackbar({ type: 'error', message: e.message || 'Failed to delete session' })
+      get().showSnackbar({ type: 'error', message: e.message || appText('store.deleteFailed') })
     }
   },
 

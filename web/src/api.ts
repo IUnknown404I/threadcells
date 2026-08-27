@@ -1,3 +1,5 @@
+import { readStoredAppLocale, translate, type TranslationKey } from './i18n'
+
 const BASE = ''  // Vite proxy handles routing to backend
 
 type ApiFailureBody = { reason_code?: unknown; diagnostic_id?: unknown; detail?: unknown; message?: unknown }
@@ -41,7 +43,7 @@ export interface WorkflowInputResponse {
   reason_code: string | null
 }
 
-const REASON_COPY: Record<string, [string, string]> = {
+const REASON_COPY = {
   WORKTREE_WRITER_LEASE_HELD: ['Working directory is locked', 'Another active write-capable agent is already using this working directory. Gracefully exit that agent or choose another working directory.'],
   WORKTREE_AUTHORITY_UNRECONCILED: ['Working directory needs attention', 'ThreadCells could not verify worktree authority. Reconcile the existing worktree before starting another writer.'],
   TOTAL_PROVIDER_CAPACITY_EXHAUSTED: ['Capacity limit reached', 'No compatible provider slot is currently available. Wait for an active agent to finish or choose another provider.'],
@@ -70,21 +72,97 @@ const REASON_COPY: Record<string, [string, string]> = {
   TERMINAL_WORKTREE_PROTECTED: ['Managed worktree retained', 'ThreadCells cannot delete this terminal history because its managed worktree contains state that must remain recoverable.'],
   SESSION_RUNTIME_ACTIVE: ['Exit every agent first', 'A live or Ready agent still owns this session. Gracefully exit every agent before deleting the session.'],
   SESSION_RUNTIME_AUTHORITY_UNPROVEN: ['Session runtime authority is uncertain', 'ThreadCells could not prove that every historical runtime is gone, so the session remains protected.'],
+  EXIT_PANE_AMBIGUOUS: ['Terminal exit needs attention', 'The terminal window has multiple panes. Resolve the terminal layout before trying Graceful Exit again.'],
+} satisfies Record<string, [string, string]>
+
+type KnownReasonCode = keyof typeof REASON_COPY
+
+const REASON_COPY_RU = {
+  WORKTREE_WRITER_LEASE_HELD: ['Рабочая папка заблокирована', 'Эту рабочую папку уже использует другой активный агент с правом записи. Корректно завершите его или выберите другую рабочую папку.'],
+  WORKTREE_AUTHORITY_UNRECONCILED: ['Требуется проверить рабочую папку', 'ThreadCells не удалось подтвердить полномочия рабочего дерева. Согласуйте существующее рабочее дерево, прежде чем запускать другого агента с правом записи.'],
+  TOTAL_PROVIDER_CAPACITY_EXHAUSTED: ['Достигнут предел ёмкости', 'Сейчас нет свободного слота совместимого провайдера. Дождитесь завершения активного агента или выберите другого провайдера.'],
+  PROVIDER_EXECUTION_CAPACITY_EXHAUSTED: ['Ходы провайдера поставлены в очередь', 'Все слоты выполнения провайдера заняты. Эта задача продолжится автоматически после освобождения слота.'],
+  RESIDENT_SUPERVISOR_CAPACITY_EXHAUSTED: ['Достигнут предел резидентных супервизоров', 'Уже запущено пять резидентных супервизоров. Завершите одного из них перед запуском нового супервизора проекта.'],
+  PROJECT_SUPERVISOR_ALREADY_RESIDENT: ['Супервизор проекта уже запущен', 'Откройте или повторно используйте существующий супервизор этого проекта.'],
+  WORK_CONTEXT_CAPACITY_EXHAUSTED: ['Достигнут предел ёмкости', 'Сейчас нет свободного совместимого рабочего слота. Дождитесь завершения активной работы и повторите попытку.'],
+  RESOURCE_HEALTH_REJECTED: ['Ресурсы ThreadCells недоступны', 'ThreadCells временно отклонил новую работу из-за состояния ресурсов хоста. Дождитесь восстановления ресурсов.'],
+  CONTEXT_INVENTORY_UNAVAILABLE: ['Сведения о ёмкости недоступны', 'ThreadCells пока не может безопасно подтвердить доступную ёмкость выполнения. Дождитесь восстановления инвентаризации среды и повторите попытку.'],
+  ADMISSION_FENCE_TIMEOUT: ['Истекло время допуска', 'ThreadCells не успел безопасно зарезервировать слот. Повторите попытку чуть позже.'],
+  HEAVY_SLOT_WAIT_TIMEOUT: ['Достигнут предел ёмкости', 'Совместимый слот тяжёлой операции не освободился вовремя. Повторите попытку после завершения активной работы.'],
+  HOUSEKEEPING_PLAN_CHANGED: ['План обслуживания изменился', 'Проверенный план больше не соответствует текущему состоянию очистки. Постройте и проверьте новый план перед выполнением.'],
+  HOUSEKEEPING_BUSY: ['Обслуживание уже выполняется', 'Каноническая блокировка занята другой операцией обслуживания. Дождитесь её завершения и постройте новый план.'],
+  FULL_CLEANUP_ADMISSION_BUSY: ['Полную очистку нельзя запустить', 'Граница допуска агента занята. Дождитесь простоя агентов и постройте новый предпросмотр.'],
+  FULL_CLEANUP_NOT_IDLE: ['Агенты ещё работают', 'Полная очистка доступна, только когда каждый агент готов или завершён, а выполнения провайдера и тяжёлые операции простаивают.'],
+  FULL_CLEANUP_IDLE_INVENTORY_UNKNOWN: ['Не удалось подтвердить простой', 'ThreadCells не удалось подтвердить простой всех агентов и каналов выполнения, поэтому полная очистка заблокирована.'],
+  OPERATOR_AUTH_NOT_CONFIGURED: ['Авторизация оператора недоступна', 'Привилегированный помощник полной очистки не смог проверить настроенные полномочия оператора. Файлы не удалялись.'],
+  TERMINAL_RUNTIME_ACTIVE: ['Сначала завершите терминал', 'Используйте корректное завершение и дождитесь, пока ThreadCells подтвердит остановку провайдера, прежде чем удалять историю терминала.'],
+  TERMINAL_EXIT_PENDING: ['Терминал ещё завершается', 'ThreadCells пока не подтвердил остановку провайдера. Дождитесь согласования завершения, прежде чем удалять историю терминала.'],
+  TERMINAL_DEATH_UNCONFIRMED: ['Остановка терминала не подтверждена', 'ThreadCells не смог вывести из среды именно этот завершённый процесс, поэтому метаданные терминала остаются защищены.'],
+  TERMINAL_RUNTIME_AUTHORITY_UNCERTAIN: ['Полномочия терминала неясны', 'ThreadCells не удалось проверить точную идентичность среды терминала, поэтому метаданные остаются защищены.'],
+  TERMINAL_IDENTITY_CHANGED: ['Идентичность терминала изменилась', 'Во время удаления изменились полномочия терминала. Обновите данные и повторите попытку после согласования жизненного цикла.'],
+  TERMINAL_RUNTIME_NOT_WRITABLE: ['Агент завершён', 'Этот исторический агент не может получать новые задачи редактора рабочего процесса. Откройте готового агента.'],
+  WORKFLOW_INPUT_IDEMPOTENCY_CONFLICT: ['Задача рабочего процесса изменилась', 'Этот идентификатор повтора уже связан с другим текстом задачи. Измените черновик и отправьте его как новую задачу.'],
+  WORKFLOW_INPUT_NO_LONGER_EXECUTABLE: ['Задачу рабочего процесса больше нельзя выполнить', 'Этот идентификатор повтора относится к ходу, который закрылся до допуска. Отправьте текст ещё раз как новую задачу.'],
+  TERMINAL_WORKTREE_PROTECTED: ['Управляемое рабочее дерево сохранено', 'Историю терминала нельзя удалить: его управляемое рабочее дерево содержит состояние, которое должно оставаться восстанавливаемым.'],
+  SESSION_RUNTIME_ACTIVE: ['Сначала завершите всех агентов', 'В этой сессии остаётся активный или готовый агент. Корректно завершите всех агентов перед удалением сессии.'],
+  SESSION_RUNTIME_AUTHORITY_UNPROVEN: ['Полномочия среды сессии не подтверждены', 'ThreadCells не удалось подтвердить остановку всех исторических процессов, поэтому сессия остаётся защищена.'],
+  EXIT_PANE_AMBIGUOUS: ['Требуется проверить завершение терминала', 'В окне терминала несколько панелей. Исправьте структуру терминала и повторите корректное завершение.'],
+} satisfies Record<KnownReasonCode, [string, string]>
+
+type ErrorKeyPair = readonly [TranslationKey, TranslationKey]
+
+const STATUS_KEYS: Record<number, ErrorKeyPair> = {
+  400: ['error.invalid.title', 'error.invalid.body'],
+  401: ['error.unauthorized.title', 'error.unauthorized.body'],
+  403: ['error.unauthorized.title', 'error.unauthorized.body'],
+  404: ['error.notFound.title', 'error.notFound.body'],
+  409: ['error.conflict.title', 'error.conflict.body'],
+  422: ['error.invalid.title', 'error.invalid.body'],
+  423: ['error.locked.title', 'error.locked.body'],
+  429: ['error.capacity.title', 'error.capacity.body'],
+  500: ['error.server.title', 'error.server.body'],
+  502: ['error.providerUnavailable.title', 'error.providerUnavailable.body'],
+  503: ['error.serviceUnavailable.title', 'error.serviceUnavailable.body'],
+  504: ['error.providerTimeout.title', 'error.providerTimeout.body'],
 }
 
-const STATUS_COPY: Record<number, [string, string]> = {
-  400: ['Invalid request', 'One or more submitted values are invalid. Review the form and try again.'],
-  401: ['Not authorized', 'The current operation is not permitted.'],
-  403: ['Not authorized', 'The current operation is not permitted.'],
-  404: ['Resource not found', 'The requested session, terminal, agent, or resource no longer exists.'],
-  409: ['Conflict', 'The requested operation conflicts with the current ThreadCells state. Refresh and try again.'],
-  422: ['Invalid request', 'One or more submitted values are invalid. Review the form and try again.'],
-  423: ['Resource is locked', 'This resource is currently locked by another operation. Wait for it to finish or choose another resource.'],
-  429: ['Capacity limit reached', 'No compatible provider or work slot is currently available. Try again after active work finishes.'],
-  500: ['ThreadCells server error', 'The operation failed unexpectedly on the ThreadCells server. Try again shortly.'],
-  502: ['Provider unavailable', 'An upstream provider is currently unavailable. Try again shortly.'],
-  503: ['ThreadCells service unavailable', 'ThreadCells is temporarily unable to accept this operation. Try again shortly.'],
-  504: ['Provider timeout', 'The upstream provider did not respond in time. Try again shortly.'],
+// The stable reason code selects product-safe localized copy. The canonical
+// code itself remains unchanged in CaoApiError's technical suffix.
+const REASON_KEYS: Record<string, ErrorKeyPair> = {
+  WORKTREE_WRITER_LEASE_HELD: ['error.locked.title', 'error.locked.body'],
+  WORKTREE_AUTHORITY_UNRECONCILED: ['error.operationUnavailable', 'error.conflict.body'],
+  TOTAL_PROVIDER_CAPACITY_EXHAUSTED: ['error.capacity.title', 'error.capacity.body'],
+  PROVIDER_EXECUTION_CAPACITY_EXHAUSTED: ['error.capacity.title', 'error.capacity.body'],
+  RESIDENT_SUPERVISOR_CAPACITY_EXHAUSTED: ['error.capacity.title', 'error.capacity.body'],
+  PROJECT_SUPERVISOR_ALREADY_RESIDENT: ['error.conflict.title', 'error.conflict.body'],
+  WORK_CONTEXT_CAPACITY_EXHAUSTED: ['error.capacity.title', 'error.capacity.body'],
+  RESOURCE_HEALTH_REJECTED: ['error.serviceUnavailable.title', 'error.serviceUnavailable.body'],
+  CONTEXT_INVENTORY_UNAVAILABLE: ['error.serviceUnavailable.title', 'error.serviceUnavailable.body'],
+  ADMISSION_FENCE_TIMEOUT: ['error.timeout.title', 'error.timeout.body'],
+  HEAVY_SLOT_WAIT_TIMEOUT: ['error.timeout.title', 'error.capacity.body'],
+  HOUSEKEEPING_PLAN_CHANGED: ['error.conflict.title', 'error.conflict.body'],
+  HOUSEKEEPING_BUSY: ['error.locked.title', 'error.locked.body'],
+  FULL_CLEANUP_ADMISSION_BUSY: ['error.locked.title', 'error.locked.body'],
+  FULL_CLEANUP_NOT_IDLE: ['error.operationUnavailable', 'error.conflict.body'],
+  FULL_CLEANUP_IDLE_INVENTORY_UNKNOWN: ['error.operationUnavailable', 'error.serviceUnavailable.body'],
+  OPERATOR_AUTH_NOT_CONFIGURED: ['error.unauthorized.title', 'error.unauthorized.body'],
+  TERMINAL_RUNTIME_ACTIVE: ['error.operationUnavailable', 'error.conflict.body'],
+  TERMINAL_EXIT_PENDING: ['error.conflict.title', 'error.conflict.body'],
+  TERMINAL_DEATH_UNCONFIRMED: ['error.operationUnavailable', 'error.conflict.body'],
+  TERMINAL_RUNTIME_AUTHORITY_UNCERTAIN: ['error.operationUnavailable', 'error.conflict.body'],
+  TERMINAL_IDENTITY_CHANGED: ['error.conflict.title', 'error.conflict.body'],
+  TERMINAL_RUNTIME_NOT_WRITABLE: ['error.operationUnavailable', 'error.conflict.body'],
+  WORKFLOW_INPUT_IDEMPOTENCY_CONFLICT: ['error.conflict.title', 'error.conflict.body'],
+  WORKFLOW_INPUT_NO_LONGER_EXECUTABLE: ['error.operationUnavailable', 'error.conflict.body'],
+  TERMINAL_WORKTREE_PROTECTED: ['error.operationUnavailable', 'error.conflict.body'],
+  SESSION_RUNTIME_ACTIVE: ['error.operationUnavailable', 'error.conflict.body'],
+  SESSION_RUNTIME_AUTHORITY_UNPROVEN: ['error.operationUnavailable', 'error.conflict.body'],
+  EXIT_PANE_AMBIGUOUS: ['error.exitPaneAmbiguous.title', 'error.exitPaneAmbiguous.body'],
+}
+
+function localizedPair(pair: ErrorKeyPair): [string, string] {
+  const locale = readStoredAppLocale()
+  return [translate(locale, pair[0]), translate(locale, pair[1])]
 }
 
 export function normalizeApiError(status: number, body: ApiFailureBody | null, statusText = ''): CaoApiError {
@@ -93,9 +171,15 @@ export function normalizeApiError(status: number, body: ApiFailureBody | null, s
   const reasonCode = typeof reasonValue === 'string' && reasonValue.trim() ? reasonValue.trim() : undefined
   const diagnosticValue = body?.diagnostic_id ?? structuredDetail?.diagnostic_id
   const diagnosticId = typeof diagnosticValue === 'string' && /^[0-9a-f]{32}$/.test(diagnosticValue) ? diagnosticValue : undefined
-  const backendMessage = [structuredDetail?.message, structuredDetail?.detail, body?.detail, body?.message].find(value => typeof value === 'string' && value.trim()) as string | undefined
-  const [title, fallback] = (reasonCode && REASON_COPY[reasonCode]) || STATUS_COPY[status] || ['Request failed', 'ThreadCells could not complete this operation. Try again shortly.']
-  const description = reasonCode && REASON_COPY[reasonCode] ? fallback : backendMessage?.trim() || fallback || statusText || 'ThreadCells could not complete this operation. Try again shortly.'
+  const locale = readStoredAppLocale()
+  const translated = (reasonCode && REASON_KEYS[reasonCode] && localizedPair(REASON_KEYS[reasonCode])) || (STATUS_KEYS[status] && localizedPair(STATUS_KEYS[status]))
+  const knownReasonCode = reasonCode && reasonCode in REASON_COPY ? reasonCode as KnownReasonCode : undefined
+  const reasonCopy = knownReasonCode
+    ? locale === 'ru'
+      ? REASON_COPY_RU[knownReasonCode]
+      : REASON_COPY[knownReasonCode]
+    : undefined
+  const [title, description] = reasonCopy || translated || [translate(locale, 'error.generic.title'), translate(locale, 'error.generic.body')]
   return new CaoApiError(title, description, status, reasonCode, diagnosticId)
 }
 
@@ -121,14 +205,22 @@ async function fetchJSON<T>(url: string, opts?: FetchJsonOptions): Promise<T> {
     return res.json()
   } catch (reason) {
     if (timedOut) {
+      const locale = readStoredAppLocale()
       const copy = timeoutError || {
-        title: 'Request took too long',
-        description: 'ThreadCells could not complete the request in time. Try again.',
+        title: translate(locale, 'error.timeout.title'),
+        description: translate(locale, 'error.timeout.body'),
         reasonCode: 'REQUEST_TIMEOUT',
       }
       throw new CaoApiError(copy.title, copy.description, 408, copy.reasonCode)
     }
-    throw reason
+    if (reason instanceof CaoApiError || (reason as { name?: string })?.name === 'AbortError') throw reason
+    const locale = readStoredAppLocale()
+    throw new CaoApiError(
+      translate(locale, 'error.generic.title'),
+      translate(locale, 'error.generic.body'),
+      0,
+      'REQUEST_NETWORK_ERROR',
+    )
   } finally {
     externalSignal?.removeEventListener('abort', abortFromCaller)
     if (timeout !== undefined) clearTimeout(timeout)
@@ -136,10 +228,12 @@ async function fetchJSON<T>(url: string, opts?: FetchJsonOptions): Promise<T> {
 }
 
 function planningNetworkError(reason: unknown, preview: boolean): never {
-  if (reason instanceof CaoApiError || (reason as { name?: string })?.name === 'AbortError') throw reason
+  if (reason instanceof CaoApiError && reason.reasonCode !== 'REQUEST_NETWORK_ERROR') throw reason
+  if ((reason as { name?: string })?.name === 'AbortError') throw reason
+  const locale = readStoredAppLocale()
   throw new CaoApiError(
-    preview ? 'Preview could not be built' : 'Plan could not be built',
-    'ThreadCells lost the connection while scanning resources. No files were deleted. Try again.',
+    translate(locale, preview ? 'error.previewNetwork.title' : 'error.planNetwork.title'),
+    translate(locale, 'error.planNetwork.body'),
     0,
     'HOUSEKEEPING_PLAN_NETWORK_ERROR',
   )
@@ -567,13 +661,14 @@ export const api = {
   getHousekeepingSettings: () => fetchJSON<HousekeepingSettings>('/api/v1/housekeeping'),
   updateHousekeepingSettings: (data: HousekeepingSettings) => fetchJSON<HousekeepingSettings>('/api/v1/housekeeping', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }),
   getHousekeepingPlan: async (mode: HousekeepingMode, signal?: AbortSignal) => {
+    const locale = readStoredAppLocale()
     try {
       return await fetchJSON<HousekeepingPlan>(`/api/v1/housekeeping/plan?mode=${mode}`, {
         signal,
         timeoutMs: HOUSEKEEPING_PLAN_TIMEOUT_MS,
         timeoutError: {
-          title: 'Plan took too long to build',
-          description: 'ThreadCells could not finish the filesystem inventory in time. No files were deleted. Try again.',
+          title: translate(locale, 'error.planTimeout.title'),
+          description: translate(locale, 'error.planTimeout.body'),
           reasonCode: 'HOUSEKEEPING_PLAN_TIMEOUT',
         },
       })
@@ -583,13 +678,14 @@ export const api = {
   },
   runHousekeeping: (mode: HousekeepingMode, dry_run: boolean, expectedPlanId?: string) => fetchJSON<Record<string, any>>('/api/v1/housekeeping/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, dry_run, expected_plan_id: expectedPlanId }), timeoutMs: null }),
   getFullCleanupPlan: async (signal?: AbortSignal) => {
+    const locale = readStoredAppLocale()
     try {
       return await fetchJSON<FullCleanupPlan>('/api/v1/housekeeping/full-cleanup/plan', {
         signal,
         timeoutMs: HOUSEKEEPING_PLAN_TIMEOUT_MS,
         timeoutError: {
-          title: 'Preview took too long to build',
-          description: 'ThreadCells could not finish the filesystem inventory in time. No files were deleted. Try again.',
+          title: translate(locale, 'error.previewTimeout.title'),
+          description: translate(locale, 'error.planTimeout.body'),
           reasonCode: 'HOUSEKEEPING_PLAN_TIMEOUT',
         },
       })

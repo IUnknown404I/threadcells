@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -16,6 +17,27 @@ SCHEMA_NAMES = ("adapter-manifest", "capabilities", "profile", "provider-config"
 
 def digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def translated_markdown(path: Path) -> tuple[dict[str, str], str] | None:
+    match = re.fullmatch(
+        r"---\n(?P<header>.*?)\n---\n(?P<body>.*)",
+        path.read_text(encoding="utf-8"),
+        re.S,
+    )
+    if not match:
+        return None
+    metadata: dict[str, str] = {}
+    for line in match.group("header").splitlines():
+        key, separator, raw = line.partition(":")
+        key = key.strip()
+        value = raw.strip()
+        if not separator or not key or not value or key in metadata:
+            return None
+        metadata[key] = value
+    if set(metadata) != {"slug", "source", "source_sha256"}:
+        return None
+    return metadata, match.group("body")
 
 
 def relative_path(root: Path, value: str) -> Path | None:
@@ -178,7 +200,11 @@ def verify(candidate: Path) -> list[str]:
     source_paths = {item["source"] for item in docs_manifest.get("documents", [])}
     if not source_paths or any(not (candidate / source).is_file() for source in source_paths):
         errors.append("candidate is missing an allowlisted documentation source")
-    bundled_documents = docs_bundle.get("documents", [])
+    schema = docs_bundle.get("schema")
+    if schema != 2:
+        errors.append("unsupported packaged documentation bundle schema")
+    locales = docs_bundle.get("locales", {}) if schema == 2 else {}
+    bundled_documents = locales.get("en", []) if schema == 2 and isinstance(locales, dict) else []
     if not isinstance(bundled_documents, list):
         errors.append("packaged documentation bundle is malformed")
         bundled_documents = []
@@ -192,6 +218,41 @@ def verify(candidate: Path) -> list[str]:
         for source in source_paths:
             if bundled_by_source[source].get("sha256") != digest(candidate / source):
                 errors.append(f"packaged documentation content mismatch: {source}")
+    if schema == 2:
+        russian_documents = locales.get("ru", []) if isinstance(locales, dict) else []
+        manifest_by_slug = {
+            item["slug"]: item
+            for item in docs_manifest.get("documents", [])
+            if isinstance(item, dict) and item.get("slug") and item.get("source")
+        }
+        manifest_slugs = set(manifest_by_slug)
+        if (
+            not isinstance(russian_documents, list)
+            or {item.get("slug") for item in russian_documents if isinstance(item, dict)}
+            != manifest_slugs
+        ):
+            errors.append("packaged Russian documentation does not match the candidate manifest")
+        else:
+            russian_by_slug = {item["slug"]: item for item in russian_documents}
+            for slug in manifest_slugs:
+                source = candidate / "docs" / "ru" / f"{slug}.md"
+                translated = translated_markdown(source) if source.is_file() else None
+                canonical_source = candidate / manifest_by_slug[slug]["source"]
+                if not canonical_source.is_file():
+                    errors.append(f"packaged Russian documentation metadata mismatch: {slug}")
+                    continue
+                expected_metadata = {
+                    "slug": slug,
+                    "source": manifest_by_slug[slug]["source"],
+                    "source_sha256": ("sha256:" + digest(canonical_source)),
+                }
+                if translated is None or translated[0] != expected_metadata:
+                    errors.append(f"packaged Russian documentation metadata mismatch: {slug}")
+                elif (
+                    russian_by_slug[slug].get("sha256")
+                    != hashlib.sha256(translated[1].encode()).hexdigest()
+                ):
+                    errors.append(f"packaged Russian documentation content mismatch: {slug}")
     sbom = json.loads((candidate / "sbom.cdx.json").read_text(encoding="utf-8"))
     if sbom.get("bomFormat") != "CycloneDX" or not sbom.get("components"):
         errors.append("SBOM is not a populated CycloneDX inventory")

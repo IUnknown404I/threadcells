@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { ChevronDown, Check } from 'lucide-react'
+import { useI18n } from '../i18n'
 
 export interface SelectOption {
   value: string
@@ -17,7 +18,8 @@ interface CustomSelectProps {
   className?: string
 }
 
-export function CustomSelect({ value, onChange, options, placeholder = 'Select...', className = '' }: CustomSelectProps) {
+export function CustomSelect({ value, onChange, options, placeholder, className = '' }: CustomSelectProps) {
+  const { t } = useI18n()
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
 
@@ -60,7 +62,7 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
         className="w-full min-h-11 flex items-center justify-between gap-2 bg-gray-900 border border-gray-700 text-sm rounded-lg px-3 py-2.5 focus:border-emerald-500 focus:outline-none transition-colors hover:border-gray-600"
       >
         <span className={selected ? 'text-gray-200' : 'text-gray-500'}>
-          {selected ? selected.label : placeholder}
+          {selected ? selected.label : placeholder || t('common.select')}
         </span>
         <ChevronDown size={14} className={`text-gray-500 transition-transform ${open ? 'rotate-180' : ''}`} />
       </button>
@@ -105,7 +107,7 @@ export function CustomSelect({ value, onChange, options, placeholder = 'Select..
             </div>
           ))}
           {options.length === 0 && (
-            <div className="px-3 py-4 text-sm text-gray-500 text-center">No options available</div>
+            <div className="px-3 py-4 text-sm text-gray-500 text-center">{t('common.noOptions')}</div>
           )}
         </div>
       )}

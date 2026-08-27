@@ -1,13 +1,31 @@
 import { useEffect, useMemo, useState } from 'react'
 import { ChevronLeft, ChevronRight, Copy, Search, Menu, X } from 'lucide-react'
+import { useI18n, type AppLocale, type TranslationKey } from '../i18n'
 
 type Heading = { level: string; text: string; anchor: string }
 type Doc = { slug: string; group: string; order: number; title: string; markdown: string; headings: Heading[] }
-type Bundle = { product: string; version: string; commit: string; documents: Doc[] }
+type Bundle = {
+  schema?: 1 | 2
+  product: string
+  version: string
+  commit: string
+  locales?: Partial<Record<AppLocale, Doc[]>>
+  /** Schema 1 compatibility for installed bundles during a rolling upgrade. */
+  documents?: Doc[]
+}
 
 const safeHref = (value: string) => /^(https?:\/\/|mailto:|#|\/docs(?:\/|$))/.test(value) ? value : '#'
 const safeImageSrc = (value: string) => /^\/media\/screenshots\/[a-z0-9-]+\.webp$/.test(value) ? value : ''
-const anchor = (value: string) => value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '')
+const anchor = (value: string) => value.normalize('NFKD').toLowerCase().replace(/[^\p{Letter}\p{Number}]+/gu, '-').replace(/(^-|-$)/g, '')
+
+const GROUP_KEYS: Record<string, TranslationKey> = {
+  'Getting started': 'docs.group.gettingStarted',
+  'Using ThreadCells': 'docs.group.using',
+  Configuration: 'docs.group.configuration',
+  Operations: 'docs.group.operations',
+  Safety: 'docs.group.safety',
+  About: 'docs.group.about',
+}
 
 function Inline({ value }: { value: string }) {
   const nodes = value.split(/(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\([^)]*\))/g)
@@ -21,11 +39,12 @@ function Inline({ value }: { value: string }) {
 }
 
 function Markdown({ markdown }: { markdown: string }) {
+  const { t } = useI18n()
   const lines = markdown.replace(/<[^>]*>/g, '').split('\n')
   const out: React.ReactNode[] = []; let i = 0
   while (i < lines.length) {
     const line = lines[i]
-    if (line.startsWith('```')) { const code: string[] = []; const lang = line.slice(3); i++; while (i < lines.length && !lines[i].startsWith('```')) code.push(lines[i++]); i++; const text = code.join('\n'); out.push(<pre key={i} className="group relative my-4 max-w-full overflow-x-auto rounded-lg border border-gray-700 bg-[#101622] p-4 text-sm"><button className="absolute right-2 top-2 rounded bg-gray-700 px-2 py-1 text-xs opacity-70 hover:opacity-100" onClick={() => navigator.clipboard?.writeText(text)} aria-label="Copy code"><Copy size={13}/></button><code data-language={lang}>{text}</code></pre>); continue }
+    if (line.startsWith('```')) { const code: string[] = []; const lang = line.slice(3); i++; while (i < lines.length && !lines[i].startsWith('```')) code.push(lines[i++]); i++; const text = code.join('\n'); out.push(<pre key={i} className="group relative my-4 max-w-full overflow-x-auto rounded-lg border border-gray-700 bg-[#101622] p-4 text-sm"><button className="absolute right-2 top-2 rounded bg-gray-700 px-2 py-1 text-xs opacity-70 hover:opacity-100" onClick={() => navigator.clipboard?.writeText(text)} aria-label={t('docs.copyCode')}><Copy size={13}/></button><code data-language={lang}>{text}</code></pre>); continue }
     const image = /^!\[([^\]]+)\]\(([^)]+)\)$/.exec(line)
     if (image) { const src = safeImageSrc(image[2]); if (src) out.push(<img key={i} src={src} alt={image[1]} loading="lazy" className="my-5 w-full rounded-xl border border-gray-700/70"/>); i++; continue }
     const heading = /^(#{1,4})\s+(.+)$/.exec(line)
@@ -41,19 +60,22 @@ function Markdown({ markdown }: { markdown: string }) {
 }
 
 export function DocsPanel() {
+  const { locale, t } = useI18n()
   const [bundle, setBundle] = useState<Bundle | null>(null); const [query, setQuery] = useState(''); const [menu, setMenu] = useState(false); const [pathname, setPathname] = useState(location.pathname)
   const slug = pathname.split('/').filter(Boolean)[1] || 'overview'
   useEffect(() => { fetch('/docs-bundle.json').then(r => r.ok ? r.json() : Promise.reject()).then(setBundle).catch(() => setBundle(null)) }, [])
-  const document = bundle?.documents.find(d => d.slug === slug)
-  const ordered = useMemo(() => [...(bundle?.documents || [])].sort((a, b) => a.order - b.order), [bundle])
+  const documents = bundle?.locales?.[locale] || bundle?.locales?.en || bundle?.documents || []
+  const document = documents.find(d => d.slug === slug)
+  const ordered = useMemo(() => [...documents].sort((a, b) => a.order - b.order), [documents])
   const position = ordered.findIndex(d => d.slug === slug)
   const previous = position > 0 ? ordered[position - 1] : undefined
   const next = position >= 0 && position < ordered.length - 1 ? ordered[position + 1] : undefined
-  const filtered = useMemo(() => (bundle?.documents.filter(d => !query || `${d.title} ${d.markdown}`.toLowerCase().includes(query.toLowerCase())) || []).sort((a, b) => a.order - b.order), [bundle, query])
+  const filtered = useMemo(() => documents.filter(d => !query || `${d.title} ${d.markdown}`.toLowerCase().includes(query.toLowerCase())).sort((a, b) => a.order - b.order), [documents, query])
   const groups = [...new Set(filtered.map(d => d.group))]
   const select = (next: string) => { history.pushState({}, '', `/docs/${next}`); dispatchEvent(new PopStateEvent('popstate')); setMenu(false); scrollTo({ top: 0, behavior: 'smooth' }) }
   useEffect(() => { const refresh = () => setPathname(location.pathname); addEventListener('popstate', refresh); return () => removeEventListener('popstate', refresh) }, [])
-  if (!bundle) return <div className="py-16 text-center text-gray-400">Loading packaged documentation…</div>
-  const navigation = <aside className="w-full shrink-0 lg:w-60"><div className="relative mb-3"><Search size={16} className="absolute left-3 top-3 text-gray-500"/><input aria-label="Search documentation" className="w-full rounded-lg border border-gray-700 bg-gray-900 py-2 pl-9 pr-3 text-sm outline-none focus:border-emerald-500" value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search docs" /></div>{groups.map(group=><section key={group} className="mb-4"><h2 className="mb-1 text-xs font-semibold uppercase tracking-wider text-gray-500">{group}</h2>{filtered.filter(d=>d.group===group).map(d=><button key={d.slug} onClick={()=>select(d.slug)} className={'block w-full rounded px-2 py-1.5 text-left text-sm '+(d.slug===slug?'bg-emerald-600 text-white':'text-gray-300 hover:bg-gray-800')}>{d.title}</button>)}</section>)}</aside>
-  return <div className="min-w-0"><div className="mb-4 flex items-center justify-between lg:hidden"><button onClick={()=>setMenu(!menu)} className="flex items-center gap-2 rounded border border-gray-700 px-3 py-2 text-sm"><Menu size={16}/> Browse docs</button>{menu && <button onClick={()=>setMenu(false)} aria-label="Close documentation navigation"><X size={16}/></button>}</div>{menu && <div className="mb-5 rounded border border-gray-700 bg-gray-900 p-3 lg:hidden">{navigation}</div>}<div className="flex gap-8"><div className="hidden lg:block">{navigation}</div><section className="min-w-0 flex-1 rounded-xl border border-gray-800 bg-gray-900/40 p-5 sm:p-8">{document ? <><p className="mb-5 text-xs font-semibold uppercase tracking-wider text-emerald-400/80">{document.group}</p><Markdown markdown={document.markdown}/><nav aria-label="Documentation pages" className="mt-10 grid gap-3 border-t border-gray-800 pt-5 sm:grid-cols-2">{previous ? <button className="flex min-w-0 items-center gap-2 rounded-lg border border-gray-700 p-3 text-left text-sm text-gray-300 hover:border-emerald-600 hover:text-white" onClick={()=>select(previous.slug)}><ChevronLeft size={16} className="shrink-0"/><span><span className="block text-xs text-gray-500">Previous</span>{previous.title}</span></button> : <span/>}{next && <button className="flex min-w-0 items-center justify-end gap-2 rounded-lg border border-gray-700 p-3 text-right text-sm text-gray-300 hover:border-emerald-600 hover:text-white" onClick={()=>select(next.slug)}><span><span className="block text-xs text-gray-500">Next</span>{next.title}</span><ChevronRight size={16} className="shrink-0"/></button>}</nav><footer className="mt-5 text-xs text-gray-500">ThreadCells {bundle.version} · docs build {bundle.commit.slice(0,12)}</footer></> : <div><h1 className="text-2xl font-semibold">Document not found</h1><p className="mt-2 text-gray-400">This build does not publish that document.</p><button className="mt-4 text-emerald-300 underline" onClick={()=>select('overview')}>Open Start here</button></div>}</section>{document && document.headings.length > 0 && <aside className="hidden w-44 shrink-0 xl:block"><p className="mb-2 text-xs uppercase text-gray-500">On this page</p>{document.headings.map(h=><a className="mb-2 block text-xs text-gray-400 hover:text-emerald-300" style={{paddingLeft:Math.max(0,(Number(h.level)-2)*8)}} href={'#'+h.anchor} key={h.anchor}>{h.text}</a>)}</aside>}</div></div>
+  if (!bundle) return <div className="py-16 text-center text-gray-400">{t('docs.loading')}</div>
+  const groupLabel = (group: string) => GROUP_KEYS[group] ? t(GROUP_KEYS[group]) : group
+  const navigation = <aside className="w-full shrink-0 lg:w-60"><div className="relative mb-3"><Search size={16} className="absolute left-3 top-3 text-gray-500"/><input aria-label={t('docs.searchLabel')} className="w-full rounded-lg border border-gray-700 bg-gray-900 py-2 pl-9 pr-3 text-sm outline-none focus:border-emerald-500" value={query} onChange={e=>setQuery(e.target.value)} placeholder={t('docs.searchPlaceholder')} /></div>{groups.map(group=><section key={group} className="mb-4"><h2 className="mb-1 text-xs font-semibold uppercase tracking-wider text-gray-500">{groupLabel(group)}</h2>{filtered.filter(d=>d.group===group).map(d=><button key={d.slug} onClick={()=>select(d.slug)} className={'block w-full rounded px-2 py-1.5 text-left text-sm '+(d.slug===slug?'bg-emerald-600 text-white':'text-gray-300 hover:bg-gray-800')}>{d.title}</button>)}</section>)}</aside>
+  return <div className="min-w-0"><div className="mb-4 flex items-center justify-between lg:hidden"><button onClick={()=>setMenu(!menu)} className="flex items-center gap-2 rounded border border-gray-700 px-3 py-2 text-sm"><Menu size={16}/> {t('docs.browse')}</button>{menu && <button onClick={()=>setMenu(false)} aria-label={t('docs.closeNavigation')}><X size={16}/></button>}</div>{menu && <div className="mb-5 rounded border border-gray-700 bg-gray-900 p-3 lg:hidden">{navigation}</div>}<div className="flex gap-8"><div className="hidden lg:block">{navigation}</div><section className="min-w-0 flex-1 rounded-xl border border-gray-800 bg-gray-900/40 p-5 sm:p-8">{document ? <><p className="mb-5 text-xs font-semibold uppercase tracking-wider text-emerald-400/80">{groupLabel(document.group)}</p><Markdown markdown={document.markdown}/><nav aria-label={t('docs.pages')} className="mt-10 grid gap-3 border-t border-gray-800 pt-5 sm:grid-cols-2">{previous ? <button className="flex min-w-0 items-center gap-2 rounded-lg border border-gray-700 p-3 text-left text-sm text-gray-300 hover:border-emerald-600 hover:text-white" onClick={()=>select(previous.slug)}><ChevronLeft size={16} className="shrink-0"/><span><span className="block text-xs text-gray-500">{t('docs.previous')}</span>{previous.title}</span></button> : <span/>}{next && <button className="flex min-w-0 items-center justify-end gap-2 rounded-lg border border-gray-700 p-3 text-right text-sm text-gray-300 hover:border-emerald-600 hover:text-white" onClick={()=>select(next.slug)}><span><span className="block text-xs text-gray-500">{t('docs.next')}</span>{next.title}</span><ChevronRight size={16} className="shrink-0"/></button>}</nav><footer className="mt-5 text-xs text-gray-500">ThreadCells {bundle.version} · {t('docs.build')} {bundle.commit.slice(0,12)}</footer></> : <div><h1 className="text-2xl font-semibold">{t('docs.notFound')}</h1><p className="mt-2 text-gray-400">{t('docs.notPublished')}</p><button className="mt-4 text-emerald-300 underline" onClick={()=>select('overview')}>{t('docs.openStart')}</button></div>}</section>{document && document.headings.length > 0 && <aside className="hidden w-44 shrink-0 xl:block"><p className="mb-2 text-xs uppercase text-gray-500">{t('docs.onPage')}</p>{document.headings.map(h=><a className="mb-2 block text-xs text-gray-400 hover:text-emerald-300" style={{paddingLeft:Math.max(0,(Number(h.level)-2)*8)}} href={'#'+h.anchor} key={h.anchor}>{h.text}</a>)}</aside>}</div></div>
 }

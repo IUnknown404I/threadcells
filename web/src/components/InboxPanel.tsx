@@ -3,6 +3,7 @@ import { api, DelegationResult, InboxMessage } from '../api'
 import { useStore } from '../store'
 import { X, Send, Mail, Loader2, Maximize2, Minimize2 } from 'lucide-react'
 import { ModalLoadingBody } from './ModalLoadingBody'
+import { useI18n, type AppLocale, type TranslationKey } from '../i18n'
 
 interface InboxPanelProps {
   terminalId: string
@@ -11,47 +12,50 @@ interface InboxPanelProps {
 
 type StatusFilter = 'all' | 'pending' | 'delivered' | 'failed'
 
-const STATUS_FILTERS: { key: StatusFilter; label: string }[] = [
-  { key: 'all', label: 'All' },
-  { key: 'pending', label: 'Pending' },
-  { key: 'delivered', label: 'Delivered' },
-  { key: 'failed', label: 'Failed' },
+const STATUS_FILTERS: { key: StatusFilter; labelKey: TranslationKey }[] = [
+  { key: 'all', labelKey: 'inbox.all' },
+  { key: 'pending', labelKey: 'inbox.pending' },
+  { key: 'delivered', labelKey: 'inbox.delivered' },
+  { key: 'failed', labelKey: 'inbox.failed' },
 ]
 
 const OWNER_MESSAGE_PREVIEW_LENGTH = 1028
 
 export function OwnerMessageBody({ message }: { message: string }) {
+  const { t } = useI18n()
   const [expanded, setExpanded] = useState(false)
   const characters = Array.from(message)
   if (characters.length <= OWNER_MESSAGE_PREVIEW_LENGTH) return <p className="text-sm text-gray-200 whitespace-pre-wrap break-words">{message}</p>
-  return <div className="text-sm text-gray-200 whitespace-pre-wrap break-words">{expanded ? message : characters.slice(0, OWNER_MESSAGE_PREVIEW_LENGTH).join('')}<button type="button" onClick={() => setExpanded(value => !value)} className="ml-1 text-sky-300 hover:text-sky-100">{expanded ? 'Show less' : 'Show more…'}</button></div>
+  return <div className="text-sm text-gray-200 whitespace-pre-wrap break-words">{expanded ? message : characters.slice(0, OWNER_MESSAGE_PREVIEW_LENGTH).join('')}<button type="button" onClick={() => setExpanded(value => !value)} className="ml-1 text-sky-300 hover:text-sky-100">{expanded ? t('inbox.showLess') : t('inbox.showMore')}</button></div>
 }
 
-function formatRelativeTime(dateStr: string | null): string {
+function formatRelativeTime(dateStr: string | null, locale: AppLocale): string {
   if (!dateStr) return ''
   const now = Date.now()
   const then = new Date(dateStr).getTime()
   const diffSec = Math.floor((now - then) / 1000)
-  if (diffSec < 0) return 'just now'
-  if (diffSec < 60) return `${diffSec}s ago`
+  const formatter = new Intl.RelativeTimeFormat(locale, { numeric: 'auto', style: 'narrow' })
+  if (diffSec < 0) return formatter.format(0, 'second')
+  if (diffSec < 60) return formatter.format(-diffSec, 'second')
   const diffMin = Math.floor(diffSec / 60)
-  if (diffMin < 60) return `${diffMin}m ago`
+  if (diffMin < 60) return formatter.format(-diffMin, 'minute')
   const diffHr = Math.floor(diffMin / 60)
-  if (diffHr < 24) return `${diffHr}h ago`
+  if (diffHr < 24) return formatter.format(-diffHr, 'hour')
   const diffDay = Math.floor(diffHr / 24)
-  return `${diffDay}d ago`
+  return formatter.format(-diffDay, 'day')
 }
 
 function MessageStatusBadge({ status }: { status: InboxMessage['status'] }) {
+  const { t } = useI18n()
   const config = {
-    delivered: { bg: 'bg-emerald-400/10', text: 'text-emerald-400', label: 'Delivered' },
-    pending: { bg: 'bg-amber-400/10', text: 'text-amber-400', label: 'Pending' },
-    failed: { bg: 'bg-red-400/10', text: 'text-red-400', label: 'Failed' },
+    delivered: { bg: 'bg-emerald-400/10', text: 'text-emerald-400', labelKey: 'inbox.delivered' as TranslationKey },
+    pending: { bg: 'bg-amber-400/10', text: 'text-amber-400', labelKey: 'inbox.pending' as TranslationKey },
+    failed: { bg: 'bg-red-400/10', text: 'text-red-400', labelKey: 'inbox.failed' as TranslationKey },
   }
   const c = config[status] || config.pending
   return (
     <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ${c.bg} ${c.text}`}>
-      {c.label}
+      {t(c.labelKey)}
     </span>
   )
 }
@@ -68,7 +72,19 @@ export function resultLifecycleLabel(status: string, delivery?: string): string 
   return status === 'complete' ? 'Complete' : 'Waiting for result'
 }
 
+export function resultLifecycleKey(status: string, delivery?: string): TranslationKey {
+  if (status === 'awaiting') return 'inbox.waitingResult'
+  if (status === 'complete' && delivery?.includes('failed')) return 'inbox.deliveryFailed'
+  if (status === 'complete' && delivery?.includes('acknowledged')) return 'inbox.acknowledged'
+  if (status === 'complete' && delivery?.includes('delivered')) return 'inbox.delivered'
+  if (status === 'complete' && delivery?.includes('queued')) return 'inbox.resultReady'
+  if (status === 'incomplete') return 'inbox.incomplete'
+  if (status === 'cancelled') return 'inbox.cancelled'
+  return status === 'complete' ? 'inbox.complete' : 'inbox.waitingResult'
+}
+
 export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
+  const { locale, t } = useI18n()
   const showSnackbar = useStore(state => state.showSnackbar)
   const [messages, setMessages] = useState<InboxMessage[]>([])
   const [resultHistory, setResultHistory] = useState<DelegationResult[]>([])
@@ -196,7 +212,7 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
       setDraft('')
       await fetchMessages(true)
     } catch (error: any) {
-      showSnackbar({ type: 'error', message: error.message || 'Unable to send the Inbox message. Try again.' })
+      showSnackbar({ type: 'error', message: error.message || t('inbox.sendFailed') })
     }
     setSending(false)
   }
@@ -228,7 +244,7 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
       <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
 
       {/* Modal */}
-      <div role="dialog" aria-modal="true" aria-label="Agent inbox" className={`bg-gray-900 border border-gray-700/50 shadow-2xl w-full min-h-0 overflow-hidden flex flex-col ${fullscreen ? 'fixed inset-0 h-[100dvh] w-screen max-w-none rounded-none border-0' : 'relative h-[calc(100dvh-1.5rem)] sm:h-[80dvh] max-w-[800px] rounded-xl sm:rounded-2xl'}`}>
+      <div role="dialog" aria-modal="true" aria-label={t('inbox.dialog')} className={`bg-gray-900 border border-gray-700/50 shadow-2xl w-full min-h-0 overflow-hidden flex flex-col ${fullscreen ? 'fixed inset-0 h-[100dvh] w-screen max-w-none rounded-none border-0' : 'relative h-[calc(100dvh-1.5rem)] sm:h-[80dvh] max-w-[800px] rounded-xl sm:rounded-2xl'}`}>
         {/* Header */}
         <div className="flex items-center justify-between gap-3 px-4 sm:px-5 py-3 sm:py-4 border-b border-gray-700/50 shrink-0">
           <div className="flex items-center gap-3 min-w-0">
@@ -236,18 +252,18 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
               <Mail size={16} className="text-emerald-400" />
             </div>
             <div>
-              <h3 className="text-sm font-semibold text-white">Agent Inbox</h3>
-              <p className="text-[11px] text-gray-500 truncate">Messages between agents in this session <span className="font-mono">({terminalId})</span></p>
+              <h3 className="text-sm font-semibold text-white">{t('inbox.title')}</h3>
+              <p className="text-[11px] text-gray-500 truncate">{t('inbox.description')} <span className="font-mono">({terminalId})</span></p>
             </div>
           </div>
           <div className="flex shrink-0 items-center gap-1">
-            <button onClick={toggleFullscreen} className="min-w-11 min-h-11 inline-flex items-center justify-center rounded-lg text-gray-400 transition-colors hover:bg-gray-800 hover:text-white" title={fullscreen ? 'Exit fullscreen' : 'Fullscreen'} aria-label={fullscreen ? 'Exit fullscreen' : 'Fullscreen'} aria-pressed={fullscreen}>
+            <button onClick={toggleFullscreen} className="min-w-11 min-h-11 inline-flex items-center justify-center rounded-lg text-gray-400 transition-colors hover:bg-gray-800 hover:text-white" title={fullscreen ? t('common.exitFullscreen') : t('common.fullscreen')} aria-label={fullscreen ? t('common.exitFullscreen') : t('common.fullscreen')} aria-pressed={fullscreen}>
               {fullscreen ? <Minimize2 size={17} /> : <Maximize2 size={17} />}
             </button>
             <button
               onClick={onClose}
               className="min-w-11 min-h-11 inline-flex items-center justify-center text-gray-500 hover:text-white transition-colors rounded-lg hover:bg-gray-800"
-              title="Close"
+              title={t('common.close')}
             >
               <X size={16} />
             </button>
@@ -267,7 +283,7 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
                     : 'bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700'
                 }`}
               >
-                {f.label}
+                {t(f.labelKey)}
               </button>
             ))}
           </div>
@@ -275,16 +291,16 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
 
         {resultHistory.length > 0 && (
           <div className="px-5 py-2 border-b border-gray-700/30 shrink-0">
-            <p className="text-[10px] uppercase tracking-wide text-gray-500 mb-1">Result History</p>
+            <p className="text-[10px] uppercase tracking-wide text-gray-500 mb-1">{t('inbox.resultHistory')}</p>
             <div className="flex gap-2 overflow-x-auto">
               {resultHistory.slice(0, 6).map(result => (
                 <button
                   key={result.id}
                   onClick={() => api.getDelegationResult(result.id).then(value => navigator.clipboard?.writeText(JSON.stringify(value, null, 2)))}
                   className="shrink-0 rounded border border-sky-800/60 bg-sky-950/20 px-2 py-1 text-[10px] text-sky-300 hover:text-sky-100"
-                  title="Copy authoritative durable result JSON"
+                  title={t('inbox.copyResult')}
                 >
-                  {resultLifecycleLabel(result.status, result.delivery_status)} · {result.id.slice(0, 8)}
+                  {t(resultLifecycleKey(result.status, result.delivery_status))} · {result.id.slice(0, 8)}
                 </button>
               ))}
             </div>
@@ -294,12 +310,12 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
         {/* Messages */}
         <div ref={messagesRef} data-testid="inbox-message-list" onScroll={() => { const node = messagesRef.current; if (node) pinnedToBottomRef.current = node.scrollHeight - node.scrollTop - node.clientHeight < 24 }} className={`flex-1 overflow-y-auto px-4 sm:px-5 py-4 min-h-[200px] ${loading && messages.length === 0 ? 'flex' : 'space-y-3'}`}>
           {loading && messages.length === 0 ? (
-            <ModalLoadingBody label="Loading inbox messages" />
+            <ModalLoadingBody label={t('inbox.loading')} />
           ) : messages.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-12 text-gray-500">
               <Mail size={32} className="mb-3 opacity-40" />
-              <p className="text-sm">No messages yet</p>
-              <p className="text-xs text-gray-600 mt-1">Messages appear here when agents communicate via handoff, assign, or send_message. You can also send a message manually below.</p>
+              <p className="text-sm">{t('inbox.empty')}</p>
+              <p className="text-xs text-gray-600 mt-1">{t('inbox.emptyHelp')}</p>
             </div>
           ) : (
             messages.map(msg => {
@@ -321,32 +337,32 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
                         {incoming ? msg.sender_id.slice(0, 8) : msg.receiver_id.slice(0, 8)}
                       </span>
                       <MessageStatusBadge status={msg.status} />
-                      {msg.result_id && <span className="text-[10px] text-sky-400">Result</span>}
-                      {msg.superseded_at && <span className="text-[10px] text-gray-500">authoritative</span>}
+                      {msg.result_id && <span className="text-[10px] text-sky-400">{t('inbox.result')}</span>}
+                      {msg.superseded_at && <span className="text-[10px] text-gray-500">{t('inbox.authoritative')}</span>}
                     </div>
                     {msg.result_id ? (
                       <button
                         onClick={() => void toggleResult(msg.result_id!)}
                         className="text-sm text-sky-300 hover:text-sky-200 underline"
-                        title="Copy authoritative structured result JSON"
+                        title={t('inbox.copyStructured')}
                       >
-                        Open durable result {msg.result_id.slice(0, 8)}
+                        {t('inbox.openResult', { id: msg.result_id.slice(0, 8) })}
                       </button>
                     ) : <OwnerMessageBody message={msg.message} />}
                     {msg.result_id && expandedResults[msg.result_id] && (
                       <div className="mt-3 border-t border-sky-800/40 pt-3 text-sm text-gray-200">
-                        {resultLoading[msg.result_id] && <p className="text-xs text-gray-400">Loading durable result…</p>}
-                        {resultErrors[msg.result_id] && <p className="text-xs text-red-300">Unable to load durable result.</p>}
+                        {resultLoading[msg.result_id] && <p className="text-xs text-gray-400">{t('inbox.loadingResult')}</p>}
+                        {resultErrors[msg.result_id] && <p className="text-xs text-red-300">{t('inbox.resultLoadFailed')}</p>}
                         {resultCache[msg.result_id] && <>
-                          <p className="mb-2 text-[10px] font-mono text-sky-300">{resultCache[msg.result_id].id} · {resultLifecycleLabel(resultCache[msg.result_id].status, resultCache[msg.result_id].delivery_status)}</p>
+                          <p className="mb-2 text-[10px] font-mono text-sky-300">{resultCache[msg.result_id].id} · {t(resultLifecycleKey(resultCache[msg.result_id].status, resultCache[msg.result_id].delivery_status))}</p>
                           {resultCache[msg.result_id].document?.summary && <p className="mb-2 font-medium">{resultCache[msg.result_id].document?.summary}</p>}
-                          <div className="whitespace-pre-wrap break-words text-gray-300">{resultCache[msg.result_id].document?.body_markdown || 'No result body available.'}</div>
+                          <div className="whitespace-pre-wrap break-words text-gray-300">{resultCache[msg.result_id].document?.body_markdown || t('inbox.noResultBody')}</div>
                         </>}
-                        <button onClick={() => setExpandedResults(current => ({ ...current, [msg.result_id!]: false }))} className="mt-3 text-xs text-sky-300 hover:text-sky-100">Hide text</button>
+                        <button onClick={() => setExpandedResults(current => ({ ...current, [msg.result_id!]: false }))} className="mt-3 text-xs text-sky-300 hover:text-sky-100">{t('inbox.hideText')}</button>
                       </div>
                     )}
                     {msg.created_at && (
-                      <p className="text-[10px] text-gray-600 mt-1">{formatRelativeTime(msg.created_at)}</p>
+                      <p className="text-[10px] text-gray-600 mt-1">{formatRelativeTime(msg.created_at, locale)}</p>
                     )}
                   </div>
                 </div>
@@ -361,22 +377,22 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
           <div className="flex flex-col gap-2">
             <textarea
               ref={inputRef}
-              aria-label="Inbox draft"
+              aria-label={t('inbox.draft')}
               value={draft}
               onChange={e => setDraft(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="Write a message for this terminal…"
+              placeholder={t('inbox.placeholder')}
               className="min-h-20 w-full resize-y bg-gray-800 border border-gray-700 text-gray-200 text-sm rounded-lg px-3 py-2.5 focus:border-emerald-500 focus:outline-none placeholder-gray-600"
             />
             <div className="flex items-center justify-between gap-3">
-              <span className="text-xs text-gray-500">Enter for newline · Ctrl/Cmd+Enter to send</span>
+              <span className="text-xs text-gray-500">{t('inbox.keyboardHint')}</span>
               <button
                 onClick={handleSend}
                 disabled={!draft.trim() || sending}
                 className="min-h-11 justify-center flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-sm font-medium px-4 py-2.5 rounded-lg transition-colors"
               >
                 {sending ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
-                Send
+                {t('inbox.send')}
               </button>
             </div>
           </div>

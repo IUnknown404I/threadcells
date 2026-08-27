@@ -8,6 +8,8 @@ import { BookOpen, CheckCircle, ExternalLink, Github, Info, Wifi, WifiOff, XCirc
 import { applyAgentFilterState, homeAgentFilterState } from './agentFilters'
 import { NAVIGATION_ITEMS, PrimaryNavigation, type TabKey } from './components/PrimaryNavigation'
 import { useUiOverview } from './uiReadModels'
+import { appLocales, useI18n } from './i18n'
+import { LanguageSelector } from './components/LanguageSelector'
 
 const AgentPanel = lazy(() => import('./components/AgentPanel').then(module => ({ default: module.AgentPanel })))
 const FlowsPanel = lazy(() => import('./components/FlowsPanel').then(module => ({ default: module.FlowsPanel })))
@@ -52,6 +54,7 @@ function Snackbar() {
 }
 
 export default function App() {
+  const { locale, setLocale, t, tp } = useI18n()
   const readTab = (): TabKey => {
     if (window.location.pathname === '/docs' || window.location.pathname.startsWith('/docs/')) return 'docs'
     if (window.location.pathname === '/settings' || window.location.pathname.startsWith('/settings/')) return 'settings'
@@ -176,16 +179,23 @@ export default function App() {
               <p className="hidden text-[10px] uppercase tracking-[0.18em] text-emerald-400 sm:block">{branding.subtitle}</p>
             </div>
           </div>
-          <div className="flex items-center gap-3 shrink-0">
-            <span className="hidden sm:inline text-xs text-gray-500">{sessionCount} session{sessionCount !== 1 ? 's' : ''}</span>
-            <div className="flex items-center gap-1.5" title={connected ? 'Connected' : 'Disconnected'}>
+          <div className="flex items-center gap-2 sm:gap-3 shrink-0">
+            <LanguageSelector
+              locale={locale}
+              label={t('language')}
+              options={appLocales.map(code => ({ code, short: code.toUpperCase(), name: code === 'en' ? t('language.english') : t('language.russian'), htmlLang: code }))}
+              onSelect={setLocale}
+              className="language-menu app-language-menu"
+            />
+            <span className="hidden sm:inline text-xs text-gray-500">{tp('sessions', sessionCount)}</span>
+            <div className="flex items-center gap-1.5" title={connected ? t('connection.connected') : t('connection.disconnected')}>
               {connected ? (
                 <Wifi size={14} className="text-emerald-400" />
               ) : (
                 <WifiOff size={14} className="text-red-400" />
               )}
               <span className={`text-xs ${connected ? 'text-emerald-400' : 'text-red-400'}`}>
-                {connected ? 'Live' : 'Offline'}
+                {connected ? t('connection.live') : t('connection.offline')}
               </span>
             </div>
           </div>
@@ -202,7 +212,7 @@ export default function App() {
       {/* Content */}
       <main className="mx-auto w-full max-w-7xl min-w-0 flex-1 px-4 py-4 sm:px-6 sm:py-6">
         <ErrorBoundary>
-          <Suspense fallback={<div className="text-gray-500 text-sm py-12 text-center">Loading...</div>}>
+          <Suspense fallback={<div className="text-gray-500 text-sm py-12 text-center">{t('common.loading')}</div>}>
             {tab === 'home' && <DashboardHome onNavigate={navigateHome} overviewState={overviewState} />}
             {tab === 'agents' && <AgentPanel navigationSearch={navigationSearch} navigationIntent={agentIntent} onNavigationIntentConsumed={() => setAgentIntent(null)} />}
             {tab === 'flows' && <FlowsPanel />}
@@ -218,13 +228,13 @@ export default function App() {
           <div className="flex min-w-0 flex-col items-center gap-2 sm:flex-row sm:items-center sm:gap-4">
             <img src="/threadcells-logo-horizontal.png" alt="ThreadCells" className="h-24 w-auto max-w-[20rem] shrink-0 rounded-md object-contain" />
             <div className="min-w-0">
-              <p className="text-sm text-gray-200">Contributions are welcome.</p>
+              <p className="text-sm text-gray-200">{t('footer.contributions')}</p>
               <p className="mt-1 text-blue-200/60">© 2026 ThreadCells</p>
             </div>
           </div>
-          <nav aria-label="Product links" className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-blue-100/70">
+          <nav aria-label={t('footer.productLinks')} className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-blue-100/70">
             <a href={PRODUCT_LINKS.github} target="_blank" rel="noreferrer" className="inline-flex min-h-9 items-center gap-1.5 hover:text-emerald-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"><Github size={14} aria-hidden="true" /> GitHub</a>
-            <a href="/docs" className="inline-flex min-h-9 items-center gap-1.5 hover:text-emerald-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"><BookOpen size={14} aria-hidden="true" /> Docs</a>
+            <a href="/docs" className="inline-flex min-h-9 items-center gap-1.5 hover:text-emerald-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"><BookOpen size={14} aria-hidden="true" /> {t('nav.docs')}</a>
             <span aria-hidden="true" className="inline-flex h-9 items-center text-blue-200/40">·</span>
             <a href={PRODUCT_LINKS.landing} target="_blank" rel="noreferrer" className="inline-flex min-h-9 items-center gap-1 hover:text-emerald-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">ThreadCells <ExternalLink size={13} aria-hidden="true" /></a>
           </nav>

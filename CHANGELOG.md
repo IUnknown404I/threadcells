@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0-alpha.3] - 2026-08-26
+
+### Added
+
+- Localize the authenticated Web UI in English and opt-in Russian with one typed catalog, safe English fallback, Russian plural rules, and a shared global language selector.
+- Render authenticated English and Russian Docs from the same manifest-governed Markdown corpus used by the seven-locale public site.
+
+### Changed
+
+- Normalize localized Docs and README authorities under locale-owned `docs/<locale>/` trees while keeping root `README.md` and manifest sources canonical English.
+- Localize first-party navigation, settings, Housekeeping, Inbox chrome, workflow statuses, and product-safe errors without changing API values, reason codes, IDs, prompts, provider output, or durable user/result content.
+
+### Safety
+
+- Keep English as the deterministic default without browser-language detection; changing locale remains a presentation-only browser preference with no backend, workflow, provider, or runtime side effect.
+
 ## [0.3.0-alpha.2] - 2026-08-26
 
 ### Fixed

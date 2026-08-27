@@ -14,7 +14,7 @@ source_sha256: sha256:8af71318e4b64c3ee6a880b961cee787de1c6ddc2c2609ba67e358c045
 - **Документация:** используйте [форму сообщения о документации](https://github.com/IUnknown404I/threadcells/issues/new?template=docs.yml) для отсутствующих, устаревших или неясных публичных руководств.
 - **Вопросы и устранение неполадок:** ознакомьтесь с [документацией](https://iunknown404i.github.io/threadcells/docs/) и [Устранением неполадок](docs/TROUBLESHOOTING.md), затем задайте вопрос в [Discussions Q&A](https://github.com/IUnknown404I/threadcells/discussions/categories/q-a).
 - **Ранние идеи:** начните с проблемы или сценария использования в [Discussions Ideas](https://github.com/IUnknown404I/threadcells/discussions/categories/ideas). Переносите идею в Issue только когда результат стал конкретным и применимым в рамках политики Issue.
-- **Настройки и сценарии использования:** делитесь workflows, интеграциями, снимками экрана и опытом в [Show and tell](https://github.com/IUnknown404I/threadcells/discussions/categories/show-and-tell).
+- **Настройки и сценарии использования:** делитесь рабочими процессами, интеграциями, снимками экрана и опытом в [Show and tell](https://github.com/IUnknown404I/threadcells/discussions/categories/show-and-tell).
 - **Безопасность:** не открывайте публичный Issue. Следуйте [SECURITY.md](SECURITY.md) и сообщайте о проблеме конфиденциально.
 
 Перед началом новой темы или отчёта найдите существующие [Discussions](https://github.com/IUnknown404I/threadcells/discussions) либо открытые и закрытые [Issues](https://github.com/IUnknown404I/threadcells/issues). Подробные правила приемлемости Issue, свидетельств, триажа и раскрытия приведены в канонической [политике Issue](docs/ISSUES.md).

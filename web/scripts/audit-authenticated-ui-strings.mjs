@@ -4,6 +4,7 @@ import path from 'node:path'
 import ts from 'typescript'
 
 const sourceRoot = path.resolve('src')
+const repositoryRoot = path.resolve('..')
 const files = []
 
 async function collect(directory) {
@@ -29,6 +30,7 @@ const allowed = new Map([
 const visibleAttributes = new Set(['alt', 'aria-label', 'label', 'placeholder', 'title'])
 const survivors = []
 const violations = []
+const russianOperatorTerms = /\b(?:Housekeeping|Workflows?|Ready|Exited|Providers?|Heavy|Work|turn)\b/i
 
 for (const absoluteFile of files) {
   const relativeFile = path.relative(process.cwd(), absoluteFile)
@@ -48,9 +50,56 @@ for (const absoluteFile of files) {
   inspect(ast)
 }
 
+const catalogPath = path.join(sourceRoot, 'i18n', 'catalogs.ts')
+const catalogSource = await readFile(catalogPath, 'utf8')
+const catalogAst = ts.createSourceFile(catalogPath, catalogSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+let russianCatalog = null
+for (const statement of catalogAst.statements) {
+  if (!ts.isVariableStatement(statement)) continue
+  for (const declaration of statement.declarationList.declarations) {
+    if (declaration.name.getText(catalogAst) === 'ru' && declaration.initializer && ts.isObjectLiteralExpression(declaration.initializer)) {
+      russianCatalog = declaration.initializer
+    }
+  }
+}
+assert.ok(russianCatalog, 'Russian catalog object was not found')
+const russianCatalogViolations = []
+for (const property of russianCatalog.properties) {
+  if (!ts.isPropertyAssignment(property)) continue
+  const value = property.initializer
+  const visibleValue = (ts.isStringLiteral(value) || ts.isNoSubstitutionTemplateLiteral(value))
+    ? value.text.replace(/\{[^}]+\}/g, '')
+    : ''
+  if (russianOperatorTerms.test(visibleValue)) {
+    russianCatalogViolations.push({ key: property.name.getText(catalogAst), value: value.text })
+  }
+}
+
+function markdownProse(value) {
+  return value
+    .replace(/^---\n[\s\S]*?\n---\n/, '')
+    .replace(/^(?:```|~~~)[\s\S]*?^(?:```|~~~)[^\n]*$/gm, '')
+    .replace(/`[^`\n]*`/g, '')
+    .replace(/\]\([^)]+\)/g, ']')
+}
+
+const russianDocsDirectory = path.join(repositoryRoot, 'docs', 'ru')
+const russianDocsViolations = []
+for (const name of (await readdir(russianDocsDirectory)).filter(name => name.endsWith('.md')).sort()) {
+  const relativeFile = path.posix.join('docs', 'ru', name)
+  const lines = markdownProse(await readFile(path.join(russianDocsDirectory, name), 'utf8')).split('\n')
+  lines.forEach((line, index) => {
+    const matches = [...line.matchAll(new RegExp(russianOperatorTerms.source, 'gi'))].map(match => match[0])
+    if (matches.length) russianDocsViolations.push({ file: relativeFile, line: index + 1, terms: matches, value: line.trim() })
+  })
+}
+
 assert.deepEqual(violations, [], `Unlocalized authenticated UI strings:\n${JSON.stringify(violations, null, 2)}`)
+assert.deepEqual(russianCatalogViolations, [], `English operator terms in Russian catalog:\n${JSON.stringify(russianCatalogViolations, null, 2)}`)
+assert.deepEqual(russianDocsViolations, [], `English operator terms in Russian Markdown prose:\n${JSON.stringify(russianDocsViolations, null, 2)}`)
 console.log(JSON.stringify({
   files: files.length,
+  russianDocs: (await readdir(russianDocsDirectory)).filter(name => name.endsWith('.md')).length,
   intentionalSurvivors: survivors,
   categories: ['product and organization names', 'contributor attribution', 'external labels', 'literal commands'],
 }))

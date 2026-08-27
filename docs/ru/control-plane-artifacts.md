@@ -3,13 +3,13 @@ slug: control-plane-artifacts
 source: docs/CONTROL_PLANE_ARTIFACTS.md
 source_sha256: sha256:bbb3ff2ed634050407d78c0fff79f097ecc2c8f29b783d422a52469c624fd8b7
 ---
-# Артефакты control plane и AI workflow
+# Артефакты control plane и рабочие процессы с AI
 
 ThreadCells публикует документы JSON Schema Draft 2020-12 для ProfileDefinition V1, ProviderConfiguration V1, AdapterManifest V1 и AdapterCapabilities V1 в `schemas/v1` локального кандидата и в `cli_agent_orchestrator/public_schemas/v1` колеса.
 
 Используйте `threadcells profiles schema|example` или `threadcells providers schema|example`, чтобы получить исходный документ. Проверяйте его до импорта. Ошибки полей представляются устойчивыми записями JSON-pointer, а не отображёнными необработанными значениями. Импорт через UI, CLI и API вызывает один и тот же сервис и создаёт неизменяемые ревизии.
 
-## Workflow артефактов с помощью AI
+## Создание артефактов с помощью AI
 
 1. Получите подходящие schema, пример и безопасный prompt для генерации из `/api/v1/profiles/ai-prompt` или `/api/v1/providers/ai-prompt`.
 2. Попросите модель вернуть только один объект JSON. Не передавайте учётные данные, приватные пути, исполняемые команды, флаги оболочки или непроверенные MCP-команды.

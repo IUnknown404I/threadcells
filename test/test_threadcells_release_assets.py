@@ -12,6 +12,8 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
+import pytest
+
 try:
     import tomllib
 except ModuleNotFoundError:  # Python 3.10 compatibility
@@ -530,13 +532,52 @@ def test_candidate_verifier_rejects_tampered_brand_checksum_file(tmp_path: Path)
 
 def test_candidate_verifier_rejects_tampered_russian_document(tmp_path: Path) -> None:
     candidate = _valid_verification_candidate(tmp_path)
-    (candidate / "docs" / "ru" / "candidate.md").write_text(
-        "# Повреждённый перевод\n", encoding="utf-8"
+    translation = candidate / "docs" / "ru" / "candidate.md"
+    translation.write_text(
+        translation.read_text(encoding="utf-8").replace(
+            "# Локализованный кандидат", "# Повреждённый перевод"
+        ),
+        encoding="utf-8",
     )
 
     errors = _candidate_verifier_module().verify(candidate)
 
     assert "packaged Russian documentation content mismatch: candidate" in errors
+
+
+@pytest.mark.parametrize(
+    "front_matter",
+    [
+        "slug: forged\nsource: README.md\nsource_sha256: sha256:{digest}",
+        "slug: candidate\nsource: OTHER.md\nsource_sha256: sha256:{digest}",
+        "slug: candidate\nsource: README.md\nsource_sha256: sha256:{zeros}",
+        "slug: candidate\nslug: duplicate\nsource: README.md\nsource_sha256: sha256:{digest}",
+        "slug: candidate\nsource: README.md\nsource_sha256: sha256:{digest}\nextra: value",
+    ],
+)
+def test_candidate_verifier_rejects_forged_russian_metadata(
+    tmp_path: Path, front_matter: str
+) -> None:
+    candidate = _valid_verification_candidate(tmp_path)
+    canonical_digest = hashlib.sha256((candidate / "README.md").read_bytes()).hexdigest()
+    translation = candidate / "docs" / "ru" / "candidate.md"
+    translation.write_text(
+        "---\n"
+        + front_matter.format(digest=canonical_digest, zeros="0" * 64)
+        + "\n---\n# Локализованный кандидат\n",
+        encoding="utf-8",
+    )
+    _candidate_builder_module().write_metadata(
+        candidate,
+        revision="a" * 40,
+        version="0.1.0",
+        components=[{"type": "application", "name": "threadcells", "version": "0.1.0"}],
+        node_licenses={},
+    )
+
+    errors = _candidate_verifier_module().verify(candidate)
+
+    assert "packaged Russian documentation metadata mismatch: candidate" in errors
 
 
 def test_dependency_owner_packet_is_deterministic_and_non_clearance(tmp_path: Path) -> None:

@@ -7,7 +7,7 @@ source_sha256: sha256:1b3bda3574765fd4b540f7460e14a1677a3d3dd58be8bf9d07f5fba0c5
 
 Это расширенное руководство для сопровождающих, добавляющих доверенную интеграцию провайдера. Операторам, выбирающим встроенных провайдеров, следует начать с [Провайдеров](PROVIDERS.md).
 
-ThreadCells Provider Adapter API V1 — граница расширения доверенного кода, отличная от observer plugins. Устанавливайте адаптеры как проверенные Python-пакеты, которые регистрируют объекты `ProviderAdapterDefinition` в группе entry point `threadcells.provider_adapters.v1`. После установки перезапустите локальный candidate/runtime, чтобы entry point были обнаружены заново.
+ThreadCells Провайдер Adapter API V1 — граница расширения доверенного кода, отличная от observer plugins. Устанавливайте адаптеры как проверенные Python-пакеты, которые регистрируют объекты `ProviderAdapterDefinition` в группе entry point `threadcells.provider_adapters.v1`. После установки перезапустите локальный candidate/runtime, чтобы entry point были обнаружены заново.
 
 ## Контракт
 

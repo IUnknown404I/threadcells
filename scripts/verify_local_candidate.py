@@ -200,13 +200,11 @@ def verify(candidate: Path) -> list[str]:
     source_paths = {item["source"] for item in docs_manifest.get("documents", [])}
     if not source_paths or any(not (candidate / source).is_file() for source in source_paths):
         errors.append("candidate is missing an allowlisted documentation source")
-    schema = docs_bundle.get("schema", 1)
+    schema = docs_bundle.get("schema")
+    if schema != 2:
+        errors.append("unsupported packaged documentation bundle schema")
     locales = docs_bundle.get("locales", {}) if schema == 2 else {}
-    bundled_documents = (
-        (locales.get("en", []) if isinstance(locales, dict) else [])
-        if schema == 2
-        else docs_bundle.get("documents", [])
-    )
+    bundled_documents = locales.get("en", []) if schema == 2 and isinstance(locales, dict) else []
     if not isinstance(bundled_documents, list):
         errors.append("packaged documentation bundle is malformed")
         bundled_documents = []

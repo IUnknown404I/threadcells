@@ -580,6 +580,30 @@ def test_candidate_verifier_rejects_forged_russian_metadata(
     assert "packaged Russian documentation metadata mismatch: candidate" in errors
 
 
+@pytest.mark.parametrize("unsupported_schema", [1, 3])
+def test_candidate_verifier_rejects_unsupported_docs_bundle_schema(
+    tmp_path: Path, unsupported_schema: int
+) -> None:
+    candidate = _valid_verification_candidate(tmp_path)
+    bundle_path = candidate / "web" / "public" / "docs-bundle.json"
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    bundle["schema"] = unsupported_schema
+    bundle["documents"] = bundle["locales"]["en"]
+    bundle.pop("locales")
+    bundle_path.write_text(json.dumps(bundle) + "\n", encoding="utf-8")
+    _candidate_builder_module().write_metadata(
+        candidate,
+        revision="a" * 40,
+        version="0.1.0",
+        components=[{"type": "application", "name": "threadcells", "version": "0.1.0"}],
+        node_licenses={},
+    )
+
+    errors = _candidate_verifier_module().verify(candidate)
+
+    assert "unsupported packaged documentation bundle schema" in errors
+
+
 def test_dependency_owner_packet_is_deterministic_and_non_clearance(tmp_path: Path) -> None:
     candidate = _candidate_with_pyproject(
         tmp_path, '[project]\nname = "test"\ndependencies = ["example>=1"]\n'

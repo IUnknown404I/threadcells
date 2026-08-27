@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0-alpha.3] - 2026-08-26
+## [0.3.3-alpha] - 2026-08-27
 
 ### Added
 
@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Adopt semantic-version alpha releases such as `v0.3.3-alpha`, with the build-tooling equivalent `0.3.3a0`, instead of incrementing a numeric suffix after `alpha`.
 - Normalize localized Docs and README authorities under locale-owned `docs/<locale>/` trees while keeping root `README.md` and manifest sources canonical English.
 - Localize first-party navigation, settings, Housekeeping, Inbox chrome, workflow statuses, and product-safe errors without changing API values, reason codes, IDs, prompts, provider output, or durable user/result content.
 

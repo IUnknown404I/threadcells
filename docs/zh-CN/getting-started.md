@@ -1,7 +1,7 @@
 ---
 slug: getting-started
 source: QUICK_SETUP.md
-source_sha256: sha256:78db799819c59fb095bd3d94baf70231351df948c7841832e9456449e40bd69e
+source_sha256: sha256:a50fbb421c1933e4880f7cfd918bcef30466fdaa91cead7de958fc274887a9c9
 ---
 # ThreadCells 快速设置
 
@@ -27,7 +27,7 @@ npm --version
 
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
-candidate="$PWD/threadcells-candidate/threadcells-0.3.0a3-local"
+candidate="$PWD/threadcells-candidate/threadcells-0.3.3a0-local"
 python3 scripts/verify_local_candidate.py --candidate "$candidate"
 ```
 

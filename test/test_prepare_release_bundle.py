@@ -59,22 +59,22 @@ def directory_digests(path: Path) -> dict[str, str]:
 
 
 def test_prepare_release_bundle_is_deterministic_and_self_describing(tmp_path: Path) -> None:
-    candidate, archive = write_candidate(tmp_path)
+    candidate, archive = write_candidate(tmp_path, version="0.3.3a0")
     first = tmp_path / "first"
     second = tmp_path / "second"
 
-    metadata = prepare(candidate, archive, "v0.2.0-alpha.1", "a" * 40, first)
-    prepare(candidate, archive, "v0.2.0-alpha.1", "a" * 40, second)
+    metadata = prepare(candidate, archive, "v0.3.3-alpha", "a" * 40, first)
+    prepare(candidate, archive, "v0.3.3-alpha", "a" * 40, second)
 
     assert directory_digests(first) == directory_digests(second)
     assert metadata["source_revision"] == "a" * 40
-    assert metadata["version"] == "0.2.0a1"
+    assert metadata["version"] == "0.3.3a0"
     assert metadata["distribution_only"] is True
     assert metadata["runtime_container_image"] is False
     assert {item["name"] for item in metadata["artifacts"]} == {
         archive.name,
         f"{archive.name}.sha256",
-        "threadcells-0.2.0a1-py3-none-any.whl",
+        "threadcells-0.3.3a0-py3-none-any.whl",
         "SHA256SUMS",
         "candidate-manifest.json",
         "sbom.cdx.json",
@@ -95,7 +95,7 @@ def test_prepare_release_bundle_is_deterministic_and_self_describing(tmp_path: P
 
 @pytest.mark.parametrize(
     ("release_tag", "version"),
-    (("v0.2.0-alpha.2", "0.2.0a1"), ("v0.2.0-alpha.1", "0.2.1a1")),
+    (("v0.3.3-alpha", "0.3.3a1"), ("v0.3.4-alpha", "0.3.3a0")),
 )
 def test_prepare_release_bundle_rejects_tag_version_mismatch(
     tmp_path: Path, release_tag: str, version: str
@@ -126,3 +126,29 @@ def test_expected_python_version_preserves_all_alpha_release_lines(
     release_tag: str, version: str
 ) -> None:
     assert expected_python_version(release_tag) == version
+
+
+@pytest.mark.parametrize(
+    ("release_tag", "version"),
+    (("v0.3.3-alpha", "0.3.3a0"), ("v0.3.4-alpha", "0.3.4a0")),
+)
+def test_expected_python_version_uses_semantic_release_with_alpha_stage(
+    release_tag: str, version: str
+) -> None:
+    assert expected_python_version(release_tag) == version
+
+
+@pytest.mark.parametrize("release_tag", ("v0.3.3-alpha.0", "v0.3-alpha", "0.3.3-alpha"))
+def test_expected_python_version_rejects_invalid_alpha_tags(release_tag: str) -> None:
+    with pytest.raises(ValueError, match="v0.X.Y-alpha"):
+        expected_python_version(release_tag)
+
+
+def test_publication_workflow_admits_semantic_alpha_release_events() -> None:
+    workflow = (
+        Path(__file__).resolve().parents[1] / ".github/workflows/publish-release-bundle.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "endsWith(github.event.release.tag_name, '-alpha')" in workflow
+    assert "contains(github.event.release.tag_name, '-alpha.')" in workflow
+    assert "s/-alpha$/a0/" in workflow

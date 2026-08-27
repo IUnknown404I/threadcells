@@ -4,9 +4,7 @@ import {
   renderLanguageSelector,
   type LanguageSelectorElementFactory,
   type LanguageSelectorProps,
-} from './LanguageSelectorCore'
-
-export type { LanguageOption } from './LanguageSelectorCore'
+} from '../../web/src/components/LanguageSelectorCore'
 
 const element: LanguageSelectorElementFactory<ReactElement> = (type, props, ...children) =>
   createElement(type, props, ...children)

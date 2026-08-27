@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   publish:
-    if: github.event_name == 'workflow_dispatch' || (startsWith(github.event.release.tag_name, 'v0.') && contains(github.event.release.tag_name, '-alpha.'))
+    if: github.event_name == 'workflow_dispatch' || (startsWith(github.event.release.tag_name, 'v0.') && (endsWith(github.event.release.tag_name, '-alpha') || contains(github.event.release.tag_name, '-alpha.')))
     runs-on: ubuntu-latest
     env:
       PACKAGE: ghcr.io/iunknown404i/threadcells-release-bundle
@@ -35,8 +35,9 @@ jobs:
           else
             release_tag="$INPUT_TAG"
           fi
-          if [[ ! "$release_tag" =~ ^v0\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha\.([1-9][0-9]*)$ ]]; then
-            echo "release tag must match v0.X.Y-alpha.N" >&2
+          if [[ ! "$release_tag" =~ ^v0\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha$ ]] &&
+             [[ ! "$release_tag" =~ ^v0\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-alpha\.([1-9][0-9]*)$ ]]; then
+            echo "release tag must match v0.X.Y-alpha" >&2
             exit 1
           fi
           release_state="$(gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,tagName)"
@@ -69,7 +70,11 @@ jobs:
           source_sha="$(git rev-parse "$RELEASE_TAG^{commit}")"
           test "$(git rev-parse HEAD)" = "$source_sha"
           version="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
-          expected="$(sed -E 's/^v//; s/-alpha\.([0-9]+)$/a\1/' <<<"$RELEASE_TAG")"
+          if [[ "$RELEASE_TAG" =~ -alpha$ ]]; then
+            expected="$(sed -E 's/^v//; s/-alpha$/a0/' <<<"$RELEASE_TAG")"
+          else
+            expected="$(sed -E 's/^v//; s/-alpha\.([0-9]+)$/a\1/' <<<"$RELEASE_TAG")"
+          fi
           test "$version" = "$expected"
           echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"

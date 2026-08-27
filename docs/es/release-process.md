@@ -1,7 +1,7 @@
 ---
 slug: release-process
 source: docs/RELEASE_PROCESS.md
-source_sha256: sha256:82961559c0645676fcec5126113c53f17492ccd1b7c0c7100552689b770353ae
+source_sha256: sha256:66966038765eab40e9e11f4cbd81cc126fc199a63e95390194c3d88dbdd598b6
 ---
 # Proceso de lanzamiento
 
@@ -26,18 +26,18 @@ Los lanzamientos alpha publicados y aprobados también cuentan con un artefacto 
 
 Este paquete es un conjunto de distribución, no una imagen Docker ni un entorno de despliegue en contenedor compatible. Tras verificar sus sumas de comprobación, use el proceso normal de instalación y despliegue de candidatos; no intente ejecutar el artefacto OCI como un servicio ThreadCells.
 
-`.github/workflows/publish-release-bundle.yml` publica tras un GitHub Release aprobado o mediante un envío explícito de backfill. Solo acepta etiquetas anotadas `v0.X.Y-alpha.N` con un prerelease existente que no sea borrador, reconstruye y verifica el código fuente exacto etiquetado, rechaza reemplazar una etiqueta de versión que no coincida y actualiza únicamente `latest-alpha`. ThreadCells no publica una etiqueta `latest` sin calificador durante la vista previa técnica.
+`.github/workflows/publish-release-bundle.yml` publica tras un GitHub Release aprobado o mediante un envío explícito de backfill. Acepta etiquetas anotadas `v0.X.Y-alpha` con un prerelease existente que no sea borrador, conserva compatibilidad con las etiquetas históricas e inmutables `v0.X.Y-alpha.N`, reconstruye y verifica el código fuente exacto etiquetado, rechaza reemplazar una etiqueta de versión que no coincida y actualiza únicamente `latest-alpha`. ThreadCells no publica una etiqueta `latest` sin calificador durante la vista previa técnica.
 
 ## Convención de la línea de versiones
 
-ThreadCells sigue el orden normal de prerelease de SemVer. Durante la vista previa alpha, `0.1.X` identifica una iteración significativa de producto, fiabilidad o documentación; `alpha.N` identifica publicaciones adicionales dentro de esa misma iteración cuando son realmente necesarias.
+ThreadCells sigue el orden normal de prerelease de SemVer. Durante la vista previa alpha, cada nueva publicación avanza la versión semántica normal y mantiene `alpha` como etapa de prerelease. El empaquetado de Python normaliza un alpha sin sufijo, como `v0.3.3-alpha`, a `0.3.3a0`.
 
 - `v0.1.0-alpha.1` fue el primer lanzamiento alpha público.
 - `v0.1.0-alpha.2` es una vista previa técnica publicada e inmutable.
 - `v0.2.0-alpha.1` es la línea de lanzamiento consolidada de multilingüismo y fiabilidad.
 - `v0.3.0-alpha.1` añade coherencia de ciclo de vida, orden de creación duradero, Full Cleanup y una política de enrutamiento sistémica.
 - `v0.3.0-alpha.2` corrige la entrega de Workflow Composer y hace definitivo el cierre del terminal para la autoridad de flujo ejecutable.
-- `v0.3.0-alpha.3` añade localización en inglés y ruso a la interfaz autenticada y un único corpus canónico de Docs por idioma para la aplicación y el sitio público.
-- Una publicación posterior en la misma línea de lanzamiento incrementa solo la secuencia alpha; un nuevo contorno de producto incrementa deliberadamente la versión semántica.
+- `v0.3.3-alpha` añade localización en inglés y ruso a la interfaz autenticada y un único corpus canónico de Docs por idioma para la aplicación y el sitio público.
+- Una publicación alpha posterior incrementa deliberadamente la versión semántica y mantiene la etapa `alpha` sin sufijo numérico.
 
 Nunca mueva una etiqueta existente. Los cambios de gobierno del repositorio por sí solos no desencadenan un aumento de versión ni un lanzamiento. Actualice todas las superficies canónicas que contienen versiones de forma conjunta solo cuando el siguiente contorno de implementación significativo esté listo para publicarse.

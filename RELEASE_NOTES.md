@@ -1,6 +1,8 @@
-# ThreadCells v0.3.0-alpha.3
+# ThreadCells v0.3.3-alpha
 
-ThreadCells `v0.3.0-alpha.3` adds English and opt-in Russian localization to the authenticated Web UI and makes the public site and authenticated Docs consume one canonical, manifest-governed Markdown corpus. It remains an alpha technical preview for trusted operators on Linux hosts.
+ThreadCells `v0.3.3-alpha` adds English and opt-in Russian localization to the authenticated Web UI and makes the public site and authenticated Docs consume one canonical, manifest-governed Markdown corpus. It remains an alpha technical preview for trusted operators on Linux hosts.
+
+This release adopts the forward alpha version convention: each alpha publication advances the normal semantic version and keeps `alpha` as the prerelease stage. Python packaging normalizes the canonical public version `v0.3.3-alpha` to `0.3.3a0`. Previously published tags remain immutable.
 
 ## What changed
 
@@ -17,7 +19,7 @@ ThreadCells `v0.3.0-alpha.3` adds English and opt-in Russian localization to the
 
 For a new installation, follow [Quick Setup](QUICK_SETUP.md). Existing operators should follow [Upgrading](docs/UPGRADING.md): verify the exact tagged candidate, create and integrity-check a SQLite backup, preserve rollback during deployment acceptance, and activate only after health and workflow checks pass.
 
-The OCI artifact at `ghcr.io/iunknown404i/threadcells-release-bundle:v0.3.0-alpha.3` is a distribution bundle, not a Docker runtime image. Verify `BUNDLE-SHA256SUMS` and the archive checksum before using its contents. The established `latest-alpha` convenience tag may move to this release; no unqualified stable `latest` tag is published.
+The OCI artifact at `ghcr.io/iunknown404i/threadcells-release-bundle:v0.3.3-alpha` is a distribution bundle, not a Docker runtime image. Verify `BUNDLE-SHA256SUMS` and the archive checksum before using its contents. The established `latest-alpha` convenience tag may move to this release; no unqualified stable `latest` tag is published.
 
 ## Compatibility and limitations
 

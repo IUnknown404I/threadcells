@@ -1,7 +1,7 @@
 ---
 slug: deployment
 source: docs/DEPLOYMENT.md
-source_sha256: sha256:c62f86a3da68342ecd221d2eca8e7b02aaa252083db448bfbc64b28fe7451bc4
+source_sha256: sha256:908a0c38b1619eac0ef2d1296b3f5d9fd619409fda6e11809564d2d3d8258d1e
 ---
 # Lokales Deployment
 
@@ -14,7 +14,7 @@ Erstellen Sie aus einem exakten sauberen Source-Commit und prüfen Sie den Kandi
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
 python3 scripts/verify_local_candidate.py \
-  --candidate "$PWD/threadcells-candidate/threadcells-0.3.0a3-local"
+  --candidate "$PWD/threadcells-candidate/threadcells-0.3.3a0-local"
 ```
 
 Der Kandidat soll Python-Code, paketierte Web-Assets, das erlaubte Docs-Bundle, Build-Identität, Prüfsummen und Release-Metadaten aus derselben Revision enthalten.

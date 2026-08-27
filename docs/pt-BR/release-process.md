@@ -1,7 +1,7 @@
 ---
 slug: release-process
 source: docs/RELEASE_PROCESS.md
-source_sha256: sha256:82961559c0645676fcec5126113c53f17492ccd1b7c0c7100552689b770353ae
+source_sha256: sha256:66966038765eab40e9e11f4cbd81cc126fc199a63e95390194c3d88dbdd598b6
 ---
 
 # Processo de lançamento
@@ -27,18 +27,18 @@ Os lançamentos alpha publicados aprovados também têm um artefato público de 
 
 Esse pacote é um bundle de distribuição, não uma imagem Docker nem um ambiente de implantação em contêiner compatível. Use o processo normal de instalação e implantação do candidato depois de verificar seus checksums; não tente executar o artefato OCI como um serviço ThreadCells.
 
-`.github/workflows/publish-release-bundle.yml` publica em um GitHub Release aprovado ou por um dispatch explícito de preenchimento retroativo. Ele aceita somente tags anotadas `v0.X.Y-alpha.N` com uma prerelease não rascunho existente, recompila e verifica a origem exata da tag, recusa substituir uma tag de versão incompatível e atualiza apenas `latest-alpha`. O ThreadCells não publica uma tag `latest` sem qualificação durante a prévia técnica.
+`.github/workflows/publish-release-bundle.yml` publica em um GitHub Release aprovado ou por um dispatch explícito de preenchimento retroativo. Ele aceita tags anotadas `v0.X.Y-alpha` com uma prerelease não rascunho existente, preserva a compatibilidade com tags históricas imutáveis `v0.X.Y-alpha.N`, recompila e verifica a origem exata da tag, recusa substituir uma tag de versão incompatível e atualiza apenas `latest-alpha`. O ThreadCells não publica uma tag `latest` sem qualificação durante a prévia técnica.
 
 ## Convenção de linhas de versão
 
-O ThreadCells segue a ordenação normal de prereleases do SemVer. Durante a prévia alpha, `0.1.X` identifica uma iteração significativa de produto, confiabilidade ou documentação; `alpha.N` identifica publicações adicionais dentro dessa mesma iteração quando elas são realmente necessárias.
+O ThreadCells segue a ordenação normal de prereleases do SemVer. Durante a prévia alpha, cada nova publicação avança a versão semântica normal e mantém `alpha` como estágio de prerelease. O empacotamento Python normaliza um alpha sem sufixo, como `v0.3.3-alpha`, para `0.3.3a0`.
 
 - `v0.1.0-alpha.1` foi o primeiro alpha público.
 - `v0.1.0-alpha.2` é uma prévia técnica publicada e imutável.
 - `v0.2.0-alpha.1` é a linha de lançamento consolidada de multilíngue e confiabilidade.
 - `v0.3.0-alpha.1` adiciona consistência de ciclo de vida, ordem de criação durável, Full Cleanup e política sistêmica de roteamento.
 - `v0.3.0-alpha.2` corrige a entrega do Workflow Composer e torna a saída do terminal definitiva para a autoridade de workflow executável.
-- `v0.3.0-alpha.3` adiciona localização em inglês e russo à interface autenticada e um único corpus canônico de Docs por idioma para o aplicativo e o site público.
-- Uma publicação posterior na mesma linha de lançamento incrementa apenas a sequência alpha; um novo contorno de produto incrementa deliberadamente a versão semântica.
+- `v0.3.3-alpha` adiciona localização em inglês e russo à interface autenticada e um único corpus canônico de Docs por idioma para o aplicativo e o site público.
+- Uma publicação alpha posterior incrementa deliberadamente a versão semântica e mantém o estágio `alpha` sem sufixo numérico.
 
 Nunca mova uma tag existente. Mudanças apenas de governança do repositório não acionam aumento de versão nem lançamento. Atualize todas as superfícies canônicas que carregam versão juntas somente quando o próximo contorno significativo de implementação estiver pronto para publicação.

@@ -9892,6 +9892,98 @@ def get_child_retirement_cleanup_intent(
 get_assigned_child_retirement_cleanup_intent = get_child_retirement_cleanup_intent
 
 
+def list_completed_assigned_child_retirement_candidates(
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """List acknowledged assigned children whose terminal lifecycle must converge.
+
+    This is a durable queue projection, not retirement authority.  The caller
+    must still claim and revalidate the exact relation immediately before any
+    provider-exit or worktree-cleanup boundary.
+    """
+    _ensure_child_assignment_schema()
+    _ensure_delegation_result_schema()
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        assignments = (
+            db.query(ChildAssignmentModel)
+            .filter(
+                ChildAssignmentModel.status == ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
+                ChildAssignmentModel.retirement_completed_at.is_(None),
+            )
+            .order_by(ChildAssignmentModel.updated_at, ChildAssignmentModel.id)
+            .all()
+        )
+        candidates: List[Dict[str, Any]] = []
+        for assignment in assignments:
+            terminal = db.query(TerminalModel).filter_by(id=assignment.child_terminal_id).first()
+            if terminal is None or terminal.runtime_lifecycle not in {
+                "running",
+                "exit_pending",
+                "exited",
+            }:
+                continue
+            if _completed_retirement_result(db, assignment, "assign") is None:
+                continue
+            workflow = _open_workflow(db, assignment.child_terminal_id, create=False)
+            if workflow is None or workflow.status != WORKFLOW_TERMINAL:
+                continue
+            if (
+                db.query(ChildAssignmentModel)
+                .filter(
+                    ChildAssignmentModel.parent_terminal_id == assignment.child_terminal_id,
+                    ChildAssignmentModel.status.in_(_active_child_assignment_statuses()),
+                )
+                .count()
+            ):
+                continue
+            candidates.append(
+                {
+                    "parent_terminal_id": assignment.parent_terminal_id,
+                    "child_terminal_id": assignment.child_terminal_id,
+                    "runtime_lifecycle": terminal.runtime_lifecycle,
+                    "exit_dispatch_reserved": (
+                        assignment.retirement_exit_dispatched_at is not None
+                    ),
+                }
+            )
+            if len(candidates) >= max(1, limit):
+                break
+        return candidates
+
+
+def release_undispatched_completed_child_retirement_claims_for_restart() -> int:
+    """Release only pre-exit claims owned by a prior API runtime.
+
+    Startup is the proof that the prior in-process reconciler can no longer
+    cross its next boundary.  A claim that reserved provider exit is never
+    released here because its external outcome must be observed, not replayed.
+    """
+    _ensure_child_assignment_schema()
+    now = datetime.now()
+    with SessionLocal() as db:
+        released = (
+            db.query(ChildAssignmentModel)
+            .filter(
+                ChildAssignmentModel.status == ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
+                ChildAssignmentModel.retirement_claim_token.is_not(None),
+                ChildAssignmentModel.retirement_exit_dispatched_at.is_(None),
+                ChildAssignmentModel.retirement_cleanup_completed_at.is_(None),
+            )
+            .update(
+                {
+                    ChildAssignmentModel.retirement_claim_token: None,
+                    ChildAssignmentModel.retirement_claimed_at: None,
+                    ChildAssignmentModel.updated_at: now,
+                },
+                synchronize_session=False,
+            )
+        )
+        if released:
+            db.commit()
+        return int(released)
+
+
 _HANDOFF_RETIREMENT_RESULT_STATUSES = (
     ChildAssignmentStatus.HANDOFF_DIRECT_RESULT_CLAIMED.value,
     ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value,

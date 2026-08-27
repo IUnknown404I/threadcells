@@ -34,13 +34,17 @@ from cli_agent_orchestrator.clients.database import (
     activate_workflow_turn_for_inbox,
     arm_handoff_continuations_for_restart,
     cancel_child_assignments_for_terminal,
+    claim_completed_assigned_child_retirement,
+    claim_completed_child_retirement,
     claim_handoff_result_batch_for_inbox,
     claim_workflow_turn,
+    complete_assigned_child_retirement,
     create_handoff_child_result_message,
     ensure_workflow_turn_for_inbox,
     fail_pending_closed_workflow_inbox_transport,
     get_child_assignment_result_child_id,
     get_child_assignment_result_id,
+    get_child_retirement_cleanup_intent,
     get_delegation_result,
     get_handoff_child_result_message,
     get_handoff_child_status,
@@ -48,11 +52,13 @@ from cli_agent_orchestrator.clients.database import (
     get_pending_handoff_child_terminal_ids,
     get_pending_messages,
     get_provider_execution_admission_queue,
+    get_terminal_metadata,
     get_workflow_status,
     get_workflow_turn_for_inbox,
     handoff_child_cleanup_acknowledged,
     handoff_child_cleanup_is_acknowledged,
     keep_managed_handoff_continuation_retryable,
+    list_completed_assigned_child_retirement_candidates,
     mark_child_assignment_result_delivered,
     mark_child_assignment_result_failed,
     mark_workflow_turn_sent,
@@ -62,10 +68,14 @@ from cli_agent_orchestrator.clients.database import (
     reconcile_exited_terminal_workflow_authorities,
     reconcile_owner_gated_workflow_successors,
     reconcile_superseded_workflow_turns_for_restart,
+    release_completed_assigned_child_retirement,
+    release_undispatched_completed_child_retirement_claims_for_restart,
     request_workflow_provider_reconnect,
     requeue_unacknowledged_child_assignment_results,
     requeue_unadmitted_workflow_turns_for_restart,
     requeue_workflow_turn,
+    reserve_completed_assigned_child_retirement_exit,
+    revalidate_completed_assigned_child_retirement,
     terminalize_missing_terminal_assignments_for_restart,
     update_message_status,
     update_pending_message_status,
@@ -402,6 +412,214 @@ def check_and_send_pending_messages(
     return reconcile_provider_execution_queue(registry, observe_open_workflows=False) > 0
 
 
+def _finish_completed_assigned_child_retirement(
+    parent_terminal_id: str,
+    child_terminal_id: str,
+    claim_token: str,
+) -> str:
+    """Finish one positively exited assigned child without losing its history."""
+    cleanup_state = get_child_retirement_cleanup_intent(child_terminal_id, claim_token)
+    if cleanup_state is None:
+        return "retirement_cleanup_intent_not_confirmed"
+    try:
+        terminal_service.cleanup_managed_worktree(cleanup_state["intent"])
+    except Exception as exc:
+        logger.warning(
+            "Completed assigned child %s exited but cleanup remains protected: %s",
+            child_terminal_id,
+            exc,
+        )
+        return "retirement_cleanup_not_confirmed"
+    if not complete_assigned_child_retirement(
+        child_terminal_id,
+        claim_token,
+        cleanup_state["intent"],
+    ):
+        return "retirement_cleanup_finalization_not_confirmed"
+    logger.info(
+        "Reconciled completed assigned child %s for parent %s",
+        child_terminal_id,
+        parent_terminal_id,
+    )
+    return "reconciled"
+
+
+def _reconcile_completed_assigned_child(candidate: dict[str, object]) -> str:
+    """Converge one acknowledged assigned child through the existing exit saga."""
+    parent_terminal_id = str(candidate["parent_terminal_id"])
+    child_terminal_id = str(candidate["child_terminal_id"])
+    try:
+        terminal = terminal_service.get_terminal(child_terminal_id)
+    except Exception as exc:
+        logger.debug(
+            "Completed assigned child %s is not yet observable: %s",
+            child_terminal_id,
+            exc,
+        )
+        return "terminal_unavailable"
+
+    lifecycle = terminal.get("lifecycle")
+    terminal_status = terminal.get("status")
+    if lifecycle == "exited":
+        fence = claim_completed_child_retirement(
+            parent_terminal_id,
+            child_terminal_id,
+            "assign",
+            require_exited_runtime=True,
+        )
+        if not fence.get("eligible"):
+            return str(fence.get("error") or "not_eligible")
+        if fence.get("already_retired"):
+            return "already_reconciled"
+        claim_token = fence.get("claim_token")
+        if not isinstance(claim_token, str) or not claim_token:
+            return "retirement_claim_not_confirmed"
+        return _finish_completed_assigned_child_retirement(
+            parent_terminal_id,
+            child_terminal_id,
+            claim_token,
+        )
+
+    # A reserved exit is an observation-only state.  Never send a second
+    # provider command; the ordinary runtime reconciler will make Exited
+    # durable once the first command settles.
+    if candidate.get("exit_dispatch_reserved"):
+        return "exit_dispatch_pending"
+    if lifecycle != "running" or terminal_status != TerminalStatus.COMPLETED.value:
+        return "provider_not_completed"
+
+    # Automatic retirement is narrower than a manual operator recovery: a
+    # dirty, changed, or unprovable managed worktree keeps its provider and
+    # capacity authority intact for explicit recovery.
+    metadata = get_terminal_metadata(child_terminal_id)
+    if metadata is None:
+        return "child_terminal_metadata_not_found"
+    try:
+        terminal_service.validate_managed_worktree_cleanup(metadata)
+    except Exception as exc:
+        logger.debug(
+            "Completed assigned child %s remains protected: %s",
+            child_terminal_id,
+            exc,
+        )
+        return str(exc) or "managed_worktree_cleanup_not_safe"
+
+    fence = claim_completed_assigned_child_retirement(
+        parent_terminal_id,
+        child_terminal_id,
+    )
+    if not fence.get("eligible"):
+        return str(fence.get("error") or "not_eligible")
+    if fence.get("already_retired"):
+        return "already_reconciled"
+    claim_token = fence.get("claim_token")
+    if not isinstance(claim_token, str) or not claim_token:
+        return "retirement_claim_not_confirmed"
+    if fence.get("exit_dispatch_reserved"):
+        return "exit_dispatch_pending"
+
+    # Re-observe every non-transactional predicate after the durable claim.
+    # The claim concurrently fences a reopened workflow or new descendant.
+    try:
+        verified = terminal_service.get_terminal(child_terminal_id)
+    except Exception:
+        release_completed_assigned_child_retirement(child_terminal_id, claim_token)
+        return "terminal_unavailable"
+    if verified.get("lifecycle") == "exited":
+        return _finish_completed_assigned_child_retirement(
+            parent_terminal_id,
+            child_terminal_id,
+            claim_token,
+        )
+    try:
+        still_quiescent = revalidate_completed_assigned_child_retirement(
+            parent_terminal_id,
+            child_terminal_id,
+            claim_token,
+        )
+    except Exception:
+        # No external exit boundary was crossed.  Release this in-process
+        # claim so the next daemon tick can deterministically retry.
+        release_completed_assigned_child_retirement(child_terminal_id, claim_token)
+        raise
+    if (
+        verified.get("lifecycle") != "running"
+        or verified.get("status") != TerminalStatus.COMPLETED.value
+        or not still_quiescent
+    ):
+        release_completed_assigned_child_retirement(child_terminal_id, claim_token)
+        return "retirement_quiescence_lost"
+    refreshed_metadata = get_terminal_metadata(child_terminal_id)
+    if refreshed_metadata is None:
+        release_completed_assigned_child_retirement(child_terminal_id, claim_token)
+        return "child_terminal_metadata_not_found"
+    try:
+        terminal_service.validate_managed_worktree_cleanup(refreshed_metadata)
+    except Exception as exc:
+        release_completed_assigned_child_retirement(child_terminal_id, claim_token)
+        return str(exc) or "managed_worktree_cleanup_not_safe"
+    if not reserve_completed_assigned_child_retirement_exit(child_terminal_id, claim_token):
+        # Another reconciler may already own the external boundary.  Retain the
+        # claim and resolve from durable state on the next tick.
+        return "exit_dispatch_reservation_not_confirmed"
+    try:
+        exit_result = terminal_service.exit_terminal(child_terminal_id)
+    except Exception as exc:
+        # The exit reservation deliberately survives unknown external outcome.
+        logger.warning(
+            "Completed assigned child %s exit outcome is pending reconciliation: %s",
+            child_terminal_id,
+            exc,
+        )
+        return "exit_dispatch_pending"
+    exit_success = exit_result is True or bool(getattr(exit_result, "success", False))
+    exit_lifecycle = "exited" if exit_result is True else getattr(exit_result, "lifecycle", None)
+    if not exit_success or exit_lifecycle != "exited":
+        return "exit_dispatch_pending"
+    return _finish_completed_assigned_child_retirement(
+        parent_terminal_id,
+        child_terminal_id,
+        claim_token,
+    )
+
+
+def _reconcile_completed_assigned_children_with_admission(
+    child_terminal_id: str | None = None,
+) -> int:
+    """Run the bounded durable queue while lifecycle mutation is admitted."""
+    candidates = list_completed_assigned_child_retirement_candidates()
+    if child_terminal_id is not None:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if candidate["child_terminal_id"] == child_terminal_id
+        ]
+    reconciled = 0
+    for candidate in candidates:
+        try:
+            outcome = _reconcile_completed_assigned_child(candidate)
+            reconciled += int(outcome in {"reconciled", "already_reconciled"})
+        except Exception as exc:
+            logger.warning(
+                "Completed assigned-child reconciliation failed safely for %s: %s",
+                candidate.get("child_terminal_id"),
+                exc,
+            )
+    return reconciled
+
+
+def reconcile_completed_assigned_children(child_terminal_id: str | None = None) -> int:
+    """Converge acknowledged assigned children without model or UI polling."""
+    from cli_agent_orchestrator.services.operations_service import (
+        workflow_execution_admission_fence,
+    )
+
+    with workflow_execution_admission_fence(nonblocking=True) as admitted:
+        if not admitted:
+            return 0
+        return _reconcile_completed_assigned_children_with_admission(child_terminal_id)
+
+
 def _reconcile_pending_messages_with_admission(registry: PluginRegistry | None = None) -> int:
     """Replay durable pending inbox rows once after a server restart.
 
@@ -410,11 +628,18 @@ def _reconcile_pending_messages_with_admission(registry: PluginRegistry | None =
     queue or a synthetic terminal event.
     """
     terminalize_missing_terminal_assignments_for_restart()
+    released_claims = release_undispatched_completed_child_retirement_claims_for_restart()
+    if released_claims:
+        logger.info(
+            "Released %s pre-dispatch child-retirement claims from the prior runtime",
+            released_claims,
+        )
     arm_handoff_continuations_for_restart()
     reconcile_superseded_workflow_turns_for_restart()
     requeue_unadmitted_workflow_turns_for_restart()
     requeue_unacknowledged_child_assignment_results()
     reconcile_handoff_continuations(registry)
+    _reconcile_completed_assigned_children_with_admission()
     return reconcile_provider_execution_queue(registry)
 
 
@@ -697,6 +922,11 @@ class LogFileHandler(FileSystemEventHandler):
                     reconcile_handoff_continuations(
                         self._registry, child_terminal_id=child_terminal_id
                     )
+            # Assigned results can be acknowledged while the child's provider
+            # is still in its short finalization tail.  The child's next log
+            # boundary is the fast-path retry; the workflow daemon below is
+            # the durable fallback when no later filesystem event arrives.
+            reconcile_completed_assigned_children(child_terminal_id=terminal_id)
             # Observe Ready/Completed first so its exact provider lease is
             # released. The global reconciler then admits already-queued
             # turns oldest-first before manufacturing this root's F13

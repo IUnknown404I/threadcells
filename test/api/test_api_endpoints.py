@@ -2581,7 +2581,7 @@ class TestFlowDaemon:
 
 class TestWorkflowDaemon:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("failed_reconciliation", ["handoff", "queue"])
+    @pytest.mark.parametrize("failed_reconciliation", ["handoff", "assigned", "queue"])
     async def test_workflow_daemon_reconciles_handoffs_before_queue_and_isolates_failures(
         self, failed_reconciliation
     ):
@@ -2598,11 +2598,20 @@ class TestWorkflowDaemon:
             if failed_reconciliation == "queue":
                 raise RuntimeError("queue failure")
 
+        def reconcile_assigned():
+            calls.append("assigned")
+            if failed_reconciliation == "assigned":
+                raise RuntimeError("assigned child failure")
+
         with (
             patch(
                 "cli_agent_orchestrator.api.main.inbox_service.reconcile_handoff_continuations",
                 side_effect=reconcile_handoffs,
             ) as handoffs,
+            patch(
+                "cli_agent_orchestrator.api.main.inbox_service.reconcile_completed_assigned_children",
+                side_effect=reconcile_assigned,
+            ) as assigned,
             patch(
                 "cli_agent_orchestrator.api.main.inbox_service.reconcile_provider_execution_queue",
                 side_effect=reconcile_queue,
@@ -2610,8 +2619,9 @@ class TestWorkflowDaemon:
         ):
             assert await _workflow_reconciliation_tick(None, False) is False
 
-        assert calls == ["handoff", "queue"]
+        assert calls == ["handoff", "assigned", "queue"]
         handoffs.assert_called_once_with(None)
+        assigned.assert_called_once_with()
         queue.assert_called_once_with(None)
 
 

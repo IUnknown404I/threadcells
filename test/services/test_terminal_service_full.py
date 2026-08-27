@@ -1834,6 +1834,8 @@ class TestGetTerminal:
             "tmux_window": "developer-abcd",
             "provider": "kiro_cli",
             "tmux_session": "cao-session",
+            "session_id": "stable-session-lifetime",
+            "runtime_generation": "generation-before-restart",
             "agent_profile": "developer",
             "last_active": datetime.now(),
         }
@@ -1853,10 +1855,15 @@ class TestGetTerminal:
         result = get_terminal("test1234")
 
         assert result["id"] == "test1234"
+        assert result["session_id"] == "stable-session-lifetime"
         assert result["status"] == TerminalStatus.IDLE.value
         assert result["lifecycle"] == "running"
         assert result["workflow_state"] == "waiting"
         assert result["assignment_status"] == "handoff_awaiting_result"
+
+        mock_get_metadata.return_value["runtime_generation"] = "generation-after-restart"
+        after_restart = get_terminal("test1234")
+        assert after_restart["session_id"] == "stable-session-lifetime"
 
     def test_get_terminal_releases_only_observed_turn_and_wakes_queue(self):
         metadata = {

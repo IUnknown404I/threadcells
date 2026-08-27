@@ -24,6 +24,11 @@ from cli_agent_orchestrator.api.main import (
     flow_daemon,
     workflow_daemon,
 )
+from cli_agent_orchestrator.clients.database import (
+    SessionDeletionReceiptModel,
+    SessionLocal,
+    TerminalModel,
+)
 from cli_agent_orchestrator.models.terminal import Terminal
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
@@ -1572,6 +1577,87 @@ class TestCreateTerminalInSession:
         assert call_kwargs["session_lifetime_id"] == "stable-session"
         assert call_kwargs["new_session"] is False
 
+    def test_canonical_lifetime_admits_child_when_reused_name_is_ambiguous(self, client):
+        session_id = "b39b817e-401b-47c3-b084-964a7b7ef77c"
+        prior_session_id = "9956ae19-6028-47d2-8e61-85fda8196c34"
+        session_name = "cao-reused-child-admission"
+        parent_id = "faceb00c"
+        with SessionLocal() as db:
+            db.add(
+                TerminalModel(
+                    id=parent_id,
+                    tmux_session=session_name,
+                    session_id=session_id,
+                    tmux_window="supervisor-faceb00c",
+                    provider="codex",
+                    agent_profile="supervisor",
+                    context_role="supervisor",
+                    launch_worktree="/fixture/project",
+                    runtime_lifecycle="running",
+                )
+            )
+            db.add(
+                SessionDeletionReceiptModel(
+                    session_id=prior_session_id,
+                    session_name=session_name,
+                    retained_resources_json="[]",
+                )
+            )
+            db.commit()
+
+        created = Terminal(
+            id="cafe1234",
+            name="reviewer-cafe1234",
+            session_name=session_name,
+            session_id=session_id,
+            provider="codex",
+            agent_profile="reviewer",
+        )
+        try:
+            with (
+                patch.object(
+                    api_main.terminal_service, "create_terminal", return_value=created
+                ) as create,
+                patch.object(
+                    api_main.session_service.tmux_client,
+                    "session_exists",
+                    return_value=True,
+                ),
+                patch.object(
+                    api_main.session_service,
+                    "prove_live_session_runtime_authority",
+                    return_value=MagicMock(proven=True),
+                ),
+                patch.object(
+                    api_main.project_service,
+                    "resolve_add_agent_context",
+                    return_value=("/fixture/project", None),
+                ),
+            ):
+                canonical = client.post(
+                    f"/sessions/{session_id}/terminals",
+                    params={"provider": "codex", "agent_profile": "reviewer"},
+                )
+                ambiguous = client.post(
+                    f"/sessions/{session_name}/terminals",
+                    params={"provider": "codex", "agent_profile": "reviewer"},
+                )
+
+            assert canonical.status_code == 201
+            assert canonical.json()["session_id"] == session_id
+            assert ambiguous.status_code == 409
+            assert ambiguous.json()["detail"]["reason_code"] == "SESSION_IDENTITY_AMBIGUOUS"
+            create.assert_called_once()
+            assert create.call_args.kwargs["session_lifetime_id"] == session_id
+            assert create.call_args.kwargs["session_name"] == session_name
+        finally:
+            with SessionLocal() as db:
+                db.query(TerminalModel).filter(TerminalModel.id == parent_id).delete()
+                db.query(SessionDeletionReceiptModel).filter(
+                    SessionDeletionReceiptModel.session_id == prior_session_id
+                ).delete()
+                db.commit()
+
     def test_create_terminal_session_not_found(self, client):
         """POST /sessions/{name}/terminals returns 404 for nonexistent session."""
         with patch.object(
@@ -1710,6 +1796,7 @@ class TestGetTerminal:
             "id": "abcd1234",
             "name": "test-window",
             "session_name": "test-session",
+            "session_id": "stable-session-lifetime",
             "provider": "kiro_cli",
             "agent_profile": "developer",
             "status": "completed",
@@ -1728,6 +1815,7 @@ class TestGetTerminal:
         assert response.status_code == 200
         data = response.json()
         assert data["id"] == "abcd1234"
+        assert data["session_id"] == "stable-session-lifetime"
         assert data["provider"] == "kiro_cli"
         assert data["workflow_state"] == "waiting"
         assert data["assignment_status"] == "handoff_awaiting_result"

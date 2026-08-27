@@ -8,6 +8,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
+from urllib.parse import quote
 
 import mcp.types as mcp_types
 import requests
@@ -93,6 +94,8 @@ _SAFE_PRE_EFFECT_ADMISSION_REASONS = {
     "PROVIDER_EXECUTION_CAPACITY_EXHAUSTED",
     "RESIDENT_SUPERVISOR_CAPACITY_EXHAUSTED",
     "RESOURCE_HEALTH_REJECTED",
+    "SESSION_IDENTITY_AMBIGUOUS",
+    "SESSION_IDENTITY_UNAVAILABLE",
     "TOTAL_PROVIDER_CAPACITY_EXHAUSTED",
     "WORK_CONTEXT_CAPACITY_EXHAUSTED",
 }
@@ -721,7 +724,12 @@ def _create_terminal(
         terminal_metadata = response.json()
 
         provider = terminal_metadata["provider"]
-        session_name = terminal_metadata["session_name"]
+        session_id = terminal_metadata.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise TerminalAdmissionError(
+                "SESSION_IDENTITY_UNAVAILABLE",
+                "terminal admission denied: canonical parent session identity is unavailable",
+            )
         parent_allowed_tools = terminal_metadata.get("allowed_tools")
 
         # If no working_directory specified, get conductor's current directory
@@ -761,7 +769,10 @@ def _create_terminal(
         if child_allowed_tools:
             params["allowed_tools"] = child_allowed_tools
 
-        response = requests.post(f"{API_BASE_URL}/sessions/{session_name}/terminals", params=params)
+        response = requests.post(
+            f"{API_BASE_URL}/sessions/{quote(session_id, safe='')}/terminals",
+            params=params,
+        )
         if response.status_code >= 400:
             raise TerminalAdmissionError.from_response(response)
         terminal = response.json()

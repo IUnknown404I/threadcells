@@ -38,6 +38,9 @@ class Terminal(BaseModel):
     # adapters may expose additional registered identifiers.
     provider: str = Field(..., description="Registered provider adapter identifier")
     session_name: str = Field(..., description="Session name")
+    session_id: Optional[str] = Field(
+        None, description="Canonical durable session lifetime identifier"
+    )
     agent_profile: Optional[str] = Field(None, description="Agent profile")
     allowed_tools: Optional[List[str]] = Field(None, description="Allowed CAO tools")
     status: Optional[TerminalStatus] = Field(

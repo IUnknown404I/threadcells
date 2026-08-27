@@ -346,6 +346,11 @@ async def _workflow_reconciliation_tick(
         logger.warning("Workflow daemon Inbox reconciliation failed: %s", exc)
     try:
         if not startup_recovery_pending and not performed_full_recovery:
+            await _run_workflow_io(inbox_service.reconcile_completed_assigned_children)
+    except Exception as exc:
+        logger.warning("Workflow daemon assigned-child reconciliation failed: %s", exc)
+    try:
+        if not startup_recovery_pending and not performed_full_recovery:
             await _run_workflow_io(inbox_service.reconcile_provider_execution_queue, registry)
     except Exception as exc:
         logger.warning("Workflow daemon reconciliation failed: %s", exc)

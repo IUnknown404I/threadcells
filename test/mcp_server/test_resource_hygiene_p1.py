@@ -4,8 +4,10 @@ import asyncio
 import json
 import subprocess
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -17,6 +19,7 @@ from cli_agent_orchestrator.clients.database import (
     Base,
     ChildAssignmentModel,
     DelegationResultModel,
+    ProviderExecutionLeaseModel,
     TerminalModel,
     WorkflowEffectModel,
     WorkflowModel,
@@ -37,6 +40,7 @@ from cli_agent_orchestrator.clients.database import (
     mark_terminal_runtime_exited,
     register_child_assignment,
     register_handoff_child,
+    release_undispatched_completed_child_retirement_claims_for_restart,
     reserve_completed_assigned_child_retirement_exit,
     set_workflow_terminal_state,
     start_workflow_input,
@@ -52,6 +56,7 @@ from cli_agent_orchestrator.runtime_generation import (
 )
 from cli_agent_orchestrator.services import (
     housekeeping_service,
+    inbox_service,
     managed_worktree_service,
     operations_service,
 )
@@ -66,6 +71,18 @@ def resource_db(monkeypatch):
     monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
     monkeypatch.setattr(database, "_child_assignment_schema_ready", True)
     monkeypatch.setattr(database, "_delegation_result_schema_ready", True)
+
+    @contextmanager
+    def admitted_workflow_fence(*_args, **_kwargs):
+        yield True
+
+    # Resource-hygiene unit tests use an isolated database and must not race
+    # the live host's canonical workflow-admission flock.
+    monkeypatch.setattr(
+        operations_service,
+        "workflow_execution_admission_fence",
+        admitted_workflow_fence,
+    )
 
 
 @pytest.fixture
@@ -2091,3 +2108,241 @@ def test_c1_r1_handoff_cleanup_removes_task_and_reviewer_worktrees_but_retains_h
             ).stdout.strip()
             == baseline
         )
+
+
+def _issue_82_running_child(child: str, *, provider_lease: bool = False) -> None:
+    """Give an acknowledged fixture the live work/provider authority from #82."""
+    with database.SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter_by(id=child).one()
+        terminal.runtime_lifecycle = "running"
+        terminal.context_role = "work"
+        if provider_lease:
+            result = (
+                db.query(DelegationResultModel)
+                .join(
+                    ChildAssignmentModel,
+                    ChildAssignmentModel.id == DelegationResultModel.child_assignment_id,
+                )
+                .filter(ChildAssignmentModel.child_terminal_id == child)
+                .one()
+            )
+            assert result.workflow_turn_id is not None
+            db.add(
+                ProviderExecutionLeaseModel(
+                    terminal_id=child,
+                    workflow_turn_id=result.workflow_turn_id,
+                )
+            )
+        db.commit()
+
+
+def _issue_82_exit(child: str) -> SimpleNamespace:
+    assert mark_terminal_runtime_exited(child)
+    return SimpleNamespace(success=True, lifecycle="exited")
+
+
+def test_issue_82_processing_assign_retries_then_releases_capacity_and_preserves_history(
+    resource_db, monkeypatch, mocker
+):
+    parent, child = "parent-issue-82-processing", "child-issue-82-processing"
+    result_id = _acknowledged_child(parent, child, monkeypatch)
+    _issue_82_running_child(child, provider_lease=True)
+    get_terminal = mocker.patch.object(
+        inbox_service.terminal_service,
+        "get_terminal",
+        return_value={"id": child, "status": "processing", "lifecycle": "running"},
+    )
+    exit_terminal = mocker.patch.object(inbox_service.terminal_service, "exit_terminal")
+    mocker.patch.object(inbox_service.terminal_service, "validate_managed_worktree_cleanup")
+    mocker.patch.object(inbox_service.terminal_service, "cleanup_managed_worktree")
+
+    assert inbox_service.reconcile_completed_assigned_children(child) == 0
+    exit_terminal.assert_not_called()
+    with database.SessionLocal() as db:
+        assert db.get(TerminalModel, child).runtime_lifecycle == "running"
+        assert db.get(ProviderExecutionLeaseModel, child) is not None
+
+    get_terminal.return_value = {"id": child, "status": "completed", "lifecycle": "running"}
+    exit_terminal.side_effect = _issue_82_exit
+    assert inbox_service.reconcile_completed_assigned_children(child) == 1
+
+    exit_terminal.assert_called_once_with(child)
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, child)
+        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id=child).one()
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=child).one()
+        assert terminal.runtime_lifecycle == "exited"
+        assert db.get(ProviderExecutionLeaseModel, child) is None
+        assert assignment.status == ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value
+        assert assignment.retirement_completed_at is not None
+        assert workflow.status == "terminal"
+    assert get_delegation_result(result_id)["status"] == DelegationResultStatus.COMPLETE.value
+
+
+def test_issue_82_parent_owner_gate_does_not_strand_acknowledged_child(
+    resource_db, monkeypatch, mocker
+):
+    parent, child = "parent-issue-82-owner-gate", "child-issue-82-owner-gate"
+    _acknowledged_child(parent, child, monkeypatch)
+    _issue_82_running_child(child)
+    assert set_workflow_terminal_state(parent, "owner_gate", "owner decision")
+    mocker.patch.object(
+        inbox_service.terminal_service,
+        "get_terminal",
+        return_value={"id": child, "status": "completed", "lifecycle": "running"},
+    )
+    mocker.patch.object(inbox_service.terminal_service, "validate_managed_worktree_cleanup")
+    mocker.patch.object(inbox_service.terminal_service, "cleanup_managed_worktree")
+    exit_terminal = mocker.patch.object(
+        inbox_service.terminal_service, "exit_terminal", side_effect=_issue_82_exit
+    )
+
+    assert inbox_service.reconcile_completed_assigned_children(child) == 1
+    exit_terminal.assert_called_once_with(child)
+    with database.SessionLocal() as db:
+        assert (
+            db.query(WorkflowModel).filter_by(root_terminal_id=parent).one().status == "owner_gate"
+        )
+
+
+def test_issue_82_parallel_assigned_children_reconcile_independently_once(
+    resource_db, monkeypatch, mocker
+):
+    parent = "parent-issue-82-parallel"
+    children = ["child-issue-82-parallel-a", "child-issue-82-parallel-b"]
+    for child in children:
+        _acknowledged_child(parent, child, monkeypatch)
+        _issue_82_running_child(child, provider_lease=True)
+    mocker.patch.object(
+        inbox_service.terminal_service,
+        "get_terminal",
+        side_effect=lambda child: {
+            "id": child,
+            "status": "completed",
+            "lifecycle": "running",
+        },
+    )
+    mocker.patch.object(inbox_service.terminal_service, "validate_managed_worktree_cleanup")
+    mocker.patch.object(inbox_service.terminal_service, "cleanup_managed_worktree")
+    exit_terminal = mocker.patch.object(
+        inbox_service.terminal_service, "exit_terminal", side_effect=_issue_82_exit
+    )
+
+    assert inbox_service.reconcile_completed_assigned_children() == 2
+    assert inbox_service.reconcile_completed_assigned_children() == 0
+    assert [call.args[0] for call in exit_terminal.call_args_list] == children
+    with database.SessionLocal() as db:
+        assert db.query(ProviderExecutionLeaseModel).count() == 0
+        assert {
+            terminal.runtime_lifecycle
+            for terminal in db.query(TerminalModel).filter(TerminalModel.id.in_(children))
+        } == {"exited"}
+
+
+@pytest.mark.parametrize(
+    ("unsafe_state", "expected_error"),
+    [
+        ("unacknowledged", None),
+        ("incomplete_result", None),
+        ("changed_worktree", "REVIEW_WORKTREE_AUTHORITY_CHANGED"),
+    ],
+)
+def test_issue_82_result_or_worktree_authority_stays_fail_closed(
+    resource_db, monkeypatch, mocker, unsafe_state, expected_error
+):
+    parent, child = f"parent-issue-82-{unsafe_state}", f"child-issue-82-{unsafe_state}"
+    _acknowledged_child(parent, child, monkeypatch)
+    _issue_82_running_child(child)
+    with database.SessionLocal() as db:
+        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id=child).one()
+        if unsafe_state == "unacknowledged":
+            assignment.status = ChildAssignmentStatus.RESULT_DELIVERED.value
+        elif unsafe_state == "incomplete_result":
+            result = (
+                db.query(DelegationResultModel).filter_by(child_assignment_id=assignment.id).one()
+            )
+            result.status = DelegationResultStatus.INCOMPLETE.value
+        db.commit()
+    mocker.patch.object(
+        inbox_service.terminal_service,
+        "get_terminal",
+        return_value={"id": child, "status": "completed", "lifecycle": "running"},
+    )
+    validator = mocker.patch.object(
+        inbox_service.terminal_service,
+        "validate_managed_worktree_cleanup",
+        side_effect=(RuntimeError(expected_error) if expected_error else None),
+    )
+    exit_terminal = mocker.patch.object(inbox_service.terminal_service, "exit_terminal")
+
+    assert inbox_service.reconcile_completed_assigned_children(child) == 0
+    exit_terminal.assert_not_called()
+    if unsafe_state in {"unacknowledged", "incomplete_result"}:
+        validator.assert_not_called()
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, child)
+        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id=child).one()
+        assert terminal.runtime_lifecycle == "running"
+        assert assignment.retirement_claim_token is None
+
+
+def test_issue_82_restart_releases_only_undispatched_claim_then_converges(
+    resource_db, monkeypatch, mocker
+):
+    parent, child = "parent-issue-82-restart", "child-issue-82-restart"
+    _acknowledged_child(parent, child, monkeypatch)
+    _issue_82_running_child(child)
+    first = claim_completed_assigned_child_retirement(parent, child)
+    assert first["eligible"] is True and first["claim_token"]
+
+    assert release_undispatched_completed_child_retirement_claims_for_restart() == 1
+    mocker.patch.object(
+        inbox_service.terminal_service,
+        "get_terminal",
+        return_value={"id": child, "status": "completed", "lifecycle": "running"},
+    )
+    mocker.patch.object(inbox_service.terminal_service, "validate_managed_worktree_cleanup")
+    mocker.patch.object(inbox_service.terminal_service, "cleanup_managed_worktree")
+    exit_terminal = mocker.patch.object(
+        inbox_service.terminal_service, "exit_terminal", side_effect=_issue_82_exit
+    )
+
+    assert inbox_service.reconcile_completed_assigned_children(child) == 1
+    exit_terminal.assert_called_once_with(child)
+
+
+def test_issue_82_reserved_exit_is_restart_safe_and_never_redispatched(
+    resource_db, monkeypatch, mocker
+):
+    parent, child = "parent-issue-82-reserved", "child-issue-82-reserved"
+    _acknowledged_child(parent, child, monkeypatch)
+    _issue_82_running_child(child)
+    fence = claim_completed_assigned_child_retirement(parent, child)
+    assert reserve_completed_assigned_child_retirement_exit(child, fence["claim_token"])
+    assert release_undispatched_completed_child_retirement_claims_for_restart() == 0
+    get_terminal = mocker.patch.object(
+        inbox_service.terminal_service,
+        "get_terminal",
+        return_value={"id": child, "status": "completed", "lifecycle": "running"},
+    )
+    exit_terminal = mocker.patch.object(inbox_service.terminal_service, "exit_terminal")
+
+    assert inbox_service.reconcile_completed_assigned_children(child) == 0
+    exit_terminal.assert_not_called()
+    assert mark_terminal_runtime_exited(child)
+    get_terminal.return_value = {"id": child, "status": "completed", "lifecycle": "exited"}
+    mocker.patch.object(inbox_service.terminal_service, "cleanup_managed_worktree")
+    assert inbox_service.reconcile_completed_assigned_children(child) == 1
+    exit_terminal.assert_not_called()
+
+
+def test_issue_82_completed_handoff_remains_owned_by_handoff_cleanup_path(resource_db, mocker):
+    parent, child = "parent-issue-82-handoff", "child-issue-82-handoff"
+    result_id = _completed_handoff_child(parent, child)
+    get_terminal = mocker.patch.object(inbox_service.terminal_service, "get_terminal")
+    exit_terminal = mocker.patch.object(inbox_service.terminal_service, "exit_terminal")
+
+    assert inbox_service.reconcile_completed_assigned_children(child) == 0
+    get_terminal.assert_not_called()
+    exit_terminal.assert_not_called()
+    assert get_delegation_result(result_id)["status"] == DelegationResultStatus.COMPLETE.value

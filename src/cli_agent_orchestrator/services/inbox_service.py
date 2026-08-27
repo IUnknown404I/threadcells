@@ -485,7 +485,7 @@ def _reconcile_completed_assigned_child(candidate: dict[str, object]) -> str:
     # durable once the first command settles.
     if candidate.get("exit_dispatch_reserved"):
         return "exit_dispatch_pending"
-    if lifecycle != "running" or terminal_status != TerminalStatus.COMPLETED.value:
+    if lifecycle != "running" or not terminal_service.is_terminal_quiescent(terminal_status):
         return "provider_not_completed"
 
     # Automatic retirement is narrower than a manual operator recovery: a
@@ -544,7 +544,7 @@ def _reconcile_completed_assigned_child(candidate: dict[str, object]) -> str:
         raise
     if (
         verified.get("lifecycle") != "running"
-        or verified.get("status") != TerminalStatus.COMPLETED.value
+        or not terminal_service.is_terminal_quiescent(verified.get("status"))
         or not still_quiescent
     ):
         release_completed_assigned_child_retirement(child_terminal_id, claim_token)

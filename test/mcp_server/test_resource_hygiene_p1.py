@@ -276,8 +276,9 @@ def _api_terminal_response(mocker, status: str, lifecycle: str):
     return response
 
 
-def test_p1_canonical_api_completed_running_exits_without_provider_observation(
-    resource_db, monkeypatch, mocker
+@pytest.mark.parametrize("provider_status", ["completed", "idle"])
+def test_p1_canonical_api_quiescent_running_exits_without_provider_observation(
+    resource_db, monkeypatch, mocker, provider_status
 ):
     parent, child = "parent-p1-ok", "child-p1-ok"
     turn_id = _admit(parent, monkeypatch)
@@ -285,7 +286,7 @@ def test_p1_canonical_api_completed_running_exits_without_provider_observation(
     get_terminal = mocker.patch.object(
         mcp_server.requests,
         "get",
-        return_value=_api_terminal_response(mocker, "completed", "running"),
+        return_value=_api_terminal_response(mocker, provider_status, "running"),
     )
     provider_state = mocker.patch.object(
         mcp_server.terminal_service,
@@ -2162,7 +2163,9 @@ def test_issue_82_processing_assign_retries_then_releases_capacity_and_preserves
         assert db.get(TerminalModel, child).runtime_lifecycle == "running"
         assert db.get(ProviderExecutionLeaseModel, child) is not None
 
-    get_terminal.return_value = {"id": child, "status": "completed", "lifecycle": "running"}
+    # Codex may settle at its Ready prompt as ``idle`` after the durable
+    # result has completed, which is the exact second production child shape.
+    get_terminal.return_value = {"id": child, "status": "idle", "lifecycle": "running"}
     exit_terminal.side_effect = _issue_82_exit
     assert inbox_service.reconcile_completed_assigned_children(child) == 1
 

@@ -518,6 +518,16 @@ class ManagedWorktreeCleanupError(RuntimeError):
         self.reason_code = reason_code
 
 
+def is_terminal_quiescent(status: str | None) -> bool:
+    """Return whether provider state is safe behind durable workflow fences.
+
+    Providers may expose their post-result prompt as either ``completed`` or
+    ``idle``.  Neither state alone authorizes lifecycle mutation; callers must
+    still hold the durable result/workflow/descendant retirement fences.
+    """
+    return status in {TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value}
+
+
 _PROVIDER_CLASS_NAMES = {
     ProviderType.Q_CLI.value: "QCliProvider",
     ProviderType.KIRO_CLI.value: "KiroCliProvider",

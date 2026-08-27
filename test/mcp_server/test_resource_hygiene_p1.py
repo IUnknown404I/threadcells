@@ -40,8 +40,8 @@ from cli_agent_orchestrator.clients.database import (
     mark_terminal_runtime_exited,
     register_child_assignment,
     register_handoff_child,
-    reserve_completed_assigned_child_retirement_exit,
     release_undispatched_completed_child_retirement_claims_for_restart,
+    reserve_completed_assigned_child_retirement_exit,
     set_workflow_terminal_state,
     start_workflow_input,
 )

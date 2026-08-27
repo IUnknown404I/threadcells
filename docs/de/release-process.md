@@ -1,7 +1,7 @@
 ---
 slug: release-process
 source: docs/RELEASE_PROCESS.md
-source_sha256: sha256:82961559c0645676fcec5126113c53f17492ccd1b7c0c7100552689b770353ae
+source_sha256: sha256:66966038765eab40e9e11f4cbd81cc126fc199a63e95390194c3d88dbdd598b6
 ---
 # Release-Prozess
 
@@ -26,18 +26,18 @@ Genehmigte veröffentlichte Alpha-Releases verfügen außerdem über ein öffent
 
 Dieses Paket ist ein Distributions-Bundle, kein Docker-Image und keine unterstützte Container-Deployment-Umgebung. Verwenden Sie nach der Prüfung seiner Prüfsummen den normalen Prozess für Kandidateninstallation und Deployment; versuchen Sie nicht, das OCI-Artefakt als ThreadCells-Dienst auszuführen.
 
-`.github/workflows/publish-release-bundle.yml` veröffentlicht bei einem genehmigten GitHub Release oder durch einen expliziten Backfill-Dispatch. Es akzeptiert nur annotierte `v0.X.Y-alpha.N`-Tags mit einem vorhandenen Nicht-Entwurfs-Prerelease, erstellt die exakte getaggte Quelle neu und prüft sie, verweigert das Ersetzen eines nicht passenden Versions-Tags und aktualisiert ausschließlich `latest-alpha`. ThreadCells veröffentlicht während der technischen Vorschau kein unqualifiziertes `latest`-Tag.
+`.github/workflows/publish-release-bundle.yml` veröffentlicht bei einem genehmigten GitHub Release oder durch einen expliziten Backfill-Dispatch. Es akzeptiert annotierte `v0.X.Y-alpha`-Tags mit einem vorhandenen Nicht-Entwurfs-Prerelease, behält die Kompatibilität mit unveränderlichen historischen `v0.X.Y-alpha.N`-Tags bei, erstellt die exakte getaggte Quelle neu und prüft sie, verweigert das Ersetzen eines nicht passenden Versions-Tags und aktualisiert ausschließlich `latest-alpha`. ThreadCells veröffentlicht während der technischen Vorschau kein unqualifiziertes `latest`-Tag.
 
 ## Konvention für Versionslinien
 
-ThreadCells folgt der normalen SemVer-Prerelease-Reihenfolge. Während der Alpha-Vorschau bezeichnet `0.1.X` eine wesentliche Produkt-, Zuverlässigkeits- oder Dokumentationsiteration; `alpha.N` bezeichnet zusätzliche Veröffentlichungen innerhalb derselben Iteration, wenn sie wirklich erforderlich sind.
+ThreadCells folgt der normalen SemVer-Prerelease-Reihenfolge. Während der Alpha-Vorschau erhöht jede neue Veröffentlichung die normale semantische Version und behält `alpha` als Prerelease-Stufe bei. Die Python-Paketierung normalisiert ein Alpha ohne Suffix wie `v0.3.3-alpha` zu `0.3.3a0`.
 
 - `v0.1.0-alpha.1` war das erste öffentliche Alpha-Release.
 - `v0.1.0-alpha.2` ist eine unveränderliche veröffentlichte technische Vorschau.
 - `v0.2.0-alpha.1` ist die konsolidierte Release-Linie für Mehrsprachigkeit und Zuverlässigkeit.
 - `v0.3.0-alpha.1` ergänzt Lifecycle-Konsistenz, dauerhafte Erstellungsreihenfolge, Full Cleanup und eine systemische Routing-Richtlinie.
 - `v0.3.0-alpha.2` korrigiert die Workflow-Composer-Zustellung und macht den Terminal-Exit für ausführbare Workflow-Autorität endgültig.
-- `v0.3.0-alpha.3` ergänzt die authentifizierte Oberfläche um Englisch/Russisch und führt einen einzigen kanonischen, sprachgeordneten Docs-Bestand für App und öffentliche Website ein.
-- Eine spätere Veröffentlichung in derselben Release-Linie erhöht nur die Alpha-Sequenz; ein neuer Produkt-Umriss erhöht die semantische Version bewusst.
+- `v0.3.3-alpha` ergänzt die authentifizierte Oberfläche um Englisch/Russisch und führt einen einzigen kanonischen, sprachgeordneten Docs-Bestand für App und öffentliche Website ein.
+- Eine spätere Alpha-Veröffentlichung erhöht die semantische Version bewusst und behält die Stufe `alpha` ohne numerisches Suffix bei.
 
 Verschieben Sie niemals ein bestehendes Tag. Änderungen allein an der Repository-Governance lösen weder eine Versionsänderung noch ein Release aus. Aktualisieren Sie alle kanonischen versionstragenden Oberflächen gemeinsam erst dann, wenn der nächste wesentliche Implementierungs-Umriss für die Veröffentlichung bereit ist.

@@ -21,18 +21,18 @@ Approved published alpha releases also have a public OCI distribution artifact a
 
 This package is a distribution bundle, not a Docker image or a supported container deployment environment. Use the normal candidate installation and deployment process after verifying its checksums; do not try to run the OCI artifact as a ThreadCells service.
 
-`.github/workflows/publish-release-bundle.yml` publishes on an approved GitHub Release or by an explicit backfill dispatch. It accepts only annotated `v0.X.Y-alpha.N` tags with an existing non-draft prerelease, rebuilds and verifies the exact tagged source, refuses to replace a mismatched version tag, and updates only `latest-alpha`. ThreadCells does not publish an unqualified `latest` tag during the technical preview.
+`.github/workflows/publish-release-bundle.yml` publishes on an approved GitHub Release or by an explicit backfill dispatch. It accepts annotated `v0.X.Y-alpha` tags with an existing non-draft prerelease, retains compatibility for immutable historical `v0.X.Y-alpha.N` tags, rebuilds and verifies the exact tagged source, refuses to replace a mismatched version tag, and updates only `latest-alpha`. ThreadCells does not publish an unqualified `latest` tag during the technical preview.
 
 ## Version-line convention
 
-ThreadCells follows normal SemVer prerelease ordering. During the alpha preview, `0.1.X` identifies a meaningful product, reliability, or documentation iteration; `alpha.N` identifies additional publications within that same iteration when they are genuinely required.
+ThreadCells follows normal SemVer prerelease ordering. During the alpha preview, every new publication advances the normal semantic version and keeps `alpha` as the prerelease stage. Python packaging normalizes an unsuffixed alpha such as `v0.3.3-alpha` to `0.3.3a0`.
 
 - `v0.1.0-alpha.1` was the first public alpha.
 - `v0.1.0-alpha.2` is an immutable published technical preview.
 - `v0.2.0-alpha.1` is the consolidated multilingual and reliability release line.
 - `v0.3.0-alpha.1` adds lifecycle consistency, durable creation order, Full Cleanup, and systemic routing policy.
 - `v0.3.0-alpha.2` corrects Workflow Composer delivery and makes terminal exit final for executable workflow authority.
-- `v0.3.0-alpha.3` adds English/Russian authenticated UI localization and one canonical locale-owned Docs corpus for both the app and public site.
-- A later publication in the same release line increments only the alpha sequence; a new product contour increments the semantic version deliberately.
+- `v0.3.3-alpha` adds English/Russian authenticated UI localization and one canonical locale-owned Docs corpus for both the app and public site.
+- A later alpha publication increments the semantic version deliberately and keeps the unsuffixed `alpha` stage.
 
 Never move an existing tag. Repository-governance changes alone do not trigger a version bump or release. Update all canonical version-bearing surfaces together only when the next meaningful implementation contour is ready for publication.

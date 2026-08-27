@@ -59,7 +59,7 @@ flowchart LR
 
 ## Seguridad y estado de la versión preliminar
 
-La versión preliminar técnica `0.3.0-alpha.3` admite un único host Ubuntu/Debian Linux, acceso loopback por defecto y una configuración centrada en Codex. Los agentes nativos pueden ejecutar comandos potentes; los worktrees no son un sandbox de seguridad. Consulta las [limitaciones](../LIMITATIONS.md) antes de evaluarlo.
+La versión preliminar técnica `0.3.3-alpha` admite un único host Ubuntu/Debian Linux, acceso loopback por defecto y una configuración centrada en Codex. Los agentes nativos pueden ejecutar comandos potentes; los worktrees no son un sandbox de seguridad. Consulta las [limitaciones](../LIMITATIONS.md) antes de evaluarlo.
 
 El paquete OCI público `ghcr.io/iunknown404i/threadcells-release-bundle` contiene archivos de publicación verificados y sus evidencias. Es un artefacto de distribución, no una imagen Docker ni un modo de despliegue en contenedores admitido; consulta el [proceso de publicación](../RELEASE_PROCESS.md).
 

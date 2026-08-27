@@ -27,14 +27,14 @@ let browser
 try {
   browser = await chromium.launch({ headless: true })
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } })
-  const page = await context.newPage()
   const checkedResources = new Set()
   const routeHtml = new Map()
   const checkedRoutes = new Set()
   let links = 0
 
   for (const { route, locale, lang } of routes) {
-    const response = await page.goto(`${server.origin}${route}`, { waitUntil: 'domcontentloaded' })
+    const page = await context.newPage()
+    const response = await page.goto(`${server.origin}${route}`, { waitUntil: 'networkidle' })
     assert(response?.ok(), `${route || '/'} returned ${response?.status()}`)
     assert.equal(await page.getByRole('heading', { level: 1 }).count(), 1, `${route || '/'} has one h1`)
     assert.equal(await page.locator('html').getAttribute('lang'), lang, `${route || '/'} uses ${lang} html lang`)
@@ -77,6 +77,7 @@ try {
       assert(resourceResponse.ok(), `Resource failed on ${route || '/'}: ${resource} (${resourceResponse.status()})`)
       checkedResources.add(requestUrl)
     }
+    await page.close()
   }
 
   assert.equal(routes.length, locales.length * (manifest.documents.length + 2), 'every locale index and manifest document are included')

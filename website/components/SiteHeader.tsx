@@ -5,7 +5,7 @@ import { usePathname } from 'next/navigation'
 import { Mark } from '@/components/Mark'
 import { assetPath, basePath, site } from '@/lib/site'
 import { docsPath, landingPath, localeCopy, locales, localizedPath, type Locale } from '@/lib/locales'
-import { LanguageSelector } from '../../web/src/components/LanguageSelector'
+import { LanguageSelector } from './LanguageSelector'
 
 export function SiteHeader({ locale = 'en', routePath = '/' }: { locale?: Locale; routePath?: string }) {
   const copy = localeCopy[locale]

@@ -2238,7 +2238,7 @@ async def retire_completed_child(
             already_retired=True,
             retiring_supervisor_terminal_id=retiring_supervisor_terminal_id,
         )
-    if terminal_status != TerminalStatus.COMPLETED.value:
+    if not terminal_service.is_terminal_quiescent(terminal_status):
         release_completed_assigned_child_retirement(child_terminal_id, claim_token)
         _finish_privileged_effect(effect, "rejected")
         return {"success": False, "error": "child_terminal_not_completed"}
@@ -2271,7 +2271,7 @@ async def retire_completed_child(
             already_retired=True,
             retiring_supervisor_terminal_id=retiring_supervisor_terminal_id,
         )
-    if terminal_status != TerminalStatus.COMPLETED.value:
+    if not terminal_service.is_terminal_quiescent(terminal_status):
         release_completed_assigned_child_retirement(child_terminal_id, claim_token)
         _finish_privileged_effect(effect, "rejected")
         return {"success": False, "error": "child_terminal_not_completed"}

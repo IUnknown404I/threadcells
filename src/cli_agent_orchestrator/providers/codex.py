@@ -556,13 +556,17 @@ def _latest_structured_codex_outcome(
         try:
             row = json.loads(line)
         except (UnicodeDecodeError, json.JSONDecodeError):
-            continue
-        if not isinstance(row, dict) or row.get("type") != "event_msg":
+            return None
+        if not isinstance(row, dict):
+            return None
+        if row.get("type") != "event_msg":
             continue
         payload = row.get("payload")
         if not isinstance(payload, dict):
-            continue
+            return None
         event_type = payload.get("type")
+        if not isinstance(event_type, str):
+            return None
         if event_type == "task_started":
             turn_started = True
             latest_outcome = None
@@ -572,7 +576,11 @@ def _latest_structured_codex_outcome(
         if not turn_started:
             continue
         error = payload.get("error")
+        if error is not None and not isinstance(error, dict):
+            return None
         detail_code = error.get("codex_error_info") if isinstance(error, dict) else None
+        if detail_code is not None and not isinstance(detail_code, str):
+            return None
         latest_outcome = detail_code if isinstance(detail_code, str) else None
         turn_started = False
 
@@ -854,6 +862,10 @@ class CodexProvider(BaseProvider):
             Path(working_directory_value).resolve(strict=False),
         )
         return _codex_outcome_cursor(rollout_path) if rollout_path else None
+
+    def turn_outcome_cursor_required(self) -> bool:
+        """Require exact event authority before every logical-turn send."""
+        return True
 
     def runtime_sidecar_reconnect_required(self) -> bool:
         """Return the signal cached by the normal provider status capture."""

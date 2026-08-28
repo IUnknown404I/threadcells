@@ -2275,6 +2275,7 @@ class TestSendInput:
             "runtime_lifecycle": "running",
         }
         mock_pm.get_provider.return_value.paste_enter_count = 1
+        mock_pm.get_provider.return_value.turn_outcome_cursor_required.return_value = True
         mock_capture_cursor.return_value = "codex-jsonl-v1:1:2:3:1"
         ordering = []
         mock_bind_cursor.side_effect = lambda *_args: ordering.append("bound") or True
@@ -2294,6 +2295,61 @@ class TestSendInput:
 
         assert ordering == ["bound", "sent"]
         mock_bind_cursor.assert_called_once_with("test1234", 42, "codex-jsonl-v1:1:2:3:1")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.release_provider_execution")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.bind_workflow_turn_provider_outcome_cursor"
+    )
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.capture_provider_turn_outcome_cursor",
+        return_value=None,
+    )
+    @patch("cli_agent_orchestrator.services.operations_service.acquire_provider_execution_slot")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_fails_before_transport_when_required_cursor_is_unavailable(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        _mock_acquire,
+        _mock_capture,
+        mock_bind_cursor,
+        _mock_update,
+        mock_release,
+    ):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "supervisor-window",
+            "runtime_lifecycle": "running",
+        }
+        provider = mock_pm.get_provider.return_value
+        provider.paste_enter_count = 1
+        provider.turn_outcome_cursor_required.return_value = True
+        mock_release.return_value = True
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.acquire_terminal_runtime_transport",
+                return_value="transport-token",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.release_terminal_runtime_operation",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service._wake_queued_provider_execution"
+            ) as wake,
+            pytest.raises(RuntimeError, match="required provider outcome boundary"),
+        ):
+            send_input("test1234", "task", logical_turn_id=42)
+
+        mock_tmux.send_keys.assert_not_called()
+        mock_bind_cursor.assert_not_called()
+        mock_release.assert_called_once_with("test1234", 42)
+        wake.assert_called_once_with(None)
 
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.mark_handoff_child_input_received")

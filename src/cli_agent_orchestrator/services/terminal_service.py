@@ -1906,7 +1906,11 @@ def send_input(
             raise AdmissionDenied("TERMINAL_RUNTIME_OPERATION_BUSY", {})
         try:
             if logical_turn_id is not None:
+                cursor_requirement = getattr(provider, "turn_outcome_cursor_required", None)
+                cursor_required = bool(cursor_requirement and cursor_requirement() is True)
                 outcome_cursor = capture_provider_turn_outcome_cursor(terminal_id, provider)
+                if cursor_required and outcome_cursor is None:
+                    raise RuntimeError("required provider outcome boundary is unavailable")
                 if outcome_cursor is not None and not bind_workflow_turn_provider_outcome_cursor(
                     terminal_id, logical_turn_id, outcome_cursor
                 ):

@@ -210,6 +210,10 @@ class BaseProvider(ABC):
         """
         return None
 
+    def turn_outcome_cursor_required(self) -> bool:
+        """Return whether logical-turn transport must bind an outcome cursor."""
+        return False
+
     def is_process_alive(self) -> bool:
         """Report provider-process liveness without inferring it from tmux.
 

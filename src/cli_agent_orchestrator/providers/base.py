@@ -23,6 +23,7 @@ and output format to reliably detect status changes.
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
+from cli_agent_orchestrator.models.provider import ProviderTurnOutcome
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.usage import UsageObservation
 
@@ -184,6 +185,34 @@ class BaseProvider(ABC):
         telemetry loss, never as a provider failure.
         """
         return None
+
+    def get_turn_outcome(
+        self,
+        *,
+        provider_session_id: Optional[str] = None,
+        after_cursor: Optional[str] = None,
+    ) -> Optional[ProviderTurnOutcome]:
+        """Return a structured outcome after an exact transport boundary.
+
+        This optional extension deliberately does not infer semantics from a
+        rendered terminal status. Providers without a stronger protocol signal
+        retain the historical ``None`` behavior.
+        """
+        return None
+
+    def capture_turn_outcome_cursor(
+        self, *, provider_session_id: Optional[str] = None
+    ) -> Optional[str]:
+        """Capture an opaque provider-event boundary before physical input.
+
+        The matching cursor is persisted on the exact workflow turn. Providers
+        without a safely comparable structured event stream return ``None``.
+        """
+        return None
+
+    def turn_outcome_cursor_required(self) -> bool:
+        """Return whether logical-turn transport must bind an outcome cursor."""
+        return False
 
     def is_process_alive(self) -> bool:
         """Report provider-process liveness without inferring it from tmux.

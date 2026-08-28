@@ -11,6 +11,7 @@ import {
   translatePlural,
   useI18n,
 } from '../i18n'
+import { ProviderOutcomeNotice } from '../components/ProviderOutcomeNotice'
 
 function LocaleProbe({ raw }: { raw?: string }) {
   const { locale, setLocale, t } = useI18n()
@@ -83,6 +84,26 @@ describe('authenticated application locale contract', () => {
     const before = screen.getByTestId('raw-content').textContent
     fireEvent.click(screen.getByRole('button', { name: 'Русский' }))
     expect(screen.getByTestId('raw-content').textContent).toBe(before)
+  })
+
+  it('localizes provider content-unavailable chrome without rendering provider detail', () => {
+    const first = render(
+      <I18nProvider>
+        <ProviderOutcomeNotice code="PROVIDER_CONTENT_UNAVAILABLE" />
+      </I18nProvider>,
+    )
+    expect(screen.getByText('Provider response unavailable')).toBeInTheDocument()
+    expect(screen.queryByText(/cyber_policy|This content can't be shown/i)).not.toBeInTheDocument()
+
+    first.unmount()
+    localStorage.setItem(APP_LOCALE_STORAGE_KEY, 'ru')
+    render(
+      <I18nProvider>
+        <ProviderOutcomeNotice code="PROVIDER_CONTENT_UNAVAILABLE" />
+      </I18nProvider>,
+    )
+    expect(screen.getByText('Ответ провайдера недоступен')).toBeInTheDocument()
+    expect(screen.getByText(/Состояние рабочего процесса сохранено/)).toBeInTheDocument()
   })
 })
 

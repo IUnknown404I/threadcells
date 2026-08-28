@@ -38,6 +38,7 @@ from cli_agent_orchestrator.clients.database import (
     WorktreeWriterLeaseConflict,
     acquire_terminal_runtime_transport,
     bind_terminal_provider_resume_identity,
+    bind_workflow_turn_provider_outcome_cursor,
     cancel_child_assignments_for_terminal,
     cancel_workflows_for_terminal,
     claim_terminal_runtime_exit,
@@ -76,7 +77,7 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.clients.tmux import PaneTargetError, tmux_client
 from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
 from cli_agent_orchestrator.models.inbox import OrchestrationType
-from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.models.provider import ProviderTurnOutcome, ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalLifecycle, TerminalStatus
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
@@ -1145,6 +1146,8 @@ def _create_terminal_after_admission(
             session_id=session_lifetime_id or f"legacy:{session_name}",
             agent_profile=agent_profile,
             status=TerminalStatus.IDLE,
+            provider_outcome_code=None,
+            provider_outcome_detail=None,
             last_active=datetime.now(),
         )
 
@@ -1481,6 +1484,67 @@ def provider_runtime_sidecar_reconnect_required(terminal_id: str, provider: Any 
     return bool(predicate and predicate() is True)
 
 
+def _runtime_bound_provider_observer(
+    terminal_id: str, provider: Any = None
+) -> tuple[Any, str] | None:
+    """Resolve one provider observer only for the persisted current generation."""
+    metadata = get_terminal_metadata(terminal_id)
+    if (
+        metadata is None
+        or metadata.get("runtime_lifecycle") not in {"starting", "running"}
+        or not metadata.get("provider_resume_identity")
+        or metadata.get("provider_resume_runtime_generation") != metadata.get("runtime_generation")
+    ):
+        return None
+    runtime_provider = (
+        provider if provider is not None else provider_manager.get_provider(terminal_id)
+    )
+    return runtime_provider, str(metadata["provider_resume_identity"])
+
+
+def capture_provider_turn_outcome_cursor(terminal_id: str, provider: Any = None) -> Optional[str]:
+    """Capture an opaque structured-event boundary for the current runtime."""
+    try:
+        resolved = _runtime_bound_provider_observer(terminal_id, provider)
+        if resolved is None:
+            return None
+        runtime_provider, provider_session_id = resolved
+        capture = getattr(runtime_provider, "capture_turn_outcome_cursor", None)
+        if capture is None:
+            return None
+        cursor = capture(provider_session_id=provider_session_id)
+    except Exception:
+        logger.warning("Provider turn cursor capture failed for %s", terminal_id, exc_info=True)
+        return None
+    return cursor if isinstance(cursor, str) and cursor else None
+
+
+def provider_turn_outcome(
+    terminal_id: str, after_cursor: str, provider: Any = None
+) -> Optional[ProviderTurnOutcome]:
+    """Read a provider-native outcome after this turn's exact send boundary."""
+    try:
+        resolved = _runtime_bound_provider_observer(terminal_id, provider)
+        if resolved is None:
+            return None
+        runtime_provider, provider_session_id = resolved
+        observer = getattr(runtime_provider, "get_turn_outcome", None)
+        if observer is None:
+            return None
+        outcome = observer(
+            provider_session_id=provider_session_id,
+            after_cursor=after_cursor,
+        )
+    except Exception:
+        logger.warning(
+            "Provider turn outcome observation failed for %s",
+            terminal_id,
+            exc_info=True,
+        )
+        return None
+    return outcome if isinstance(outcome, ProviderTurnOutcome) else None
+
+
 def provider_runtime_sidecar_resume_identity(terminal_id: str) -> str:
     """Capture the exact provider identity at a managed readiness boundary."""
     provider = provider_manager.get_provider(terminal_id)
@@ -1738,6 +1802,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "workflow_state": workflow["state"],
             "workflow_status": workflow["workflow_status"],
             "workflow_reason": workflow.get("workflow_reason"),
+            "provider_outcome_code": workflow.get("provider_outcome_code"),
+            "provider_outcome_detail": workflow.get("provider_outcome_detail"),
             "assignment_status": workflow["assignment_status"],
             "result_status": workflow["result_status"],
             "delivery_status": workflow["delivery_status"],
@@ -1839,6 +1905,16 @@ def send_input(
                 _wake_queued_provider_execution(registry)
             raise AdmissionDenied("TERMINAL_RUNTIME_OPERATION_BUSY", {})
         try:
+            if logical_turn_id is not None:
+                cursor_requirement = getattr(provider, "turn_outcome_cursor_required", None)
+                cursor_required = bool(cursor_requirement and cursor_requirement() is True)
+                outcome_cursor = capture_provider_turn_outcome_cursor(terminal_id, provider)
+                if cursor_required and outcome_cursor is None:
+                    raise RuntimeError("required provider outcome boundary is unavailable")
+                if outcome_cursor is not None and not bind_workflow_turn_provider_outcome_cursor(
+                    terminal_id, logical_turn_id, outcome_cursor
+                ):
+                    raise RuntimeError("provider outcome boundary lost workflow-turn ownership")
             tmux_client.send_keys(
                 metadata["tmux_session"],
                 metadata["tmux_window"],

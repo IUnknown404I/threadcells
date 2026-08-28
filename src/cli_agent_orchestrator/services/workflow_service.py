@@ -22,9 +22,11 @@ from cli_agent_orchestrator.clients.database import (
     get_pending_message_receiver_ids,
     get_pending_workflow_provider_reconnect_root_terminal_ids,
     get_queued_workflow_root_terminal_ids,
+    get_workflow_provider_outcome_observation,
     mark_workflow_turn_sent,
     observe_workflow_final,
     observe_workflow_processing,
+    observe_workflow_provider_outcome,
     observe_workflow_ready,
     prepare_workflow_input,
     renew_workflow_provider_reconnect,
@@ -37,6 +39,7 @@ from cli_agent_orchestrator.clients.database import (
     workflow_provider_reconnect_pending,
 )
 from cli_agent_orchestrator.models.inbox import ChildAssignmentStatus, OrchestrationType
+from cli_agent_orchestrator.models.provider import ProviderTurnOutcome
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.services import terminal_service
@@ -340,6 +343,32 @@ def _reconcile_root_workflow_with_admission(
                 exc,
             )
             return False
+        return False
+
+    outcome_observation = get_workflow_provider_outcome_observation(root_terminal_id)
+    provider_outcome = (
+        terminal_service.provider_turn_outcome(root_terminal_id, outcome_observation["cursor"])
+        if outcome_observation is not None
+        else None
+    )
+    if isinstance(provider_outcome, ProviderTurnOutcome):
+        persisted = observe_workflow_provider_outcome(
+            root_terminal_id,
+            outcome_observation["turn_id"],
+            outcome_observation["cursor"],
+            provider_outcome.code,
+            provider_outcome.detail_code,
+            now=now,
+        )
+        logger.info(
+            "Provider outcome %s observed for %s (persisted=%s)",
+            provider_outcome.code,
+            root_terminal_id,
+            persisted,
+        )
+        # A policy outcome never owns an automatic retry or an Inbox-driven
+        # continuation. A deliberate external Composer input can supersede the
+        # finished turn through the normal exactly-once admission contract.
         return False
 
     # Inbox-backed provider inputs already own their exact logical turn and

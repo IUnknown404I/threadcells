@@ -15,6 +15,7 @@ import { providerIsAvailable, providerSelectOption } from '../providerAvailabili
 import { useAgentSummaryFeed, useNearViewport, useSessionSummaryFeed } from '../uiReadModels'
 import { AgentViewControls, type AgentViewLayout } from './AgentViewControls'
 import { useI18n, type TranslationKey } from '../i18n'
+import { ProviderOutcomeNotice } from './ProviderOutcomeNotice'
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })))
 
@@ -464,6 +465,7 @@ export function AgentPanel({
           <button onClick={() => setPendingClose(toTerminalMeta(terminal))} disabled={closingTerminal === terminal.id || terminal.lifecycle !== 'exited'} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-red-600 hover:bg-red-500 disabled:opacity-40 text-white text-xs font-medium rounded-lg transition-colors" title={terminal.lifecycle === 'exited' ? t('home.deleteExited') : t('home.exitBeforeDelete')}><Trash2 size={14} />{closingTerminal === terminal.id ? t('agents.deleting') : t('common.delete')}</button>
         </div>
       </div>
+      <ProviderOutcomeNotice code={terminal.provider_outcome_code} />
       {terminal.launch_worktree && <div className="flex items-center gap-1.5" title={terminal.launch_worktree}><FolderOpen size={12} className="text-gray-600 shrink-0" /><span className="text-xs font-mono text-gray-500 truncate max-w-[400px]">{terminal.launch_worktree}</span></div>}
       <button onClick={() => openTerminal(terminal.id, terminal.provider, terminal.agent_profile)} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">{t('agents.openComposer')}</button>
     </div>

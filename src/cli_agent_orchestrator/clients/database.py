@@ -724,6 +724,15 @@ class WorkflowTurnModel(Base):
     # successor while guaranteeing that a stable Ready OPEN workflow advances.
     provider_processing_observed_at = Column(DateTime, nullable=True)
     provider_ready_observed_at = Column(DateTime, nullable=True)
+    # A provider-native, response-free classification for the settled turn.
+    # The normalized code drives lifecycle/read-model behavior; the optional
+    # detail is a bounded provider protocol identifier, never response prose.
+    provider_outcome_code = Column(String, nullable=True)
+    provider_outcome_detail = Column(String, nullable=True)
+    provider_outcome_observed_at = Column(DateTime, nullable=True)
+    # Provider-native event-stream boundary captured before this exact turn's
+    # physical transport. It is opaque to workflow logic and compared by CAS.
+    provider_outcome_cursor = Column(String, nullable=True)
     # A stale MCP sidecar is recovered by one provider-native context
     # reinitialization. This durable timestamp is a short retry lease so two
     # workflow reconcilers cannot race the restart. The opaque provider resume
@@ -2268,6 +2277,16 @@ def _migrate_workflow_turn_columns() -> None:
             conn.execute(
                 "ALTER TABLE workflow_turns ADD COLUMN provider_ready_observed_at DATETIME"
             )
+        if "provider_outcome_code" not in columns:
+            conn.execute("ALTER TABLE workflow_turns ADD COLUMN provider_outcome_code TEXT")
+        if "provider_outcome_detail" not in columns:
+            conn.execute("ALTER TABLE workflow_turns ADD COLUMN provider_outcome_detail TEXT")
+        if "provider_outcome_observed_at" not in columns:
+            conn.execute(
+                "ALTER TABLE workflow_turns ADD COLUMN provider_outcome_observed_at DATETIME"
+            )
+        if "provider_outcome_cursor" not in columns:
+            conn.execute("ALTER TABLE workflow_turns ADD COLUMN provider_outcome_cursor TEXT")
         if "provider_reconnect_requested_at" not in columns:
             conn.execute(
                 "ALTER TABLE workflow_turns ADD COLUMN provider_reconnect_requested_at DATETIME"
@@ -3643,9 +3662,12 @@ WITH selected_terminals AS MATERIALIZED (
                   AND NULLIF(TRIM(lw.terminal_reason), '') IS NOT NULL THEN 'owner_gate'
              WHEN lw.status = 'terminal' THEN 'completed'
              WHEN lw.status = 'cancelled' THEN 'cancelled'
+             WHEN lw.status = 'open' AND awt.provider_outcome_code IS NOT NULL
+                  AND br.relation_state IS NULL THEN 'recoverable'
              ELSE COALESCE(br.relation_state, CASE WHEN lw.status = 'open' THEN 'active' END)
            END AS workflow_state,
            lw.status AS workflow_status, lw.terminal_reason AS workflow_reason,
+           awt.provider_outcome_code, awt.provider_outcome_detail,
            lr.status AS assignment_status,
            lr.result_status, lr.status AS delivery_status,
            t.context_role, t.launch_worktree, t.managed_worktree_kind,
@@ -5441,6 +5463,7 @@ TURN_CLAIMED = "claimed"
 TURN_SENT = "sent"
 TURN_FINISHED = "finished"
 TURN_CANCELLED = "cancelled"
+PROVIDER_CONTENT_UNAVAILABLE = "PROVIDER_CONTENT_UNAVAILABLE"
 WORKFLOW_EXECUTION_RESUME_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{40,64}$")
 # A provider-final observation for a turn whose receiver never admitted the
 # envelope is not progress.  Keep this distinct from ``None`` (no workflow or
@@ -6073,6 +6096,7 @@ def queue_workflow_input_for_provider(
                     WorkflowTurnModel.queue_reason: reason_code,
                     WorkflowTurnModel.claim_token: None,
                     WorkflowTurnModel.claim_expires_at: None,
+                    WorkflowTurnModel.provider_outcome_cursor: None,
                     WorkflowTurnModel.updated_at: datetime.now(),
                 },
                 synchronize_session=False,
@@ -6333,6 +6357,21 @@ def get_terminal_workflow_projection(terminal_id: str) -> Dict[str, Optional[str
     with SessionLocal() as db:
         workflow = _open_workflow(db, terminal_id, create=False)
         raw_workflow = workflow.status if workflow is not None else None
+        active_turn = (
+            db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
+            if workflow is not None and workflow.active_turn_id is not None
+            else None
+        )
+        provider_outcome_code = (
+            str(active_turn.provider_outcome_code)
+            if active_turn is not None and active_turn.provider_outcome_code
+            else None
+        )
+        provider_outcome_detail = (
+            str(active_turn.provider_outcome_detail)
+            if active_turn is not None and active_turn.provider_outcome_detail
+            else None
+        )
         assignments = (
             db.query(ChildAssignmentModel)
             .filter(
@@ -6429,7 +6468,11 @@ def get_terminal_workflow_projection(terminal_id: str) -> Dict[str, Optional[str
                 ):
                     relation_state = candidate_state
 
-            state = relation_state or ("active" if raw_workflow == WORKFLOW_OPEN else None)
+            state = relation_state or (
+                "recoverable"
+                if raw_workflow == WORKFLOW_OPEN and provider_outcome_code is not None
+                else "active" if raw_workflow == WORKFLOW_OPEN else None
+            )
 
         assignment_status = assignment.status if assignment is not None else None
         result_status = result.status if result is not None else None
@@ -6437,6 +6480,8 @@ def get_terminal_workflow_projection(terminal_id: str) -> Dict[str, Optional[str
             "state": state,
             "workflow_status": raw_workflow,
             "workflow_reason": owner_reason,
+            "provider_outcome_code": provider_outcome_code,
+            "provider_outcome_detail": provider_outcome_detail,
             "assignment_status": assignment_status,
             "result_status": result_status,
             "delivery_status": assignment_status,
@@ -8505,6 +8550,160 @@ def observe_workflow_ready(
     return observe_workflow_final(root_terminal_id, now=now) if should_finalize else None
 
 
+def bind_workflow_turn_provider_outcome_cursor(
+    root_terminal_id: str,
+    logical_turn_id: int,
+    cursor: str,
+) -> bool:
+    """Bind one opaque pre-transport provider boundary to the active turn."""
+    if not re.fullmatch(r"[A-Za-z0-9:._-]{1,192}", cursor):
+        raise ValueError("provider outcome cursor is malformed")
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        workflow = _open_workflow(db, root_terminal_id, create=False)
+        if (
+            workflow is None
+            or workflow.status != WORKFLOW_OPEN
+            or workflow.active_turn_id != logical_turn_id
+        ):
+            db.rollback()
+            return False
+        turn = db.get(WorkflowTurnModel, logical_turn_id)
+        if (
+            turn is None
+            or turn.workflow_id != workflow.id
+            or turn.state not in (TURN_CLAIMED, TURN_SENT)
+        ):
+            db.rollback()
+            return False
+        if turn.provider_outcome_cursor is not None:
+            matches = turn.provider_outcome_cursor == cursor
+            db.rollback()
+            return matches
+        turn.provider_outcome_cursor = cursor
+        turn.updated_at = datetime.now()
+        db.commit()
+        return True
+
+
+def get_workflow_provider_outcome_observation(
+    root_terminal_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Return the active turn and its exact provider boundary, if transport-bound."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        workflow = _open_workflow(db, root_terminal_id, create=False)
+        if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
+            return None
+        turn = db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
+        if (
+            turn is None
+            or turn.workflow_id != workflow.id
+            or turn.state not in (TURN_SENT, TURN_FINISHED)
+            or not turn.provider_outcome_cursor
+        ):
+            return None
+        return {"turn_id": int(turn.id), "cursor": str(turn.provider_outcome_cursor)}
+
+
+def observe_workflow_provider_outcome(
+    root_terminal_id: str,
+    expected_turn_id: int,
+    expected_cursor: str,
+    outcome_code: str,
+    detail_code: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Finalize one active transported turn with a non-retriable provider outcome.
+
+    Unlike a generic provider final, this transition never manufactures an
+    ``open_final`` successor. The workflow remains OPEN for a deliberate new
+    external input, while the exact active turn retains the durable outcome.
+    A receipt is not required: policy can stop a model before it claims the
+    envelope, and the transition grants no privileged-effect authority.
+    """
+    if outcome_code != PROVIDER_CONTENT_UNAVAILABLE:
+        raise ValueError("unsupported provider outcome")
+    if detail_code is not None and not re.fullmatch(r"[a-z0-9_]{1,64}", detail_code):
+        raise ValueError("provider outcome detail is malformed")
+    _ensure_workflow_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        workflow = _open_workflow(db, root_terminal_id, create=False)
+        if (
+            workflow is None
+            or workflow.status != WORKFLOW_OPEN
+            or workflow.active_turn_id != expected_turn_id
+        ):
+            db.rollback()
+            return False
+        turn = db.get(WorkflowTurnModel, expected_turn_id)
+        if (
+            turn is None
+            or turn.workflow_id != workflow.id
+            or turn.provider_outcome_cursor != expected_cursor
+        ):
+            db.rollback()
+            return False
+        if turn.provider_outcome_code is not None:
+            matches = (
+                turn.state == TURN_FINISHED
+                and turn.provider_outcome_code == outcome_code
+                and turn.provider_outcome_detail == detail_code
+            )
+            db.rollback()
+            return matches
+        if turn.state not in (TURN_SENT, TURN_FINISHED):
+            db.rollback()
+            return False
+
+        # A pre-upgrade observer may already have created the exact synthetic
+        # successor. It is safe to cancel only before transport ownership; a
+        # claimed or sent row remains fail-closed and prevents relabelling.
+        successor = (
+            db.query(WorkflowTurnModel)
+            .filter(
+                WorkflowTurnModel.workflow_id == workflow.id,
+                WorkflowTurnModel.dedupe_key == f"open-final:{expected_turn_id}",
+            )
+            .first()
+        )
+        if successor is not None and successor.state not in (TURN_QUEUED, TURN_CANCELLED):
+            db.rollback()
+            return False
+        if successor is not None and successor.state == TURN_QUEUED:
+            successor.state = TURN_CANCELLED
+            successor.queue_reason = None
+            successor.updated_at = now
+
+        turn.state = TURN_FINISHED
+        turn.provider_outcome_code = outcome_code
+        turn.provider_outcome_detail = detail_code
+        turn.provider_outcome_observed_at = now
+        turn.updated_at = now
+        workflow.updated_at = now
+        db.commit()
+        return True
+
+
+def get_workflow_provider_outcome(root_terminal_id: str) -> Optional[Dict[str, str]]:
+    """Return the active turn's safe normalized provider outcome, if any."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        workflow = _open_workflow(db, root_terminal_id, create=False)
+        if workflow is None or workflow.active_turn_id is None:
+            return None
+        turn = db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
+        if turn is None or turn.workflow_id != workflow.id or not turn.provider_outcome_code:
+            return None
+        result = {"code": str(turn.provider_outcome_code)}
+        if turn.provider_outcome_detail:
+            result["detail_code"] = str(turn.provider_outcome_detail)
+        return result
+
+
 def observe_workflow_final(
     root_terminal_id: str, now: Optional[datetime] = None
 ) -> Optional[int] | str:
@@ -8945,6 +9144,7 @@ def requeue_workflow_turn(
         values: Dict[Any, Any] = {
             WorkflowTurnModel.claim_token: None,
             WorkflowTurnModel.claim_expires_at: None,
+            WorkflowTurnModel.provider_outcome_cursor: None,
             WorkflowTurnModel.updated_at: now,
         }
         admission_deferred = admission_reason_code is not None
@@ -9059,6 +9259,7 @@ def requeue_expired_workflow_turn_claims(now: Optional[datetime] = None) -> int:
                     WorkflowTurnModel.state: TURN_QUEUED,
                     WorkflowTurnModel.claim_token: None,
                     WorkflowTurnModel.claim_expires_at: None,
+                    WorkflowTurnModel.provider_outcome_cursor: None,
                     WorkflowTurnModel.updated_at: now,
                 },
                 synchronize_session=False,
@@ -9101,6 +9302,7 @@ def requeue_unadmitted_workflow_turns_for_restart(now: Optional[datetime] = None
                     WorkflowTurnModel.state: TURN_QUEUED,
                     WorkflowTurnModel.claim_token: None,
                     WorkflowTurnModel.claim_expires_at: None,
+                    WorkflowTurnModel.provider_outcome_cursor: None,
                     WorkflowTurnModel.updated_at: now,
                 },
                 synchronize_session=False,

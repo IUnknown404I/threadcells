@@ -59,6 +59,12 @@ class Terminal(BaseModel):
     workflow_status: Optional[str] = Field(
         None, description="Raw durable workflow status retained as diagnostic metadata"
     )
+    provider_outcome_code: Optional[str] = Field(
+        None, description="Normalized structured outcome for the active provider turn"
+    )
+    provider_outcome_detail: Optional[str] = Field(
+        None, description="Bounded provider-native outcome identifier; never response content"
+    )
     assignment_status: Optional[str] = Field(
         None, description="Raw delegated-child relation status retained as diagnostic metadata"
     )

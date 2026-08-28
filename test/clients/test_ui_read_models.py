@@ -838,3 +838,49 @@ def test_session_agents_and_boundaries_use_durable_creation_order(monkeypatch):
         "m-created-last",
         "b-created-fourth",
     ]
+
+
+def test_provider_content_unavailable_projects_recoverable_without_processing(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 8, 28, 12, 0, 0)
+    with database.SessionLocal() as db:
+        db.add(
+            TerminalModel(
+                id="provider-policy",
+                tmux_session="cao-provider-policy",
+                session_id="lifetime-provider-policy",
+                tmux_window="provider-policy",
+                provider="codex",
+                runtime_lifecycle="running",
+                last_active=now,
+            )
+        )
+        workflow = WorkflowModel(
+            root_terminal_id="provider-policy",
+            status="open",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(workflow)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="provider-policy-turn",
+            state="finished",
+            provider_outcome_code="PROVIDER_CONTENT_UNAVAILABLE",
+            provider_outcome_detail="cyber_policy",
+            provider_outcome_observed_at=now,
+        )
+        db.add(turn)
+        db.flush()
+        workflow.active_turn_id = turn.id
+        db.commit()
+
+    item = ui_read_model_service.list_agent_summaries(limit=10)["items"][0]
+
+    assert item["activity"] == "ready"
+    assert item["execution_state"] == "ready"
+    assert item["workflow_state"] == "recoverable"
+    assert item["provider_outcome_code"] == "PROVIDER_CONTENT_UNAVAILABLE"
+    assert item["provider_outcome_detail"] == "cyber_policy"

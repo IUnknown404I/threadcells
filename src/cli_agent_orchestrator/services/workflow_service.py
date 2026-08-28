@@ -22,6 +22,7 @@ from cli_agent_orchestrator.clients.database import (
     get_pending_message_receiver_ids,
     get_pending_workflow_provider_reconnect_root_terminal_ids,
     get_queued_workflow_root_terminal_ids,
+    get_workflow_provider_outcome_observation,
     mark_workflow_turn_sent,
     observe_workflow_final,
     observe_workflow_processing,
@@ -344,10 +345,17 @@ def _reconcile_root_workflow_with_admission(
             return False
         return False
 
-    provider_outcome = terminal_service.provider_turn_outcome(root_terminal_id)
+    outcome_observation = get_workflow_provider_outcome_observation(root_terminal_id)
+    provider_outcome = (
+        terminal_service.provider_turn_outcome(root_terminal_id, outcome_observation["cursor"])
+        if outcome_observation is not None
+        else None
+    )
     if isinstance(provider_outcome, ProviderTurnOutcome):
         persisted = observe_workflow_provider_outcome(
             root_terminal_id,
+            outcome_observation["turn_id"],
+            outcome_observation["cursor"],
             provider_outcome.code,
             provider_outcome.detail_code,
             now=now,

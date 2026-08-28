@@ -179,6 +179,10 @@ CODEX_SESSION_ID_PATTERN = re.compile(
 )
 CODEX_PROVIDER_CONTENT_UNAVAILABLE = "PROVIDER_CONTENT_UNAVAILABLE"
 CODEX_CONTENT_UNAVAILABLE_ERROR_CODES = frozenset({"cyber_policy"})
+CODEX_OUTCOME_CURSOR_PATTERN = re.compile(
+    r"^codex-jsonl-v1:(?P<device>[0-9a-f]+):(?P<inode>[0-9a-f]+):"
+    r"(?P<offset>[0-9]+):(?P<complete>[01])$"
+)
 CODEX_OUTCOME_TRANSCRIPT_LIMIT_BYTES = 8 * 1024 * 1024
 CODEX_PANE_COMMAND_PATTERN = re.compile(r"^codex(?:[.-][A-Za-z0-9_-]+)?$")
 SHELL_PANE_COMMANDS = {"bash", "sh", "dash", "zsh", "fish"}
@@ -475,20 +479,57 @@ def _rollout_path_for_identity(
     return next(iter(candidates)) if len(candidates) == 1 else None
 
 
-def _latest_structured_codex_outcome(path: Path) -> Optional[ProviderTurnOutcome]:
-    """Classify the latest settled turn from bounded provider protocol rows.
-
-    Only a provider-native ``task_complete.error.codex_error_info`` value is
-    authoritative. Rendered interstitial prose and any unavailable response
-    body are deliberately ignored.
-    """
+def _codex_outcome_cursor(path: Path) -> Optional[str]:
+    """Capture an exact regular-file identity and byte offset."""
     descriptor = -1
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
         file_stat = os.fstat(descriptor)
         if not stat.S_ISREG(file_stat.st_mode):
             return None
-        start = max(0, file_stat.st_size - CODEX_OUTCOME_TRANSCRIPT_LIMIT_BYTES)
+        complete_row = file_stat.st_size == 0
+        if file_stat.st_size:
+            os.lseek(descriptor, file_stat.st_size - 1, os.SEEK_SET)
+            complete_row = os.read(descriptor, 1) == b"\n"
+        return (
+            f"codex-jsonl-v1:{file_stat.st_dev:x}:{file_stat.st_ino:x}:"
+            f"{file_stat.st_size}:{int(complete_row)}"
+        )
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _latest_structured_codex_outcome(
+    path: Path, after_cursor: str
+) -> Optional[ProviderTurnOutcome]:
+    """Classify one settled turn after its exact transport boundary.
+
+    Only a provider-native ``task_complete.error.codex_error_info`` value is
+    authoritative. Rendered interstitial prose and any unavailable response
+    body are deliberately ignored.
+    """
+    cursor_match = CODEX_OUTCOME_CURSOR_PATTERN.fullmatch(after_cursor)
+    if cursor_match is None:
+        return None
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            return None
+        expected_identity = (
+            int(cursor_match.group("device"), 16),
+            int(cursor_match.group("inode"), 16),
+        )
+        if (file_stat.st_dev, file_stat.st_ino) != expected_identity:
+            return None
+        cursor_offset = int(cursor_match.group("offset"))
+        if cursor_offset < 0 or cursor_offset > file_stat.st_size:
+            return None
+        start = max(cursor_offset, file_stat.st_size - CODEX_OUTCOME_TRANSCRIPT_LIMIT_BYTES)
         os.lseek(descriptor, start, os.SEEK_SET)
         chunks: list[bytes] = []
         remaining = file_stat.st_size - start
@@ -505,11 +546,12 @@ def _latest_structured_codex_outcome(path: Path) -> Optional[ProviderTurnOutcome
         if descriptor >= 0:
             os.close(descriptor)
 
-    if start:
+    if start > cursor_offset or cursor_match.group("complete") == "0":
         _discarded, separator, raw = raw.partition(b"\n")
         if not separator:
             return None
-    latest_event: tuple[str, Optional[str]] | None = None
+    turn_started = False
+    latest_outcome: Optional[str] = None
     for line in raw.splitlines():
         try:
             row = json.loads(line)
@@ -522,25 +564,22 @@ def _latest_structured_codex_outcome(path: Path) -> Optional[ProviderTurnOutcome
             continue
         event_type = payload.get("type")
         if event_type == "task_started":
-            latest_event = ("task_started", None)
+            turn_started = True
+            latest_outcome = None
             continue
         if event_type != "task_complete":
             continue
+        if not turn_started:
+            continue
         error = payload.get("error")
         detail_code = error.get("codex_error_info") if isinstance(error, dict) else None
-        latest_event = (
-            "task_complete",
-            detail_code if isinstance(detail_code, str) else None,
-        )
+        latest_outcome = detail_code if isinstance(detail_code, str) else None
+        turn_started = False
 
-    if (
-        latest_event is not None
-        and latest_event[0] == "task_complete"
-        and latest_event[1] in CODEX_CONTENT_UNAVAILABLE_ERROR_CODES
-    ):
+    if latest_outcome in CODEX_CONTENT_UNAVAILABLE_ERROR_CODES:
         return ProviderTurnOutcome(
             code=CODEX_PROVIDER_CONTENT_UNAVAILABLE,
-            detail_code=latest_event[1],
+            detail_code=latest_outcome,
         )
     return None
 
@@ -778,9 +817,31 @@ class CodexProvider(BaseProvider):
         self._input_received = True
 
     def get_turn_outcome(
-        self, *, provider_session_id: Optional[str] = None
+        self,
+        *,
+        provider_session_id: Optional[str] = None,
+        after_cursor: Optional[str] = None,
     ) -> Optional[ProviderTurnOutcome]:
-        """Return only the latest exact-session structured policy outcome."""
+        """Return one exact-session policy outcome after its send boundary."""
+        if not provider_session_id or not after_cursor:
+            return None
+        working_directory_value = tmux_client.get_pane_working_directory(
+            self.session_name, self.window_name
+        )
+        if not working_directory_value or not os.path.isabs(working_directory_value):
+            return None
+        rollout_path = _rollout_path_for_identity(
+            provider_session_id,
+            Path(working_directory_value).resolve(strict=False),
+        )
+        return (
+            _latest_structured_codex_outcome(rollout_path, after_cursor) if rollout_path else None
+        )
+
+    def capture_turn_outcome_cursor(
+        self, *, provider_session_id: Optional[str] = None
+    ) -> Optional[str]:
+        """Capture the exact rollout boundary before provider transport."""
         if not provider_session_id:
             return None
         working_directory_value = tmux_client.get_pane_working_directory(
@@ -792,7 +853,7 @@ class CodexProvider(BaseProvider):
             provider_session_id,
             Path(working_directory_value).resolve(strict=False),
         )
-        return _latest_structured_codex_outcome(rollout_path) if rollout_path else None
+        return _codex_outcome_cursor(rollout_path) if rollout_path else None
 
     def runtime_sidecar_reconnect_required(self) -> bool:
         """Return the signal cached by the normal provider status capture."""

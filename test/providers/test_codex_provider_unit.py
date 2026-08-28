@@ -1458,6 +1458,25 @@ class TestCodexBulletFormatStatusDetection:
                         "type": "event_msg",
                         "payload": {
                             "type": "task_complete",
+                            "error": {"codex_error_info": "cyber_policy"},
+                        },
+                    }
+                )
+                + "\n"
+            )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        cursor = provider.capture_turn_outcome_cursor(provider_session_id=identity)
+        assert cursor is not None
+        with rollout.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n"
+            )
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_complete",
                             "error": {
                                 "codex_error_info": "cyber_policy",
                                 "message": "provider-owned text must not be retained",
@@ -1467,14 +1486,58 @@ class TestCodexBulletFormatStatusDetection:
                 )
                 + "\n"
             )
-        monkeypatch.setenv("CODEX_HOME", str(codex_home))
-
-        outcome = provider.get_turn_outcome(provider_session_id=identity)
+        outcome = provider.get_turn_outcome(provider_session_id=identity, after_cursor=cursor)
 
         assert outcome is not None
         assert outcome.code == "PROVIDER_CONTENT_UNAVAILABLE"
         assert outcome.detail_code == "cyber_policy"
         assert not hasattr(outcome, "message")
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_structured_policy_cursor_skips_pre_transport_partial_row(
+        self, mock_tmux, tmp_path, monkeypatch
+    ):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        working_directory = tmp_path / "project"
+        working_directory.mkdir()
+        mock_tmux.get_pane_working_directory.return_value = str(working_directory)
+        codex_home = tmp_path / "codex"
+        identity = "01234567-89ab-cdef-0123-456789abcdef"
+        rollout = _open_rollout_fixture(
+            tmp_path / "proc",
+            codex_home,
+            process_id=200,
+            descriptor="8",
+            session_id=identity,
+            working_directory=working_directory,
+        )
+        with rollout.open("a", encoding="utf-8") as handle:
+            handle.write('{"type":"event_msg","payload":{"type":"task_started"}')
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        cursor = provider.capture_turn_outcome_cursor(provider_session_id=identity)
+        assert cursor is not None and cursor.endswith(":0")
+        with rollout.open("a", encoding="utf-8") as handle:
+            handle.write("}\n")
+            handle.write(
+                json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n"
+            )
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_complete",
+                            "error": {"codex_error_info": "cyber_policy"},
+                        },
+                    }
+                )
+                + "\n"
+            )
+
+        outcome = provider.get_turn_outcome(provider_session_id=identity, after_cursor=cursor)
+        assert outcome is not None
+        assert outcome.code == "PROVIDER_CONTENT_UNAVAILABLE"
+        assert outcome.detail_code == "cyber_policy"
 
     @pytest.mark.parametrize(
         "rows",
@@ -1520,12 +1583,17 @@ class TestCodexBulletFormatStatusDetection:
             session_id=identity,
             working_directory=working_directory,
         )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        cursor = provider.capture_turn_outcome_cursor(provider_session_id=identity)
+        assert cursor is not None
         with rollout.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n"
+            )
             for row in rows:
                 handle.write(json.dumps(row) + "\n")
-        monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
-        assert provider.get_turn_outcome(provider_session_id=identity) is None
+        assert provider.get_turn_outcome(provider_session_id=identity, after_cursor=cursor) is None
 
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
     def test_structured_policy_outcome_fails_closed_for_duplicate_rollout_identity(
@@ -1545,6 +1613,9 @@ class TestCodexBulletFormatStatusDetection:
             session_id=identity,
             working_directory=working_directory,
         )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        cursor = provider.capture_turn_outcome_cursor(provider_session_id=identity)
+        assert cursor is not None
         with rollout.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(
@@ -1563,9 +1634,7 @@ class TestCodexBulletFormatStatusDetection:
         )
         duplicate.parent.mkdir(parents=True)
         duplicate.write_bytes(rollout.read_bytes())
-        monkeypatch.setenv("CODEX_HOME", str(codex_home))
-
-        assert provider.get_turn_outcome(provider_session_id=identity) is None
+        assert provider.get_turn_outcome(provider_session_id=identity, after_cursor=cursor) is None
 
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
     def test_runtime_sidecar_resume_identity_fails_closed_when_ambiguous(

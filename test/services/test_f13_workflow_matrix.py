@@ -36,6 +36,7 @@ from cli_agent_orchestrator.clients.database import (
     activate_workflow_turn,
     activate_workflow_turn_for_inbox,
     arm_handoff_continuations_for_restart,
+    bind_workflow_turn_provider_outcome_cursor,
     cancel_workflows_for_terminal,
     claim_handoff_child_result_direct,
     claim_handoff_result_batch_for_inbox,
@@ -51,6 +52,7 @@ from cli_agent_orchestrator.clients.database import (
     get_parent_completion_barrier,
     get_pending_handoff_child_terminal_ids,
     get_workflow_provider_outcome,
+    get_workflow_provider_outcome_observation,
     get_workflow_status,
     get_workflow_turn_for_inbox,
     issue_workflow_input_binding,
@@ -92,6 +94,7 @@ from cli_agent_orchestrator.services.terminal_service import ExitTerminalResult
 
 TEST_CODEX_RESUME_IDENTITY = "01234567-89ab-cdef-0123-456789abcdef"
 TEST_TERMINAL_RUNTIME_GENERATION = "11111111-2222-4333-8444-555555555555"
+TEST_PROVIDER_OUTCOME_CURSOR = "codex-jsonl-v1:1:2:3:1"
 
 
 @pytest.fixture
@@ -167,6 +170,11 @@ def _start_admitted_input(root: str) -> int:
     assert turn_id is not None
     assert claim_workflow_turn_receipt(root, turn_id)
     return turn_id
+
+
+def _bind_policy_cursor(root: str, turn_id: int) -> str:
+    assert bind_workflow_turn_provider_outcome_cursor(root, turn_id, TEST_PROVIDER_OUTCOME_CURSOR)
+    return TEST_PROVIDER_OUTCOME_CURSOR
 
 
 def _pending_inbox_turn(root: str, message: str) -> tuple[database.InboxMessage, int]:
@@ -267,6 +275,7 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
     assert "provider_outcome_code" in columns
     assert "provider_outcome_detail" in columns
     assert "provider_outcome_observed_at" in columns
+    assert "provider_outcome_cursor" in columns
     assert "provider_reconnect_requested_at" in columns
     assert "provider_reconnect_claim_token" in columns
     assert "provider_reconnect_resume_identity" in columns
@@ -308,16 +317,27 @@ def test_f13_no_child_open_final_queues_one_safe_continuation(workflow_db):
 def test_f13_provider_content_unavailable_is_durable_without_automatic_successor(workflow_db):
     root = "root-provider-content-unavailable"
     turn_id = _start_admitted_input(root)
+    cursor = _bind_policy_cursor(root, turn_id)
     effect = claim_workflow_effect(root, turn_id, "send_message", "committed-before-policy")
     assert effect is not None
     assert finish_workflow_effect(root, effect["id"], effect["claim_token"], "completed")
     now = datetime(2026, 8, 28, 12, 0, 0)
 
     assert observe_workflow_provider_outcome(
-        root, "PROVIDER_CONTENT_UNAVAILABLE", "cyber_policy", now=now
+        root,
+        turn_id,
+        cursor,
+        "PROVIDER_CONTENT_UNAVAILABLE",
+        "cyber_policy",
+        now=now,
     )
     assert observe_workflow_provider_outcome(
-        root, "PROVIDER_CONTENT_UNAVAILABLE", "cyber_policy", now=now
+        root,
+        turn_id,
+        cursor,
+        "PROVIDER_CONTENT_UNAVAILABLE",
+        "cyber_policy",
+        now=now,
     )
 
     assert get_workflow_provider_outcome(root) == {
@@ -340,8 +360,15 @@ def test_f13_policy_before_receipt_finishes_without_granting_effect_authority(wo
     _ensure_running_test_terminal(root)
     turn_id = start_workflow_input(root)
     assert turn_id is not None
+    cursor = _bind_policy_cursor(root, turn_id)
 
-    assert observe_workflow_provider_outcome(root, "PROVIDER_CONTENT_UNAVAILABLE", "cyber_policy")
+    assert observe_workflow_provider_outcome(
+        root,
+        turn_id,
+        cursor,
+        "PROVIDER_CONTENT_UNAVAILABLE",
+        "cyber_policy",
+    )
     assert claim_workflow_effect(root, turn_id, "send_message", "never-admitted") is None
     assert claim_workflow_turn(root) is None
     with database.SessionLocal() as db:
@@ -384,7 +411,8 @@ def test_f13_reconciler_persists_policy_outcome_and_never_sends_automatic_retry(
     mock_terminal, workflow_db
 ):
     root = "root-policy-reconcile"
-    _start_admitted_input(root)
+    turn_id = _start_admitted_input(root)
+    _bind_policy_cursor(root, turn_id)
     mock_terminal.get_terminal.return_value = {
         "status": TerminalStatus.COMPLETED.value,
         "lifecycle": "running",
@@ -401,6 +429,92 @@ def test_f13_reconciler_persists_policy_outcome_and_never_sends_automatic_retry(
     mock_terminal.send_input.assert_not_called()
     with database.SessionLocal() as db:
         assert db.query(WorkflowTurnModel).count() == 1
+
+
+@patch("cli_agent_orchestrator.services.workflow_service.terminal_service")
+def test_f13_stale_policy_cannot_finish_composer_turn_before_physical_transport(
+    mock_terminal, workflow_db
+):
+    root = "root-policy-composer-interleave"
+    prior_turn_id = _start_admitted_input(root)
+    prior_cursor = _bind_policy_cursor(root, prior_turn_id)
+    assert observe_workflow_provider_outcome(
+        root,
+        prior_turn_id,
+        prior_cursor,
+        "PROVIDER_CONTENT_UNAVAILABLE",
+        "cyber_policy",
+    )
+
+    prepared = database.prepare_workflow_input(
+        root,
+        "deliberate owner continuation",
+        request_id="policy-interleave-1",
+        require_live_terminal=True,
+    )
+    assert prepared is not None and prepared["queued"] is False
+    continuation_turn_id = prepared["turn_id"]
+    mock_terminal.get_terminal.return_value = {
+        "status": TerminalStatus.COMPLETED.value,
+        "lifecycle": "running",
+    }
+    mock_terminal.provider_runtime_sidecar_reconnect_required.return_value = False
+    mock_terminal.provider_turn_outcome.return_value = ProviderTurnOutcome(
+        code="PROVIDER_CONTENT_UNAVAILABLE", detail_code="cyber_policy"
+    )
+
+    assert workflow_service.reconcile_root_workflow(root) is False
+    mock_terminal.provider_turn_outcome.assert_not_called()
+    assert get_workflow_provider_outcome(root) is None
+    assert claim_workflow_turn_receipt(root, continuation_turn_id)
+    assert not claim_workflow_turn_receipt(root, continuation_turn_id)
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, continuation_turn_id)
+        assert turn is not None
+        assert turn.state == "sent"
+        assert turn.provider_outcome_code is None
+        assert turn.provider_outcome_cursor is None
+
+
+def test_f13_provider_outcome_cas_rejects_newer_active_turn(workflow_db):
+    root = "root-provider-outcome-cas"
+    prior_turn_id = _start_admitted_input(root)
+    prior_cursor = _bind_policy_cursor(root, prior_turn_id)
+    observation = get_workflow_provider_outcome_observation(root)
+    assert observation == {"turn_id": prior_turn_id, "cursor": prior_cursor}
+    prepared = database.prepare_workflow_input(
+        root, "new turn", request_id="provider-outcome-cas-1", require_live_terminal=True
+    )
+    assert prepared is not None and prepared["turn_id"] != prior_turn_id
+
+    assert not observe_workflow_provider_outcome(
+        root,
+        observation["turn_id"],
+        observation["cursor"],
+        "PROVIDER_CONTENT_UNAVAILABLE",
+        "cyber_policy",
+    )
+    assert get_workflow_provider_outcome(root) is None
+
+
+def test_f13_provider_outcome_cursor_is_rebound_after_transport_retry(workflow_db):
+    root = "root-provider-outcome-retry"
+    _ensure_running_test_terminal(root)
+    turn_id = start_workflow_input(root)
+    assert turn_id is not None
+    _bind_policy_cursor(root, turn_id)
+    assert database.queue_workflow_input_for_provider(root, turn_id, "retry payload")
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowTurnModel, turn_id).provider_outcome_cursor is None
+
+    claimed = claim_workflow_turn(root)
+    assert claimed is not None and claimed["id"] == turn_id
+    assert bind_workflow_turn_provider_outcome_cursor(root, turn_id, "codex-jsonl-v1:4:5:6:1")
+    assert requeue_workflow_turn(turn_id, claimed["claim_token"], claimed["claim_generation"])
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, turn_id)
+        assert turn.state == "queued"
+        assert turn.provider_outcome_cursor is None
 
 
 def test_f13_stale_compacted_turn_rejection_keeps_open_workflow_moving_once(workflow_db):

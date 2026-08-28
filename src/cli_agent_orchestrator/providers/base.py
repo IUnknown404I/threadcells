@@ -187,13 +187,26 @@ class BaseProvider(ABC):
         return None
 
     def get_turn_outcome(
-        self, *, provider_session_id: Optional[str] = None
+        self,
+        *,
+        provider_session_id: Optional[str] = None,
+        after_cursor: Optional[str] = None,
     ) -> Optional[ProviderTurnOutcome]:
-        """Return a structured outcome for the latest settled provider turn.
+        """Return a structured outcome after an exact transport boundary.
 
         This optional extension deliberately does not infer semantics from a
         rendered terminal status. Providers without a stronger protocol signal
         retain the historical ``None`` behavior.
+        """
+        return None
+
+    def capture_turn_outcome_cursor(
+        self, *, provider_session_id: Optional[str] = None
+    ) -> Optional[str]:
+        """Capture an opaque provider-event boundary before physical input.
+
+        The matching cursor is persisted on the exact workflow turn. Providers
+        without a safely comparable structured event stream return ``None``.
         """
         return None
 

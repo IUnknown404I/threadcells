@@ -730,6 +730,9 @@ class WorkflowTurnModel(Base):
     provider_outcome_code = Column(String, nullable=True)
     provider_outcome_detail = Column(String, nullable=True)
     provider_outcome_observed_at = Column(DateTime, nullable=True)
+    # Provider-native event-stream boundary captured before this exact turn's
+    # physical transport. It is opaque to workflow logic and compared by CAS.
+    provider_outcome_cursor = Column(String, nullable=True)
     # A stale MCP sidecar is recovered by one provider-native context
     # reinitialization. This durable timestamp is a short retry lease so two
     # workflow reconcilers cannot race the restart. The opaque provider resume
@@ -2282,6 +2285,8 @@ def _migrate_workflow_turn_columns() -> None:
             conn.execute(
                 "ALTER TABLE workflow_turns ADD COLUMN provider_outcome_observed_at DATETIME"
             )
+        if "provider_outcome_cursor" not in columns:
+            conn.execute("ALTER TABLE workflow_turns ADD COLUMN provider_outcome_cursor TEXT")
         if "provider_reconnect_requested_at" not in columns:
             conn.execute(
                 "ALTER TABLE workflow_turns ADD COLUMN provider_reconnect_requested_at DATETIME"
@@ -6091,6 +6096,7 @@ def queue_workflow_input_for_provider(
                     WorkflowTurnModel.queue_reason: reason_code,
                     WorkflowTurnModel.claim_token: None,
                     WorkflowTurnModel.claim_expires_at: None,
+                    WorkflowTurnModel.provider_outcome_cursor: None,
                     WorkflowTurnModel.updated_at: datetime.now(),
                 },
                 synchronize_session=False,
@@ -8544,8 +8550,67 @@ def observe_workflow_ready(
     return observe_workflow_final(root_terminal_id, now=now) if should_finalize else None
 
 
+def bind_workflow_turn_provider_outcome_cursor(
+    root_terminal_id: str,
+    logical_turn_id: int,
+    cursor: str,
+) -> bool:
+    """Bind one opaque pre-transport provider boundary to the active turn."""
+    if not re.fullmatch(r"[A-Za-z0-9:._-]{1,192}", cursor):
+        raise ValueError("provider outcome cursor is malformed")
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        workflow = _open_workflow(db, root_terminal_id, create=False)
+        if (
+            workflow is None
+            or workflow.status != WORKFLOW_OPEN
+            or workflow.active_turn_id != logical_turn_id
+        ):
+            db.rollback()
+            return False
+        turn = db.get(WorkflowTurnModel, logical_turn_id)
+        if (
+            turn is None
+            or turn.workflow_id != workflow.id
+            or turn.state not in (TURN_CLAIMED, TURN_SENT)
+        ):
+            db.rollback()
+            return False
+        if turn.provider_outcome_cursor is not None:
+            matches = turn.provider_outcome_cursor == cursor
+            db.rollback()
+            return matches
+        turn.provider_outcome_cursor = cursor
+        turn.updated_at = datetime.now()
+        db.commit()
+        return True
+
+
+def get_workflow_provider_outcome_observation(
+    root_terminal_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Return the active turn and its exact provider boundary, if transport-bound."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        workflow = _open_workflow(db, root_terminal_id, create=False)
+        if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
+            return None
+        turn = db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
+        if (
+            turn is None
+            or turn.workflow_id != workflow.id
+            or turn.state not in (TURN_SENT, TURN_FINISHED)
+            or not turn.provider_outcome_cursor
+        ):
+            return None
+        return {"turn_id": int(turn.id), "cursor": str(turn.provider_outcome_cursor)}
+
+
 def observe_workflow_provider_outcome(
     root_terminal_id: str,
+    expected_turn_id: int,
+    expected_cursor: str,
     outcome_code: str,
     detail_code: Optional[str] = None,
     now: Optional[datetime] = None,
@@ -8567,12 +8632,19 @@ def observe_workflow_provider_outcome(
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         workflow = _open_workflow(db, root_terminal_id, create=False)
-        if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
+        if (
+            workflow is None
+            or workflow.status != WORKFLOW_OPEN
+            or workflow.active_turn_id != expected_turn_id
+        ):
             db.rollback()
             return False
-        active_turn_id = cast(int, workflow.active_turn_id)
-        turn = db.get(WorkflowTurnModel, active_turn_id)
-        if turn is None or turn.workflow_id != workflow.id:
+        turn = db.get(WorkflowTurnModel, expected_turn_id)
+        if (
+            turn is None
+            or turn.workflow_id != workflow.id
+            or turn.provider_outcome_cursor != expected_cursor
+        ):
             db.rollback()
             return False
         if turn.provider_outcome_code is not None:
@@ -8594,7 +8666,7 @@ def observe_workflow_provider_outcome(
             db.query(WorkflowTurnModel)
             .filter(
                 WorkflowTurnModel.workflow_id == workflow.id,
-                WorkflowTurnModel.dedupe_key == f"open-final:{active_turn_id}",
+                WorkflowTurnModel.dedupe_key == f"open-final:{expected_turn_id}",
             )
             .first()
         )
@@ -9072,6 +9144,7 @@ def requeue_workflow_turn(
         values: Dict[Any, Any] = {
             WorkflowTurnModel.claim_token: None,
             WorkflowTurnModel.claim_expires_at: None,
+            WorkflowTurnModel.provider_outcome_cursor: None,
             WorkflowTurnModel.updated_at: now,
         }
         admission_deferred = admission_reason_code is not None
@@ -9186,6 +9259,7 @@ def requeue_expired_workflow_turn_claims(now: Optional[datetime] = None) -> int:
                     WorkflowTurnModel.state: TURN_QUEUED,
                     WorkflowTurnModel.claim_token: None,
                     WorkflowTurnModel.claim_expires_at: None,
+                    WorkflowTurnModel.provider_outcome_cursor: None,
                     WorkflowTurnModel.updated_at: now,
                 },
                 synchronize_session=False,
@@ -9228,6 +9302,7 @@ def requeue_unadmitted_workflow_turns_for_restart(now: Optional[datetime] = None
                     WorkflowTurnModel.state: TURN_QUEUED,
                     WorkflowTurnModel.claim_token: None,
                     WorkflowTurnModel.claim_expires_at: None,
+                    WorkflowTurnModel.provider_outcome_cursor: None,
                     WorkflowTurnModel.updated_at: now,
                 },
                 synchronize_session=False,

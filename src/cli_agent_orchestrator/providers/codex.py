@@ -15,6 +15,7 @@ from typing import Any, Callable, Optional
 
 from cli_agent_orchestrator.clients.tmux import tmux_client
 from cli_agent_orchestrator.constants import TERMINAL_LOG_DIR
+from cli_agent_orchestrator.models.provider import ProviderTurnOutcome
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.usage import UsageObservation
 from cli_agent_orchestrator.providers.base import BaseProvider
@@ -176,6 +177,9 @@ CODEX_SESSION_ID_PATTERN = re.compile(
     r"(?P<session>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})" r"\.jsonl$",
     re.IGNORECASE,
 )
+CODEX_PROVIDER_CONTENT_UNAVAILABLE = "PROVIDER_CONTENT_UNAVAILABLE"
+CODEX_CONTENT_UNAVAILABLE_ERROR_CODES = frozenset({"cyber_policy"})
+CODEX_OUTCOME_TRANSCRIPT_LIMIT_BYTES = 8 * 1024 * 1024
 CODEX_PANE_COMMAND_PATTERN = re.compile(r"^codex(?:[.-][A-Za-z0-9_-]+)?$")
 SHELL_PANE_COMMANDS = {"bash", "sh", "dash", "zsh", "fish"}
 # The active Codex interaction is rendered at the bottom of capture-pane. Keep
@@ -431,6 +435,116 @@ def _root_rollout_identity(path: Path, working_directory: Path) -> Optional[str]
         return None
 
 
+def _rollout_path_for_identity(
+    provider_session_id: str,
+    working_directory: Path,
+    *,
+    codex_home: Optional[Path] = None,
+) -> Optional[Path]:
+    """Resolve one exact root rollout from its persisted provider identity.
+
+    Recency and display names are never authority. A missing or duplicated
+    identity is intentionally unclassifiable rather than guessed.
+    """
+    identity_match = CODEX_SESSION_ID_PATTERN.fullmatch(f"{provider_session_id}.jsonl")
+    if identity_match is None:
+        return None
+    normalized_identity = identity_match.group("session").lower()
+    root = (
+        codex_home
+        if codex_home is not None
+        else Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+    )
+    try:
+        session_root = (root / "sessions").resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return None
+    candidates: set[Path] = set()
+    try:
+        matching_paths = session_root.glob(f"**/*{normalized_identity}.jsonl")
+        for candidate in matching_paths:
+            try:
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(session_root)
+            except (FileNotFoundError, OSError, ValueError):
+                continue
+            if _root_rollout_identity(resolved, working_directory) == normalized_identity:
+                candidates.add(resolved)
+    except OSError:
+        return None
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+def _latest_structured_codex_outcome(path: Path) -> Optional[ProviderTurnOutcome]:
+    """Classify the latest settled turn from bounded provider protocol rows.
+
+    Only a provider-native ``task_complete.error.codex_error_info`` value is
+    authoritative. Rendered interstitial prose and any unavailable response
+    body are deliberately ignored.
+    """
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            return None
+        start = max(0, file_stat.st_size - CODEX_OUTCOME_TRANSCRIPT_LIMIT_BYTES)
+        os.lseek(descriptor, start, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = file_stat.st_size - start
+        while remaining > 0:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    if start:
+        _discarded, separator, raw = raw.partition(b"\n")
+        if not separator:
+            return None
+    latest_event: tuple[str, Optional[str]] | None = None
+    for line in raw.splitlines():
+        try:
+            row = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(row, dict) or row.get("type") != "event_msg":
+            continue
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        event_type = payload.get("type")
+        if event_type == "task_started":
+            latest_event = ("task_started", None)
+            continue
+        if event_type != "task_complete":
+            continue
+        error = payload.get("error")
+        detail_code = error.get("codex_error_info") if isinstance(error, dict) else None
+        latest_event = (
+            "task_complete",
+            detail_code if isinstance(detail_code, str) else None,
+        )
+
+    if (
+        latest_event is not None
+        and latest_event[0] == "task_complete"
+        and latest_event[1] in CODEX_CONTENT_UNAVAILABLE_ERROR_CODES
+    ):
+        return ProviderTurnOutcome(
+            code=CODEX_PROVIDER_CONTENT_UNAVAILABLE,
+            detail_code=latest_event[1],
+        )
+    return None
+
+
 def _durable_reconnect_output_boundary(terminal_id: str) -> Optional[dict[str, Any]]:
     """Load the DB-authorized byte boundary without creating a provider import cycle."""
     from cli_agent_orchestrator.clients.database import (
@@ -662,6 +776,23 @@ class CodexProvider(BaseProvider):
         self._reset_completion_candidate()
         self._handled_advisory_fingerprints.clear()
         self._input_received = True
+
+    def get_turn_outcome(
+        self, *, provider_session_id: Optional[str] = None
+    ) -> Optional[ProviderTurnOutcome]:
+        """Return only the latest exact-session structured policy outcome."""
+        if not provider_session_id:
+            return None
+        working_directory_value = tmux_client.get_pane_working_directory(
+            self.session_name, self.window_name
+        )
+        if not working_directory_value or not os.path.isabs(working_directory_value):
+            return None
+        rollout_path = _rollout_path_for_identity(
+            provider_session_id,
+            Path(working_directory_value).resolve(strict=False),
+        )
+        return _latest_structured_codex_outcome(rollout_path) if rollout_path else None
 
     def runtime_sidecar_reconnect_required(self) -> bool:
         """Return the signal cached by the normal provider status capture."""

@@ -14,7 +14,7 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.clients.tmux import TmuxClient
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
 from cli_agent_orchestrator.models.inbox import OrchestrationType
-from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.models.provider import ProviderTurnOutcome, ProviderType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.codex import (
     CodexProvider,
@@ -37,6 +37,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     get_output,
     get_terminal,
     get_working_directory,
+    provider_turn_outcome,
     reconcile_terminal_context_roles,
     request_provider_runtime_sidecar_reconnect,
     send_input,
@@ -171,6 +172,56 @@ def test_bind_provider_runtime_session_identity_fails_closed_for_wrong_identity(
             source="resume",
             runtime_generation=generation,
         )
+
+
+def test_provider_turn_outcome_is_bound_to_current_resume_generation(monkeypatch):
+    identity = "01234567-89ab-cdef-0123-456789abcdef"
+    generation = "generation-current"
+    metadata = {
+        "runtime_lifecycle": "running",
+        "runtime_generation": generation,
+        "provider_resume_runtime_generation": generation,
+        "provider_resume_identity": identity,
+    }
+    provider = MagicMock()
+    expected = ProviderTurnOutcome(code="PROVIDER_CONTENT_UNAVAILABLE", detail_code="cyber_policy")
+    provider.get_turn_outcome.return_value = expected
+    manager = MagicMock()
+    manager.get_provider.return_value = provider
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+        lambda _terminal_id: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.provider_manager", manager
+    )
+
+    assert provider_turn_outcome("abcdef12") == expected
+    provider.get_turn_outcome.assert_called_once_with(provider_session_id=identity)
+
+    metadata["runtime_generation"] = "generation-after-reconnect"
+    assert provider_turn_outcome("abcdef12") is None
+    assert provider.get_turn_outcome.call_count == 1
+
+
+def test_provider_turn_outcome_observation_failure_is_not_a_provider_outcome(monkeypatch):
+    generation = "generation-current"
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+        lambda _terminal_id: {
+            "runtime_lifecycle": "running",
+            "runtime_generation": generation,
+            "provider_resume_runtime_generation": generation,
+            "provider_resume_identity": "01234567-89ab-cdef-0123-456789abcdef",
+        },
+    )
+    manager = MagicMock()
+    manager.get_provider.side_effect = RuntimeError("adapter transport unavailable")
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.provider_manager", manager
+    )
+
+    assert provider_turn_outcome("abcdef12") is None
 
 
 @pytest.fixture(autouse=True)

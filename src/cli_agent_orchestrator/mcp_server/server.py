@@ -43,6 +43,7 @@ from cli_agent_orchestrator.clients.database import (
     get_handoff_parent_terminal_id,
     get_parent_completion_barrier,
     get_terminal_metadata,
+    get_workflow_provider_outcome,
     get_workflow_status,
     has_admitted_workflow_turn,
     is_delegated_child_terminal,
@@ -1024,6 +1025,29 @@ def _waiting_handoff_result(terminal_id: str, timeout: int, reason: str) -> Hand
     )
 
 
+def _provider_content_unavailable_handoff_result(terminal_id: str) -> HandoffResult:
+    """Retain a live handoff for deliberate continuation without false success."""
+    return HandoffResult(
+        success=False,
+        message=(
+            "Provider response unavailable; workflow state is preserved. "
+            "Continue the child through its normal workflow input where permitted, "
+            "then call await_handoff with this terminal_id to resume."
+        ),
+        output=None,
+        terminal_id=terminal_id,
+        reason_code="PROVIDER_CONTENT_UNAVAILABLE",
+        workflow_state=get_workflow_status(terminal_id),
+        state=HandoffState.WAITING,
+    )
+
+
+def _has_provider_content_unavailable_outcome(terminal_id: str) -> bool:
+    """Recognize only the canonical normalized outcome, never a truthy mock/value."""
+    outcome = get_workflow_provider_outcome(terminal_id)
+    return isinstance(outcome, dict) and outcome.get("code") == "PROVIDER_CONTENT_UNAVAILABLE"
+
+
 def _runtime_reconnect_handoff_result(terminal_id: Optional[str]) -> HandoffResult:
     return HandoffResult(
         success=False,
@@ -1312,6 +1336,8 @@ async def _await_handoff_impl(terminal_id: str, timeout: int = 600) -> HandoffRe
                         guard_reason = (
                             "direct-handoff staged result is not claimable by this parent"
                         )
+                    elif _has_provider_content_unavailable_outcome(terminal_id):
+                        return _provider_content_unavailable_handoff_result(terminal_id)
                     elif is_managed_structured_handoff_child(terminal_id):
                         # New managed handoffs possess an injected V1
                         # capability. Provider terminal prose is evidence of

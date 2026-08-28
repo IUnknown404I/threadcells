@@ -23,6 +23,7 @@ and output format to reliably detect status changes.
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
+from cli_agent_orchestrator.models.provider import ProviderTurnOutcome
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.models.usage import UsageObservation
 
@@ -182,6 +183,17 @@ class BaseProvider(ABC):
         This extension point is deliberately optional.  Providers must not
         estimate tokens from text and callers must treat parser failures as
         telemetry loss, never as a provider failure.
+        """
+        return None
+
+    def get_turn_outcome(
+        self, *, provider_session_id: Optional[str] = None
+    ) -> Optional[ProviderTurnOutcome]:
+        """Return a structured outcome for the latest settled provider turn.
+
+        This optional extension deliberately does not infer semantics from a
+        rendered terminal status. Providers without a stronger protocol signal
+        retain the historical ``None`` behavior.
         """
         return None
 

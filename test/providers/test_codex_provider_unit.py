@@ -316,6 +316,33 @@ class TestCodexBuildCommand:
         assert "You are a code supervisor agent." in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_restricted_prompt_keeps_authority_without_unnecessary_adversarial_examples(
+        self, mock_load_profile
+    ):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = "Review the assigned repository change."
+        mock_profile.mcpServers = None
+        mock_profile.codexConfig = {}
+        mock_load_profile.return_value = mock_profile
+        provider = CodexProvider(
+            "test1234",
+            "test-session",
+            "window-0",
+            "reviewer",
+            allowed_tools=["fs_read", "@cao-mcp-server"],
+        )
+
+        command = provider._build_codex_command()
+
+        assert "RESTRICTED TOOL AND DATA HANDLING" in command
+        assert "Review the assigned repository change." in command
+        assert "fs_read, @cao-mcp-server" in command
+        assert "exfiltrate" not in command
+        assert "aws sts assume-role" not in command
+        assert "rm -rf /" not in command
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_escapes_quotes(self, mock_load_profile):
         mock_profile = MagicMock()
         mock_profile.model = None
@@ -1402,6 +1429,143 @@ class TestCodexBulletFormatStatusDetection:
             provider.runtime_sidecar_resume_identity(proc_root)
             == "01234567-89ab-cdef-0123-456789abcdef"
         )
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_structured_policy_outcome_uses_exact_rollout_without_response_content(
+        self, mock_tmux, tmp_path, monkeypatch
+    ):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        working_directory = tmp_path / "project"
+        working_directory.mkdir()
+        mock_tmux.get_pane_working_directory.return_value = str(working_directory)
+        codex_home = tmp_path / "codex"
+        identity = "01234567-89ab-cdef-0123-456789abcdef"
+        rollout = _open_rollout_fixture(
+            tmp_path / "proc",
+            codex_home,
+            process_id=200,
+            descriptor="8",
+            session_id=identity,
+            working_directory=working_directory,
+        )
+        with rollout.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n"
+            )
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_complete",
+                            "error": {
+                                "codex_error_info": "cyber_policy",
+                                "message": "provider-owned text must not be retained",
+                            },
+                        },
+                    }
+                )
+                + "\n"
+            )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        outcome = provider.get_turn_outcome(provider_session_id=identity)
+
+        assert outcome is not None
+        assert outcome.code == "PROVIDER_CONTENT_UNAVAILABLE"
+        assert outcome.detail_code == "cyber_policy"
+        assert not hasattr(outcome, "message")
+
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            [{"type": "event_msg", "payload": {"type": "task_complete"}}],
+            [
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "error": {"codex_error_info": "rate_limit"},
+                    },
+                }
+            ],
+            [
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "error": {"codex_error_info": "cyber_policy"},
+                    },
+                },
+                {"type": "event_msg", "payload": {"type": "task_started"}},
+            ],
+        ],
+        ids=("success", "ordinary-error", "new-turn-processing"),
+    )
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_structured_policy_outcome_does_not_misclassify_other_protocol_states(
+        self, mock_tmux, rows, tmp_path, monkeypatch
+    ):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        working_directory = tmp_path / "project"
+        working_directory.mkdir()
+        mock_tmux.get_pane_working_directory.return_value = str(working_directory)
+        codex_home = tmp_path / "codex"
+        identity = "01234567-89ab-cdef-0123-456789abcdef"
+        rollout = _open_rollout_fixture(
+            tmp_path / "proc",
+            codex_home,
+            process_id=200,
+            descriptor="8",
+            session_id=identity,
+            working_directory=working_directory,
+        )
+        with rollout.open("a", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        assert provider.get_turn_outcome(provider_session_id=identity) is None
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_structured_policy_outcome_fails_closed_for_duplicate_rollout_identity(
+        self, mock_tmux, tmp_path, monkeypatch
+    ):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        working_directory = tmp_path / "project"
+        working_directory.mkdir()
+        mock_tmux.get_pane_working_directory.return_value = str(working_directory)
+        codex_home = tmp_path / "codex"
+        identity = "01234567-89ab-cdef-0123-456789abcdef"
+        rollout = _open_rollout_fixture(
+            tmp_path / "proc",
+            codex_home,
+            process_id=200,
+            descriptor="8",
+            session_id=identity,
+            working_directory=working_directory,
+        )
+        with rollout.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_complete",
+                            "error": {"codex_error_info": "cyber_policy"},
+                        },
+                    }
+                )
+                + "\n"
+            )
+        duplicate = (
+            codex_home / "sessions/2026/08/23" / f"rollout-2026-08-23T12-00-00-{identity}.jsonl"
+        )
+        duplicate.parent.mkdir(parents=True)
+        duplicate.write_bytes(rollout.read_bytes())
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        assert provider.get_turn_outcome(provider_session_id=identity) is None
 
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
     def test_runtime_sidecar_resume_identity_fails_closed_when_ambiguous(

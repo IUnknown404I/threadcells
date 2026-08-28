@@ -657,6 +657,70 @@ class TestResumableHandoffWait:
         mock_exit.assert_called_once_with("http://127.0.0.1:9889/terminals/child-staged/exit")
         mock_ack.assert_called_once_with("parent-staged", "child-staged")
 
+    @patch("cli_agent_orchestrator.mcp_server.server.is_managed_structured_handoff_child")
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server.get_workflow_provider_outcome",
+        return_value={
+            "code": "PROVIDER_CONTENT_UNAVAILABLE",
+            "detail_code": "cyber_policy",
+        },
+    )
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server.get_workflow_status",
+        return_value="open",
+    )
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server.claim_staged_handoff_result_direct",
+        return_value=None,
+    )
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server.get_claimed_handoff_child_result_direct",
+        return_value=None,
+    )
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server.get_acknowledged_handoff_child_result_direct",
+        return_value=None,
+    )
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server.get_handoff_parent_terminal_id",
+        return_value="parent-policy",
+    )
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server.get_delegation_result_for_assignment",
+        return_value=None,
+    )
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server.get_parent_completion_barrier",
+        return_value=(0, 0),
+    )
+    @patch(
+        "cli_agent_orchestrator.mcp_server.server._read_handoff_terminal",
+        return_value=("completed", "running"),
+    )
+    @patch.dict(os.environ, {"CAO_TERMINAL_ID": "parent-policy"})
+    def test_provider_content_unavailable_keeps_handoff_live_and_recoverable(
+        self,
+        _mock_terminal,
+        _mock_barrier,
+        _mock_result,
+        _mock_parent,
+        _mock_acknowledged,
+        _mock_claimed,
+        mock_staged,
+        _mock_workflow_status,
+        _mock_outcome,
+        mock_managed,
+    ):
+        result = asyncio.run(_await_handoff_impl("child-policy", timeout=1))
+
+        assert result.state == HandoffState.WAITING
+        assert result.reason_code == "PROVIDER_CONTENT_UNAVAILABLE"
+        assert result.workflow_state == "open"
+        assert result.output is None
+        assert "workflow state is preserved" in result.message
+        mock_staged.assert_called_once_with("parent-policy", "child-policy")
+        mock_managed.assert_not_called()
+
     @patch("cli_agent_orchestrator.mcp_server.server.cancel_child_assignments_for_terminal")
     @patch(
         "cli_agent_orchestrator.mcp_server.server.is_managed_structured_handoff_child",

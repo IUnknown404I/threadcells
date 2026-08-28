@@ -76,7 +76,7 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.clients.tmux import PaneTargetError, tmux_client
 from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
 from cli_agent_orchestrator.models.inbox import OrchestrationType
-from cli_agent_orchestrator.models.provider import ProviderType
+from cli_agent_orchestrator.models.provider import ProviderTurnOutcome, ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalLifecycle, TerminalStatus
 from cli_agent_orchestrator.plugins import (
     PluginRegistry,
@@ -1145,6 +1145,8 @@ def _create_terminal_after_admission(
             session_id=session_lifetime_id or f"legacy:{session_name}",
             agent_profile=agent_profile,
             status=TerminalStatus.IDLE,
+            provider_outcome_code=None,
+            provider_outcome_detail=None,
             last_active=datetime.now(),
         )
 
@@ -1481,6 +1483,34 @@ def provider_runtime_sidecar_reconnect_required(terminal_id: str, provider: Any 
     return bool(predicate and predicate() is True)
 
 
+def provider_turn_outcome(terminal_id: str, provider: Any = None) -> Optional[ProviderTurnOutcome]:
+    """Read a provider-native outcome bound to this exact runtime session."""
+    metadata = get_terminal_metadata(terminal_id)
+    if (
+        metadata is None
+        or metadata.get("runtime_lifecycle") not in {"starting", "running"}
+        or not metadata.get("provider_resume_identity")
+        or metadata.get("provider_resume_runtime_generation") != metadata.get("runtime_generation")
+    ):
+        return None
+    try:
+        runtime_provider = (
+            provider if provider is not None else provider_manager.get_provider(terminal_id)
+        )
+        observer = getattr(runtime_provider, "get_turn_outcome", None)
+        if observer is None:
+            return None
+        outcome = observer(provider_session_id=metadata["provider_resume_identity"])
+    except Exception:
+        logger.warning(
+            "Provider turn outcome observation failed for %s",
+            terminal_id,
+            exc_info=True,
+        )
+        return None
+    return outcome if isinstance(outcome, ProviderTurnOutcome) else None
+
+
 def provider_runtime_sidecar_resume_identity(terminal_id: str) -> str:
     """Capture the exact provider identity at a managed readiness boundary."""
     provider = provider_manager.get_provider(terminal_id)
@@ -1738,6 +1768,8 @@ def get_terminal(terminal_id: str) -> Dict:
             "workflow_state": workflow["state"],
             "workflow_status": workflow["workflow_status"],
             "workflow_reason": workflow.get("workflow_reason"),
+            "provider_outcome_code": workflow.get("provider_outcome_code"),
+            "provider_outcome_detail": workflow.get("provider_outcome_detail"),
             "assignment_status": workflow["assignment_status"],
             "result_status": workflow["result_status"],
             "delivery_status": workflow["delivery_status"],

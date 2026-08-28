@@ -78,6 +78,8 @@ def _public_agent_summary(terminal: Dict[str, Any]) -> Dict[str, Any]:
         "workflow_state",
         "workflow_status",
         "workflow_reason",
+        "provider_outcome_code",
+        "provider_outcome_detail",
         "assignment_status",
         "result_status",
         "delivery_status",

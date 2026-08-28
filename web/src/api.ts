@@ -291,6 +291,8 @@ export interface AgentSummary {
   workflow_state: string | null
   workflow_status: string | null
   workflow_reason: string | null
+  provider_outcome_code?: string | null
+  provider_outcome_detail?: string | null
   assignment_status: string | null
   result_status: string | null
   delivery_status: string | null
@@ -331,6 +333,8 @@ export interface Terminal {
   workflow_state?: 'open' | 'active' | 'waiting' | 'recoverable' | 'result_ready' | 'owner_gate' | 'completed' | 'incomplete' | 'failed' | 'cancelled' | null
   workflow_status?: string | null
   workflow_reason?: string | null
+  provider_outcome_code?: string | null
+  provider_outcome_detail?: string | null
   assignment_status?: string | null
   result_status?: string | null
   delivery_status?: string | null

@@ -1522,6 +1522,34 @@ def capture_provider_turn_outcome_cursor(terminal_id: str, provider: Any = None)
     return cursor if isinstance(cursor, str) and cursor else None
 
 
+def provider_turn_execution_active(terminal_id: str, provider: Any = None) -> Optional[bool]:
+    """Classify exact provider-native task activity before another send.
+
+    ``False`` is positive idle evidence (or a provider without this optional
+    guard). ``None`` means a bound provider session could not be classified
+    and must therefore fail closed at the workflow dispatcher.
+    """
+    metadata = get_terminal_metadata(terminal_id)
+    if metadata is None or not metadata.get("provider_resume_identity"):
+        return False
+    if metadata.get("provider_resume_runtime_generation") != metadata.get("runtime_generation"):
+        return None
+    runtime_provider = (
+        provider if provider is not None else provider_manager.get_provider(terminal_id)
+    )
+    observer = getattr(runtime_provider, "turn_execution_active", None)
+    if observer is None:
+        return False
+    try:
+        active = observer(provider_session_id=str(metadata["provider_resume_identity"]))
+    except Exception:
+        logger.warning(
+            "Provider task-boundary observation failed for %s", terminal_id, exc_info=True
+        )
+        return None
+    return active if isinstance(active, bool) else None
+
+
 def provider_turn_outcome(
     terminal_id: str, after_cursor: str, provider: Any = None
 ) -> Optional[ProviderTurnOutcome]:
@@ -1754,6 +1782,23 @@ def get_terminal(terminal_id: str) -> Dict:
             else:
                 refreshed = get_terminal_metadata(terminal_id)
                 lifecycle = (refreshed or metadata).get("runtime_lifecycle") or "running"
+            # A reconstructed provider can briefly project its resident Codex
+            # session as Ready even though the exact provider-native task has
+            # not emitted task_complete. Preserve both the durable execution
+            # lease and capacity ownership until that stronger boundary says
+            # the model turn settled. An unclassifiable bound runtime likewise
+            # fails closed; a truly exited process was handled above.
+            if (
+                lifecycle
+                in {
+                    TerminalLifecycle.STARTING.value,
+                    TerminalLifecycle.RUNNING.value,
+                }
+                and status == TerminalStatus.IDLE.value
+            ):
+                provider_task_active = provider_turn_execution_active(terminal_id, provider)
+                if provider_task_active is not False:
+                    status = TerminalStatus.PROCESSING.value
         # Usage is a separate, best-effort observation that cannot affect this
         # response or provider lifecycle. Durable providers are sampled while
         # active; pane parsing remains a completion-only fallback.

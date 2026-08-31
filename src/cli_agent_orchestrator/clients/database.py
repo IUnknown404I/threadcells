@@ -3207,6 +3207,8 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "runtime_generation": terminal.runtime_generation,
             "runtime_generation_origin": terminal.runtime_generation_origin,
             "runtime_process_start_ticks": terminal.runtime_process_start_ticks,
+            "provider_resume_identity": terminal.provider_resume_identity,
+            "provider_resume_runtime_generation": terminal.provider_resume_runtime_generation,
             "runtime_operation_kind": terminal.runtime_operation_kind,
             "runtime_operation_token": terminal.runtime_operation_token,
             "runtime_operation_claimed_at": terminal.runtime_operation_claimed_at,
@@ -6344,14 +6346,157 @@ def is_owner_gate_resume_turn(root_terminal_id: str, logical_turn_id: int) -> bo
         )
 
 
+def _pre_fix_transport_recovery_turn(
+    db: Any, workflow: WorkflowModel
+) -> Optional[WorkflowTurnModel]:
+    """Return one exact unreceipted turn stranded by the pre-fix cursor bug."""
+    active = (
+        db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
+        if workflow.active_turn_id is not None
+        else None
+    )
+    if (
+        workflow.terminal_reason != BOUNDED_TRANSPORT_RETRY_GUARD_REASON
+        or active is None
+        or active.workflow_id != workflow.id
+        or active.kind != "external_input"
+        or active.inbox_message_id is not None
+        or active.payload is None
+        or active.state != TURN_CANCELLED
+        or active.queue_reason != "PROVIDER_TRANSPORT_RETRY_EXHAUSTED"
+        or int(active.attempt_count or 0) < 3
+        or int(active.dispatch_recovery_count or 0) != 0
+    ):
+        return None
+    return (
+        cast(WorkflowTurnModel, active)
+        if _workflow_is_transport_only_gate(db, workflow, active)
+        else None
+    )
+
+
+def _workflow_is_transport_only_gate(
+    db: Any, workflow: WorkflowModel, active: WorkflowTurnModel
+) -> bool:
+    """Prove a gate has no semantic authority besides its failed transport."""
+    turn_ids = [
+        int(row[0])
+        for row in db.query(WorkflowTurnModel.id)
+        .filter(WorkflowTurnModel.workflow_id == workflow.id)
+        .order_by(WorkflowTurnModel.id.asc())
+        .all()
+    ]
+    if turn_ids != [int(active.id)]:
+        return False
+    if any(
+        (
+            active.provider_processing_observed_at,
+            active.provider_ready_observed_at,
+            active.provider_outcome_code,
+            active.provider_outcome_detail,
+            active.provider_outcome_observed_at,
+            active.provider_outcome_cursor,
+            active.provider_outcome_cursor_bootstrap_generation,
+            active.provider_reconnect_requested_at,
+            active.provider_reconnect_claim_token,
+            active.provider_reconnect_resume_identity,
+        )
+    ):
+        return False
+    if (
+        db.query(WorkflowTurnReceiptModel.id)
+        .filter(WorkflowTurnReceiptModel.workflow_turn_id == active.id)
+        .first()
+        is not None
+    ):
+        return False
+    if (
+        db.query(WorkflowEffectModel.id)
+        .filter(WorkflowEffectModel.workflow_id == workflow.id)
+        .first()
+        is not None
+    ):
+        return False
+    return (
+        db.query(WorkflowProviderReconnectAttemptModel.id)
+        .filter(WorkflowProviderReconnectAttemptModel.workflow_id == workflow.id)
+        .first()
+        is None
+    )
+
+
+def _newer_transport_gates_for_historical_recovery(
+    db: Any, workflow: WorkflowModel
+) -> Optional[list[WorkflowModel]]:
+    """Prove every newer workflow is another unadmitted transport-only gate."""
+    newer = (
+        db.query(WorkflowModel)
+        .filter(
+            WorkflowModel.root_terminal_id == workflow.root_terminal_id,
+            WorkflowModel.id > workflow.id,
+        )
+        .order_by(WorkflowModel.id.asc())
+        .all()
+    )
+    if not newer:
+        return []
+    if db.get(ProviderExecutionLeaseModel, cast(str, workflow.root_terminal_id)) is not None:
+        return None
+    for candidate in newer:
+        active = (
+            db.get(WorkflowTurnModel, cast(int, candidate.active_turn_id))
+            if candidate.active_turn_id is not None
+            else None
+        )
+        if (
+            candidate.status != WORKFLOW_OWNER_GATE
+            or candidate.terminal_reason != BOUNDED_TRANSPORT_RETRY_GUARD_REASON
+            or active is None
+            or active.workflow_id != candidate.id
+            or active.kind != "external_input"
+            or active.inbox_message_id is not None
+            or active.state != TURN_CANCELLED
+            or active.queue_reason != "PROVIDER_TRANSPORT_RETRY_EXHAUSTED"
+            or int(active.dispatch_recovery_count or 0) < 1
+            or not _workflow_is_transport_only_gate(db, candidate, active)
+        ):
+            return None
+    return cast(list[WorkflowModel], newer)
+
+
+def _queue_pre_fix_transport_recovery(
+    workflow: WorkflowModel,
+    active: WorkflowTurnModel,
+    now: datetime,
+) -> None:
+    """Re-arm one proven pre-fix input without creating a replacement turn."""
+    active.state = TURN_QUEUED
+    active.attempt_count = 0
+    active.not_before = None
+    active.queue_reason = "WORKFLOW_DISPATCH_RECOVERY_PENDING"
+    active.claim_token = None
+    active.claim_expires_at = None
+    active.provider_outcome_cursor = None
+    active.provider_outcome_cursor_bootstrap_generation = None
+    active.dispatch_recovery_count = 1
+    active.updated_at = now
+    workflow.status = WORKFLOW_OPEN
+    workflow.active_turn_id = active.id
+    workflow.terminal_reason = None
+    workflow.no_progress_count = 0
+    workflow.updated_at = now
+
+
 def reconcile_owner_gated_workflow_successors(now: Optional[datetime] = None) -> List[str]:
-    """Reopen latest owner gates which already contain an explicit queued successor.
+    """Reopen exact owner-gated input which still has executable authority.
 
     A transport retry can exhaust immediately after a newer Composer request
     commits behind the claimed head.  The newer request is the owner's durable
     decision to continue; leaving it under an OWNER_GATE workflow makes it
-    impossible to claim.  This restart-safe transaction promotes that exact
-    row without creating a replacement turn or reviving Inbox callbacks.
+    impossible to claim. A pre-fix payload can also be hidden by later
+    transport-only bootstrap gates. This restart-safe transaction promotes or
+    adopts that same exact row without creating a replacement turn or reviving
+    Inbox callbacks.
     """
     _ensure_workflow_schema()
     now = now or datetime.now()
@@ -6365,15 +6510,7 @@ def reconcile_owner_gated_workflow_successors(now: Optional[datetime] = None) ->
             .all()
         )
         for workflow in workflows:
-            if (
-                db.query(WorkflowModel.id)
-                .filter(
-                    WorkflowModel.root_terminal_id == workflow.root_terminal_id,
-                    WorkflowModel.id > workflow.id,
-                )
-                .first()
-                is not None
-            ):
+            if workflow.status != WORKFLOW_OWNER_GATE:
                 continue
             terminal = db.get(TerminalModel, cast(str, workflow.root_terminal_id))
             if terminal is None or terminal.runtime_lifecycle in ("exit_pending", "exited"):
@@ -6388,47 +6525,26 @@ def reconcile_owner_gated_workflow_successors(now: Optional[datetime] = None) ->
                 # that durable canonical payload once after upgrade. Explicit
                 # owner gates, reconnect exhaustion, admitted turns, and any
                 # repeated post-fix transport failure remain fail-closed.
-                active = (
-                    db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
-                    if workflow.active_turn_id is not None
-                    else None
-                )
-                receipt_exists = bool(
-                    active is not None
-                    and db.query(WorkflowTurnReceiptModel.id)
-                    .filter_by(
-                        workflow_turn_id=active.id,
-                        receiver_terminal_id=workflow.root_terminal_id,
-                    )
-                    .first()
-                )
-                if (
-                    workflow.terminal_reason == BOUNDED_TRANSPORT_RETRY_GUARD_REASON
-                    and active is not None
-                    and active.workflow_id == workflow.id
-                    and active.kind == "external_input"
-                    and active.inbox_message_id is None
-                    and active.payload is not None
-                    and active.state == TURN_CANCELLED
-                    and active.queue_reason == "PROVIDER_TRANSPORT_RETRY_EXHAUSTED"
-                    and int(active.dispatch_recovery_count or 0) == 0
-                    and not receipt_exists
-                ):
-                    active.state = TURN_QUEUED
-                    active.attempt_count = 0
-                    active.not_before = None
-                    active.queue_reason = "WORKFLOW_DISPATCH_RECOVERY_PENDING"
-                    active.claim_token = None
-                    active.claim_expires_at = None
-                    active.provider_outcome_cursor = None
-                    active.provider_outcome_cursor_bootstrap_generation = None
-                    active.dispatch_recovery_count = 1
-                    active.updated_at = now
-                    workflow.status = WORKFLOW_OPEN
-                    workflow.terminal_reason = None
-                    workflow.no_progress_count = 0
-                    workflow.updated_at = now
-                    successor = active
+                active = _pre_fix_transport_recovery_turn(db, workflow)
+                if active is not None:
+                    newer = _newer_transport_gates_for_historical_recovery(db, workflow)
+                    if newer == []:
+                        _queue_pre_fix_transport_recovery(workflow, active, now)
+                        successor = active
+                    elif newer:
+                        # Bootstrap traffic can create newer transport-only
+                        # owner gates while the original Composer payload is
+                        # still stranded. Move that same logical turn (never a
+                        # copy) into the latest workflow authority only when
+                        # every intervening workflow is proven unreceipted and
+                        # post-fix fail-closed. This preserves the original
+                        # dedupe key, payload, FIFO age, and receipt identity.
+                        latest = newer[-1]
+                        workflow.active_turn_id = None
+                        active.workflow_id = latest.id
+                        latest.resumed_from_owner_gate_workflow_id = workflow.id
+                        _queue_pre_fix_transport_recovery(latest, active, now)
+                        successor = active
             if successor is None:
                 continue
             reopened.append(cast(str, workflow.root_terminal_id))

@@ -502,6 +502,49 @@ def _codex_outcome_cursor(path: Path) -> Optional[str]:
             os.close(descriptor)
 
 
+def _codex_turn_execution_active(path: Path) -> Optional[bool]:
+    """Return the latest provider-native task boundary for one exact rollout.
+
+    The inline TUI can retain an idle footer while a tool-heavy turn is still
+    running, especially after the CAO service reconstructs its provider
+    object.  The rollout's ordered ``task_started`` / ``task_complete`` events
+    are the narrower authority for whether another input may be transported.
+    Malformed or unclassifiable evidence fails closed with ``None``.
+    """
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        file_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(file_stat.st_mode):
+            return None
+        latest: Optional[bool] = None
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            for raw in handle:
+                if len(raw) > 4 * 1024 * 1024 or not raw.endswith(b"\n"):
+                    return None
+                try:
+                    row = json.loads(raw)
+                except (UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                    return None
+                if not isinstance(row, dict):
+                    return None
+                payload = row.get("payload")
+                event_type = payload.get("type") if isinstance(payload, dict) else None
+                if row.get("type") != "event_msg" or event_type not in {
+                    "task_started",
+                    "task_complete",
+                }:
+                    continue
+                latest = event_type == "task_started"
+        return latest if latest is not None else False
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _latest_structured_codex_outcome(
     path: Path, after_cursor: str
 ) -> Optional[ProviderTurnOutcome]:
@@ -862,6 +905,21 @@ class CodexProvider(BaseProvider):
             Path(working_directory_value).resolve(strict=False),
         )
         return _codex_outcome_cursor(rollout_path) if rollout_path else None
+
+    def turn_execution_active(self, *, provider_session_id: Optional[str] = None) -> Optional[bool]:
+        """Observe whether the exact persisted Codex session has a live task."""
+        if not provider_session_id:
+            return None
+        working_directory_value = tmux_client.get_pane_working_directory(
+            self.session_name, self.window_name
+        )
+        if not working_directory_value or not os.path.isabs(working_directory_value):
+            return None
+        rollout_path = _rollout_path_for_identity(
+            provider_session_id,
+            Path(working_directory_value).resolve(strict=False),
+        )
+        return _codex_turn_execution_active(rollout_path) if rollout_path else None
 
     def turn_outcome_cursor_required(self) -> bool:
         """Require exact event authority before every logical-turn send."""

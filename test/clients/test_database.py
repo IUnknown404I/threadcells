@@ -389,6 +389,10 @@ class TestTerminalOperations:
             resume_identity=identity,
             runtime_generation="generation-stale",
         )
+        metadata = get_terminal_metadata("managed")
+        assert metadata is not None
+        assert metadata["provider_resume_identity"] == identity
+        assert metadata["provider_resume_runtime_generation"] == "generation-1"
         with test_db() as db:
             terminal = db.get(TerminalModel, "managed")
             assert terminal.provider_resume_identity == identity
@@ -544,6 +548,8 @@ class TestTerminalOperations:
         mock_terminal.allowed_tools = None
         mock_terminal.launch_worktree = "/srv/worktree"
         mock_terminal.write_enabled = True
+        mock_terminal.provider_resume_identity = "01234567-89ab-cdef-0123-456789abcdef"
+        mock_terminal.provider_resume_runtime_generation = "generation-1"
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
@@ -557,6 +563,8 @@ class TestTerminalOperations:
         assert result["id"] == "test123"
         assert result["launch_worktree"] == "/srv/worktree"
         assert result["write_enabled"] is True
+        assert result["provider_resume_identity"] == mock_terminal.provider_resume_identity
+        assert result["provider_resume_runtime_generation"] == "generation-1"
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_metadata_not_found(self, mock_session_class):

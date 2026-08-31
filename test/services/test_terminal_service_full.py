@@ -37,6 +37,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     get_output,
     get_terminal,
     get_working_directory,
+    provider_turn_execution_active,
     provider_turn_outcome,
     reconcile_terminal_context_roles,
     request_provider_runtime_sidecar_reconnect,
@@ -267,6 +268,35 @@ def test_provider_turn_outcome_is_bound_to_current_resume_generation(monkeypatch
     metadata["runtime_generation"] = "generation-after-reconnect"
     assert provider_turn_outcome("abcdef12", "cursor-1") is None
     assert provider.get_turn_outcome.call_count == 1
+
+
+def test_provider_task_boundary_uses_persisted_resume_generation(monkeypatch):
+    identity = "01234567-89ab-cdef-0123-456789abcdef"
+    generation = "generation-current"
+    metadata = {
+        "runtime_lifecycle": "running",
+        "runtime_generation": generation,
+        "provider_resume_runtime_generation": generation,
+        "provider_resume_identity": identity,
+    }
+    provider = MagicMock()
+    provider.turn_execution_active.return_value = True
+    manager = MagicMock()
+    manager.get_provider.return_value = provider
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+        lambda _terminal_id: metadata,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.provider_manager", manager
+    )
+
+    assert provider_turn_execution_active("abcdef12") is True
+    provider.turn_execution_active.assert_called_once_with(provider_session_id=identity)
+
+    metadata["runtime_generation"] = "generation-after-reconnect"
+    assert provider_turn_execution_active("abcdef12") is None
+    assert provider.turn_execution_active.call_count == 1
 
 
 def test_provider_turn_outcome_observation_failure_is_not_a_provider_outcome(monkeypatch):
@@ -1988,6 +2018,10 @@ class TestGetTerminal:
             "provider": "codex",
             "tmux_session": "cao-session",
             "agent_profile": "supervisor",
+            "runtime_lifecycle": "running",
+            "runtime_generation": "generation-1",
+            "provider_resume_identity": "provider-session-1",
+            "provider_resume_runtime_generation": "generation-1",
             "last_active": datetime.now(),
         }
         projection = {
@@ -1999,6 +2033,7 @@ class TestGetTerminal:
         }
         provider = MagicMock()
         provider.get_status.return_value = TerminalStatus.IDLE
+        provider.turn_execution_active.return_value = False
         with (
             patch(
                 "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
@@ -2037,6 +2072,75 @@ class TestGetTerminal:
         release.assert_called_once_with("test1234", 77)
         requeue.assert_called_once_with("test1234", 77)
         wake.assert_called_once_with()
+
+    def test_get_terminal_preserves_execution_lease_for_native_active_task(self):
+        metadata = {
+            "id": "test1234",
+            "tmux_window": "developer-abcd",
+            "provider": "codex",
+            "tmux_session": "cao-session",
+            "agent_profile": "supervisor",
+            "runtime_lifecycle": "running",
+            "runtime_generation": "generation-1",
+            "provider_resume_identity": "provider-session-1",
+            "provider_resume_runtime_generation": "generation-1",
+            "last_active": datetime.now(),
+        }
+        projection = {
+            "state": "active",
+            "workflow_status": "open",
+            "assignment_status": None,
+            "result_status": None,
+            "delivery_status": None,
+        }
+        provider = MagicMock()
+        provider.get_status.return_value = TerminalStatus.IDLE
+        provider.turn_execution_active.return_value = True
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=metadata,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_workflow_projection",
+                return_value=projection,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_execution_projection",
+                return_value={"active_turn": True, "wait_reason": None},
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_provider_execution_turn",
+                return_value=77,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.reconcile_terminal_runtime",
+                return_value=False,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.provider_manager.get_provider",
+                return_value=provider,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.release_provider_execution"
+            ) as release,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.requeue_settled_unadmitted_workflow_turn"
+            ) as requeue,
+            patch(
+                "cli_agent_orchestrator.services.terminal_service._wake_queued_provider_execution"
+            ) as wake,
+        ):
+            terminal = get_terminal("test1234")
+
+        assert terminal["status"] == TerminalStatus.PROCESSING.value
+        assert terminal["execution_state"] == "processing"
+        provider.turn_execution_active.assert_called_once_with(
+            provider_session_id="provider-session-1"
+        )
+        release.assert_not_called()
+        requeue.assert_not_called()
+        wake.assert_not_called()
 
     def test_get_terminal_reports_processing_for_active_turn_when_provider_is_ready(self):
         metadata = {

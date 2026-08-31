@@ -452,7 +452,8 @@ def test_reconnect_fifo_inbox_head_remains_ahead_of_later_external(workflow_db):
     predecessor = _start_admitted_input(root)
     assert isinstance(observe_workflow_final(root), int)
     assert database.request_workflow_provider_reconnect(root)
-    inbox, inbox_turn = _pending_inbox_turn(root, "Inbox FIFO head")
+    inbox = create_inbox_message("synthetic-sender", root, "Inbox FIFO head")
+    assert get_workflow_turn_for_inbox(inbox.id) is None
     database.prepare_workflow_input(
         root,
         "later Composer input",
@@ -462,6 +463,9 @@ def test_reconnect_fifo_inbox_head_remains_ahead_of_later_external(workflow_db):
 
     _complete_ready_test_reconnect(root, predecessor)
 
+    materialized = get_workflow_turn_for_inbox(inbox.id)
+    assert materialized is not None
+    inbox_turn = materialized["turn_id"]
     with database.SessionLocal() as db:
         workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
         assert workflow.active_turn_id == inbox_turn

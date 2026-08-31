@@ -5010,6 +5010,39 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
         return _inbox_model_to_message(inbox_msg)
 
 
+def _materialize_pending_inbox_turn_in_transaction(
+    db: Any,
+    inbox: InboxModel,
+    workflow: WorkflowModel,
+    now: datetime,
+) -> WorkflowTurnModel:
+    """Bind one pending Inbox row to its OPEN workflow without a commit gap."""
+    existing = (
+        db.query(WorkflowTurnModel).filter(WorkflowTurnModel.inbox_message_id == inbox.id).first()
+    )
+    if existing is not None:
+        return cast(WorkflowTurnModel, existing)
+    turn = WorkflowTurnModel(
+        workflow_id=workflow.id,
+        kind="inbox_message",
+        dedupe_key=f"inbox:{inbox.id}",
+        payload=inbox.message,
+        inbox_message_id=inbox.id,
+        state=TURN_QUEUED,
+        created_at=inbox.created_at,
+    )
+    db.add(turn)
+    db.flush()
+    _cancel_superseded_open_final_turns(
+        db,
+        int(workflow.id),
+        now,
+        superseding_turn_id=cast(int, turn.id),
+    )
+    workflow.updated_at = now
+    return turn
+
+
 def ensure_workflow_turn_for_inbox(message_id: int) -> Optional[int]:
     """Attach one durable provider turn to a legacy or ordinary Inbox row.
 
@@ -5051,7 +5084,6 @@ def ensure_workflow_turn_for_inbox(message_id: int) -> Optional[int]:
         if existing is not None:
             db.commit()
             return cast(int, existing.id)
-
         workflow = _open_workflow(db, str(inbox.receiver_id), create=True)
         assert workflow is not None
         if workflow.status != WORKFLOW_OPEN:
@@ -5060,24 +5092,12 @@ def ensure_workflow_turn_for_inbox(message_id: int) -> Optional[int]:
             workflow = WorkflowModel(root_terminal_id=str(inbox.receiver_id), status=WORKFLOW_OPEN)
             db.add(workflow)
             db.flush()
-        turn = WorkflowTurnModel(
-            workflow_id=workflow.id,
-            kind="inbox_message",
-            dedupe_key=f"inbox:{message_id}",
-            payload=inbox.message,
-            inbox_message_id=message_id,
-            state=TURN_QUEUED,
-            created_at=inbox.created_at,
-        )
-        db.add(turn)
-        db.flush()
-        _cancel_superseded_open_final_turns(
+        turn = _materialize_pending_inbox_turn_in_transaction(
             db,
-            int(workflow.id),
+            inbox,
+            workflow,
             datetime.now(),
-            superseding_turn_id=cast(int, turn.id),
         )
-        workflow.updated_at = datetime.now()
         db.commit()
         return cast(int, turn.id)
 
@@ -8371,6 +8391,23 @@ def complete_workflow_provider_reconnect(
         if workflow is None or turn is None:
             db.rollback()
             return False
+        # Ordinary Inbox persistence intentionally precedes turn
+        # materialization. Close that crash window inside this same reconnect
+        # completion transaction before choosing a cross-source FIFO head;
+        # otherwise a later Composer row could overtake an older durable Inbox
+        # row simply because its watchdog had not run yet.
+        pending_inbox_rows = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.receiver_id == root_terminal_id,
+                InboxModel.status == MessageStatus.PENDING.value,
+                InboxModel.kind == "message",
+            )
+            .order_by(InboxModel.created_at.asc(), InboxModel.id.asc())
+            .all()
+        )
+        for inbox in pending_inbox_rows:
+            _materialize_pending_inbox_turn_in_transaction(db, inbox, workflow, now)
         # Canonical work submitted during reconnect is durable successor
         # authority, but it must not cancel the turn that owns the exact
         # resume attempt. Once the sidecar is proven Ready, atomically retire

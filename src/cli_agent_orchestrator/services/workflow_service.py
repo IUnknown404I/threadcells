@@ -36,6 +36,7 @@ from cli_agent_orchestrator.clients.database import (
     requeue_workflow_turn,
     set_workflow_terminal_state,
     start_workflow_input,
+    workflow_has_active_queued_external_input,
     workflow_provider_reconnect_pending,
 )
 from cli_agent_orchestrator.models.inbox import ChildAssignmentStatus, OrchestrationType
@@ -375,16 +376,17 @@ def _reconcile_root_workflow_with_admission(
     # must win over a synthetic open-final successor. This also gives the
     # workflow daemon durable retry ownership when a Ready transition occurs
     # without a fresh terminal-log event.
+    active_external_head = workflow_has_active_queued_external_input(root_terminal_id)
     if pending_inbox is None:
         pending_inbox = root_terminal_id in set(get_pending_message_receiver_ids())
-    if pending_inbox:
+    if pending_inbox and not active_external_head:
         from cli_agent_orchestrator.services.inbox_service import check_and_send_pending_messages
 
         check_and_send_pending_messages(root_terminal_id, registry=registry)
         return False
 
     active_children, _failed_children = get_parent_completion_barrier(root_terminal_id)
-    if active_children:
+    if active_children and not active_external_head:
         # An assigned-child result can be persisted just after the receiver's
         # one immediate Inbox probe observes it as busy.  Its own log then has
         # no reason to change, so the filesystem watcher alone cannot retry
@@ -405,7 +407,7 @@ def _reconcile_root_workflow_with_admission(
     # assigned-child barrier above is deliberately serviced first: that child
     # may be the direct-handoff worker's dependency and its persisted callback
     # is the only way it can continue to its own final result.
-    if get_handoff_child_status(root_terminal_id) in (
+    if not active_external_head and get_handoff_child_status(root_terminal_id) in (
         ChildAssignmentStatus.HANDOFF_AWAITING_RESULT.value,
         ChildAssignmentStatus.HANDOFF_RECOVERY_AWAITING_RESULT.value,
     ):

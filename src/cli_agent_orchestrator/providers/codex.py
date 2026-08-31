@@ -867,6 +867,15 @@ class CodexProvider(BaseProvider):
         """Require exact event authority before every logical-turn send."""
         return True
 
+    def defer_turn_outcome_cursor_to_session_start(self) -> bool:
+        """Permit only the fresh session's authenticated first-turn handshake.
+
+        The terminal service still reserves the exact runtime generation and
+        workflow turn before transport. The synchronous SessionStart hook must
+        bind the real provider cursor before Codex begins that model request.
+        """
+        return True
+
     def runtime_sidecar_reconnect_required(self) -> bool:
         """Return the signal cached by the normal provider status capture."""
         return self._runtime_sidecar_reconnect_pending

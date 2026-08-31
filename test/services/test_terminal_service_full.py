@@ -72,6 +72,10 @@ def test_bind_provider_runtime_session_identity_proves_exact_hook_path(monkeypat
     tmux.get_pane_working_directory.return_value = str(working_directory)
     bind = MagicMock(return_value=True)
     monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_workflow_turn_provider_outcome_cursor_bootstrap",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
         lambda _terminal_id: {
             "provider": "codex",
@@ -111,6 +115,65 @@ def test_bind_provider_runtime_session_identity_proves_exact_hook_path(monkeypat
         resume_identity=identity,
         runtime_generation=generation,
     )
+
+
+def test_bind_provider_runtime_session_identity_completes_first_turn_cursor_bootstrap(
+    monkeypatch, tmp_path
+):
+    identity = "01234567-89ab-cdef-0123-456789abcdef"
+    generation = "a" * 64
+    working_directory = tmp_path / "project"
+    working_directory.mkdir()
+    transcript = tmp_path / "codex/sessions/rollout.jsonl"
+    provider = MagicMock()
+    provider.runtime_sidecar_resume_identity.return_value = identity
+    provider.capture_turn_outcome_cursor.return_value = "codex-jsonl-v1:1:2:3:1"
+    manager = MagicMock()
+    manager.get_provider.return_value = provider
+    tmux = MagicMock()
+    tmux.get_pane_working_directory.return_value = str(working_directory)
+    bind_identity = MagicMock(return_value=True)
+    bind_cursor = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+        lambda _terminal_id: {
+            "provider": "codex",
+            "runtime_lifecycle": "running",
+            "runtime_generation": generation,
+            "tmux_session": "cao-managed",
+            "tmux_window": "managed",
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.provider_manager", manager
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.services.terminal_service.tmux_client", tmux)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.bind_terminal_provider_resume_identity",
+        bind_identity,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_workflow_turn_provider_outcome_cursor_bootstrap",
+        lambda *_args: 73,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.bind_workflow_turn_provider_outcome_cursor",
+        bind_cursor,
+    )
+
+    assert (
+        bind_provider_runtime_session_identity(
+            "abcdef12",
+            resume_identity=identity,
+            transcript_path=str(transcript),
+            working_directory=str(working_directory),
+            source="startup",
+            runtime_generation=generation,
+        )
+        == identity
+    )
+    provider.capture_turn_outcome_cursor.assert_called_once_with(provider_session_id=identity)
+    bind_cursor.assert_called_once_with("abcdef12", 73, "codex-jsonl-v1:1:2:3:1")
 
 
 def test_bind_provider_runtime_session_identity_fails_closed_for_stale_generation(
@@ -1962,12 +2025,17 @@ class TestGetTerminal:
                 return_value=True,
             ) as release,
             patch(
+                "cli_agent_orchestrator.services.terminal_service.requeue_settled_unadmitted_workflow_turn",
+                return_value=True,
+            ) as requeue,
+            patch(
                 "cli_agent_orchestrator.services.terminal_service._wake_queued_provider_execution"
             ) as wake,
         ):
             assert get_terminal("test1234")["status"] == TerminalStatus.IDLE.value
 
         release.assert_called_once_with("test1234", 77)
+        requeue.assert_called_once_with("test1234", 77)
         wake.assert_called_once_with()
 
     def test_get_terminal_reports_processing_for_active_turn_when_provider_is_ready(self):
@@ -2295,6 +2363,56 @@ class TestSendInput:
 
         assert ordering == ["bound", "sent"]
         mock_bind_cursor.assert_called_once_with("test1234", 42, "codex-jsonl-v1:1:2:3:1")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.reserve_workflow_turn_provider_outcome_cursor_bootstrap"
+    )
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_provider_turn_outcome_cursor")
+    @patch("cli_agent_orchestrator.services.operations_service.acquire_provider_execution_slot")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_reserves_fresh_codex_cursor_bootstrap_before_transport(
+        self,
+        mock_get_metadata,
+        mock_tmux,
+        mock_pm,
+        _mock_acquire,
+        mock_capture_cursor,
+        mock_reserve_bootstrap,
+        _mock_update,
+    ):
+        generation = "fresh-runtime-generation"
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "supervisor-window",
+            "runtime_lifecycle": "running",
+            "runtime_generation": generation,
+        }
+        provider = mock_pm.get_provider.return_value
+        provider.paste_enter_count = 1
+        provider.turn_outcome_cursor_required.return_value = True
+        provider.defer_turn_outcome_cursor_to_session_start.return_value = True
+        mock_capture_cursor.return_value = None
+        ordering = []
+        mock_reserve_bootstrap.side_effect = lambda *_args: ordering.append("reserved") or True
+        mock_tmux.send_keys.side_effect = lambda *_args, **_kwargs: ordering.append("sent")
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.acquire_terminal_runtime_transport",
+                return_value="transport-token",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.release_terminal_runtime_operation",
+                return_value=True,
+            ),
+        ):
+            assert send_input("test1234", "first task", logical_turn_id=42)
+
+        assert ordering == ["reserved", "sent"]
+        mock_reserve_bootstrap.assert_called_once_with("test1234", 42, generation)
 
     @patch("cli_agent_orchestrator.services.terminal_service.release_provider_execution")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")

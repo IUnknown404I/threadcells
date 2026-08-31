@@ -390,7 +390,10 @@ def _complete_ready_test_reconnect(root: str, turn_id: int) -> None:
     )
 
 
-def test_reconnect_fifo_external_head_is_not_hidden_by_later_inbox(workflow_db, monkeypatch):
+@pytest.mark.parametrize("deferred_relation", ["assigned_child", "handoff_child"])
+def test_reconnect_fifo_external_head_is_not_hidden_by_later_inbox(
+    workflow_db, monkeypatch, deferred_relation
+):
     root = "root-reconnect-external-before-inbox"
     predecessor = _start_admitted_input(root)
     assert isinstance(observe_workflow_final(root), int)
@@ -424,6 +427,19 @@ def test_reconnect_fifo_external_head_is_not_hidden_by_later_inbox(workflow_db, 
         lambda *_args: {"lifecycle": "running", "status": TerminalStatus.IDLE.value},
     )
     monkeypatch.setattr(workflow_service.terminal_service, "send_input", send)
+    if deferred_relation == "assigned_child":
+        monkeypatch.setattr(
+            workflow_service, "get_parent_completion_barrier", lambda *_args: (1, 0)
+        )
+    else:
+        monkeypatch.setattr(
+            workflow_service, "get_parent_completion_barrier", lambda *_args: (0, 0)
+        )
+        monkeypatch.setattr(
+            workflow_service,
+            "get_handoff_child_status",
+            lambda *_args: "handoff_awaiting_result",
+        )
     assert inbox_service.reconcile_provider_execution_queue() == 1
     assert send.call_count == 1
     assert send.call_args.args[1].endswith("Composer FIFO head")

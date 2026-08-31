@@ -266,6 +266,40 @@ def test_retry_exhausted_canonical_input_recovers_once_but_genuine_owner_gate_do
     assert get_workflow_status(genuine_root) == "owner_gate"
 
 
+def test_post_fix_transport_retry_gate_never_enters_upgrade_recovery(workflow_db):
+    root = "root-post-fix-transport-gate"
+    _ensure_running_test_terminal(root)
+    prepared = database.prepare_workflow_input(
+        root,
+        "new dispatcher failure",
+        request_id="post-fix-transport-gate",
+        require_live_terminal=True,
+    )
+    assert database.queue_workflow_input_for_provider(
+        root,
+        prepared["turn_id"],
+        "new dispatcher failure",
+        "PROVIDER_TRANSPORT_RETRY_PENDING",
+    )
+    now = datetime(2026, 8, 31, 12, 0, 0)
+    for offset in (0, 2, 5):
+        claimed = claim_workflow_turn(root, now=now + timedelta(seconds=offset))
+        assert claimed is not None
+        assert requeue_workflow_turn(
+            claimed["id"],
+            claimed["claim_token"],
+            claimed["claim_generation"],
+            now=now + timedelta(seconds=offset),
+        )
+
+    assert get_workflow_status(root) == "owner_gate"
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, prepared["turn_id"])
+        assert turn.dispatch_recovery_count == 1
+        assert turn.queue_reason == "PROVIDER_TRANSPORT_RETRY_EXHAUSTED"
+    assert database.reconcile_owner_gated_workflow_successors() == []
+
+
 def test_composer_successor_waits_for_reconnect_then_delivers_without_second_reconnect(
     workflow_db, monkeypatch
 ):
@@ -331,6 +365,96 @@ def _pending_inbox_turn(root: str, message: str) -> tuple[database.InboxMessage,
     turn_id = database.ensure_workflow_turn_for_inbox(inbox.id)
     assert turn_id is not None
     return inbox, turn_id
+
+
+def _complete_ready_test_reconnect(root: str, turn_id: int) -> None:
+    reconnect = database.claim_workflow_provider_reconnect(root)
+    assert reconnect is not None and reconnect.get("exhausted") is not True
+    with database.SessionLocal() as db:
+        attempt = (
+            db.query(WorkflowProviderReconnectAttemptModel)
+            .filter_by(attempt_token=reconnect["attempt_token"])
+            .one()
+        )
+        attempt.state = database.PROVIDER_RECONNECT_READY
+        attempt.output_log_device = 1
+        attempt.output_log_inode = 2
+        attempt.output_log_offset = 3
+        attempt.output_boundary_at = datetime.now()
+        db.commit()
+    assert database.complete_workflow_provider_reconnect(
+        root,
+        turn_id,
+        reconnect["claim_token"],
+        reconnect["attempt_token"],
+    )
+
+
+def test_reconnect_fifo_external_head_is_not_hidden_by_later_inbox(workflow_db, monkeypatch):
+    root = "root-reconnect-external-before-inbox"
+    predecessor = _start_admitted_input(root)
+    assert isinstance(observe_workflow_final(root), int)
+    assert database.request_workflow_provider_reconnect(root)
+    external = database.prepare_workflow_input(
+        root,
+        "Composer FIFO head",
+        request_id="reconnect-external-before-inbox",
+        require_live_terminal=True,
+    )
+    inbox, inbox_turn = _pending_inbox_turn(root, "later Inbox input")
+
+    _complete_ready_test_reconnect(root, predecessor)
+
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        assert workflow.active_turn_id == external["turn_id"]
+    assert database.get_provider_execution_admission_queue() == [
+        {
+            "source": "workflow",
+            "terminal_id": root,
+            "created_at": database.get_provider_execution_admission_queue()[0]["created_at"],
+            "source_id": external["turn_id"],
+        }
+    ]
+
+    send = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        workflow_service.terminal_service,
+        "get_terminal",
+        lambda *_args: {"lifecycle": "running", "status": TerminalStatus.IDLE.value},
+    )
+    monkeypatch.setattr(workflow_service.terminal_service, "send_input", send)
+    assert inbox_service.reconcile_provider_execution_queue() == 1
+    assert send.call_count == 1
+    assert send.call_args.args[1].endswith("Composer FIFO head")
+    assert claim_workflow_turn_receipt(root, external["turn_id"])
+    assert activate_workflow_turn_for_inbox(inbox.id) == inbox_turn
+
+
+def test_reconnect_fifo_inbox_head_remains_ahead_of_later_external(workflow_db):
+    root = "root-reconnect-inbox-before-external"
+    predecessor = _start_admitted_input(root)
+    assert isinstance(observe_workflow_final(root), int)
+    assert database.request_workflow_provider_reconnect(root)
+    inbox, inbox_turn = _pending_inbox_turn(root, "Inbox FIFO head")
+    database.prepare_workflow_input(
+        root,
+        "later Composer input",
+        request_id="reconnect-inbox-before-external",
+        require_live_terminal=True,
+    )
+
+    _complete_ready_test_reconnect(root, predecessor)
+
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        assert workflow.active_turn_id == inbox_turn
+    assert database.get_provider_execution_admission_queue()[0] == {
+        "source": "inbox",
+        "terminal_id": root,
+        "created_at": database.get_provider_execution_admission_queue()[0]["created_at"],
+        "source_id": inbox.id,
+    }
 
 
 def _admit_sent_continuation(root: str, turn: dict, now: datetime) -> None:

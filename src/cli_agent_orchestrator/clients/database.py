@@ -6661,7 +6661,11 @@ def get_provider_execution_admission_queue() -> List[Dict[str, Any]]:
             )
 
         workflow_rows = (
-            db.query(WorkflowTurnModel, WorkflowModel.root_terminal_id)
+            db.query(
+                WorkflowTurnModel,
+                WorkflowModel.root_terminal_id,
+                WorkflowModel.active_turn_id,
+            )
             .join(WorkflowModel, WorkflowTurnModel.workflow_id == WorkflowModel.id)
             .filter(
                 WorkflowModel.status == WORKFLOW_OPEN,
@@ -6672,12 +6676,30 @@ def get_provider_execution_admission_queue() -> List[Dict[str, Any]]:
             .all()
         )
         seen_workflow: set[str] = set()
-        for turn, root_terminal_id in workflow_rows:
+        for turn, root_terminal_id, active_turn_id in workflow_rows:
             terminal_id = str(root_terminal_id)
             # A resident's explicit Inbox payload is semantic authority over
-            # its synthetic OPEN-workflow continuation. Represent only that
-            # Inbox candidate; cross-resident ordering remains durable FIFO.
-            if terminal_id in seen_inbox or terminal_id in seen_workflow:
+            # its synthetic OPEN-workflow continuation. An active external
+            # Composer turn is different: reconnect completion selected that
+            # exact canonical item as the FIFO head, so a later pending Inbox
+            # row may not hide it and then defer against its active binding.
+            if terminal_id in seen_inbox:
+                active_external = (
+                    turn.kind == "external_input"
+                    and turn.inbox_message_id is None
+                    and active_turn_id == turn.id
+                )
+                if not active_external:
+                    continue
+                candidates = [
+                    candidate
+                    for candidate in candidates
+                    if not (
+                        candidate["terminal_id"] == terminal_id and candidate["source"] == "inbox"
+                    )
+                ]
+                seen_inbox.remove(terminal_id)
+            if terminal_id in seen_workflow:
                 continue
             seen_workflow.add(terminal_id)
             candidates.append(
@@ -6713,6 +6735,26 @@ def terminal_has_queued_provider_turn(terminal_id: str) -> bool:
                 WorkflowTurnModel.state == TURN_QUEUED,
             )
             .first()
+        )
+
+
+def workflow_has_active_queued_external_input(root_terminal_id: str) -> bool:
+    """Whether the OPEN workflow's exact active authority is Composer input."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        return (
+            db.query(WorkflowTurnModel.id)
+            .join(WorkflowModel, WorkflowTurnModel.workflow_id == WorkflowModel.id)
+            .filter(
+                WorkflowModel.root_terminal_id == root_terminal_id,
+                WorkflowModel.status == WORKFLOW_OPEN,
+                WorkflowModel.active_turn_id == WorkflowTurnModel.id,
+                WorkflowTurnModel.state == TURN_QUEUED,
+                WorkflowTurnModel.kind == "external_input",
+                WorkflowTurnModel.inbox_message_id.is_(None),
+            )
+            .first()
+            is not None
         )
 
 
@@ -8329,22 +8371,24 @@ def complete_workflow_provider_reconnect(
         if workflow is None or turn is None:
             db.rollback()
             return False
-        # An explicit Composer input submitted during reconnect is durable
-        # successor authority, but it must not cancel the synthetic turn that
-        # owns the exact resume attempt. Once the sidecar is proven Ready,
-        # atomically retire only that synthetic transport and promote the FIFO
-        # external successor. The next dispatcher tick injects it into this
-        # already-resident provider without purchasing another reconnect.
+        # Canonical work submitted during reconnect is durable successor
+        # authority, but it must not cancel the turn that owns the exact
+        # resume attempt. Once the sidecar is proven Ready, atomically retire
+        # only that synthetic transport and promote the FIFO head across both
+        # Composer and Inbox inputs. The next dispatcher tick injects it into
+        # this already-resident provider without purchasing another reconnect.
         successor = (
             db.query(WorkflowTurnModel)
             .filter(
                 WorkflowTurnModel.workflow_id == workflow.id,
                 WorkflowTurnModel.id > turn.id,
-                WorkflowTurnModel.kind == "external_input",
-                WorkflowTurnModel.inbox_message_id.is_(None),
                 WorkflowTurnModel.state == TURN_QUEUED,
+                or_(
+                    WorkflowTurnModel.kind == "external_input",
+                    WorkflowTurnModel.inbox_message_id.is_not(None),
+                ),
             )
-            .order_by(WorkflowTurnModel.id.asc())
+            .order_by(WorkflowTurnModel.created_at.asc(), WorkflowTurnModel.id.asc())
             .first()
         )
         if successor is not None:
@@ -9344,6 +9388,10 @@ def requeue_workflow_turn(
         if owner_gate:
             values[WorkflowTurnModel.state] = TURN_CANCELLED
             values[WorkflowTurnModel.queue_reason] = "PROVIDER_TRANSPORT_RETRY_EXHAUSTED"
+            # Any gate produced by the fixed dispatcher is ineligible for the
+            # rolling-upgrade replay. Existing pre-fix rows already on disk
+            # retain the migration default of zero and may recover once.
+            values[WorkflowTurnModel.dispatch_recovery_count] = 1
         else:
             values[WorkflowTurnModel.state] = TURN_QUEUED
             if admission_deferred:

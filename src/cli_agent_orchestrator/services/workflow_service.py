@@ -36,6 +36,7 @@ from cli_agent_orchestrator.clients.database import (
     requeue_workflow_turn,
     set_workflow_terminal_state,
     start_workflow_input,
+    workflow_has_active_queued_external_input,
     workflow_provider_reconnect_pending,
 )
 from cli_agent_orchestrator.models.inbox import ChildAssignmentStatus, OrchestrationType
@@ -377,7 +378,7 @@ def _reconcile_root_workflow_with_admission(
     # without a fresh terminal-log event.
     if pending_inbox is None:
         pending_inbox = root_terminal_id in set(get_pending_message_receiver_ids())
-    if pending_inbox:
+    if pending_inbox and not workflow_has_active_queued_external_input(root_terminal_id):
         from cli_agent_orchestrator.services.inbox_service import check_and_send_pending_messages
 
         check_and_send_pending_messages(root_terminal_id, registry=registry)

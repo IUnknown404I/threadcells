@@ -826,6 +826,28 @@ def test_interrupted_composer_send_requeues_same_payload_and_turn(capacity_db):
     ]
 
 
+def test_restart_preserves_uncertain_sent_turn_until_provider_settles(capacity_db):
+    prepared = database.prepare_workflow_input(
+        "term-0",
+        "retain the uncertain dispatch",
+        request_id="cebb6f21-d3d6-45c3-975d-a1d0a5d17d42",
+        require_live_terminal=True,
+    )
+    assert database.acquire_provider_execution("term-0", prepared["turn_id"], limit=2)
+
+    assert database.requeue_unadmitted_workflow_turns_for_restart() == 0
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowTurnModel, prepared["turn_id"]).state == "sent"
+
+    assert database.release_provider_execution("term-0", prepared["turn_id"])
+    assert database.requeue_settled_unadmitted_workflow_turn("term-0", prepared["turn_id"])
+    assert not database.requeue_settled_unadmitted_workflow_turn("term-0", prepared["turn_id"])
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, prepared["turn_id"])
+        assert turn.state == "queued"
+        assert turn.queue_reason == "PROVIDER_SETTLED_BEFORE_RECEIPT"
+
+
 def test_composer_input_queued_during_runtime_reconnect_wakes_after_recovery(
     capacity_db, monkeypatch
 ):

@@ -177,6 +177,154 @@ def _bind_policy_cursor(root: str, turn_id: int) -> str:
     return TEST_PROVIDER_OUTCOME_CURSOR
 
 
+def test_fresh_codex_turn_reserves_and_binds_session_start_outcome_cursor(workflow_db):
+    root = "root-fresh-cursor-bootstrap"
+    with database.SessionLocal() as db:
+        db.add(
+            TerminalModel(
+                id=root,
+                tmux_session=f"cao-{root}",
+                tmux_window="owner-0000",
+                provider="codex",
+                runtime_lifecycle="running",
+                runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
+            )
+        )
+        db.commit()
+    turn_id = start_workflow_input(root)
+    assert turn_id is not None
+
+    assert database.reserve_workflow_turn_provider_outcome_cursor_bootstrap(
+        root, turn_id, TEST_TERMINAL_RUNTIME_GENERATION
+    )
+    assert (
+        database.get_workflow_turn_provider_outcome_cursor_bootstrap(
+            root, TEST_TERMINAL_RUNTIME_GENERATION
+        )
+        == turn_id
+    )
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, root)
+        terminal.provider_resume_identity = TEST_CODEX_RESUME_IDENTITY
+        terminal.provider_resume_runtime_generation = TEST_TERMINAL_RUNTIME_GENERATION
+        db.commit()
+    assert bind_workflow_turn_provider_outcome_cursor(root, turn_id, TEST_PROVIDER_OUTCOME_CURSOR)
+    assert (
+        database.get_workflow_turn_provider_outcome_cursor_bootstrap(
+            root, TEST_TERMINAL_RUNTIME_GENERATION
+        )
+        is None
+    )
+    assert get_workflow_provider_outcome_observation(root) == {
+        "turn_id": turn_id,
+        "cursor": TEST_PROVIDER_OUTCOME_CURSOR,
+    }
+
+
+def test_retry_exhausted_canonical_input_recovers_once_but_genuine_owner_gate_does_not(
+    workflow_db,
+):
+    recovered_root = "root-pretransport-recovery"
+    _ensure_running_test_terminal(recovered_root)
+    prepared = database.prepare_workflow_input(
+        recovered_root,
+        "pre-existing canonical task",
+        request_id="pre-existing-canonical-task",
+        require_live_terminal=True,
+    )
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=recovered_root).one()
+        turn = db.get(WorkflowTurnModel, prepared["turn_id"])
+        workflow.status = "owner_gate"
+        workflow.terminal_reason = database.BOUNDED_TRANSPORT_RETRY_GUARD_REASON
+        turn.state = "cancelled"
+        turn.attempt_count = 3
+        turn.queue_reason = "PROVIDER_TRANSPORT_RETRY_EXHAUSTED"
+        db.commit()
+
+    assert database.reconcile_owner_gated_workflow_successors() == [recovered_root]
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=recovered_root).one()
+        turn = db.get(WorkflowTurnModel, prepared["turn_id"])
+        assert workflow.status == "open"
+        assert turn.state == "queued"
+        assert turn.dispatch_recovery_count == 1
+        workflow.status = "owner_gate"
+        workflow.terminal_reason = database.BOUNDED_TRANSPORT_RETRY_GUARD_REASON
+        turn.state = "cancelled"
+        turn.queue_reason = "PROVIDER_TRANSPORT_RETRY_EXHAUSTED"
+        db.commit()
+
+    assert database.reconcile_owner_gated_workflow_successors() == []
+
+    genuine_root = "root-genuine-owner-gate"
+    _ensure_running_test_terminal(genuine_root)
+    genuine_turn = start_workflow_input(genuine_root)
+    assert genuine_turn is not None
+    assert set_workflow_terminal_state(genuine_root, "owner_gate", "owner decision required")
+    assert database.reconcile_owner_gated_workflow_successors() == []
+    assert get_workflow_status(genuine_root) == "owner_gate"
+
+
+def test_composer_successor_waits_for_reconnect_then_delivers_without_second_reconnect(
+    workflow_db, monkeypatch
+):
+    root = "root-reconnect-composer-successor"
+    predecessor = _start_admitted_input(root)
+    reconnect_turn = observe_workflow_final(root)
+    assert isinstance(reconnect_turn, int) and reconnect_turn != predecessor
+    assert database.request_workflow_provider_reconnect(root)
+
+    prepared = database.prepare_workflow_input(
+        root,
+        "deliver after exact reconnect",
+        request_id="reconnect-composer-successor",
+        require_live_terminal=True,
+    )
+    assert prepared["queued"] is True
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        assert workflow.active_turn_id == predecessor
+        assert db.get(WorkflowTurnModel, reconnect_turn).state == "cancelled"
+
+    reconnect = database.claim_workflow_provider_reconnect(root)
+    assert reconnect is not None and reconnect.get("exhausted") is not True
+    with database.SessionLocal() as db:
+        attempt = (
+            db.query(WorkflowProviderReconnectAttemptModel)
+            .filter_by(attempt_token=reconnect["attempt_token"])
+            .one()
+        )
+        attempt.state = database.PROVIDER_RECONNECT_READY
+        attempt.output_log_device = 1
+        attempt.output_log_inode = 2
+        attempt.output_log_offset = 3
+        attempt.output_boundary_at = datetime.now()
+        db.commit()
+    assert database.complete_workflow_provider_reconnect(
+        root,
+        predecessor,
+        reconnect["claim_token"],
+        reconnect["attempt_token"],
+    )
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        assert workflow.active_turn_id == prepared["turn_id"]
+        assert db.get(WorkflowTurnModel, reconnect_turn).state == "cancelled"
+        assert db.get(WorkflowTurnModel, prepared["turn_id"]).state == "queued"
+
+    send = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        workflow_service.terminal_service,
+        "get_terminal",
+        lambda *_args: {"lifecycle": "running", "status": TerminalStatus.IDLE.value},
+    )
+    monkeypatch.setattr(workflow_service.terminal_service, "send_input", send)
+    assert inbox_service.reconcile_provider_execution_queue() == 1
+    assert send.call_count == 1
+    assert send.call_args.args[1].endswith("deliver after exact reconnect")
+
+
 def _pending_inbox_turn(root: str, message: str) -> tuple[database.InboxMessage, int]:
     """Bind one ordinary PENDING transport to the root's current OPEN workflow."""
     inbox = create_inbox_message("synthetic-sender", root, message)
@@ -276,6 +424,8 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
     assert "provider_outcome_detail" in columns
     assert "provider_outcome_observed_at" in columns
     assert "provider_outcome_cursor" in columns
+    assert "provider_outcome_cursor_bootstrap_generation" in columns
+    assert "dispatch_recovery_count" in columns
     assert "provider_reconnect_requested_at" in columns
     assert "provider_reconnect_claim_token" in columns
     assert "provider_reconnect_resume_identity" in columns

@@ -733,6 +733,16 @@ class WorkflowTurnModel(Base):
     # Provider-native event-stream boundary captured before this exact turn's
     # physical transport. It is opaque to workflow logic and compared by CAS.
     provider_outcome_cursor = Column(String, nullable=True)
+    # A fresh Codex runtime has no provider session identity until its first
+    # SessionStart hook.  Reserve that one deferred cursor handshake before
+    # physical transport and bind the real event boundary synchronously from
+    # the authenticated hook before the first model request proceeds.
+    provider_outcome_cursor_bootstrap_generation = Column(String, nullable=True)
+    # Rolling-upgrade recovery for the pre-fix failure which exhausted an
+    # explicit Composer input before its first physical send.  The recovery is
+    # deliberately one-shot so a genuine recurring transport failure cannot
+    # become an automatic restart loop.
+    dispatch_recovery_count = Column(Integer, nullable=False, default=0)
     # A stale MCP sidecar is recovered by one provider-native context
     # reinitialization. This durable timestamp is a short retry lease so two
     # workflow reconcilers cannot race the restart. The opaque provider resume
@@ -2287,6 +2297,16 @@ def _migrate_workflow_turn_columns() -> None:
             )
         if "provider_outcome_cursor" not in columns:
             conn.execute("ALTER TABLE workflow_turns ADD COLUMN provider_outcome_cursor TEXT")
+        if "provider_outcome_cursor_bootstrap_generation" not in columns:
+            conn.execute(
+                "ALTER TABLE workflow_turns "
+                "ADD COLUMN provider_outcome_cursor_bootstrap_generation TEXT"
+            )
+        if "dispatch_recovery_count" not in columns:
+            conn.execute(
+                "ALTER TABLE workflow_turns "
+                "ADD COLUMN dispatch_recovery_count INTEGER NOT NULL DEFAULT 0"
+            )
         if "provider_reconnect_requested_at" not in columns:
             conn.execute(
                 "ALTER TABLE workflow_turns ADD COLUMN provider_reconnect_requested_at DATETIME"
@@ -5483,6 +5503,7 @@ PROVIDER_RECONNECT_RECOVERY_EXHAUSTED_REASON = (
     "Provider reconnect recovery exhausted after three bounded exact-resume attempts. "
     "No further provider launch will occur automatically."
 )
+BOUNDED_TRANSPORT_RETRY_GUARD_REASON = "bounded continuation transport retry guard"
 WORKFLOW_READY_AFTER_PROCESSING_GRACE_SECONDS = 3
 WORKFLOW_READY_WITHOUT_PROCESSING_GRACE_SECONDS = 30
 # Provider finals are transport observations, not semantic mission outcomes.
@@ -5591,6 +5612,7 @@ def _cancel_superseded_open_final_turns(
                 WorkflowTurnModel.workflow_id == workflow_id,
                 WorkflowTurnModel.kind == "open_final",
                 WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+                WorkflowTurnModel.provider_reconnect_requested_at.is_(None),
             )
             .first()
         )
@@ -5601,6 +5623,7 @@ def _cancel_superseded_open_final_turns(
             WorkflowTurnModel.workflow_id == workflow_id,
             WorkflowTurnModel.kind == "open_final",
             WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+            WorkflowTurnModel.provider_reconnect_requested_at.is_(None),
         )
         .update(
             {
@@ -6097,6 +6120,7 @@ def queue_workflow_input_for_provider(
                     WorkflowTurnModel.claim_token: None,
                     WorkflowTurnModel.claim_expires_at: None,
                     WorkflowTurnModel.provider_outcome_cursor: None,
+                    WorkflowTurnModel.provider_outcome_cursor_bootstrap_generation: None,
                     WorkflowTurnModel.updated_at: datetime.now(),
                 },
                 synchronize_session=False,
@@ -6335,6 +6359,56 @@ def reconcile_owner_gated_workflow_successors(now: Optional[datetime] = None) ->
             if terminal is None or terminal.runtime_lifecycle in ("exit_pending", "exited"):
                 continue
             successor = _resume_owner_gated_successor_in_transaction(db, workflow, now)
+            if successor is None:
+                # v0.3.3a0 required a Codex outcome cursor before the first
+                # input, even though that provider identity exists only after
+                # the first SessionStart hook.  The physical send therefore
+                # never occurred, yet the bounded retry guard canceled the
+                # exact external input and owner-gated the workflow. Recover
+                # that durable canonical payload once after upgrade. Explicit
+                # owner gates, reconnect exhaustion, admitted turns, and any
+                # repeated post-fix transport failure remain fail-closed.
+                active = (
+                    db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
+                    if workflow.active_turn_id is not None
+                    else None
+                )
+                receipt_exists = bool(
+                    active is not None
+                    and db.query(WorkflowTurnReceiptModel.id)
+                    .filter_by(
+                        workflow_turn_id=active.id,
+                        receiver_terminal_id=workflow.root_terminal_id,
+                    )
+                    .first()
+                )
+                if (
+                    workflow.terminal_reason == BOUNDED_TRANSPORT_RETRY_GUARD_REASON
+                    and active is not None
+                    and active.workflow_id == workflow.id
+                    and active.kind == "external_input"
+                    and active.inbox_message_id is None
+                    and active.payload is not None
+                    and active.state == TURN_CANCELLED
+                    and active.queue_reason == "PROVIDER_TRANSPORT_RETRY_EXHAUSTED"
+                    and int(active.dispatch_recovery_count or 0) == 0
+                    and not receipt_exists
+                ):
+                    active.state = TURN_QUEUED
+                    active.attempt_count = 0
+                    active.not_before = None
+                    active.queue_reason = "WORKFLOW_DISPATCH_RECOVERY_PENDING"
+                    active.claim_token = None
+                    active.claim_expires_at = None
+                    active.provider_outcome_cursor = None
+                    active.provider_outcome_cursor_bootstrap_generation = None
+                    active.dispatch_recovery_count = 1
+                    active.updated_at = now
+                    workflow.status = WORKFLOW_OPEN
+                    workflow.terminal_reason = None
+                    workflow.no_progress_count = 0
+                    workflow.updated_at = now
+                    successor = active
             if successor is None:
                 continue
             reopened.append(cast(str, workflow.root_terminal_id))
@@ -8250,6 +8324,41 @@ def complete_workflow_provider_reconnect(
         if completed != 1:
             db.rollback()
             return False
+        workflow = db.get(WorkflowModel, cast(int, attempt.workflow_id))
+        turn = db.get(WorkflowTurnModel, turn_id)
+        if workflow is None or turn is None:
+            db.rollback()
+            return False
+        # An explicit Composer input submitted during reconnect is durable
+        # successor authority, but it must not cancel the synthetic turn that
+        # owns the exact resume attempt. Once the sidecar is proven Ready,
+        # atomically retire only that synthetic transport and promote the FIFO
+        # external successor. The next dispatcher tick injects it into this
+        # already-resident provider without purchasing another reconnect.
+        successor = (
+            db.query(WorkflowTurnModel)
+            .filter(
+                WorkflowTurnModel.workflow_id == workflow.id,
+                WorkflowTurnModel.id > turn.id,
+                WorkflowTurnModel.kind == "external_input",
+                WorkflowTurnModel.inbox_message_id.is_(None),
+                WorkflowTurnModel.state == TURN_QUEUED,
+            )
+            .order_by(WorkflowTurnModel.id.asc())
+            .first()
+        )
+        if successor is not None:
+            if turn.kind == "open_final" and turn.state in (TURN_QUEUED, TURN_CLAIMED):
+                turn.state = TURN_CANCELLED
+                turn.queue_reason = None
+                turn.claim_token = None
+                turn.claim_expires_at = None
+            workflow.active_turn_id = successor.id
+            workflow.no_progress_count = 0
+            workflow.updated_at = datetime.now()
+            successor.not_before = None
+            successor.queue_reason = "WORKFLOW_CONTINUATION_PENDING"
+            successor.updated_at = workflow.updated_at
         terminal.runtime_operation_kind = None
         terminal.runtime_operation_token = None
         terminal.runtime_operation_claimed_at = None
@@ -8582,9 +8691,76 @@ def bind_workflow_turn_provider_outcome_cursor(
             db.rollback()
             return matches
         turn.provider_outcome_cursor = cursor
+        turn.provider_outcome_cursor_bootstrap_generation = None
         turn.updated_at = datetime.now()
         db.commit()
         return True
+
+
+def reserve_workflow_turn_provider_outcome_cursor_bootstrap(
+    root_terminal_id: str,
+    logical_turn_id: int,
+    runtime_generation: str,
+) -> bool:
+    """Reserve the fresh-runtime SessionStart cursor handshake before send.
+
+    Only the active, unsatisfied logical turn in the exact live terminal
+    generation may defer its provider outcome cursor.  This is not a relaxed
+    policy boundary: Codex's authenticated SessionStart hook must replace this
+    reservation with the real provider-native cursor before its first model
+    request continues.
+    """
+    if not runtime_generation:
+        return False
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.get(TerminalModel, root_terminal_id)
+        workflow = _open_workflow(db, root_terminal_id, create=False)
+        turn = db.get(WorkflowTurnModel, logical_turn_id)
+        if (
+            terminal is None
+            or terminal.provider != "codex"
+            or terminal.runtime_lifecycle not in (None, "running")
+            or terminal.runtime_generation != runtime_generation
+            or terminal.provider_resume_identity is not None
+            or workflow is None
+            or workflow.status != WORKFLOW_OPEN
+            or workflow.active_turn_id != logical_turn_id
+            or turn is None
+            or turn.workflow_id != workflow.id
+            or turn.state not in (TURN_CLAIMED, TURN_SENT)
+            or turn.provider_outcome_cursor is not None
+            or turn.provider_outcome_cursor_bootstrap_generation not in (None, runtime_generation)
+        ):
+            db.rollback()
+            return False
+        turn.provider_outcome_cursor_bootstrap_generation = runtime_generation
+        turn.updated_at = datetime.now()
+        db.commit()
+        return True
+
+
+def get_workflow_turn_provider_outcome_cursor_bootstrap(
+    root_terminal_id: str,
+    runtime_generation: str,
+) -> Optional[int]:
+    """Return the exact active turn awaiting its authenticated first cursor."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        workflow = _open_workflow(db, root_terminal_id, create=False)
+        if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
+            return None
+        turn = db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
+        if (
+            turn is None
+            or turn.workflow_id != workflow.id
+            or turn.state not in (TURN_CLAIMED, TURN_SENT)
+            or turn.provider_outcome_cursor is not None
+            or turn.provider_outcome_cursor_bootstrap_generation != runtime_generation
+        ):
+            return None
+        return int(turn.id)
 
 
 def get_workflow_provider_outcome_observation(
@@ -9145,6 +9321,7 @@ def requeue_workflow_turn(
             WorkflowTurnModel.claim_token: None,
             WorkflowTurnModel.claim_expires_at: None,
             WorkflowTurnModel.provider_outcome_cursor: None,
+            WorkflowTurnModel.provider_outcome_cursor_bootstrap_generation: None,
             WorkflowTurnModel.updated_at: now,
         }
         admission_deferred = admission_reason_code is not None
@@ -9200,7 +9377,7 @@ def requeue_workflow_turn(
             workflow_values.update(
                 {
                     WorkflowModel.status: WORKFLOW_OWNER_GATE,
-                    WorkflowModel.terminal_reason: "bounded continuation transport retry guard",
+                    WorkflowModel.terminal_reason: BOUNDED_TRANSPORT_RETRY_GUARD_REASON,
                 }
             )
         elif successor is not None:
@@ -9260,6 +9437,7 @@ def requeue_expired_workflow_turn_claims(now: Optional[datetime] = None) -> int:
                     WorkflowTurnModel.claim_token: None,
                     WorkflowTurnModel.claim_expires_at: None,
                     WorkflowTurnModel.provider_outcome_cursor: None,
+                    WorkflowTurnModel.provider_outcome_cursor_bootstrap_generation: None,
                     WorkflowTurnModel.updated_at: now,
                 },
                 synchronize_session=False,
@@ -9274,9 +9452,11 @@ def requeue_unadmitted_workflow_turns_for_restart(now: Optional[datetime] = None
     """Replay a restart-interrupted transport under its same logical turn.
 
     A ``sent`` turn without a receiver receipt has crossed only the physical
-    transport boundary. On restart it is safe to retry that exact envelope;
-    the receiver receipt remains the idempotency fence. Restrict this to the
-    current active turn so historical audit rows can never be revived.
+    transport boundary. On restart it is safe to retry that exact envelope
+    only when no durable provider-execution lease says the dispatch may still
+    be resident. A surviving lease is uncertain post-dispatch state and must
+    first settle through a provider observation. Restrict this to the current
+    active turn so historical audit rows can never be revived.
     """
     _ensure_workflow_schema()
     now = now or datetime.now()
@@ -9296,6 +9476,11 @@ def requeue_unadmitted_workflow_turns_for_restart(now: Optional[datetime] = None
                     WorkflowTurnReceiptModel.workflow_turn_id == WorkflowTurnModel.id,
                 )
                 .exists(),
+                ~db.query(ProviderExecutionLeaseModel)
+                .filter(
+                    ProviderExecutionLeaseModel.workflow_turn_id == WorkflowTurnModel.id,
+                )
+                .exists(),
             )
             .update(
                 {
@@ -9303,6 +9488,7 @@ def requeue_unadmitted_workflow_turns_for_restart(now: Optional[datetime] = None
                     WorkflowTurnModel.claim_token: None,
                     WorkflowTurnModel.claim_expires_at: None,
                     WorkflowTurnModel.provider_outcome_cursor: None,
+                    WorkflowTurnModel.provider_outcome_cursor_bootstrap_generation: None,
                     WorkflowTurnModel.updated_at: now,
                 },
                 synchronize_session=False,
@@ -9311,6 +9497,63 @@ def requeue_unadmitted_workflow_turns_for_restart(now: Optional[datetime] = None
         if unreceived:
             db.commit()
         return unreceived
+
+
+def requeue_settled_unadmitted_workflow_turn(
+    root_terminal_id: str,
+    logical_turn_id: int,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Recover one same-turn dispatch only after its provider has settled.
+
+    ``terminal_service.get_terminal`` snapshots the durable execution lease,
+    observes the provider, and releases only that exact lease when the runtime
+    is no longer processing. This follow-up transaction turns the matching
+    active, unreceipted ``sent`` row back into its same queued envelope. The
+    no-lease predicate prevents a stale status observer from requeueing a new
+    resident execution, while the receiver receipt remains the semantic
+    exactly-once fence.
+    """
+    _ensure_workflow_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        workflow = _open_workflow(db, root_terminal_id, create=False)
+        if (
+            workflow is None
+            or workflow.status != WORKFLOW_OPEN
+            or workflow.active_turn_id != logical_turn_id
+        ):
+            db.rollback()
+            return False
+        turn = db.get(WorkflowTurnModel, logical_turn_id)
+        if (
+            turn is None
+            or turn.workflow_id != workflow.id
+            or turn.state != TURN_SENT
+            or db.get(ProviderExecutionLeaseModel, root_terminal_id) is not None
+            or db.query(WorkflowTurnReceiptModel)
+            .filter_by(
+                workflow_turn_id=logical_turn_id,
+                receiver_terminal_id=root_terminal_id,
+            )
+            .first()
+            is not None
+        ):
+            db.rollback()
+            return False
+        turn.state = TURN_QUEUED
+        turn.claim_token = None
+        turn.claim_expires_at = None
+        turn.provider_outcome_cursor = None
+        turn.provider_outcome_cursor_bootstrap_generation = None
+        turn.provider_processing_observed_at = None
+        turn.provider_ready_observed_at = None
+        turn.not_before = now
+        turn.queue_reason = "PROVIDER_SETTLED_BEFORE_RECEIPT"
+        turn.updated_at = now
+        db.commit()
+        return True
 
 
 def reconcile_superseded_workflow_turns_for_restart(
@@ -9349,6 +9592,32 @@ def reconcile_superseded_workflow_turns_for_restart(
                 if workflow.active_turn_id is not None
                 else None
             )
+            if (
+                active is not None
+                and active.kind == "open_final"
+                and active.state == TURN_CANCELLED
+                and active.provider_reconnect_requested_at is not None
+                and db.query(WorkflowTurnModel.id)
+                .filter(
+                    WorkflowTurnModel.workflow_id == workflow.id,
+                    WorkflowTurnModel.id > active.id,
+                    WorkflowTurnModel.kind == "external_input",
+                    WorkflowTurnModel.inbox_message_id.is_(None),
+                    WorkflowTurnModel.state == TURN_QUEUED,
+                )
+                .first()
+                is not None
+            ):
+                # Rolling-upgrade repair for the pre-fix race where Composer
+                # canceled the synthetic turn that still owned a durable
+                # sidecar reconnect. Restore only that exact reconnect owner;
+                # completion will promote the already-queued explicit input.
+                active.state = TURN_QUEUED
+                active.claim_token = None
+                active.claim_expires_at = None
+                active.updated_at = now
+                workflow.updated_at = now
+                changed += 1
             if (
                 newest_admitted is not None
                 and active is not None

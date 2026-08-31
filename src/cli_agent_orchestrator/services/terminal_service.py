@@ -54,6 +54,7 @@ from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
     get_terminal_workflow_projection,
     get_workflow_provider_reconnect_runtime_ready,
+    get_workflow_turn_provider_outcome_cursor_bootstrap,
     list_all_terminals,
     mark_handoff_child_input_received,
     mark_terminal_runtime_exited,
@@ -67,6 +68,8 @@ from cli_agent_orchestrator.clients.database import (
     release_provider_execution,
     release_terminal_runtime_operation,
     replace_starting_terminal_runtime_identity,
+    requeue_settled_unadmitted_workflow_turn,
+    reserve_workflow_turn_provider_outcome_cursor_bootstrap,
     resolve_session_lifetime,
     terminal_deletion_receipt_exists,
     terminal_requires_result_snapshot,
@@ -1619,6 +1622,23 @@ def bind_provider_runtime_session_identity(
         runtime_generation=runtime_generation,
     ):
         raise RuntimeError("Could not durably bind Codex session identity")
+    bootstrap_turn_id = get_workflow_turn_provider_outcome_cursor_bootstrap(
+        terminal_id, runtime_generation
+    )
+    if bootstrap_turn_id is not None:
+        capture = getattr(provider, "capture_turn_outcome_cursor", None)
+        cursor = capture(provider_session_id=verified) if capture is not None else None
+        if (
+            not isinstance(cursor, str)
+            or not cursor
+            or not bind_workflow_turn_provider_outcome_cursor(
+                terminal_id, bootstrap_turn_id, cursor
+            )
+        ):
+            # SessionStart is synchronous and precedes the first model
+            # request. Failing this callback therefore stops work before a
+            # policy outcome could occur without its exact event boundary.
+            raise RuntimeError("Could not bind first-turn provider outcome boundary")
     return verified
 
 
@@ -1753,6 +1773,11 @@ def get_terminal(terminal_id: str) -> Dict:
             if observed_execution_turn is not None and release_provider_execution(
                 terminal_id, observed_execution_turn
             ):
+                # Startup never replays a SENT envelope while its durable
+                # execution lease survives. Only this exact settled-provider
+                # observation may requeue it, and a concurrent receipt or
+                # successor wins the database transaction instead.
+                requeue_settled_unadmitted_workflow_turn(terminal_id, observed_execution_turn)
                 _wake_queued_provider_execution()
         workflow = get_terminal_workflow_projection(terminal_id)
         execution = get_terminal_execution_projection(terminal_id)
@@ -1910,7 +1935,19 @@ def send_input(
                 cursor_required = bool(cursor_requirement and cursor_requirement() is True)
                 outcome_cursor = capture_provider_turn_outcome_cursor(terminal_id, provider)
                 if cursor_required and outcome_cursor is None:
-                    raise RuntimeError("required provider outcome boundary is unavailable")
+                    deferred_requirement = getattr(
+                        provider, "defer_turn_outcome_cursor_to_session_start", None
+                    )
+                    runtime_generation = metadata.get("runtime_generation")
+                    if (
+                        not deferred_requirement
+                        or deferred_requirement() is not True
+                        or not isinstance(runtime_generation, str)
+                        or not reserve_workflow_turn_provider_outcome_cursor_bootstrap(
+                            terminal_id, logical_turn_id, runtime_generation
+                        )
+                    ):
+                        raise RuntimeError("required provider outcome boundary is unavailable")
                 if outcome_cursor is not None and not bind_workflow_turn_provider_outcome_cursor(
                     terminal_id, logical_turn_id, outcome_cursor
                 ):

@@ -82,7 +82,12 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
-from cli_agent_orchestrator.services import inbox_service, operations_service, workflow_service
+from cli_agent_orchestrator.services import (
+    inbox_service,
+    operations_service,
+    terminal_service,
+    workflow_service,
+)
 from cli_agent_orchestrator.services.inbox_service import (
     LogFileHandler,
     _dispatch_pending_messages_with_admission,
@@ -122,6 +127,14 @@ def workflow_db(monkeypatch, tmp_path):
         operations_service,
         "workflow_execution_admission_fence",
         admitted_workflow_fence,
+    )
+    # Provider-native rollout evidence belongs to the terminal-service unit
+    # contour. Workflow matrix cases opt into active/unavailable boundaries
+    # explicitly; their synthetic terminals have no real tmux rollout.
+    monkeypatch.setattr(
+        workflow_service.terminal_service,
+        "provider_turn_execution_active",
+        lambda _terminal_id: False,
     )
     yield engine
     engine.dispose()
@@ -221,6 +234,21 @@ def test_fresh_codex_turn_reserves_and_binds_session_start_outcome_cursor(workfl
     }
 
 
+def test_persisted_resume_metadata_reaches_real_cursor_capture_path(workflow_db):
+    root = "root-real-resume-metadata-projection"
+    _ensure_running_test_terminal(root)
+    provider = MagicMock()
+    provider.capture_turn_outcome_cursor.return_value = TEST_PROVIDER_OUTCOME_CURSOR
+
+    assert (
+        terminal_service.capture_provider_turn_outcome_cursor(root, provider)
+        == TEST_PROVIDER_OUTCOME_CURSOR
+    )
+    provider.capture_turn_outcome_cursor.assert_called_once_with(
+        provider_session_id=TEST_CODEX_RESUME_IDENTITY
+    )
+
+
 def test_retry_exhausted_canonical_input_recovers_once_but_genuine_owner_gate_does_not(
     workflow_db,
 ):
@@ -298,6 +326,357 @@ def test_post_fix_transport_retry_gate_never_enters_upgrade_recovery(workflow_db
         assert turn.dispatch_recovery_count == 1
         assert turn.queue_reason == "PROVIDER_TRANSPORT_RETRY_EXHAUSTED"
     assert database.reconcile_owner_gated_workflow_successors() == []
+
+
+def test_historical_pre_fix_composer_turn_survives_newer_bootstrap_transport_gates(
+    workflow_db,
+):
+    root = "root-production-owner-gate-replay"
+    _ensure_running_test_terminal(root)
+    now = datetime(2026, 8, 31, 13, 41, 0)
+    with database.SessionLocal() as db:
+        original_workflow = WorkflowModel(
+            root_terminal_id=root,
+            status="owner_gate",
+            terminal_reason=database.BOUNDED_TRANSPORT_RETRY_GUARD_REASON,
+        )
+        db.add(original_workflow)
+        db.flush()
+        original_turn = WorkflowTurnModel(
+            workflow_id=original_workflow.id,
+            kind="external_input",
+            dedupe_key="external_request:pre-existing-production-task",
+            payload="same pre-existing canonical Composer task",
+            state="cancelled",
+            attempt_count=3,
+            queue_reason="PROVIDER_TRANSPORT_RETRY_EXHAUSTED",
+            dispatch_recovery_count=0,
+        )
+        db.add(original_turn)
+        db.flush()
+        original_workflow.active_turn_id = original_turn.id
+
+        newer_workflows = []
+        newer_turns = []
+        for index in range(2):
+            newer = WorkflowModel(
+                root_terminal_id=root,
+                status="owner_gate",
+                terminal_reason=database.BOUNDED_TRANSPORT_RETRY_GUARD_REASON,
+                resumed_from_owner_gate_workflow_id=(
+                    original_workflow.id if index == 0 else newer_workflows[-1].id
+                ),
+            )
+            db.add(newer)
+            db.flush()
+            newer_turn = WorkflowTurnModel(
+                workflow_id=newer.id,
+                kind="external_input",
+                dedupe_key=f"external_request:bootstrap-{index}",
+                payload=f"bootstrap {index}",
+                state="cancelled",
+                attempt_count=3,
+                queue_reason="PROVIDER_TRANSPORT_RETRY_EXHAUSTED",
+                dispatch_recovery_count=1,
+            )
+            db.add(newer_turn)
+            db.flush()
+            newer.active_turn_id = newer_turn.id
+            newer_workflows.append(newer)
+            newer_turns.append(newer_turn)
+        original_workflow_id = original_workflow.id
+        original_turn_id = original_turn.id
+        latest_workflow_id = newer_workflows[-1].id
+        newer_turn_ids = [turn.id for turn in newer_turns]
+        db.commit()
+
+    barrier = Barrier(2)
+
+    def reconcile(_index):
+        barrier.wait()
+        return database.reconcile_owner_gated_workflow_successors(now=now)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(reconcile, range(2)))
+
+    assert sorted(results, key=len) == [[], [root]]
+    assert database.reconcile_owner_gated_workflow_successors(now=now) == []
+    with database.SessionLocal() as db:
+        original = db.get(WorkflowModel, original_workflow_id)
+        latest = db.get(WorkflowModel, latest_workflow_id)
+        recovered = db.get(WorkflowTurnModel, original_turn_id)
+        assert original.status == "owner_gate"
+        assert original.active_turn_id is None
+        assert latest.status == "open"
+        assert latest.active_turn_id == original_turn_id
+        assert latest.resumed_from_owner_gate_workflow_id == original_workflow_id
+        assert recovered.workflow_id == latest_workflow_id
+        assert recovered.state == "queued"
+        assert recovered.payload == "same pre-existing canonical Composer task"
+        assert recovered.dedupe_key == "external_request:pre-existing-production-task"
+        assert recovered.dispatch_recovery_count == 1
+        assert [db.get(WorkflowTurnModel, turn_id).state for turn_id in newer_turn_ids] == [
+            "cancelled",
+            "cancelled",
+        ]
+
+    claim = claim_workflow_turn(root, now=now)
+    assert claim is not None and claim["id"] == original_turn_id
+    assert claim_workflow_turn(root, now=now) is None
+
+
+def test_historical_transport_replay_does_not_cross_newer_genuine_owner_gate(workflow_db):
+    root = "root-production-genuine-gate"
+    _ensure_running_test_terminal(root)
+    with database.SessionLocal() as db:
+        historical = WorkflowModel(
+            root_terminal_id=root,
+            status="owner_gate",
+            terminal_reason=database.BOUNDED_TRANSPORT_RETRY_GUARD_REASON,
+        )
+        db.add(historical)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=historical.id,
+            kind="external_input",
+            dedupe_key="external_request:historical",
+            payload="must remain gated",
+            state="cancelled",
+            attempt_count=3,
+            queue_reason="PROVIDER_TRANSPORT_RETRY_EXHAUSTED",
+            dispatch_recovery_count=0,
+        )
+        db.add(turn)
+        db.flush()
+        historical.active_turn_id = turn.id
+        genuine = WorkflowModel(
+            root_terminal_id=root,
+            status="owner_gate",
+            terminal_reason="owner decision required",
+        )
+        db.add(genuine)
+        db.commit()
+
+    assert database.reconcile_owner_gated_workflow_successors() == []
+    assert get_workflow_status(root) == "owner_gate"
+
+
+@pytest.mark.parametrize("semantic_history", ["receipt", "effect", "queued_turn"])
+def test_historical_transport_replay_does_not_cross_newer_semantic_history(
+    workflow_db, semantic_history
+):
+    root = f"root-production-history-{semantic_history}"
+    _ensure_running_test_terminal(root)
+    with database.SessionLocal() as db:
+        historical = WorkflowModel(
+            root_terminal_id=root,
+            status="owner_gate",
+            terminal_reason=database.BOUNDED_TRANSPORT_RETRY_GUARD_REASON,
+        )
+        db.add(historical)
+        db.flush()
+        original = WorkflowTurnModel(
+            workflow_id=historical.id,
+            kind="external_input",
+            dedupe_key="external_request:historical",
+            payload="historical payload",
+            state="cancelled",
+            attempt_count=3,
+            queue_reason="PROVIDER_TRANSPORT_RETRY_EXHAUSTED",
+            dispatch_recovery_count=0,
+        )
+        db.add(original)
+        db.flush()
+        historical.active_turn_id = original.id
+
+        newer = WorkflowModel(
+            root_terminal_id=root,
+            status="owner_gate",
+            terminal_reason=database.BOUNDED_TRANSPORT_RETRY_GUARD_REASON,
+            resumed_from_owner_gate_workflow_id=historical.id,
+        )
+        db.add(newer)
+        db.flush()
+        active = WorkflowTurnModel(
+            workflow_id=newer.id,
+            kind="external_input",
+            dedupe_key="external_request:newer-active",
+            payload="newer bootstrap payload",
+            state="cancelled",
+            attempt_count=3,
+            queue_reason="PROVIDER_TRANSPORT_RETRY_EXHAUSTED",
+            dispatch_recovery_count=1,
+        )
+        db.add(active)
+        db.flush()
+        newer.active_turn_id = active.id
+
+        queued_turn_id = None
+        if semantic_history in {"receipt", "queued_turn"}:
+            earlier = WorkflowTurnModel(
+                workflow_id=newer.id,
+                kind="external_input",
+                dedupe_key=f"external_request:{semantic_history}",
+                payload="newer semantic authority",
+                state="sent" if semantic_history == "receipt" else "queued",
+            )
+            db.add(earlier)
+            db.flush()
+            queued_turn_id = earlier.id
+            if semantic_history == "receipt":
+                db.add(
+                    WorkflowTurnReceiptModel(
+                        workflow_turn_id=earlier.id,
+                        receiver_terminal_id=root,
+                    )
+                )
+        else:
+            db.add(
+                WorkflowEffectModel(
+                    workflow_id=newer.id,
+                    workflow_turn_id=active.id,
+                    effect_kind="send_message",
+                    effect_key="newer-semantic-effect",
+                    state="finished",
+                    claim_token="effect-claim",
+                )
+            )
+        historical_id = historical.id
+        original_id = original.id
+        newer_id = newer.id
+        active_id = active.id
+        db.commit()
+
+    expected = [root] if semantic_history == "queued_turn" else []
+    assert database.reconcile_owner_gated_workflow_successors() == expected
+    with database.SessionLocal() as db:
+        historical = db.get(WorkflowModel, historical_id)
+        newer = db.get(WorkflowModel, newer_id)
+        assert historical.status == "owner_gate"
+        assert historical.active_turn_id == original_id
+        if semantic_history == "queued_turn":
+            assert newer.status == "open"
+            assert newer.active_turn_id == queued_turn_id
+        else:
+            assert newer.status == "owner_gate"
+            assert newer.active_turn_id == active_id
+        assert db.get(WorkflowTurnModel, original_id).workflow_id == historical_id
+
+
+@patch("cli_agent_orchestrator.services.workflow_service.terminal_service")
+def test_production_owner_gate_replay_dispatches_and_admits_same_turn_once(
+    mock_terminal, workflow_db
+):
+    root = "root-production-live-replay"
+    _ensure_running_test_terminal(root)
+    now = datetime(2026, 8, 31, 13, 55, 0)
+    with database.SessionLocal() as db:
+        stranded = WorkflowModel(
+            root_terminal_id=root,
+            status="owner_gate",
+            terminal_reason=database.BOUNDED_TRANSPORT_RETRY_GUARD_REASON,
+        )
+        db.add(stranded)
+        db.flush()
+        original = WorkflowTurnModel(
+            workflow_id=stranded.id,
+            kind="external_input",
+            dedupe_key="external_request:same-live-payload",
+            payload="same live production payload",
+            state="cancelled",
+            attempt_count=3,
+            queue_reason="PROVIDER_TRANSPORT_RETRY_EXHAUSTED",
+            dispatch_recovery_count=0,
+        )
+        db.add(original)
+        db.flush()
+        stranded.active_turn_id = original.id
+        newer = WorkflowModel(
+            root_terminal_id=root,
+            status="owner_gate",
+            terminal_reason=database.BOUNDED_TRANSPORT_RETRY_GUARD_REASON,
+            resumed_from_owner_gate_workflow_id=stranded.id,
+        )
+        db.add(newer)
+        db.flush()
+        bootstrap = WorkflowTurnModel(
+            workflow_id=newer.id,
+            kind="external_input",
+            dedupe_key="external_request:bootstrap",
+            payload="already handled bootstrap",
+            state="cancelled",
+            attempt_count=3,
+            queue_reason="PROVIDER_TRANSPORT_RETRY_EXHAUSTED",
+            dispatch_recovery_count=1,
+        )
+        db.add(bootstrap)
+        db.flush()
+        newer.active_turn_id = bootstrap.id
+        original_turn_id = original.id
+        db.commit()
+
+    mock_terminal.get_terminal.return_value = {
+        "status": TerminalStatus.IDLE.value,
+        "lifecycle": "running",
+    }
+    mock_terminal.provider_runtime_sidecar_reconnect_required.return_value = False
+    mock_terminal.provider_turn_execution_active.return_value = False
+    mock_terminal.provider_turn_outcome.return_value = None
+    mock_terminal.send_input.return_value = True
+
+    assert inbox_service.reconcile_provider_execution_queue(observe_open_workflows=False) == 1
+    assert inbox_service.reconcile_provider_execution_queue(observe_open_workflows=False) == 0
+    mock_terminal.send_input.assert_called_once()
+    assert mock_terminal.send_input.call_args.kwargs["logical_turn_id"] == original_turn_id
+    assert f"[CAO workflow input: logical-turn={original_turn_id}]" in (
+        mock_terminal.send_input.call_args.args[1]
+    )
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, original_turn_id)
+        assert turn.state == "sent"
+        assert turn.payload == "same live production payload"
+        assert db.query(WorkflowTurnReceiptModel).count() == 0
+
+    assert claim_workflow_turn_receipt(root, original_turn_id) is True
+    assert claim_workflow_turn_receipt(root, original_turn_id) is False
+    assert inbox_service.reconcile_provider_execution_queue(observe_open_workflows=False) == 0
+    assert mock_terminal.send_input.call_count == 1
+
+
+@patch("cli_agent_orchestrator.services.workflow_service.terminal_service")
+def test_provider_native_active_task_fences_ready_projection_before_dispatch(
+    mock_terminal, workflow_db
+):
+    root = "root-ready-projection-active-provider"
+    _ensure_running_test_terminal(root)
+    prepared = database.prepare_workflow_input(
+        root,
+        "wait for provider task completion",
+        request_id="provider-active-ready-projection",
+        require_live_terminal=True,
+    )
+    assert database.queue_workflow_input_for_provider(
+        root,
+        prepared["turn_id"],
+        "wait for provider task completion",
+        "WORKFLOW_CONTINUATION_PENDING",
+    )
+    mock_terminal.get_terminal.return_value = {
+        "status": TerminalStatus.IDLE.value,
+        "lifecycle": "running",
+    }
+    mock_terminal.provider_runtime_sidecar_reconnect_required.return_value = False
+    mock_terminal.provider_turn_execution_active.side_effect = [True, False]
+    mock_terminal.provider_turn_outcome.return_value = None
+    mock_terminal.send_input.return_value = True
+
+    assert workflow_service.reconcile_root_workflow(root) is False
+    mock_terminal.send_input.assert_not_called()
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowTurnModel, prepared["turn_id"]).state == "queued"
+
+    assert workflow_service.reconcile_root_workflow(root) is True
+    mock_terminal.send_input.assert_called_once()
 
 
 def test_composer_successor_waits_for_reconnect_then_delivers_without_second_reconnect(

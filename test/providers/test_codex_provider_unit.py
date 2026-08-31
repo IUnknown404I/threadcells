@@ -1431,6 +1431,42 @@ class TestCodexBulletFormatStatusDetection:
         )
 
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
+    def test_exact_rollout_task_boundary_fences_reconstructed_ready_state(
+        self, mock_tmux, tmp_path, monkeypatch
+    ):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        working_directory = tmp_path / "project"
+        working_directory.mkdir()
+        mock_tmux.get_pane_working_directory.return_value = str(working_directory)
+        codex_home = tmp_path / "codex"
+        identity = "01234567-89ab-cdef-0123-456789abcdef"
+        rollout = _open_rollout_fixture(
+            tmp_path / "proc",
+            codex_home,
+            process_id=200,
+            descriptor="8",
+            session_id=identity,
+            working_directory=working_directory,
+        )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+        assert provider.turn_execution_active(provider_session_id=identity) is False
+        with rollout.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n"
+            )
+        assert provider.turn_execution_active(provider_session_id=identity) is True
+        with rollout.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}) + "\n"
+            )
+        assert provider.turn_execution_active(provider_session_id=identity) is False
+
+        with rollout.open("a", encoding="utf-8") as handle:
+            handle.write('{"type":"event_msg","payload":{"type":"task_started"}')
+        assert provider.turn_execution_active(provider_session_id=identity) is None
+
+    @patch("cli_agent_orchestrator.providers.codex.tmux_client")
     def test_structured_policy_outcome_uses_exact_rollout_without_response_content(
         self, mock_tmux, tmp_path, monkeypatch
     ):

@@ -261,6 +261,20 @@ def _reconcile_root_workflow_with_admission(
         return False
     if status not in (TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value):
         return False
+    provider_task_active = terminal_service.provider_turn_execution_active(root_terminal_id)
+    if provider_task_active is True:
+        observe_workflow_processing(root_terminal_id, now=now)
+        logger.debug(
+            "Workflow root %s provider task boundary is active; deferring transport",
+            root_terminal_id,
+        )
+        return False
+    if provider_task_active is None:
+        logger.debug(
+            "Workflow root %s provider task boundary is unavailable; deferring transport",
+            root_terminal_id,
+        )
+        return False
 
     # A promoted API must never let its stale in-process MCP sidecar mutate
     # current state. When Codex surfaces the exact generation fence, persist

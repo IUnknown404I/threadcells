@@ -240,7 +240,7 @@ def test_request_durably_claims_before_runtime_retirement_and_writer_transfer(mo
         events.append("admission_locked")
         yield {}
 
-    monkeypatch.setattr(service, "context_launch_admission", admitted)
+    monkeypatch.setattr(service, "context_lifecycle_fence", admitted)
 
     def claim(**_kwargs):
         assert events == ["admission_locked"]
@@ -338,7 +338,7 @@ def test_restart_before_dispatch_launches_exactly_once(monkeypatch):
     def admitted(**_kwargs):
         yield {}
 
-    monkeypatch.setattr(service, "context_launch_admission", admitted)
+    monkeypatch.setattr(service, "context_lifecycle_fence", admitted)
     assert service.reconcile_recovery_takeover("takeover-1")["state"] == "completed"
     assert launches == ["takeover-1"]
 
@@ -383,7 +383,7 @@ def test_restart_after_claim_retires_then_fences_then_dispatches_once(monkeypatc
     def admitted(**_kwargs):
         yield {}
 
-    monkeypatch.setattr(service, "context_launch_admission", admitted)
+    monkeypatch.setattr(service, "context_lifecycle_fence", admitted)
     assert service.reconcile_recovery_takeover("takeover-1")["state"] == "completed"
     assert events == [
         "runtime_retired",
@@ -423,6 +423,8 @@ def test_restart_after_admission_observes_existing_provider_without_second_launc
     takeover = {
         "id": "takeover-1",
         "state": "admitted",
+        "canonical_worktree": "/repo",
+        "project_id": "project-1",
         "new_terminal_id": "b22ce001",
         "new_session_name": "cao-recovery",
         "new_window_name": "recovery-window",
@@ -452,15 +454,27 @@ def test_restart_after_admission_observes_existing_provider_without_second_launc
         get_status=lambda: TerminalStatus.PROCESSING,
         initialize=lambda: (_ for _ in ()).throw(AssertionError("must not initialize twice")),
     )
+    current = dict(takeover)
+    monkeypatch.setattr(service, "get_recovery_takeover", lambda _id: dict(current))
     monkeypatch.setattr(service, "get_terminal_metadata", lambda _id: new)
     monkeypatch.setattr(service.tmux_client, "exact_runtime_target", lambda *_args: target)
     monkeypatch.setattr(service.provider_manager, "get_provider", lambda _id: provider)
     monkeypatch.setattr(service, "mark_terminal_runtime_running", lambda _id: True)
     completed = []
-    monkeypatch.setattr(
-        service, "mark_recovery_takeover_completed", lambda _id: completed.append(_id) or True
-    )
-    assert service._recover_dispatching_takeover(takeover) is False
+
+    @contextmanager
+    def fenced(**_kwargs):
+        yield True
+
+    monkeypatch.setattr(service, "context_lifecycle_fence", fenced)
+
+    def complete(takeover_id):
+        completed.append(takeover_id)
+        current["state"] = "completed"
+        return True
+
+    monkeypatch.setattr(service, "mark_recovery_takeover_completed", complete)
+    assert service.reconcile_recovery_takeover("takeover-1")["state"] == "completed"
     assert completed == ["takeover-1"]
 
 
@@ -485,7 +499,7 @@ def test_concurrent_admitted_reconcilers_initialize_provider_once(monkeypatch):
         current["state"] = "completed"
         return False
 
-    monkeypatch.setattr(service, "context_launch_admission", admitted)
+    monkeypatch.setattr(service, "context_lifecycle_fence", admitted)
     monkeypatch.setattr(service, "get_recovery_takeover", lambda _id: dict(current))
     monkeypatch.setattr(service, "_recover_dispatching_takeover", recover)
 

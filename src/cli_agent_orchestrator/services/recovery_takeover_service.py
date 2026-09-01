@@ -33,7 +33,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.control_plane_registry import resolve_launch
 from cli_agent_orchestrator.services.managed_worktree_service import managed_worktree_status
-from cli_agent_orchestrator.services.operations_service import context_launch_admission
+from cli_agent_orchestrator.services.operations_service import context_lifecycle_fence
 from cli_agent_orchestrator.services.terminal_service import (
     SHELL_COMMANDS,
     _create_terminal_after_admission,
@@ -377,14 +377,9 @@ def request_recovery_takeover(
     new_window_name = generate_window_name(agent_profile)
     new_runtime_generation = str(uuid.uuid4())
     try:
-        with context_launch_admission(
-            canonical_worktree=terminal["launch_worktree"],
-            write_enabled=True,
-            context_role="supervisor",
-            project_id=terminal["project_id"],
-        ):
-            # Runtime absence was observed before waiting for capacity. Re-prove
-            # it under the same launch fence immediately before the DB CAS.
+        with context_lifecycle_fence():
+            # Runtime absence was observed before waiting for the lifecycle
+            # fence. Re-prove it immediately before the DB CAS.
             refreshed = preview_recovery_takeover(
                 old_terminal_id,
                 expected_authority_generation=expected_authority_generation,
@@ -622,12 +617,7 @@ def reconcile_recovery_takeover(takeover_id: str, *, registry=None) -> dict[str,
                 )
                 or takeover
             )
-        with context_launch_admission(
-            canonical_worktree=str(takeover["canonical_worktree"]),
-            write_enabled=True,
-            context_role="supervisor",
-            project_id=str(takeover["project_id"]),
-        ):
+        with context_lifecycle_fence():
             # Re-prove and retire the exact old runtime under the sole launch
             # fence, then atomically move the DB writer epoch. A crash between
             # these steps leaves a durable claimed row for startup recovery.
@@ -646,12 +636,7 @@ def reconcile_recovery_takeover(takeover_id: str, *, registry=None) -> dict[str,
                 )
             takeover = fence_claimed_recovery_takeover(takeover_id) or takeover
     if takeover["state"] in {"fenced", "dispatching", "admitted"}:
-        with context_launch_admission(
-            canonical_worktree=str(takeover["canonical_worktree"]),
-            write_enabled=True,
-            context_role="supervisor",
-            project_id=str(takeover["project_id"]),
-        ):
+        with context_lifecycle_fence():
             # Re-read under the cross-process context launch lock. Both the
             # original provider launch and crash recovery use this same lock,
             # so only one process may initialize an admitted shell or claim a

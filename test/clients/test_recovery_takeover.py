@@ -55,6 +55,8 @@ def takeover_db(monkeypatch, tmp_path):
                 runtime_generation=RUNTIME_GENERATION,
                 runtime_generation_origin="launch",
                 runtime_process_start_ticks=5678,
+                runtime_process_group_id=1234,
+                runtime_process_session_id=1234,
                 creation_order=1,
                 last_active=datetime.now(),
             )
@@ -153,6 +155,28 @@ def test_generation_change_after_claim_fails_without_transferring_writer(takeove
         lease = db.get(database.WorktreeWriterLeaseModel, worktree)
         assert old.runtime_lifecycle == "running"
         assert lease.terminal_id == OLD_ID
+
+
+def test_pre_fence_failed_claim_does_not_permanently_block_recovery(takeover_db):
+    sessions, worktree = takeover_db
+    first = _claim_only(worktree, suffix="failed-first", new_terminal_id="b22ce091")
+    failed = database.record_recovery_takeover_claim_wait(
+        first["id"], "RECOVERY_RUNTIME_PROCESS_TREE_ACTIVE", terminal=True
+    )
+    assert failed["state"] == "failed"
+    assert failed["fenced_at"] is None
+    assert database.recovery_takeover_durable_eligibility(OLD_ID)["eligible"] is True
+
+    second = _claim_only(worktree, suffix="replacement", new_terminal_id="b22ce092")
+    assert second["state"] == "claimed"
+    with sessions() as db:
+        rows = (
+            db.query(database.RecoveryTakeoverModel)
+            .filter(database.RecoveryTakeoverModel.old_terminal_id == OLD_ID)
+            .order_by(database.RecoveryTakeoverModel.created_at.asc())
+            .all()
+        )
+        assert [row.state for row in rows] == ["failed", "claimed"]
 
 
 def test_fence_and_writer_transfer_are_one_transaction(takeover_db):
@@ -333,6 +357,8 @@ def test_reserved_successor_is_admitted_and_completed_on_same_writer_epoch(takeo
         runtime_pane_pid=4321,
         runtime_generation=dispatched["new_runtime_generation"],
         runtime_process_start_ticks=8765,
+        runtime_process_group_id=4321,
+        runtime_process_session_id=4321,
         recovery_takeover_id=takeover["id"],
     )
     assert created["writer_authority_generation"] == takeover["new_authority_generation"]

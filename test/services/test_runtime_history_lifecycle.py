@@ -131,12 +131,23 @@ def test_exited_runtime_retirement_requires_exact_terminal_identity(monkeypatch)
         "runtime_generation": "gen-1",
         "runtime_generation_origin": "launch",
         "runtime_process_start_ticks": 777,
+        "runtime_process_group_id": 4242,
+        "runtime_process_session_id": 4242,
     }
     monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda *_: metadata)
     monkeypatch.setattr(
         terminal_service.tmux_client,
         "exact_runtime_target",
-        lambda *_args, **_kwargs: RuntimePaneTarget("%41", 4242, "bash", "closed00", "gen-1", 777),
+        lambda *_args, **_kwargs: RuntimePaneTarget(
+            "%41",
+            4242,
+            "bash",
+            "closed00",
+            "gen-1",
+            777,
+            process_group_id=4242,
+            process_session_id=4242,
+        ),
     )
     retired = []
     monkeypatch.setattr(
@@ -160,7 +171,17 @@ def test_exited_runtime_retirement_requires_exact_terminal_identity(monkeypatch)
 
 def test_startup_reconciles_intact_legacy_runtime_identity_once(lifecycle_db, monkeypatch):
     _terminal("legacy00", "cao-legacy", "/worktree-legacy", write_enabled=False)
-    target = RuntimePaneTarget("%71", 7171, "codex", "legacy00", "reconciled-gen", 999, False)
+    target = RuntimePaneTarget(
+        "%71",
+        7171,
+        "codex",
+        "legacy00",
+        "reconciled-gen",
+        999,
+        False,
+        7171,
+        7171,
+    )
     bind = MagicMock(return_value=target)
     monkeypatch.setattr(terminal_service.tmux_client, "bind_legacy_runtime_generation", bind)
 
@@ -172,9 +193,44 @@ def test_startup_reconciles_intact_legacy_runtime_identity_once(lifecycle_db, mo
     assert metadata["runtime_generation"] == "reconciled-gen"
     assert metadata["runtime_generation_origin"] == "reconciled"
     assert metadata["runtime_process_start_ticks"] == 999
+    assert metadata["runtime_process_group_id"] == 7171
+    assert metadata["runtime_process_session_id"] == 7171
 
     assert terminal_service.reconcile_legacy_runtime_identities() == 0
     assert bind.call_count == 1
+
+
+def test_startup_backfills_process_tree_fence_for_exact_existing_runtime(lifecycle_db, monkeypatch):
+    create_terminal(
+        "rolling00",
+        "cao-rolling",
+        "agent",
+        "codex",
+        runtime_pane_id="%72",
+        runtime_pane_pid=7272,
+        runtime_generation="rolling-gen",
+        runtime_process_start_ticks=1001,
+    )
+    target = RuntimePaneTarget(
+        "%72",
+        7272,
+        "bash",
+        "rolling00",
+        "rolling-gen",
+        1001,
+        True,
+        7272,
+        7272,
+    )
+    exact = MagicMock(return_value=target)
+    monkeypatch.setattr(terminal_service.tmux_client, "exact_runtime_target", exact)
+
+    assert terminal_service.reconcile_legacy_runtime_identities() == 1
+    metadata = get_terminal_metadata("rolling00")
+    assert metadata["runtime_process_group_id"] == 7272
+    assert metadata["runtime_process_session_id"] == 7272
+    assert terminal_service.reconcile_legacy_runtime_identities() == 0
+    assert exact.call_count == 1
 
 
 def test_startup_runtime_reconciliation_never_polls_durable_history(monkeypatch):
@@ -208,6 +264,8 @@ def test_new_terminal_persists_launch_generation_and_process_start(lifecycle_db)
         runtime_pane_pid=8181,
         runtime_generation="launch-gen",
         runtime_process_start_ticks=1234,
+        runtime_process_group_id=8181,
+        runtime_process_session_id=8181,
     )
     metadata = get_terminal_metadata("launch00")
     assert metadata is not None
@@ -216,6 +274,8 @@ def test_new_terminal_persists_launch_generation_and_process_start(lifecycle_db)
     assert metadata["runtime_generation"] == "launch-gen"
     assert metadata["runtime_generation_origin"] == "launch"
     assert metadata["runtime_process_start_ticks"] == 1234
+    assert metadata["runtime_process_group_id"] == 8181
+    assert metadata["runtime_process_session_id"] == 8181
 
 
 def test_exited_terminal_output_falls_back_to_durable_log(tmp_path, monkeypatch):

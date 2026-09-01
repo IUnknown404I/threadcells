@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from threading import Lock
+from time import sleep
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +23,8 @@ def _metadata(command: str = "bash"):
         "runtime_generation": "11111111-1111-4111-8111-111111111111",
         "runtime_generation_origin": "launch",
         "runtime_process_start_ticks": 5678,
+        "runtime_process_group_id": 1234,
+        "runtime_process_session_id": 1234,
         "_command": command,
     }
 
@@ -31,6 +36,8 @@ def _target(command: str):
         pane_pid=1234,
         runtime_generation="11111111-1111-4111-8111-111111111111",
         process_start_ticks=5678,
+        process_group_id=1234,
+        process_session_id=1234,
         generation_inherited=True,
         current_command=command,
     )
@@ -63,8 +70,24 @@ def test_exact_idle_runtime_is_retired_before_writer_transfer(monkeypatch):
         "retire_runtime_pane",
         lambda observed: retired.append(observed) or True,
     )
+    monkeypatch.setattr(
+        service, "_runtime_process_tree_absent", lambda *_args, **_kwargs: (True, None)
+    )
     assert service._retire_recovery_runtime(_metadata()) == (True, None)
     assert retired == [target]
+
+
+def test_missing_tmux_window_does_not_override_live_process_tree(monkeypatch, tmp_path):
+    child = tmp_path / "4321"
+    child.mkdir()
+    fields = ["S", "1", "1234", "1234", *(["0"] * 15), "8765"]
+    (child / "stat").write_text(f"4321 (orphaned provider) {' '.join(fields)}\n", encoding="utf-8")
+    monkeypatch.setattr(service.tmux_client, "window_exists", lambda *_args: False)
+
+    assert service._physical_runtime_absence(_metadata(), proc_root=tmp_path) == (
+        False,
+        "RECOVERY_RUNTIME_PROCESS_TREE_ACTIVE",
+    )
 
 
 def test_generation_mismatch_fails_closed(monkeypatch):
@@ -280,6 +303,9 @@ def test_dirty_worktree_is_reported_and_preserved(monkeypatch, tmp_path):
         lambda *_args, **_kwargs: {"eligible": True, "reason_code": None, "terminal": terminal},
     )
     monkeypatch.setattr(service.tmux_client, "window_exists", lambda *_args: False)
+    monkeypatch.setattr(
+        service, "_runtime_process_tree_absent", lambda *_args, **_kwargs: (True, None)
+    )
     preview = service.preview_recovery_takeover("a11ce001")
     assert preview["eligible"] is True
     assert preview["worktree"] == {"state": "dirty", "dirty": True, "reason_code": None}
@@ -408,6 +434,8 @@ def test_restart_after_admission_observes_existing_provider_without_second_launc
         "runtime_pane_pid": 4321,
         "runtime_generation": "22222222-2222-4222-8222-222222222222",
         "runtime_process_start_ticks": 8765,
+        "runtime_process_group_id": 4321,
+        "runtime_process_session_id": 4321,
     }
     target = SimpleNamespace(
         terminal_id="b22ce001",
@@ -415,6 +443,8 @@ def test_restart_after_admission_observes_existing_provider_without_second_launc
         pane_pid=4321,
         runtime_generation="22222222-2222-4222-8222-222222222222",
         process_start_ticks=8765,
+        process_group_id=4321,
+        process_session_id=4321,
         generation_inherited=True,
         current_command="codex",
     )
@@ -432,6 +462,38 @@ def test_restart_after_admission_observes_existing_provider_without_second_launc
     )
     assert service._recover_dispatching_takeover(takeover) is False
     assert completed == ["takeover-1"]
+
+
+def test_concurrent_admitted_reconcilers_initialize_provider_once(monkeypatch):
+    current = {
+        "id": "takeover-1",
+        "state": "admitted",
+        "canonical_worktree": "/repo",
+        "project_id": "project-1",
+    }
+    admission_lock = Lock()
+    recoveries = []
+
+    @contextmanager
+    def admitted(**_kwargs):
+        with admission_lock:
+            yield {}
+
+    def recover(_takeover):
+        recoveries.append("initialize")
+        sleep(0.05)
+        current["state"] = "completed"
+        return False
+
+    monkeypatch.setattr(service, "context_launch_admission", admitted)
+    monkeypatch.setattr(service, "get_recovery_takeover", lambda _id: dict(current))
+    monkeypatch.setattr(service, "_recover_dispatching_takeover", recover)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(service.reconcile_recovery_takeover, ["takeover-1"] * 2))
+
+    assert recoveries == ["initialize"]
+    assert [result["state"] for result in results] == ["completed", "completed"]
 
 
 def test_unknown_post_dispatch_state_is_fenced_not_replayed(monkeypatch):

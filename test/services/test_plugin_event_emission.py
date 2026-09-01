@@ -44,6 +44,8 @@ def isolate_operational_admission(monkeypatch):
             terminal_id=terminal_id,
             runtime_generation=generation,
             process_start_ticks=777,
+            process_group_id=4242,
+            process_session_id=4242,
         ),
     )
     monkeypatch.setattr(

@@ -66,6 +66,7 @@ from cli_agent_orchestrator.clients.database import (
     persist_terminal_result_snapshot,
     promote_terminal_context_role_to_supervisor,
     reconcile_legacy_terminal_runtime_identity,
+    reconcile_terminal_runtime_process_identity,
     record_workflow_provider_reconnect_output_boundary,
     release_provider_execution,
     release_terminal_runtime_operation,
@@ -280,6 +281,8 @@ def _capture_created_runtime_identity(
         target.terminal_id != terminal_id
         or target.runtime_generation != runtime_generation
         or not target.generation_inherited
+        or target.process_group_id is None
+        or target.process_session_id is None
     ):
         raise RuntimeError("Created pane did not retain its launch identity")
     return target
@@ -295,6 +298,57 @@ def reconcile_legacy_runtime_identities() -> int:
         }:
             continue
         if metadata.get("runtime_generation"):
+            process_tree_fields = (
+                metadata.get("runtime_process_group_id"),
+                metadata.get("runtime_process_session_id"),
+            )
+            if all(isinstance(value, int) and value > 1 for value in process_tree_fields):
+                continue
+            if any(value is not None for value in process_tree_fields):
+                logger.warning(
+                    "Terminal %s has a partial process-tree identity; preserving it",
+                    metadata.get("id"),
+                )
+                continue
+            durable_identity = (
+                metadata.get("id"),
+                metadata.get("runtime_pane_id"),
+                metadata.get("runtime_pane_pid"),
+                metadata.get("runtime_generation"),
+                metadata.get("runtime_process_start_ticks"),
+            )
+            if any(value in (None, "") for value in durable_identity):
+                continue
+            try:
+                target = tmux_client.exact_runtime_target(
+                    str(metadata["tmux_session"]), str(metadata["tmux_window"])
+                )
+            except Exception:
+                continue
+            observed_identity = (
+                target.terminal_id,
+                target.pane_id,
+                target.pane_pid,
+                target.runtime_generation,
+                target.process_start_ticks,
+            )
+            origin = metadata.get("runtime_generation_origin")
+            if (
+                durable_identity != observed_identity
+                or origin not in {"launch", "reconciled"}
+                or ((origin == "launch") != bool(target.generation_inherited))
+            ):
+                continue
+            if reconcile_terminal_runtime_process_identity(
+                str(metadata["id"]),
+                pane_id=target.pane_id,
+                pane_pid=target.pane_pid,
+                runtime_generation=target.runtime_generation,
+                process_start_ticks=target.process_start_ticks,
+                process_group_id=target.process_group_id,
+                process_session_id=target.process_session_id,
+            ):
+                reconciled += 1
             continue
         legacy_fields = (
             metadata.get("runtime_pane_id"),
@@ -324,6 +378,8 @@ def reconcile_legacy_runtime_identities() -> int:
             pane_pid=target.pane_pid,
             runtime_generation=target.runtime_generation,
             process_start_ticks=target.process_start_ticks,
+            process_group_id=target.process_group_id,
+            process_session_id=target.process_session_id,
         ):
             reconciled += 1
     return reconciled
@@ -955,6 +1011,8 @@ def _create_terminal_after_admission(
                 "runtime_generation": runtime_target.runtime_generation,
                 "runtime_generation_origin": "launch",
                 "runtime_process_start_ticks": runtime_target.process_start_ticks,
+                "runtime_process_group_id": runtime_target.process_group_id,
+                "runtime_process_session_id": runtime_target.process_session_id,
             }
             runtime_proof = prove_live_session_runtime_authority(
                 session_name,
@@ -1005,6 +1063,8 @@ def _create_terminal_after_admission(
                 runtime_pane_pid=runtime_target.pane_pid,
                 runtime_generation=runtime_target.runtime_generation,
                 runtime_process_start_ticks=runtime_target.process_start_ticks,
+                runtime_process_group_id=runtime_target.process_group_id,
+                runtime_process_session_id=runtime_target.process_session_id,
                 recovery_takeover_id=recovery_takeover_id,
             )
             metadata_persisted = True
@@ -1145,6 +1205,8 @@ def _create_terminal_after_admission(
                 pane_pid=runtime_target.pane_pid,
                 runtime_generation=runtime_target.runtime_generation,
                 process_start_ticks=runtime_target.process_start_ticks,
+                process_group_id=runtime_target.process_group_id,
+                process_session_id=runtime_target.process_session_id,
             ):
                 raise RuntimeError("Could not publish the retry pane launch identity")
             tmux_client.pipe_pane(session_name, window_name, str(log_path))

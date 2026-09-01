@@ -116,6 +116,8 @@ class TerminalModel(Base):
     runtime_generation = Column(String, nullable=True)
     runtime_generation_origin = Column(String, nullable=True)
     runtime_process_start_ticks = Column(Integer, nullable=True)
+    runtime_process_group_id = Column(Integer, nullable=True)
+    runtime_process_session_id = Column(Integer, nullable=True)
     # Provider-native continuation authority is captured from the exact
     # foreground runtime only after its initial ready boundary.  Reconnect may
     # copy this opaque value into an attempt, but may never rediscover or
@@ -187,7 +189,7 @@ class RecoveryTakeoverModel(Base):
 
     id = Column(String, primary_key=True)
     request_id = Column(String, nullable=False, unique=True)
-    old_terminal_id = Column(String, nullable=False, unique=True, index=True)
+    old_terminal_id = Column(String, nullable=False, index=True)
     new_terminal_id = Column(String, nullable=False, unique=True, index=True)
     old_session_id = Column(String, nullable=False)
     expected_authority_generation = Column(String, nullable=False)
@@ -2930,7 +2932,12 @@ def _migrate_terminal_worktree_authority_columns() -> bool:
         ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE terminals ADD COLUMN {name} DATETIME")
-        for name in ("runtime_pane_pid", "runtime_process_start_ticks"):
+        for name in (
+            "runtime_pane_pid",
+            "runtime_process_start_ticks",
+            "runtime_process_group_id",
+            "runtime_process_session_id",
+        ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE terminals ADD COLUMN {name} INTEGER")
         if "creation_order" not in columns:
@@ -3067,6 +3074,8 @@ def create_terminal(
     runtime_generation: Optional[str] = None,
     runtime_generation_origin: Optional[str] = None,
     runtime_process_start_ticks: Optional[int] = None,
+    runtime_process_group_id: Optional[int] = None,
+    runtime_process_session_id: Optional[int] = None,
     recovery_takeover_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create metadata and atomically acquire any required writer lease."""
@@ -3233,6 +3242,8 @@ def create_terminal(
                 runtime_generation_origin or ("launch" if runtime_generation is not None else None)
             ),
             runtime_process_start_ticks=runtime_process_start_ticks,
+            runtime_process_group_id=runtime_process_group_id,
+            runtime_process_session_id=runtime_process_session_id,
             recovery_takeover_id=recovery_takeover_id,
         )
         db.add(terminal)
@@ -3314,6 +3325,8 @@ def create_terminal(
             "runtime_generation": terminal.runtime_generation,
             "runtime_generation_origin": terminal.runtime_generation_origin,
             "runtime_process_start_ticks": terminal.runtime_process_start_ticks,
+            "runtime_process_group_id": terminal.runtime_process_group_id,
+            "runtime_process_session_id": terminal.runtime_process_session_id,
             "recovery_fenced_at": terminal.recovery_fenced_at,
             "recovery_fenced_reason": terminal.recovery_fenced_reason,
             "recovery_takeover_id": terminal.recovery_takeover_id,
@@ -3383,6 +3396,8 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "runtime_generation": terminal.runtime_generation,
             "runtime_generation_origin": terminal.runtime_generation_origin,
             "runtime_process_start_ticks": terminal.runtime_process_start_ticks,
+            "runtime_process_group_id": terminal.runtime_process_group_id,
+            "runtime_process_session_id": terminal.runtime_process_session_id,
             "provider_resume_identity": terminal.provider_resume_identity,
             "provider_resume_runtime_generation": terminal.provider_resume_runtime_generation,
             "runtime_operation_kind": terminal.runtime_operation_kind,
@@ -3437,6 +3452,8 @@ def _session_terminal_dict(terminal: TerminalModel) -> Dict[str, Any]:
         "runtime_generation": terminal.runtime_generation,
         "runtime_generation_origin": terminal.runtime_generation_origin,
         "runtime_process_start_ticks": terminal.runtime_process_start_ticks,
+        "runtime_process_group_id": terminal.runtime_process_group_id,
+        "runtime_process_session_id": terminal.runtime_process_session_id,
         "last_active": terminal.last_active,
     }
 
@@ -3675,6 +3692,8 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "runtime_generation": t.runtime_generation,
                 "runtime_generation_origin": t.runtime_generation_origin,
                 "runtime_process_start_ticks": t.runtime_process_start_ticks,
+                "runtime_process_group_id": t.runtime_process_group_id,
+                "runtime_process_session_id": t.runtime_process_session_id,
                 "runtime_operation_kind": t.runtime_operation_kind,
                 "runtime_operation_token": t.runtime_operation_token,
                 "last_active": t.last_active,
@@ -4788,6 +4807,8 @@ def replace_starting_terminal_runtime_identity(
     pane_pid: int,
     runtime_generation: str,
     process_start_ticks: int,
+    process_group_id: Optional[int],
+    process_session_id: Optional[int],
 ) -> bool:
     """Replace launch identity only while startup still owns the DB row.
 
@@ -4800,6 +4821,10 @@ def replace_starting_terminal_runtime_identity(
         not re.fullmatch(r"%[0-9]+", pane_id)
         or pane_pid <= 1
         or process_start_ticks <= 0
+        or process_group_id is None
+        or process_group_id <= 1
+        or process_session_id is None
+        or process_session_id <= 1
         or not runtime_generation
     ):
         return False
@@ -4817,6 +4842,8 @@ def replace_starting_terminal_runtime_identity(
                     TerminalModel.runtime_generation: runtime_generation,
                     TerminalModel.runtime_generation_origin: "launch",
                     TerminalModel.runtime_process_start_ticks: process_start_ticks,
+                    TerminalModel.runtime_process_group_id: process_group_id,
+                    TerminalModel.runtime_process_session_id: process_session_id,
                     TerminalModel.provider_resume_identity: None,
                     TerminalModel.provider_resume_runtime_generation: None,
                     TerminalModel.last_active: datetime.now(),
@@ -4835,6 +4862,8 @@ def reconcile_legacy_terminal_runtime_identity(
     pane_pid: int,
     runtime_generation: str,
     process_start_ticks: int,
+    process_group_id: Optional[int],
+    process_session_id: Optional[int],
 ) -> bool:
     """Persist a one-time exact-process fence for a pre-generation runtime."""
     _ensure_terminal_worktree_authority_schema()
@@ -4842,6 +4871,10 @@ def reconcile_legacy_terminal_runtime_identity(
         not re.fullmatch(r"%[0-9]+", pane_id)
         or pane_pid <= 1
         or process_start_ticks <= 0
+        or process_group_id is None
+        or process_group_id <= 1
+        or process_session_id is None
+        or process_session_id <= 1
         or not runtime_generation
     ):
         return False
@@ -4854,6 +4887,8 @@ def reconcile_legacy_terminal_runtime_identity(
                 TerminalModel.runtime_pane_id.is_(None),
                 TerminalModel.runtime_pane_pid.is_(None),
                 TerminalModel.runtime_process_start_ticks.is_(None),
+                TerminalModel.runtime_process_group_id.is_(None),
+                TerminalModel.runtime_process_session_id.is_(None),
             )
             .update(
                 {
@@ -4862,6 +4897,56 @@ def reconcile_legacy_terminal_runtime_identity(
                     TerminalModel.runtime_generation: runtime_generation,
                     TerminalModel.runtime_generation_origin: "reconciled",
                     TerminalModel.runtime_process_start_ticks: process_start_ticks,
+                    TerminalModel.runtime_process_group_id: process_group_id,
+                    TerminalModel.runtime_process_session_id: process_session_id,
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return changed == 1
+
+
+def reconcile_terminal_runtime_process_identity(
+    terminal_id: str,
+    *,
+    pane_id: str,
+    pane_pid: int,
+    runtime_generation: str,
+    process_start_ticks: int,
+    process_group_id: Optional[int],
+    process_session_id: Optional[int],
+) -> bool:
+    """Backfill process-tree fencing for an otherwise exact live runtime."""
+    _ensure_terminal_worktree_authority_schema()
+    if (
+        not re.fullmatch(r"%[0-9]+", pane_id)
+        or pane_pid <= 1
+        or process_start_ticks <= 0
+        or process_group_id is None
+        or process_group_id <= 1
+        or process_session_id is None
+        or process_session_id <= 1
+        or not runtime_generation
+    ):
+        return False
+    with SessionLocal() as db:
+        changed = (
+            db.query(TerminalModel)
+            .filter(
+                TerminalModel.id == terminal_id,
+                TerminalModel.runtime_lifecycle.in_(("starting", "running")),
+                TerminalModel.runtime_pane_id == pane_id,
+                TerminalModel.runtime_pane_pid == pane_pid,
+                TerminalModel.runtime_generation == runtime_generation,
+                TerminalModel.runtime_process_start_ticks == process_start_ticks,
+                TerminalModel.runtime_process_group_id.is_(None),
+                TerminalModel.runtime_process_session_id.is_(None),
+            )
+            .update(
+                {
+                    TerminalModel.runtime_process_group_id: process_group_id,
+                    TerminalModel.runtime_process_session_id: process_session_id,
                 },
                 synchronize_session=False,
             )
@@ -5317,7 +5402,13 @@ def recovery_takeover_durable_eligibility(
             reason = "RECOVERY_TARGET_NOT_FOUND"
         elif (
             db.query(RecoveryTakeoverModel.id)
-            .filter(RecoveryTakeoverModel.old_terminal_id == old_terminal_id)
+            .filter(
+                RecoveryTakeoverModel.old_terminal_id == old_terminal_id,
+                or_(
+                    RecoveryTakeoverModel.state != "failed",
+                    RecoveryTakeoverModel.fenced_at.is_not(None),
+                ),
+            )
             .first()
             is not None
         ):
@@ -5423,6 +5514,8 @@ def recovery_takeover_durable_eligibility(
                     "runtime_pane_id": terminal.runtime_pane_id,
                     "runtime_pane_pid": terminal.runtime_pane_pid,
                     "runtime_process_start_ticks": terminal.runtime_process_start_ticks,
+                    "runtime_process_group_id": terminal.runtime_process_group_id,
+                    "runtime_process_session_id": terminal.runtime_process_session_id,
                     "writer_authority_generation": terminal.writer_authority_generation,
                 }
                 if terminal is not None
@@ -5471,7 +5564,13 @@ def claim_recovery_takeover(
             raise RecoveryTakeoverRejected("RECOVERY_TARGET_NOT_FOUND")
         if (
             db.query(RecoveryTakeoverModel.id)
-            .filter(RecoveryTakeoverModel.old_terminal_id == old_terminal_id)
+            .filter(
+                RecoveryTakeoverModel.old_terminal_id == old_terminal_id,
+                or_(
+                    RecoveryTakeoverModel.state != "failed",
+                    RecoveryTakeoverModel.fenced_at.is_not(None),
+                ),
+            )
             .first()
             is not None
         ):

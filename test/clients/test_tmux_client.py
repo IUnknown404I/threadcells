@@ -358,7 +358,7 @@ class TestExactPaneTarget:
             b"PATH=/bin\0CAO_TERMINAL_ID=closed00\0CAO_RUNTIME_GENERATION=gen-1\0"
         )
         (process / "stat").write_text(
-            "4242 (bash) " + " ".join(["S", *(["0"] * 18), "777"]),
+            "4242 (bash) " + " ".join(["S", "1", "4242", "4242", *(["0"] * 15), "777"]),
             encoding="utf-8",
         )
         completed = MagicMock(stdout="4242\tgen-1\n")
@@ -372,6 +372,8 @@ class TestExactPaneTarget:
         assert target.terminal_id == "closed00"
         assert target.runtime_generation == "gen-1"
         assert target.process_start_ticks == 777
+        assert target.process_group_id == 4242
+        assert target.process_session_id == 4242
 
     def test_runtime_target_fails_closed_without_terminal_identity(self, tmux, tmp_path):
         from cli_agent_orchestrator.clients.tmux import PaneTargetError
@@ -384,7 +386,7 @@ class TestExactPaneTarget:
         process.mkdir()
         (process / "environ").write_bytes(b"PATH=/bin\0CAO_RUNTIME_GENERATION=gen-1\0")
         (process / "stat").write_text(
-            "4242 (bash) " + " ".join(["S", *(["0"] * 18), "777"]),
+            "4242 (bash) " + " ".join(["S", "1", "4242", "4242", *(["0"] * 15), "777"]),
             encoding="utf-8",
         )
         with (
@@ -406,7 +408,7 @@ class TestExactPaneTarget:
         process.mkdir()
         (process / "environ").write_bytes(b"CAO_TERMINAL_ID=legacy00\0")
         (process / "stat").write_text(
-            "4242 (bash) " + " ".join(["S", *(["0"] * 18), "777"]),
+            "4242 (bash) " + " ".join(["S", "1", "4242", "4242", *(["0"] * 15), "777"]),
             encoding="utf-8",
         )
         results = [
@@ -422,6 +424,8 @@ class TestExactPaneTarget:
             )
         assert target.runtime_generation == "gen-legacy"
         assert target.process_start_ticks == 777
+        assert target.process_group_id == 4242
+        assert target.process_session_id == 4242
         assert target.generation_inherited is False
         assert run.call_args_list[1].args[0] == [
             "tmux",
@@ -439,14 +443,23 @@ class TestExactPaneTarget:
     ):
         from cli_agent_orchestrator.clients.tmux import RuntimePaneTarget
 
-        target = RuntimePaneTarget("%7", 4242, "bash", "closed00", "gen-1", 777)
+        target = RuntimePaneTarget(
+            "%7",
+            4242,
+            "bash",
+            "closed00",
+            "gen-1",
+            777,
+            process_group_id=4242,
+            process_session_id=4242,
+        )
         process = tmp_path / "4242"
         process.mkdir()
         (process / "environ").write_bytes(
             b"CAO_TERMINAL_ID=closed00\0CAO_RUNTIME_GENERATION=gen-1\0"
         )
         (process / "stat").write_text(
-            "4242 (bash) " + " ".join(["S", *(["0"] * 18), "777"]),
+            "4242 (bash) " + " ".join(["S", "1", "4242", "4242", *(["0"] * 15), "777"]),
             encoding="utf-8",
         )
         # Killing the pane can also destroy its last tmux session, in which
@@ -494,14 +507,23 @@ class TestExactPaneTarget:
     ):
         from cli_agent_orchestrator.clients.tmux import RuntimePaneTarget
 
-        target = RuntimePaneTarget("%7", 4242, "bash", "closed00", "gen-1", 777)
+        target = RuntimePaneTarget(
+            "%7",
+            4242,
+            "bash",
+            "closed00",
+            "gen-1",
+            777,
+            process_group_id=4242,
+            process_session_id=4242,
+        )
         process = tmp_path / "4242"
         process.mkdir()
         (process / "environ").write_bytes(
             b"CAO_TERMINAL_ID=closed00\0CAO_RUNTIME_GENERATION=gen-1\0"
         )
         (process / "stat").write_text(
-            "4242 (bash) " + " ".join(["S", *(["0"] * 18), str(start_ticks)]),
+            "4242 (bash) " + " ".join(["S", "1", "4242", "4242", *(["0"] * 15), str(start_ticks)]),
             encoding="utf-8",
         )
         with patch(
@@ -517,14 +539,23 @@ class TestExactPaneTarget:
     ):
         from cli_agent_orchestrator.clients.tmux import RuntimePaneTarget
 
-        target = RuntimePaneTarget("%7", 4242, "bash", "closed00", "gen-1", 777)
+        target = RuntimePaneTarget(
+            "%7",
+            4242,
+            "bash",
+            "closed00",
+            "gen-1",
+            777,
+            process_group_id=4242,
+            process_session_id=4242,
+        )
         process = tmp_path / "4242"
         process.mkdir()
         (process / "environ").write_bytes(
             b"CAO_TERMINAL_ID=closed00\0CAO_RUNTIME_GENERATION=gen-1\0"
         )
         (process / "stat").write_text(
-            "4242 (bash) " + " ".join(["S", *(["0"] * 18), "777"]),
+            "4242 (bash) " + " ".join(["S", "1", "4242", "4242", *(["0"] * 15), "777"]),
             encoding="utf-8",
         )
         results = [

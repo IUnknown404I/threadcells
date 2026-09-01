@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -50,6 +51,54 @@ class RecoveryTakeoverError(RuntimeError):
         super().__init__(reason_code)
 
 
+def _proc_stat_identity(path: Path) -> tuple[str, int, int, int]:
+    text = path.read_text(encoding="utf-8")
+    suffix = text[text.rfind(")") + 2 :].split()
+    return suffix[0], int(suffix[2]), int(suffix[3]), int(suffix[19])
+
+
+def _runtime_process_tree_absent(
+    metadata: Mapping[str, Any], *, proc_root: Path = Path("/proc")
+) -> tuple[bool, str | None]:
+    """Prove the persisted pane process group/session has no live writer."""
+    pane_pid = metadata.get("runtime_pane_pid")
+    start_ticks = metadata.get("runtime_process_start_ticks")
+    process_group_id = metadata.get("runtime_process_group_id")
+    process_session_id = metadata.get("runtime_process_session_id")
+    if not all(
+        isinstance(value, int) and value > 1
+        for value in (pane_pid, start_ticks, process_group_id, process_session_id)
+    ):
+        return False, "RECOVERY_RUNTIME_AUTHORITY_AMBIGUOUS"
+    try:
+        state, _group, _session, observed_ticks = _proc_stat_identity(
+            proc_root / str(pane_pid) / "stat"
+        )
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, IndexError):
+        return False, "RECOVERY_RUNTIME_INVENTORY_UNAVAILABLE"
+    else:
+        if observed_ticks == start_ticks and state != "Z":
+            return False, "RECOVERY_RUNTIME_PROCESS_TREE_ACTIVE"
+    try:
+        processes = list(proc_root.iterdir())
+    except OSError:
+        return False, "RECOVERY_RUNTIME_INVENTORY_UNAVAILABLE"
+    for process in processes:
+        if not process.name.isdigit():
+            continue
+        try:
+            state, group_id, session_id, _ticks = _proc_stat_identity(process / "stat")
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError, IndexError):
+            return False, "RECOVERY_RUNTIME_INVENTORY_UNAVAILABLE"
+        if state != "Z" and (group_id == process_group_id or session_id == process_session_id):
+            return False, "RECOVERY_RUNTIME_PROCESS_TREE_ACTIVE"
+    return True, None
+
+
 def _request_result(result: dict[str, Any]) -> dict[str, Any]:
     """Never project a fenced-but-failed successor as authoritative."""
     if result.get("state") in {"failed", "dispatch_uncertain"}:
@@ -59,13 +108,15 @@ def _request_result(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _physical_runtime_absence(metadata: Mapping[str, Any]) -> tuple[bool, str | None]:
+def _physical_runtime_absence(
+    metadata: Mapping[str, Any], *, proc_root: Path = Path("/proc")
+) -> tuple[bool, str | None]:
     """Classify a missing or exactly idle old runtime as safely retireable."""
     session_name = str(metadata.get("tmux_session") or "")
     window_name = str(metadata.get("tmux_window") or "")
     exists = tmux_client.window_exists(session_name, window_name)
     if exists is False:
-        return True, None
+        return _runtime_process_tree_absent(metadata, proc_root=proc_root)
     if exists is None:
         return False, "RECOVERY_RUNTIME_INVENTORY_UNAVAILABLE"
     try:
@@ -77,7 +128,7 @@ def _physical_runtime_absence(metadata: Mapping[str, Any]) -> tuple[bool, str | 
             "EXIT_PANE_MISSING",
             "EXIT_PANE_DEAD",
         }:
-            return True, None
+            return _runtime_process_tree_absent(metadata, proc_root=proc_root)
         return False, "RECOVERY_RUNTIME_AUTHORITY_AMBIGUOUS"
     except Exception:
         return False, "RECOVERY_RUNTIME_INVENTORY_UNAVAILABLE"
@@ -87,6 +138,8 @@ def _physical_runtime_absence(metadata: Mapping[str, Any]) -> tuple[bool, str | 
         metadata.get("runtime_pane_pid"),
         metadata.get("runtime_generation"),
         metadata.get("runtime_process_start_ticks"),
+        metadata.get("runtime_process_group_id"),
+        metadata.get("runtime_process_session_id"),
     )
     observed = (
         target.terminal_id,
@@ -94,6 +147,8 @@ def _physical_runtime_absence(metadata: Mapping[str, Any]) -> tuple[bool, str | 
         target.pane_pid,
         target.runtime_generation,
         target.process_start_ticks,
+        target.process_group_id,
+        target.process_session_id,
     )
     if any(value in (None, "") for value in durable) or durable != observed:
         return False, "RECOVERY_RUNTIME_AUTHORITY_AMBIGUOUS"
@@ -107,13 +162,15 @@ def _physical_runtime_absence(metadata: Mapping[str, Any]) -> tuple[bool, str | 
     return False, "RECOVERY_HEALTHY_RUNTIME_ACTIVE"
 
 
-def _retire_recovery_runtime(metadata: Mapping[str, Any]) -> tuple[bool, str | None]:
+def _retire_recovery_runtime(
+    metadata: Mapping[str, Any], *, proc_root: Path = Path("/proc")
+) -> tuple[bool, str | None]:
     """Permanently remove the exact idle old pane before writer-lease fencing."""
     session_name = str(metadata.get("tmux_session") or "")
     window_name = str(metadata.get("tmux_window") or "")
     exists = tmux_client.window_exists(session_name, window_name)
     if exists is False:
-        return True, None
+        return _runtime_process_tree_absent(metadata, proc_root=proc_root)
     if exists is None:
         return False, "RECOVERY_RUNTIME_INVENTORY_UNAVAILABLE"
     try:
@@ -125,7 +182,7 @@ def _retire_recovery_runtime(metadata: Mapping[str, Any]) -> tuple[bool, str | N
             "EXIT_PANE_MISSING",
             "EXIT_PANE_DEAD",
         }:
-            return True, None
+            return _runtime_process_tree_absent(metadata, proc_root=proc_root)
         return False, "RECOVERY_RUNTIME_AUTHORITY_AMBIGUOUS"
     except Exception:
         return False, "RECOVERY_RUNTIME_INVENTORY_UNAVAILABLE"
@@ -135,6 +192,8 @@ def _retire_recovery_runtime(metadata: Mapping[str, Any]) -> tuple[bool, str | N
         metadata.get("runtime_pane_pid"),
         metadata.get("runtime_generation"),
         metadata.get("runtime_process_start_ticks"),
+        metadata.get("runtime_process_group_id"),
+        metadata.get("runtime_process_session_id"),
     )
     observed = (
         target.terminal_id,
@@ -142,6 +201,8 @@ def _retire_recovery_runtime(metadata: Mapping[str, Any]) -> tuple[bool, str | N
         target.pane_pid,
         target.runtime_generation,
         target.process_start_ticks,
+        target.process_group_id,
+        target.process_session_id,
     )
     origin = metadata.get("runtime_generation_origin")
     if (
@@ -155,7 +216,14 @@ def _retire_recovery_runtime(metadata: Mapping[str, Any]) -> tuple[bool, str | N
         return False, "RECOVERY_HEALTHY_RUNTIME_ACTIVE"
     if not tmux_client.retire_runtime_pane(target):
         return False, "RECOVERY_RUNTIME_RETIREMENT_FAILED"
-    return True, None
+    for _attempt in range(20):
+        absent, reason = _runtime_process_tree_absent(metadata, proc_root=proc_root)
+        if absent:
+            return True, None
+        if reason != "RECOVERY_RUNTIME_PROCESS_TREE_ACTIVE":
+            return False, reason
+        time.sleep(0.05)
+    return False, "RECOVERY_RUNTIME_PROCESS_TREE_ACTIVE"
 
 
 def _worktree_snapshot(metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -482,6 +550,8 @@ def _recover_dispatching_takeover(takeover: Mapping[str, Any]) -> bool:
         new.get("runtime_pane_pid"),
         new.get("runtime_generation"),
         new.get("runtime_process_start_ticks"),
+        new.get("runtime_process_group_id"),
+        new.get("runtime_process_session_id"),
     )
     observed = (
         target.terminal_id,
@@ -489,6 +559,8 @@ def _recover_dispatching_takeover(takeover: Mapping[str, Any]) -> bool:
         target.pane_pid,
         target.runtime_generation,
         target.process_start_ticks,
+        target.process_group_id,
+        target.process_session_id,
     )
     if durable != observed:
         mark_recovery_takeover_dispatch_uncertain(
@@ -573,23 +645,30 @@ def reconcile_recovery_takeover(takeover_id: str, *, registry=None) -> dict[str,
                     or takeover
                 )
             takeover = fence_claimed_recovery_takeover(takeover_id) or takeover
-    if takeover["state"] == "admitted":
-        _recover_dispatching_takeover(takeover)
-        return get_recovery_takeover(takeover_id) or takeover
-    if takeover["state"] == "dispatching":
-        if not _recover_dispatching_takeover(takeover):
-            return get_recovery_takeover(takeover_id) or takeover
-        takeover = get_recovery_takeover(takeover_id) or takeover
-    if takeover["state"] == "fenced":
+    if takeover["state"] in {"fenced", "dispatching", "admitted"}:
         with context_launch_admission(
             canonical_worktree=str(takeover["canonical_worktree"]),
             write_enabled=True,
             context_role="supervisor",
             project_id=str(takeover["project_id"]),
         ):
-            claimed = claim_recovery_takeover_dispatch(takeover_id)
-            if claimed is not None and claimed["state"] == "dispatching":
-                _launch_claimed_takeover(claimed, registry=registry)
+            # Re-read under the cross-process context launch lock. Both the
+            # original provider launch and crash recovery use this same lock,
+            # so only one process may initialize an admitted shell or claim a
+            # retry. A waiter observes the completed transition instead of
+            # replaying provider initialization.
+            takeover = get_recovery_takeover(takeover_id) or takeover
+            if takeover["state"] == "admitted":
+                _recover_dispatching_takeover(takeover)
+                return get_recovery_takeover(takeover_id) or takeover
+            if takeover["state"] == "dispatching":
+                if not _recover_dispatching_takeover(takeover):
+                    return get_recovery_takeover(takeover_id) or takeover
+                takeover = get_recovery_takeover(takeover_id) or takeover
+            if takeover["state"] == "fenced":
+                claimed = claim_recovery_takeover_dispatch(takeover_id)
+                if claimed is not None and claimed["state"] == "dispatching":
+                    _launch_claimed_takeover(claimed, registry=registry)
     return get_recovery_takeover(takeover_id) or takeover
 
 

@@ -114,6 +114,7 @@ def _authority(
     workflows: list[str] | None = None,
     leases: list[dict[str, object]] | None = None,
     projects: list[object] | None = None,
+    work_contexts: list[dict[str, object]] | None = None,
 ) -> None:
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.list_all_terminals",
@@ -130,6 +131,10 @@ def _authority(
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.list_projects",
         lambda: list(projects or []),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.list_writable_work_contexts",
+        lambda: list(work_contexts or []),
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.list_orphaned_protected_workflow_authorities",
@@ -248,6 +253,7 @@ def test_git_locked_worktree_is_protected(tmp_path, monkeypatch):
         ("managed_source", "ACTIVE_MANAGED_WORKTREE_SOURCE"),
         ("workflow", "ACTIVE_OR_RECOVERY_WORKFLOW"),
         ("lease", "WRITER_LEASE_WORKTREE"),
+        ("work_context", "DURABLE_WORK_CONTEXT"),
         ("project", "PROJECT_SOURCE_AUTHORITY"),
     ],
 )
@@ -275,6 +281,17 @@ def test_active_authority_protects_worktree(tmp_path, monkeypatch, authority_kin
             else []
         ),
         projects=([SimpleNamespace(path=str(worktree))] if authority_kind == "project" else []),
+        work_contexts=(
+            [
+                {
+                    "state": "reserved",
+                    "canonical_worktree": str(worktree),
+                    "canonical_source": str(repository),
+                }
+            ]
+            if authority_kind == "work_context"
+            else []
+        ),
     )
 
     candidate = _worktree_candidate(_plan(tmp_path, config), worktree)

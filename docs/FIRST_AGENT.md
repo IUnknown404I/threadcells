@@ -50,7 +50,7 @@ git status --short
 git diff -- README.md
 ```
 
-If the agent worked in a managed worktree, use the worktree path shown by ThreadCells instead of the original repository path. The worktree keeps concurrent writers separate until their commits are deliberately reconciled.
+The Project-backed agent works in the managed worktree path shown by ThreadCells, not the registered source root. Use that path for inspection. The worktree keeps concurrent writers separate until their commits are deliberately reconciled.
 
 ## 5. Try supervision
 

@@ -461,6 +461,8 @@ def _launch_claimed_takeover(takeover: Mapping[str, Any], *, registry=None) -> N
         managed_worktree_origin_terminal_id=(
             old.get("managed_worktree_origin_terminal_id") or old.get("id")
         ),
+        writable_work_context_id=old.get("writable_work_context_id"),
+        workspace_classification=old.get("workspace_classification"),
         project_context={
             "id": str(old["project_id"]),
             "name": str(old.get("project_name") or old["project_id"]),

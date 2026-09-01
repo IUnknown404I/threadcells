@@ -114,6 +114,7 @@ export function AgentPanel({
   const [profile, setProfile] = useState('')
   const [creating, setCreating] = useState(false)
   const creatingRef = useRef(false)
+  const workContextRequestRef = useRef<{ key: string; id: string } | null>(null)
   const [liveTerminal, setLiveTerminal] = useState<{ id: string; provider?: string; agentProfile?: string | null } | null>(null)
   const [profiles, setProfiles] = useState<AgentProfileInfo[]>([])
   const [loadingProfiles, setLoadingProfiles] = useState(true)
@@ -289,6 +290,21 @@ export function AgentPanel({
     setCreating(true)
     try {
       const selectedSessionName = sessionName.trim().replace(/\./g, '_') || undefined
+      const workContextRequestKey = projectId
+        ? JSON.stringify([projectId, provider, profile.trim(), selectedSessionName || ''])
+        : null
+      if (
+        workContextRequestKey
+        && workContextRequestRef.current?.key !== workContextRequestKey
+      ) {
+        workContextRequestRef.current = {
+          key: workContextRequestKey,
+          id: crypto.randomUUID(),
+        }
+      }
+      const workContextRequestId = workContextRequestKey
+        ? workContextRequestRef.current?.id
+        : undefined
       const selectedProfile = profiles.find(item => item.name === profile.trim())
       let ownerGrant
       if (selectedProfile?.owner_authorization_required) {
@@ -306,13 +322,14 @@ export function AgentPanel({
         })
       }
       if (ownerGrant) {
-        await createSession(provider, profile.trim(), selectedSessionName, undefined, projectId, ownerGrant)
+        await createSession(provider, profile.trim(), selectedSessionName, undefined, projectId, ownerGrant, workContextRequestId)
       } else if (projectId) {
-        await createSession(provider, profile.trim(), selectedSessionName, undefined, projectId)
+        await createSession(provider, profile.trim(), selectedSessionName, undefined, projectId, undefined, workContextRequestId)
       } else {
         await createSession(provider, profile.trim(), selectedSessionName, undefined)
       }
       setShowSpawnModal(false)
+      workContextRequestRef.current = null
       setProfile('')
       setSessionName('')
       setOwnerConfirmed(false)
@@ -539,7 +556,8 @@ export function AgentPanel({
         </div>
       </div>
       <ProviderOutcomeNotice code={terminal.provider_outcome_code} />
-      {terminal.launch_worktree && <div className="flex items-center gap-1.5" title={terminal.launch_worktree}><FolderOpen size={12} className="text-gray-600 shrink-0" /><span className="text-xs font-mono text-gray-500 truncate max-w-[400px]">{terminal.launch_worktree}</span></div>}
+      {terminal.launch_worktree && <div className="flex items-center gap-1.5" title={terminal.launch_worktree}><FolderOpen size={12} className="text-gray-600 shrink-0" /><span className="text-xs text-gray-500">{t(terminal.workspace_classification === 'managed_isolated' ? 'agents.isolatedWorkspace' : 'agents.legacyWorkspace')} ·</span><span className="text-xs font-mono text-gray-500 truncate max-w-[400px]">{terminal.launch_worktree}</span></div>}
+      {terminal.writable_work_context_id && <div className="text-xs text-gray-600 font-mono truncate" title={`${terminal.writable_work_context_id}${terminal.writer_authority_generation ? ` · ${terminal.writer_authority_generation}` : ''}`}>{t('agents.writerAuthority')} · {terminal.writable_work_context_id.slice(0, 12)}{terminal.writer_authority_generation ? ` · ${terminal.writer_authority_generation.slice(0, 12)}` : ''}</div>}
       <button onClick={() => openTerminal(terminal.id, terminal.provider, terminal.agent_profile)} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">{t('agents.openComposer')}</button>
     </div>
   )
@@ -1029,7 +1047,7 @@ export function AgentPanel({
                 <label className="block text-xs text-gray-500 mb-1">{t('common.project')} <span className="text-gray-600">({t('common.optional')})</span></label>
                 <ProjectPicker projects={projects} value={projectId} onChange={setProjectId} />
                 {selectedSpawnProject ? (
-                  <p aria-live="polite" className="mt-1 min-w-0 break-all font-mono text-xs text-gray-500" title={selectedSpawnProject.path}>{selectedSpawnProject.path}</p>
+                  <div aria-live="polite" className="mt-1 space-y-1 text-xs text-gray-500"><p className="min-w-0 break-all"><span>{t('agents.projectSourceAuthority')}: </span><span className="font-mono" title={selectedSpawnProject.path}>{selectedSpawnProject.path}</span></p><p className="text-emerald-400/80">{t('agents.managedWorkspaceHelp')}</p></div>
                 ) : projects.length === 0 ? (
                   <p aria-live="polite" className="mt-1 text-xs text-amber-400">{t('agents.noProjectsDefault')}</p>
                 ) : null}

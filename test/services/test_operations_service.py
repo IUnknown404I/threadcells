@@ -642,8 +642,8 @@ def test_context_admission_does_not_use_racy_worktree_inventory(tmp_path, monkey
         pass
 
 
-def test_resident_supervisor_limit_and_project_uniqueness_release_after_exit(tmp_path, monkeypatch):
-    """G: sixth residency is rejected; project reuse conflicts until exit."""
+def test_resident_supervisor_limit_allows_independent_same_project_sessions(tmp_path, monkeypatch):
+    """Resident capacity remains global; Project identity is not a singleton."""
     full = {
         "resource_state": "GREEN",
         "resident_supervisors": {"active": 5, "limit": 5, "available": 0, "certain": True},
@@ -671,15 +671,6 @@ def test_resident_supervisor_limit_and_project_uniqueness_release_after_exit(tmp
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.operations_service._active_contexts",
         lambda: [{"id": "resident", "context_role": "supervisor", "project_id": "project-a"}],
-    )
-    with pytest.raises(AdmissionDenied, match="PROJECT_SUPERVISOR_ALREADY_RESIDENT"):
-        with context_launch_admission(
-            _config(tmp_path), context_role="supervisor", project_id="project-a"
-        ):
-            pytest.fail("duplicate project supervisor must not launch")
-
-    monkeypatch.setattr(
-        "cli_agent_orchestrator.services.operations_service._active_contexts", lambda: []
     )
     with context_launch_admission(
         _config(tmp_path), context_role="supervisor", project_id="project-a"

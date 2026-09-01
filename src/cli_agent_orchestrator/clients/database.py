@@ -92,6 +92,10 @@ class TerminalModel(Base):
     managed_worktree_branch = Column(String, nullable=True)
     managed_worktree_commit = Column(String, nullable=True)
     managed_worktree_origin_terminal_id = Column(String, nullable=True)
+    # Stable writable-context identity. New Project supervisors own a durable
+    # per-session context; legacy shared-root sessions deliberately remain NULL.
+    writable_work_context_id = Column(String, nullable=True, index=True)
+    workspace_classification = Column(String, nullable=True)
     # Project context is copied at launch, so history remains truthful even if
     # an administrator later changes or removes the registry entry.
     project_id = Column(String, nullable=True)
@@ -179,6 +183,43 @@ class WorktreeWriterLeaseModel(Base):
     canonical_worktree = Column(String, primary_key=True)
     terminal_id = Column(String, nullable=False, unique=True, index=True)
     authority_generation = Column(String, nullable=True, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class WritableWorkContextModel(Base):
+    """Crash-reconcilable reservation for one independent writable Session."""
+
+    __tablename__ = "writable_work_contexts"
+
+    id = Column(String, primary_key=True)
+    request_id = Column(String, nullable=False, unique=True, index=True)
+    project_id = Column(String, nullable=False, index=True)
+    session_id = Column(String, nullable=False, unique=True, index=True)
+    terminal_id = Column(String, nullable=False, unique=True, index=True)
+    canonical_source = Column(String, nullable=False)
+    canonical_worktree = Column(String, nullable=False, unique=True)
+    branch = Column(String, nullable=False, unique=True)
+    base_revision = Column(String, nullable=False)
+    state = Column(String, nullable=False, default="reserved", index=True)
+    writer_authority_generation = Column(String, nullable=True, unique=True)
+    failure_reason = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class WritableWorkContextAuditModel(Base):
+    """Append-only non-secret evidence for workspace provisioning authority."""
+
+    __tablename__ = "writable_work_context_audit"
+    __table_args__ = (UniqueConstraint("event_key", name="uq_work_context_audit_event"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    work_context_id = Column(String, nullable=False, index=True)
+    event_key = Column(String, nullable=False)
+    event_type = Column(String, nullable=False)
+    terminal_id = Column(String, nullable=False, index=True)
+    reason_code = Column(String, nullable=True)
+    detail_json = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
@@ -471,6 +512,18 @@ class WorktreeWriterLeaseConflict(RuntimeError):
     def __init__(self, canonical_worktree: str):
         self.canonical_worktree = canonical_worktree
         super().__init__(f"writer lease already exists for {canonical_worktree}")
+
+
+class SessionPrimarySupervisorConflict(RuntimeError):
+    """A durable Session already owns a non-fenced primary supervisor."""
+
+
+class WritableWorkContextConflict(RuntimeError):
+    """A provisioning idempotency key was reused for different authority."""
+
+    def __init__(self, reason_code: str = "WORK_CONTEXT_REQUEST_CONFLICT"):
+        self.reason_code = reason_code
+        super().__init__(reason_code)
 
 
 class UnreconciledTerminalAuthority(RuntimeError):
@@ -2908,6 +2961,8 @@ def _migrate_terminal_worktree_authority_columns() -> bool:
             "managed_worktree_branch",
             "managed_worktree_commit",
             "managed_worktree_origin_terminal_id",
+            "writable_work_context_id",
+            "workspace_classification",
             "runtime_lifecycle",
             "owner_grant_id",
             "runtime_pane_id",
@@ -2942,6 +2997,11 @@ def _migrate_terminal_worktree_authority_columns() -> bool:
                 conn.execute(f"ALTER TABLE terminals ADD COLUMN {name} INTEGER")
         if "creation_order" not in columns:
             conn.execute("ALTER TABLE terminals ADD COLUMN creation_order INTEGER")
+        conn.execute(
+            "UPDATE terminals SET workspace_classification = CASE "
+            "WHEN managed_worktree_kind IS NOT NULL THEN 'managed_isolated' "
+            "ELSE 'legacy_shared_root' END WHERE workspace_classification IS NULL"
+        )
         # SQLite rowid is an accurate insertion order at migration/insert time,
         # but it can be reassigned by table rebuilds. Copy it into a durable
         # column once and use only that explicit value thereafter.
@@ -3037,6 +3097,153 @@ def _ensure_terminal_worktree_authority_schema() -> None:
             _terminal_authority_schema_ready = _migrate_terminal_worktree_authority_columns()
         RecoveryTakeoverModel.__table__.create(bind=engine, checkfirst=True)
         RecoveryTakeoverAuditModel.__table__.create(bind=engine, checkfirst=True)
+        WritableWorkContextModel.__table__.create(bind=engine, checkfirst=True)
+        WritableWorkContextAuditModel.__table__.create(bind=engine, checkfirst=True)
+
+
+def _work_context_dict(row: WritableWorkContextModel) -> Dict[str, Any]:
+    return {
+        "id": row.id,
+        "request_id": row.request_id,
+        "project_id": row.project_id,
+        "session_id": row.session_id,
+        "terminal_id": row.terminal_id,
+        "canonical_source": row.canonical_source,
+        "canonical_worktree": row.canonical_worktree,
+        "branch": row.branch,
+        "base_revision": row.base_revision,
+        "state": row.state,
+        "writer_authority_generation": row.writer_authority_generation,
+        "failure_reason": row.failure_reason,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
+
+
+def reserve_writable_work_context(
+    *,
+    context_id: str,
+    request_id: str,
+    project_id: str,
+    session_id: str,
+    terminal_id: str,
+    canonical_source: str,
+    canonical_worktree: str,
+    branch: str,
+    base_revision: str,
+) -> Dict[str, Any]:
+    """Acquire or replay one exact per-Session work-context reservation."""
+    _ensure_terminal_worktree_authority_schema()
+    expected = {
+        "id": context_id,
+        "request_id": request_id,
+        "project_id": project_id,
+        "session_id": session_id,
+        "terminal_id": terminal_id,
+        "canonical_source": canonical_source,
+        "canonical_worktree": canonical_worktree,
+        "branch": branch,
+        "base_revision": base_revision,
+    }
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        existing = (
+            db.query(WritableWorkContextModel)
+            .filter(WritableWorkContextModel.request_id == request_id)
+            .first()
+        )
+        if existing is not None:
+            current = _work_context_dict(existing)
+            if any(current[key] != value for key, value in expected.items()):
+                db.rollback()
+                raise WritableWorkContextConflict()
+            db.rollback()
+            return current
+        row = WritableWorkContextModel(**expected, state="reserved")
+        db.add(row)
+        db.add(
+            WritableWorkContextAuditModel(
+                work_context_id=context_id,
+                event_key=f"{context_id}:reserved",
+                event_type="work_context_reserved",
+                terminal_id=terminal_id,
+                detail_json=json.dumps(
+                    {"base_revision": base_revision, "project_id": project_id},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+        )
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise WritableWorkContextConflict("WORK_CONTEXT_AUTHORITY_CONFLICT") from exc
+        return _work_context_dict(row)
+
+
+def get_writable_work_context_by_request(request_id: str) -> Optional[Dict[str, Any]]:
+    _ensure_terminal_worktree_authority_schema()
+    with SessionLocal() as db:
+        row = (
+            db.query(WritableWorkContextModel)
+            .filter(WritableWorkContextModel.request_id == request_id)
+            .first()
+        )
+        return _work_context_dict(row) if row is not None else None
+
+
+def list_writable_work_contexts(*, states: Sequence[str] | None = None) -> List[Dict[str, Any]]:
+    _ensure_terminal_worktree_authority_schema()
+    with SessionLocal() as db:
+        query = db.query(WritableWorkContextModel)
+        if states:
+            query = query.filter(WritableWorkContextModel.state.in_(tuple(states)))
+        return [
+            _work_context_dict(row) for row in query.order_by(WritableWorkContextModel.created_at)
+        ]
+
+
+def transition_writable_work_context(
+    context_id: str,
+    *,
+    expected_states: Sequence[str],
+    state: str,
+    event_type: str,
+    reason_code: str | None = None,
+) -> bool:
+    """CAS one provisioning transition and append its idempotent audit event."""
+    _ensure_terminal_worktree_authority_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        row = db.get(WritableWorkContextModel, context_id)
+        if row is None:
+            db.rollback()
+            return False
+        if row.state == state:
+            db.rollback()
+            return True
+        if row.state not in set(expected_states):
+            db.rollback()
+            return False
+        row.state = state
+        row.failure_reason = reason_code
+        row.updated_at = datetime.now()
+        db.add(
+            WritableWorkContextAuditModel(
+                work_context_id=context_id,
+                # The same recovery context may be taken over more than once
+                # over its lifetime. Bind transition evidence to the current
+                # terminal generation so a later legitimate successor cannot
+                # collide with the prior recovery audit row.
+                event_key=f"{context_id}:{event_type}:{row.terminal_id}",
+                event_type=event_type,
+                terminal_id=row.terminal_id,
+                reason_code=reason_code,
+            )
+        )
+        db.commit()
+        return True
 
 
 def create_terminal(
@@ -3055,6 +3262,8 @@ def create_terminal(
     managed_worktree_branch: Optional[str] = None,
     managed_worktree_commit: Optional[str] = None,
     managed_worktree_origin_terminal_id: Optional[str] = None,
+    writable_work_context_id: Optional[str] = None,
+    workspace_classification: Optional[str] = None,
     project_id: Optional[str] = None,
     project_name: Optional[str] = None,
     project_path: Optional[str] = None,
@@ -3090,10 +3299,12 @@ def create_terminal(
         raise ValueError("write-enabled terminals require an absolute canonical worktree")
     if context_role not in {"supervisor", "work"}:
         raise ValueError("terminal context_role must be supervisor or work")
-    if managed_worktree_kind not in {None, "task", "reviewer"}:
-        raise ValueError("managed_worktree_kind must be task or reviewer")
+    if managed_worktree_kind not in {None, "supervisor", "task", "reviewer"}:
+        raise ValueError("managed_worktree_kind must be supervisor, task, or reviewer")
+    if workspace_classification not in {None, "managed_isolated", "legacy_shared_root"}:
+        raise ValueError("workspace_classification is invalid")
     with SessionLocal() as db:
-        if privileged_launch or recovery_takeover_id is not None:
+        if privileged_launch or recovery_takeover_id is not None or context_role == "supervisor":
             # Serialize validation, one-use consumption, and terminal metadata.
             db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         existing_session = (
@@ -3112,6 +3323,28 @@ def create_terminal(
             if session_lifetime_id
             else str(existing_session[0]) if existing_session else str(uuid.uuid4())
         )
+        # New isolated primary supervisors are session-singleton at the DB
+        # boundary. Historical rows may be temporarily misclassified as a
+        # supervisor until topology reconciliation repairs them, so the
+        # additive migration cannot impose this check on legacy rows.
+        if (
+            context_role == "supervisor"
+            and recovery_takeover_id is None
+            and (writable_work_context_id is not None or managed_worktree_kind == "supervisor")
+        ):
+            existing_primary = (
+                db.query(TerminalModel.id)
+                .filter(
+                    TerminalModel.session_id == session_id,
+                    TerminalModel.context_role == "supervisor",
+                    (TerminalModel.runtime_lifecycle.is_(None))
+                    | (TerminalModel.runtime_lifecycle.notin_(("exited", "recovery_fenced"))),
+                )
+                .first()
+            )
+            if existing_primary is not None:
+                db.rollback()
+                raise SessionPrimarySupervisorConflict(str(existing_primary[0]))
         if write_enabled is True:
             unresolved = (
                 db.query(TerminalModel.id)
@@ -3126,6 +3359,7 @@ def create_terminal(
                 raise UnreconciledTerminalAuthority(str(unresolved[0]))
         owner_grant_id = None
         recovery_takeover = None
+        writable_context = None
         writer_authority_generation = uuid.uuid4().hex
         if recovery_takeover_id is not None:
             recovery_takeover = db.get(RecoveryTakeoverModel, recovery_takeover_id)
@@ -3152,6 +3386,50 @@ def create_terminal(
                 raise OwnerGrantRejected("RECOVERY_TAKEOVER_WRITER_FENCE_LOST")
             owner_grant_id = recovery_takeover.owner_grant_id
             writer_authority_generation = recovery_takeover.new_authority_generation
+        if writable_work_context_id is not None:
+            writable_context = db.get(WritableWorkContextModel, writable_work_context_id)
+            if writable_context is None:
+                db.rollback()
+                raise WritableWorkContextConflict("WORK_CONTEXT_AUTHORITY_CHANGED")
+            normal_context_valid = bool(
+                recovery_takeover is None
+                and writable_context.state == "provisioned"
+                and writable_context.terminal_id == terminal_id
+                and writable_context.session_id == session_id
+            )
+            recovery_context_valid = bool(
+                recovery_takeover is not None
+                and writable_context.state == "admitted"
+                and writable_context.terminal_id == recovery_takeover.old_terminal_id
+            )
+            if not (
+                (normal_context_valid or recovery_context_valid)
+                and writable_context.project_id == project_id
+                and writable_context.canonical_worktree == launch_worktree
+                and writable_context.canonical_source == managed_worktree_source
+                and writable_context.branch == managed_worktree_branch
+                and writable_context.base_revision == managed_worktree_commit
+            ):
+                event_key = f"{writable_context.id}:writer-conflict-rejected:{terminal_id}"
+                if (
+                    db.query(WritableWorkContextAuditModel.id)
+                    .filter(WritableWorkContextAuditModel.event_key == event_key)
+                    .first()
+                    is None
+                ):
+                    db.add(
+                        WritableWorkContextAuditModel(
+                            work_context_id=writable_context.id,
+                            event_key=event_key,
+                            event_type="writer_conflict_rejected",
+                            terminal_id=terminal_id,
+                            reason_code="WORK_CONTEXT_AUTHORITY_CHANGED",
+                        )
+                    )
+                    db.commit()
+                else:
+                    db.rollback()
+                raise WritableWorkContextConflict("WORK_CONTEXT_AUTHORITY_CHANGED")
         if privileged_launch:
             if not owner_grant_token or not owner_grant_launch_id:
                 raise OwnerGrantRejected()
@@ -3230,6 +3508,15 @@ def create_terminal(
                 if managed_worktree_kind is not None
                 else None
             ),
+            writable_work_context_id=writable_work_context_id,
+            workspace_classification=(
+                workspace_classification
+                or (
+                    "managed_isolated"
+                    if managed_worktree_kind is not None
+                    else "legacy_shared_root"
+                )
+            ),
             project_id=project_id,
             project_name=project_name,
             project_path=project_path,
@@ -3268,6 +3555,32 @@ def create_terminal(
                     new_terminal_id=terminal_id,
                     detail_json=json.dumps(
                         {"authority_generation": writer_authority_generation},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+        if writable_context is not None:
+            # Persist the writer lease and terminal identity before crossing
+            # the external provider-start boundary, but do not claim that the
+            # supervisor is admitted until its runtime reaches Running.
+            writable_context.state = "launching"
+            writable_context.terminal_id = terminal_id
+            writable_context.session_id = session_id
+            writable_context.writer_authority_generation = writer_authority_generation
+            writable_context.updated_at = datetime.now()
+            db.add(
+                WritableWorkContextAuditModel(
+                    work_context_id=writable_context.id,
+                    event_key=f"{writable_context.id}:writer-lease:{terminal_id}",
+                    event_type=(
+                        "recovery_writer_lease_granted"
+                        if recovery_takeover is not None
+                        else "writer_lease_granted"
+                    ),
+                    terminal_id=terminal_id,
+                    detail_json=json.dumps(
+                        {"writer_authority_generation": writer_authority_generation},
                         sort_keys=True,
                         separators=(",", ":"),
                     ),
@@ -3313,6 +3626,8 @@ def create_terminal(
             "managed_worktree_branch": terminal.managed_worktree_branch,
             "managed_worktree_commit": terminal.managed_worktree_commit,
             "managed_worktree_origin_terminal_id": terminal.managed_worktree_origin_terminal_id,
+            "writable_work_context_id": terminal.writable_work_context_id,
+            "workspace_classification": terminal.workspace_classification,
             "project_id": terminal.project_id,
             "project_name": terminal.project_name,
             "project_path": terminal.project_path,
@@ -3380,6 +3695,8 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "managed_worktree_branch": terminal.managed_worktree_branch,
             "managed_worktree_commit": terminal.managed_worktree_commit,
             "managed_worktree_origin_terminal_id": terminal.managed_worktree_origin_terminal_id,
+            "writable_work_context_id": terminal.writable_work_context_id,
+            "workspace_classification": terminal.workspace_classification,
             "project_id": terminal.project_id,
             "project_name": terminal.project_name,
             "project_path": terminal.project_path,
@@ -3440,6 +3757,9 @@ def _session_terminal_dict(terminal: TerminalModel) -> Dict[str, Any]:
         "managed_worktree_source": terminal.managed_worktree_source,
         "managed_worktree_branch": terminal.managed_worktree_branch,
         "managed_worktree_commit": terminal.managed_worktree_commit,
+        "managed_worktree_origin_terminal_id": terminal.managed_worktree_origin_terminal_id,
+        "writable_work_context_id": terminal.writable_work_context_id,
+        "workspace_classification": terminal.workspace_classification,
         "project_id": terminal.project_id,
         "project_name": terminal.project_name,
         "project_path": terminal.project_path,
@@ -3680,6 +4000,8 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "managed_worktree_branch": t.managed_worktree_branch,
                 "managed_worktree_commit": t.managed_worktree_commit,
                 "managed_worktree_origin_terminal_id": t.managed_worktree_origin_terminal_id,
+                "writable_work_context_id": t.writable_work_context_id,
+                "workspace_classification": t.workspace_classification,
                 "project_id": t.project_id,
                 "project_name": t.project_name,
                 "project_path": t.project_path,
@@ -3729,6 +4051,7 @@ WITH selected_terminals AS MATERIALIZED (
            agent_profile, runtime_lifecycle, context_role, launch_worktree,
            runtime_operation_kind,
            managed_worktree_kind, managed_worktree_commit, managed_worktree_branch,
+           writable_work_context_id, writer_authority_generation, workspace_classification,
            project_id, project_name, project_path,
            COALESCE(creation_order, rowid) AS creation_order, last_active
     FROM terminals
@@ -3894,6 +4217,8 @@ WITH selected_terminals AS MATERIALIZED (
            lr.result_status, lr.status AS delivery_status,
            t.context_role, t.launch_worktree, t.managed_worktree_kind,
            t.managed_worktree_commit, t.managed_worktree_branch,
+           t.writable_work_context_id, t.writer_authority_generation,
+           t.workspace_classification,
            t.project_id AS projectId, t.project_name, t.project_path,
            t.creation_order, t.last_active
     FROM selected_terminals t
@@ -4474,6 +4799,12 @@ def list_worktree_writer_leases() -> List[Dict[str, Any]]:
             {
                 "canonical_worktree": lease.canonical_worktree,
                 "terminal_id": lease.terminal_id,
+                "authority_generation": lease.authority_generation,
+                "writable_work_context_id": (
+                    terminal.writable_work_context_id if terminal is not None else None
+                ),
+                "project_id": terminal.project_id if terminal is not None else None,
+                "session_id": terminal.session_id if terminal is not None else None,
                 "tmux_session": terminal.tmux_session if terminal is not None else None,
                 "tmux_window": terminal.tmux_window if terminal is not None else None,
                 "runtime_lifecycle": (terminal.runtime_lifecycle if terminal is not None else None),

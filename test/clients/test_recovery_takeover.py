@@ -339,6 +339,33 @@ def test_dispatch_claim_is_exactly_once_and_retry_rotates_runtime_generation(tak
 
 def test_reserved_successor_is_admitted_and_completed_on_same_writer_epoch(takeover_db):
     sessions, worktree = takeover_db
+    context_id = "recovery-context"
+    branch = f"cao/session/{context_id}"
+    base_revision = "b" * 40
+    with sessions() as db:
+        old = db.get(database.TerminalModel, OLD_ID)
+        old.managed_worktree_kind = "supervisor"
+        old.managed_worktree_source = worktree
+        old.managed_worktree_branch = branch
+        old.managed_worktree_commit = base_revision
+        old.writable_work_context_id = context_id
+        old.workspace_classification = "managed_isolated"
+        db.add(
+            database.WritableWorkContextModel(
+                id=context_id,
+                request_id="00000000-0000-4000-8000-000000000095",
+                project_id="project-1",
+                session_id=old.session_id,
+                terminal_id=OLD_ID,
+                canonical_source=worktree,
+                canonical_worktree=worktree,
+                branch=branch,
+                base_revision=base_revision,
+                state="admitted",
+                writer_authority_generation=WRITER_GENERATION,
+            )
+        )
+        db.commit()
     takeover = _claim(worktree)
     dispatched = database.claim_recovery_takeover_dispatch(takeover["id"])
 
@@ -352,6 +379,12 @@ def test_reserved_successor_is_admitted_and_completed_on_same_writer_epoch(takeo
         launch_worktree=worktree,
         write_enabled=True,
         context_role="supervisor",
+        managed_worktree_kind="supervisor",
+        managed_worktree_source=worktree,
+        managed_worktree_branch=branch,
+        managed_worktree_commit=base_revision,
+        writable_work_context_id=context_id,
+        workspace_classification="managed_isolated",
         project_id="project-1",
         runtime_pane_id="%2",
         runtime_pane_pid=4321,
@@ -364,6 +397,12 @@ def test_reserved_successor_is_admitted_and_completed_on_same_writer_epoch(takeo
     assert created["writer_authority_generation"] == takeover["new_authority_generation"]
     assert database.get_recovery_takeover(takeover["id"])["state"] == "admitted"
     assert database.mark_terminal_runtime_running(takeover["new_terminal_id"])
+    assert database.transition_writable_work_context(
+        context_id,
+        expected_states=("launching",),
+        state="admitted",
+        event_type="recovery_supervisor_admitted",
+    )
     assert database.mark_recovery_takeover_completed(takeover["id"])
 
     with sessions() as db:
@@ -371,6 +410,11 @@ def test_reserved_successor_is_admitted_and_completed_on_same_writer_epoch(takeo
         assert lease.terminal_id == takeover["new_terminal_id"]
         assert lease.authority_generation == takeover["new_authority_generation"]
         assert db.query(database.WorktreeWriterLeaseModel).count() == 1
+        context = db.get(database.WritableWorkContextModel, context_id)
+        assert context.terminal_id == takeover["new_terminal_id"]
+        assert context.session_id == takeover["new_session_id"]
+        assert context.state == "admitted"
+        assert context.writer_authority_generation == takeover["new_authority_generation"]
         audit = {row.event_type for row in db.query(database.RecoveryTakeoverAuditModel).all()}
         assert {
             "takeover_requested",

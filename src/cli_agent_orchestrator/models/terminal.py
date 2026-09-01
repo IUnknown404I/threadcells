@@ -80,13 +80,22 @@ class Terminal(BaseModel):
     )
     launch_worktree: Optional[str] = Field(None, description="Immutable canonical launch worktree")
     managed_worktree_kind: Optional[str] = Field(
-        None, description="CAO-managed worktree lifecycle: task or reviewer"
+        None, description="ThreadCells-managed worktree lifecycle: supervisor, task, or reviewer"
     )
     managed_worktree_commit: Optional[str] = Field(
         None, description="Exact source commit used to create a managed worktree"
     )
     managed_worktree_branch: Optional[str] = Field(
         None, description="Preserved task branch for deterministic integration"
+    )
+    writable_work_context_id: Optional[str] = Field(
+        None, description="Stable independent writable work-context identity"
+    )
+    writer_authority_generation: Optional[str] = Field(
+        None, description="Current fenced writer-authority generation"
+    )
+    workspace_classification: Optional[str] = Field(
+        None, description="Managed-isolated or preserved legacy workspace classification"
     )
     project_id: Optional[str] = Field(None, alias="projectId", description="Launch project ID")
     project_name: Optional[str] = Field(None, description="Historical launch project name")

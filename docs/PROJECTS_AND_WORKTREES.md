@@ -1,6 +1,6 @@
 # Projects and managed worktrees
 
-A ThreadCells project is a registered Git repository. It gives sessions, profiles, statistics, and workflows a stable place to belong. ThreadCells never makes a repository safe merely by registering it, so start with a clean status and understand the write boundary you grant.
+A ThreadCells project is a registered Git repository and canonical source authority. It gives sessions, profiles, statistics, and workflows a stable place to belong, but it is not the normal writable directory of a new supervisor. ThreadCells never makes a repository safe merely by registering it, so start with a clean status and understand the write boundary you grant.
 
 ## Registering a project
 
@@ -22,12 +22,17 @@ Two writers in one checkout can overwrite each other's edits even if their promp
 ```text
 Canonical repository
   ├── operator checkout
-  ├── supervisor context
+  ├── Session A supervisor worktree
+  ├── Session B supervisor worktree
   ├── developer worktree
   └── reviewer worktree or read-only context
 ```
 
 ThreadCells records the relationship instead of treating temporary directories as anonymous. That makes cleanup and result attribution safer.
+
+Every new Project-backed supervisor Session, including the first one, receives a unique managed worktree and branch at an exact recorded base revision. A second Session in the same Project receives another worktree; resident capacity remains global. One Session still has one primary supervisor, and one writable context/worktree still has at most one writer lease. Replacing an unusable supervisor for the same context uses explicit recovery takeover and preserves that context's worktree rather than creating an independent one.
+
+Active legacy Sessions that predate this contract remain in their existing workspace. ThreadCells does not move, reset, clean, stash, or copy their dirty state during upgrade; new Sessions use managed worktrees.
 
 ## Writer authority
 

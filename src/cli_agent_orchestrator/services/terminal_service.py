@@ -57,6 +57,8 @@ from cli_agent_orchestrator.clients.database import (
     get_workflow_turn_provider_outcome_cursor_bootstrap,
     list_all_terminals,
     mark_handoff_child_input_received,
+    mark_recovery_takeover_completed,
+    mark_recovery_takeover_dispatch_uncertain,
     mark_terminal_runtime_exited,
     mark_terminal_runtime_exited_with_workflow_ids,
     mark_terminal_runtime_running,
@@ -70,6 +72,7 @@ from cli_agent_orchestrator.clients.database import (
     replace_starting_terminal_runtime_identity,
     requeue_settled_unadmitted_workflow_turn,
     reserve_workflow_turn_provider_outcome_cursor_bootstrap,
+    reset_recovery_takeover_after_confirmed_prestart_failure,
     resolve_session_lifetime,
     terminal_deletion_receipt_exists,
     terminal_requires_result_snapshot,
@@ -605,7 +608,9 @@ def reconcile_terminal_runtime(terminal_id: str, provider=None) -> bool | None:
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         return None
-    if metadata.get("runtime_lifecycle") == "exited":
+    if metadata.get("runtime_lifecycle") in {"exited", "recovery_fenced"}:
+        if metadata.get("runtime_lifecycle") == "recovery_fenced":
+            return True
         _retire_exited_terminal_runtime(metadata)
         return True
     if metadata.get("runtime_operation_kind") == "reconnect":
@@ -806,6 +811,7 @@ def _create_terminal_after_admission(
     managed_worktree_source: str | None = None,
     managed_worktree_branch: str | None = None,
     managed_worktree_commit: str | None = None,
+    managed_worktree_origin_terminal_id: str | None = None,
     project_context: Dict[str, str] | None = None,
     terminal_id_override: str | None = None,
     privileged_launch: bool = False,
@@ -821,6 +827,9 @@ def _create_terminal_after_admission(
     resolved_profile: Any | None = None,
     owner_grant_canonical_worktree: str | None = None,
     session_lifetime_id: str | None = None,
+    window_name_override: str | None = None,
+    runtime_generation_override: str | None = None,
+    recovery_takeover_id: str | None = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -851,13 +860,15 @@ def _create_terminal_after_admission(
     persisted_metadata: Dict | None = None
     terminal_id: str | None = None
     window_name: str | None = None
-    runtime_generation = str(uuid.uuid4())
+    runtime_generation = runtime_generation_override or str(uuid.uuid4())
     runtime_target = None
     terminal_auth_token = secrets.token_urlsafe(32)
     terminal_auth_token_sha256 = hashlib.sha256(
         terminal_auth_token.encode("utf-8", "strict")
     ).hexdigest()
-    session_lifetime_id = str(uuid.uuid4()) if new_session else session_lifetime_id
+    session_lifetime_id = (
+        session_lifetime_id or str(uuid.uuid4()) if new_session else session_lifetime_id
+    )
     if structured_owner_authorized is None:
         structured_owner_authorized = privileged_launch
     try:
@@ -869,7 +880,7 @@ def _create_terminal_after_admission(
         elif new_session:
             session_name = validate_session_name(session_name)
 
-        window_name = generate_window_name(agent_profile)
+        window_name = window_name_override or generate_window_name(agent_profile)
 
         # Step 2: Create tmux session or window
         if new_session:
@@ -975,6 +986,7 @@ def _create_terminal_after_admission(
                 managed_worktree_source=managed_worktree_source,
                 managed_worktree_branch=managed_worktree_branch,
                 managed_worktree_commit=managed_worktree_commit,
+                managed_worktree_origin_terminal_id=managed_worktree_origin_terminal_id,
                 project_id=project_context.get("id") if project_context else None,
                 project_name=project_context.get("name") if project_context else None,
                 project_path=project_context.get("path") if project_context else None,
@@ -993,6 +1005,7 @@ def _create_terminal_after_admission(
                 runtime_pane_pid=runtime_target.pane_pid,
                 runtime_generation=runtime_target.runtime_generation,
                 runtime_process_start_ticks=runtime_target.process_start_ticks,
+                recovery_takeover_id=recovery_takeover_id,
             )
             metadata_persisted = True
         except (
@@ -1039,7 +1052,14 @@ def _create_terminal_after_admission(
             prompt_parts.append(build_skill_catalog())
         if project_instructions:
             prompt_parts.append(project_instructions)
-        skill_prompt = "\n\n".join(part for part in prompt_parts if part)
+        if recovery_takeover_id:
+            prompt_parts.append(
+                "Recovery Takeover\n"
+                "This supervisor replaces a fenced, unusable predecessor for the same work "
+                "context. Inspect the existing Git/workflow history before mutating, preserve "
+                "all pre-existing state, and do not replay completed effects."
+            )
+        skill_prompt: Optional[str] = "\n\n".join(part for part in prompt_parts if part)
         if not skill_prompt and provider not in RUNTIME_SKILL_PROMPT_PROVIDERS:
             skill_prompt = None
 
@@ -1139,6 +1159,8 @@ def _create_terminal_after_admission(
         lifecycle_published = mark_terminal_runtime_running(terminal_id)
         if isinstance(persisted_metadata, dict) and not lifecycle_published:
             raise RuntimeError(f"Could not publish running lifecycle for {terminal_id}")
+        if recovery_takeover_id and not mark_recovery_takeover_completed(recovery_takeover_id):
+            raise RuntimeError("Could not publish completed recovery takeover authority")
 
         # Build and return the Terminal object
         terminal = Terminal(
@@ -1200,7 +1222,14 @@ def _create_terminal_after_admission(
                         )
             except Exception:
                 death_confirmed = False
-        if metadata_persisted and terminal_id is not None and death_confirmed:
+        if recovery_takeover_id:
+            if death_confirmed:
+                reset_recovery_takeover_after_confirmed_prestart_failure(recovery_takeover_id)
+            else:
+                mark_recovery_takeover_dispatch_uncertain(
+                    recovery_takeover_id, "RECOVERY_PROVIDER_DISPATCH_UNCERTAIN"
+                )
+        elif metadata_persisted and terminal_id is not None and death_confirmed:
             try:
                 if managed_worktree_kind is not None:
                     # The outer launch boundary owns managed-worktree cleanup.
@@ -1761,7 +1790,10 @@ def get_terminal(terminal_id: str) -> Dict:
 
         lifecycle = metadata.get("runtime_lifecycle")
         provider = None
-        if lifecycle == TerminalLifecycle.EXITED.value:
+        if lifecycle in {
+            TerminalLifecycle.EXITED.value,
+            TerminalLifecycle.RECOVERY_FENCED.value,
+        }:
             status = TerminalStatus.COMPLETED.value
         else:
             provider = provider_manager.get_provider(terminal_id)
@@ -1828,27 +1860,31 @@ def get_terminal(terminal_id: str) -> Dict:
         execution = get_terminal_execution_projection(terminal_id)
         wait_reason = execution["wait_reason"]
         execution_state = (
-            "exited"
-            if lifecycle == "exited"
+            "recovery_fenced"
+            if lifecycle == "recovery_fenced"
             else (
-                "processing"
-                if status == TerminalStatus.PROCESSING.value or execution["active_turn"]
+                "exited"
+                if lifecycle == "exited"
                 else (
-                    "queued_provider_execution"
-                    if wait_reason == "provider_capacity"
+                    "processing"
+                    if status == TerminalStatus.PROCESSING.value or execution["active_turn"]
                     else (
-                        "waiting_child_retirement"
-                        if wait_reason == "child_retirement"
+                        "queued_provider_execution"
+                        if wait_reason == "provider_capacity"
                         else (
-                            "waiting_resource_recovery"
-                            if wait_reason == "resource_health"
+                            "waiting_child_retirement"
+                            if wait_reason == "child_retirement"
                             else (
-                                "waiting_runtime_recovery"
-                                if wait_reason == "runtime_recovery"
+                                "waiting_resource_recovery"
+                                if wait_reason == "resource_health"
                                 else (
-                                    "waiting_workflow_continuation"
-                                    if wait_reason == "workflow_continuation"
-                                    else "ready"
+                                    "waiting_runtime_recovery"
+                                    if wait_reason == "runtime_recovery"
+                                    else (
+                                        "waiting_workflow_continuation"
+                                        if wait_reason == "workflow_continuation"
+                                        else "ready"
+                                    )
                                 )
                             )
                         )
@@ -1886,6 +1922,10 @@ def get_terminal(terminal_id: str) -> Dict:
             "project_name": metadata.get("project_name"),
             "project_path": metadata.get("project_path"),
             "project_description": metadata.get("project_description"),
+            "recovery_fenced_at": metadata.get("recovery_fenced_at"),
+            "recovery_fenced_reason": metadata.get("recovery_fenced_reason"),
+            "recovery_takeover_id": metadata.get("recovery_takeover_id"),
+            "replaced_by_terminal_id": metadata.get("replaced_by_terminal_id"),
             "last_active": metadata["last_active"],
         }
 
@@ -2433,7 +2473,10 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                     metadata["tmux_session"], metadata["tmux_window"], tail_lines=tail_lines
                 )
             except Exception:
-                if metadata.get("runtime_lifecycle") == TerminalLifecycle.EXITED.value:
+                if metadata.get("runtime_lifecycle") in {
+                    TerminalLifecycle.EXITED.value,
+                    TerminalLifecycle.RECOVERY_FENCED.value,
+                }:
                     return durable_output()
                 raise
 
@@ -2442,7 +2485,10 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         elif mode == OutputMode.LAST:
             provider = provider_manager.get_provider(terminal_id)
             if provider is None:
-                if metadata.get("runtime_lifecycle") == TerminalLifecycle.EXITED.value:
+                if metadata.get("runtime_lifecycle") in {
+                    TerminalLifecycle.EXITED.value,
+                    TerminalLifecycle.RECOVERY_FENCED.value,
+                }:
                     return durable_output()
                 raise ValueError(f"Provider not found for terminal {terminal_id}")
 

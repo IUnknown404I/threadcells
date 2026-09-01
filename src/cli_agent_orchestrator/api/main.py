@@ -85,6 +85,7 @@ from cli_agent_orchestrator.services import (
     flow_service,
     inbox_service,
     project_service,
+    recovery_takeover_service,
     result_service,
     session_service,
     telegram_notification_service,
@@ -220,9 +221,25 @@ class XHighGrantRequest(BaseModel):
     working_directory: Optional[str] = None
     requested_session_name: Optional[str] = None
     project_id: Optional[str] = None
-    launch_mode: Literal["new_session", "existing_session"] = "new_session"
+    launch_mode: Literal["new_session", "existing_session", "recovery_takeover"] = "new_session"
+    target_terminal_id: Optional[str] = None
+    expected_authority_generation: Optional[str] = None
+    expected_runtime_generation: Optional[str] = None
     confirmation: Optional[str] = None
     confirmed: bool = False
+
+
+class RecoveryTakeoverRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: UUID = Field(default_factory=uuid4)
+    expected_authority_generation: str = Field(pattern=r"^[0-9a-f]{32}$")
+    expected_runtime_generation: str = Field(
+        pattern=r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$"
+    )
+    agent_profile: str
+    provider: str
+    owner_grant_launch_id: str
 
 
 class RegistryImportRequest(BaseModel):
@@ -335,6 +352,15 @@ async def _workflow_reconciliation_tick(
 ) -> bool:
     """Run one isolated recovery tick and return whether startup replay remains due."""
     performed_full_recovery = False
+    try:
+        recovered = await _run_workflow_io(
+            recovery_takeover_service.reconcile_recovery_takeovers,
+            registry=registry,
+        )
+        if recovered:
+            logger.info("Reconciled %s supervisor recovery takeovers", recovered)
+    except Exception as exc:
+        logger.warning("Recovery takeover reconciliation failed: %s", exc)
     try:
         if startup_recovery_pending:
             await _run_workflow_io(inbox_service.reconcile_pending_messages, registry)
@@ -921,6 +947,64 @@ async def create_xhigh_grant_endpoint(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid provider"
         ) from exc
+    if body.launch_mode == "recovery_takeover":
+        if not (
+            body.target_terminal_id
+            and body.expected_authority_generation
+            and body.expected_runtime_generation
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"reason_code": "RECOVERY_TAKEOVER_SCOPE_REQUIRED"},
+            )
+        preview = await _run_operational_io(
+            recovery_takeover_service.preview_recovery_takeover,
+            body.target_terminal_id,
+            expected_authority_generation=body.expected_authority_generation,
+            expected_runtime_generation=body.expected_runtime_generation,
+        )
+        if not preview.get("eligible"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"reason_code": preview.get("reason_code")},
+            )
+        terminal = cast(Dict[str, Any], preview["terminal"])
+        from cli_agent_orchestrator.services.control_plane_registry import resolve_launch
+
+        resolution = resolve_launch(body.agent_profile, fallback_provider=body.provider)
+        if resolution.provider_adapter_id != body.provider:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"reason_code": "RECOVERY_PROFILE_AUTHORITY_MISMATCH"},
+            )
+        try:
+            return mint_xhigh_launch_grant(
+                auth_identity=identity,
+                agent_profile=body.agent_profile,
+                provider=body.provider,
+                canonical_worktree=str(terminal["launch_worktree"]),
+                requested_session_name=None,
+                confirmation=(
+                    f"RECOVERY TAKEOVER {body.target_terminal_id}"
+                    if body.confirmed
+                    else body.confirmation or ""
+                ),
+                expected_confirmation=f"RECOVERY TAKEOVER {body.target_terminal_id}",
+                owner_grant_required=resolution.owner_grant_required,
+                grant_scope={
+                    "profile_revision_id": resolution.profile_revision_id,
+                    "provider_config_revision_id": resolution.provider_config_revision_id,
+                    "project_id": terminal["project_id"],
+                    "launch_mode": "recovery_takeover",
+                    "delegation_depth": 0,
+                    "target_terminal_id": body.target_terminal_id,
+                    "expected_authority_generation": body.expected_authority_generation,
+                    "expected_runtime_generation": body.expected_runtime_generation,
+                },
+            )
+        except OperatorAuthenticationError as exc:
+            raise _operator_auth_error(exc) from exc
+
     requested_session_name = (
         body.requested_session_name.strip()
         if body.requested_session_name and body.requested_session_name.strip()
@@ -1976,6 +2060,95 @@ async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDire
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get working directory: {str(e)}",
         )
+
+
+@app.get("/terminals/{terminal_id}/recovery-takeover/preview")
+async def preview_terminal_recovery_takeover(
+    request: Request,
+    terminal_id: TerminalId,
+    expected_authority_generation: Optional[str] = None,
+    expected_runtime_generation: Optional[str] = None,
+    authorization: Annotated[Optional[str], Header()] = None,
+) -> Dict[str, Any]:
+    """Inspect one exact recovery target without mutating its authority."""
+    _require_operator(request, authorization)
+    return cast(
+        Dict[str, Any],
+        await _run_operational_io(
+            recovery_takeover_service.preview_recovery_takeover,
+            str(terminal_id),
+            expected_authority_generation=expected_authority_generation,
+            expected_runtime_generation=expected_runtime_generation,
+        ),
+    )
+
+
+@app.post("/terminals/{terminal_id}/recovery-takeover", status_code=status.HTTP_201_CREATED)
+async def create_terminal_recovery_takeover(
+    request: Request,
+    terminal_id: TerminalId,
+    body: RecoveryTakeoverRequest,
+    owner_grant: Annotated[Optional[str], Header(alias="X-ThreadCells-Owner-Grant")] = None,
+    authorization: Annotated[Optional[str], Header()] = None,
+) -> Dict[str, Any]:
+    """Fence one unusable supervisor and admit its sole recovery successor."""
+    _require_operator(request, authorization)
+    if not owner_grant:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"reason_code": "OWNER_GRANT_REQUIRED"},
+        )
+    try:
+        return cast(
+            Dict[str, Any],
+            await _run_operational_io(
+                recovery_takeover_service.request_recovery_takeover,
+                request_id=str(body.request_id),
+                old_terminal_id=str(terminal_id),
+                expected_authority_generation=body.expected_authority_generation,
+                expected_runtime_generation=body.expected_runtime_generation,
+                agent_profile=body.agent_profile,
+                provider=body.provider,
+                owner_grant_token=owner_grant,
+                owner_grant_launch_id=body.owner_grant_launch_id,
+                registry=get_plugin_registry(request),
+            ),
+        )
+    except AdmissionDenied as exc:
+        raise _admission_http_exception(exc) from exc
+    except recovery_takeover_service.RecoveryTakeoverError as exc:
+        raise HTTPException(
+            status_code=(
+                status.HTTP_403_FORBIDDEN
+                if exc.reason_code.startswith("OWNER_GRANT")
+                else status.HTTP_409_CONFLICT
+            ),
+            detail={"reason_code": exc.reason_code},
+        ) from exc
+
+
+@app.get("/recovery-takeovers/{takeover_id}")
+async def get_recovery_takeover_endpoint(
+    request: Request,
+    takeover_id: str,
+    authorization: Annotated[Optional[str], Header()] = None,
+) -> Dict[str, Any]:
+    """Return one durable, non-secret recovery saga state to its operator."""
+    _require_operator(request, authorization)
+    if re.fullmatch(r"[0-9a-f]{32}", takeover_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"reason_code": "RECOVERY_TAKEOVER_NOT_FOUND"},
+        )
+    from cli_agent_orchestrator.clients.database import get_recovery_takeover
+
+    takeover = await _run_operational_io(get_recovery_takeover, takeover_id)
+    if takeover is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"reason_code": "RECOVERY_TAKEOVER_NOT_FOUND"},
+        )
+    return cast(Dict[str, Any], takeover)
 
 
 @app.post("/terminals/{terminal_id}/input")

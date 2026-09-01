@@ -20,6 +20,7 @@
     "test:e2e:session-badges-p1": "node e2e/session-badges-p1.chromium.mjs",
     "test:e2e:modal-loading": "node e2e/modal-loading.chromium.mjs",
     "test:e2e:add-agent-xhigh": "node e2e/add-agent-xhigh.chromium.mjs",
+    "test:e2e:recovery-takeover": "node e2e/recovery-takeover.chromium.mjs",
     "test:e2e:agent-filters-p1": "node e2e/agent-filters-p1.chromium.mjs",
     "test:e2e:agent-inline-detail-p1": "node e2e/agent-inline-detail-p1.chromium.mjs",
     "test:e2e:home-agent-deeplinks-p2": "node e2e/home-agent-deeplinks-p2.chromium.mjs",

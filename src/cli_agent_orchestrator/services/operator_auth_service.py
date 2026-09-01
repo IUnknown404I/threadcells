@@ -215,9 +215,12 @@ def mint_xhigh_launch_grant(
     confirmation: str,
     owner_grant_required: bool,
     grant_scope: Mapping[str, Any] | None = None,
+    expected_confirmation: str | None = None,
 ) -> dict[str, str | int]:
     """Issue one exact manual launch capability after explicit confirmation."""
-    if not owner_grant_required or confirmation != f"LAUNCH {agent_profile}":
+    if not owner_grant_required or confirmation != (
+        expected_confirmation or f"LAUNCH {agent_profile}"
+    ):
         raise OperatorAuthenticationError("explicit XHigh confirmation is required")
     if not canonical_worktree.startswith("/"):
         raise ValueError("canonical_worktree must be absolute")

@@ -55,7 +55,7 @@ async function allAgents(): Promise<AgentSummary[]> {
       const state = await statusFor(terminal.id)
       const activity = String(state.activity || state.status || 'idle').toLowerCase()
       const lifecycleValue = String(state.lifecycle || 'running').toLowerCase()
-      const lifecycle: AgentSummary['lifecycle'] = ['starting', 'running', 'exit_pending', 'exited'].includes(lifecycleValue)
+      const lifecycle: AgentSummary['lifecycle'] = ['starting', 'running', 'exit_pending', 'exited', 'recovery_fenced'].includes(lifecycleValue)
         ? lifecycleValue as AgentSummary['lifecycle']
         : 'running'
       result.push({
@@ -109,7 +109,7 @@ async function sessionSummaries(): Promise<SessionSummary[]> {
     return {
       ...session,
       agent_count: members.length,
-      active_agent_count: members.filter(agent => agent.lifecycle !== 'exited').length,
+      active_agent_count: members.filter(agent => !agent.lifecycle || !['exited', 'recovery_fenced'].includes(agent.lifecycle)).length,
       workflow_counts: counts(members.map(agent => agent.workflow_state)),
       activity_counts: counts(members.map(agent => agent.activity)),
       project_name: exactProject ? members[0].project_name : null,
@@ -177,7 +177,7 @@ export function installUiReadModelSpies() {
     return {
       sessions: useStore.getState().sessions.length,
       agents: agents.length,
-      active: agents.filter(item => item.lifecycle !== 'exited').length,
+      active: agents.filter(item => !item.lifecycle || !['exited', 'recovery_fenced'].includes(item.lifecycle)).length,
       waiting: agents.filter(item => (
         Boolean(item.workflow_state)
         && !['owner_gate', 'cancelled', 'completed'].includes(item.workflow_state || '')

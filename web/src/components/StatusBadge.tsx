@@ -10,7 +10,9 @@ export function lifecycleBadgeStatus(
   executionState?: string | null,
 ): string {
   if (!workflowState) return providerStatus || 'unknown'
-  const provider = providerLifecycle === 'exited'
+  const provider = providerLifecycle === 'recovery_fenced'
+    ? 'RecoveryFenced'
+    : providerLifecycle === 'exited'
     ? 'Exited'
     : executionState === 'processing' ? 'Processing'
     : executionState === 'queued_provider_execution' ? 'WaitingProviderSlot'
@@ -81,6 +83,12 @@ const STATUS_CONFIG: Record<string, StatusStyle> = {
     dotClass: 'bg-purple-400',
     bgClass: 'bg-purple-400/10',
     textClass: 'text-purple-400',
+  },
+  RECOVERYFENCED: {
+    labelKey: 'status.recoveryFenced',
+    dotClass: 'bg-amber-400',
+    bgClass: 'bg-amber-400/10',
+    textClass: 'text-amber-300',
   },
   WORKFLOW_UNTRACKED: {
     labelKey: 'status.untracked',

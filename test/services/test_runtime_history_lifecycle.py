@@ -236,6 +236,24 @@ def test_exited_terminal_output_falls_back_to_durable_log(tmp_path, monkeypatch)
     assert terminal_service.get_output("closed00") == "durable output"
 
 
+def test_recovery_fenced_terminal_history_remains_available(tmp_path, monkeypatch):
+    metadata = {
+        "id": "fenced00",
+        "tmux_session": "cao-history",
+        "tmux_window": "old-owner",
+        "runtime_lifecycle": "recovery_fenced",
+    }
+    (tmp_path / "fenced00.log").write_text("preserved recovery history", encoding="utf-8")
+    monkeypatch.setattr(terminal_service, "TERMINAL_LOG_DIR", tmp_path)
+    monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda *_: metadata)
+    monkeypatch.setattr(
+        terminal_service.tmux_client,
+        "get_history",
+        MagicMock(side_effect=ValueError("old pane retired")),
+    )
+    assert terminal_service.get_output("fenced00") == "preserved recovery history"
+
+
 def test_exited_terminal_output_reads_housekeeping_compressed_log(tmp_path, monkeypatch):
     import gzip
 

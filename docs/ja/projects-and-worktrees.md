@@ -1,11 +1,11 @@
 ---
 slug: projects-and-worktrees
 source: docs/PROJECTS_AND_WORKTREES.md
-source_sha256: sha256:330c4175df07b3a91dc7d9e0c88bbf91d6c3bb7b2bb76fd4340828260562dd02
+source_sha256: sha256:c296e8fec6654451a29dbef47bde79d19fda28f7bbfdf926c857e2cc8508ad3a
 ---
 # プロジェクトと管理済み worktree
 
-ThreadCells プロジェクトは、登録済みの Git リポジトリです。セッション、プロファイル、統計、ワークフローに安定した所属先を与えます。ThreadCells はリポジトリを登録しただけで安全にすることはありません。クリーンな状態から始め、付与する書き込み境界を理解してください。
+ThreadCells プロジェクトは、登録済みの Git リポジトリであり、正規のソース権限です。セッション、プロファイル、統計、ワークフローに安定した所属先を与えますが、新しい supervisor の通常の書き込み可能ディレクトリではありません。ThreadCells はリポジトリを登録しただけで安全にすることはありません。クリーンな状態から始め、付与する書き込み境界を理解してください。
 
 ## プロジェクトを登録する
 
@@ -27,12 +27,17 @@ git -C /path/to/project worktree list
 ```text
 Canonical repository
   ├── operator checkout
-  ├── supervisor context
+  ├── Session A supervisor worktree
+  ├── Session B supervisor worktree
   ├── developer worktree
   └── reviewer worktree or read-only context
 ```
 
 ThreadCells は一時ディレクトリを匿名として扱わず、関係を記録します。これによりクリーンアップと結果の帰属がより安全になります。
+
+プロジェクトに関連付けられた新しい supervisor セッションは、最初のセッションを含めて、正確に記録されたベースリビジョン上の一意な管理済み worktree とブランチを受け取ります。同じプロジェクトの二つ目のセッションには別の worktree が与えられ、Resident 容量は引き続きグローバルです。一つのセッションには引き続き一つのプライマリ supervisor だけが存在し、一つの書き込み可能コンテキスト/worktree には最大一つの書き込みリースだけが存在します。同じコンテキストで使用不能な supervisor を置き換える場合は、明示的な recovery takeover を使用し、独立した worktree を作るのではなく、そのコンテキストの worktree を保持します。
+
+この契約より前から存在するアクティブな legacy セッションは、既存のワークスペースに留まります。アップグレード時に ThreadCells がその dirty 状態を移動、リセット、クリーン、stash、コピーすることはありません。新しいセッションは管理済み worktree を使用します。
 
 ## 書き込み権限
 

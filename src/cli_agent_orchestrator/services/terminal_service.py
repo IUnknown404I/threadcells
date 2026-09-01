@@ -34,8 +34,10 @@ from typing import Any, Callable, Dict, Optional
 from cli_agent_orchestrator.clients.database import (
     AmbiguousTerminalIdentity,
     OwnerGrantRejected,
+    SessionPrimarySupervisorConflict,
     UnreconciledTerminalAuthority,
     WorktreeWriterLeaseConflict,
+    WritableWorkContextConflict,
     acquire_terminal_runtime_transport,
     bind_terminal_provider_resume_identity,
     bind_workflow_turn_provider_outcome_cursor,
@@ -55,6 +57,7 @@ from cli_agent_orchestrator.clients.database import (
     get_terminal_workflow_projection,
     get_workflow_provider_reconnect_runtime_ready,
     get_workflow_turn_provider_outcome_cursor_bootstrap,
+    get_writable_work_context_by_request,
     list_all_terminals,
     mark_handoff_child_input_received,
     mark_recovery_takeover_completed,
@@ -73,11 +76,13 @@ from cli_agent_orchestrator.clients.database import (
     replace_starting_terminal_runtime_identity,
     requeue_settled_unadmitted_workflow_turn,
     reserve_workflow_turn_provider_outcome_cursor_bootstrap,
+    reserve_writable_work_context,
     reset_recovery_takeover_after_confirmed_prestart_failure,
     resolve_session_lifetime,
     terminal_deletion_receipt_exists,
     terminal_requires_result_snapshot,
     terminal_runtime_operation_owned,
+    transition_writable_work_context,
     update_last_active,
     validate_owner_launch_grant,
 )
@@ -868,6 +873,8 @@ def _create_terminal_after_admission(
     managed_worktree_branch: str | None = None,
     managed_worktree_commit: str | None = None,
     managed_worktree_origin_terminal_id: str | None = None,
+    writable_work_context_id: str | None = None,
+    workspace_classification: str | None = None,
     project_context: Dict[str, str] | None = None,
     terminal_id_override: str | None = None,
     privileged_launch: bool = False,
@@ -1045,6 +1052,8 @@ def _create_terminal_after_admission(
                 managed_worktree_branch=managed_worktree_branch,
                 managed_worktree_commit=managed_worktree_commit,
                 managed_worktree_origin_terminal_id=managed_worktree_origin_terminal_id,
+                writable_work_context_id=writable_work_context_id,
+                workspace_classification=workspace_classification,
                 project_id=project_context.get("id") if project_context else None,
                 project_name=project_context.get("name") if project_context else None,
                 project_path=project_context.get("path") if project_context else None,
@@ -1070,7 +1079,9 @@ def _create_terminal_after_admission(
             metadata_persisted = True
         except (
             OwnerGrantRejected,
+            SessionPrimarySupervisorConflict,
             UnreconciledTerminalAuthority,
+            WritableWorkContextConflict,
             WorktreeWriterLeaseConflict,
         ) as exc:
             from cli_agent_orchestrator.services.operations_service import AdmissionDenied
@@ -1082,6 +1093,10 @@ def _create_terminal_after_admission(
                     "WORKTREE_AUTHORITY_UNRECONCILED",
                     {"terminal_id": exc.terminal_id},
                 ) from exc
+            if isinstance(exc, SessionPrimarySupervisorConflict):
+                raise AdmissionDenied("SESSION_PRIMARY_SUPERVISOR_EXISTS", {}) from exc
+            if isinstance(exc, WritableWorkContextConflict):
+                raise AdmissionDenied(exc.reason_code, {}) from exc
             raise AdmissionDenied(
                 "WORKTREE_WRITER_LEASE_HELD",
                 {"canonical_worktree": exc.canonical_worktree},
@@ -1100,12 +1115,18 @@ def _create_terminal_after_admission(
         project_instructions = None
         if project_context:
             description = project_context.get("description")
+            workspace_line = (
+                f"\nManaged workspace: {launch_worktree}"
+                if managed_worktree_kind == "supervisor"
+                else ""
+            )
             project_instructions = (
                 "Project Context\n"
                 f"Project: {project_context['name']}\n"
-                f"Path: {project_context['path']}"
+                f"Canonical source authority: {project_context['path']}"
+                + workspace_line
                 + (f"\nDescription: {description}" if description else "")
-                + "\nUse this project context for the work you perform in this terminal."
+                + "\nPerform normal writes only in this terminal's launch workspace."
             )
         prompt_parts = []
         if provider in RUNTIME_SKILL_PROMPT_PROVIDERS:
@@ -1221,6 +1242,17 @@ def _create_terminal_after_admission(
         lifecycle_published = mark_terminal_runtime_running(terminal_id)
         if isinstance(persisted_metadata, dict) and not lifecycle_published:
             raise RuntimeError(f"Could not publish running lifecycle for {terminal_id}")
+        if writable_work_context_id and not transition_writable_work_context(
+            writable_work_context_id,
+            expected_states=("launching",),
+            state="admitted",
+            event_type=(
+                "recovery_supervisor_admitted" if recovery_takeover_id else "supervisor_admitted"
+            ),
+        ):
+            raise RuntimeError(
+                f"Could not publish admitted work-context lifecycle for {terminal_id}"
+            )
         if recovery_takeover_id and not mark_recovery_takeover_completed(recovery_takeover_id):
             raise RuntimeError("Could not publish completed recovery takeover authority")
 
@@ -1233,6 +1265,22 @@ def _create_terminal_after_admission(
             session_id=session_lifetime_id or f"legacy:{session_name}",
             agent_profile=agent_profile,
             status=TerminalStatus.IDLE,
+            context_role=context_role,
+            launch_worktree=launch_worktree,
+            managed_worktree_kind=managed_worktree_kind,
+            managed_worktree_commit=managed_worktree_commit,
+            managed_worktree_branch=managed_worktree_branch,
+            writable_work_context_id=writable_work_context_id,
+            writer_authority_generation=(
+                persisted_metadata.get("writer_authority_generation")
+                if isinstance(persisted_metadata, dict)
+                else None
+            ),
+            workspace_classification=workspace_classification,
+            projectId=project_context.get("id") if project_context else None,
+            project_name=project_context.get("name") if project_context else None,
+            project_path=project_context.get("path") if project_context else None,
+            project_description=project_context.get("description") if project_context else None,
             provider_outcome_code=None,
             provider_outcome_detail=None,
             last_active=datetime.now(),
@@ -1326,6 +1374,7 @@ def create_terminal(
     owner_grant_token: str | None = None,
     owner_grant_launch_id: str | None = None,
     session_lifetime_id: str | None = None,
+    work_context_request_id: str | None = None,
 ) -> Terminal:
     """Create one terminal under the cross-process context admission fence."""
     # An explicit name for a new session is request admission data.  Normalize
@@ -1337,6 +1386,7 @@ def create_terminal(
 
     from cli_agent_orchestrator.services.managed_worktree_service import (
         create_managed_worktree,
+        plan_managed_worktree,
         remove_managed_worktree,
     )
     from cli_agent_orchestrator.services.operations_service import context_launch_admission
@@ -1353,9 +1403,74 @@ def create_terminal(
         provider = launch_resolution.provider_adapter_id
         if allowed_tools is None:
             allowed_tools = list(launch_resolution.profile.allowedTools or [])
-    if managed_worktree_kind is not None and resolved_role != "work":
-        raise ValueError("only work contexts may use managed worktrees")
     source_worktree = _canonical_worktree(working_directory)
+    isolated_supervisor = bool(
+        new_session and resolved_role == "supervisor" and project_context is not None
+    )
+    if managed_worktree_kind is not None and resolved_role != "work":
+        raise ValueError("supervisor workspaces are provisioned automatically")
+    effective_managed_kind = "supervisor" if isolated_supervisor else managed_worktree_kind
+    if isolated_supervisor and not work_context_request_id:
+        work_context_request_id = str(uuid.uuid4())
+    if work_context_request_id is not None:
+        try:
+            uuid.UUID(work_context_request_id)
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ValueError("work_context_request_id must be a UUID") from exc
+
+    def replay_admitted_context(context: Dict[str, Any]) -> Terminal:
+        duplicate = get_terminal_metadata(str(context["terminal_id"]))
+        if duplicate is None:
+            from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+            raise AdmissionDenied("WORK_CONTEXT_AUTHORITY_CHANGED", {})
+        return Terminal(
+            id=str(duplicate["id"]),
+            name=str(duplicate["tmux_window"]),
+            provider=str(duplicate["provider"]),
+            session_name=str(duplicate["tmux_session"]),
+            session_id=str(duplicate["session_id"]),
+            agent_profile=duplicate.get("agent_profile"),
+            status=TerminalStatus.IDLE,
+            lifecycle=duplicate.get("runtime_lifecycle"),
+            context_role=duplicate.get("context_role"),
+            launch_worktree=duplicate.get("launch_worktree"),
+            managed_worktree_kind=duplicate.get("managed_worktree_kind"),
+            managed_worktree_commit=duplicate.get("managed_worktree_commit"),
+            managed_worktree_branch=duplicate.get("managed_worktree_branch"),
+            writable_work_context_id=duplicate.get("writable_work_context_id"),
+            writer_authority_generation=duplicate.get("writer_authority_generation"),
+            workspace_classification=duplicate.get("workspace_classification"),
+            projectId=duplicate.get("project_id"),
+            project_name=duplicate.get("project_name"),
+            project_path=duplicate.get("project_path"),
+            last_active=duplicate.get("last_active"),
+        )
+
+    existing_context = (
+        get_writable_work_context_by_request(work_context_request_id)
+        if isolated_supervisor and work_context_request_id
+        else None
+    )
+    if existing_context is not None:
+        if (
+            existing_context.get("project_id") != project_context.get("id")
+            or existing_context.get("canonical_source") != source_worktree
+        ):
+            from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+            raise AdmissionDenied("WORK_CONTEXT_REQUEST_CONFLICT", {})
+        terminal_id = str(existing_context["terminal_id"])
+        session_lifetime_id = str(existing_context["session_id"])
+        if existing_context.get("state") == "admitted":
+            return replay_admitted_context(existing_context)
+        if existing_context.get("state") in {"launching", "preserved"}:
+            from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+            raise AdmissionDenied(
+                "WORK_CONTEXT_PROVIDER_LAUNCH_UNCERTAIN",
+                {"work_context_id": existing_context["id"]},
+            )
     requested_session_name = session_name
     from cli_agent_orchestrator.services.launch_authority import is_privileged_profile
 
@@ -1397,7 +1512,10 @@ def create_terminal(
 
         raise AdmissionDenied("OWNER_GRANT_SCOPE_MISMATCH", {})
     write_enabled = _write_enabled_lane(provider, agent_profile, allowed_tools)
-    terminal_id = generate_terminal_id()
+    if existing_context is None:
+        terminal_id = generate_terminal_id()
+        if isolated_supervisor:
+            session_lifetime_id = session_lifetime_id or str(uuid.uuid4())
     managed = None
     with context_launch_admission(
         canonical_worktree=source_worktree,
@@ -1419,6 +1537,28 @@ def create_terminal(
             from cli_agent_orchestrator.services.operations_service import AdmissionDenied
 
             raise AdmissionDenied("WORKTREE_AUTHORITY_CHANGED", {})
+        if isolated_supervisor and work_context_request_id:
+            concurrent_context = get_writable_work_context_by_request(work_context_request_id)
+            if concurrent_context is not None:
+                if (
+                    concurrent_context.get("project_id") != project_context.get("id")
+                    or concurrent_context.get("canonical_source") != source_worktree
+                ):
+                    from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+                    raise AdmissionDenied("WORK_CONTEXT_REQUEST_CONFLICT", {})
+                existing_context = concurrent_context
+                terminal_id = str(concurrent_context["terminal_id"])
+                session_lifetime_id = str(concurrent_context["session_id"])
+                if concurrent_context.get("state") == "admitted":
+                    return replay_admitted_context(concurrent_context)
+                if concurrent_context.get("state") in {"launching", "preserved"}:
+                    from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+                    raise AdmissionDenied(
+                        "WORK_CONTEXT_PROVIDER_LAUNCH_UNCERTAIN",
+                        {"work_context_id": concurrent_context["id"]},
+                    )
         if not new_session and session_name is not None:
             durable_session = resolve_session_lifetime(session_lifetime_id or session_name or "")
             expected_session_id = (
@@ -1439,6 +1579,15 @@ def create_terminal(
                 from cli_agent_orchestrator.services.operations_service import AdmissionDenied
 
                 raise AdmissionDenied("SESSION_IDENTITY_CHANGED", {})
+            if resolved_role == "supervisor" and any(
+                terminal.get("context_role") == "supervisor"
+                and terminal.get("runtime_lifecycle")
+                not in {TerminalLifecycle.EXITED.value, TerminalLifecycle.RECOVERY_FENCED.value}
+                for terminal in durable_session["terminals"]
+            ):
+                from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+                raise AdmissionDenied("SESSION_PRIMARY_SUPERVISOR_EXISTS", {})
             runtime_proof = prove_live_session_runtime_authority(
                 str(session_name),
                 durable_session["terminals"],
@@ -1452,8 +1601,62 @@ def create_terminal(
                     {"inventory_uncertain": runtime_proof.inventory_uncertain},
                 )
             session_lifetime_id = str(expected_session_id)
-        if managed_worktree_kind is not None:
-            managed = create_managed_worktree(source_worktree, terminal_id, managed_worktree_kind)
+        writable_work_context_id = None
+        if isolated_supervisor:
+            assert project_context is not None
+            assert work_context_request_id is not None
+            assert session_lifetime_id is not None
+            planned = plan_managed_worktree(source_worktree, terminal_id, "supervisor")
+            if planned is None or planned.branch is None:
+                from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+                raise AdmissionDenied("PROJECT_SOURCE_NOT_GIT", {})
+            if existing_context is not None:
+                if (
+                    existing_context.get("canonical_worktree") != planned.path
+                    or existing_context.get("branch") != planned.branch
+                ):
+                    from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+                    raise AdmissionDenied("WORK_CONTEXT_AUTHORITY_CHANGED", {})
+                base_revision = str(existing_context["base_revision"])
+                writable_work_context_id = str(existing_context["id"])
+            else:
+                base_revision = planned.commit
+                writable_work_context_id = terminal_id
+                existing_context = reserve_writable_work_context(
+                    context_id=writable_work_context_id,
+                    request_id=work_context_request_id,
+                    project_id=str(project_context["id"]),
+                    session_id=session_lifetime_id,
+                    terminal_id=terminal_id,
+                    canonical_source=planned.source,
+                    canonical_worktree=planned.path,
+                    branch=planned.branch,
+                    base_revision=base_revision,
+                )
+            managed = create_managed_worktree(
+                source_worktree,
+                terminal_id,
+                "supervisor",
+                expected_commit=base_revision,
+                allow_existing=True,
+            )
+            if managed is None:
+                from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+                raise AdmissionDenied("PROJECT_SOURCE_NOT_GIT", {})
+            if not transition_writable_work_context(
+                writable_work_context_id,
+                expected_states=("reserved",),
+                state="provisioned",
+                event_type="managed_worktree_provisioned",
+            ):
+                from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+                raise AdmissionDenied("WORK_CONTEXT_AUTHORITY_CHANGED", {})
+        elif effective_managed_kind is not None:
+            managed = create_managed_worktree(source_worktree, terminal_id, effective_managed_kind)
         launch_worktree = managed.path if managed is not None else source_worktree
         launch_directory = managed.path if managed is not None else working_directory
         try:
@@ -1472,6 +1675,10 @@ def create_terminal(
                 managed_worktree_source=managed.source if managed is not None else None,
                 managed_worktree_branch=managed.branch if managed is not None else None,
                 managed_worktree_commit=managed.commit if managed is not None else None,
+                writable_work_context_id=writable_work_context_id,
+                workspace_classification=(
+                    "managed_isolated" if managed is not None else "legacy_shared_root"
+                ),
                 project_context=project_context,
                 terminal_id_override=terminal_id,
                 privileged_launch=privileged_launch,
@@ -1517,6 +1724,8 @@ def create_terminal(
                     "managed_worktree_commit": managed.commit,
                     "launch_worktree": managed.path,
                 }
+                if writable_work_context_id is not None:
+                    identity["writable_work_context_id"] = writable_work_context_id
                 launch_cleanup = getattr(error, "_cao_launch_cleanup_outcome", None)
                 try:
                     durable = get_terminal_metadata(terminal_id)
@@ -1543,6 +1752,20 @@ def create_terminal(
                         terminal_id,
                     )
                 elif durable is not None and durable.get("runtime_lifecycle") != "exited":
+                    if writable_work_context_id is not None:
+                        transition_writable_work_context(
+                            writable_work_context_id,
+                            expected_states=("launching",),
+                            state="preserved",
+                            event_type="provisioning_preserved",
+                            reason_code="PROVIDER_LAUNCH_OUTCOME_UNCERTAIN",
+                            expected_terminal_id=terminal_id,
+                            expected_writer_authority_generation=(
+                                str(durable["writer_authority_generation"])
+                                if durable.get("writer_authority_generation")
+                                else None
+                            ),
+                        )
                     logger.error(
                         "Managed worktree retained after uncertain launch failure; "
                         "durable terminal metadata remains for recovery: %s",
@@ -1551,7 +1774,28 @@ def create_terminal(
                 else:
                     cleanup = remove_managed_worktree(identity)
                     if cleanup.get("removed"):
-                        if durable is not None:
+                        context_abandoned = True
+                        if writable_work_context_id is not None:
+                            context_abandoned = transition_writable_work_context(
+                                writable_work_context_id,
+                                expected_states=(
+                                    "reserved",
+                                    "provisioned",
+                                    "launching",
+                                    "admitted",
+                                ),
+                                state="abandoned",
+                                event_type="provisioning_abandoned",
+                                reason_code="PROVIDER_LAUNCH_FAILED_CONFIRMED",
+                                expected_terminal_id=terminal_id,
+                                expected_writer_authority_generation=(
+                                    str(durable["writer_authority_generation"])
+                                    if durable is not None
+                                    and durable.get("writer_authority_generation")
+                                    else None
+                                ),
+                            )
+                        if durable is not None and context_abandoned:
                             try:
                                 db_delete_terminal(terminal_id)
                             except Exception:
@@ -1559,7 +1803,35 @@ def create_terminal(
                                     "Removed managed worktree but retained terminal metadata: %s",
                                     terminal_id,
                                 )
+                        elif durable is not None:
+                            logger.error(
+                                "Removed managed worktree but retained terminal metadata because "
+                                "the exact writable context authority changed: %s",
+                                terminal_id,
+                            )
                     else:
+                        if writable_work_context_id is not None:
+                            transition_writable_work_context(
+                                writable_work_context_id,
+                                expected_states=(
+                                    "reserved",
+                                    "provisioned",
+                                    "launching",
+                                    "admitted",
+                                ),
+                                state="preserved",
+                                event_type="provisioning_preserved",
+                                reason_code=str(
+                                    cleanup.get("reason_code") or "PROVIDER_LAUNCH_UNCERTAIN"
+                                ),
+                                expected_terminal_id=terminal_id,
+                                expected_writer_authority_generation=(
+                                    str(durable["writer_authority_generation"])
+                                    if durable is not None
+                                    and durable.get("writer_authority_generation")
+                                    else None
+                                ),
+                            )
                         logger.error(
                             "Managed worktree retained after launch failure with durable identity "
                             "%s: %s",
@@ -2261,8 +2533,10 @@ def validate_managed_worktree_cleanup(metadata: Dict) -> None:
         reason = status.get("reason_code", "MANAGED_WORKTREE_UNVERIFIED")
     elif not status.get("clean"):
         reason = "MANAGED_WORKTREE_DIRTY"
-    elif status.get("kind") == "task" and status.get("branch") != status.get("expected_branch"):
-        reason = "TASK_WORKTREE_AUTHORITY_CHANGED"
+    elif status.get("kind") in {"task", "supervisor"} and status.get("branch") != status.get(
+        "expected_branch"
+    ):
+        reason = "WRITABLE_WORKTREE_AUTHORITY_CHANGED"
     elif status.get("kind") == "reviewer" and (
         status.get("branch") is not None or status.get("commit") != status.get("expected_commit")
     ):
@@ -2593,6 +2867,8 @@ _TERMINAL_DELETION_IDENTITY_FIELDS = (
     "managed_worktree_source",
     "managed_worktree_branch",
     "managed_worktree_commit",
+    "writable_work_context_id",
+    "writer_authority_generation",
     "runtime_pane_id",
     "runtime_pane_pid",
     "runtime_generation",

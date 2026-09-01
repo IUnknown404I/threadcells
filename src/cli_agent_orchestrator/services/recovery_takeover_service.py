@@ -25,6 +25,7 @@ from cli_agent_orchestrator.clients.database import (
     record_recovery_takeover_rejection,
     recovery_takeover_durable_eligibility,
     reset_recovery_takeover_after_confirmed_prestart_failure,
+    transition_writable_work_context,
     validate_owner_launch_grant,
 )
 from cli_agent_orchestrator.clients.tmux import PaneTargetError, tmux_client
@@ -461,6 +462,8 @@ def _launch_claimed_takeover(takeover: Mapping[str, Any], *, registry=None) -> N
         managed_worktree_origin_terminal_id=(
             old.get("managed_worktree_origin_terminal_id") or old.get("id")
         ),
+        writable_work_context_id=old.get("writable_work_context_id"),
+        workspace_classification=old.get("workspace_classification"),
         project_context={
             "id": str(old["project_id"]),
             "name": str(old.get("project_name") or old["project_id"]),
@@ -525,6 +528,8 @@ def _recover_dispatching_takeover(takeover: Mapping[str, Any]) -> bool:
         )
         return False
     if new.get("runtime_lifecycle") == "running":
+        if not _admit_recovered_work_context(takeover, new):
+            return False
         mark_recovery_takeover_completed(str(takeover["id"]))
         return False
     if new.get("runtime_lifecycle") != "starting":
@@ -588,8 +593,33 @@ def _recover_dispatching_takeover(takeover: Mapping[str, Any]) -> bool:
             str(takeover["id"]), "RECOVERY_PROVIDER_START_UNCLASSIFIED"
         )
         return False
+    if not _admit_recovered_work_context(takeover, new):
+        return False
     mark_recovery_takeover_completed(str(takeover["id"]))
     return False
+
+
+def _admit_recovered_work_context(takeover: Mapping[str, Any], terminal: Mapping[str, Any]) -> bool:
+    """Publish the exact recovered successor context before takeover completion."""
+    context_id = terminal.get("writable_work_context_id")
+    if context_id is None:
+        # Mission A deliberately preserves legacy shared-root supervisors.
+        return True
+    terminal_id = str(takeover["new_terminal_id"])
+    writer_generation = terminal.get("writer_authority_generation")
+    if not writer_generation or not transition_writable_work_context(
+        str(context_id),
+        expected_states=("launching", "preserved"),
+        state="admitted",
+        event_type="recovery_supervisor_admitted",
+        expected_terminal_id=terminal_id,
+        expected_writer_authority_generation=str(writer_generation),
+    ):
+        mark_recovery_takeover_dispatch_uncertain(
+            str(takeover["id"]), "RECOVERY_WORK_CONTEXT_AUTHORITY_CHANGED"
+        )
+        return False
+    return True
 
 
 def reconcile_recovery_takeover(takeover_id: str, *, registry=None) -> dict[str, Any]:

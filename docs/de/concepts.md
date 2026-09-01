@@ -1,7 +1,7 @@
 ---
 slug: concepts
 source: docs/CONCEPTS.md
-source_sha256: sha256:1e0e6123a7e1d36cffc5d9bd3a7178930c5d355386e008093fc0209c5cf951e9
+source_sha256: sha256:558a270183e49568ee5d52d6efd30c6a8215fe7d563df596ee9391313d8f3299
 ---
 
 # Kernkonzepte
@@ -26,11 +26,11 @@ Eine **Sitzung** ist die dauerhafte Laufzeit von ThreadCells für eine zusammeng
 
 ## Projekt
 
-Ein **Projekt** identifiziert das Git-Repository, zu dem Arbeit gehört. Es gibt ThreadCells einen stabilen Geltungsbereich für Sitzungen, Worktrees und Ergebnisse; es ersetzt weder Git-Remotes noch Repository-Berechtigungen.
+Ein **Projekt** identifiziert die kanonische Git- und Quellcode-Autorität für die Arbeit. Es gibt ThreadCells einen stabilen Geltungsbereich für Sitzungen, Worktrees und Ergebnisse; der registrierte Quellstamm ist nicht das normale beschreibbare cwd eines neuen Supervisors und ersetzt weder Git-Remotes noch Repository-Berechtigungen.
 
 ## Verwalteter Worktree
 
-Ein **verwalteter Worktree** ist ein Git-Worktree, der für einen begrenzten Agentenkontext angelegt wurde. Er ermöglicht parallelen Workern, auf verschiedenen Branches zu arbeiten, ohne denselben Checkout zu bearbeiten.
+Ein **verwalteter Worktree** ist ein Git-Worktree, der für einen begrenzten beschreibbaren Kontext angelegt wurde. Jede neue mit einem Projekt verbundene Supervisor-Sitzung, einschließlich der ersten, erhält einen. Unabhängige Sitzungen im selben Projekt verwenden verschiedene Branches und Checkouts; ein Recovery Takeover desselben Kontexts bewahrt dessen bestehenden Worktree.
 
 Worktrees verringern Kollisionen; sie sind keine Sicherheits-Sandboxes. Ein Agent kann weiterhin alles erreichen, was sein Betriebssystemkonto erreichen kann.
 

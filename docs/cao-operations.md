@@ -23,7 +23,7 @@ executions `1`; operators may configure `2..50 / 1..50 / 1..50 / 1..50` through
 an idle/waiting supervisor counts only as resident. Admission
 failures retain stable reason codes through API, MCP, and CLI:
 `WORKTREE_WRITER_LEASE_HELD`, `WORKTREE_AUTHORITY_UNRECONCILED`,
-`PROJECT_SUPERVISOR_ALREADY_RESIDENT`,
+`SESSION_PRIMARY_SUPERVISOR_EXISTS`, `WORK_CONTEXT_AUTHORITY_CHANGED`,
 `RESIDENT_SUPERVISOR_CAPACITY_EXHAUSTED`,
 `PROVIDER_EXECUTION_CAPACITY_EXHAUSTED`,
 `WORK_CONTEXT_CAPACITY_EXHAUSTED`, and `RESOURCE_HEALTH_REJECTED`.
@@ -40,17 +40,21 @@ input remains in `workflow_turns`/Inbox with state
 wakeup owner after a release. No separate scheduler or notification queue is
 used.
 
-Project-backed resident supervisors are unique by authoritative Project ID.
-Launching another live supervisor for that Project returns
-`PROJECT_SUPERVISOR_ALREADY_RESIDENT`; termination releases both the project
-residency and the global resident slot. Legacy no-project supervisors retain
-compatibility without participating in project uniqueness.
+Project-backed resident supervisors are isolated by Session work-context, not
+made unique by Project ID. Every new Project Session reserves a durable context,
+creates its own `cao/session/<context>` linked worktree at an exact base commit,
+and acquires a writer lease before provider start. Multiple Sessions may use one
+Project while resident capacity remains. A second primary in the same Session
+returns `SESSION_PRIMARY_SUPERVISOR_EXISTS`; a second writer for one worktree
+returns `WORKTREE_WRITER_LEASE_HELD`. Legacy pre-upgrade shared-root Sessions are
+preserved in place and are never relocated automatically.
 
-## Managed delegated worktrees
+## Managed worktrees
 
-An owner can launch the supervisor in the canonical project worktree. With no
-explicit child working directory, CAO creates a linked Git worktree automatically:
+The registered Project path is canonical Git/source authority, not the normal
+writable cwd of a new supervisor. ThreadCells creates linked worktrees automatically:
 
+- every new Project supervisor Session uses one unique supervisor branch/worktree;
 - execution owners use one task branch/worktree for their complete warm contour;
 - reviewers use a detached worktree at the exact source commit;
 - explicit isolated working directories bypass automatic management;

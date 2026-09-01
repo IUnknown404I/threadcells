@@ -56,9 +56,13 @@ async function openSpawn(page) {
   await page.goto(origin)
   await page.getByRole('link', { name: 'Agents' }).click()
   await page.getByRole('button', { name: 'Create Session & Spawn Agent' }).click()
+  await page.getByText('Canonical source authority', { exact: false }).waitFor()
+  await page.getByText('ThreadCells will create a separate managed Git workspace for this supervisor.', { exact: true }).waitFor()
   await page.getByText('/workspace/project-a').waitFor()
   await page.getByText(profile.description, { exact: true }).waitFor()
-  assert.doesNotMatch(await page.locator('div.fixed.inset-0.z-50').last().textContent() || '', /[\u0400-\u052f]/, 'Spawn modal must not contain Cyrillic UI copy')
+  const modal = page.locator('div.fixed.inset-0.z-50').last()
+  assert.doesNotMatch(await modal.textContent() || '', /[\u0400-\u052f]/, 'Spawn modal must not contain Cyrillic UI copy')
+  assert.equal(await modal.evaluate(element => element.scrollWidth <= element.clientWidth + 1), true, 'Spawn modal must not overflow horizontally')
   assert.equal(await page.getByText('Working Directory', { exact: true }).count(), 0)
 }
 
@@ -80,6 +84,7 @@ try {
   await medium.getByRole('button', { name: 'Create Session' }).last().click()
   await medium.getByText('Session created').waitFor()
   assert.equal(createRequests.at(-1)?.searchParams.get('projectId'), 'project-b')
+  assert.match(createRequests.at(-1)?.searchParams.get('workContextRequestId') || '', /^[0-9a-f-]{36}$/)
   assert.equal(createRequests.at(-1)?.searchParams.has('working_directory'), false)
 
   projects.length = 0
@@ -90,12 +95,14 @@ try {
   await narrow.getByText('No projects are configured. This launch will use the default working directory.').waitFor()
   await narrow.getByText(profile.description, { exact: true }).waitFor()
   assert.doesNotMatch(await narrow.locator('div.fixed.inset-0.z-50').last().textContent() || '', /[\u0400-\u052f]/, 'Narrow Spawn modal must not contain Cyrillic UI copy')
+  assert.equal(await narrow.locator('div.fixed.inset-0.z-50').last().evaluate(element => element.scrollWidth <= element.clientWidth + 1), true, 'Narrow Spawn modal must not overflow horizontally')
   assert.equal(await narrow.getByText('Working Directory', { exact: true }).count(), 0)
   await narrow.screenshot({ path: path.join(screenshotDir, 'spawn-project-p1-390.png'), fullPage: true })
   await narrow.getByText('developer', { exact: true }).click()
   await narrow.getByRole('button', { name: 'Create Session' }).last().click()
   await narrow.getByText('Session created').waitFor()
   assert.equal(createRequests.at(-1)?.searchParams.has('projectId'), false)
+  assert.equal(createRequests.at(-1)?.searchParams.has('workContextRequestId'), false)
   assert.equal(createRequests.at(-1)?.searchParams.has('working_directory'), false)
   await narrow.getByRole('link', { name: 'Settings' }).click()
   await narrow.getByText('Available agent profiles and their descriptions').click()

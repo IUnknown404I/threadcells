@@ -1,7 +1,7 @@
 ---
 slug: concepts
 source: docs/CONCEPTS.md
-source_sha256: sha256:1e0e6123a7e1d36cffc5d9bd3a7178930c5d355386e008093fc0209c5cf951e9
+source_sha256: sha256:558a270183e49568ee5d52d6efd30c6a8215fe7d563df596ee9391313d8f3299
 ---
 # 核心概念
 
@@ -25,11 +25,11 @@ ThreadCells 为原生编码智能体终端增加结构。本页一次介绍一�
 
 ## 项目
 
-**项目**标识工作所属的 Git 仓库。它为会话、worktree 和结果提供 ThreadCells 的稳定范围；它并不取代 Git remote 或仓库权限。
+**项目**标识工作的规范 Git/源代码权限。它为会话、worktree 和结果提供 ThreadCells 的稳定范围；已注册的源代码根目录不是新 supervisor 的常规可写 cwd，也不取代 Git remote 或仓库权限。
 
 ## 管理的 worktree
 
-**管理的 worktree** 是为有界智能体上下文创建的 Git worktree。它让并行工作者可在不同分支上操作，而不编辑同一个检出。
+**管理的 worktree** 是为有界可写上下文创建的 Git worktree。每个与项目关联的新 supervisor 会话（包括第一个）都会获得一个。相同项目中的独立会话使用不同的分支和检出；对相同上下文执行 recovery takeover 时会保留其现有 worktree。
 
 worktree 会减少冲突；它们不是安全沙箱。智能体仍可能访问其操作系统账户能够访问的任何内容。
 

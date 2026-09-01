@@ -24,7 +24,7 @@ interface Store {
 
   fetchSessions: () => Promise<void>
   selectSession: (name: string | null) => Promise<void>
-  createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string, projectId?: string, ownerGrant?: OwnerLaunchGrant) => Promise<void>
+  createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string, projectId?: string, ownerGrant?: OwnerLaunchGrant, workContextRequestId?: string) => Promise<void>
   deleteSession: (name: string) => Promise<void>
   showSnackbar: (snackbar: Snackbar) => void
   hideSnackbar: () => void
@@ -70,12 +70,12 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
-  createSession: async (provider, agentProfile, sessionName, workingDirectory, projectId, ownerGrant) => {
+  createSession: async (provider, agentProfile, sessionName, workingDirectory, projectId, ownerGrant, workContextRequestId) => {
     try {
       if (ownerGrant) {
-        await api.createSession(provider, agentProfile, sessionName, workingDirectory, projectId, ownerGrant)
+        await api.createSession(provider, agentProfile, sessionName, workingDirectory, projectId, ownerGrant, workContextRequestId)
       } else if (projectId) {
-        await api.createSession(provider, agentProfile, sessionName, workingDirectory, projectId)
+        await api.createSession(provider, agentProfile, sessionName, workingDirectory, projectId, undefined, workContextRequestId)
       } else {
         await api.createSession(provider, agentProfile, sessionName, workingDirectory)
       }

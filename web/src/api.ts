@@ -49,7 +49,12 @@ const REASON_COPY = {
   TOTAL_PROVIDER_CAPACITY_EXHAUSTED: ['Capacity limit reached', 'No compatible provider slot is currently available. Wait for an active agent to finish or choose another provider.'],
   PROVIDER_EXECUTION_CAPACITY_EXHAUSTED: ['Provider turns are queued', 'All provider execution slots are active. This input will continue automatically when a slot is released.'],
   RESIDENT_SUPERVISOR_CAPACITY_EXHAUSTED: ['Resident supervisor limit reached', 'Five supervisors are already resident. Exit one before starting another project supervisor.'],
-  PROJECT_SUPERVISOR_ALREADY_RESIDENT: ['Project supervisor already resident', 'Open or reuse the existing supervisor for this project.'],
+  SESSION_PRIMARY_SUPERVISOR_EXISTS: ['Session already has a primary supervisor', 'Create a new Session for independent work, or use recovery takeover for this same work context.'],
+  PROJECT_SOURCE_NOT_GIT: ['Project source is not a Git repository', 'Managed supervisor workspaces require a canonical Git source with a valid HEAD revision.'],
+  WORK_CONTEXT_REQUEST_CONFLICT: ['Workspace request changed', 'This retry identity is already bound to another managed workspace request.'],
+  WORK_CONTEXT_AUTHORITY_CONFLICT: ['Workspace authority conflict', 'ThreadCells could not reserve a unique Session workspace. Retry with a new Session request.'],
+  WORK_CONTEXT_AUTHORITY_CHANGED: ['Workspace authority changed', 'The reserved managed workspace no longer matches its durable identity and was preserved for inspection.'],
+  WORK_CONTEXT_PROVIDER_LAUNCH_UNCERTAIN: ['Supervisor launch needs recovery', 'The writer was reserved but the provider launch outcome is uncertain. The workspace was preserved; use recovery takeover instead of starting a second writer.'],
   RECOVERY_HEALTHY_RUNTIME_ACTIVE: ['Recovery takeover blocked', 'The current supervisor runtime is still active. Retire it canonically or restore it instead of creating a second writer.'],
   RECOVERY_PROVIDER_EXECUTION_ACTIVE: ['Recovery takeover blocked', 'The current supervisor still owns an active provider execution.'],
   RECOVERY_PRIVILEGED_EFFECT_UNRESOLVED: ['Recovery takeover blocked', 'A privileged effect has an unresolved outcome. Reconcile it before replacing the supervisor.'],
@@ -106,7 +111,12 @@ const REASON_COPY_RU = {
   TOTAL_PROVIDER_CAPACITY_EXHAUSTED: ['Достигнут предел ёмкости', 'Сейчас нет свободного слота совместимого провайдера. Дождитесь завершения активного агента или выберите другого провайдера.'],
   PROVIDER_EXECUTION_CAPACITY_EXHAUSTED: ['Ходы провайдера поставлены в очередь', 'Все слоты выполнения провайдера заняты. Эта задача продолжится автоматически после освобождения слота.'],
   RESIDENT_SUPERVISOR_CAPACITY_EXHAUSTED: ['Достигнут предел резидентных супервизоров', 'Уже запущено пять резидентных супервизоров. Завершите одного из них перед запуском нового супервизора проекта.'],
-  PROJECT_SUPERVISOR_ALREADY_RESIDENT: ['Супервизор проекта уже запущен', 'Откройте или повторно используйте существующий супервизор этого проекта.'],
+  SESSION_PRIMARY_SUPERVISOR_EXISTS: ['В сессии уже есть основной супервизор', 'Создайте новую сессию для независимой работы или используйте перехват восстановления для этого рабочего контекста.'],
+  PROJECT_SOURCE_NOT_GIT: ['Источник проекта не является репозиторием Git', 'Для управляемого рабочего дерева супервизора нужен канонический источник Git с корректной ревизией HEAD.'],
+  WORK_CONTEXT_REQUEST_CONFLICT: ['Запрос рабочего пространства изменился', 'Этот идентификатор повтора уже связан с другим запросом управляемого рабочего пространства.'],
+  WORK_CONTEXT_AUTHORITY_CONFLICT: ['Конфликт полномочий рабочего пространства', 'ThreadCells не удалось зарезервировать уникальное рабочее пространство сессии. Повторите с новым запросом сессии.'],
+  WORK_CONTEXT_AUTHORITY_CHANGED: ['Полномочия рабочего пространства изменились', 'Зарезервированное рабочее пространство больше не совпадает с долговечной идентичностью и сохранено для проверки.'],
+  WORK_CONTEXT_PROVIDER_LAUNCH_UNCERTAIN: ['Запуск супервизора требует восстановления', 'Writer был зарезервирован, но результат запуска провайдера не определён. Рабочее пространство сохранено; используйте recovery takeover вместо запуска второго writer.'],
   RECOVERY_HEALTHY_RUNTIME_ACTIVE: ['Перехват восстановления заблокирован', 'Среда текущего супервизора всё ещё активна. Корректно завершите или восстановите её вместо создания второго владельца записи.'],
   RECOVERY_PROVIDER_EXECUTION_ACTIVE: ['Перехват восстановления заблокирован', 'Текущий супервизор всё ещё владеет активным выполнением провайдера.'],
   RECOVERY_PRIVILEGED_EFFECT_UNRESOLVED: ['Перехват восстановления заблокирован', 'Результат привилегированного действия не определён. Сначала согласуйте его.'],
@@ -180,7 +190,12 @@ const REASON_KEYS: Record<string, ErrorKeyPair> = {
   TOTAL_PROVIDER_CAPACITY_EXHAUSTED: ['error.capacity.title', 'error.capacity.body'],
   PROVIDER_EXECUTION_CAPACITY_EXHAUSTED: ['error.capacity.title', 'error.capacity.body'],
   RESIDENT_SUPERVISOR_CAPACITY_EXHAUSTED: ['error.capacity.title', 'error.capacity.body'],
-  PROJECT_SUPERVISOR_ALREADY_RESIDENT: ['error.conflict.title', 'error.conflict.body'],
+  SESSION_PRIMARY_SUPERVISOR_EXISTS: ['error.conflict.title', 'error.conflict.body'],
+  PROJECT_SOURCE_NOT_GIT: ['error.conflict.title', 'error.conflict.body'],
+  WORK_CONTEXT_REQUEST_CONFLICT: ['error.conflict.title', 'error.conflict.body'],
+  WORK_CONTEXT_AUTHORITY_CONFLICT: ['error.conflict.title', 'error.conflict.body'],
+  WORK_CONTEXT_AUTHORITY_CHANGED: ['error.conflict.title', 'error.conflict.body'],
+  WORK_CONTEXT_PROVIDER_LAUNCH_UNCERTAIN: ['error.conflict.title', 'error.conflict.body'],
   WORK_CONTEXT_CAPACITY_EXHAUSTED: ['error.capacity.title', 'error.capacity.body'],
   RESOURCE_HEALTH_REJECTED: ['error.serviceUnavailable.title', 'error.serviceUnavailable.body'],
   CONTEXT_INVENTORY_UNAVAILABLE: ['error.serviceUnavailable.title', 'error.serviceUnavailable.body'],
@@ -347,6 +362,9 @@ export interface AgentSummary {
   managed_worktree_kind: string | null
   managed_worktree_commit: string | null
   managed_worktree_branch: string | null
+  writable_work_context_id?: string | null
+  writer_authority_generation?: string | null
+  workspace_classification?: 'managed_isolated' | 'legacy_shared_root' | null
   projectId: string | null
   project_name: string | null
   project_path: string | null
@@ -386,9 +404,12 @@ export interface Terminal {
   delivery_status?: string | null
   context_role?: 'supervisor' | 'work' | null
   launch_worktree?: string | null
-  managed_worktree_kind?: 'task' | 'reviewer' | null
+  managed_worktree_kind?: 'supervisor' | 'task' | 'reviewer' | null
   managed_worktree_commit?: string | null
   managed_worktree_branch?: string | null
+  writable_work_context_id?: string | null
+  writer_authority_generation?: string | null
+  workspace_classification?: 'managed_isolated' | 'legacy_shared_root' | null
   last_active: string | null
 }
 
@@ -810,11 +831,11 @@ export const api = {
   getSession: (name: string) => fetchJSON<SessionDetail>(`/sessions/${encodeURIComponent(name)}`),
   getSessionWorkingDirectory: (name: string) =>
     fetchJSON<{ working_directory: string | null }>(`/sessions/${encodeURIComponent(name)}/working-directory`),
-  createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string, projectId?: string, ownerGrant?: OwnerLaunchGrant) =>
+  createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string, projectId?: string, ownerGrant?: OwnerLaunchGrant, workContextRequestId?: string) =>
     // Session startup can outlive a browser request. Keep this request owned by
     // the UI until it settles so the backend cancellation reconciliation only
     // runs for genuine caller cancellation (navigation, disconnect, etc.).
-    fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}${projectId ? `&projectId=${encodeURIComponent(projectId)}` : ''}${ownerGrant ? `&owner_grant_launch_id=${encodeURIComponent(ownerGrant.launch_id)}` : ''}`, { method: 'POST', headers: ownerGrant ? { 'X-ThreadCells-Owner-Grant': ownerGrant.grant } : undefined, timeoutMs: null }),
+    fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}${projectId ? `&projectId=${encodeURIComponent(projectId)}` : ''}${ownerGrant ? `&owner_grant_launch_id=${encodeURIComponent(ownerGrant.launch_id)}` : ''}${workContextRequestId ? `&workContextRequestId=${encodeURIComponent(workContextRequestId)}` : ''}`, { method: 'POST', headers: ownerGrant ? { 'X-ThreadCells-Owner-Grant': ownerGrant.grant } : undefined, timeoutMs: null }),
   deleteSession: (name: string) => fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${encodeURIComponent(name)}`, { method: 'DELETE' }),
 
   // Terminals

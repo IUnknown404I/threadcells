@@ -2,6 +2,7 @@
 
 import sqlite3
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -18,10 +19,14 @@ from cli_agent_orchestrator.clients.database import (
     FlowModel,
     InboxModel,
     ProviderUsageBindingModel,
+    SessionPrimarySupervisorConflict,
     TerminalModel,
     UnreconciledTerminalAuthority,
     WorktreeWriterLeaseConflict,
     WorktreeWriterLeaseModel,
+    WritableWorkContextAuditModel,
+    WritableWorkContextConflict,
+    WritableWorkContextModel,
     _migrate_terminal_worktree_authority_columns,
     bind_terminal_provider_resume_identity,
     create_flow,
@@ -37,7 +42,9 @@ from cli_agent_orchestrator.clients.database import (
     init_db,
     list_flows,
     list_terminals_by_session,
+    reserve_writable_work_context,
     terminal_auth_token_matches,
+    transition_writable_work_context,
     update_flow_enabled,
     update_flow_run_times,
     update_last_active,
@@ -71,6 +78,7 @@ class TestTerminalOperations:
         database_file = tmp_path / "legacy.db"
         with sqlite3.connect(database_file) as connection:
             connection.execute("CREATE TABLE terminals (id TEXT PRIMARY KEY)")
+            connection.execute("INSERT INTO terminals (id) VALUES ('legacy-owner')")
         monkeypatch.setattr(
             "cli_agent_orchestrator.constants.DATABASE_FILE",
             database_file,
@@ -82,12 +90,17 @@ class TestTerminalOperations:
             lease_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(worktree_writer_leases)")
             }
+            classification = connection.execute(
+                "SELECT workspace_classification FROM terminals WHERE id = 'legacy-owner'"
+            ).fetchone()[0]
         assert {
             "id",
             "creation_order",
             "launch_worktree",
             "write_enabled",
             "writer_authority_generation",
+            "writable_work_context_id",
+            "workspace_classification",
             "runtime_lifecycle",
             "runtime_exit_requested_at",
             "runtime_exited_at",
@@ -108,6 +121,7 @@ class TestTerminalOperations:
             "authority_generation",
             "created_at",
         } <= lease_columns
+        assert classification == "legacy_shared_root"
 
     def test_runtime_identity_migration_preserves_one_exact_live_codex_binding(
         self, tmp_path, monkeypatch
@@ -545,6 +559,236 @@ class TestTerminalOperations:
             launch_worktree="/srv/worktree",
             write_enabled=True,
         )
+
+    def test_independent_project_sessions_bind_distinct_work_contexts_and_leases(
+        self, test_db, monkeypatch
+    ):
+        monkeypatch.setattr(database_client, "SessionLocal", test_db)
+        monkeypatch.setattr(database_client, "_terminal_authority_schema_ready", True)
+        base = "a" * 40
+
+        for suffix in ("1", "2"):
+            terminal_id = f"context{suffix}"
+            session_id = f"session-{suffix}"
+            worktree = f"/managed/{terminal_id}"
+            branch = f"cao/session/{terminal_id}"
+            reserve_writable_work_context(
+                context_id=terminal_id,
+                request_id=f"00000000-0000-4000-8000-00000000000{suffix}",
+                project_id="project-a",
+                session_id=session_id,
+                terminal_id=terminal_id,
+                canonical_source="/source/project-a",
+                canonical_worktree=worktree,
+                branch=branch,
+                base_revision=base,
+            )
+            assert transition_writable_work_context(
+                terminal_id,
+                expected_states=("reserved",),
+                state="provisioned",
+                event_type="managed_worktree_provisioned",
+            )
+            created = create_terminal(
+                terminal_id,
+                f"cao-session-{suffix}",
+                terminal_id,
+                "codex",
+                launch_worktree=worktree,
+                write_enabled=True,
+                context_role="supervisor",
+                managed_worktree_kind="supervisor",
+                managed_worktree_source="/source/project-a",
+                managed_worktree_branch=branch,
+                managed_worktree_commit=base,
+                writable_work_context_id=terminal_id,
+                workspace_classification="managed_isolated",
+                project_id="project-a",
+                session_lifetime_id=session_id,
+            )
+            assert created["writable_work_context_id"] == terminal_id
+
+        with test_db() as db:
+            contexts = (
+                db.query(WritableWorkContextModel).order_by(WritableWorkContextModel.id).all()
+            )
+            leases = (
+                db.query(WorktreeWriterLeaseModel)
+                .order_by(WorktreeWriterLeaseModel.canonical_worktree)
+                .all()
+            )
+            assert [row.state for row in contexts] == ["launching", "launching"]
+            assert [row.project_id for row in contexts] == ["project-a", "project-a"]
+            assert [row.terminal_id for row in contexts] == ["context1", "context2"]
+            assert [row.terminal_id for row in leases] == ["context1", "context2"]
+            assert contexts[0].writer_authority_generation == leases[0].authority_generation
+            assert contexts[1].writer_authority_generation == leases[1].authority_generation
+
+        with pytest.raises(WritableWorkContextConflict):
+            create_terminal(
+                "intruder",
+                "cao-session-intruder",
+                "intruder",
+                "codex",
+                launch_worktree="/managed/context1",
+                write_enabled=True,
+                context_role="supervisor",
+                managed_worktree_kind="supervisor",
+                managed_worktree_source="/source/project-a",
+                managed_worktree_branch="cao/session/context1",
+                managed_worktree_commit=base,
+                writable_work_context_id="context1",
+                workspace_classification="managed_isolated",
+                project_id="project-a",
+                session_lifetime_id="session-intruder",
+            )
+        with test_db() as db:
+            assert db.query(WorktreeWriterLeaseModel).count() == 2
+            rejected = (
+                db.query(WritableWorkContextAuditModel)
+                .filter_by(event_type="writer_conflict_rejected")
+                .one()
+            )
+            assert rejected.work_context_id == "context1"
+            assert rejected.terminal_id == "intruder"
+            assert rejected.reason_code == "WORK_CONTEXT_AUTHORITY_CHANGED"
+
+        with pytest.raises(SessionPrimarySupervisorConflict):
+            create_terminal(
+                "context3",
+                "cao-session-1",
+                "context3",
+                "codex",
+                launch_worktree="/managed/context3",
+                write_enabled=True,
+                context_role="supervisor",
+                managed_worktree_kind="supervisor",
+                session_lifetime_id="session-1",
+            )
+
+    def test_concurrent_work_context_reservation_has_one_durable_winner(
+        self, tmp_path, monkeypatch
+    ):
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'work-context.db'}",
+            connect_args={"check_same_thread": False},
+        )
+        Base.metadata.create_all(bind=engine)
+        sessions = sessionmaker(bind=engine)
+        monkeypatch.setattr(database_client, "engine", engine)
+        monkeypatch.setattr(database_client, "SessionLocal", sessions)
+        monkeypatch.setattr(
+            database_client, "_ensure_terminal_worktree_authority_schema", lambda: None
+        )
+        request_id = "00000000-0000-4000-8000-000000000099"
+
+        def reserve(_index):
+            return reserve_writable_work_context(
+                context_id="context-a",
+                request_id=request_id,
+                project_id="project-a",
+                session_id="session-a",
+                terminal_id="terminal-a",
+                canonical_source="/source/project-a",
+                canonical_worktree="/managed/context-a",
+                branch="cao/session/context-a",
+                base_revision="a" * 40,
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(reserve, range(8)))
+
+        assert {row["id"] for row in results} == {"context-a"}
+        with sessions() as db:
+            assert db.query(WritableWorkContextModel).count() == 1
+            assert db.query(WritableWorkContextAuditModel).count() == 1
+
+    def test_repeated_recovery_admission_audits_each_successor_generation(
+        self, test_db, monkeypatch
+    ):
+        monkeypatch.setattr(database_client, "SessionLocal", test_db)
+        monkeypatch.setattr(database_client, "_terminal_authority_schema_ready", True)
+        context_id = "reusable-recovery-context"
+        reserve_writable_work_context(
+            context_id=context_id,
+            request_id="00000000-0000-4000-8000-000000000097",
+            project_id="project-a",
+            session_id="session-a",
+            terminal_id="supervisor-a",
+            canonical_source="/source/project-a",
+            canonical_worktree="/managed/supervisor-a",
+            branch="cao/session/supervisor-a",
+            base_revision="a" * 40,
+        )
+        assert transition_writable_work_context(
+            context_id,
+            expected_states=("reserved",),
+            state="launching",
+            event_type="writer_lease_granted",
+        )
+        assert transition_writable_work_context(
+            context_id,
+            expected_states=("launching",),
+            state="admitted",
+            event_type="recovery_supervisor_admitted",
+        )
+        with test_db() as db:
+            context = db.get(WritableWorkContextModel, context_id)
+            context.state = "launching"
+            context.terminal_id = "supervisor-a2"
+            db.commit()
+        assert transition_writable_work_context(
+            context_id,
+            expected_states=("launching",),
+            state="admitted",
+            event_type="recovery_supervisor_admitted",
+        )
+        with test_db() as db:
+            recovery_events = (
+                db.query(WritableWorkContextAuditModel)
+                .filter_by(event_type="recovery_supervisor_admitted")
+                .order_by(WritableWorkContextAuditModel.id)
+                .all()
+            )
+            assert [event.terminal_id for event in recovery_events] == [
+                "supervisor-a",
+                "supervisor-a2",
+            ]
+
+    def test_work_context_transition_rejects_stale_terminal_generation(self, test_db, monkeypatch):
+        monkeypatch.setattr(database_client, "SessionLocal", test_db)
+        monkeypatch.setattr(database_client, "_terminal_authority_schema_ready", True)
+        reserve_writable_work_context(
+            context_id="fenced-context",
+            request_id="00000000-0000-4000-8000-000000000096",
+            project_id="project-a",
+            session_id="session-a",
+            terminal_id="supervisor-a",
+            canonical_source="/source/project-a",
+            canonical_worktree="/managed/supervisor-a",
+            branch="cao/session/supervisor-a",
+            base_revision="a" * 40,
+        )
+        with test_db() as db:
+            context = db.get(WritableWorkContextModel, "fenced-context")
+            context.state = "preserved"
+            context.terminal_id = "supervisor-a2"
+            context.writer_authority_generation = "generation-a2"
+            db.commit()
+
+        assert not transition_writable_work_context(
+            "fenced-context",
+            expected_states=("launching", "preserved"),
+            state="admitted",
+            event_type="recovery_supervisor_admitted",
+            expected_terminal_id="supervisor-a",
+            expected_writer_authority_generation="generation-a",
+        )
+        with test_db() as db:
+            context = db.get(WritableWorkContextModel, "fenced-context")
+            assert context.state == "preserved"
+            assert context.terminal_id == "supervisor-a2"
+            assert context.writer_authority_generation == "generation-a2"
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_metadata_found(self, mock_session_class):

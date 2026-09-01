@@ -135,7 +135,28 @@ describe('session creation and canonical ordering', () => {
     fireEvent.click(screen.getByText('Select a profile...'))
     fireEvent.click(screen.getAllByText('developer')[0])
     fireEvent.click(screen.getAllByText('Create Session').slice(-1)[0])
-    await waitFor(() => expect(create).toHaveBeenCalledWith('kiro_cli', 'developer', undefined, undefined, 'project-b'))
+    await waitFor(() => expect(create).toHaveBeenCalledWith('kiro_cli', 'developer', undefined, undefined, 'project-b', undefined, expect.any(String)))
+  })
+
+  it('reuses one work-context request identity after an uncertain Project launch response', async () => {
+    const create = vi.spyOn(api, 'createSession')
+      .mockRejectedValueOnce(new Error('response lost'))
+      .mockResolvedValueOnce({} as never)
+    vi.spyOn(api, 'listProjects').mockResolvedValue([
+      { projectId: 'project-a', name: 'Project A', path: '/work/project-a', description: null, isDefault: true },
+    ])
+    render(<AgentPanel />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Create Session & Spawn Agent' }))
+    await waitFor(() => expect(screen.queryByText('Loading profiles...')).not.toBeInTheDocument())
+    fireEvent.click(screen.getByText('Select a profile...'))
+    fireEvent.click(screen.getAllByText('developer')[0])
+    fireEvent.click(screen.getAllByText('Create Session').slice(-1)[0])
+    expect(await screen.findByRole('alert')).toHaveTextContent('response lost')
+
+    fireEvent.click(screen.getAllByText('Create Session').slice(-1)[0])
+    await waitFor(() => expect(create).toHaveBeenCalledTimes(2))
+    expect(create.mock.calls[0][6]).toMatch(/[0-9a-f-]{36}/)
+    expect(create.mock.calls[1][6]).toBe(create.mock.calls[0][6])
   })
 
   it('omits a blank session name and shows duplicate-name errors in the modal', async () => {
@@ -223,6 +244,7 @@ describe('session creation and canonical ordering', () => {
       undefined,
       '',
       grant,
+      undefined,
     )
   })
 

@@ -84,6 +84,7 @@ from cli_agent_orchestrator.services import (
     branding_service,
     flow_service,
     inbox_service,
+    managed_worktree_service,
     project_service,
     recovery_takeover_service,
     result_service,
@@ -352,6 +353,14 @@ async def _workflow_reconciliation_tick(
 ) -> bool:
     """Run one isolated recovery tick and return whether startup replay remains due."""
     performed_full_recovery = False
+    try:
+        workspaces = await _run_workflow_io(
+            managed_worktree_service.reconcile_writable_work_context_provisioning
+        )
+        if workspaces:
+            logger.info("Reconciled %s managed supervisor workspaces", workspaces)
+    except Exception as exc:
+        logger.warning("Managed workspace reconciliation failed: %s", exc)
     try:
         recovered = await _run_workflow_io(
             recovery_takeover_service.reconcile_recovery_takeovers,
@@ -1551,7 +1560,12 @@ def _admission_http_exception(exc: AdmissionDenied) -> HTTPException:
         "TOTAL_PROVIDER_CAPACITY_EXHAUSTED": status.HTTP_429_TOO_MANY_REQUESTS,
         "PROVIDER_EXECUTION_CAPACITY_EXHAUSTED": status.HTTP_429_TOO_MANY_REQUESTS,
         "RESIDENT_SUPERVISOR_CAPACITY_EXHAUSTED": status.HTTP_429_TOO_MANY_REQUESTS,
-        "PROJECT_SUPERVISOR_ALREADY_RESIDENT": status.HTTP_409_CONFLICT,
+        "SESSION_PRIMARY_SUPERVISOR_EXISTS": status.HTTP_409_CONFLICT,
+        "PROJECT_SOURCE_NOT_GIT": status.HTTP_409_CONFLICT,
+        "WORK_CONTEXT_REQUEST_CONFLICT": status.HTTP_409_CONFLICT,
+        "WORK_CONTEXT_AUTHORITY_CONFLICT": status.HTTP_409_CONFLICT,
+        "WORK_CONTEXT_AUTHORITY_CHANGED": status.HTTP_409_CONFLICT,
+        "WORK_CONTEXT_PROVIDER_LAUNCH_UNCERTAIN": status.HTTP_409_CONFLICT,
         "WORK_CONTEXT_CAPACITY_EXHAUSTED": status.HTTP_429_TOO_MANY_REQUESTS,
         "RESOURCE_HEALTH_REJECTED": status.HTTP_503_SERVICE_UNAVAILABLE,
         "OWNER_GRANT_REQUIRED": status.HTTP_403_FORBIDDEN,
@@ -1746,6 +1760,7 @@ async def create_session(
     session_name: Optional[str] = None,
     working_directory: Optional[str] = None,
     project_id: Optional[str] = Query(default=None, alias="projectId"),
+    work_context_request_id: Optional[str] = Query(default=None, alias="workContextRequestId"),
     allowed_tools: Optional[str] = None,
     owner_grant_launch_id: Optional[str] = None,
     owner_grant: Annotated[Optional[str], Header(alias="X-ThreadCells-Owner-Grant")] = None,
@@ -1762,21 +1777,19 @@ async def create_session(
 
         launch_directory, project_context = _resolve_launch_project(project_id, working_directory)
         registry = get_plugin_registry(request)
-        create_session_kwargs = {
-            "provider": provider,
-            "agent_profile": agent_profile,
-            "session_name": session_name,
-            "working_directory": launch_directory,
-            "allowed_tools": allowed_tools_list,
-            "registry": registry,
-            "project_context": project_context,
-            "owner_grant_token": owner_grant,
-            "owner_grant_launch_id": owner_grant_launch_id,
-        }
         creation_task = asyncio.create_task(
             asyncio.to_thread(
                 session_service.create_session,
-                **create_session_kwargs,
+                provider=provider,
+                agent_profile=agent_profile,
+                session_name=session_name,
+                working_directory=launch_directory,
+                allowed_tools=allowed_tools_list,
+                registry=registry,
+                project_context=project_context,
+                owner_grant_token=owner_grant,
+                owner_grant_launch_id=owner_grant_launch_id,
+                work_context_request_id=work_context_request_id,
             )
         )
         return await asyncio.shield(creation_task)

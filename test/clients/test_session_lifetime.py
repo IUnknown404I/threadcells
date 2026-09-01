@@ -13,6 +13,8 @@ from cli_agent_orchestrator.clients.database import (
     TerminalDeletionReceiptModel,
     TerminalModel,
     WorktreeWriterLeaseModel,
+    WritableWorkContextAuditModel,
+    WritableWorkContextModel,
 )
 
 
@@ -275,6 +277,54 @@ def test_exact_exited_terminal_delete_reconciles_stale_leases_and_is_idempotent(
         assert db.get(TerminalDeletionReceiptModel, "exited") is not None
         assert db.query(WorktreeWriterLeaseModel).count() == 0
         assert db.query(ProviderExecutionLeaseModel).count() == 0
+
+
+def test_exact_exited_terminal_delete_retires_managed_work_context_atomically(monkeypatch):
+    _install_database(monkeypatch)
+    terminal = _terminal("exited", "lifetime", "cao-session", "/work/exited")
+    terminal.writable_work_context_id = "context-a"
+    terminal.writer_authority_generation = "generation-a"
+    terminal.managed_worktree_kind = "supervisor"
+    with database.SessionLocal() as db:
+        db.add_all(
+            [
+                terminal,
+                WritableWorkContextModel(
+                    id="context-a",
+                    request_id="00000000-0000-4000-8000-000000000095",
+                    project_id="project-a",
+                    session_id="lifetime",
+                    terminal_id="exited",
+                    canonical_source="/source/project-a",
+                    canonical_worktree="/work/exited",
+                    branch="cao/session/exited",
+                    base_revision="a" * 40,
+                    state="admitted",
+                    writer_authority_generation="generation-a",
+                ),
+                WorktreeWriterLeaseModel(
+                    canonical_worktree="/work/exited",
+                    terminal_id="exited",
+                    authority_generation="generation-a",
+                ),
+            ]
+        )
+        db.commit()
+        expected = {
+            field: getattr(terminal, field) for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
+        }
+
+    assert database.delete_exited_terminal("exited", expected_identity=expected)["deleted"] == 1
+
+    with database.SessionLocal() as db:
+        assert db.get(TerminalModel, "exited") is None
+        context = db.get(WritableWorkContextModel, "context-a")
+        assert context.state == "retired"
+        assert context.failure_reason is None
+        audit = db.query(WritableWorkContextAuditModel).one()
+        assert audit.event_type == "managed_worktree_retired"
+        assert audit.terminal_id == "exited"
+        assert db.query(WorktreeWriterLeaseModel).count() == 0
 
 
 def test_exact_exited_terminal_delete_rejects_changed_identity(monkeypatch):

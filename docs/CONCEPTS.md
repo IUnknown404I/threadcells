@@ -20,11 +20,11 @@ A **session** is ThreadCells's durable lifetime for one related group of agent r
 
 ## Project
 
-A **project** identifies the Git repository in which work belongs. It gives ThreadCells a stable scope for sessions, worktrees, and results; it is not a replacement for Git remotes or repository permissions.
+A **project** identifies canonical Git/source authority for work. It gives ThreadCells a stable scope for sessions, worktrees, and results; the registered source root is not the normal writable cwd of a new supervisor and is not a replacement for Git remotes or repository permissions.
 
 ## Managed worktree
 
-A **managed worktree** is a Git worktree created for a bounded agent context. It lets parallel workers operate on different branches without editing the same checkout.
+A **managed worktree** is a Git worktree created for a bounded writable context. Every new Project-backed supervisor Session, including the first, receives one. Independent Sessions in the same Project use different branches and checkouts; recovery takeover for the same context preserves its existing worktree.
 
 Worktrees reduce collisions; they are not security sandboxes. An agent may still reach anything its operating-system account can reach.
 

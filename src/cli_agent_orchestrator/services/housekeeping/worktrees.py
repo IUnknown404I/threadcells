@@ -23,6 +23,7 @@ class WorktreeAuthority:
     managed_source_paths: frozenset[Path]
     workflow_paths: frozenset[Path]
     writer_lease_paths: frozenset[Path]
+    work_context_paths: frozenset[Path]
     project_paths: frozenset[Path]
     repository_seeds: frozenset[Path]
     certain: bool
@@ -36,6 +37,7 @@ class WorktreeAuthority:
             (self.managed_source_paths, "ACTIVE_MANAGED_WORKTREE_SOURCE"),
             (self.workflow_paths, "ACTIVE_OR_RECOVERY_WORKFLOW"),
             (self.writer_lease_paths, "WRITER_LEASE_WORKTREE"),
+            (self.work_context_paths, "DURABLE_WORK_CONTEXT"),
             (self.project_paths, "PROJECT_SOURCE_AUTHORITY"),
         )
         for paths, reason in inventories:
@@ -89,11 +91,13 @@ def authority_inventory() -> WorktreeAuthority:
             list_all_terminals,
             list_projects,
             list_worktree_writer_leases,
+            list_writable_work_contexts,
         )
 
         terminals = list_all_terminals()
         leases = list_worktree_writer_leases()
         projects = list_projects()
+        work_contexts = list_writable_work_contexts()
         workflow_terminal_ids = set(get_protected_workflow_root_terminal_ids())
     except Exception:
         return WorktreeAuthority(
@@ -101,6 +105,7 @@ def authority_inventory() -> WorktreeAuthority:
             managed_source_paths=frozenset(),
             workflow_paths=frozenset(),
             writer_lease_paths=frozenset(),
+            work_context_paths=frozenset(),
             project_paths=frozenset(),
             repository_seeds=frozenset(),
             certain=False,
@@ -165,6 +170,19 @@ def authority_inventory() -> WorktreeAuthority:
             project_paths.add(path)
             seeds.add(path)
 
+    work_context_paths: set[Path] = set()
+    for context in work_contexts:
+        if context.get("state") in {"abandoned", "retired"}:
+            continue
+        path = _canonical_absolute(context.get("canonical_worktree"))
+        source = _canonical_absolute(context.get("canonical_source"))
+        if path is None or source is None:
+            certain = False
+            continue
+        work_context_paths.add(path)
+        managed_sources.add(source)
+        seeds.update((path, source))
+
     warnings: list[str] = []
     if orphan_workflows:
         # A protected workflow whose root terminal/path cannot be resolved is
@@ -181,6 +199,7 @@ def authority_inventory() -> WorktreeAuthority:
         managed_source_paths=frozenset(managed_sources),
         workflow_paths=frozenset(workflows),
         writer_lease_paths=frozenset(lease_paths),
+        work_context_paths=frozenset(work_context_paths),
         project_paths=frozenset(project_paths),
         repository_seeds=frozenset(seeds),
         certain=certain,

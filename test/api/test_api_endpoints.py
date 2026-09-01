@@ -1130,6 +1130,7 @@ class TestCreateSession:
             project_context=None,
             owner_grant_token=None,
             owner_grant_launch_id=None,
+            work_context_request_id=None,
         )
 
     def test_create_session_passes_owner_grant_header_without_logging_it(self, client):

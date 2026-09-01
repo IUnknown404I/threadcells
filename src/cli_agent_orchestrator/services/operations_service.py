@@ -590,19 +590,6 @@ def context_launch_admission(
             residents = status["resident_supervisors"]
             if not residents.get("certain", True):
                 raise AdmissionDenied("CONTEXT_INVENTORY_UNAVAILABLE", status)
-            if project_id:
-                contexts = _active_contexts()
-                if contexts is None:
-                    raise AdmissionDenied("CONTEXT_INVENTORY_UNAVAILABLE", status)
-                if any(
-                    context.get("context_role") == "supervisor"
-                    and context.get("project_id") == project_id
-                    for context in contexts
-                ):
-                    raise AdmissionDenied(
-                        "PROJECT_SUPERVISOR_ALREADY_RESIDENT",
-                        {**status, "project_id": project_id},
-                    )
             if residents["available"] < 1:
                 raise AdmissionDenied("RESIDENT_SUPERVISOR_CAPACITY_EXHAUSTED", status)
         yield status

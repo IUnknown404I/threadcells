@@ -438,6 +438,8 @@ def test_restart_after_admission_observes_existing_provider_without_second_launc
         "runtime_process_start_ticks": 8765,
         "runtime_process_group_id": 4321,
         "runtime_process_session_id": 4321,
+        "writable_work_context_id": "context-a",
+        "writer_authority_generation": "writer-generation-a2",
     }
     target = SimpleNamespace(
         terminal_id="b22ce001",
@@ -460,7 +462,7 @@ def test_restart_after_admission_observes_existing_provider_without_second_launc
     monkeypatch.setattr(service.tmux_client, "exact_runtime_target", lambda *_args: target)
     monkeypatch.setattr(service.provider_manager, "get_provider", lambda _id: provider)
     monkeypatch.setattr(service, "mark_terminal_runtime_running", lambda _id: True)
-    completed = []
+    events = []
 
     @contextmanager
     def fenced(**_kwargs):
@@ -469,13 +471,73 @@ def test_restart_after_admission_observes_existing_provider_without_second_launc
     monkeypatch.setattr(service, "context_lifecycle_fence", fenced)
 
     def complete(takeover_id):
-        completed.append(takeover_id)
+        events.append(("takeover_completed", takeover_id))
         current["state"] = "completed"
         return True
 
+    def admit_context(context_id, **kwargs):
+        events.append(("context_admitted", context_id, kwargs))
+        return True
+
+    monkeypatch.setattr(service, "transition_writable_work_context", admit_context)
     monkeypatch.setattr(service, "mark_recovery_takeover_completed", complete)
     assert service.reconcile_recovery_takeover("takeover-1")["state"] == "completed"
-    assert completed == ["takeover-1"]
+    assert events == [
+        (
+            "context_admitted",
+            "context-a",
+            {
+                "expected_states": ("launching", "preserved"),
+                "state": "admitted",
+                "event_type": "recovery_supervisor_admitted",
+                "expected_terminal_id": "b22ce001",
+                "expected_writer_authority_generation": "writer-generation-a2",
+            },
+        ),
+        ("takeover_completed", "takeover-1"),
+    ]
+
+
+def test_running_recovery_readmits_context_preserved_by_earlier_daemon_tick(monkeypatch):
+    takeover = {
+        "id": "takeover-1",
+        "new_terminal_id": "b22ce001",
+        "new_session_name": "cao-recovery",
+        "new_window_name": "recovery-window",
+    }
+    terminal = {
+        "id": "b22ce001",
+        "runtime_lifecycle": "running",
+        "writable_work_context_id": "context-a",
+        "writer_authority_generation": "writer-generation-a2",
+    }
+    events = []
+    monkeypatch.setattr(service, "get_terminal_metadata", lambda _id: terminal)
+
+    def admit_context(context_id, **kwargs):
+        events.append(("context_admitted", context_id, kwargs))
+        return True
+
+    monkeypatch.setattr(service, "transition_writable_work_context", admit_context)
+    monkeypatch.setattr(
+        service,
+        "mark_recovery_takeover_completed",
+        lambda takeover_id: events.append(("takeover_completed", takeover_id)) or True,
+    )
+
+    assert service._recover_dispatching_takeover(takeover) is False
+    assert events[0] == (
+        "context_admitted",
+        "context-a",
+        {
+            "expected_states": ("launching", "preserved"),
+            "state": "admitted",
+            "event_type": "recovery_supervisor_admitted",
+            "expected_terminal_id": "b22ce001",
+            "expected_writer_authority_generation": "writer-generation-a2",
+        },
+    )
+    assert events[1] == ("takeover_completed", "takeover-1")
 
 
 def test_concurrent_admitted_reconcilers_initialize_provider_once(monkeypatch):

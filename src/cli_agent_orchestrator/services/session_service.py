@@ -128,23 +128,22 @@ def create_session(
     project_context: dict[str, str] | None = None,
     owner_grant_token: str | None = None,
     owner_grant_launch_id: str | None = None,
+    work_context_request_id: str | None = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal."""
 
-    create_terminal_kwargs = {
-        "provider": provider,
-        "agent_profile": agent_profile,
-        "session_name": session_name,
-        "new_session": True,
-        "working_directory": working_directory,
-        "allowed_tools": allowed_tools,
-        "registry": registry,
-        "project_context": project_context,
-        "owner_grant_token": owner_grant_token,
-        "owner_grant_launch_id": owner_grant_launch_id,
-    }
     terminal = create_terminal(
-        **create_terminal_kwargs,
+        provider=provider,
+        agent_profile=agent_profile,
+        session_name=session_name,
+        new_session=True,
+        working_directory=working_directory,
+        allowed_tools=allowed_tools,
+        registry=registry,
+        project_context=project_context,
+        owner_grant_token=owner_grant_token,
+        owner_grant_launch_id=owner_grant_launch_id,
+        work_context_request_id=work_context_request_id,
     )
     dispatch_plugin_event(
         registry,
@@ -295,6 +294,18 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                     continue
                 try:
                     cleanup_managed_worktree(terminal)
+                    work_context_id = terminal.get("writable_work_context_id")
+                    if work_context_id:
+                        from cli_agent_orchestrator.clients.database import (
+                            transition_writable_work_context,
+                        )
+
+                        transition_writable_work_context(
+                            str(work_context_id),
+                            expected_states=("admitted", "preserved"),
+                            state="retired",
+                            event_type="managed_worktree_retired",
+                        )
                 except ManagedWorktreeCleanupError as exc:
                     cleanup_eligible.discard(terminal_id)
                     retained_resources.append(

@@ -50,6 +50,29 @@ const REASON_COPY = {
   PROVIDER_EXECUTION_CAPACITY_EXHAUSTED: ['Provider turns are queued', 'All provider execution slots are active. This input will continue automatically when a slot is released.'],
   RESIDENT_SUPERVISOR_CAPACITY_EXHAUSTED: ['Resident supervisor limit reached', 'Five supervisors are already resident. Exit one before starting another project supervisor.'],
   PROJECT_SUPERVISOR_ALREADY_RESIDENT: ['Project supervisor already resident', 'Open or reuse the existing supervisor for this project.'],
+  RECOVERY_HEALTHY_RUNTIME_ACTIVE: ['Recovery takeover blocked', 'The current supervisor runtime is still active. Retire it canonically or restore it instead of creating a second writer.'],
+  RECOVERY_PROVIDER_EXECUTION_ACTIVE: ['Recovery takeover blocked', 'The current supervisor still owns an active provider execution.'],
+  RECOVERY_PRIVILEGED_EFFECT_UNRESOLVED: ['Recovery takeover blocked', 'A privileged effect has an unresolved outcome. Reconcile it before replacing the supervisor.'],
+  RECOVERY_GENUINE_OWNER_GATE: ['Owner decision still required', 'Recovery takeover cannot bypass a genuine semantic owner decision.'],
+  RECOVERY_AUTHORITY_GENERATION_STALE: ['Recovery preview is stale', 'Writer authority changed after inspection. Inspect the supervisor again.'],
+  RECOVERY_RUNTIME_GENERATION_STALE: ['Recovery preview is stale', 'Provider runtime generation changed after inspection. Inspect the supervisor again.'],
+  RECOVERY_RUNTIME_AUTHORITY_AMBIGUOUS: ['Runtime authority is uncertain', 'ThreadCells could not prove that the exact old runtime can no longer write.'],
+  RECOVERY_RUNTIME_INVENTORY_UNAVAILABLE: ['Runtime inventory unavailable', 'ThreadCells could not inspect the exact old runtime and left writer authority unchanged.'],
+  RECOVERY_RUNTIME_PROCESS_TREE_ACTIVE: ['Old process tree is still active', 'ThreadCells found a live process from the old supervisor runtime and left writer authority unchanged.'],
+  RECOVERY_RUNTIME_RETIREMENT_FAILED: ['Old runtime could not be fenced', 'ThreadCells could not retire the exact idle pane, so writer authority was not transferred.'],
+  RECOVERY_RUNTIME_OPERATION_ACTIVE: ['Recovery takeover blocked', 'A lifecycle operation is already active for this supervisor.'],
+  RECOVERY_CHILD_WORK_ACTIVE: ['Recovery takeover blocked', 'Child work is still active under this supervisor and must be reconciled first.'],
+  RECOVERY_TARGET_IDENTITY_MISMATCH: ['Recovery target rejected', 'The selected terminal is not the exact project supervisor work context.'],
+  RECOVERY_TARGET_NOT_TAKEOVER_ELIGIBLE: ['Recovery target rejected', 'This supervisor lifecycle is not eligible for recovery takeover.'],
+  RECOVERY_REQUEST_ID_REUSED: ['Recovery request rejected', 'This request identity was already bound to different recovery authority.'],
+  RECOVERY_WRITER_AUTHORITY_AMBIGUOUS: ['Writer authority is uncertain', 'ThreadCells could not prove one exact writer lease for this work context.'],
+  RECOVERY_TAKEOVER_ALREADY_CLAIMED: ['Recovery already claimed', 'Another owner-authorized takeover already owns this supervisor.'],
+  RECOVERY_WORKTREE_STATUS_UNAVAILABLE: ['Worktree status unavailable', 'ThreadCells could not safely inspect the existing Git worktree.'],
+  RECOVERY_WORKTREE_AUTHORITY_AMBIGUOUS: ['Worktree authority is uncertain', 'The existing managed worktree identity could not be proven.'],
+  RECOVERY_PROFILE_AUTHORITY_MISMATCH: ['Recovery profile rejected', 'The selected provider/profile does not match the trusted XHigh launch authority.'],
+  RECOVERY_PROVIDER_DISPATCH_UNCERTAIN: ['Recovery launch needs attention', 'The provider launch crossed an uncertain boundary and will not be dispatched again blindly.'],
+  RECOVERY_TAKEOVER_WRITER_FENCE_LOST: ['Recovery fencing failed', 'The reserved successor writer epoch no longer matches durable authority. No second provider was launched.'],
+  RECOVERY_PROVIDER_START_FAILED: ['Recovery provider did not start', 'ThreadCells exhausted the bounded safe startup retries without creating a duplicate supervisor.'],
   WORK_CONTEXT_CAPACITY_EXHAUSTED: ['Capacity limit reached', 'No compatible work slot is currently available. Wait for an active work agent to finish and try again.'],
   RESOURCE_HEALTH_REJECTED: ['ThreadCells resources are unavailable', 'ThreadCells temporarily rejected new work because host resources are not healthy. Wait for the resource state to recover.'],
   CONTEXT_INVENTORY_UNAVAILABLE: ['Capacity status is unavailable', 'ThreadCells cannot safely confirm available execution capacity yet. Wait for runtime inventory to recover and try again.'],
@@ -84,6 +107,29 @@ const REASON_COPY_RU = {
   PROVIDER_EXECUTION_CAPACITY_EXHAUSTED: ['Ходы провайдера поставлены в очередь', 'Все слоты выполнения провайдера заняты. Эта задача продолжится автоматически после освобождения слота.'],
   RESIDENT_SUPERVISOR_CAPACITY_EXHAUSTED: ['Достигнут предел резидентных супервизоров', 'Уже запущено пять резидентных супервизоров. Завершите одного из них перед запуском нового супервизора проекта.'],
   PROJECT_SUPERVISOR_ALREADY_RESIDENT: ['Супервизор проекта уже запущен', 'Откройте или повторно используйте существующий супервизор этого проекта.'],
+  RECOVERY_HEALTHY_RUNTIME_ACTIVE: ['Перехват восстановления заблокирован', 'Среда текущего супервизора всё ещё активна. Корректно завершите или восстановите её вместо создания второго владельца записи.'],
+  RECOVERY_PROVIDER_EXECUTION_ACTIVE: ['Перехват восстановления заблокирован', 'Текущий супервизор всё ещё владеет активным выполнением провайдера.'],
+  RECOVERY_PRIVILEGED_EFFECT_UNRESOLVED: ['Перехват восстановления заблокирован', 'Результат привилегированного действия не определён. Сначала согласуйте его.'],
+  RECOVERY_GENUINE_OWNER_GATE: ['По-прежнему требуется решение владельца', 'Перехват восстановления не обходит настоящее семантическое решение владельца.'],
+  RECOVERY_AUTHORITY_GENERATION_STALE: ['Предпросмотр восстановления устарел', 'Полномочия записи изменились после проверки. Проверьте супервизора ещё раз.'],
+  RECOVERY_RUNTIME_GENERATION_STALE: ['Предпросмотр восстановления устарел', 'Поколение среды провайдера изменилось после проверки. Проверьте супервизора ещё раз.'],
+  RECOVERY_RUNTIME_AUTHORITY_AMBIGUOUS: ['Полномочия среды неясны', 'ThreadCells не удалось доказать, что точная старая среда больше не может записывать.'],
+  RECOVERY_RUNTIME_INVENTORY_UNAVAILABLE: ['Инвентаризация среды недоступна', 'ThreadCells не удалось проверить точную старую среду; полномочия записи не изменены.'],
+  RECOVERY_RUNTIME_PROCESS_TREE_ACTIVE: ['Старое дерево процессов всё ещё активно', 'ThreadCells обнаружил живой процесс старой среды супервизора; полномочия записи не изменены.'],
+  RECOVERY_RUNTIME_RETIREMENT_FAILED: ['Не удалось оградить старую среду', 'ThreadCells не смог завершить точную простаивающую панель, поэтому полномочия записи не переданы.'],
+  RECOVERY_RUNTIME_OPERATION_ACTIVE: ['Перехват восстановления заблокирован', 'Для этого супервизора уже выполняется операция жизненного цикла.'],
+  RECOVERY_CHILD_WORK_ACTIVE: ['Перехват восстановления заблокирован', 'Под этим супервизором всё ещё выполняется дочерняя работа; сначала согласуйте её.'],
+  RECOVERY_TARGET_IDENTITY_MISMATCH: ['Цель восстановления отклонена', 'Выбранный терминал не является точным рабочим контекстом супервизора проекта.'],
+  RECOVERY_TARGET_NOT_TAKEOVER_ELIGIBLE: ['Цель восстановления отклонена', 'Состояние жизненного цикла этого супервизора не допускает перехват восстановления.'],
+  RECOVERY_REQUEST_ID_REUSED: ['Запрос восстановления отклонён', 'Этот идентификатор запроса уже связан с другими полномочиями восстановления.'],
+  RECOVERY_WRITER_AUTHORITY_AMBIGUOUS: ['Полномочия записи неясны', 'ThreadCells не удалось подтвердить единственную точную аренду записи для этого рабочего контекста.'],
+  RECOVERY_TAKEOVER_ALREADY_CLAIMED: ['Восстановление уже заявлено', 'Другой авторизованный владельцем перехват уже владеет этим супервизором.'],
+  RECOVERY_WORKTREE_STATUS_UNAVAILABLE: ['Статус рабочего дерева недоступен', 'ThreadCells не удалось безопасно проверить существующее рабочее дерево Git.'],
+  RECOVERY_WORKTREE_AUTHORITY_AMBIGUOUS: ['Полномочия рабочего дерева неясны', 'Не удалось подтвердить идентичность существующего управляемого рабочего дерева.'],
+  RECOVERY_PROFILE_AUTHORITY_MISMATCH: ['Профиль восстановления отклонён', 'Выбранные провайдер и профиль не соответствуют доверенным полномочиям запуска XHigh.'],
+  RECOVERY_PROVIDER_DISPATCH_UNCERTAIN: ['Запуск восстановления требует внимания', 'Запуск провайдера пересёк неопределённую границу и не будет слепо отправлен повторно.'],
+  RECOVERY_TAKEOVER_WRITER_FENCE_LOST: ['Ограждение восстановления не выполнено', 'Зарезервированное поколение нового владельца записи больше не совпадает с долговременными полномочиями. Второй провайдер не запущен.'],
+  RECOVERY_PROVIDER_START_FAILED: ['Провайдер восстановления не запустился', 'ThreadCells исчерпал ограниченные безопасные попытки запуска, не создавая дубликат супервизора.'],
   WORK_CONTEXT_CAPACITY_EXHAUSTED: ['Достигнут предел ёмкости', 'Сейчас нет свободного совместимого рабочего слота. Дождитесь завершения активной работы и повторите попытку.'],
   RESOURCE_HEALTH_REJECTED: ['Ресурсы ThreadCells недоступны', 'ThreadCells временно отклонил новую работу из-за состояния ресурсов хоста. Дождитесь восстановления ресурсов.'],
   CONTEXT_INVENTORY_UNAVAILABLE: ['Сведения о ёмкости недоступны', 'ThreadCells пока не может безопасно подтвердить доступную ёмкость выполнения. Дождитесь восстановления инвентаризации среды и повторите попытку.'],
@@ -276,7 +322,7 @@ export interface SessionBoundaryAgent {
   workflow_reason: string | null
 }
 
-export type TerminalLifecycle = 'starting' | 'running' | 'exit_pending' | 'exited'
+export type TerminalLifecycle = 'starting' | 'running' | 'exit_pending' | 'exited' | 'recovery_fenced'
 
 export interface AgentSummary {
   id: string
@@ -590,6 +636,36 @@ export interface OwnerLaunchGrant {
   expires_in_seconds: number
 }
 
+export interface RecoveryTakeoverPreview {
+  eligible: boolean
+  reason_code: string | null
+  runtime_absent: boolean | null
+  consequence: 'OLD_SUPERVISOR_PERMANENTLY_LOSES_WRITER_AUTHORITY'
+  terminal: null | {
+    id: string
+    session_id: string
+    tmux_session: string
+    tmux_window: string
+    project_id: string
+    project_name: string | null
+    project_path: string | null
+    launch_worktree: string
+    runtime_lifecycle: TerminalLifecycle
+    runtime_generation: string
+    writer_authority_generation: string
+  }
+  worktree: null | { state: 'clean' | 'dirty' | 'unknown'; dirty: boolean | null; reason_code: string | null }
+}
+
+export interface RecoveryTakeover {
+  id: string
+  request_id: string
+  old_terminal_id: string
+  new_terminal_id: string
+  state: 'claimed' | 'fenced' | 'dispatching' | 'admitted' | 'completed' | 'dispatch_uncertain' | 'failed'
+  failure_reason: string | null
+}
+
 export interface OperatorSessionStatus {
   configured: boolean
   configuration_state?: 'missing' | 'invalid' | 'ready'
@@ -643,7 +719,7 @@ export const api = {
   getOperatorSession: () => fetchJSON<OperatorSessionStatus>('/operator/session'),
   createOperatorSession: (secret: string) => fetchJSON<{ authenticated: boolean }>('/operator/session', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ secret }) }),
   deleteOperatorSession: () => fetchJSON<{ revoked: boolean }>('/operator/session', { method: 'DELETE' }),
-  createXHighGrant: (data: { agent_profile: string; provider: string; working_directory?: string; requested_session_name?: string; project_id?: string; launch_mode: 'new_session' | 'existing_session'; confirmed: true }) =>
+  createXHighGrant: (data: { agent_profile: string; provider: string; working_directory?: string; requested_session_name?: string; project_id?: string; launch_mode: 'new_session' | 'existing_session' | 'recovery_takeover'; target_terminal_id?: string; expected_authority_generation?: string; expected_runtime_generation?: string; confirmed: true }) =>
     fetchJSON<OwnerLaunchGrant>('/operator/xhigh-grants', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }),
   getTelegramSettings: () => fetchJSON<TelegramSettings>('/api/v1/telegram'),
   updateTelegramSettings: (data: { enabled: boolean; chat_id: string | null; message_thread_id: number | null; bot_token: string | null; clear_bot_token?: boolean }) =>
@@ -774,6 +850,10 @@ export const api = {
   deleteTerminal: (id: string) => fetchJSON<{ success: boolean }>(`/terminals/${id}`, { method: 'DELETE' }),
   getWorkingDirectory: (id: string) =>
     fetchJSON<{ working_directory: string | null }>(`/terminals/${id}/working-directory`),
+  getRecoveryTakeoverPreview: (id: string) =>
+    fetchJSON<RecoveryTakeoverPreview>(`/terminals/${id}/recovery-takeover/preview`),
+  createRecoveryTakeover: (id: string, data: { request_id: string; expected_authority_generation: string; expected_runtime_generation: string; agent_profile: string; provider: string; owner_grant_launch_id: string }, ownerGrant: OwnerLaunchGrant) =>
+    fetchJSON<RecoveryTakeover>(`/terminals/${id}/recovery-takeover`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-ThreadCells-Owner-Grant': ownerGrant.grant }, body: JSON.stringify(data), timeoutMs: null }),
   addTerminalToSession: (sessionName: string, provider: string, agentProfile: string, workingDirectory?: string, projectId?: string, ownerGrant?: OwnerLaunchGrant) =>
     fetchJSON<Terminal>(`/sessions/${encodeURIComponent(sessionName)}/terminals?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}${projectId ? `&projectId=${encodeURIComponent(projectId)}` : ''}${ownerGrant ? `&owner_grant_launch_id=${encodeURIComponent(ownerGrant.launch_id)}` : ''}`, { method: 'POST', headers: ownerGrant ? { 'X-ThreadCells-Owner-Grant': ownerGrant.grant } : undefined, timeoutMs: 90000 }),
 

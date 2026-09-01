@@ -131,6 +131,8 @@ class RuntimePaneTarget:
     runtime_generation: str
     process_start_ticks: int
     generation_inherited: bool = True
+    process_group_id: int | None = None
+    process_session_id: int | None = None
 
 
 class PaneTargetError(RuntimeError):
@@ -721,8 +723,15 @@ class TmuxClient:
             environ = (proc_root / str(pane_pid) / "environ").read_bytes()
             stat = (proc_root / str(pane_pid) / "stat").read_text(encoding="utf-8")
             suffix = stat[stat.rfind(")") + 2 :].split()
+            process_group_id = int(suffix[2])
+            process_session_id = int(suffix[3])
             process_start_ticks = int(suffix[19])
-            if process_start_ticks <= 0 or not runtime_generation:
+            if (
+                process_group_id <= 1
+                or process_session_id <= 1
+                or process_start_ticks <= 0
+                or not runtime_generation
+            ):
                 raise ValueError("invalid launch generation")
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             raise PaneTargetError(
@@ -754,6 +763,8 @@ class TmuxClient:
             runtime_generation=runtime_generation,
             process_start_ticks=process_start_ticks,
             generation_inherited=bool(inherited_generation),
+            process_group_id=process_group_id,
+            process_session_id=process_session_id,
         )
 
     def bind_legacy_runtime_generation(
@@ -868,6 +879,13 @@ class TmuxClient:
             stat = (proc_root / str(current_pid) / "stat").read_text(encoding="utf-8")
             suffix = stat[stat.rfind(")") + 2 :].split()
             if int(suffix[19]) != target.process_start_ticks:
+                return False
+            if target.process_group_id is not None and int(suffix[2]) != target.process_group_id:
+                return False
+            if (
+                target.process_session_id is not None
+                and int(suffix[3]) != target.process_session_id
+            ):
                 return False
             environ = (proc_root / str(current_pid) / "environ").read_bytes().split(b"\0")
             expected_terminal = f"CAO_TERMINAL_ID={target.terminal_id}".encode()

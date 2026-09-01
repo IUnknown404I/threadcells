@@ -87,6 +87,7 @@ class TestTerminalOperations:
             "creation_order",
             "launch_worktree",
             "write_enabled",
+            "writer_authority_generation",
             "runtime_lifecycle",
             "runtime_exit_requested_at",
             "runtime_exited_at",
@@ -96,8 +97,17 @@ class TestTerminalOperations:
             "runtime_operation_expires_at",
             "provider_resume_identity",
             "provider_resume_runtime_generation",
+            "recovery_fenced_at",
+            "recovery_fenced_reason",
+            "recovery_takeover_id",
+            "replaced_by_terminal_id",
         } <= columns
-        assert {"canonical_worktree", "terminal_id", "created_at"} <= lease_columns
+        assert {
+            "canonical_worktree",
+            "terminal_id",
+            "authority_generation",
+            "created_at",
+        } <= lease_columns
 
     def test_runtime_identity_migration_preserves_one_exact_live_codex_binding(
         self, tmp_path, monkeypatch
@@ -248,10 +258,15 @@ class TestTerminalOperations:
         with sqlite3.connect(database_file) as connection:
             owners = list(
                 connection.execute(
-                    "SELECT canonical_worktree, terminal_id FROM worktree_writer_leases"
+                    "SELECT l.canonical_worktree, l.terminal_id, "
+                    "l.authority_generation, t.writer_authority_generation "
+                    "FROM worktree_writer_leases l JOIN terminals t ON t.id = l.terminal_id"
                 )
             )
-        assert owners == [("/worktree", "writer-a")]
+        assert len(owners) == 1
+        assert owners[0][0:2] == ("/worktree", "writer-a")
+        assert owners[0][2] == owners[0][3]
+        assert len(owners[0][2]) == 32
 
     def test_pre_p1_live_terminal_migration_fences_new_writer_until_reconciled(
         self, tmp_path, monkeypatch
@@ -508,7 +523,10 @@ class TestTerminalOperations:
         assert delete_terminal("writer-1")
         with test_db() as db:
             lease = db.query(WorktreeWriterLeaseModel).one()
+            replacement = db.get(TerminalModel, "legacy-writer")
             assert lease.terminal_id == "legacy-writer"
+            assert replacement.writer_authority_generation
+            assert lease.authority_generation == replacement.writer_authority_generation
         with pytest.raises(WorktreeWriterLeaseConflict):
             create_terminal(
                 "writer-2",

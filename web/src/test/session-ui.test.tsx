@@ -1017,3 +1017,130 @@ describe('graceful exit authority feedback', () => {
     expect(screen.getByRole('heading', { name: 'Graceful Exit' })).toBeInTheDocument()
   })
 })
+
+describe('owner-authorized recovery takeover', () => {
+  const recoverySession = { ...session('recovery-session', '100'), name: 'cao-recovery-old' }
+  const terminal = {
+    id: 'a11ce001',
+    tmux_session: recoverySession.name,
+    tmux_window: 'old-owner',
+    provider: 'codex',
+    agent_profile: 'critical_sol_xhigh_owner',
+    project_id: 'project-1',
+    project_name: 'Recovery Project',
+    project_path: '/repo',
+    last_active: null,
+  }
+
+  beforeEach(() => {
+    vi.restoreAllMocks()
+    useStore.setState({
+      sessions: [recoverySession],
+      activeSession: recoverySession.id,
+      activeSessionDetail: { session: recoverySession, terminals: [terminal] },
+      terminalStatuses: {
+        [terminal.id]: {
+          activity: 'idle',
+          lifecycle: 'running',
+          context_role: 'supervisor',
+          launch_worktree: '/repo',
+        },
+      } as never,
+      snackbar: null,
+      connected: true,
+    })
+    vi.spyOn(api, 'listProviders').mockResolvedValue([
+      { name: 'codex', binary: 'codex', installed: true },
+    ])
+    vi.spyOn(api, 'listProfiles').mockResolvedValue([
+      {
+        name: 'critical_sol_xhigh_owner',
+        description: 'Exceptional owner executor',
+        source: 'built-in',
+        owner_authorization_required: true,
+      },
+    ])
+    vi.spyOn(api, 'listProjects').mockResolvedValue([])
+    vi.spyOn(api, 'getSession').mockResolvedValue({
+      session: recoverySession,
+      terminals: [terminal],
+    } as never)
+    vi.spyOn(api, 'getTerminalStatus').mockResolvedValue({
+      ...terminal,
+      activity: 'idle',
+      lifecycle: 'running',
+      context_role: 'supervisor',
+      launch_worktree: '/repo',
+    } as never)
+    installUiReadModelSpies()
+  })
+
+  it('inspects dirty state and sends one exact takeover capability', async () => {
+    const login = vi.spyOn(api, 'createOperatorSession').mockResolvedValue({ authenticated: true })
+    vi.spyOn(api, 'getRecoveryTakeoverPreview').mockResolvedValue({
+      eligible: true,
+      reason_code: null,
+      runtime_absent: true,
+      terminal: {
+        id: terminal.id,
+        project_id: 'project-1',
+        project_name: 'Recovery Project',
+        session_id: recoverySession.id,
+        tmux_session: recoverySession.name,
+        tmux_window: terminal.tmux_window,
+        launch_worktree: '/repo',
+        project_path: '/repo',
+        runtime_lifecycle: 'running',
+        writer_authority_generation: 'a'.repeat(32),
+        runtime_generation: '11111111-1111-4111-8111-111111111111',
+      },
+      worktree: { state: 'dirty', dirty: true, reason_code: null },
+      consequence: 'OLD_SUPERVISOR_PERMANENTLY_LOSES_WRITER_AUTHORITY',
+    })
+    const grant = vi.spyOn(api, 'createXHighGrant').mockResolvedValue({
+      grant: 'one-use-grant',
+      launch_id: 'launch-1',
+      expires_in_seconds: 60,
+    })
+    const takeover = vi.spyOn(api, 'createRecoveryTakeover').mockResolvedValue({
+      id: 'takeover-1',
+      request_id: 'request-1',
+      old_terminal_id: terminal.id,
+      new_terminal_id: 'b22ce001',
+      state: 'completed',
+      failure_reason: null,
+    })
+
+    render(<AgentPanel />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand recovery-old' }))
+    fireEvent.click(await screen.findByTitle('Recover supervisor authority'))
+    expect(screen.getByRole('dialog', { name: 'Recover supervisor authority' })).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('Operator secret'), {
+      target: { value: 'owner-passphrase' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Authenticate & inspect' }))
+    await waitFor(() => expect(login).toHaveBeenCalledWith('owner-passphrase'))
+    expect(await screen.findByText('Dirty — uncommitted state will be preserved')).toBeInTheDocument()
+    fireEvent.click(screen.getByLabelText('Confirm recovery takeover'))
+    fireEvent.click(screen.getByRole('button', { name: 'Take over supervisor' }))
+
+    await waitFor(() => expect(takeover).toHaveBeenCalledTimes(1))
+    expect(grant).toHaveBeenCalledWith(expect.objectContaining({
+      launch_mode: 'recovery_takeover',
+      target_terminal_id: terminal.id,
+      expected_authority_generation: 'a'.repeat(32),
+      expected_runtime_generation: '11111111-1111-4111-8111-111111111111',
+      confirmed: true,
+    }))
+    expect(takeover.mock.calls[0][0]).toBe(terminal.id)
+    expect(takeover.mock.calls[0][1]).toEqual(expect.objectContaining({
+      owner_grant_launch_id: 'launch-1',
+      agent_profile: 'critical_sol_xhigh_owner',
+      provider: 'codex',
+    }))
+    expect(takeover.mock.calls[0][2]).toEqual(expect.objectContaining({
+      grant: 'one-use-grant',
+      launch_id: 'launch-1',
+    }))
+  })
+})

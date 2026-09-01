@@ -25,6 +25,7 @@ class TerminalLifecycle(str, Enum):
     RUNNING = "running"
     EXIT_PENDING = "exit_pending"
     EXITED = "exited"
+    RECOVERY_FENCED = "recovery_fenced"
 
 
 class Terminal(BaseModel):

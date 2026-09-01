@@ -334,6 +334,8 @@ def _legacy_profile_resolution_for_service_unit_tests(monkeypatch):
             terminal_id=terminal_id,
             runtime_generation=generation,
             process_start_ticks=777,
+            process_group_id=4242,
+            process_session_id=4242,
         ),
     )
     resolved_session_name: dict[str, str | None] = {"value": None}

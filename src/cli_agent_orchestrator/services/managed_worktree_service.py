@@ -91,7 +91,7 @@ def create_managed_worktree(
 def managed_worktree_status(metadata: Mapping[str, Any]) -> dict[str, Any]:
     """Return verified lifecycle state without mutating Git or filesystem state."""
     kind = metadata.get("managed_worktree_kind")
-    terminal_id = metadata.get("id")
+    terminal_id = metadata.get("managed_worktree_origin_terminal_id") or metadata.get("id")
     path_value = metadata.get("launch_worktree")
     source_value = metadata.get("managed_worktree_source")
     if kind not in {"task", "reviewer"}:

@@ -59,3 +59,33 @@ def test_verifier_reference_rejects_symlink_even_when_target_is_valid(tmp_path, 
         operator_auth_service.OperatorAuthUnavailable, match="reference must be canonical"
     ):
         operator_auth_service.load_operator_verifier()
+
+
+def test_recovery_takeover_grant_requires_exact_specialized_confirmation(monkeypatch):
+    issued = []
+    monkeypatch.setattr(
+        operator_auth_service,
+        "issue_owner_launch_grant",
+        lambda **kwargs: issued.append(kwargs) or "one-use-grant",
+    )
+    arguments = {
+        "auth_identity": "operator_session:1",
+        "agent_profile": "critical_sol_xhigh_owner",
+        "provider": "codex",
+        "canonical_worktree": "/repo",
+        "requested_session_name": None,
+        "owner_grant_required": True,
+        "expected_confirmation": "RECOVERY TAKEOVER a11ce001",
+        "grant_scope": {"launch_mode": "recovery_takeover"},
+    }
+    with pytest.raises(operator_auth_service.OperatorAuthenticationError):
+        operator_auth_service.mint_xhigh_launch_grant(
+            **arguments,
+            confirmation="LAUNCH critical_sol_xhigh_owner",
+        )
+    result = operator_auth_service.mint_xhigh_launch_grant(
+        **arguments,
+        confirmation="RECOVERY TAKEOVER a11ce001",
+    )
+    assert result["grant"] == "one-use-grant"
+    assert issued[0]["grant_scope"] == {"launch_mode": "recovery_takeover"}

@@ -210,6 +210,36 @@ describe('API wrapper', () => {
     expect(options.body).toBeUndefined()
   })
 
+  it('sends recovery takeover authority only in the protected header', async () => {
+    const payload = {
+      request_id: '00000000-0000-4000-8000-000000000001',
+      expected_authority_generation: 'a'.repeat(32),
+      expected_runtime_generation: '11111111-1111-4111-8111-111111111111',
+      agent_profile: 'critical_sol_xhigh_owner',
+      provider: 'codex',
+      owner_grant_launch_id: 'recovery-launch-1',
+    }
+    mockResponse({ id: 'takeover-1', state: 'completed' })
+    await api.createRecoveryTakeover('a11ce001', payload, {
+      launch_id: 'recovery-launch-1',
+      grant: 'one-use-recovery-secret',
+      expires_in_seconds: 60,
+    })
+
+    const [url, options] = mockFetch.mock.calls[0]
+    expect(url).toBe('/terminals/a11ce001/recovery-takeover')
+    expect(url).not.toContain('one-use-recovery-secret')
+    expect(options).toEqual(expect.objectContaining({
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-ThreadCells-Owner-Grant': 'one-use-recovery-secret',
+      },
+      body: JSON.stringify(payload),
+      signal: expect.any(AbortSignal),
+    }))
+  })
+
   it('uses versioned control-plane API paths distinct from Settings page routes', async () => {
     mockResponse([])
     await api.listRegistryProfiles()

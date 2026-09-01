@@ -884,3 +884,51 @@ def test_provider_content_unavailable_projects_recoverable_without_processing(mo
     assert item["workflow_state"] == "recoverable"
     assert item["provider_outcome_code"] == "PROVIDER_CONTENT_UNAVAILABLE"
     assert item["provider_outcome_detail"] == "cyber_policy"
+
+
+def test_recovery_fenced_supervisor_is_historical_while_successor_is_active(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 1, 12, 0, 0)
+    with database.SessionLocal() as db:
+        db.add_all(
+            [
+                TerminalModel(
+                    id="old-owner",
+                    tmux_session="cao-old-owner",
+                    session_id="lifetime-old-owner",
+                    tmux_window="old-owner",
+                    provider="codex",
+                    context_role="supervisor",
+                    project_id="project-1",
+                    runtime_lifecycle="recovery_fenced",
+                    recovery_fenced_at=now,
+                    replaced_by_terminal_id="new-owner",
+                    last_active=now,
+                ),
+                TerminalModel(
+                    id="new-owner",
+                    tmux_session="cao-new-owner",
+                    session_id="lifetime-new-owner",
+                    tmux_window="new-owner",
+                    provider="codex",
+                    context_role="supervisor",
+                    project_id="project-1",
+                    runtime_lifecycle="running",
+                    last_active=now,
+                ),
+            ]
+        )
+        db.commit()
+
+    agents = {
+        item["id"]: item for item in ui_read_model_service.list_agent_summaries(limit=10)["items"]
+    }
+    sessions = {
+        item["id"]: item for item in ui_read_model_service.list_session_summaries(limit=10)["items"]
+    }
+
+    assert agents["old-owner"]["activity"] == "recovery_fenced"
+    assert agents["old-owner"]["execution_state"] == "recovery_fenced"
+    assert agents["new-owner"]["activity"] == "ready"
+    assert sessions["lifetime-old-owner"]["active_agent_count"] == 0
+    assert sessions["lifetime-new-owner"]["active_agent_count"] == 1

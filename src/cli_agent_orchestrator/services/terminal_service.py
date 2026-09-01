@@ -1759,6 +1759,12 @@ def create_terminal(
                             state="preserved",
                             event_type="provisioning_preserved",
                             reason_code="PROVIDER_LAUNCH_OUTCOME_UNCERTAIN",
+                            expected_terminal_id=terminal_id,
+                            expected_writer_authority_generation=(
+                                str(durable["writer_authority_generation"])
+                                if durable.get("writer_authority_generation")
+                                else None
+                            ),
                         )
                     logger.error(
                         "Managed worktree retained after uncertain launch failure; "
@@ -1768,15 +1774,28 @@ def create_terminal(
                 else:
                     cleanup = remove_managed_worktree(identity)
                     if cleanup.get("removed"):
+                        context_abandoned = True
                         if writable_work_context_id is not None:
-                            transition_writable_work_context(
+                            context_abandoned = transition_writable_work_context(
                                 writable_work_context_id,
-                                expected_states=("reserved", "provisioned", "admitted"),
+                                expected_states=(
+                                    "reserved",
+                                    "provisioned",
+                                    "launching",
+                                    "admitted",
+                                ),
                                 state="abandoned",
                                 event_type="provisioning_abandoned",
                                 reason_code="PROVIDER_LAUNCH_FAILED_CONFIRMED",
+                                expected_terminal_id=terminal_id,
+                                expected_writer_authority_generation=(
+                                    str(durable["writer_authority_generation"])
+                                    if durable is not None
+                                    and durable.get("writer_authority_generation")
+                                    else None
+                                ),
                             )
-                        if durable is not None:
+                        if durable is not None and context_abandoned:
                             try:
                                 db_delete_terminal(terminal_id)
                             except Exception:
@@ -1784,15 +1803,33 @@ def create_terminal(
                                     "Removed managed worktree but retained terminal metadata: %s",
                                     terminal_id,
                                 )
+                        elif durable is not None:
+                            logger.error(
+                                "Removed managed worktree but retained terminal metadata because "
+                                "the exact writable context authority changed: %s",
+                                terminal_id,
+                            )
                     else:
                         if writable_work_context_id is not None:
                             transition_writable_work_context(
                                 writable_work_context_id,
-                                expected_states=("reserved", "provisioned", "admitted"),
+                                expected_states=(
+                                    "reserved",
+                                    "provisioned",
+                                    "launching",
+                                    "admitted",
+                                ),
                                 state="preserved",
                                 event_type="provisioning_preserved",
                                 reason_code=str(
                                     cleanup.get("reason_code") or "PROVIDER_LAUNCH_UNCERTAIN"
+                                ),
+                                expected_terminal_id=terminal_id,
+                                expected_writer_authority_generation=(
+                                    str(durable["writer_authority_generation"])
+                                    if durable is not None
+                                    and durable.get("writer_authority_generation")
+                                    else None
                                 ),
                             )
                         logger.error(
@@ -2830,6 +2867,8 @@ _TERMINAL_DELETION_IDENTITY_FIELDS = (
     "managed_worktree_source",
     "managed_worktree_branch",
     "managed_worktree_commit",
+    "writable_work_context_id",
+    "writer_authority_generation",
     "runtime_pane_id",
     "runtime_pane_pid",
     "runtime_generation",

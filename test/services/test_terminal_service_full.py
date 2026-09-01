@@ -1017,6 +1017,95 @@ def test_first_project_supervisor_is_launched_in_reserved_managed_worktree(monke
     assert not (repository / "managed").exists()
 
 
+def test_confirmed_project_supervisor_launch_failure_abandons_exact_launching_context(
+    monkeypatch, tmp_path
+):
+    repository = tmp_path / "source"
+    repository.mkdir()
+    subprocess.run(["git", "-C", str(repository), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repository), "config", "user.name", "Test"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    (repository / "tracked.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "tracked.txt"], check=True)
+    subprocess.run(["git", "-C", str(repository), "commit", "-qm", "base"], check=True)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_worktree_service.MANAGED_WORKTREE_DIR",
+        tmp_path / "managed",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.generate_terminal_id",
+        lambda: "aa11bb22",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_writable_work_context_by_request",
+        lambda _request_id: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.reserve_writable_work_context",
+        lambda **kwargs: {**kwargs, "state": "reserved"},
+    )
+    transitions = []
+    events = []
+
+    def transition(context_id, **kwargs):
+        transitions.append((context_id, kwargs))
+        if kwargs.get("state") == "abandoned":
+            events.append("context_abandoned")
+        return True
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.transition_writable_work_context",
+        transition,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service._create_terminal_after_admission",
+        MagicMock(side_effect=RuntimeError("confirmed provider launch failure")),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+        lambda _terminal_id: {
+            "id": "aa11bb22",
+            "runtime_lifecycle": "exited",
+            "writer_authority_generation": "writer-generation-a",
+        },
+    )
+    cleanup = MagicMock(return_value={"removed": True})
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.managed_worktree_service.remove_managed_worktree", cleanup
+    )
+    delete = MagicMock(side_effect=lambda _terminal_id: events.append("terminal_deleted"))
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.db_delete_terminal", delete
+    )
+
+    with pytest.raises(RuntimeError, match="confirmed provider launch failure"):
+        create_terminal(
+            "codex",
+            "developer",
+            new_session=True,
+            working_directory=str(repository),
+            project_context={"id": "project-a", "name": "A", "path": str(repository)},
+            work_context_request_id="00000000-0000-4000-8000-000000000002",
+        )
+
+    assert transitions[-1] == (
+        "aa11bb22",
+        {
+            "expected_states": ("reserved", "provisioned", "launching", "admitted"),
+            "state": "abandoned",
+            "event_type": "provisioning_abandoned",
+            "reason_code": "PROVIDER_LAUNCH_FAILED_CONFIRMED",
+            "expected_terminal_id": "aa11bb22",
+            "expected_writer_authority_generation": "writer-generation-a",
+        },
+    )
+    delete.assert_called_once_with("aa11bb22")
+    assert events == ["context_abandoned", "terminal_deleted"]
+
+
 def test_context_role_reconciliation_delegates_to_topology_authority(monkeypatch):
     reconcile = MagicMock(return_value=3)
     monkeypatch.setattr(

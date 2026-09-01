@@ -755,6 +755,41 @@ class TestTerminalOperations:
                 "supervisor-a2",
             ]
 
+    def test_work_context_transition_rejects_stale_terminal_generation(self, test_db, monkeypatch):
+        monkeypatch.setattr(database_client, "SessionLocal", test_db)
+        monkeypatch.setattr(database_client, "_terminal_authority_schema_ready", True)
+        reserve_writable_work_context(
+            context_id="fenced-context",
+            request_id="00000000-0000-4000-8000-000000000096",
+            project_id="project-a",
+            session_id="session-a",
+            terminal_id="supervisor-a",
+            canonical_source="/source/project-a",
+            canonical_worktree="/managed/supervisor-a",
+            branch="cao/session/supervisor-a",
+            base_revision="a" * 40,
+        )
+        with test_db() as db:
+            context = db.get(WritableWorkContextModel, "fenced-context")
+            context.state = "preserved"
+            context.terminal_id = "supervisor-a2"
+            context.writer_authority_generation = "generation-a2"
+            db.commit()
+
+        assert not transition_writable_work_context(
+            "fenced-context",
+            expected_states=("launching", "preserved"),
+            state="admitted",
+            event_type="recovery_supervisor_admitted",
+            expected_terminal_id="supervisor-a",
+            expected_writer_authority_generation="generation-a",
+        )
+        with test_db() as db:
+            context = db.get(WritableWorkContextModel, "fenced-context")
+            assert context.state == "preserved"
+            assert context.terminal_id == "supervisor-a2"
+            assert context.writer_authority_generation == "generation-a2"
+
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_metadata_found(self, mock_session_class):
         """Test getting terminal metadata that exists."""

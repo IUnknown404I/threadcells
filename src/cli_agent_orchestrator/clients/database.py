@@ -3211,13 +3211,26 @@ def transition_writable_work_context(
     state: str,
     event_type: str,
     reason_code: str | None = None,
+    expected_terminal_id: str | None = None,
+    expected_writer_authority_generation: str | None = None,
 ) -> bool:
-    """CAS one provisioning transition and append its idempotent audit event."""
+    """CAS one provisioning transition and append its idempotent audit event.
+
+    Optional terminal and writer-generation fences bind restart recovery to the
+    exact authority it inspected.  A stale reconciler may never advance a
+    context that has already moved to another supervisor generation.
+    """
     _ensure_terminal_worktree_authority_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         row = db.get(WritableWorkContextModel, context_id)
         if row is None:
+            db.rollback()
+            return False
+        if (expected_terminal_id is not None and row.terminal_id != expected_terminal_id) or (
+            expected_writer_authority_generation is not None
+            and row.writer_authority_generation != expected_writer_authority_generation
+        ):
             db.rollback()
             return False
         if row.state == state:
@@ -4563,6 +4576,8 @@ _TERMINAL_DELETION_IDENTITY_FIELDS = (
     "managed_worktree_source",
     "managed_worktree_branch",
     "managed_worktree_commit",
+    "writable_work_context_id",
+    "writer_authority_generation",
     "runtime_pane_id",
     "runtime_pane_pid",
     "runtime_generation",
@@ -4617,6 +4632,19 @@ def delete_exited_terminal(
             "window_name": terminal.tmux_window,
         }
 
+        writable_context = None
+        if terminal.writable_work_context_id is not None:
+            writable_context = db.get(WritableWorkContextModel, terminal.writable_work_context_id)
+            if not (
+                writable_context is not None
+                and writable_context.terminal_id == terminal.id
+                and writable_context.writer_authority_generation
+                == terminal.writer_authority_generation
+                and writable_context.state in {"admitted", "preserved", "retired"}
+            ):
+                db.rollback()
+                raise AmbiguousTerminalIdentity(terminal_id)
+
         # Exited is the durable terminal boundary. Reconcile any legacy stale
         # runtime-owned leases inside the same transaction as row deletion.
         terminal.runtime_operation_kind = None
@@ -4633,6 +4661,18 @@ def delete_exited_terminal(
         if provider_execution is not None:
             db.delete(provider_execution)
         _purge_staged_handoff_submissions_for_terminals(db, [terminal_id])
+        if writable_context is not None and writable_context.state != "retired":
+            writable_context.state = "retired"
+            writable_context.failure_reason = None
+            writable_context.updated_at = datetime.now()
+            db.add(
+                WritableWorkContextAuditModel(
+                    work_context_id=writable_context.id,
+                    event_key=(f"{writable_context.id}:managed-worktree-retired:{terminal.id}"),
+                    event_type="managed_worktree_retired",
+                    terminal_id=terminal.id,
+                )
+            )
         db.flush()
         deleted = (
             db.query(TerminalModel)

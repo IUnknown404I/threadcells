@@ -1,7 +1,7 @@
 ---
 slug: first-agent
 source: docs/FIRST_AGENT.md
-source_sha256: sha256:0695738b5c690bf05b93bbd5a0afd0e1ab38857a7f488141af3244ce66dae948
+source_sha256: sha256:d677c6eeb4bf6847ed8361d5073920ff9682b13de198f994ac8c9fb0625672bb
 ---
 # 你的第一个项目和智能体
 
@@ -55,7 +55,7 @@ git status --short
 git diff -- README.md
 ```
 
-若智能体在管理的 worktree 中工作，请使用 ThreadCells 显示的 worktree 路径，而非原始仓库路径。worktree 会将并发写入者隔离开，直到有意协调其提交。
+与项目关联的智能体在 ThreadCells 显示的管理 worktree 路径中工作，而不是在已注册的源代码根目录中工作。请使用该路径进行检查。worktree 会将并发写入者隔离开，直到有意协调其提交。
 
 ## 5. 尝试监督
 

@@ -1,7 +1,7 @@
 ---
 slug: first-agent
 source: docs/FIRST_AGENT.md
-source_sha256: sha256:0695738b5c690bf05b93bbd5a0afd0e1ab38857a7f488141af3244ce66dae948
+source_sha256: sha256:d677c6eeb4bf6847ed8361d5073920ff9682b13de198f994ac8c9fb0625672bb
 ---
 
 # Seu primeiro projeto e agente
@@ -56,7 +56,7 @@ git status --short
 git diff -- README.md
 ```
 
-Se o agente trabalhou em um worktree gerenciado, use o caminho de worktree mostrado pelo ThreadCells em vez do caminho do repositório original. O worktree mantém escritores concorrentes separados até que seus commits sejam reconciliados deliberadamente.
+O agente associado a um Projeto trabalha no caminho do worktree gerenciado mostrado pelo ThreadCells, e não na raiz de código-fonte registrada. Use esse caminho para inspeção. O worktree mantém escritores concorrentes separados até que seus commits sejam reconciliados deliberadamente.
 
 ## 5. Experimente a supervisão
 

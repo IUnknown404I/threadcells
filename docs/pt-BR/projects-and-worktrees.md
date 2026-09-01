@@ -1,12 +1,12 @@
 ---
 slug: projects-and-worktrees
 source: docs/PROJECTS_AND_WORKTREES.md
-source_sha256: sha256:330c4175df07b3a91dc7d9e0c88bbf91d6c3bb7b2bb76fd4340828260562dd02
+source_sha256: sha256:c296e8fec6654451a29dbef47bde79d19fda28f7bbfdf926c857e2cc8508ad3a
 ---
 
 # Projetos e worktrees gerenciados
 
-Um projeto do ThreadCells é um repositório Git registrado. Ele dá a sessões, perfis, estatísticas e fluxos de trabalho um lugar estável ao qual pertencer. O ThreadCells nunca torna um repositório seguro apenas por registrá-lo; portanto, comece com um status limpo e entenda o limite de escrita que você concede.
+Um projeto do ThreadCells é um repositório Git registrado e a autoridade canônica do código-fonte. Ele dá a sessões, perfis, estatísticas e fluxos de trabalho um lugar estável ao qual pertencer, mas não é o diretório gravável normal de um novo supervisor. O ThreadCells nunca torna um repositório seguro apenas por registrá-lo; portanto, comece com um status limpo e entenda o limite de escrita que você concede.
 
 ## Registrar um projeto
 
@@ -28,12 +28,17 @@ Dois escritores em um checkout podem sobrescrever as alterações um do outro me
 ```text
 Canonical repository
   ├── operator checkout
-  ├── supervisor context
+  ├── Session A supervisor worktree
+  ├── Session B supervisor worktree
   ├── developer worktree
   └── reviewer worktree or read-only context
 ```
 
 O ThreadCells registra essa relação em vez de tratar diretórios temporários como anônimos. Isso torna a limpeza e a atribuição de resultados mais seguras.
+
+Cada nova Sessão de supervisor associada a um Projeto, incluindo a primeira, recebe um worktree gerenciado e uma branch exclusivos em uma revisão base registrada exatamente. Uma segunda Sessão no mesmo Projeto recebe outro worktree; a capacidade residente continua global. Uma Sessão ainda tem um único supervisor principal, e um contexto gravável/worktree ainda tem no máximo um lease de escrita. A substituição de um supervisor inutilizável no mesmo contexto usa um recovery takeover explícito e preserva o worktree desse contexto em vez de criar um independente.
+
+Sessões legacy ativas anteriores a este contrato permanecem no workspace existente. O ThreadCells não move, redefine, limpa, guarda com stash nem copia o estado sujo delas durante a atualização; Sessões novas usam worktrees gerenciados.
 
 ## Autoridade de escrita
 

@@ -1,7 +1,7 @@
 ---
 slug: concepts
 source: docs/CONCEPTS.md
-source_sha256: sha256:1e0e6123a7e1d36cffc5d9bd3a7178930c5d355386e008093fc0209c5cf951e9
+source_sha256: sha256:558a270183e49568ee5d52d6efd30c6a8215fe7d563df596ee9391313d8f3299
 ---
 
 # Conceptos básicos
@@ -26,11 +26,11 @@ Una **sesión** es la vida útil duradera de ThreadCells para un grupo relaciona
 
 ## Proyecto
 
-Un **proyecto** identifica el repositorio Git al que pertenece el trabajo. Da a ThreadCells un ámbito estable para sesiones, worktrees y resultados; no sustituye a los remotos de Git ni a los permisos del repositorio.
+Un **proyecto** identifica la autoridad canónica de Git y del código fuente para el trabajo. Da a ThreadCells un ámbito estable para sesiones, worktrees y resultados; la raíz de fuentes registrada no es el cwd escribible normal de un supervisor nuevo ni sustituye a los remotos de Git o a los permisos del repositorio.
 
 ## Worktree gestionado
 
-Un **worktree gestionado** es un Git worktree creado para un contexto de agente acotado. Permite que trabajadores en paralelo operen en ramas diferentes sin editar el mismo checkout.
+Un **worktree gestionado** es un Git worktree creado para un contexto escribible acotado. Cada nueva Sesión de supervisor asociada a un Proyecto, incluida la primera, recibe uno. Las Sesiones independientes del mismo Proyecto usan ramas y checkouts distintos; un recovery takeover del mismo contexto conserva su worktree existente.
 
 Los worktrees reducen las colisiones; no son sandboxes de seguridad. Un agente puede seguir alcanzando todo lo que pueda alcanzar su cuenta del sistema operativo.
 

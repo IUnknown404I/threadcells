@@ -1,7 +1,7 @@
 ---
 slug: first-agent
 source: docs/FIRST_AGENT.md
-source_sha256: sha256:0695738b5c690bf05b93bbd5a0afd0e1ab38857a7f488141af3244ce66dae948
+source_sha256: sha256:d677c6eeb4bf6847ed8361d5073920ff9682b13de198f994ac8c9fb0625672bb
 ---
 # 最初のプロジェクトとエージェント
 
@@ -55,7 +55,7 @@ git status --short
 git diff -- README.md
 ```
 
-エージェントが管理済み worktree で作業した場合は、元のリポジトリパスではなく ThreadCells が示す worktree パスを使ってください。worktree は、コミットが意図的に調整されるまで同時書き込み者を分離します。
+プロジェクトに関連付けられたエージェントは、登録済みのソースルートではなく、ThreadCells が示す管理済み worktree パスで作業します。確認にはそのパスを使ってください。worktree は、コミットが意図的に調整されるまで同時書き込み者を分離します。
 
 ## 5. 監督を試す
 

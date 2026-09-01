@@ -1,7 +1,7 @@
 ---
 slug: first-agent
 source: docs/FIRST_AGENT.md
-source_sha256: sha256:0695738b5c690bf05b93bbd5a0afd0e1ab38857a7f488141af3244ce66dae948
+source_sha256: sha256:d677c6eeb4bf6847ed8361d5073920ff9682b13de198f994ac8c9fb0625672bb
 ---
 
 # Dein erstes Projekt und dein erster Agent
@@ -56,7 +56,7 @@ git status --short
 git diff -- README.md
 ```
 
-Falls der Agent in einem verwalteten Worktree gearbeitet hat, nutze statt des ursprünglichen Repository-Pfads den von ThreadCells angezeigten Worktree-Pfad. Der Worktree hält nebenläufige Schreiber getrennt, bis ihre Commits bewusst zusammengeführt werden.
+Der mit einem Projekt verbundene Agent arbeitet im von ThreadCells angezeigten verwalteten Worktree-Pfad und nicht im registrierten Quellstamm. Nutze diesen Pfad zur Prüfung. Der Worktree hält nebenläufige Schreiber getrennt, bis ihre Commits bewusst zusammengeführt werden.
 
 ## 5. Supervision ausprobieren
 

@@ -1,11 +1,11 @@
 ---
 slug: projects-and-worktrees
 source: docs/PROJECTS_AND_WORKTREES.md
-source_sha256: sha256:330c4175df07b3a91dc7d9e0c88bbf91d6c3bb7b2bb76fd4340828260562dd02
+source_sha256: sha256:c296e8fec6654451a29dbef47bde79d19fda28f7bbfdf926c857e2cc8508ad3a
 ---
 # 项目与管理的 worktree
 
-ThreadCells 项目是已注册的 Git 仓库。它为会话、配置文件、统计和工作流提供稳定的归属位置。仅注册仓库绝不会让它变得安全，因此请从干净状态开始，并了解你授予的写入边界。
+ThreadCells 项目是已注册的 Git 仓库和规范源代码权限。它为会话、配置文件、统计和工作流提供稳定的归属位置，但不是新 supervisor 的常规可写目录。仅注册仓库绝不会让它变得安全，因此请从干净状态开始，并了解你授予的写入边界。
 
 ## 注册项目
 
@@ -27,12 +27,17 @@ git -C /path/to/project worktree list
 ```text
 Canonical repository
   ├── operator checkout
-  ├── supervisor context
+  ├── Session A supervisor worktree
+  ├── Session B supervisor worktree
   ├── developer worktree
   └── reviewer worktree or read-only context
 ```
 
 ThreadCells 会记录这种关系，而不是将临时目录当作匿名目录。这样做能使清理和结果归属更安全。
+
+每个与项目关联的新 supervisor 会话（包括第一个）都会在准确记录的基础修订版上获得唯一的管理 worktree 和分支。同一项目中的第二个会话会获得另一个 worktree；驻留容量仍是全局的。一个会话仍只有一个主 supervisor，一个可写上下文/worktree 仍最多只有一个写入者租约。替换相同上下文中不可用的 supervisor 时，必须使用显式 recovery takeover 并保留该上下文的 worktree，而不是创建独立 worktree。
+
+早于此契约的活跃旧版会话保留在现有工作区中。升级期间，ThreadCells 不会移动、重置、清理、stash 或复制其脏状态；新会话使用管理 worktree。
 
 ## 写入者权限
 

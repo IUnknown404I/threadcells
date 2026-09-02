@@ -873,6 +873,35 @@ def test_session_summary_keeps_known_recovery_lifecycle_separate_from_workflow(m
     assert summary["first_agent"]["workflow_state"] is None
 
 
+def test_recovery_required_projects_known_runtime_wait_instead_of_ready(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 2, 18, 30, 0)
+    with database.SessionLocal() as db:
+        db.add(
+            TerminalModel(
+                id="recovery-required",
+                tmux_session="cao-recovery-required",
+                session_id="lifetime-recovery-required",
+                tmux_window="recovery-required",
+                provider="codex",
+                context_role="supervisor",
+                runtime_lifecycle="recovery_required",
+                creation_order=1,
+                last_active=now,
+            )
+        )
+        db.commit()
+
+    agent = ui_read_model_service.list_agent_summaries(limit=10)["items"][0]
+    session = ui_read_model_service.list_session_summaries(limit=10)["items"][0]
+
+    assert agent["lifecycle"] == "recovery_required"
+    assert agent["activity"] == "queued"
+    assert agent["execution_state"] == "waiting_runtime_recovery"
+    assert session["activity_counts"] == {"queued": 1}
+    assert session["workflow_counts"] == {"untracked": 1}
+
+
 def test_provider_content_unavailable_projects_recoverable_without_processing(monkeypatch):
     _install_database(monkeypatch)
     now = datetime(2026, 8, 28, 12, 0, 0)

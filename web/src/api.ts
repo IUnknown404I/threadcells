@@ -337,7 +337,7 @@ export interface SessionBoundaryAgent {
   workflow_reason: string | null
 }
 
-export type TerminalLifecycle = 'starting' | 'running' | 'exit_pending' | 'exited' | 'recovery_fenced'
+export type TerminalLifecycle = 'starting' | 'running' | 'recovery_required' | 'exit_pending' | 'exited' | 'recovery_fenced'
 
 export interface AgentSummary {
   id: string

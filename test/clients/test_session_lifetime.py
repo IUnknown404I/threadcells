@@ -371,6 +371,27 @@ def test_exited_terminal_reconciliation_transfers_a_legacy_shared_writer_lease(m
         assert lease.terminal_id == "active"
 
 
+def test_legacy_writer_release_never_reactivates_recovery_required_authority(monkeypatch):
+    _install_database(monkeypatch)
+    exited = _terminal("exited", "lifetime", "cao-session", "/work/shared")
+    recovery = _terminal("recovery", "lifetime", "cao-session", "/work/shared")
+    recovery.runtime_lifecycle = "recovery_required"
+    with database.SessionLocal() as db:
+        db.add_all(
+            [
+                exited,
+                recovery,
+                WorktreeWriterLeaseModel(canonical_worktree="/work/shared", terminal_id="exited"),
+            ]
+        )
+        db.commit()
+
+    assert database.mark_terminal_runtime_exited("exited") is True
+    with database.SessionLocal() as db:
+        assert db.get(WorktreeWriterLeaseModel, "/work/shared") is None
+        assert db.get(TerminalModel, "recovery").runtime_lifecycle == "recovery_required"
+
+
 def test_terminal_deletion_receipt_never_authorizes_a_reused_id(monkeypatch):
     _install_database(monkeypatch)
     original = _terminal("reused", "old-lifetime", "cao-old", "/work/old")

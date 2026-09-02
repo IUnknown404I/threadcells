@@ -77,7 +77,8 @@ class SessionAuthority:
     @property
     def has_live_runtime_owner(self) -> bool:
         return any(
-            terminal.get("runtime_lifecycle") not in {"exited", "recovery_fenced"}
+            terminal.get("runtime_lifecycle")
+            not in {"exited", "recovery_fenced", "recovery_required"}
             for terminal in self.terminals
         )
 

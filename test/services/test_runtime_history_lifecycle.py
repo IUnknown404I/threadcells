@@ -70,6 +70,93 @@ def _terminal(
     )
 
 
+def _recoverable_supervisor(terminal_id: str = "recover00"):
+    return create_terminal(
+        terminal_id,
+        "cao-recoverable",
+        f"window-{terminal_id}",
+        "codex",
+        "critical_sol_xhigh_owner",
+        launch_worktree=f"/worktree-{terminal_id}",
+        write_enabled=True,
+        context_role="supervisor",
+        project_id="project-recovery",
+        project_name="Recovery test",
+        project_path="/source-recovery",
+        runtime_pane_id="%91",
+        runtime_pane_pid=9191,
+        runtime_generation="runtime-recovery-a",
+        runtime_generation_origin="launch",
+        runtime_process_start_ticks=919191,
+        runtime_process_group_id=9191,
+        runtime_process_session_id=9191,
+    )
+
+
+def test_unexpected_supervisor_runtime_death_preserves_stable_takeover_authority(
+    lifecycle_db, monkeypatch
+):
+    _recoverable_supervisor()
+    assert mark_terminal_runtime_running("recover00")
+    cleanup = MagicMock()
+    retire = MagicMock(return_value=True)
+    monkeypatch.setattr(terminal_service, "_runtime_death_observation", lambda *_: True)
+    monkeypatch.setattr(
+        terminal_service, "_retire_observed_dead_runtime", lambda *_args, **_kwargs: (True, None)
+    )
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", cleanup)
+    monkeypatch.setattr(
+        terminal_service,
+        "_retire_recovery_required_terminal_runtime",
+        retire,
+    )
+
+    assert terminal_service.reconcile_terminal_runtime("recover00") is False
+    first = get_terminal_metadata("recover00")
+    assert first["runtime_lifecycle"] == "recovery_required"
+    assert first["writer_authority_generation"]
+    assert list_worktree_writer_leases() == []
+    assert database.recovery_takeover_durable_eligibility("recover00")["eligible"] is True
+
+    # Arbitrarily many daemon/status ticks preserve the same exact recovery
+    # generation; there is no UI race window and no writer lease leak.
+    assert terminal_service.reconcile_terminal_runtime("recover00") is False
+    second = get_terminal_metadata("recover00")
+    assert second["runtime_lifecycle"] == "recovery_required"
+    assert second["runtime_generation"] == first["runtime_generation"]
+    assert second["writer_authority_generation"] == first["writer_authority_generation"]
+    cleanup.assert_called_once_with("recover00")
+    assert retire.call_count == 2
+
+
+def test_recovery_required_graceful_exit_is_idempotent_and_never_sends_input(
+    lifecycle_db, monkeypatch
+):
+    _recoverable_supervisor()
+    assert mark_terminal_runtime_running("recover00")
+    observed = {
+        field: get_terminal_metadata("recover00").get(field)
+        for field in database.TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
+    }
+    state, _ = database.mark_terminal_runtime_recovery_required_with_workflow_ids(
+        "recover00", expected_runtime_authority=observed
+    )
+    assert state == "recovery_required"
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", lambda *_: None)
+    monkeypatch.setattr(terminal_service, "_retire_exited_terminal_runtime", lambda *_: True)
+    monkeypatch.setattr(terminal_service, "_wake_queued_provider_execution", lambda *_: None)
+    send = MagicMock()
+    monkeypatch.setattr(terminal_service.tmux_client, "send_keys", send)
+
+    first = terminal_service.exit_terminal("recover00")
+    second = terminal_service.exit_terminal("recover00")
+
+    assert first.success is second.success is True
+    assert first.command_delivered is second.command_delivered is False
+    assert get_terminal_metadata("recover00")["runtime_lifecycle"] == "exited"
+    send.assert_not_called()
+
+
 def test_positive_death_releases_runtime_ownership_but_preserves_history(lifecycle_db, monkeypatch):
     _terminal(
         "parent00",
@@ -355,11 +442,80 @@ def test_housekeeping_restart_recovery_releases_only_positive_death(lifecycle_db
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.tmux.tmux_client.window_exists", lambda *_: False
     )
+    monkeypatch.setattr(
+        terminal_service, "_retire_observed_dead_runtime", lambda *_args, **_kwargs: (True, None)
+    )
     dead = HousekeepingSummary()
     _reconcile_writer_leases(dead)
     assert list_worktree_writer_leases() == []
     assert get_terminal_metadata("uncert00")["runtime_lifecycle"] == "exited"
     assert dead.writer_leases_reconciled == 1
+
+
+def test_housekeeping_preserves_recoverable_supervisor_for_takeover(
+    lifecycle_db, monkeypatch, tmp_path
+):
+    _recoverable_supervisor()
+    assert mark_terminal_runtime_running("recover00")
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.tmux.tmux_client.window_exists", lambda *_: False
+    )
+    monkeypatch.setattr(
+        terminal_service.tmux_client,
+        "exact_runtime_target",
+        MagicMock(side_effect=PaneTargetError("EXIT_SESSION_MISSING", "session absent")),
+    )
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", lambda *_: None)
+
+    summary = HousekeepingSummary()
+    _reconcile_writer_leases(summary, proc_root=tmp_path)
+
+    metadata = get_terminal_metadata("recover00")
+    assert metadata["runtime_lifecycle"] == "recovery_required"
+    assert list_worktree_writer_leases() == []
+    assert database.recovery_takeover_durable_eligibility("recover00")["eligible"] is True
+    assert summary.writer_leases_reconciled == 1
+    assert summary.skipped_unknown == 0
+
+
+def test_housekeeping_missing_tmux_preserves_live_orphan_writer_authority(
+    lifecycle_db, monkeypatch, tmp_path
+):
+    _recoverable_supervisor()
+    assert mark_terminal_runtime_running("recover00")
+    process = tmp_path / "9191"
+    process.mkdir()
+    fields = ["S", "1", "9191", "9191", *(["0"] * 15), "919191"]
+    (process / "stat").write_text(
+        f"9191 (orphaned provider) {' '.join(fields)}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.tmux.tmux_client.window_exists", lambda *_: False
+    )
+
+    summary = HousekeepingSummary()
+    _reconcile_writer_leases(summary, proc_root=tmp_path)
+
+    metadata = get_terminal_metadata("recover00")
+    assert metadata["runtime_lifecycle"] == "running"
+    assert list_worktree_writer_leases()[0]["terminal_id"] == "recover00"
+    with pytest.raises(WorktreeWriterLeaseConflict):
+        _terminal("replacement", "cao-replacement", "/worktree-recover00", write_enabled=True)
+    assert summary.writer_leases_reconciled == 0
+
+
+def test_read_only_legacy_runtime_missing_tmux_still_converges_under_issue_58(
+    lifecycle_db, monkeypatch
+):
+    _terminal("readonly", "cao-readonly", "/legacy-readonly", write_enabled=False)
+    assert mark_terminal_runtime_running("readonly")
+    monkeypatch.setattr(terminal_service, "_runtime_death_observation", lambda *_: True)
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", lambda *_: None)
+    monkeypatch.setattr(terminal_service, "_wake_queued_provider_execution", lambda *_: None)
+
+    assert terminal_service.reconcile_terminal_runtime("readonly") is True
+    assert get_terminal_metadata("readonly")["runtime_lifecycle"] == "exited"
+    assert list_worktree_writer_leases() == []
 
 
 def test_completed_historical_contexts_do_not_consume_capacity(monkeypatch):
@@ -429,6 +585,11 @@ def test_graceful_exit_releases_only_after_positive_runtime_death(monkeypatch):
         "mark_terminal_runtime_exited_with_workflow_ids",
         lambda terminal_id, **_kwargs: (exited.append(terminal_id) or True, []),
     )
+    monkeypatch.setattr(
+        terminal_service,
+        "mark_terminal_runtime_recovery_required_with_workflow_ids",
+        lambda *_args, **_kwargs: ("ineligible", []),
+    )
     monkeypatch.setattr(terminal_service.tmux_client, "window_exists", lambda *_: True)
     monkeypatch.setattr(terminal_service.tmux_client, "get_pane_current_command", lambda *_: "bash")
     monkeypatch.setattr(
@@ -456,6 +617,9 @@ def test_missing_tmux_session_converges_running_runtime_and_repeated_exit(
     monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", lambda *_: None)
     monkeypatch.setattr(terminal_service, "cancel_child_assignments_for_terminal", lambda *_: None)
     monkeypatch.setattr(terminal_service, "_wake_queued_provider_execution", lambda *_: None)
+    monkeypatch.setattr(
+        terminal_service, "_retire_observed_dead_runtime", lambda *_args, **_kwargs: (True, None)
+    )
     monkeypatch.setattr(terminal_service.tmux_client, "window_exists", lambda *_: False)
     monkeypatch.setattr(
         terminal_service.tmux_client,
@@ -500,6 +664,9 @@ def test_stale_death_observation_cannot_overwrite_recovery_fence(lifecycle_db, m
     cancel = MagicMock()
     wake = MagicMock()
     monkeypatch.setattr(terminal_service, "_runtime_death_observation", lambda *_: True)
+    monkeypatch.setattr(
+        terminal_service, "_retire_observed_dead_runtime", lambda *_args, **_kwargs: (True, None)
+    )
     monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", cleanup)
     monkeypatch.setattr(terminal_service, "cancel_child_assignments_for_terminal", cancel)
     monkeypatch.setattr(terminal_service, "_wake_queued_provider_execution", wake)
@@ -558,6 +725,9 @@ def test_stale_death_observation_cannot_terminalize_new_runtime_generation(
     cancel = MagicMock()
     wake = MagicMock()
     monkeypatch.setattr(terminal_service, "_runtime_death_observation", lambda *_: True)
+    monkeypatch.setattr(
+        terminal_service, "_retire_observed_dead_runtime", lambda *_args, **_kwargs: (True, None)
+    )
     monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", cleanup)
     monkeypatch.setattr(terminal_service, "cancel_child_assignments_for_terminal", cancel)
     monkeypatch.setattr(terminal_service, "_wake_queued_provider_execution", wake)

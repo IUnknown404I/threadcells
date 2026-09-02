@@ -490,15 +490,16 @@ def _cleanup_browser_cache(
         )
 
 
-def _reconcile_writer_leases(summary: HousekeepingSummary) -> None:
+def _reconcile_writer_leases(
+    summary: HousekeepingSummary, *, proc_root: Path = Path("/proc")
+) -> None:
     """Retire runtimes only after exact positive process/tmux death evidence."""
     from cli_agent_orchestrator.clients.database import (
-        cancel_child_assignments_for_terminal,
-        cancel_workflows_for_terminal,
+        get_terminal_metadata,
         list_worktree_writer_leases,
-        mark_terminal_runtime_exited,
     )
     from cli_agent_orchestrator.clients.tmux import tmux_client
+    from cli_agent_orchestrator.services.terminal_service import reconcile_terminal_runtime
 
     try:
         leases = list_worktree_writer_leases()
@@ -530,18 +531,19 @@ def _reconcile_writer_leases(summary: HousekeepingSummary) -> None:
         if summary.dry_run:
             summary.writer_leases_reconciled += 1
             continue
-        if mark_terminal_runtime_exited(terminal_id):
+        reconciled = reconcile_terminal_runtime(terminal_id, proc_root=proc_root)
+        if reconciled is True:
             summary.writer_leases_reconciled += 1
-            try:
-                cancel_child_assignments_for_terminal(terminal_id)
-                cancel_workflows_for_terminal(terminal_id)
-                from cli_agent_orchestrator.services.inbox_service import (
-                    wake_provider_execution_queue,
-                )
-
-                wake_provider_execution_queue()
-            except Exception:
-                summary.warnings.append(f"runtime_history_finalization_failed:{terminal_id}")
+            continue
+        current = get_terminal_metadata(terminal_id)
+        if current and current.get("runtime_lifecycle") == "recovery_required":
+            # Recovery-required is also a completed lease reconciliation: the
+            # old runtime/writer are fenced and no longer consume capacity,
+            # while its work-context generation remains available to #95.
+            summary.writer_leases_reconciled += 1
+        elif reconciled is None:
+            summary.skipped_unknown += 1
+            summary.warnings.append(f"runtime_history_finalization_failed:{terminal_id}")
 
 
 def _reconcile_supervisor_context_roles(summary: HousekeepingSummary) -> None:

@@ -13,6 +13,8 @@ import { useAgentSummaryFeed, useNearViewport, useSessionSummaryFeed, useUiOverv
 import { AgentViewControls } from './AgentViewControls'
 import { useI18n } from '../i18n'
 import { ProviderOutcomeNotice } from './ProviderOutcomeNotice'
+import { RecoveryTakeoverAction } from './RecoveryTakeoverAction'
+import { useRecoveryTakeoverCapabilities } from '../recoveryCapabilities'
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })))
 
@@ -45,6 +47,7 @@ function ExpandedSessionAgents({
   onTerminal,
   onExit,
   onClose,
+  onRecoveryCompleted,
   exitingTerminal,
   closingTerminal,
   refreshKey,
@@ -56,12 +59,14 @@ function ExpandedSessionAgents({
   onTerminal: (agent: AgentSummary) => void
   onExit: (agent: AgentSummary) => void
   onClose: (agent: AgentSummary) => void
+  onRecoveryCompleted: () => void
   exitingTerminal: string | null
   closingTerminal: string | null
   refreshKey: number
 }) {
   const { t } = useI18n()
   const feed = useAgentSummaryFeed({ sessionId: session.id, refreshKey })
+  const recoveryCapabilities = useRecoveryTakeoverCapabilities(feed.items, refreshKey)
   const sentinelRef = useNearViewport(feed.loadMore, feed.nextOffset !== null && !feed.loading)
   return <div id={`home-session-detail-${session.id}`} className="space-y-2 border-t border-gray-700/30 px-3 pb-4 pt-3 sm:px-4">
     {feed.error && <p role="alert" className="text-xs text-red-300">{t('home.agentLoadFailed')}</p>}
@@ -75,6 +80,7 @@ function ExpandedSessionAgents({
             <button onClick={() => onInbox(agent.id)} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white" title={t('home.inbox')}><Mail size={14}/></button>
             <button onClick={() => onOutput(agent.id)} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white" title={t('home.output')}><FileText size={14}/></button>
             <button onClick={() => onTerminal(agent)} className="flex min-h-11 items-center gap-1.5 rounded-lg bg-emerald-600 px-3 text-xs font-medium text-white hover:bg-emerald-500"><Monitor size={12}/>{t('home.terminal')}</button>
+            <RecoveryTakeoverAction agent={agent} capability={recoveryCapabilities[agent.id]} onCompleted={onRecoveryCompleted} className="flex min-h-11 items-center gap-1.5 rounded-lg bg-indigo-700 px-3 text-xs font-medium text-white hover:bg-indigo-600"/>
             <button onClick={() => onExit(agent)} disabled={exitingTerminal === agent.id || agent.lifecycle === 'exited' || agent.lifecycle === 'recovery_fenced'} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-amber-400 disabled:opacity-30" title={t('home.gracefulExit')}><LogOut size={14}/></button>
             <button onClick={() => onClose(agent)} disabled={closingTerminal === agent.id || agent.lifecycle !== 'exited'} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-red-400 disabled:opacity-30" title={agent.lifecycle === 'exited' ? t('home.deleteExited') : t('home.exitBeforeDelete')}><Trash2 size={14}/></button>
           </div>
@@ -158,6 +164,11 @@ export function DashboardHome({ onNavigate, overviewState }: { onNavigate: (dest
     try { await deleteSession(pendingDeleteSession.id); sessionFeed.reload(); setPendingDeleteSession(null) } finally { deletingSessionRef.current = false; setDeletingSession(null) }
   }
 
+  const handleRecoveryCompleted = () => {
+    setAgentRefreshKey(value => value + 1)
+    sessionFeed.reload()
+  }
+
   const summaryValue = (key: 'sessions' | 'agents' | 'active' | 'waiting' | 'owner_gate' | 'cancelled' | 'completed') => overview ? overview[key] : '—'
   return <div className="space-y-6">
     {(overviewError || sessionFeed.error) && <p role="alert" className="rounded-lg border border-red-800/50 bg-red-950/20 p-3 text-xs text-red-300">{t('home.refreshFailed')}</p>}
@@ -184,6 +195,7 @@ export function DashboardHome({ onNavigate, overviewState }: { onNavigate: (dest
             onTerminal={openTerminal}
             onExit={agent => setPendingExit(toTerminalMeta(agent))}
             onClose={agent => setPendingClose(toTerminalMeta(agent))}
+            onRecoveryCompleted={handleRecoveryCompleted}
             exitingTerminal={exitingTerminal}
             closingTerminal={closingTerminal}
             refreshKey={agentRefreshKey}

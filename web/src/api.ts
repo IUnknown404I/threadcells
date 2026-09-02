@@ -678,6 +678,12 @@ export interface RecoveryTakeoverPreview {
   worktree: null | { state: 'clean' | 'dirty' | 'unknown'; dirty: boolean | null; reason_code: string | null }
 }
 
+export interface RecoveryTakeoverCapability {
+  terminal_id: string
+  eligible: boolean
+  reason_code: string | null
+}
+
 export interface RecoveryTakeover {
   id: string
   request_id: string
@@ -873,6 +879,13 @@ export const api = {
     fetchJSON<{ working_directory: string | null }>(`/terminals/${id}/working-directory`),
   getRecoveryTakeoverPreview: (id: string) =>
     fetchJSON<RecoveryTakeoverPreview>(`/terminals/${id}/recovery-takeover/preview`),
+  getRecoveryTakeoverCapabilities: (terminalIds: string[], signal?: AbortSignal) =>
+    fetchJSON<{ capabilities: RecoveryTakeoverCapability[] }>('/recovery-takeovers/capabilities', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ terminal_ids: terminalIds }),
+      signal,
+    }),
   createRecoveryTakeover: (id: string, data: { request_id: string; expected_authority_generation: string; expected_runtime_generation: string; agent_profile: string; provider: string; owner_grant_launch_id: string }, ownerGrant: OwnerLaunchGrant) =>
     fetchJSON<RecoveryTakeover>(`/terminals/${id}/recovery-takeover`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-ThreadCells-Owner-Grant': ownerGrant.grant }, body: JSON.stringify(data), timeoutMs: null }),
   addTerminalToSession: (sessionName: string, provider: string, agentProfile: string, workingDirectory?: string, projectId?: string, ownerGrant?: OwnerLaunchGrant) =>

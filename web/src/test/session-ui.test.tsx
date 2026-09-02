@@ -1115,6 +1115,9 @@ describe('owner-authorized recovery takeover', () => {
   })
 
   it('inspects dirty state and sends one exact takeover capability', async () => {
+    vi.mocked(api.getRecoveryTakeoverCapabilities).mockResolvedValue({
+      capabilities: [{ terminal_id: terminal.id, eligible: true, reason_code: null }],
+    })
     const login = vi.spyOn(api, 'createOperatorSession').mockResolvedValue({ authenticated: true })
     vi.spyOn(api, 'getRecoveryTakeoverPreview').mockResolvedValue({
       eligible: true,
@@ -1181,5 +1184,62 @@ describe('owner-authorized recovery takeover', () => {
       grant: 'one-use-grant',
       launch_id: 'launch-1',
     }))
+  })
+
+  it('hides recovery on Agents and Home when canonical preview rejects a healthy runtime', async () => {
+    vi.mocked(api.getRecoveryTakeoverCapabilities).mockResolvedValue({
+      capabilities: [{
+        terminal_id: terminal.id,
+        eligible: false,
+        reason_code: 'RECOVERY_HEALTHY_RUNTIME_ACTIVE',
+      }],
+    })
+
+    const agents = render(<AgentPanel />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand recovery-old' }))
+    await waitFor(() => expect(api.getRecoveryTakeoverCapabilities).toHaveBeenCalledWith(
+      [terminal.id], expect.any(AbortSignal),
+    ))
+    expect(screen.queryByTitle('Recover supervisor authority')).not.toBeInTheDocument()
+    agents.unmount()
+
+    render(<DashboardHome onNavigate={() => {}} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand recovery-old' }))
+    await waitFor(() => expect(api.getRecoveryTakeoverCapabilities).toHaveBeenCalledTimes(2))
+    expect(screen.queryByTitle('Recover supervisor authority')).not.toBeInTheDocument()
+  })
+
+  it('offers the same backend-authorized recovery action on Home', async () => {
+    vi.mocked(api.getRecoveryTakeoverCapabilities).mockResolvedValue({
+      capabilities: [{ terminal_id: terminal.id, eligible: true, reason_code: null }],
+    })
+
+    render(<DashboardHome onNavigate={() => {}} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand recovery-old' }))
+    const action = await screen.findByRole('button', { name: 'Recover agent' })
+    expect(action).toHaveAttribute('title', 'Recover supervisor authority')
+    fireEvent.click(action)
+    expect(screen.getByRole('dialog', { name: 'Recover supervisor authority' })).toBeInTheDocument()
+  })
+
+  it.each([
+    ['recovery_fenced', 'RECOVERY_TARGET_NOT_TAKEOVER_ELIGIBLE'],
+    ['running', 'RECOVERY_RUNTIME_INVENTORY_UNAVAILABLE'],
+  ])('fails closed for %s recovery authority', async (lifecycle, reasonCode) => {
+    vi.mocked(api.getTerminalStatus).mockResolvedValue({
+      ...terminal,
+      activity: 'idle',
+      lifecycle,
+      context_role: 'supervisor',
+      launch_worktree: '/repo',
+    } as never)
+    vi.mocked(api.getRecoveryTakeoverCapabilities).mockResolvedValue({
+      capabilities: [{ terminal_id: terminal.id, eligible: false, reason_code: reasonCode }],
+    })
+
+    render(<AgentPanel />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand recovery-old' }))
+    await waitFor(() => expect(api.getRecoveryTakeoverCapabilities).toHaveBeenCalled())
+    expect(screen.queryByRole('button', { name: 'Recover agent' })).not.toBeInTheDocument()
   })
 })

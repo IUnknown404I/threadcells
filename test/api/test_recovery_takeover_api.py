@@ -54,6 +54,48 @@ def test_preview_returns_exact_authority_and_dirty_state(client):
     )
 
 
+def test_capability_projection_is_non_secret_and_does_not_require_operator(client):
+    projected = {
+        "capabilities": [
+            {
+                "terminal_id": "a11ce001",
+                "eligible": False,
+                "reason_code": "RECOVERY_HEALTHY_RUNTIME_ACTIVE",
+            }
+        ]
+    }
+    with (
+        patch(
+            "cli_agent_orchestrator.api.main._require_operator",
+            side_effect=AssertionError("read-only capability must not require an operator secret"),
+        ),
+        patch(
+            "cli_agent_orchestrator.api.main.recovery_takeover_service.list_recovery_takeover_capabilities",
+            return_value=projected,
+        ) as capabilities,
+    ):
+        response = client.post(
+            "/recovery-takeovers/capabilities",
+            json={"terminal_ids": ["a11ce001"]},
+        )
+    assert response.status_code == 200
+    assert response.json() == projected
+    capabilities.assert_called_once_with(["a11ce001"])
+
+
+def test_capability_projection_rejects_duplicate_or_malformed_terminal_ids(client):
+    duplicate = client.post(
+        "/recovery-takeovers/capabilities",
+        json={"terminal_ids": ["a11ce001", "a11ce001"]},
+    )
+    malformed = client.post(
+        "/recovery-takeovers/capabilities",
+        json={"terminal_ids": ["not-a-terminal"]},
+    )
+    assert duplicate.status_code == 422
+    assert malformed.status_code == 422
+
+
 def test_create_takeover_passes_one_use_owner_grant(client):
     result = {
         "id": "takeover",

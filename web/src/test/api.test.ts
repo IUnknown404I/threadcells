@@ -240,6 +240,19 @@ describe('API wrapper', () => {
     }))
   })
 
+  it('requests only bounded terminal identities for recovery action capabilities', async () => {
+    const controller = new AbortController()
+    mockResponse({ capabilities: [{ terminal_id: 'a11ce001', eligible: false, reason_code: 'RECOVERY_HEALTHY_RUNTIME_ACTIVE' }] })
+    await api.getRecoveryTakeoverCapabilities(['a11ce001'], controller.signal)
+
+    expect(mockFetch).toHaveBeenCalledWith('/recovery-takeovers/capabilities', expect.objectContaining({
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ terminal_ids: ['a11ce001'] }),
+      signal: controller.signal,
+    }))
+  })
+
   it('uses versioned control-plane API paths distinct from Settings page routes', async () => {
     mockResponse([])
     await api.listRegistryProfiles()

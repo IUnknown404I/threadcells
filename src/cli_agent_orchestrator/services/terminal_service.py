@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from cli_agent_orchestrator.clients.database import (
+    TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS,
     AmbiguousTerminalIdentity,
     OwnerGrantRejected,
     SessionPrimarySupervisorConflict,
@@ -692,8 +693,20 @@ def reconcile_terminal_runtime(terminal_id: str, provider=None) -> bool | None:
     observation = _runtime_death_observation(metadata, provider)
     if observation is not True:
         return observation
-    exited, cancelled_workflow_ids = mark_terminal_runtime_exited_with_workflow_ids(terminal_id)
+    observed_authority = {
+        field: metadata.get(field) for field in TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
+    }
+    exited, cancelled_workflow_ids = mark_terminal_runtime_exited_with_workflow_ids(
+        terminal_id,
+        expected_runtime_authority=observed_authority,
+    )
     if not exited:
+        current = get_terminal_metadata(terminal_id)
+        if current and current.get("runtime_lifecycle") == TerminalLifecycle.EXITED.value:
+            # Another reconciler won the same terminalization. Its durable
+            # transaction already owns cleanup, cancellation, and lease
+            # release, so this observer performs no duplicate side effect.
+            return True
         return None
     cancel_child_assignments_for_terminal(terminal_id)
     provider_manager.cleanup_provider(terminal_id)

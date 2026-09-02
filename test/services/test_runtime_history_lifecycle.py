@@ -427,7 +427,7 @@ def test_graceful_exit_releases_only_after_positive_runtime_death(monkeypatch):
     monkeypatch.setattr(
         terminal_service,
         "mark_terminal_runtime_exited_with_workflow_ids",
-        lambda terminal_id: (exited.append(terminal_id) or True, []),
+        lambda terminal_id, **_kwargs: (exited.append(terminal_id) or True, []),
     )
     monkeypatch.setattr(terminal_service.tmux_client, "window_exists", lambda *_: True)
     monkeypatch.setattr(terminal_service.tmux_client, "get_pane_current_command", lambda *_: "bash")
@@ -482,6 +482,115 @@ def test_missing_tmux_session_converges_running_runtime_and_repeated_exit(
     send.assert_not_called()
 
 
+def test_stale_death_observation_cannot_overwrite_recovery_fence(lifecycle_db, monkeypatch):
+    _terminal("writer00", "cao-session", "/worktree-a", write_enabled=True)
+    with database.SessionLocal() as db:
+        terminal = db.get(database.TerminalModel, "writer00")
+        terminal.runtime_lifecycle = "running"
+        terminal.runtime_generation = "runtime-generation-a"
+        terminal.runtime_generation_origin = "launch"
+        terminal.runtime_pane_id = "%41"
+        terminal.runtime_pane_pid = 4141
+        terminal.runtime_process_start_ticks = 111
+        terminal.runtime_process_group_id = 4141
+        terminal.runtime_process_session_id = 4141
+        db.commit()
+
+    cleanup = MagicMock()
+    cancel = MagicMock()
+    wake = MagicMock()
+    monkeypatch.setattr(terminal_service, "_runtime_death_observation", lambda *_: True)
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", cleanup)
+    monkeypatch.setattr(terminal_service, "cancel_child_assignments_for_terminal", cancel)
+    monkeypatch.setattr(terminal_service, "_wake_queued_provider_execution", wake)
+    original_mark = terminal_service.mark_terminal_runtime_exited_with_workflow_ids
+
+    def fence_then_compare(terminal_id, **kwargs):
+        with database.SessionLocal() as db:
+            terminal = db.get(database.TerminalModel, terminal_id)
+            lease = db.get(database.WorktreeWriterLeaseModel, "/worktree-a")
+            terminal.runtime_lifecycle = "recovery_fenced"
+            terminal.writer_authority_generation = "successor-writer-generation"
+            terminal.recovery_fenced_reason = "owner_authorized_recovery_takeover"
+            terminal.replaced_by_terminal_id = "successor00"
+            lease.terminal_id = "successor00"
+            lease.authority_generation = "successor-writer-generation"
+            db.commit()
+        return original_mark(terminal_id, **kwargs)
+
+    monkeypatch.setattr(
+        terminal_service,
+        "mark_terminal_runtime_exited_with_workflow_ids",
+        fence_then_compare,
+    )
+
+    assert terminal_service.reconcile_terminal_runtime("writer00") is None
+    current = get_terminal_metadata("writer00")
+    assert current["runtime_lifecycle"] == "recovery_fenced"
+    assert current["replaced_by_terminal_id"] == "successor00"
+    leases = list_worktree_writer_leases()
+    assert len(leases) == 1
+    assert leases[0]["canonical_worktree"] == "/worktree-a"
+    assert leases[0]["terminal_id"] == "successor00"
+    assert leases[0]["authority_generation"] == "successor-writer-generation"
+    cleanup.assert_not_called()
+    cancel.assert_not_called()
+    wake.assert_not_called()
+
+
+def test_stale_death_observation_cannot_terminalize_new_runtime_generation(
+    lifecycle_db, monkeypatch
+):
+    _terminal("writer00", "cao-session", "/worktree-a", write_enabled=True)
+    with database.SessionLocal() as db:
+        terminal = db.get(database.TerminalModel, "writer00")
+        terminal.runtime_lifecycle = "running"
+        terminal.runtime_generation = "runtime-generation-a"
+        terminal.runtime_generation_origin = "launch"
+        terminal.runtime_pane_id = "%41"
+        terminal.runtime_pane_pid = 4141
+        terminal.runtime_process_start_ticks = 111
+        terminal.runtime_process_group_id = 4141
+        terminal.runtime_process_session_id = 4141
+        db.commit()
+
+    cleanup = MagicMock()
+    cancel = MagicMock()
+    wake = MagicMock()
+    monkeypatch.setattr(terminal_service, "_runtime_death_observation", lambda *_: True)
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", cleanup)
+    monkeypatch.setattr(terminal_service, "cancel_child_assignments_for_terminal", cancel)
+    monkeypatch.setattr(terminal_service, "_wake_queued_provider_execution", wake)
+    original_mark = terminal_service.mark_terminal_runtime_exited_with_workflow_ids
+
+    def reconnect_then_compare(terminal_id, **kwargs):
+        with database.SessionLocal() as db:
+            terminal = db.get(database.TerminalModel, terminal_id)
+            terminal.runtime_generation = "runtime-generation-b"
+            terminal.runtime_pane_id = "%42"
+            terminal.runtime_pane_pid = 4242
+            terminal.runtime_process_start_ticks = 222
+            terminal.runtime_process_group_id = 4242
+            terminal.runtime_process_session_id = 4242
+            db.commit()
+        return original_mark(terminal_id, **kwargs)
+
+    monkeypatch.setattr(
+        terminal_service,
+        "mark_terminal_runtime_exited_with_workflow_ids",
+        reconnect_then_compare,
+    )
+
+    assert terminal_service.reconcile_terminal_runtime("writer00") is None
+    current = get_terminal_metadata("writer00")
+    assert current["runtime_lifecycle"] == "running"
+    assert current["runtime_generation"] == "runtime-generation-b"
+    assert list_worktree_writer_leases()[0]["terminal_id"] == "writer00"
+    cleanup.assert_not_called()
+    cancel.assert_not_called()
+    wake.assert_not_called()
+
+
 def test_graceful_exit_uncertainty_keeps_pending_ownership(monkeypatch):
     metadata = {
         "id": "writer00",
@@ -506,7 +615,7 @@ def test_graceful_exit_uncertainty_keeps_pending_ownership(monkeypatch):
     monkeypatch.setattr(
         terminal_service,
         "mark_terminal_runtime_exited_with_workflow_ids",
-        lambda terminal_id: (exited.append(terminal_id) or True, []),
+        lambda terminal_id, **_kwargs: (exited.append(terminal_id) or True, []),
     )
     monkeypatch.setattr(terminal_service.tmux_client, "window_exists", lambda *_: None)
     monkeypatch.setattr(

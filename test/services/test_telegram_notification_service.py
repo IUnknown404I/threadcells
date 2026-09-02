@@ -370,9 +370,9 @@ def test_completion_winning_before_cancellation_suppresses_failure(telegram_stat
     monkeypatch.setattr(terminal_service, "_wake_queued_provider_execution", MagicMock())
     original_exit = terminal_service.mark_terminal_runtime_exited_with_workflow_ids
 
-    def complete_then_exit(root: str) -> tuple[bool, list[int]]:
+    def complete_then_exit(root: str, **kwargs) -> tuple[bool, list[int]]:
         assert database.set_workflow_terminal_state(root, "terminal", "completion won")
-        return original_exit(root)
+        return original_exit(root, **kwargs)
 
     monkeypatch.setattr(
         terminal_service, "mark_terminal_runtime_exited_with_workflow_ids", complete_then_exit
@@ -407,7 +407,7 @@ def test_replacement_workflow_winning_exit_gets_exact_failure_notification(
 
     replacement_workflow_id = None
 
-    def replace_then_exit(root: str) -> tuple[bool, list[int]]:
+    def replace_then_exit(root: str, **kwargs) -> tuple[bool, list[int]]:
         nonlocal replacement_workflow_id
         assert database.set_workflow_terminal_state(root, "terminal", "first completed")
         with database.SessionLocal() as db:
@@ -415,7 +415,7 @@ def test_replacement_workflow_winning_exit_gets_exact_failure_notification(
             db.add(replacement)
             db.commit()
             replacement_workflow_id = replacement.id
-        return original_exit(root)
+        return original_exit(root, **kwargs)
 
     monkeypatch.setattr(
         terminal_service,
@@ -448,8 +448,8 @@ def test_failure_claim_stays_bound_when_a_new_workflow_opens_after_cancellation(
     with database.SessionLocal() as db:
         old_workflow_id = db.query(WorkflowModel.id).scalar()
 
-    def exit_and_reopen(root: str) -> tuple[bool, list[int]]:
-        result = original_exit(root)
+    def exit_and_reopen(root: str, **kwargs) -> tuple[bool, list[int]]:
+        result = original_exit(root, **kwargs)
         with database.SessionLocal() as db:
             db.add(WorkflowModel(root_terminal_id=root, status="open"))
             db.commit()

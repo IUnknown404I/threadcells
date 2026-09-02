@@ -490,7 +490,9 @@ def _cleanup_browser_cache(
         )
 
 
-def _reconcile_writer_leases(summary: HousekeepingSummary) -> None:
+def _reconcile_writer_leases(
+    summary: HousekeepingSummary, *, proc_root: Path = Path("/proc")
+) -> None:
     """Retire runtimes only after exact positive process/tmux death evidence."""
     from cli_agent_orchestrator.clients.database import (
         get_terminal_metadata,
@@ -529,7 +531,7 @@ def _reconcile_writer_leases(summary: HousekeepingSummary) -> None:
         if summary.dry_run:
             summary.writer_leases_reconciled += 1
             continue
-        reconciled = reconcile_terminal_runtime(terminal_id)
+        reconciled = reconcile_terminal_runtime(terminal_id, proc_root=proc_root)
         if reconciled is True:
             summary.writer_leases_reconciled += 1
             continue

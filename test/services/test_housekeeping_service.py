@@ -302,7 +302,7 @@ def test_writer_lease_reconciliation_requires_positive_tmux_death(monkeypatch):
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.terminal_service.reconcile_terminal_runtime",
-        lambda terminal_id: retired.append(terminal_id) or True,
+        lambda terminal_id, **_kwargs: retired.append(terminal_id) or True,
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.cancel_child_assignments_for_terminal",

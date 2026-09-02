@@ -678,7 +678,28 @@ def _runtime_death_observation(metadata: Dict, provider=None) -> bool | None:
     return None
 
 
-def reconcile_terminal_runtime(terminal_id: str, provider=None) -> bool | None:
+def _retire_observed_dead_runtime(
+    metadata: Dict, *, proc_root: Path = Path("/proc")
+) -> tuple[bool, str | None]:
+    """Fence the exact old process tree before durable writer release.
+
+    The #95 takeover boundary already owns the canonical fail-closed proof for
+    a missing tmux window and the exact retirement path for an idle pane.  Keep
+    runtime-death reconciliation on that same authority instead of treating a
+    missing window as proof that an orphaned writer process also disappeared.
+    The import is intentionally local because the takeover service uses the
+    terminal creation primitives from this module.
+    """
+    from cli_agent_orchestrator.services.recovery_takeover_service import (
+        _retire_recovery_runtime,
+    )
+
+    return _retire_recovery_runtime(metadata, proc_root=proc_root)
+
+
+def reconcile_terminal_runtime(
+    terminal_id: str, provider=None, *, proc_root: Path = Path("/proc")
+) -> bool | None:
     """Persist a positive runtime-death observation without deleting history."""
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
@@ -706,6 +727,24 @@ def reconcile_terminal_runtime(terminal_id: str, provider=None) -> bool | None:
     observation = _runtime_death_observation(metadata, provider)
     if observation is not True:
         return observation
+    # Releasing a writer lease is safe only after the exact persisted writer
+    # process authority has been retired or proven absent. Read-only legacy
+    # terminals do not hold that filesystem authority and keep the established
+    # #58 convergence path.
+    if metadata.get("write_enabled") is True or metadata.get("writer_authority_generation"):
+        retired, retirement_reason = _retire_observed_dead_runtime(metadata, proc_root=proc_root)
+        if not retired:
+            if retirement_reason in {
+                "RECOVERY_RUNTIME_PROCESS_TREE_ACTIVE",
+                "RECOVERY_HEALTHY_RUNTIME_ACTIVE",
+            }:
+                return False
+            logger.warning(
+                "Runtime %s death observation remained fail-closed: %s",
+                terminal_id,
+                retirement_reason or "RECOVERY_RUNTIME_INVENTORY_UNAVAILABLE",
+            )
+            return None
     observed_authority = {
         field: metadata.get(field) for field in TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
     }

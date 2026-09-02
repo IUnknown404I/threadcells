@@ -135,6 +135,7 @@ async function sessionSummaries(): Promise<SessionSummary[]> {
 }
 
 export function installUiReadModelSpies() {
+  vi.spyOn(api, 'getRecoveryTakeoverCapabilities').mockResolvedValue({ capabilities: [] })
   vi.spyOn(api, 'listSessionSummaries').mockImplementation(async params => {
     const resolved = params || {}
     const query = resolved.query?.toLowerCase() || ''

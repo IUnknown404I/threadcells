@@ -304,6 +304,52 @@ def preview_recovery_takeover(
     }
 
 
+def _recovery_takeover_capability(terminal_id: str) -> dict[str, Any]:
+    """Fast-fail known blockers, then defer the positive decision to preview."""
+    durable = recovery_takeover_durable_eligibility(terminal_id)
+    terminal = durable.get("terminal")
+    if not durable["eligible"] or terminal is None:
+        return durable
+    absent, runtime_reason = _physical_runtime_absence(terminal)
+    if not absent:
+        return {**durable, "eligible": False, "reason_code": runtime_reason}
+    # Worktree safety and the final combined decision remain owned by the
+    # canonical operator-preview evaluator. Repeating the read is intentional:
+    # it closes rather than opens any race between capability and action use.
+    return preview_recovery_takeover(terminal_id)
+
+
+def list_recovery_takeover_capabilities(
+    terminal_ids: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Return a fail-closed, non-secret action capability projection.
+
+    UI surfaces must not guess recovery safety from lifecycle labels. The
+    operator-only preview remains the source of truth; this bounded projection
+    exposes only whether an action may be offered and its stable reason code.
+    """
+    capabilities: list[dict[str, Any]] = []
+    for terminal_id in terminal_ids:
+        try:
+            preview = _recovery_takeover_capability(terminal_id)
+            eligible = preview.get("eligible") is True
+            reason_code = preview.get("reason_code")
+        except Exception:
+            logger.exception("Recovery eligibility inventory failed for terminal %s", terminal_id)
+            eligible = False
+            reason_code = "RECOVERY_ELIGIBILITY_UNAVAILABLE"
+        capabilities.append(
+            {
+                "terminal_id": terminal_id,
+                "eligible": eligible,
+                "reason_code": (
+                    None if eligible else str(reason_code or "RECOVERY_TAKEOVER_REJECTED")
+                ),
+            }
+        )
+    return {"capabilities": capabilities}
+
+
 def request_recovery_takeover(
     *,
     request_id: str,

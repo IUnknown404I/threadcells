@@ -243,6 +243,21 @@ class RecoveryTakeoverRequest(BaseModel):
     owner_grant_launch_id: str
 
 
+class RecoveryTakeoverCapabilitiesRequest(BaseModel):
+    """Bounded, non-secret recovery eligibility projection for UI actions."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    terminal_ids: List[TerminalId] = Field(min_length=1, max_length=100)
+
+    @field_validator("terminal_ids")
+    @classmethod
+    def terminal_ids_must_be_unique(cls, value: List[str]) -> List[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("terminal_ids must be unique")
+        return value
+
+
 class RegistryImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -2092,6 +2107,26 @@ async def preview_terminal_recovery_takeover(
             str(terminal_id),
             expected_authority_generation=expected_authority_generation,
             expected_runtime_generation=expected_runtime_generation,
+        ),
+    )
+
+
+@app.post("/recovery-takeovers/capabilities")
+async def list_recovery_takeover_capabilities(
+    body: RecoveryTakeoverCapabilitiesRequest,
+) -> Dict[str, Any]:
+    """Project only safe eligibility needed to render recovery actions.
+
+    The detailed preview and every mutating operation remain behind operator
+    authentication. This projection deliberately omits worktree paths and
+    authority generations while reusing the canonical backend eligibility
+    evaluator.
+    """
+    return cast(
+        Dict[str, Any],
+        await _run_operational_io(
+            recovery_takeover_service.list_recovery_takeover_capabilities,
+            body.terminal_ids,
         ),
     )
 

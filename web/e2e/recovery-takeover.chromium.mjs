@@ -93,6 +93,9 @@ const server = http.createServer(async (request, response) => {
     worktree: { state: 'dirty', dirty: true, reason_code: null },
     consequence: 'OLD_SUPERVISOR_PERMANENTLY_LOSES_WRITER_AUTHORITY',
   })
+  if (request.method === 'POST' && url.pathname === '/recovery-takeovers/capabilities') return json(response, {
+    capabilities: [{ terminal_id: terminal.id, eligible: true, reason_code: null }],
+  })
   if (request.method === 'GET' && url.pathname === '/agents/providers') return json(response, [{ name: 'codex', binary: 'codex', installed: true }])
   if (request.method === 'GET' && url.pathname === '/agents/profiles') return json(response, [{ name: terminal.agent_profile, description: 'Exceptional owner executor', source: 'built-in', owner_authorization_required: true }])
   if (request.method === 'GET' && url.pathname === '/projects') return json(response, [])

@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from threading import Lock
 from time import sleep
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -99,6 +100,134 @@ def test_generation_mismatch_fails_closed(monkeypatch):
         False,
         "RECOVERY_RUNTIME_AUTHORITY_AMBIGUOUS",
     )
+
+
+def test_capability_projection_reuses_preview_and_omits_authority_details(monkeypatch):
+    previews = {
+        "a11ce001": {
+            "eligible": True,
+            "reason_code": None,
+            "terminal": {"launch_worktree": "/private/worktree", "runtime_generation": "secret"},
+        },
+        "b22ce001": {
+            "eligible": False,
+            "reason_code": "RECOVERY_HEALTHY_RUNTIME_ACTIVE",
+            "terminal": {"launch_worktree": "/private/other"},
+        },
+    }
+    monkeypatch.setattr(
+        service,
+        "_recovery_takeover_capability",
+        lambda terminal_id, **_kwargs: previews[terminal_id],
+    )
+
+    assert service.list_recovery_takeover_capabilities(["a11ce001", "b22ce001"]) == {
+        "capabilities": [
+            {"terminal_id": "a11ce001", "eligible": True, "reason_code": None},
+            {
+                "terminal_id": "b22ce001",
+                "eligible": False,
+                "reason_code": "RECOVERY_HEALTHY_RUNTIME_ACTIVE",
+            },
+        ]
+    }
+
+
+def test_capability_projection_fails_closed_when_inventory_raises(monkeypatch):
+    monkeypatch.setattr(
+        service,
+        "_recovery_takeover_capability",
+        lambda _terminal_id, **_kwargs: (_ for _ in ()).throw(OSError("inventory unavailable")),
+    )
+
+    assert service.list_recovery_takeover_capabilities(["a11ce001"]) == {
+        "capabilities": [
+            {
+                "terminal_id": "a11ce001",
+                "eligible": False,
+                "reason_code": "RECOVERY_ELIGIBILITY_UNAVAILABLE",
+            }
+        ]
+    }
+
+
+def test_capability_fast_path_does_not_probe_runtime_for_durable_rejection(monkeypatch):
+    monkeypatch.setattr(
+        service,
+        "recovery_takeover_durable_eligibility",
+        lambda *_args, **_kwargs: {
+            "eligible": False,
+            "reason_code": "RECOVERY_TARGET_NOT_TAKEOVER_ELIGIBLE",
+            "terminal": {"id": "a11ce001"},
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "_physical_runtime_absence",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("durably blocked capability must not inspect runtime")
+        ),
+    )
+
+    result = service._recovery_takeover_capability("a11ce001")
+    assert result["eligible"] is False
+    assert result["reason_code"] == "RECOVERY_TARGET_NOT_TAKEOVER_ELIGIBLE"
+
+
+def test_capability_fast_path_does_not_scan_worktree_for_active_runtime(monkeypatch):
+    monkeypatch.setattr(
+        service,
+        "recovery_takeover_durable_eligibility",
+        lambda *_args, **_kwargs: {
+            "eligible": True,
+            "reason_code": None,
+            "terminal": {"id": "a11ce001"},
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "_physical_runtime_absence",
+        lambda *_args, **_kwargs: (False, "RECOVERY_HEALTHY_RUNTIME_ACTIVE"),
+    )
+    monkeypatch.setattr(
+        service,
+        "_worktree_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("active runtime must block before Git inventory")
+        ),
+    )
+
+    result = service._recovery_takeover_capability("a11ce001")
+    assert result["eligible"] is False
+    assert result["reason_code"] == "RECOVERY_HEALTHY_RUNTIME_ACTIVE"
+
+
+def test_capability_positive_path_defers_to_canonical_preview(monkeypatch):
+    terminal = {"id": "a11ce001"}
+    monkeypatch.setattr(
+        service,
+        "recovery_takeover_durable_eligibility",
+        lambda *_args, **_kwargs: {
+            "eligible": True,
+            "reason_code": None,
+            "terminal": terminal,
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "_physical_runtime_absence",
+        lambda candidate: (candidate is terminal, "RECOVERY_RUNTIME_PRESENT"),
+    )
+    preview = {
+        "eligible": True,
+        "reason_code": None,
+        "terminal": {"id": "a11ce001", "writer_authority_generation": "writer-2"},
+    }
+    canonical_preview = Mock(return_value=preview)
+    monkeypatch.setattr(service, "preview_recovery_takeover", canonical_preview)
+
+    assert service._recovery_takeover_capability("a11ce001") is preview
+    canonical_preview.assert_called_once_with("a11ce001")
 
 
 def test_invalid_owner_grant_cannot_retire_old_runtime(monkeypatch):

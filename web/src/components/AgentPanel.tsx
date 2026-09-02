@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useRef } from 'react'
 import { useStore } from '../store'
-import { AgentSummary, AgentProfileInfo, OwnerLaunchGrant, Project, ProviderInfo, RecoveryTakeoverPreview, Session, SessionSummary, TerminalMeta, api } from '../api'
+import { AgentSummary, AgentProfileInfo, OwnerLaunchGrant, Project, ProviderInfo, Session, SessionSummary, TerminalMeta, api } from '../api'
 import { Bot, Play, Trash2, ChevronRight, Terminal as TermIcon, Monitor, Package, FolderOpen, Search, Mail, Plus, LogOut, FileText, X, LoaderCircle, ShieldAlert } from 'lucide-react'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
@@ -16,6 +16,8 @@ import { useAgentSummaryFeed, useNearViewport, useSessionSummaryFeed } from '../
 import { AgentViewControls, type AgentViewLayout } from './AgentViewControls'
 import { useI18n, type TranslationKey } from '../i18n'
 import { ProviderOutcomeNotice } from './ProviderOutcomeNotice'
+import { RecoveryTakeoverAction } from './RecoveryTakeoverAction'
+import { useRecoveryTakeoverCapabilities } from '../recoveryCapabilities'
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })))
 
@@ -163,15 +165,7 @@ export function AgentPanel({
   const [spawnError, setSpawnError] = useState<string | null>(null)
   const [ownerConfirmed, setOwnerConfirmed] = useState(false)
   const [operatorSecret, setOperatorSecret] = useState('')
-  const [pendingRecovery, setPendingRecovery] = useState<AgentSummary | null>(null)
-  const [recoveryPreview, setRecoveryPreview] = useState<RecoveryTakeoverPreview | null>(null)
-  const [recoveryOperatorSecret, setRecoveryOperatorSecret] = useState('')
-  const [recoveryProfile, setRecoveryProfile] = useState('critical_sol_xhigh_owner')
-  const [recoveryProvider, setRecoveryProvider] = useState('codex')
-  const [recoveryConfirmed, setRecoveryConfirmed] = useState(false)
-  const [recoveryInspecting, setRecoveryInspecting] = useState(false)
-  const [recoverySubmitting, setRecoverySubmitting] = useState(false)
-  const [recoveryError, setRecoveryError] = useState<string | null>(null)
+  const [recoveryRefreshKey, setRecoveryRefreshKey] = useState(0)
   const consumedNavigationIntent = useRef<'create-session' | null>(null)
   const sessionFeed = useSessionSummaryFeed(sessionSearch, agentViewMode === 'sessions')
   const activeSessionRecord = sessionFeed.items.find(session => session.id === activeSession) || null
@@ -186,6 +180,8 @@ export function AgentPanel({
     profiles: profileFilters,
     homeFilter,
   }, agentViewMode !== 'sessions')
+  const recoveryAgents = agentViewMode === 'sessions' ? activeSessionFeed.items : filteredAgentFeed.items
+  const recoveryCapabilities = useRecoveryTakeoverCapabilities(recoveryAgents, recoveryRefreshKey)
   const sessionSentinelRef = useNearViewport(sessionFeed.loadMore, sessionFeed.nextOffset !== null && !sessionFeed.loading)
   const activeAgentSentinelRef = useNearViewport(activeSessionFeed.loadMore, activeSessionFeed.nextOffset !== null && !activeSessionFeed.loading)
   const filteredAgentSentinelRef = useNearViewport(filteredAgentFeed.loadMore, filteredAgentFeed.nextOffset !== null && !filteredAgentFeed.loading)
@@ -369,69 +365,6 @@ export function AgentPanel({
     setLiveTerminal({ id: terminalId, provider, agentProfile })
   }
 
-  const openRecoveryTakeover = (terminal: AgentSummary) => {
-    setPendingRecovery(terminal)
-    setRecoveryPreview(null)
-    setRecoveryOperatorSecret('')
-    setRecoveryProfile('critical_sol_xhigh_owner')
-    setRecoveryProvider(defaultProvider(providers))
-    setRecoveryConfirmed(false)
-    setRecoveryError(null)
-  }
-
-  const inspectRecoveryTakeover = async () => {
-    if (!pendingRecovery || !recoveryOperatorSecret || recoveryInspecting) return
-    setRecoveryInspecting(true)
-    setRecoveryError(null)
-    try {
-      await api.createOperatorSession(recoveryOperatorSecret)
-      setRecoveryPreview(await api.getRecoveryTakeoverPreview(pendingRecovery.id))
-    } catch (error: any) {
-      setRecoveryError(error.message || t('agents.recoverFailed'))
-    } finally {
-      setRecoveryOperatorSecret('')
-      setRecoveryInspecting(false)
-    }
-  }
-
-  const submitRecoveryTakeover = async () => {
-    if (!pendingRecovery || !recoveryPreview?.eligible || !recoveryPreview.terminal || !recoveryConfirmed || recoverySubmitting) return
-    setRecoverySubmitting(true)
-    setRecoveryError(null)
-    try {
-      const ownerGrant = await api.createXHighGrant({
-        agent_profile: recoveryProfile,
-        provider: recoveryProvider,
-        project_id: recoveryPreview.terminal.project_id,
-        launch_mode: 'recovery_takeover',
-        target_terminal_id: pendingRecovery.id,
-        expected_authority_generation: recoveryPreview.terminal.writer_authority_generation,
-        expected_runtime_generation: recoveryPreview.terminal.runtime_generation,
-        confirmed: true,
-      })
-      const takeover = await api.createRecoveryTakeover(pendingRecovery.id, {
-        request_id: crypto.randomUUID(),
-        expected_authority_generation: recoveryPreview.terminal.writer_authority_generation,
-        expected_runtime_generation: recoveryPreview.terminal.runtime_generation,
-        agent_profile: recoveryProfile,
-        provider: recoveryProvider,
-        owner_grant_launch_id: ownerGrant.launch_id,
-      }, ownerGrant)
-      if (takeover.state !== 'completed') {
-        throw new Error(t('agents.recoverPending', { state: takeover.state }))
-      }
-      showSnackbar({ type: 'success', message: t('agents.recoverSucceeded', { id: takeover.new_terminal_id }) })
-      setPendingRecovery(null)
-      activeSessionFeed.reload()
-      filteredAgentFeed.reload()
-      sessionFeed.reload()
-    } catch (error: any) {
-      setRecoveryError(error.message || t('agents.recoverFailed'))
-    } finally {
-      setRecoverySubmitting(false)
-    }
-  }
-
   const currentSessionWorkingDirectory = sessionRootWorkDir || ''
   const selectedAddProfile = profiles.find(item => item.name === addProfile.trim())
   const selectedAddProject = projects.find(item => item.projectId === addProjectId)
@@ -550,7 +483,7 @@ export function AgentPanel({
           <button onClick={() => setInboxTerminalId(terminal.id)} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs font-medium rounded-lg transition-colors" title={t('agents.viewInbox')}><Mail size={14} />{t('agents.inbox')}</button>
           <button onClick={() => openTerminal(terminal.id, terminal.provider, terminal.agent_profile)} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium rounded-lg transition-colors" title={t('agents.openLiveTerminal')}><Monitor size={14} />{t('agents.openTerminal')}</button>
           <button onClick={() => setOutputTerminalId(terminal.id)} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs font-medium rounded-lg transition-colors" title={t('agents.viewOutput')}><FileText size={14} />{t('agents.output')}</button>
-          {terminal.context_role === 'supervisor' && terminal.projectId && terminal.lifecycle !== 'exited' && terminal.lifecycle !== 'recovery_fenced' && <button onClick={() => openRecoveryTakeover(terminal)} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-indigo-700 hover:bg-indigo-600 text-white text-xs font-medium rounded-lg transition-colors" title={t('agents.recoverTitle')}><ShieldAlert size={14} />{t('agents.recoverTakeover')}</button>}
+          <RecoveryTakeoverAction agent={terminal} capability={recoveryCapabilities[terminal.id]} onCompleted={() => { setRecoveryRefreshKey(value => value + 1); activeSessionFeed.reload(); filteredAgentFeed.reload(); sessionFeed.reload() }} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-indigo-700 hover:bg-indigo-600 text-white text-xs font-medium rounded-lg transition-colors"/>
           <button onClick={() => setPendingExit(toTerminalMeta(terminal))} disabled={exitingTerminal === terminal.id || terminal.lifecycle === 'exited' || terminal.lifecycle === 'recovery_fenced'} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-amber-600 hover:bg-amber-500 disabled:opacity-40 text-white text-xs font-medium rounded-lg transition-colors" title={t('agents.gracefulExitTitle')}><LogOut size={14} />{exitingTerminal === terminal.id ? t('agents.exiting') : t('agents.gracefulExit')}</button>
           <button onClick={() => setPendingClose(toTerminalMeta(terminal))} disabled={closingTerminal === terminal.id || terminal.lifecycle !== 'exited'} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-red-600 hover:bg-red-500 disabled:opacity-40 text-white text-xs font-medium rounded-lg transition-colors" title={terminal.lifecycle === 'exited' ? t('home.deleteExited') : t('home.exitBeforeDelete')}><Trash2 size={14} />{closingTerminal === terminal.id ? t('agents.deleting') : t('common.delete')}</button>
         </div>
@@ -905,57 +838,6 @@ export function AgentPanel({
         onConfirm={handleExitTerminal}
         onCancel={() => setPendingExit(null)}
       />
-
-      {pendingRecovery && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6">
-          <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={() => !recoverySubmitting && setPendingRecovery(null)} />
-          <div role="dialog" aria-modal="true" aria-labelledby="recovery-takeover-title" className="relative max-h-[94vh] w-full max-w-2xl overflow-y-auto rounded-2xl border border-indigo-700/60 bg-gray-900 shadow-2xl shadow-black/60">
-            <div className="flex items-start justify-between gap-4 border-b border-gray-700/60 p-4 sm:p-5">
-              <div className="min-w-0">
-                <h3 id="recovery-takeover-title" className="text-base font-semibold text-gray-100">{t('agents.recoverTitle')}</h3>
-                <p className="mt-1 text-xs text-gray-400">{t('agents.recoverHelp')}</p>
-              </div>
-              <button type="button" aria-label={t('common.close')} disabled={recoverySubmitting} onClick={() => setPendingRecovery(null)} className="min-h-11 min-w-11 rounded-lg text-gray-400 hover:bg-gray-800 hover:text-gray-100 disabled:opacity-40"><X className="mx-auto" size={18}/></button>
-            </div>
-            <div className="space-y-4 p-4 sm:p-5">
-              <dl className="grid gap-3 rounded-xl border border-gray-700/50 bg-gray-950/50 p-3 text-xs sm:grid-cols-2">
-                <div><dt className="text-gray-500">{t('agents.terminalId')}</dt><dd className="mt-1 break-all font-mono text-gray-200">{pendingRecovery.id}</dd></div>
-                <div><dt className="text-gray-500">{t('statistics.session')}</dt><dd className="mt-1 break-all text-gray-200">{sessionDisplayName(pendingRecovery.session_name)}</dd></div>
-                <div><dt className="text-gray-500">{t('common.project')}</dt><dd className="mt-1 break-all text-gray-200">{pendingRecovery.project_name || pendingRecovery.projectId}</dd></div>
-                <div><dt className="text-gray-500">{t('agents.status')}</dt><dd className="mt-1 text-gray-200">{t(statusTranslationKey(terminalBadgeStatus(pendingRecovery)))}</dd></div>
-                <div className="sm:col-span-2"><dt className="text-gray-500">{t('agents.recoverWorktree')}</dt><dd className="mt-1 break-all font-mono text-gray-200">{pendingRecovery.launch_worktree}</dd></div>
-              </dl>
-
-              {!recoveryPreview && <div className="rounded-xl border border-amber-700/50 bg-amber-950/20 p-3">
-                <label className="block text-xs text-amber-200/80">{t('agents.operatorSecret')}<input type="password" autoComplete="current-password" value={recoveryOperatorSecret} onChange={event => setRecoveryOperatorSecret(event.target.value)} className="mt-1 min-h-11 w-full rounded-lg border border-amber-700/60 bg-gray-950 px-3 text-sm text-gray-100 focus:border-amber-400 focus:outline-none" /></label>
-                <button type="button" onClick={inspectRecoveryTakeover} disabled={!recoveryOperatorSecret || recoveryInspecting} className="mt-3 min-h-11 w-full rounded-lg bg-indigo-700 px-4 text-sm font-medium text-white hover:bg-indigo-600 disabled:opacity-40">{recoveryInspecting ? t('common.loading') : t('agents.recoverInspect')}</button>
-              </div>}
-
-              {recoveryPreview && <>
-                <div role="status" className={`rounded-xl border p-3 text-sm ${recoveryPreview.eligible ? 'border-emerald-700/50 bg-emerald-950/20 text-emerald-200' : 'border-red-700/50 bg-red-950/30 text-red-200'}`}>
-                  {recoveryPreview.eligible ? t('agents.recoverEligible') : t('agents.recoverBlocked', { reason: recoveryPreview.reason_code || t('status.unknown') })}
-                </div>
-                <div className="rounded-xl border border-gray-700/50 bg-gray-950/50 p-3 text-sm">
-                  <p className="text-gray-400">{t('agents.recoverWorktree')}</p>
-                  <p className="mt-1 text-gray-200">{recoveryPreview.worktree?.state === 'dirty' ? t('agents.recoverDirty') : recoveryPreview.worktree?.state === 'clean' ? t('agents.recoverClean') : t('agents.recoverUnknown')}</p>
-                </div>
-                {recoveryPreview.eligible && <>
-                  <div className="grid gap-3 sm:grid-cols-2">
-                    <div><label className="mb-1 block text-xs text-gray-500">{t('common.provider')}</label><CustomSelect value={recoveryProvider} onChange={setRecoveryProvider} placeholder={t('common.selectProvider')} options={(providers.length > 0 ? providers : UNAVAILABLE_PROVIDER_FALLBACK).map(item => providerSelectOption(item, t))}/></div>
-                    <div><label className="mb-1 block text-xs text-gray-500">{t('agents.agentProfile')}</label><ProfilePicker value={recoveryProfile} onChange={setRecoveryProfile} profiles={profiles.filter(item => item.owner_authorization_required)}/></div>
-                  </div>
-                  <div className="rounded-xl border border-red-700/50 bg-red-950/20 p-3 text-sm text-red-100">
-                    <p>{t('agents.recoverConsequence')}</p>
-                    <label className="mt-3 flex min-h-11 items-center gap-2 text-xs"><input aria-label={t('agents.recoverConfirmAria')} type="checkbox" checked={recoveryConfirmed} onChange={event => setRecoveryConfirmed(event.target.checked)}/>{t('agents.recoverConfirm')}</label>
-                  </div>
-                  <button type="button" onClick={submitRecoveryTakeover} disabled={!recoveryConfirmed || !recoveryProfile || !recoveryProvider || recoverySubmitting} className="min-h-11 w-full rounded-lg bg-red-700 px-4 text-sm font-semibold text-white hover:bg-red-600 disabled:opacity-40">{recoverySubmitting ? t('agents.recovering') : t('agents.recoverSubmit')}</button>
-                </>}
-              </>}
-              {recoveryError && <div role="alert" className="whitespace-pre-line rounded-lg border border-red-700/50 bg-red-950/40 px-3 py-2 text-sm text-red-300">{recoveryError}</div>}
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Create Session Modal */}
       {showSpawnModal && (

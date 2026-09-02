@@ -35,7 +35,7 @@ For a new installation, follow [Quick Setup](QUICK_SETUP.md). Existing operators
 ## Operational notes
 
 - Recovery takeover is an explicit owner action and fails closed for healthy or actively Processing supervisors.
-- Project-wide resident capacity still applies even though multiple independent Sessions may belong to one Project.
+- Global Resident, Provider, and Work capacity limits still apply even though multiple independent Sessions may belong to one Project.
 - Workflow owner gates remain distinct from queued-input liveness, provider reconnect, and dispatcher failure states.
 
 ## Known limitations

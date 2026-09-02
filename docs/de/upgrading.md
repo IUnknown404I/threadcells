@@ -1,7 +1,7 @@
 ---
 slug: upgrading
 source: docs/UPGRADING.md
-source_sha256: sha256:3c85c3ee65aa5e12117d4ff63b0967e0cfb6f277cfeeb554024ba3843c15840f
+source_sha256: sha256:6b8fc9eedd7c87562991ebed6aa062f97ecd70668491eb0871a81aa57f550786
 ---
 # ThreadCells aktualisieren
 
@@ -22,7 +22,7 @@ Aus dem vorgesehenen Source-Commit:
 
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
-candidate="$PWD/threadcells-candidate/threadcells-0.3.3a0-local"
+candidate="$PWD/threadcells-candidate/threadcells-0.3.4a0-local"
 python3 scripts/verify_local_candidate.py --candidate "$candidate"
 ```
 

@@ -24,7 +24,7 @@ body:
     attributes:
       label: ThreadCells version or revision
       description: Include this when known.
-      placeholder: v0.3.3-alpha or a commit SHA
+      placeholder: v0.3.4-alpha or a commit SHA
   - type: textarea
     id: environment
     attributes:

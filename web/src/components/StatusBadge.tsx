@@ -9,12 +9,14 @@ export function lifecycleBadgeStatus(
   providerLifecycle?: string | null,
   executionState?: string | null,
 ): string {
+  if (providerLifecycle === 'recovery_fenced') {
+    return workflowState ? `WORKFLOW_${workflowState.toUpperCase()}::RecoveryFenced` : 'RecoveryFenced'
+  }
+  if (providerLifecycle === 'exited') {
+    return workflowState ? `WORKFLOW_${workflowState.toUpperCase()}::Exited` : 'Exited'
+  }
   if (!workflowState) return providerStatus || 'unknown'
-  const provider = providerLifecycle === 'recovery_fenced'
-    ? 'RecoveryFenced'
-    : providerLifecycle === 'exited'
-    ? 'Exited'
-    : executionState === 'processing' ? 'Processing'
+  const provider = executionState === 'processing' ? 'Processing'
     : executionState === 'queued_provider_execution' ? 'WaitingProviderSlot'
     : executionState === 'waiting_child_retirement' ? 'WaitingChildRetirement'
     : executionState === 'waiting_resource_recovery' ? 'WaitingResourceRecovery'

@@ -193,6 +193,18 @@ class TestSessionAuthority:
 
     @patch("cli_agent_orchestrator.services.session_service.resolve_session_lifetime")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_recovery_fenced_history_is_not_a_live_runtime_owner(self, mock_tmux, resolve):
+        resolve.return_value = _durable_session(lifecycle="recovery_fenced")
+        mock_tmux.session_exists.return_value = False
+
+        with pytest.raises(SessionLifecycleError) as error:
+            resolve_session_authority("session-lifetime-1", require_live=True)
+
+        assert error.value.reason_code == "SESSION_HISTORY_INELIGIBLE"
+        mock_tmux.get_session_windows.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.session_service.resolve_session_lifetime")
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
     def test_inventory_uncertainty_remains_fail_closed(self, mock_tmux, resolve):
         resolve.return_value = _durable_session()
         mock_tmux.session_exists.return_value = None
@@ -253,6 +265,31 @@ class TestDeleteSession:
 
         assert error.value.reason_code == "SESSION_RUNTIME_ACTIVE"
         resolve.assert_called_once_with("session-lifetime-1")
+        prepare.assert_not_called()
+        cancel.assert_not_called()
+        validate.assert_not_called()
+        cleanup.assert_not_called()
+        providers.cleanup_provider.assert_not_called()
+        delete.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_recovery_fenced_session_is_retained_as_takeover_evidence(self, mock_tmux):
+        mock_tmux.session_exists.return_value = False
+        contexts = self._patch_common(_durable_session(lifecycle="recovery_fenced"))
+        with (
+            contexts[0],
+            contexts[1] as prepare,
+            contexts[2] as cancel,
+            contexts[3] as validate,
+            contexts[4] as cleanup,
+            contexts[5] as providers,
+            contexts[6] as delete,
+            contexts[7],
+        ):
+            with pytest.raises(SessionLifecycleError) as error:
+                delete_session("session-lifetime-1")
+
+        assert error.value.reason_code == "SESSION_RECOVERY_EVIDENCE_PROTECTED"
         prepare.assert_not_called()
         cancel.assert_not_called()
         validate.assert_not_called()

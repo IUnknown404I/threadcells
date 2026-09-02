@@ -115,6 +115,19 @@ describe('StatusBadge', () => {
   })
 
   it.each([
+    ['exited', 'Exited'],
+    ['recovery_fenced', 'Replaced by recovery takeover'],
+  ])('keeps known terminal lifecycle %s when no workflow was tracked', (lifecycle, label) => {
+    render(
+      <StatusBadge
+        status={lifecycleBadgeStatus(null, null, lifecycle)}
+      />
+    )
+    expect(screen.getByText(label)).toBeInTheDocument()
+    expect(screen.queryByText('Unknown')).not.toBeInTheDocument()
+  })
+
+  it.each([
     [{ status: 'completed', lifecycle: 'running', workflow_state: 'open' }, 'Ready', 'Open'],
     [{ status: 'processing', lifecycle: 'running', workflow_state: 'open' }, 'Processing', 'Open'],
     [{ status: 'completed', lifecycle: 'running', workflow_state: 'owner_gate' }, 'Ready', 'Needs owner decision'],

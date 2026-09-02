@@ -75,7 +75,7 @@ export function matchesHomeAgentFilter(terminal: AgentStatusLike, filter: HomeAg
       // against the same raw values so it can also drive the Agents projection.
       return Boolean(terminal.workflow_state)
         && !['owner_gate', 'cancelled', 'completed'].includes(terminal.workflow_state || '')
-        && terminal.lifecycle !== 'exited'
+        && !['exited', 'recovery_fenced'].includes(terminal.lifecycle || '')
         && terminal.status !== 'processing'
     case 'owner_gate':
     case 'cancelled':

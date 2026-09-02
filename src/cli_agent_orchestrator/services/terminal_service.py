@@ -141,7 +141,11 @@ def prove_live_session_runtime_authority(
     active = [
         terminal
         for terminal in terminals
-        if terminal.get("runtime_lifecycle") != TerminalLifecycle.EXITED.value
+        if terminal.get("runtime_lifecycle")
+        not in {
+            TerminalLifecycle.EXITED.value,
+            TerminalLifecycle.RECOVERY_FENCED.value,
+        }
     ]
     if not active:
         return SessionRuntimeAuthorityProof(
@@ -534,6 +538,12 @@ RUNTIME_SKILL_PROMPT_PROVIDERS = {
 SHELL_COMMANDS = {"bash", "sh", "dash", "zsh", "fish"}
 EXIT_CONFIRMATION_TIMEOUT_SECONDS = 5.0
 EXIT_CONFIRMATION_POLL_SECONDS = 0.1
+_POSITIVE_RUNTIME_ABSENCE_REASONS = {
+    "EXIT_SESSION_MISSING",
+    "EXIT_WINDOW_MISSING",
+    "EXIT_PANE_MISSING",
+    "EXIT_PANE_DEAD",
+}
 
 
 @dataclass(frozen=True)
@@ -2575,17 +2585,28 @@ def _validate_exit_provider(metadata: Dict, provider) -> None:
 
 
 def _already_exited_result(terminal_id: str, message: str) -> ExitTerminalResult:
-    """Reconcile positive death and report that no exit command was delivered."""
+    """Reconcile positive death and report that no exit command was delivered.
+
+    A recovery-fenced predecessor is already terminalized but deliberately
+    retains its distinct durable lifecycle for audit and writer fencing. Exit
+    retries therefore succeed without converting that evidence to ``exited``.
+    """
     metadata = get_terminal_metadata(terminal_id)
-    if metadata and metadata.get("runtime_lifecycle") != TerminalLifecycle.EXITED.value:
+    lifecycle = (metadata or {}).get("runtime_lifecycle")
+    terminalized = {
+        TerminalLifecycle.EXITED.value,
+        TerminalLifecycle.RECOVERY_FENCED.value,
+    }
+    if metadata and lifecycle not in terminalized:
         if reconcile_terminal_runtime(terminal_id) is not True:
             raise ExitAuthorityError(
                 "EXIT_DEATH_RECONCILIATION_FAILED",
                 "Provider death was observed but durable exit reconciliation failed",
             )
+        lifecycle = TerminalLifecycle.EXITED.value
     return ExitTerminalResult(
         success=True,
-        lifecycle=TerminalLifecycle.EXITED.value,
+        lifecycle=lifecycle or TerminalLifecycle.EXITED.value,
         outcome="already_exited",
         message=message,
         command_delivered=False,
@@ -2597,11 +2618,24 @@ def exit_terminal(terminal_id: str) -> ExitTerminalResult:
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         raise ValueError(f"Terminal '{terminal_id}' not found")
-    if metadata.get("runtime_lifecycle") == TerminalLifecycle.EXITED.value:
+    if metadata.get("runtime_lifecycle") in {
+        TerminalLifecycle.EXITED.value,
+        TerminalLifecycle.RECOVERY_FENCED.value,
+    }:
         return _already_exited_result(terminal_id, "Terminal was already exited; no command sent")
     provider = provider_manager.get_provider(terminal_id)
     if provider is None:
-        raise ValueError(f"Provider not found for terminal {terminal_id}")
+        reconciled = reconcile_terminal_runtime(terminal_id)
+        if reconciled is True:
+            return _already_exited_result(
+                terminal_id,
+                "Provider runtime was already absent and was reconciled; no command sent",
+            )
+        raise ExitAuthorityError(
+            "EXIT_PROVIDER_AUTHORITY_UNAVAILABLE",
+            "Provider authority is unavailable for a runtime that is not proven exited",
+            inventory_uncertain=reconciled is None,
+        )
     _validate_exit_provider(metadata, provider)
 
     try:
@@ -2630,6 +2664,17 @@ def exit_terminal(terminal_id: str) -> ExitTerminalResult:
                 metadata["tmux_session"], metadata["tmux_window"]
             )
         except PaneTargetError as exc:
+            if exc.reason_code in _POSITIVE_RUNTIME_ABSENCE_REASONS:
+                if reconcile_terminal_runtime(terminal_id, provider) is True:
+                    return _already_exited_result(
+                        terminal_id,
+                        "Provider runtime was already absent and was reconciled; no command sent",
+                    )
+                raise ExitAuthorityError(
+                    "EXIT_DEATH_RECONCILIATION_FAILED",
+                    "Runtime absence was observed but durable exit reconciliation did not converge",
+                    inventory_uncertain=True,
+                ) from exc
             raise ExitAuthorityError(
                 exc.reason_code,
                 str(exc),
@@ -2898,14 +2943,23 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
             lifecycle = metadata.get("runtime_lifecycle")
             if lifecycle != TerminalLifecycle.EXITED.value:
                 reason_code = (
-                    "TERMINAL_EXIT_PENDING"
-                    if lifecycle == TerminalLifecycle.EXIT_PENDING.value
-                    else "TERMINAL_RUNTIME_ACTIVE"
+                    "TERMINAL_RECOVERY_EVIDENCE_PROTECTED"
+                    if lifecycle == TerminalLifecycle.RECOVERY_FENCED.value
+                    else (
+                        "TERMINAL_EXIT_PENDING"
+                        if lifecycle == TerminalLifecycle.EXIT_PENDING.value
+                        else "TERMINAL_RUNTIME_ACTIVE"
+                    )
+                )
+                message = (
+                    "Recovery-fenced terminal history is protected as takeover evidence"
+                    if lifecycle == TerminalLifecycle.RECOVERY_FENCED.value
+                    else "Terminal runtime is not durably exited; use graceful exit and wait for "
+                    "positive provider death before deleting history"
                 )
                 raise TerminalDeletionError(
                     reason_code,
-                    "Terminal runtime is not durably exited; use graceful exit and wait for "
-                    "positive provider death before deleting history",
+                    message,
                 )
 
             # Worktree authority and any required child-result snapshot are

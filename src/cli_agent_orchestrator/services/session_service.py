@@ -76,7 +76,16 @@ class SessionAuthority:
 
     @property
     def has_live_runtime_owner(self) -> bool:
-        return any(terminal.get("runtime_lifecycle") != "exited" for terminal in self.terminals)
+        return any(
+            terminal.get("runtime_lifecycle") not in {"exited", "recovery_fenced"}
+            for terminal in self.terminals
+        )
+
+    @property
+    def has_recovery_fenced_history(self) -> bool:
+        return any(
+            terminal.get("runtime_lifecycle") == "recovery_fenced" for terminal in self.terminals
+        )
 
 
 def resolve_session_authority(identifier: str, *, require_live: bool = False) -> SessionAuthority:
@@ -228,6 +237,14 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                 result["retained_resources"] = authority.retained_resources
                 return result
             terminals = authority.terminals
+
+            # A recovery-fenced predecessor is terminalized, but its durable
+            # relation to the successor remains protected takeover evidence.
+            if authority.has_recovery_fenced_history:
+                raise SessionLifecycleError(
+                    "SESSION_RECOVERY_EVIDENCE_PROTECTED",
+                    "This session contains recovery-takeover evidence and must be retained",
+                )
 
             # A live session remains usable authority even while its provider
             # is Ready.  Session deletion is a historical operation: callers

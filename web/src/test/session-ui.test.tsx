@@ -1038,6 +1038,23 @@ describe('graceful exit authority feedback', () => {
     await waitFor(() => expect(useStore.getState().snackbar?.message).toBe(pending.message))
     expect(screen.getByRole('heading', { name: 'Graceful Exit' })).toBeInTheDocument()
   })
+
+  it('does not offer another exit for recovery-fenced takeover history on Home', async () => {
+    vi.mocked(api.getTerminalStatus).mockResolvedValue({
+      ...terminal,
+      status: 'completed',
+      lifecycle: 'recovery_fenced',
+      workflow_state: null,
+    } as never)
+    render(<DashboardHome onNavigate={() => {}} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand exit' }))
+    const exitAction = await screen.findByTitle('Graceful Exit')
+
+    expect(exitAction).toBeDisabled()
+    expect(screen.getAllByText('Replaced by recovery takeover').length).toBeGreaterThan(0)
+    expect(screen.queryByText('Unknown')).not.toBeInTheDocument()
+  })
 })
 
 describe('owner-authorized recovery takeover', () => {

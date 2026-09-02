@@ -126,6 +126,7 @@ class TestSessionPluginEvents:
             terminals=[],
             deleted=False,
             has_live_runtime_owner=False,
+            has_recovery_fenced_history=False,
         )
         mock_delete_terminals.side_effect = lambda *_args, **_kwargs: (
             call_order.append("delete_terminals")

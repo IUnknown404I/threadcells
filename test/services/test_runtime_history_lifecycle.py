@@ -26,7 +26,11 @@ from cli_agent_orchestrator.clients.database import (
     mark_terminal_runtime_running,
     register_handoff_child,
 )
-from cli_agent_orchestrator.clients.tmux import PaneDeliveryTarget, RuntimePaneTarget
+from cli_agent_orchestrator.clients.tmux import (
+    PaneDeliveryTarget,
+    PaneTargetError,
+    RuntimePaneTarget,
+)
 from cli_agent_orchestrator.services import operations_service, terminal_service
 from cli_agent_orchestrator.services.housekeeping_service import (
     HousekeepingSummary,
@@ -436,6 +440,46 @@ def test_graceful_exit_releases_only_after_positive_runtime_death(monkeypatch):
     assert terminal_service.exit_terminal("writer00").success is True
     assert sent == [(("cao-session", "writer", "/exit"), {"enter_count": 1, "pane_id": "%41"})]
     assert exited == ["writer00"]
+
+
+def test_missing_tmux_session_converges_running_runtime_and_repeated_exit(
+    lifecycle_db, monkeypatch
+):
+    _terminal("writer00", "cao-session", "/worktree-a", write_enabled=True)
+    assert mark_terminal_runtime_running("writer00")
+    provider = MagicMock()
+    provider.terminal_id = "writer00"
+    provider.session_name = "cao-session"
+    provider.window_name = "window-writer00"
+    provider.is_process_alive.return_value = True
+    monkeypatch.setattr(terminal_service.provider_manager, "get_provider", lambda *_: provider)
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", lambda *_: None)
+    monkeypatch.setattr(terminal_service, "cancel_child_assignments_for_terminal", lambda *_: None)
+    monkeypatch.setattr(terminal_service, "_wake_queued_provider_execution", lambda *_: None)
+    monkeypatch.setattr(terminal_service.tmux_client, "window_exists", lambda *_: False)
+    monkeypatch.setattr(
+        terminal_service.tmux_client,
+        "exact_pane_target",
+        MagicMock(side_effect=PaneTargetError("EXIT_SESSION_MISSING", "session absent")),
+    )
+    monkeypatch.setattr(
+        terminal_service.tmux_client,
+        "exact_runtime_target",
+        MagicMock(side_effect=PaneTargetError("EXIT_SESSION_MISSING", "session absent")),
+    )
+    send = MagicMock()
+    monkeypatch.setattr(terminal_service.tmux_client, "send_keys", send)
+
+    first = terminal_service.exit_terminal("writer00")
+    second = terminal_service.exit_terminal("writer00")
+
+    assert first.success is True
+    assert second.success is True
+    assert first.command_delivered is False
+    assert second.command_delivered is False
+    assert get_terminal_metadata("writer00")["runtime_lifecycle"] == "exited"
+    assert list_worktree_writer_leases() == []
+    send.assert_not_called()
 
 
 def test_graceful_exit_uncertainty_keeps_pending_ownership(monkeypatch):

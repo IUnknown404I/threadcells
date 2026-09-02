@@ -5595,8 +5595,29 @@ def reconcile_terminal_context_roles_by_topology(*, dry_run: bool = False) -> in
         return len(changes)
 
 
+TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS = (
+    "session_id",
+    "tmux_session",
+    "tmux_window",
+    "provider",
+    "writer_authority_generation",
+    "runtime_lifecycle",
+    "runtime_pane_id",
+    "runtime_pane_pid",
+    "runtime_generation",
+    "runtime_generation_origin",
+    "runtime_process_start_ticks",
+    "runtime_process_group_id",
+    "runtime_process_session_id",
+    "runtime_operation_kind",
+    "runtime_operation_token",
+)
+
+
 def mark_terminal_runtime_exited_with_workflow_ids(
     terminal_id: str,
+    *,
+    expected_runtime_authority: Mapping[str, Any] | None = None,
 ) -> tuple[bool, List[int]]:
     """Atomically retire runtime and return workflows cancelled by this transition.
 
@@ -5617,6 +5638,18 @@ def mark_terminal_runtime_exited_with_workflow_ids(
         if terminal is None:
             db.rollback()
             return False, []
+        if expected_runtime_authority is not None:
+            if any(
+                field not in expected_runtime_authority
+                or getattr(terminal, field) != expected_runtime_authority[field]
+                for field in TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
+            ):
+                # Runtime observation occurs outside SQLite. A takeover fence,
+                # reconnect, exit claimant, or identity change that wins in
+                # that interval invalidates the observation; stale death must
+                # never terminalize the newer authority.
+                db.rollback()
+                return False, []
         terminal.runtime_lifecycle = "exited"
         terminal.runtime_exited_at = terminal.runtime_exited_at or datetime.now()
         terminal.runtime_operation_kind = None

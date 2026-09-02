@@ -2390,7 +2390,11 @@ class TestGetTerminal:
         terminal = get_terminal("test1234")
         assert terminal["lifecycle"] == "exited"
         assert terminal["workflow_state"] == "owner_gate"
-        mock_mark_exited.assert_called_once_with("test1234")
+        mock_mark_exited.assert_called_once()
+        assert mock_mark_exited.call_args.args == ("test1234",)
+        authority = mock_mark_exited.call_args.kwargs["expected_runtime_authority"]
+        assert authority["tmux_session"] == "cao-session"
+        assert authority["runtime_generation"] is None
 
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_terminal_not_found(self, mock_get_metadata):

@@ -156,11 +156,11 @@ export function installUiReadModelSpies() {
       if (resolved.activities?.length && !resolved.activities.includes(item.activity || '')) return false
       if (resolved.workflowStates?.length && !resolved.workflowStates.includes(item.workflow_state || '')) return false
       if (resolved.profiles?.length && !resolved.profiles.includes(item.agent_profile || '')) return false
-      if (resolved.homeFilter === 'active' && item.lifecycle === 'exited') return false
+      if (resolved.homeFilter === 'active' && ['exited', 'recovery_fenced'].includes(item.lifecycle || '')) return false
       if (resolved.homeFilter === 'waiting' && (
         !item.workflow_state
         || ['owner_gate', 'cancelled', 'completed'].includes(item.workflow_state)
-        || item.lifecycle === 'exited'
+        || ['exited', 'recovery_fenced'].includes(item.lifecycle || '')
         || item.activity === 'processing'
       )) return false
       if (resolved.homeFilter === 'owner_gate' && item.workflow_state !== 'owner_gate') return false
@@ -181,7 +181,7 @@ export function installUiReadModelSpies() {
       waiting: agents.filter(item => (
         Boolean(item.workflow_state)
         && !['owner_gate', 'cancelled', 'completed'].includes(item.workflow_state || '')
-        && item.lifecycle !== 'exited'
+        && !['exited', 'recovery_fenced'].includes(item.lifecycle || '')
         && item.activity !== 'processing'
       )).length,
       owner_gate: agents.filter(item => item.workflow_state === 'owner_gate').length,

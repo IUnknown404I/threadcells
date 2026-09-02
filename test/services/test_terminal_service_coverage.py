@@ -432,6 +432,27 @@ class TestDeleteTerminal:
         assert raised.value.reason_code == "TERMINAL_RUNTIME_ACTIVE"
         prepare.assert_not_called()
 
+    def test_delete_terminal_recovery_fence_is_retained_as_takeover_evidence(self):
+        from cli_agent_orchestrator.services.terminal_service import (
+            TerminalDeletionError,
+            delete_terminal,
+        )
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+                return_value=self._metadata("recovery_fenced"),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.prepare_terminal_for_destruction"
+            ) as prepare,
+        ):
+            with pytest.raises(TerminalDeletionError) as raised:
+                delete_terminal("tid1")
+
+        assert raised.value.reason_code == "TERMINAL_RECOVERY_EVIDENCE_PROTECTED"
+        prepare.assert_not_called()
+
     def test_delete_terminal_identity_change_after_retirement_is_protected(self):
         from cli_agent_orchestrator.services.terminal_service import (
             TerminalDeletionError,

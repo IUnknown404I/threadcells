@@ -415,7 +415,7 @@ export interface Terminal {
 
 export interface ExitTerminalResponse {
   success: boolean
-  lifecycle: 'exited' | 'exit_pending'
+  lifecycle: 'exited' | 'exit_pending' | 'recovery_fenced'
   outcome: 'command_delivered' | 'already_exited' | 'exit_pending'
   message: string
   command_delivered: boolean

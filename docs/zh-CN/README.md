@@ -59,7 +59,7 @@ flowchart LR
 
 ## 安全与预览版本状态
 
-`0.3.3-alpha` 技术预览版支持单台 Ubuntu/Debian Linux 主机，默认采用 loopback 访问，并以 Codex 为首要配置。原生智能体可以执行高权限命令；worktree 不是安全沙箱。评估前请阅读[当前限制](../LIMITATIONS.md)。
+`0.3.4-alpha` 技术预览版支持单台 Ubuntu/Debian Linux 主机，默认采用 loopback 访问，并以 Codex 为首要配置。原生智能体可以执行高权限命令；worktree 不是安全沙箱。评估前请阅读[当前限制](../LIMITATIONS.md)。
 
 公开 OCI 包 `ghcr.io/iunknown404i/threadcells-release-bundle` 携带经过验证的发布归档和证据。它是分发制品，不是 Docker 镜像，也不是受支持的容器部署方式；请参阅[发布流程](../RELEASE_PROCESS.md)。
 

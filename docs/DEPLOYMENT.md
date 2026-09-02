@@ -9,7 +9,7 @@ Build from one exact clean source commit, then verify the candidate before stagi
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
 python3 scripts/verify_local_candidate.py \
-  --candidate "$PWD/threadcells-candidate/threadcells-0.3.3a0-local"
+  --candidate "$PWD/threadcells-candidate/threadcells-0.3.4a0-local"
 ```
 
 The candidate should contain Python code, packaged Web assets, the allowlisted Docs bundle, build identity, checksums, and release metadata from the same revision.

@@ -1,6 +1,6 @@
 {
   "name": "threadcells-website",
-  "version": "0.3.3-alpha",
+  "version": "0.3.4-alpha",
   "private": true,
   "description": "Static public website and launch-media tooling for ThreadCells",
   "scripts": {

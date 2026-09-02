@@ -59,7 +59,7 @@ flowchart LR
 
 ## Sicherheits- und Preview-Status
 
-Die technische Vorschau `0.3.3-alpha` unterstützt einen einzelnen Ubuntu/Debian-Linux-Host, Loopback-first-Zugriff und ein Codex-first-Setup. Native Agenten können mächtige Befehle ausführen; Worktrees sind keine Sicherheits-Sandbox. Siehe vor der Bewertung die [Einschränkungen](../LIMITATIONS.md).
+Die technische Vorschau `0.3.4-alpha` unterstützt einen einzelnen Ubuntu/Debian-Linux-Host, Loopback-first-Zugriff und ein Codex-first-Setup. Native Agenten können mächtige Befehle ausführen; Worktrees sind keine Sicherheits-Sandbox. Siehe vor der Bewertung die [Einschränkungen](../LIMITATIONS.md).
 
 Das öffentliche OCI-Paket `ghcr.io/iunknown404i/threadcells-release-bundle` enthält verifizierte Release-Archive und Nachweise. Es ist ein Distributionsartefakt, kein Docker-Image und kein unterstützter Container-Bereitstellungsmodus; siehe den [Release-Prozess](../RELEASE_PROCESS.md).
 

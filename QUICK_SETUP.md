@@ -22,7 +22,7 @@ npm --version
 
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
-candidate="$PWD/threadcells-candidate/threadcells-0.3.3a0-local"
+candidate="$PWD/threadcells-candidate/threadcells-0.3.4a0-local"
 python3 scripts/verify_local_candidate.py --candidate "$candidate"
 ```
 

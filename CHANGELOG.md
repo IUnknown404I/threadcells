@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4-alpha] - 2026-09-02
+
+### Added
+
+- Add explicit owner-authorized supervisor recovery takeover with durable claims, old-writer fencing, same-work-context preservation, and restart-safe successor admission ([#95](https://github.com/IUnknown404I/threadcells/issues/95)).
+- Allow independent supervisor Sessions in one Project, with an isolated managed worktree, branch, work context, and writer lease for every new writable supervisor—including the first ([#97](https://github.com/IUnknown404I/threadcells/issues/97)).
+
+### Changed
+
+- Treat the registered Project root as canonical Git/source authority rather than the normal writable supervisor directory.
+- Preserve active legacy shared-root Sessions in place while using isolated managed worktrees for new Project-backed writable Sessions.
+
+### Fixed
+
+- Preserve canonical Session lifetime identity through child admission instead of matching ambiguous historical names ([#85](https://github.com/IUnknown404I/threadcells/issues/85)).
+- Reconcile finalized and acknowledged child results into restart-safe retirement, including quiescent completed provider states ([#82](https://github.com/IUnknown404I/threadcells/issues/82)).
+- Represent provider content-unavailable outcomes without retaining, reconstructing, or automatically retrying blocked provider content ([#89](https://github.com/IUnknown404I/threadcells/issues/89)).
+- Make queued canonical workflow work durably wake or reconnect providers and inject FIFO input exactly once, including rolling-upgrade and false-Ready boundaries ([#92](https://github.com/IUnknown404I/threadcells/issues/92)).
+
+### Safety
+
+- Keep one active writer generation per writable work context, reject ordinary same-worktree acquisition, and preserve operation-level locks for exclusive deployment and destructive actions.
+- Fence a replaced supervisor before its recovery successor becomes writable; the old terminal remains auditable as `recovery_fenced`.
+
 ## [0.3.3-alpha] - 2026-08-27
 
 ### Added

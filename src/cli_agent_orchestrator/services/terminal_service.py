@@ -731,7 +731,7 @@ def reconcile_terminal_runtime(
     # process authority has been retired or proven absent. Read-only legacy
     # terminals do not hold that filesystem authority and keep the established
     # #58 convergence path.
-    if metadata.get("write_enabled") is True or metadata.get("writer_authority_generation"):
+    if metadata.get("write_enabled") is True:
         retired, retirement_reason = _retire_observed_dead_runtime(metadata, proc_root=proc_root)
         if not retired:
             if retirement_reason in {

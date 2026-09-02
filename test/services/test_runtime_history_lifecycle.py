@@ -504,6 +504,20 @@ def test_housekeeping_missing_tmux_preserves_live_orphan_writer_authority(
     assert summary.writer_leases_reconciled == 0
 
 
+def test_read_only_legacy_runtime_missing_tmux_still_converges_under_issue_58(
+    lifecycle_db, monkeypatch
+):
+    _terminal("readonly", "cao-readonly", "/legacy-readonly", write_enabled=False)
+    assert mark_terminal_runtime_running("readonly")
+    monkeypatch.setattr(terminal_service, "_runtime_death_observation", lambda *_: True)
+    monkeypatch.setattr(terminal_service.provider_manager, "cleanup_provider", lambda *_: None)
+    monkeypatch.setattr(terminal_service, "_wake_queued_provider_execution", lambda *_: None)
+
+    assert terminal_service.reconcile_terminal_runtime("readonly") is True
+    assert get_terminal_metadata("readonly")["runtime_lifecycle"] == "exited"
+    assert list_worktree_writer_leases() == []
+
+
 def test_completed_historical_contexts_do_not_consume_capacity(monkeypatch):
     monkeypatch.setattr(
         "cli_agent_orchestrator.clients.database.list_all_terminals",

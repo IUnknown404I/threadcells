@@ -840,6 +840,39 @@ def test_session_agents_and_boundaries_use_durable_creation_order(monkeypatch):
     ]
 
 
+def test_session_summary_keeps_known_recovery_lifecycle_separate_from_workflow(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 2, 12, 0, 0)
+    with database.SessionLocal() as db:
+        for terminal_id, creation_order, lifecycle in (
+            ("recovery-predecessor", 1, "recovery_fenced"),
+            ("historical-peer", 2, "exited"),
+        ):
+            db.add(
+                TerminalModel(
+                    id=terminal_id,
+                    tmux_session="cao-recovery-history",
+                    session_id="lifetime-recovery-history",
+                    tmux_window=terminal_id,
+                    provider="codex",
+                    runtime_lifecycle=lifecycle,
+                    creation_order=creation_order,
+                    last_active=now + timedelta(seconds=creation_order),
+                )
+            )
+        db.commit()
+
+    summary = ui_read_model_service.list_session_summaries(limit=10)["items"][0]
+
+    assert summary["status"] == "history"
+    assert summary["active_agent_count"] == 0
+    assert summary["activity_counts"] == {"exited": 1, "recovery_fenced": 1}
+    assert summary["workflow_counts"] == {"untracked": 2}
+    assert summary["first_agent"]["lifecycle"] == "recovery_fenced"
+    assert summary["first_agent"]["activity"] == "recovery_fenced"
+    assert summary["first_agent"]["workflow_state"] is None
+
+
 def test_provider_content_unavailable_projects_recoverable_without_processing(monkeypatch):
     _install_database(monkeypatch)
     now = datetime(2026, 8, 28, 12, 0, 0)

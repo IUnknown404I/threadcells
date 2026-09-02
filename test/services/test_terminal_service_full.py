@@ -2361,11 +2361,20 @@ class TestGetTerminal:
         "cli_agent_orchestrator.services.terminal_service.mark_terminal_runtime_exited_with_workflow_ids",
         return_value=(True, []),
     )
+    @patch(
+        "cli_agent_orchestrator.services.terminal_service.mark_terminal_runtime_recovery_required_with_workflow_ids",
+        return_value=("ineligible", []),
+    )
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_workflow_projection")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_terminal_reports_exited_process_even_if_tmux_metadata_persists(
-        self, mock_get_metadata, mock_get_projection, mock_provider_manager, mock_mark_exited
+        self,
+        mock_get_metadata,
+        mock_get_projection,
+        mock_provider_manager,
+        _mock_mark_recovery,
+        mock_mark_exited,
     ):
         mock_get_metadata.return_value = {
             "id": "test1234",

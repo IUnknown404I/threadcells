@@ -23,6 +23,7 @@ class TerminalLifecycle(str, Enum):
 
     STARTING = "starting"
     RUNNING = "running"
+    RECOVERY_REQUIRED = "recovery_required"
     EXIT_PENDING = "exit_pending"
     EXITED = "exited"
     RECOVERY_FENCED = "recovery_fenced"

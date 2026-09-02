@@ -39,6 +39,7 @@ from cli_agent_orchestrator.clients.database import (
     UnreconciledTerminalAuthority,
     WorktreeWriterLeaseConflict,
     WritableWorkContextConflict,
+    abandon_terminal_runtime_recovery,
     acquire_terminal_runtime_transport,
     bind_terminal_provider_resume_identity,
     bind_workflow_turn_provider_outcome_cursor,
@@ -65,6 +66,7 @@ from cli_agent_orchestrator.clients.database import (
     mark_recovery_takeover_dispatch_uncertain,
     mark_terminal_runtime_exited,
     mark_terminal_runtime_exited_with_workflow_ids,
+    mark_terminal_runtime_recovery_required_with_workflow_ids,
     mark_terminal_runtime_running,
     mark_workflow_provider_reconnect_launch_dispatched,
     persist_terminal_result_snapshot,
@@ -146,6 +148,7 @@ def prove_live_session_runtime_authority(
         not in {
             TerminalLifecycle.EXITED.value,
             TerminalLifecycle.RECOVERY_FENCED.value,
+            TerminalLifecycle.RECOVERY_REQUIRED.value,
         }
     ]
     if not active:
@@ -685,6 +688,16 @@ def reconcile_terminal_runtime(terminal_id: str, provider=None) -> bool | None:
             return True
         _retire_exited_terminal_runtime(metadata)
         return True
+    if metadata.get("runtime_lifecycle") == TerminalLifecycle.RECOVERY_REQUIRED.value:
+        # This is already a durable non-writable recovery boundary. Runtime
+        # cleanup is restart-safe, while only #95 takeover or explicit exit
+        # may consume the preserved work-context generation.
+        _retire_recovery_required_terminal_runtime(metadata)
+        return False
+    if metadata.get("runtime_operation_kind") == "recovery_takeover":
+        # The owner-authorized saga won the terminal-row claim. It alone owns
+        # exact runtime retirement and writer-generation transfer from here.
+        return False
     if metadata.get("runtime_operation_kind") == "reconnect":
         # The exact-session recovery intentionally crosses a shell gap.  That
         # shell is not provider-death evidence while durable reconnect state
@@ -696,6 +709,29 @@ def reconcile_terminal_runtime(terminal_id: str, provider=None) -> bool | None:
     observed_authority = {
         field: metadata.get(field) for field in TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
     }
+    recovery_state, recovery_workflow_ids = (
+        mark_terminal_runtime_recovery_required_with_workflow_ids(
+            terminal_id,
+            expected_runtime_authority=observed_authority,
+        )
+    )
+    if recovery_state == "recovery_required":
+        provider_manager.cleanup_provider(terminal_id)
+        _retire_recovery_required_terminal_runtime(metadata)
+        if recovery_workflow_ids:
+            logger.info(
+                "Terminal %s entered owner-recoverable runtime state; workflows %s were fenced",
+                terminal_id,
+                recovery_workflow_ids,
+            )
+        return False
+    if recovery_state == "stale":
+        current = get_terminal_metadata(terminal_id)
+        if current and current.get("runtime_lifecycle") == "recovery_required":
+            return False
+        if current and current.get("runtime_lifecycle") in {"exited", "recovery_fenced"}:
+            return True
+        return None
     exited, cancelled_workflow_ids = mark_terminal_runtime_exited_with_workflow_ids(
         terminal_id,
         expected_runtime_authority=observed_authority,
@@ -729,10 +765,13 @@ def reconcile_terminal_runtime(terminal_id: str, provider=None) -> bool | None:
     return True
 
 
-def _retire_exited_terminal_runtime(
-    metadata: dict, *, proc_root: Path = Path("/proc")
+def _retire_inactive_terminal_runtime(
+    metadata: dict,
+    *,
+    expected_lifecycle: str,
+    proc_root: Path = Path("/proc"),
 ) -> bool | None:
-    """Retire an exited runtime without deleting its durable terminal history.
+    """Retire an exact inactive runtime without deleting durable history.
 
     This is deliberately fail-closed. A reusable tmux name is never sufficient:
     the exact pane's inherited terminal identity must match the exited DB row.
@@ -741,7 +780,7 @@ def _retire_exited_terminal_runtime(
     if not terminal_id:
         return None
     current = get_terminal_metadata(terminal_id)
-    if not current or current.get("runtime_lifecycle") != TerminalLifecycle.EXITED.value:
+    if not current or current.get("runtime_lifecycle") != expected_lifecycle:
         return None
     try:
         target = tmux_client.exact_runtime_target(
@@ -758,10 +797,10 @@ def _retire_exited_terminal_runtime(
         logger.warning("Exited runtime %s was preserved: %s", terminal_id, exc.reason_code)
         return None
     except Exception:
-        logger.warning("Exited runtime %s inventory failed safely", terminal_id)
+        logger.warning("Inactive runtime %s inventory failed safely", terminal_id)
         return None
     if target.terminal_id != terminal_id:
-        logger.warning("Exited runtime %s identity mismatch; pane preserved", terminal_id)
+        logger.warning("Inactive runtime %s identity mismatch; pane preserved", terminal_id)
         return None
     durable_identity = (
         current.get("runtime_pane_id"),
@@ -777,7 +816,7 @@ def _retire_exited_terminal_runtime(
     )
     if any(value in (None, "") for value in durable_identity):
         logger.warning(
-            "Exited runtime %s has no persisted launch identity; pane preserved", terminal_id
+            "Inactive runtime %s has no persisted launch identity; pane preserved", terminal_id
         )
         return None
     origin = current.get("runtime_generation_origin")
@@ -785,22 +824,46 @@ def _retire_exited_terminal_runtime(
         (origin == "launch") != bool(target.generation_inherited)
     ):
         logger.warning(
-            "Exited runtime %s generation provenance mismatch; pane preserved", terminal_id
+            "Inactive runtime %s generation provenance mismatch; pane preserved", terminal_id
         )
         return None
     if durable_identity != observed_identity:
-        logger.warning("Exited runtime %s launch generation mismatch; pane preserved", terminal_id)
+        logger.warning(
+            "Inactive runtime %s launch generation mismatch; pane preserved", terminal_id
+        )
         return None
     if target.current_command not in SHELL_COMMANDS:
-        logger.warning("Exited runtime %s is not at a shell; pane preserved", terminal_id)
+        logger.warning("Inactive runtime %s is not at a shell; pane preserved", terminal_id)
         return None
     if not tmux_client.retire_runtime_pane(target, proc_root=proc_root):
-        logger.warning("Exited runtime %s could not be retired", terminal_id)
+        logger.warning("Inactive runtime %s could not be retired", terminal_id)
         return False
     logger.info(
-        "Retired exited runtime pane for terminal %s; durable history retained", terminal_id
+        "Retired inactive runtime pane for terminal %s; durable history retained", terminal_id
     )
     return True
+
+
+def _retire_exited_terminal_runtime(
+    metadata: dict, *, proc_root: Path = Path("/proc")
+) -> bool | None:
+    """Retire an exited runtime without deleting its durable terminal history."""
+    return _retire_inactive_terminal_runtime(
+        metadata,
+        expected_lifecycle=TerminalLifecycle.EXITED.value,
+        proc_root=proc_root,
+    )
+
+
+def _retire_recovery_required_terminal_runtime(
+    metadata: dict, *, proc_root: Path = Path("/proc")
+) -> bool | None:
+    """Retire the fenced old runtime while preserving its #95 recovery context."""
+    return _retire_inactive_terminal_runtime(
+        metadata,
+        expected_lifecycle=TerminalLifecycle.RECOVERY_REQUIRED.value,
+        proc_root=proc_root,
+    )
 
 
 def retire_exited_terminal_runtime(
@@ -2152,6 +2215,11 @@ def get_terminal(terminal_id: str) -> Dict:
             TerminalLifecycle.RECOVERY_FENCED.value,
         }:
             status = TerminalStatus.COMPLETED.value
+        elif lifecycle == TerminalLifecycle.RECOVERY_REQUIRED.value:
+            # The provider runtime is gone and its old writer generation is
+            # fenced. Keep the terminal observable without reconstructing a
+            # provider object or pretending that execution remains resident.
+            status = TerminalStatus.IDLE.value
         else:
             provider = provider_manager.get_provider(terminal_id)
             if provider is None:
@@ -2220,27 +2288,31 @@ def get_terminal(terminal_id: str) -> Dict:
             "recovery_fenced"
             if lifecycle == "recovery_fenced"
             else (
-                "exited"
-                if lifecycle == "exited"
+                "waiting_runtime_recovery"
+                if lifecycle == "recovery_required"
                 else (
-                    "processing"
-                    if status == TerminalStatus.PROCESSING.value or execution["active_turn"]
+                    "exited"
+                    if lifecycle == "exited"
                     else (
-                        "queued_provider_execution"
-                        if wait_reason == "provider_capacity"
+                        "processing"
+                        if status == TerminalStatus.PROCESSING.value or execution["active_turn"]
                         else (
-                            "waiting_child_retirement"
-                            if wait_reason == "child_retirement"
+                            "queued_provider_execution"
+                            if wait_reason == "provider_capacity"
                             else (
-                                "waiting_resource_recovery"
-                                if wait_reason == "resource_health"
+                                "waiting_child_retirement"
+                                if wait_reason == "child_retirement"
                                 else (
-                                    "waiting_runtime_recovery"
-                                    if wait_reason == "runtime_recovery"
+                                    "waiting_resource_recovery"
+                                    if wait_reason == "resource_health"
                                     else (
-                                        "waiting_workflow_continuation"
-                                        if wait_reason == "workflow_continuation"
-                                        else "ready"
+                                        "waiting_runtime_recovery"
+                                        if wait_reason == "runtime_recovery"
+                                        else (
+                                            "waiting_workflow_continuation"
+                                            if wait_reason == "workflow_continuation"
+                                            else "ready"
+                                        )
                                     )
                                 )
                             )
@@ -2341,7 +2413,12 @@ def send_input(
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
-        if metadata.get("runtime_lifecycle") in {"exit_pending", "exited"}:
+        if metadata.get("runtime_lifecycle") in {
+            "recovery_required",
+            "exit_pending",
+            "exited",
+            "recovery_fenced",
+        }:
             raise RuntimeError(f"Terminal '{terminal_id}' runtime is not writable")
 
         # Check how many Enter keys the provider needs after paste
@@ -2491,7 +2568,12 @@ def send_special_key(terminal_id: str, key: str) -> bool:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
-        if metadata.get("runtime_lifecycle") in {"exit_pending", "exited"}:
+        if metadata.get("runtime_lifecycle") in {
+            "recovery_required",
+            "exit_pending",
+            "exited",
+            "recovery_fenced",
+        }:
             raise RuntimeError(f"Terminal '{terminal_id}' runtime is not writable")
 
         runtime_operation_token = acquire_terminal_runtime_transport(terminal_id)
@@ -2631,6 +2713,31 @@ def exit_terminal(terminal_id: str) -> ExitTerminalResult:
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         raise ValueError(f"Terminal '{terminal_id}' not found")
+    if metadata.get("runtime_lifecycle") == TerminalLifecycle.RECOVERY_REQUIRED.value:
+        outcome, _cancelled_workflow_ids = abandon_terminal_runtime_recovery(terminal_id)
+        if outcome == "busy":
+            raise ExitAuthorityError(
+                "EXIT_RUNTIME_OPERATION_BUSY",
+                "Owner-authorized recovery takeover is in progress; retry exit safely",
+                inventory_uncertain=True,
+            )
+        if outcome not in {"exited"}:
+            raise ExitAuthorityError(
+                "EXIT_TERMINAL_AUTHORITY_STALE",
+                "Recovery authority changed before graceful exit could converge",
+                inventory_uncertain=True,
+            )
+        provider_manager.cleanup_provider(terminal_id)
+        refreshed = get_terminal_metadata(terminal_id) or metadata
+        _retire_exited_terminal_runtime(refreshed)
+        _wake_queued_provider_execution()
+        return ExitTerminalResult(
+            success=True,
+            lifecycle=TerminalLifecycle.EXITED.value,
+            outcome="already_exited",
+            message="Recovery was not requested; the absent runtime is now exited",
+            command_delivered=False,
+        )
     if metadata.get("runtime_lifecycle") in {
         TerminalLifecycle.EXITED.value,
         TerminalLifecycle.RECOVERY_FENCED.value,

@@ -3033,7 +3033,8 @@ def _migrate_terminal_worktree_authority_columns() -> bool:
             "SELECT launch_worktree, id, writer_authority_generation, CURRENT_TIMESTAMP "
             "FROM terminals "
             "WHERE write_enabled = 1 AND launch_worktree IS NOT NULL "
-            "AND (runtime_lifecycle IS NULL OR runtime_lifecycle NOT IN ('exited', 'recovery_fenced')) "
+            "AND (runtime_lifecycle IS NULL OR runtime_lifecycle "
+            "NOT IN ('recovery_required', 'exited', 'recovery_fenced')) "
             "ORDER BY id"
         )
         for (terminal_id,) in conn.execute(
@@ -4156,6 +4157,8 @@ WITH selected_terminals AS MATERIALIZED (
              WHEN COALESCE(t.runtime_lifecycle, 'starting') = 'recovery_fenced'
                   THEN 'recovery_fenced'
              WHEN COALESCE(t.runtime_lifecycle, 'starting') = 'exited' THEN 'exited'
+             WHEN COALESCE(t.runtime_lifecycle, 'starting') = 'recovery_required'
+                  THEN 'queued'
              WHEN pel.terminal_id IS NOT NULL
                   OR (lw.status = 'open' AND (
                     awt.state = 'claimed'
@@ -4175,6 +4178,8 @@ WITH selected_terminals AS MATERIALIZED (
              WHEN COALESCE(t.runtime_lifecycle, 'starting') = 'recovery_fenced'
                   THEN 'recovery_fenced'
              WHEN COALESCE(t.runtime_lifecycle, 'starting') = 'exited' THEN 'exited'
+             WHEN COALESCE(t.runtime_lifecycle, 'starting') = 'recovery_required'
+                  THEN 'waiting_runtime_recovery'
              WHEN pel.terminal_id IS NOT NULL
                   OR (lw.status = 'open' AND (
                     awt.state = 'claimed'
@@ -4531,7 +4536,11 @@ def _release_or_transfer_worktree_writer_lease(
         TerminalModel.launch_worktree == lease.canonical_worktree,
         TerminalModel.write_enabled.is_(True),
         (TerminalModel.runtime_lifecycle.is_(None))
-        | (TerminalModel.runtime_lifecycle.notin_(("exited", "recovery_fenced"))),
+        | (
+            TerminalModel.runtime_lifecycle.notin_(
+                ("recovery_required", "exited", "recovery_fenced")
+            )
+        ),
         TerminalModel.id.notin_(sorted(excluded)),
     )
     replacement = replacement_query.order_by(TerminalModel.id.asc()).first()
@@ -4981,7 +4990,12 @@ def acquire_provider_execution_decision(
         if terminal is None:
             db.commit()
             return decision(False, "TERMINAL_NOT_FOUND")
-        if terminal.runtime_lifecycle in ("exit_pending", "exited", "recovery_fenced"):
+        if terminal.runtime_lifecycle in (
+            "recovery_required",
+            "exit_pending",
+            "exited",
+            "recovery_fenced",
+        ):
             db.commit()
             return decision(False, "TERMINAL_RUNTIME_NOT_WRITABLE")
         if _terminal_has_pending_provider_reconnect(db, terminal_id):
@@ -5091,7 +5105,11 @@ def mark_terminal_runtime_running(terminal_id: str) -> bool:
     _ensure_terminal_worktree_authority_schema()
     with SessionLocal() as db:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
-        if terminal is None or terminal.runtime_lifecycle in {"exited", "recovery_fenced"}:
+        if terminal is None or terminal.runtime_lifecycle in {
+            "recovery_required",
+            "exited",
+            "recovery_fenced",
+        }:
             return False
         terminal.runtime_lifecycle = "running"
         terminal.runtime_exit_requested_at = None
@@ -5423,7 +5441,12 @@ def _terminal_runtime_mutation_blocked(db, terminal_id: str, now: datetime) -> b
     terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
     if terminal is None:
         return False
-    if terminal.runtime_lifecycle in ("exit_pending", "exited", "recovery_fenced"):
+    if terminal.runtime_lifecycle in (
+        "recovery_required",
+        "exit_pending",
+        "exited",
+        "recovery_fenced",
+    ):
         return True
     if _terminal_has_pending_provider_reconnect(db, terminal_id):
         return True
@@ -5672,6 +5695,192 @@ def mark_terminal_runtime_exited(terminal_id: str) -> bool:
     return exited
 
 
+def mark_terminal_runtime_recovery_required_with_workflow_ids(
+    terminal_id: str,
+    *,
+    expected_runtime_authority: Mapping[str, Any],
+) -> tuple[str, List[int]]:
+    """Fence an unexpectedly lost supervisor runtime without losing #95 recovery.
+
+    ``recovery_required`` is a non-running, non-writable lifecycle boundary.
+    The old writer lease is released, while the immutable writer/runtime
+    generations and work-context binding remain on the terminal as the exact
+    authority a later owner-authorized takeover must present.  This is not a
+    time-based grace period: explicit graceful exit may abandon the recovery
+    opportunity, while #95 may atomically claim it at any later point.
+    """
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_provider_execution_schema()
+    _ensure_child_assignment_schema()
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.get(TerminalModel, terminal_id)
+        if terminal is None:
+            db.rollback()
+            return "stale", []
+        if any(
+            field not in expected_runtime_authority
+            or getattr(terminal, field) != expected_runtime_authority[field]
+            for field in TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
+        ):
+            db.rollback()
+            return "stale", []
+        if terminal.runtime_lifecycle == "recovery_required":
+            db.commit()
+            return "recovery_required", []
+        if (
+            terminal.runtime_lifecycle not in {"starting", "running"}
+            or terminal.context_role != "supervisor"
+            or not terminal.project_id
+            or not terminal.session_id
+            or not terminal.launch_worktree
+            or not terminal.writer_authority_generation
+            or not terminal.runtime_generation
+            or terminal.runtime_operation_kind
+            or terminal.runtime_operation_token
+            or db.get(ProviderExecutionLeaseModel, terminal_id) is not None
+            or db.query(RecoveryTakeoverModel.id)
+            .filter(
+                RecoveryTakeoverModel.old_terminal_id == terminal_id,
+                or_(
+                    RecoveryTakeoverModel.state != "failed",
+                    RecoveryTakeoverModel.fenced_at.is_not(None),
+                ),
+            )
+            .first()
+            is not None
+            or db.query(WorkflowModel.id)
+            .filter(
+                WorkflowModel.root_terminal_id == terminal_id,
+                WorkflowModel.status == WORKFLOW_OWNER_GATE,
+            )
+            .first()
+            is not None
+            or db.query(WorkflowEffectModel.id)
+            .join(WorkflowModel, WorkflowModel.id == WorkflowEffectModel.workflow_id)
+            .filter(
+                WorkflowModel.root_terminal_id == terminal_id,
+                WorkflowEffectModel.state.in_(("claimed", "indeterminate")),
+            )
+            .first()
+            is not None
+            or db.query(ChildAssignmentModel.id)
+            .filter(
+                ChildAssignmentModel.parent_terminal_id == terminal_id,
+                ChildAssignmentModel.status.notin_(
+                    (
+                        ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
+                        ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value,
+                        ChildAssignmentStatus.CANCELLED.value,
+                    )
+                ),
+            )
+            .first()
+            is not None
+        ):
+            db.rollback()
+            return "ineligible", []
+        lease = db.get(WorktreeWriterLeaseModel, terminal.launch_worktree)
+        if not (
+            lease
+            and lease.terminal_id == terminal_id
+            and lease.authority_generation == terminal.writer_authority_generation
+        ):
+            db.rollback()
+            return "ineligible", []
+
+        now = datetime.now()
+        terminal.runtime_lifecycle = "recovery_required"
+        terminal.runtime_exited_at = terminal.runtime_exited_at or now
+        terminal.runtime_operation_kind = None
+        terminal.runtime_operation_token = None
+        terminal.runtime_operation_claimed_at = None
+        terminal.runtime_operation_expires_at = None
+        cancelled_workflow_ids = _cancel_protected_workflows_in_transaction(
+            db,
+            [terminal_id],
+            reason="supervisor runtime lost; owner-authorized recovery is required",
+        )
+        # The lifecycle fence invalidates the old writer before its lease is
+        # released. #95 will create the successor lease only after winning its
+        # exact generation-bound takeover claim.
+        db.delete(lease)
+        event_key = f"runtime-recovery-required:{terminal_id}:{terminal.runtime_generation}"
+        if (
+            db.query(RecoveryTakeoverAuditModel.id)
+            .filter(RecoveryTakeoverAuditModel.event_key == event_key)
+            .first()
+            is None
+        ):
+            _add_recovery_audit(
+                db,
+                event_key=event_key,
+                event_type="runtime_recovery_required",
+                old_terminal_id=terminal_id,
+                detail={
+                    "authority_generation": terminal.writer_authority_generation,
+                    "runtime_generation": terminal.runtime_generation,
+                },
+            )
+        db.commit()
+        return "recovery_required", cancelled_workflow_ids
+
+
+def abandon_terminal_runtime_recovery(terminal_id: str) -> tuple[str, List[int]]:
+    """Explicitly converge an unclaimed recovery opportunity to ordinary exit."""
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_provider_execution_schema()
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.get(TerminalModel, terminal_id)
+        if terminal is None:
+            db.rollback()
+            return "missing", []
+        if terminal.runtime_lifecycle in {"exited", "recovery_fenced"}:
+            db.commit()
+            return "exited", []
+        if terminal.runtime_lifecycle != "recovery_required":
+            db.rollback()
+            return "not_recovery_required", []
+        if terminal.runtime_operation_kind or terminal.runtime_operation_token:
+            db.rollback()
+            return "busy", []
+        if db.get(ProviderExecutionLeaseModel, terminal_id) is not None:
+            db.rollback()
+            return "busy", []
+        lease = (
+            db.query(WorktreeWriterLeaseModel)
+            .filter(WorktreeWriterLeaseModel.terminal_id == terminal_id)
+            .first()
+        )
+        if lease is not None:
+            db.rollback()
+            return "busy", []
+        now = datetime.now()
+        terminal.runtime_lifecycle = "exited"
+        terminal.runtime_exited_at = terminal.runtime_exited_at or now
+        cancelled_workflow_ids = _cancel_protected_workflows_in_transaction(
+            db, [terminal_id], reason="runtime recovery was explicitly abandoned"
+        )
+        event_key = f"runtime-recovery-abandoned:{terminal_id}:{terminal.runtime_generation}"
+        if (
+            db.query(RecoveryTakeoverAuditModel.id)
+            .filter(RecoveryTakeoverAuditModel.event_key == event_key)
+            .first()
+            is None
+        ):
+            _add_recovery_audit(
+                db,
+                event_key=event_key,
+                event_type="runtime_recovery_abandoned",
+                old_terminal_id=terminal_id,
+            )
+        db.commit()
+        return "exited", cancelled_workflow_ids
+
+
 def _recovery_takeover_dict(row: RecoveryTakeoverModel) -> Dict[str, Any]:
     return {
         "id": row.id,
@@ -5823,7 +6032,7 @@ def recovery_takeover_durable_eligibility(
             reason = "RECOVERY_TARGET_AUTHORITY_AMBIGUOUS"
         elif terminal.runtime_lifecycle in {"recovery_fenced", "exited", "exit_pending"}:
             reason = "RECOVERY_TARGET_NOT_TAKEOVER_ELIGIBLE"
-        elif terminal.runtime_lifecycle not in {"starting", "running"}:
+        elif terminal.runtime_lifecycle not in {"starting", "running", "recovery_required"}:
             reason = "RECOVERY_TARGET_AUTHORITY_AMBIGUOUS"
         elif not terminal.writer_authority_generation or not terminal.runtime_generation:
             reason = "RECOVERY_TARGET_AUTHORITY_AMBIGUOUS"
@@ -5882,7 +6091,10 @@ def recovery_takeover_durable_eligibility(
             if terminal is not None and terminal.launch_worktree
             else None
         )
-        if reason is None:
+        if reason is None and terminal.runtime_lifecycle == "recovery_required":
+            if lease is not None:
+                reason = "RECOVERY_WRITER_AUTHORITY_AMBIGUOUS"
+        elif reason is None:
             eligible_terminal = cast(TerminalModel, terminal)
             if not (
                 lease
@@ -5986,7 +6198,7 @@ def claim_recovery_takeover(
             blockers.append("RECOVERY_TARGET_IDENTITY_MISMATCH")
         if not terminal.session_id or not terminal.launch_worktree:
             blockers.append("RECOVERY_TARGET_AUTHORITY_AMBIGUOUS")
-        if terminal.runtime_lifecycle not in {"starting", "running"}:
+        if terminal.runtime_lifecycle not in {"starting", "running", "recovery_required"}:
             blockers.append("RECOVERY_TARGET_NOT_TAKEOVER_ELIGIBLE")
         if not terminal.writer_authority_generation or not hmac.compare_digest(
             cast(str, terminal.writer_authority_generation),
@@ -6039,7 +6251,10 @@ def claim_recovery_takeover(
         ):
             blockers.append("RECOVERY_CHILD_WORK_ACTIVE")
         lease = db.get(WorktreeWriterLeaseModel, terminal.launch_worktree)
-        if not (
+        if terminal.runtime_lifecycle == "recovery_required":
+            if lease is not None:
+                blockers.append("RECOVERY_WRITER_AUTHORITY_AMBIGUOUS")
+        elif not (
             lease
             and lease.terminal_id == old_terminal_id
             and lease.authority_generation == expected_authority_generation
@@ -6111,6 +6326,13 @@ def claim_recovery_takeover(
             updated_at=now,
         )
         db.add(row)
+        # The claim itself must fence runtime-death reconciliation. Without
+        # this terminal-row CAS, a reconciler can win after the owner grant is
+        # consumed but before the takeover saga fences/transfers authority.
+        terminal.runtime_operation_kind = "recovery_takeover"
+        terminal.runtime_operation_token = takeover_id
+        terminal.runtime_operation_claimed_at = now
+        terminal.runtime_operation_expires_at = None
         _add_recovery_audit(
             db,
             event_key=f"{takeover_id}:requested",
@@ -6166,7 +6388,7 @@ def fence_claimed_recovery_takeover(takeover_id: str) -> Optional[Dict[str, Any]
                 or terminal.launch_worktree != row.canonical_worktree
             ):
                 blockers.append("RECOVERY_TARGET_AUTHORITY_AMBIGUOUS")
-            if terminal.runtime_lifecycle not in {"starting", "running"}:
+            if terminal.runtime_lifecycle not in {"starting", "running", "recovery_required"}:
                 blockers.append("RECOVERY_TARGET_NOT_TAKEOVER_ELIGIBLE")
             if not terminal.writer_authority_generation or not hmac.compare_digest(
                 cast(str, terminal.writer_authority_generation),
@@ -6177,7 +6399,10 @@ def fence_claimed_recovery_takeover(takeover_id: str) -> Optional[Dict[str, Any]
                 cast(str, terminal.runtime_generation), row.expected_runtime_generation
             ):
                 blockers.append("RECOVERY_RUNTIME_GENERATION_STALE")
-            if terminal.runtime_operation_kind or terminal.runtime_operation_token:
+            if (
+                terminal.runtime_operation_kind != "recovery_takeover"
+                or terminal.runtime_operation_token != row.id
+            ):
                 blockers.append("RECOVERY_RUNTIME_OPERATION_ACTIVE")
             if db.get(ProviderExecutionLeaseModel, row.old_terminal_id) is not None:
                 blockers.append("RECOVERY_PROVIDER_EXECUTION_ACTIVE")
@@ -6219,7 +6444,10 @@ def fence_claimed_recovery_takeover(takeover_id: str) -> Optional[Dict[str, Any]
             ):
                 blockers.append("RECOVERY_CHILD_WORK_ACTIVE")
         lease = db.get(WorktreeWriterLeaseModel, row.canonical_worktree)
-        if not (
+        if terminal is not None and terminal.runtime_lifecycle == "recovery_required":
+            if lease is not None:
+                blockers.append("RECOVERY_WRITER_AUTHORITY_AMBIGUOUS")
+        elif not (
             lease
             and lease.terminal_id == row.old_terminal_id
             and lease.authority_generation == row.expected_authority_generation
@@ -6238,10 +6466,19 @@ def fence_claimed_recovery_takeover(takeover_id: str) -> Optional[Dict[str, Any]
                 new_terminal_id=row.new_terminal_id,
                 reason_code=blockers[0],
             )
+            if (
+                terminal is not None
+                and terminal.runtime_operation_kind == "recovery_takeover"
+                and terminal.runtime_operation_token == row.id
+            ):
+                terminal.runtime_operation_kind = None
+                terminal.runtime_operation_token = None
+                terminal.runtime_operation_claimed_at = None
+                terminal.runtime_operation_expires_at = None
             db.commit()
             return _recovery_takeover_dict(row)
         valid_terminal = cast(TerminalModel, terminal)
-        valid_lease = cast(WorktreeWriterLeaseModel, lease)
+        valid_lease = cast(Optional[WorktreeWriterLeaseModel], lease)
         now = datetime.now()
         valid_terminal.runtime_lifecycle = "recovery_fenced"
         valid_terminal.recovery_fenced_at = now
@@ -6257,8 +6494,17 @@ def fence_claimed_recovery_takeover(takeover_id: str) -> Optional[Dict[str, Any]
             [row.old_terminal_id],
             reason="supervisor replaced by owner-authorized recovery takeover",
         )
-        valid_lease.terminal_id = row.new_terminal_id
-        valid_lease.authority_generation = row.new_authority_generation
+        if valid_lease is None:
+            db.add(
+                WorktreeWriterLeaseModel(
+                    canonical_worktree=row.canonical_worktree,
+                    terminal_id=row.new_terminal_id,
+                    authority_generation=row.new_authority_generation,
+                )
+            )
+        else:
+            valid_lease.terminal_id = row.new_terminal_id
+            valid_lease.authority_generation = row.new_authority_generation
         row.state = "fenced"
         row.failure_reason = None
         row.fenced_at = now
@@ -6294,6 +6540,16 @@ def record_recovery_takeover_claim_wait(
         row.updated_at = datetime.now()
         if terminal:
             row.state = "failed"
+            old_terminal = db.get(TerminalModel, row.old_terminal_id)
+            if (
+                old_terminal is not None
+                and old_terminal.runtime_operation_kind == "recovery_takeover"
+                and old_terminal.runtime_operation_token == row.id
+            ):
+                old_terminal.runtime_operation_kind = None
+                old_terminal.runtime_operation_token = None
+                old_terminal.runtime_operation_claimed_at = None
+                old_terminal.runtime_operation_expires_at = None
         event_type = "takeover_claim_failed" if terminal else "takeover_claim_deferred"
         _add_recovery_audit(
             db,
@@ -6467,7 +6723,12 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
         terminal = db.get(TerminalModel, receiver_id)
         if terminal is None:
             raise ValueError(f"Terminal '{receiver_id}' not found")
-        if terminal.runtime_lifecycle in {"exit_pending", "exited", "recovery_fenced"}:
+        if terminal.runtime_lifecycle in {
+            "recovery_required",
+            "exit_pending",
+            "exited",
+            "recovery_fenced",
+        }:
             raise ValueError(f"Terminal '{receiver_id}' is exited and cannot receive messages")
         inbox_msg = InboxModel(
             sender_id=sender_id,
@@ -7343,6 +7604,7 @@ def _prepare_workflow_input(
                 "reason_code": "TERMINAL_NOT_FOUND",
             }
         if terminal is not None and terminal.runtime_lifecycle in (
+            "recovery_required",
             "exit_pending",
             "exited",
             "recovery_fenced",
@@ -8384,6 +8646,8 @@ def get_terminal_execution_projection(terminal_id: str) -> Dict[str, Any]:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal is None:
             return {"active_turn": False, "wait_reason": None}
+        if terminal.runtime_lifecycle == "recovery_required":
+            return {"active_turn": False, "wait_reason": "runtime_recovery"}
         execution = db.get(ProviderExecutionLeaseModel, terminal_id)
         if execution is not None:
             # The active binding may already have advanced to newer semantic

@@ -175,7 +175,11 @@ def _active_contexts() -> list[dict[str, str]] | None:
     except Exception:
         return None
     for terminal in terminals:
-        if terminal.get("runtime_lifecycle") in {"exited", "recovery_fenced"}:
+        if terminal.get("runtime_lifecycle") in {
+            "exited",
+            "recovery_fenced",
+            "recovery_required",
+        }:
             continue
         target = f"{terminal['tmux_session']}:{terminal['tmux_window']}"
         completed = subprocess.run(

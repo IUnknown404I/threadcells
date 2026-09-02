@@ -125,6 +125,14 @@ def _claim(worktree: str, *, suffix: str = "one", new_terminal_id: str = "b22ce0
     return database.fence_claimed_recovery_takeover(claimed["id"])
 
 
+def _runtime_authority(terminal_id: str = OLD_ID):
+    metadata = database.get_terminal_metadata(terminal_id)
+    assert metadata is not None
+    return {
+        field: metadata.get(field) for field in database.TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
+    }
+
+
 def test_durable_claim_precedes_runtime_and_writer_fencing(takeover_db):
     sessions, worktree = takeover_db
     claimed = _claim_only(worktree, suffix="durable-claim", new_terminal_id="b22ce099")
@@ -133,10 +141,116 @@ def test_durable_claim_precedes_runtime_and_writer_fencing(takeover_db):
         old = db.get(database.TerminalModel, OLD_ID)
         lease = db.get(database.WorktreeWriterLeaseModel, worktree)
         assert old.runtime_lifecycle == "running"
+        assert old.runtime_operation_kind == "recovery_takeover"
+        assert old.runtime_operation_token == claimed["id"]
         assert lease.terminal_id == OLD_ID
 
     fenced = database.fence_claimed_recovery_takeover(claimed["id"])
     assert fenced["state"] == "fenced"
+
+
+def test_runtime_death_enters_non_writable_recovery_without_leaking_writer(takeover_db):
+    sessions, worktree = takeover_db
+
+    state, workflows = database.mark_terminal_runtime_recovery_required_with_workflow_ids(
+        OLD_ID,
+        expected_runtime_authority=_runtime_authority(),
+    )
+
+    assert state == "recovery_required"
+    assert workflows == []
+    assert database.recovery_takeover_durable_eligibility(OLD_ID)["eligible"] is True
+    assert database.acquire_terminal_runtime_transport(OLD_ID) is None
+    assert database.mark_terminal_runtime_running(OLD_ID) is False
+    with sessions() as db:
+        old = db.get(database.TerminalModel, OLD_ID)
+        assert old.runtime_lifecycle == "recovery_required"
+        assert old.writer_authority_generation == WRITER_GENERATION
+        assert db.get(database.WorktreeWriterLeaseModel, worktree) is None
+
+
+def test_recovery_required_takeover_claim_survives_reconciliation_and_recreates_lease(
+    takeover_db,
+):
+    sessions, worktree = takeover_db
+    observed = _runtime_authority()
+    state, _workflows = database.mark_terminal_runtime_recovery_required_with_workflow_ids(
+        OLD_ID,
+        expected_runtime_authority=observed,
+    )
+    assert state == "recovery_required"
+
+    claimed = _claim_only(
+        worktree,
+        suffix="after-runtime-death",
+        new_terminal_id="b22ce097",
+    )
+    assert claimed["state"] == "claimed"
+    # The stale death observation loses to the takeover-owned terminal CAS.
+    exited, _ = database.mark_terminal_runtime_exited_with_workflow_ids(
+        OLD_ID,
+        expected_runtime_authority=observed,
+    )
+    assert exited is False
+
+    fenced = database.fence_claimed_recovery_takeover(claimed["id"])
+    assert fenced["state"] == "fenced"
+    with sessions() as db:
+        old = db.get(database.TerminalModel, OLD_ID)
+        lease = db.get(database.WorktreeWriterLeaseModel, worktree)
+        assert old.runtime_lifecycle == "recovery_fenced"
+        assert lease.terminal_id == "b22ce097"
+        assert lease.authority_generation == fenced["new_authority_generation"]
+
+
+def test_runtime_death_and_takeover_claim_converge_without_split_brain(takeover_db):
+    sessions, worktree = takeover_db
+    observed = _runtime_authority()
+
+    def runtime_death():
+        return database.mark_terminal_runtime_recovery_required_with_workflow_ids(
+            OLD_ID,
+            expected_runtime_authority=observed,
+        )[0]
+
+    def takeover():
+        return _claim_only(
+            worktree,
+            suffix="death-race",
+            new_terminal_id="b22ce096",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        death_future = pool.submit(runtime_death)
+        claim_future = pool.submit(takeover)
+        death_state = death_future.result()
+        claimed = claim_future.result()
+
+    assert death_state in {"recovery_required", "stale"}
+    assert claimed["state"] == "claimed"
+    fenced = database.fence_claimed_recovery_takeover(claimed["id"])
+    assert fenced["state"] == "fenced"
+    with sessions() as db:
+        old = db.get(database.TerminalModel, OLD_ID)
+        leases = db.query(database.WorktreeWriterLeaseModel).all()
+        assert old.runtime_lifecycle == "recovery_fenced"
+        assert len(leases) == 1
+        assert leases[0].terminal_id == "b22ce096"
+
+
+def test_unclaimed_recovery_can_converge_to_idempotent_exit(takeover_db):
+    sessions, worktree = takeover_db
+    state, _workflows = database.mark_terminal_runtime_recovery_required_with_workflow_ids(
+        OLD_ID,
+        expected_runtime_authority=_runtime_authority(),
+    )
+    assert state == "recovery_required"
+
+    assert database.abandon_terminal_runtime_recovery(OLD_ID)[0] == "exited"
+    assert database.abandon_terminal_runtime_recovery(OLD_ID)[0] == "exited"
+    with sessions() as db:
+        assert db.get(database.TerminalModel, OLD_ID).runtime_lifecycle == "exited"
+        assert db.get(database.WorktreeWriterLeaseModel, worktree) is None
 
 
 def test_generation_change_after_claim_fails_without_transferring_writer(takeover_db):

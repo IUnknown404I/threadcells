@@ -1052,7 +1052,7 @@ describe('graceful exit authority feedback', () => {
     const exitAction = await screen.findByTitle('Graceful Exit')
 
     expect(exitAction).toBeDisabled()
-    expect(screen.getAllByText('Replaced by recovery takeover').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('Replaced during recovery').length).toBeGreaterThan(0)
     expect(screen.queryByText('Unknown')).not.toBeInTheDocument()
   })
 })

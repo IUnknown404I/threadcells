@@ -26,6 +26,15 @@ const fewSession = {
   last_agent: boundary('few-agent-0', 'exited', 'exited', 'completed'),
 }
 
+const recoverySession = {
+  id: 'recovery-badges', name: 'cao-recovery-badges', status: 'history',
+  created_at: '2026-08-22T01:30:00Z', last_active: '2026-08-22T01:35:00Z',
+  agent_count: 1, active_agent_count: 0, project_name: null,
+  activity_counts: { recovery_fenced: 1 }, workflow_counts: { untracked: 1 },
+  first_agent: boundary('recovery-agent-0', 'recovery_fenced', 'recovery_fenced', null),
+  last_agent: boundary('recovery-agent-0', 'recovery_fenced', 'recovery_fenced', null),
+}
+
 const manySession = {
   id: 'many-badges', name: 'cao-many-badges', status: 'active',
   created_at: '2026-08-22T02:00:00Z', last_active: '2026-08-22T03:00:00Z',
@@ -58,6 +67,12 @@ const fewAgents = [{
   session_name: fewSession.name, activity: 'exited', execution_state: 'ready',
   lifecycle: 'exited', workflow_state: 'completed', creation_order: 1,
 }]
+const recoveryAgents = [{
+  ...manyAgents[0], id: 'recovery-agent-0', name: '0', session_id: recoverySession.id,
+  session_name: recoverySession.name, activity: 'recovery_fenced',
+  execution_state: 'recovery_fenced', lifecycle: 'recovery_fenced',
+  workflow_state: null, creation_order: 1,
+}]
 
 function pageResult(items, url, defaultLimit) {
   const limit = Number(url.searchParams.get('limit') || defaultLimit)
@@ -76,13 +91,14 @@ const vite = await createViteServer({
 const json = (response, value) => { response.writeHead(200, { 'content-type': 'application/json' }); response.end(JSON.stringify(value)) }
 const server = http.createServer((request, response) => {
   const url = new URL(request.url, 'http://localhost')
-  if (request.method === 'GET' && url.pathname === '/ui/overview') return json(response, { sessions: 2, agents: 73, active: 5, waiting: 3, owner_gate: 0, cancelled: 2, completed: 61 })
-  if (request.method === 'GET' && url.pathname === '/ui/sessions') return json(response, pageResult([manySession, fewSession], url, 10))
+  if (request.method === 'GET' && url.pathname === '/ui/overview') return json(response, { sessions: 3, agents: 74, active: 5, waiting: 3, owner_gate: 0, cancelled: 2, completed: 61 })
+  if (request.method === 'GET' && url.pathname === '/ui/sessions') return json(response, pageResult([manySession, recoverySession, fewSession], url, 10))
   if (request.method === 'GET' && url.pathname === '/ui/agents') {
-    const agents = url.searchParams.get('session_id') === fewSession.id ? fewAgents : manyAgents
-    return json(response, { ...pageResult(agents, url, 40), facets: { activities: ['processing', 'ready', 'exited'], workflow_states: ['active', 'waiting', 'recoverable', 'completed', 'cancelled'], profiles: ['developer'] } })
+    const sessionId = url.searchParams.get('session_id')
+    const agents = sessionId === fewSession.id ? fewAgents : sessionId === recoverySession.id ? recoveryAgents : manyAgents
+    return json(response, { ...pageResult(agents, url, 40), facets: { activities: ['processing', 'ready', 'recovery_fenced', 'exited'], workflow_states: ['active', 'waiting', 'recoverable', 'completed', 'cancelled'], profiles: ['developer'] } })
   }
-  if (request.method === 'GET' && url.pathname === '/sessions') return json(response, [manySession, fewSession])
+  if (request.method === 'GET' && url.pathname === '/sessions') return json(response, [manySession, recoverySession, fewSession])
   if (request.method === 'GET' && url.pathname === '/agents/profiles') return json(response, [])
   if (request.method === 'GET' && url.pathname === '/agents/providers') return json(response, [])
   if (request.method === 'GET' && url.pathname === '/projects') return json(response, [])
@@ -121,6 +137,35 @@ try {
   assert.equal(await manyTotal.locator('[data-terminal-id]').count(), 0, 'Total rendered per-agent badges')
   assert.equal(await page.getByTestId(`session-status-badges-${fewSession.id}`).getByText('×1').count(), 0)
 
+  for (const [locale, terminalLabel, sessionLabel, workflowLabel] of [
+    ['en', 'Replaced during recovery', 'Replaced during recovery', 'Untracked'],
+    ['ru', 'Заменён при восстановлении', 'Заменена при восстановлении', 'Не отслеживается'],
+  ]) {
+    await page.evaluate(value => localStorage.setItem('threadcells.app.locale', value), locale)
+    await page.reload()
+    const recoveryFirst = page.getByTestId(`session-status-first-${recoverySession.id}`)
+    const recoveryTotal = page.getByTestId(`session-status-total-${recoverySession.id}`)
+    await recoveryFirst.waitFor()
+    assert.equal(await recoveryFirst.getByText(terminalLabel, { exact: true }).count(), 1)
+    assert.equal(await recoveryTotal.getByText(sessionLabel, { exact: true }).count(), 1)
+    assert.equal(await recoveryTotal.getByText(workflowLabel, { exact: true }).count(), 1)
+    assert.equal(await recoveryTotal.getByText(locale === 'ru' ? 'Неизвестно' : 'Unknown', { exact: true }).count(), 0)
+
+    for (const width of [1440, 834, 390]) {
+      await page.setViewportSize({ width, height: 960 })
+      const geometry = await recoveryTotal.evaluate(element => ({
+        overflow: element.scrollWidth - element.clientWidth,
+        documentOverflow: document.documentElement.scrollWidth - window.innerWidth,
+      }))
+      assert(geometry.overflow <= 1, `Recovery status overflowed at ${width}px in ${locale}`)
+      assert.equal(geometry.documentOverflow, 0, `document overflowed at ${width}px in ${locale}`)
+      await page.getByTestId(`home-session-${recoverySession.id}`).screenshot({ path: `${evidenceDir}/recovery-status-${locale}-${width}.png` })
+    }
+  }
+  await page.evaluate(() => localStorage.setItem('threadcells.app.locale', 'en'))
+  await page.reload()
+  await page.getByTestId(`session-status-first-${manySession.id}`).waitFor()
+
   for (const width of [1440, 834, 390]) {
     await page.setViewportSize({ width, height: 960 })
     const geometry = await manyTotal.evaluate(element => ({
@@ -148,7 +193,7 @@ try {
   assert.deepEqual(await terminalIds(page.getByTestId(`session-status-first-${manySession.id}`)), ['many-agent-00'])
   assert.deepEqual(await terminalIds(page.getByTestId(`session-status-last-${manySession.id}`)), ['many-agent-71'])
 
-  console.log(JSON.stringify({ evidenceDir, widths: [1440, 834, 390], agentCount: 72, totalGroups: 7, order: 'oldest-first', first: 'many-agent-00', last: 'many-agent-71' }))
+  console.log(JSON.stringify({ evidenceDir, widths: [1440, 834, 390], locales: ['en', 'ru'], agentCount: 72, totalGroups: 7, order: 'oldest-first', first: 'many-agent-00', last: 'many-agent-71', recoveryAggregate: 'known' }))
 } finally {
   await browser?.close()
   await new Promise(resolve => server.close(resolve))

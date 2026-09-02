@@ -1,12 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { StatusBadge, lifecycleBadgeStatus } from '../components/StatusBadge'
+import { SessionStatusSummary } from '../components/SessionStatusSummary'
 import { ErrorBoundary } from '../components/ErrorBoundary'
 import { ConfirmModal } from '../components/ConfirmModal'
 import { resultLifecycleLabel, OwnerMessageBody } from '../components/InboxPanel'
 import { InboxPanel } from '../components/InboxPanel'
 import { OutputViewer } from '../components/OutputViewer'
 import { api } from '../api'
+import { APP_LOCALE_STORAGE_KEY, I18nProvider } from '../i18n'
 
 describe('StatusBadge', () => {
   it('renders idle status', () => {
@@ -116,7 +118,7 @@ describe('StatusBadge', () => {
 
   it.each([
     ['exited', 'Exited'],
-    ['recovery_fenced', 'Replaced by recovery takeover'],
+    ['recovery_fenced', 'Replaced during recovery'],
   ])('keeps known terminal lifecycle %s when no workflow was tracked', (lifecycle, label) => {
     render(
       <StatusBadge
@@ -125,6 +127,20 @@ describe('StatusBadge', () => {
     )
     expect(screen.getByText(label)).toBeInTheDocument()
     expect(screen.queryByText('Unknown')).not.toBeInTheDocument()
+  })
+
+  it('renders the canonical underscored recovery lifecycle without degrading to Unknown', () => {
+    render(<StatusBadge status="recovery_fenced" />)
+    expect(screen.getByText('Replaced during recovery')).toBeInTheDocument()
+    expect(screen.queryByText('Unknown')).not.toBeInTheDocument()
+  })
+
+  it('renders the natural Russian terminal recovery wording', () => {
+    localStorage.setItem(APP_LOCALE_STORAGE_KEY, 'ru')
+    const view = render(<I18nProvider><StatusBadge status="recovery_fenced" /></I18nProvider>)
+    expect(screen.getByText('Заменён при восстановлении')).toBeInTheDocument()
+    view.unmount()
+    localStorage.removeItem(APP_LOCALE_STORAGE_KEY)
   })
 
   it.each([
@@ -156,6 +172,71 @@ describe('StatusBadge', () => {
     )
     expect(screen.getByText(label)).toBeInTheDocument()
     expect(screen.getByText('Ready')).toBeInTheDocument()
+  })
+})
+
+describe('SessionStatusSummary recovery lifecycle', () => {
+  const recoveryAgent = {
+    id: 'recovery-agent',
+    activity: 'recovery_fenced',
+    execution_state: 'recovery_fenced',
+    lifecycle: 'recovery_fenced',
+    workflow_state: null,
+    workflow_reason: null,
+  }
+
+  const summary = (activityCounts: Record<string, number>, workflowCounts: Record<string, number> = { untracked: 1 }) => ({
+    id: 'recovery-session',
+    name: 'cao-recovery-session',
+    status: 'history',
+    created_at: null,
+    agent_count: Object.values(activityCounts).reduce((total, count) => total + count, 0),
+    active_agent_count: 0,
+    activity_counts: activityCounts,
+    workflow_counts: workflowCounts,
+    project_name: null,
+    last_active: null,
+    first_agent: recoveryAgent,
+    last_agent: recoveryAgent,
+  })
+
+  it('keeps a recovery-only session aggregate known while leaving its workflow untracked', () => {
+    render(<SessionStatusSummary session={summary({ recovery_fenced: 1 }) as never} />)
+    const total = screen.getByTestId('session-status-total-recovery-session')
+    expect(within(total).getByText('Replaced during recovery')).toBeInTheDocument()
+    expect(within(total).getByText('Untracked')).toBeInTheDocument()
+    expect(within(total).queryByText('Unknown')).not.toBeInTheDocument()
+  })
+
+  it('uses the grammatically distinct Russian terminal and session labels', () => {
+    localStorage.setItem(APP_LOCALE_STORAGE_KEY, 'ru')
+    const view = render(
+      <I18nProvider><SessionStatusSummary session={summary({ recovery_fenced: 1 }) as never} /></I18nProvider>,
+    )
+    expect(within(screen.getByTestId('session-status-first-recovery-session')).getByText('Заменён при восстановлении')).toBeInTheDocument()
+    expect(within(screen.getByTestId('session-status-total-recovery-session')).getByText('Заменена при восстановлении')).toBeInTheDocument()
+    view.unmount()
+    localStorage.removeItem(APP_LOCALE_STORAGE_KEY)
+  })
+
+  it('orders mixed known historical states deterministically and preserves exited-only state', () => {
+    const mixed = summary({ exited: 1, recovery_fenced: 1 }, { untracked: 2 })
+    const view = render(<SessionStatusSummary session={mixed as never} />)
+    const badges = screen.getByTestId('session-status-badges-recovery-session')
+    const activityLabels = Array.from(
+      badges.querySelectorAll<HTMLElement>('[data-testid^="session-status-agent-"]'),
+    ).map(node => node.textContent)
+    expect(activityLabels).toEqual(['Replaced during recovery', 'Exited'])
+    expect(within(badges).getByText('Untracked')).toBeInTheDocument()
+    view.unmount()
+
+    render(<SessionStatusSummary session={summary({ exited: 1 }) as never} />)
+    expect(within(screen.getByTestId('session-status-total-recovery-session')).getByText('Exited')).toBeInTheDocument()
+  })
+
+  it('reserves Unknown for an unrecognized aggregate state', () => {
+    render(<SessionStatusSummary session={summary({ inventory_uncertain: 1 }) as never} />)
+    expect(within(screen.getByTestId('session-status-total-recovery-session')).getByText('Unknown')).toBeInTheDocument()
   })
 })
 

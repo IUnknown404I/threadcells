@@ -92,6 +92,12 @@ const STATUS_CONFIG: Record<string, StatusStyle> = {
     bgClass: 'bg-amber-400/10',
     textClass: 'text-amber-300',
   },
+  SESSION_RECOVERY_FENCED: {
+    labelKey: 'status.session.recoveryFenced',
+    dotClass: 'bg-amber-400',
+    bgClass: 'bg-amber-400/10',
+    textClass: 'text-amber-300',
+  },
   WORKFLOW_UNTRACKED: {
     labelKey: 'status.untracked',
     dotClass: 'bg-gray-400',
@@ -125,9 +131,15 @@ const UNKNOWN_CONFIG: StatusStyle = {
   textClass: 'text-gray-500',
 }
 
+function resolveStatusConfig(normalized: string | null | undefined): StatusStyle | undefined {
+  return normalized
+    ? STATUS_CONFIG[normalized] || STATUS_CONFIG[normalized.replace(/_/g, '')]
+    : undefined
+}
+
 export function statusTranslationKey(status: string | null | undefined): TranslationKey {
   const normalized = status?.toUpperCase()
-  return (normalized && (STATUS_CONFIG[normalized] || STATUS_CONFIG[normalized.replace(/_/g, '')])?.labelKey) || UNKNOWN_CONFIG.labelKey
+  return resolveStatusConfig(normalized)?.labelKey || UNKNOWN_CONFIG.labelKey
 }
 
 export function sessionStatusTranslationKey(status: string | null | undefined): TranslationKey {
@@ -148,7 +160,7 @@ export function StatusBadge({ status, workflowState }: { status: TerminalStatus,
   const { t } = useI18n()
   const [storedPrimary, providerDiagnostic] = typeof status === 'string' ? status.split('::', 2) : [status, undefined]
   const normalized = workflowState ? `WORKFLOW_${workflowState.toUpperCase()}` : (storedPrimary ? storedPrimary.toUpperCase() : null)
-  const config = (normalized && STATUS_CONFIG[normalized]) || UNKNOWN_CONFIG
+  const config = resolveStatusConfig(normalized) || UNKNOWN_CONFIG
 
   if (normalized?.startsWith('WORKFLOW_') && providerDiagnostic) {
     const activity = providerDiagnostic.toUpperCase()

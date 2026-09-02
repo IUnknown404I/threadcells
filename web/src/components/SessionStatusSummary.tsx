@@ -3,7 +3,7 @@ import { SessionBoundaryAgent, SessionSummary } from '../api'
 import { lifecycleBadgeStatus, StatusBadge } from './StatusBadge'
 import { useI18n } from '../i18n'
 
-const ACTIVITY_ORDER = ['processing', 'queued', 'ready', 'exited']
+const ACTIVITY_ORDER = ['processing', 'queued', 'ready', 'recovery_fenced', 'exited']
 const WORKFLOW_ORDER = [
   'active', 'waiting', 'result_ready', 'owner_gate', 'completed',
   'cancelled', 'failed', 'incomplete', 'untracked',
@@ -37,6 +37,10 @@ function Count({ value }: { value: number }) {
   return value > 1
     ? <span className="text-xs tabular-nums text-gray-300">×{value}</span>
     : null
+}
+
+export function sessionActivityBadgeStatus(activity: string): string {
+  return activity === 'recovery_fenced' ? 'session_recovery_fenced' : activity
 }
 
 function BoundaryStatus({
@@ -90,7 +94,7 @@ export function SessionStatusSummary({ session, trailing }: { session: SessionSu
         <div data-testid={`session-status-badges-${session.id}`} className="flex min-w-0 flex-wrap items-center gap-1.5">
           {activities.map(([state, count]) => (
             <span key={`activity-${state}`} data-testid={`session-status-agent-${session.id}-${state}`} className="inline-flex items-center gap-1">
-              <StatusBadge status={state} /><Count value={count} />
+              <StatusBadge status={sessionActivityBadgeStatus(state)} /><Count value={count} />
             </span>
           ))}
           {workflows.map(([state, count]) => (

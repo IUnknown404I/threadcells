@@ -158,7 +158,9 @@ def test_recovery_required_graceful_exit_is_idempotent_and_never_sends_input(
     send.assert_not_called()
 
 
-def test_positive_death_releases_runtime_ownership_but_preserves_history(lifecycle_db, monkeypatch):
+def test_positive_death_releases_runtime_ownership_but_preserves_history(
+    lifecycle_db, monkeypatch, tmp_path
+):
     _terminal(
         "parent00",
         "cao-parent",
@@ -176,6 +178,8 @@ def test_positive_death_releases_runtime_ownership_but_preserves_history(lifecyc
         "get_history",
         lambda *_args, **_kwargs: "durable terminal output",
     )
+    (tmp_path / "writer00.log").write_text("durable terminal output", encoding="utf-8")
+    monkeypatch.setattr(terminal_service, "TERMINAL_LOG_DIR", tmp_path)
 
     assert list_worktree_writer_leases()[0]["terminal_id"] == "writer00"
     assert mark_terminal_runtime_exit_pending("writer00")

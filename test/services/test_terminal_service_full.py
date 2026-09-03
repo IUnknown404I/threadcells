@@ -1,5 +1,7 @@
 """Full tests for terminal service."""
 
+import gzip
+import os
 import subprocess
 from contextlib import nullcontext
 from datetime import datetime
@@ -24,7 +26,12 @@ from cli_agent_orchestrator.providers.codex import (
     ProviderError,
 )
 from cli_agent_orchestrator.services.terminal_service import (
+    COMPRESSED_OUTPUT_MAX_BYTES,
+    LAST_OUTPUT_READ_MAX_BYTES,
+    LAST_OUTPUT_RESPONSE_MAX_BYTES,
+    OUTPUT_CHUNK_MAX_BYTES,
     OutputMode,
+    TerminalOutputCursorError,
     TerminalOutputUnavailable,
     _active_worktree_lanes,
     _canonical_worktree,
@@ -36,6 +43,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     create_terminal,
     delete_terminal,
     get_output,
+    get_output_chunk,
     get_terminal,
     get_working_directory,
     provider_turn_execution_active,
@@ -2797,32 +2805,248 @@ class TestSendInput:
 class TestGetOutput:
     """Tests for get_output function."""
 
+    @staticmethod
+    def _durable_terminal(monkeypatch, tmp_path, terminal_id="test1234"):
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR", tmp_path
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+            lambda requested: (
+                {
+                    "id": terminal_id,
+                    "tmux_session": "cao-history",
+                    "tmux_window": "agent",
+                    "provider": "codex",
+                    "runtime_lifecycle": "exited",
+                }
+                if requested == terminal_id
+                else None
+            ),
+        )
+
+    def test_last_response_reads_only_a_bounded_sparse_tail(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        path = tmp_path / "test1234.log"
+        with path.open("wb") as stream:
+            stream.seek(64 * 1024 * 1024)
+            stream.write(b"\nlatest response\n")
+        provider = MagicMock()
+        provider.extract_last_message_from_script.return_value = "latest response"
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.provider_manager.get_provider",
+            lambda *_: provider,
+        )
+        original_pread = os.pread
+        reads = []
+
+        def tracked_pread(descriptor, count, offset):
+            reads.append((count, offset))
+            return original_pread(descriptor, count, offset)
+
+        monkeypatch.setattr(os, "pread", tracked_pread)
+
+        assert get_output("test1234", OutputMode.LAST) == "latest response"
+        assert reads
+        assert max(count for count, _ in reads) <= LAST_OUTPUT_READ_MAX_BYTES
+        assert sum(count for count, _ in reads) <= LAST_OUTPUT_READ_MAX_BYTES
+        assert reads[0][1] > 0
+        provider.extract_last_message_from_script.assert_called_once()
+        assert len(provider.extract_last_message_from_script.call_args.args[0].encode()) <= (
+            LAST_OUTPUT_READ_MAX_BYTES
+        )
+
+    def test_last_response_has_an_independent_response_ceiling(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        (tmp_path / "test1234.log").write_text("tail", encoding="utf-8")
+        provider = MagicMock()
+        provider.extract_last_message_from_script.return_value = "x" * (
+            LAST_OUTPUT_RESPONSE_MAX_BYTES * 2
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.provider_manager.get_provider",
+            lambda *_: provider,
+        )
+
+        result = get_output("test1234", OutputMode.LAST)
+
+        assert len(result.encode()) <= LAST_OUTPUT_RESPONSE_MAX_BYTES
+        assert result.endswith("x" * 100)
+
+    def test_full_output_pages_newest_first_without_gaps_or_overlap(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        expected = "".join(
+            f"{number:07d}:{'x' * 113}\n" for number in range((OUTPUT_CHUNK_MAX_BYTES * 3) // 122)
+        )
+        (tmp_path / "test1234.log").write_text(expected, encoding="utf-8")
+
+        cursor = None
+        chunks = []
+        ranges = []
+        first_chunk = None
+        while True:
+            chunk = get_output_chunk("test1234", cursor)
+            if first_chunk is None:
+                first_chunk = chunk
+            chunks.insert(0, chunk.output)
+            ranges.insert(0, (chunk.start_offset, chunk.end_offset))
+            assert chunk.end_offset - chunk.start_offset <= OUTPUT_CHUNK_MAX_BYTES
+            if not chunk.has_older:
+                break
+            assert chunk.cursor
+            cursor = chunk.cursor
+
+        assert first_chunk is not None
+        assert first_chunk.end_offset == len(expected.encode())
+        assert first_chunk.output == expected.encode()[first_chunk.start_offset :].decode()
+        assert first_chunk.cursor is not None
+        assert get_output_chunk("test1234", first_chunk.cursor) == get_output_chunk(
+            "test1234", first_chunk.cursor
+        )
+        assert "".join(chunks) == expected
+        assert ranges[0][0] == 0
+        assert ranges[-1][1] == len(expected.encode())
+        assert all(older[1] == newer[0] for older, newer in zip(ranges, ranges[1:]))
+
+    def test_full_output_preserves_utf8_boundaries_and_replaces_malformed_bytes(
+        self, monkeypatch, tmp_path
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        payload = (
+            b"a" * (OUTPUT_CHUNK_MAX_BYTES - 17)
+            + "Привет✓".encode("utf-8") * 40000
+            + b"\xffbroken\nend"
+        )
+        (tmp_path / "test1234.log").write_bytes(payload)
+
+        cursor = None
+        chunks = []
+        while True:
+            chunk = get_output_chunk("test1234", cursor)
+            chunks.insert(0, chunk.output)
+            if not chunk.has_older:
+                break
+            cursor = chunk.cursor
+
+        assert "".join(chunks) == payload.decode("utf-8", errors="replace")
+
+    def test_full_output_splits_a_huge_line_at_the_byte_ceiling(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        payload = b"z" * (OUTPUT_CHUNK_MAX_BYTES * 3 + 71)
+        (tmp_path / "test1234.log").write_bytes(payload)
+
+        cursor = None
+        chunks = []
+        while True:
+            chunk = get_output_chunk("test1234", cursor)
+            chunks.insert(0, chunk.output)
+            assert len(chunk.output.encode()) <= OUTPUT_CHUNK_MAX_BYTES
+            if not chunk.has_older:
+                break
+            cursor = chunk.cursor
+
+        assert "".join(chunks).encode() == payload
+
+    def test_full_output_keeps_crlf_atomic_at_a_chunk_boundary(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        total = OUTPUT_CHUNK_MAX_BYTES * 2
+        candidate = total - (OUTPUT_CHUNK_MAX_BYTES - 4)
+        separator = candidate + (16 * 1024) - 1
+        payload = b"a" * separator + b"\r\n" + b"b" * (total - separator - 2)
+        (tmp_path / "test1234.log").write_bytes(payload)
+
+        cursor = None
+        chunks = []
+        while True:
+            chunk = get_output_chunk("test1234", cursor)
+            chunks.insert(0, chunk.output)
+            if not chunk.has_older:
+                break
+            cursor = chunk.cursor
+
+        assert "".join(chunks) == _sanitize_human_terminal_output(payload.decode())
+
+    def test_full_output_cursor_rejects_replaced_history(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        path = tmp_path / "test1234.log"
+        path.write_bytes(b"old\n" * OUTPUT_CHUNK_MAX_BYTES)
+        first = get_output_chunk("test1234")
+        assert first.cursor
+        replacement = tmp_path / "replacement.log"
+        replacement.write_text("new history", encoding="utf-8")
+        os.replace(replacement, path)
+
+        with pytest.raises(TerminalOutputCursorError, match="changed") as error:
+            get_output_chunk("test1234", first.cursor)
+
+        assert error.value.reason_code == "OUTPUT_CURSOR_STALE"
+
+    def test_full_output_empty_and_missing_history(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        (tmp_path / "test1234.log").touch()
+
+        empty = get_output_chunk("test1234")
+
+        assert empty.output == ""
+        assert empty.cursor is None
+        assert empty.has_older is False
+        (tmp_path / "test1234.log").unlink()
+        with pytest.raises(TerminalOutputUnavailable):
+            get_output_chunk("test1234")
+
+    def test_output_source_never_follows_a_terminal_log_symlink(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        outside = tmp_path / "outside"
+        outside.write_text("must not be exposed", encoding="utf-8")
+        (tmp_path / "test1234.log").symlink_to(outside)
+
+        with pytest.raises(TerminalOutputUnavailable):
+            get_output_chunk("test1234")
+
+    def test_large_compressed_history_fails_without_an_unbounded_scan(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        with gzip.open(tmp_path / "test1234.log.gz", "wb") as stream:
+            stream.write(b"x" * (COMPRESSED_OUTPUT_MAX_BYTES + 1))
+
+        with pytest.raises(TerminalOutputUnavailable) as error:
+            get_output_chunk("test1234")
+
+        assert error.value.reason_code == "COMPRESSED_OUTPUT_REQUIRES_INDEX"
+
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_output_full(self, mock_get_metadata, mock_tmux):
-        """Test getting full output."""
+    def test_get_output_full(self, mock_get_metadata, mock_tmux, tmp_path, monkeypatch):
+        """Compatibility full output returns only the newest durable chunk."""
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
-        mock_tmux.get_history.return_value = "full terminal output"
+        (tmp_path / "test1234.log").write_text("full terminal output", encoding="utf-8")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR", tmp_path
+        )
 
         result = get_output("test1234", OutputMode.FULL)
 
         assert result == "full terminal output"
+        mock_tmux.get_history.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_output_full_sanitizes_ansi_vt_and_preserves_unicode(
-        self, mock_get_metadata, mock_tmux
+        self, mock_get_metadata, mock_tmux, tmp_path, monkeypatch
     ):
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
-        mock_tmux.get_history.return_value = (
+        raw = (
             "\x1b[?2026h\x1b[31mПривет\x1b[0m, мир\x1b[?2026l\n"
             "\x1b[?25h\x1b[0 q\x1bMТекст\tданные\x1b[?2004h\x1b[?2004l"
+        )
+        (tmp_path / "test1234.log").write_text(raw, encoding="utf-8")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR", tmp_path
         )
 
         result = get_output("test1234", OutputMode.FULL)
@@ -2833,17 +3057,21 @@ class TestGetOutput:
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_output_full_removes_control_strings_and_c1_forms(
-        self, mock_get_metadata, mock_tmux
+        self, mock_get_metadata, mock_tmux, tmp_path, monkeypatch
     ):
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
-        mock_tmux.get_history.return_value = (
+        raw = (
             "до\x1b]0;private title\x07после\n"
             "link \x1b]8;;https://example.invalid\x1b\\ссылка\x1b]8;;\x1b\\\n"
             "\x1bPprivate-dcs\x1b\\готово\n"
             "A\x9b31mB\x9b0m C\x9dprivate-osc\x9cD\x90private-dcs\x9cE"
+        )
+        (tmp_path / "test1234.log").write_text(raw, encoding="utf-8")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR", tmp_path
         )
 
         result = get_output("test1234", OutputMode.FULL)
@@ -2855,14 +3083,16 @@ class TestGetOutput:
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_output_full_handles_partial_controls_and_normalizes_lines(
-        self, mock_get_metadata, mock_tmux
+        self, mock_get_metadata, mock_tmux, tmp_path, monkeypatch
     ):
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
-        mock_tmux.get_history.return_value = (
-            "Русский\r\nтекст\t✓\x00\x07\nprogressXX\b\bOK\rnext\nplain\x1b[?2026"
+        raw = "Русский\r\nтекст\t✓\x00\x07\nprogressXX\b\bOK\rnext\nplain\x1b[?2026"
+        (tmp_path / "test1234.log").write_text(raw, encoding="utf-8")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR", tmp_path
         )
 
         result = get_output("test1234", OutputMode.FULL)
@@ -2874,14 +3104,17 @@ class TestGetOutput:
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_output_last_keeps_raw_controls_for_provider_extraction(
-        self, mock_get_metadata, mock_tmux, mock_provider_manager
+        self, mock_get_metadata, mock_tmux, mock_provider_manager, tmp_path, monkeypatch
     ):
         raw = "\x1b[36m• result\x1b[0m"
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
-        mock_tmux.get_history.return_value = raw
+        (tmp_path / "test1234.log").write_text(raw, encoding="utf-8")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR", tmp_path
+        )
         mock_provider = MagicMock(extraction_retries=0)
         mock_provider.extract_last_message_from_script.return_value = "result"
         mock_provider_manager.get_provider.return_value = mock_provider
@@ -2892,13 +3125,18 @@ class TestGetOutput:
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_output_last(self, mock_get_metadata, mock_tmux, mock_provider_manager):
+    def test_get_output_last(
+        self, mock_get_metadata, mock_tmux, mock_provider_manager, tmp_path, monkeypatch
+    ):
         """Test getting last message."""
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
-        mock_tmux.get_history.return_value = "full terminal output"
+        (tmp_path / "test1234.log").write_text("full terminal output", encoding="utf-8")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR", tmp_path
+        )
         mock_provider = MagicMock()
         mock_provider.extract_last_message_from_script.return_value = "last message"
         mock_provider_manager.get_provider.return_value = mock_provider
@@ -2937,17 +3175,21 @@ class TestGetOutput:
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
-    def test_get_output_last_no_provider(self, mock_get_metadata, mock_tmux, mock_provider_manager):
-        """Test getting last message when provider not found."""
+    def test_get_output_last_no_provider(
+        self, mock_get_metadata, mock_tmux, mock_provider_manager, tmp_path, monkeypatch
+    ):
+        """A missing provider still returns a bounded readable tail."""
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "developer-abcd",
         }
-        mock_tmux.get_history.return_value = "full output"
+        (tmp_path / "test1234.log").write_text("full output", encoding="utf-8")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR", tmp_path
+        )
         mock_provider_manager.get_provider.return_value = None
 
-        with pytest.raises(ValueError, match="Provider not found"):
-            get_output("test1234", OutputMode.LAST)
+        assert get_output("test1234", OutputMode.LAST) == "full output"
 
 
 class TestCodexProviderLifecycleThroughTerminalService:
@@ -2965,6 +3207,8 @@ class TestCodexProviderLifecycleThroughTerminalService:
         mock_service_tmux,
         mock_update_last_active,
         mock_codex_tmux,
+        tmp_path,
+        monkeypatch,
     ):
         metadata = {
             "id": "codex-lifecycle",
@@ -3011,6 +3255,10 @@ class TestCodexProviderLifecycleThroughTerminalService:
             "144 tests passed.\n"
             "SAMPLE_WORKER_READONLY_OK\n"
             f"{footer}"
+        )
+        (tmp_path / "codex-lifecycle.log").write_text(complete_capture, encoding="utf-8")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.TERMINAL_LOG_DIR", tmp_path
         )
         mock_codex_tmux.get_history.side_effect = [
             progress,

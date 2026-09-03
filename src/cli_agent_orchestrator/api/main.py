@@ -112,6 +112,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     ExitAuthorityError,
     OutputMode,
     TerminalDeletionError,
+    TerminalOutputCursorError,
     TerminalOutputUnavailable,
 )
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
@@ -423,6 +424,11 @@ class TerminalOutputResponse(BaseModel):
     mode: str
     availability: Literal["available", "unavailable"] = "available"
     reason_code: Optional[str] = None
+    cursor: Optional[str] = None
+    has_older: bool = False
+    range_start: Optional[int] = None
+    range_end: Optional[int] = None
+    snapshot_size: Optional[int] = None
 
 
 class SkillContentResponse(BaseModel):
@@ -2594,18 +2600,48 @@ async def create_terminal_file_attachment(
 
 @app.get("/terminals/{terminal_id}/output", response_model=TerminalOutputResponse)
 async def get_terminal_output(
-    terminal_id: TerminalId, mode: OutputMode = OutputMode.FULL
+    terminal_id: TerminalId,
+    mode: OutputMode = OutputMode.FULL,
+    cursor: Optional[str] = Query(default=None, max_length=128),
 ) -> TerminalOutputResponse:
     try:
+        if mode == OutputMode.FULL:
+            chunk = await _run_operational_io(
+                terminal_service.get_output_chunk, terminal_id, cursor
+            )
+            return TerminalOutputResponse(
+                output=chunk.output,
+                mode=mode,
+                availability="available",
+                cursor=chunk.cursor,
+                has_older=chunk.has_older,
+                range_start=chunk.start_offset,
+                range_end=chunk.end_offset,
+                snapshot_size=chunk.snapshot_size,
+            )
+        if cursor is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="A cursor is only valid for full output",
+            )
         output = await _run_operational_io(terminal_service.get_output, terminal_id, mode)
         return TerminalOutputResponse(output=output, mode=mode, availability="available")
-    except TerminalOutputUnavailable:
+    except TerminalOutputUnavailable as exc:
         return TerminalOutputResponse(
             output="",
             mode=mode,
             availability="unavailable",
-            reason_code="DURABLE_OUTPUT_UNAVAILABLE",
+            reason_code=exc.reason_code,
         )
+    except TerminalOutputCursorError as exc:
+        status_code = (
+            status.HTTP_409_CONFLICT
+            if exc.reason_code == "OUTPUT_CURSOR_STALE"
+            else status.HTTP_400_BAD_REQUEST
+        )
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:

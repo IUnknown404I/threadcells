@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import httpx
@@ -2396,9 +2397,16 @@ class TestGetTerminalOutput:
     """Tests for GET /terminals/{terminal_id}/output endpoint."""
 
     def test_get_output_full_mode(self, client):
-        """GET /terminals/{id}/output returns full output by default."""
+        """GET /terminals/{id}/output returns the newest bounded chunk by default."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.get_output.return_value = "Hello from terminal"
+            mock_svc.get_output_chunk.return_value = SimpleNamespace(
+                output="Hello from terminal",
+                cursor="opaque-cursor",
+                has_older=True,
+                start_offset=1024,
+                end_offset=2048,
+                snapshot_size=2048,
+            )
 
             response = client.get("/terminals/abcd1234/output")
 
@@ -2406,6 +2414,11 @@ class TestGetTerminalOutput:
         data = response.json()
         assert data["output"] == "Hello from terminal"
         assert data["mode"] == "full"
+        assert data["cursor"] == "opaque-cursor"
+        assert data["has_older"] is True
+        assert data["range_start"] == 1024
+        assert data["range_end"] == 2048
+        assert data["snapshot_size"] == 2048
 
     def test_get_output_last_mode(self, client):
         """GET /terminals/{id}/output with mode=last returns last response."""
@@ -2419,10 +2432,33 @@ class TestGetTerminalOutput:
         assert data["output"] == "Last response"
         assert data["mode"] == "last"
 
+    def test_get_output_full_forwards_opaque_cursor(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_output_chunk.return_value = SimpleNamespace(
+                output="older",
+                cursor=None,
+                has_older=False,
+                start_offset=0,
+                end_offset=128,
+                snapshot_size=2048,
+            )
+
+            response = client.get("/terminals/abcd1234/output?mode=full&cursor=opaque")
+
+        assert response.status_code == 200
+        mock_svc.get_output_chunk.assert_called_once_with("abcd1234", "opaque")
+
+    def test_get_output_rejects_cursor_for_last_response(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            response = client.get("/terminals/abcd1234/output?mode=last&cursor=opaque")
+
+        assert response.status_code == 400
+        mock_svc.get_output.assert_not_called()
+
     def test_get_output_terminal_not_found(self, client):
         """GET /terminals/{id}/output returns 404 for nonexistent terminal."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.get_output.side_effect = ValueError("Terminal not found")
+            mock_svc.get_output_chunk.side_effect = ValueError("Terminal not found")
 
             response = client.get("/terminals/deadbeef/output")
 
@@ -2431,7 +2467,7 @@ class TestGetTerminalOutput:
 
     def test_get_output_returns_cleaned_state_for_retained_history(self, client):
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.get_output.side_effect = api_main.TerminalOutputUnavailable(
+            mock_svc.get_output_chunk.side_effect = api_main.TerminalOutputUnavailable(
                 "durable output unavailable"
             )
 
@@ -2443,12 +2479,17 @@ class TestGetTerminalOutput:
             "mode": "full",
             "availability": "unavailable",
             "reason_code": "DURABLE_OUTPUT_UNAVAILABLE",
+            "cursor": None,
+            "has_older": False,
+            "range_start": None,
+            "range_end": None,
+            "snapshot_size": None,
         }
 
     def test_get_output_server_error(self, client):
         """GET /terminals/{id}/output returns 500 on error."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
-            mock_svc.get_output.side_effect = Exception("Read failed")
+            mock_svc.get_output_chunk.side_effect = Exception("Read failed")
 
             response = client.get("/terminals/abcd1234/output")
 

@@ -17,12 +17,16 @@ Terminal Workflow:
 4. delete_terminal() → Cleans up provider, database record, and logging
 """
 
+import base64
+import binascii
 import gzip
 import hashlib
 import hmac
 import logging
 import os
 import secrets
+import stat
+import struct
 import time
 import uuid
 from dataclasses import dataclass
@@ -408,7 +412,7 @@ def _wake_queued_provider_execution(registry: PluginRegistry | None = None) -> N
 class OutputMode(str, Enum):
     """Output mode for terminal history retrieval.
 
-    FULL: Returns complete terminal output (scrollback buffer)
+    FULL: Returns the newest bounded chunk of terminal history
     LAST: Returns only the last agent response (extracted by provider)
     """
 
@@ -418,6 +422,167 @@ class OutputMode(str, Enum):
 
 class TerminalOutputUnavailable(Exception):
     """Durable terminal history was intentionally cleaned or is absent."""
+
+    def __init__(self, message: str, reason_code: str = "DURABLE_OUTPUT_UNAVAILABLE") -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+class TerminalOutputCursorError(Exception):
+    """A progressive-output cursor is malformed or no longer owns its source."""
+
+    def __init__(self, message: str, reason_code: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+OUTPUT_CHUNK_MAX_BYTES = 256 * 1024
+LAST_OUTPUT_READ_MAX_BYTES = 1024 * 1024
+LAST_OUTPUT_RESPONSE_MAX_BYTES = 256 * 1024
+COMPRESSED_OUTPUT_MAX_BYTES = 256 * 1024
+_OUTPUT_BOUNDARY_SCAN_BYTES = 16 * 1024
+_OUTPUT_CURSOR = struct.Struct(">BQQQQ")
+_OUTPUT_CURSOR_VERSION = 1
+_OUTPUT_CURSOR_ENCODED_LENGTH = len(
+    base64.urlsafe_b64encode(bytes(_OUTPUT_CURSOR.size)).rstrip(b"=")
+)
+
+
+@dataclass(frozen=True)
+class TerminalOutputChunk:
+    """One bounded, stable byte range from durable terminal history."""
+
+    output: str
+    cursor: str | None
+    has_older: bool
+    start_offset: int
+    end_offset: int
+    snapshot_size: int
+
+
+def _encode_output_cursor(
+    *, device: int, inode: int, snapshot_size: int, before_offset: int
+) -> str:
+    payload = _OUTPUT_CURSOR.pack(
+        _OUTPUT_CURSOR_VERSION, device, inode, snapshot_size, before_offset
+    )
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+
+def _decode_output_cursor(cursor: str) -> tuple[int, int, int, int]:
+    if len(cursor) != _OUTPUT_CURSOR_ENCODED_LENGTH:
+        raise TerminalOutputCursorError("Output cursor is malformed", "OUTPUT_CURSOR_INVALID")
+    try:
+        padding = "=" * (-len(cursor) % 4)
+        payload = base64.b64decode(cursor + padding, altchars=b"-_", validate=True)
+        version, device, inode, snapshot_size, before_offset = _OUTPUT_CURSOR.unpack(payload)
+    except (ValueError, binascii.Error, struct.error) as exc:
+        raise TerminalOutputCursorError(
+            "Output cursor is malformed", "OUTPUT_CURSOR_INVALID"
+        ) from exc
+    if version != _OUTPUT_CURSOR_VERSION or before_offset > snapshot_size:
+        raise TerminalOutputCursorError("Output cursor is malformed", "OUTPUT_CURSOR_INVALID")
+    return device, inode, snapshot_size, before_offset
+
+
+def _open_durable_output(terminal_id: str) -> tuple[int, os.stat_result, bool]:
+    """Open one authoritative regular output file without following symlinks."""
+    if not terminal_id or terminal_id in {".", ".."} or "/" in terminal_id or "\\" in terminal_id:
+        raise ValueError("Invalid terminal identifier")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    file_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+        file_flags |= os.O_NOFOLLOW
+    try:
+        directory_fd = os.open(TERMINAL_LOG_DIR, directory_flags)
+    except OSError as exc:
+        raise TerminalOutputUnavailable("Durable output directory is unavailable") from exc
+    try:
+        for name, compressed in (
+            (f"{terminal_id}.log", False),
+            (f"{terminal_id}.log.gz", True),
+        ):
+            try:
+                descriptor = os.open(name, file_flags, dir_fd=directory_fd)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise TerminalOutputUnavailable("Durable output source is unavailable") from exc
+            source = os.fstat(descriptor)
+            if not stat.S_ISREG(source.st_mode):
+                os.close(descriptor)
+                raise TerminalOutputUnavailable("Durable output source is not a regular file")
+            return descriptor, source, compressed
+    finally:
+        os.close(directory_fd)
+    raise TerminalOutputUnavailable(f"Durable output is unavailable for terminal {terminal_id}")
+
+
+def _bounded_suffix_bytes(
+    descriptor: int, *, before_offset: int, maximum_bytes: int
+) -> tuple[int, bytes]:
+    """Read a suffix with UTF-8-safe and usually line-safe byte boundaries."""
+    if before_offset <= 0:
+        return 0, b""
+    # Reserve enough room to move a split UTF-8 code point into the newer chunk.
+    candidate = max(0, before_offset - max(1, maximum_bytes - 4))
+    probe_start = max(0, candidate - 3)
+    requested = before_offset - probe_start
+    payload = os.pread(descriptor, requested, probe_start)
+    if len(payload) != requested:
+        raise TerminalOutputCursorError(
+            "Output source changed during the read", "OUTPUT_CURSOR_STALE"
+        )
+
+    boundary = candidate - probe_start
+    moves = 0
+    while boundary > 0 and 0x80 <= payload[boundary] <= 0xBF and moves < 3:
+        boundary -= 1
+        moves += 1
+    start_offset = probe_start + boundary
+    chunk = payload[boundary:]
+
+    # Prefer a complete hard line boundary near the oldest edge. Very long
+    # individual lines deliberately fall back to the fixed byte ceiling.
+    if start_offset > 0:
+        search = chunk[:_OUTPUT_BOUNDARY_SCAN_BYTES]
+        newline = search.find(b"\n")
+        carriage = search.find(b"\r")
+        separators = [position for position in (newline, carriage) if position >= 0]
+        if separators:
+            separator = min(separators)
+            skip = separator + 1
+            if chunk[separator : separator + 2] == b"\r\n":
+                skip += 1
+            start_offset += skip
+            chunk = chunk[skip:]
+    if len(chunk) > maximum_bytes:
+        raise RuntimeError("bounded output read exceeded its internal ceiling")
+    return start_offset, chunk
+
+
+def _read_small_compressed_output(descriptor: int) -> bytes:
+    """Preserve small gzip history while rejecting sources that need a full scan."""
+    with os.fdopen(os.dup(descriptor), "rb") as raw:
+        with gzip.GzipFile(fileobj=raw, mode="rb") as stream:
+            payload = stream.read(COMPRESSED_OUTPUT_MAX_BYTES + 1)
+    if len(payload) > COMPRESSED_OUTPUT_MAX_BYTES:
+        raise TerminalOutputUnavailable(
+            "Compressed output is too large for bounded random access",
+            "COMPRESSED_OUTPUT_REQUIRES_INDEX",
+        )
+    return payload
+
+
+def _bounded_text_suffix(value: str, maximum_bytes: int) -> str:
+    payload = value.encode("utf-8", errors="replace")
+    if len(payload) <= maximum_bytes:
+        return value
+    start = len(payload) - max(1, maximum_bytes - 4)
+    while start > 0 and 0x80 <= payload[start] <= 0xBF:
+        start -= 1
+    return payload[start:].decode("utf-8", errors="replace")
 
 
 def _consume_terminal_control_string(value: str, index: int) -> int:
@@ -2976,88 +3141,120 @@ def exit_terminal(terminal_id: str) -> ExitTerminalResult:
         time.sleep(EXIT_CONFIRMATION_POLL_SECONDS)
 
 
+def get_output_chunk(terminal_id: str, cursor: str | None = None) -> TerminalOutputChunk:
+    """Return one newest-first, bounded chunk from durable terminal history.
+
+    Cursors bind pagination to the already-opened file identity and its size at
+    first access. Appends therefore do not move an in-progress reader, while a
+    replacement or truncation fails closed instead of mixing histories.
+    """
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        raise ValueError(f"Terminal '{terminal_id}' not found")
+
+    descriptor, source, compressed = _open_durable_output(terminal_id)
+    try:
+        if compressed:
+            if cursor is not None:
+                raise TerminalOutputCursorError(
+                    "Compressed output cursor is invalid", "OUTPUT_CURSOR_INVALID"
+                )
+            payload = _read_small_compressed_output(descriptor)
+            rendered = _sanitize_human_terminal_output(payload.decode("utf-8", errors="replace"))
+            return TerminalOutputChunk(
+                output=rendered,
+                cursor=None,
+                has_older=False,
+                start_offset=0,
+                end_offset=len(payload),
+                snapshot_size=len(payload),
+            )
+
+        if cursor is None:
+            snapshot_size = source.st_size
+            before_offset = snapshot_size
+        else:
+            device, inode, snapshot_size, before_offset = _decode_output_cursor(cursor)
+            if (device, inode) != (source.st_dev, source.st_ino) or source.st_size < snapshot_size:
+                raise TerminalOutputCursorError(
+                    "Output source changed after the viewer opened", "OUTPUT_CURSOR_STALE"
+                )
+
+        start_offset, payload = _bounded_suffix_bytes(
+            descriptor,
+            before_offset=before_offset,
+            maximum_bytes=OUTPUT_CHUNK_MAX_BYTES,
+        )
+        rendered = _sanitize_human_terminal_output(payload.decode("utf-8", errors="replace"))
+        has_older = start_offset > 0
+        next_cursor = (
+            _encode_output_cursor(
+                device=source.st_dev,
+                inode=source.st_ino,
+                snapshot_size=snapshot_size,
+                before_offset=start_offset,
+            )
+            if has_older
+            else None
+        )
+        return TerminalOutputChunk(
+            output=rendered,
+            cursor=next_cursor,
+            has_older=has_older,
+            start_offset=start_offset,
+            end_offset=before_offset,
+            snapshot_size=snapshot_size,
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _get_last_output(terminal_id: str) -> str:
+    descriptor, source, compressed = _open_durable_output(terminal_id)
+    try:
+        if compressed:
+            payload = _read_small_compressed_output(descriptor)
+        else:
+            _, payload = _bounded_suffix_bytes(
+                descriptor,
+                before_offset=source.st_size,
+                maximum_bytes=LAST_OUTPUT_READ_MAX_BYTES,
+            )
+    finally:
+        os.close(descriptor)
+
+    raw_tail = payload.decode("utf-8", errors="replace")
+    if not raw_tail:
+        return ""
+    extracted: str | None = None
+    try:
+        provider = provider_manager.get_provider(terminal_id)
+        if provider is not None:
+            extracted = provider.extract_last_message_from_script(raw_tail)
+    except Exception as exc:
+        logger.debug("Bounded last-response extraction failed for %s: %s", terminal_id, exc)
+    rendered = _sanitize_human_terminal_output(extracted if extracted is not None else raw_tail)
+    return _bounded_text_suffix(rendered, LAST_OUTPUT_RESPONSE_MAX_BYTES)
+
+
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
-    """Get terminal output.
+    """Return bounded terminal output for compatibility callers.
 
-    For ``LAST`` mode, if the provider declares ``extraction_retries > 0``,
-    retries extraction with 10 s delays between attempts.  This handles
-    TUI-based providers (e.g. Gemini CLI's Ink renderer) whose notification
-    spinners can temporarily obscure response text in the tmux capture buffer.
-
-    If the provider exposes an ``extraction_tail_lines`` attribute, the
-    history capture for LAST mode uses that value instead of the default
-    ``TMUX_HISTORY_LINES``. Status-check captures are unaffected (they go
-    through get_status directly). A single capture-pane call is made per
-    get_output invocation.
+    ``FULL`` now means the newest progressive chunk; the HTTP API exposes its
+    opaque cursor. ``LAST`` reads only a fixed-size durable tail before provider
+    extraction and caps the returned response independently.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
         if not metadata:
             raise ValueError(f"Terminal '{terminal_id}' not found")
-
-        def durable_output() -> str:
-            log_path = TERMINAL_LOG_DIR / f"{terminal_id}.log"
-            if log_path.is_file() and not log_path.is_symlink():
-                return log_path.read_text(encoding="utf-8", errors="replace")
-            compressed = log_path.with_suffix(log_path.suffix + ".gz")
-            if compressed.is_file() and not compressed.is_symlink():
-                with gzip.open(compressed, "rt", encoding="utf-8", errors="replace") as stream:
-                    return stream.read()
-            raise TerminalOutputUnavailable(
-                f"Durable output is unavailable for terminal {terminal_id}"
-            )
-
-        def capture_output(*, tail_lines: int | None = None) -> str:
-            try:
-                return tmux_client.get_history(
-                    metadata["tmux_session"], metadata["tmux_window"], tail_lines=tail_lines
-                )
-            except Exception:
-                if metadata.get("runtime_lifecycle") in {
-                    TerminalLifecycle.EXITED.value,
-                    TerminalLifecycle.RECOVERY_FENCED.value,
-                }:
-                    return durable_output()
-                raise
-
         if mode == OutputMode.FULL:
-            return _sanitize_human_terminal_output(capture_output())
-        elif mode == OutputMode.LAST:
-            provider = provider_manager.get_provider(terminal_id)
-            if provider is None:
-                if metadata.get("runtime_lifecycle") in {
-                    TerminalLifecycle.EXITED.value,
-                    TerminalLifecycle.RECOVERY_FENCED.value,
-                }:
-                    return durable_output()
-                raise ValueError(f"Provider not found for terminal {terminal_id}")
-
-            # Capability check: providers that need deeper scrollback for extraction
-            # opt in by defining ``extraction_tail_lines``. Base providers don't.
-            extract_lines = getattr(provider, "extraction_tail_lines", None)
-            full_output = capture_output(tail_lines=extract_lines)
-
-            retries = provider.extraction_retries
-            last_err: Exception | None = None
-            for attempt in range(1 + retries):
-                try:
-                    if attempt > 0:
-                        time.sleep(10.0)
-                        full_output = capture_output(tail_lines=extract_lines)
-                    return provider.extract_last_message_from_script(full_output)
-                except ValueError as exc:
-                    last_err = exc
-                    logger.debug(
-                        "Output extraction attempt %d/%d for %s failed: %s",
-                        attempt + 1,
-                        1 + retries,
-                        terminal_id,
-                        exc,
-                    )
-            raise last_err  # type: ignore[misc]
-
-    except Exception as e:
-        logger.error(f"Failed to get output from terminal {terminal_id}: {e}")
+            return get_output_chunk(terminal_id).output
+        if mode == OutputMode.LAST:
+            return _get_last_output(terminal_id)
+        raise ValueError(f"Unsupported output mode: {mode}")
+    except Exception as exc:
+        logger.error("Failed to get output from terminal %s: %s", terminal_id, exc)
         raise
 
 

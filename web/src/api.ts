@@ -43,6 +43,18 @@ export interface WorkflowInputResponse {
   reason_code: string | null
 }
 
+export interface TerminalOutputResponse {
+  output: string
+  mode: 'full' | 'last'
+  availability?: 'available' | 'unavailable'
+  reason_code?: string | null
+  cursor?: string | null
+  has_older?: boolean
+  range_start?: number | null
+  range_end?: number | null
+  snapshot_size?: number | null
+}
+
 const REASON_COPY = {
   WORKTREE_WRITER_LEASE_HELD: ['Working directory is locked', 'Another active write-capable agent is already using this working directory. Gracefully exit that agent or choose another working directory.'],
   WORKTREE_AUTHORITY_UNRECONCILED: ['Working directory needs attention', 'ThreadCells could not verify worktree authority. Reconcile the existing worktree before starting another writer.'],
@@ -864,8 +876,16 @@ export const api = {
 
   // Terminals
   getTerminalStatus: (id: string) => fetchJSON<Terminal>(`/terminals/${id}`),
-  getTerminalOutput: (id: string, mode: 'full' | 'last' = 'full') =>
-    fetchJSON<{ output: string; mode: string; availability?: 'available' | 'unavailable'; reason_code?: string | null }>(`/terminals/${id}/output?mode=${mode}`),
+  getTerminalOutput: (
+    id: string,
+    mode: 'full' | 'last' = 'full',
+    cursor?: string,
+    signal?: AbortSignal,
+  ) =>
+    fetchJSON<TerminalOutputResponse>(
+      `/terminals/${id}/output?mode=${mode}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`,
+      { signal },
+    ),
   sendInput: (id: string, message: string) =>
     fetchJSON<{ success: boolean }>(`/terminals/${id}/input?message=${encodeURIComponent(message)}`, { method: 'POST' }),
   sendWorkflowInput: (id: string, message: string, requestId: string) =>

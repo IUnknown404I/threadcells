@@ -76,12 +76,21 @@ def sha256(path: Path) -> str:
 
 
 def safe_extract(archive: tarfile.TarFile, destination: Path) -> None:
+    """Extract an archive into destination using an explicit 'data' filter policy.
+
+    Explicitly specifies the 'data' extraction filter introduced in PEP 706 (Python 3.12+)
+    to maintain forward-compatibility with Python 3.14+ without relying on interpreter
+    defaults, while preserving fail-closed path traversal validation.
+    """
     root = destination.resolve()
     for member in archive.getmembers():
         path = (destination / member.name).resolve()
         if root != path and root not in path.parents:
             raise ValueError(f"unsafe archive member: {member.name}")
-    archive.extractall(destination)
+    if hasattr(tarfile, "data_filter"):
+        archive.extractall(destination, filter="data")
+    else:
+        archive.extractall(destination)
 
 
 def dependency_components(candidate: Path, version: str) -> list[dict[str, Any]]:

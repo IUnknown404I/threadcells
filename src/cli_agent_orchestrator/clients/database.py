@@ -584,7 +584,18 @@ class ChildAssignmentModel(Base):
     # Every callback expectation is one immutable attempt.  The child
     # terminal is a producer identity, not an attempt identity: a bounded
     # rereview may reuse the same reviewer runtime without rebinding history.
-    attempt_id = Column(String, nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
+    attempt_id = Column(
+        String,
+        nullable=False,
+        unique=True,
+        default=lambda: str(uuid.uuid4()),
+        # Keep the schema writable by a still-running pre-#81 process during
+        # an atomic/rolling service transition.  New code always supplies a
+        # UUID explicitly; the database fallback gives a legacy writer one
+        # immutable identity without pretending that it supplied review
+        # provenance or an exact revision.
+        server_default=text("(lower(hex(randomblob(16))))"),
+    )
     request_workflow_id = Column(Integer, nullable=True, index=True)
     request_workflow_turn_id = Column(Integer, nullable=True, index=True)
     request_workflow_effect_id = Column(Integer, nullable=True, unique=True)
@@ -2920,7 +2931,7 @@ def _migrate_child_assignment_columns() -> bool:
                 "child_terminal_id VARCHAR NOT NULL, "
                 "status VARCHAR NOT NULL, "
                 "result_message_id INTEGER, "
-                "attempt_id VARCHAR NOT NULL, "
+                "attempt_id VARCHAR NOT NULL DEFAULT (lower(hex(randomblob(16)))), "
                 "request_workflow_id INTEGER, "
                 "request_workflow_turn_id INTEGER, "
                 "request_workflow_effect_id INTEGER, "
@@ -12302,8 +12313,19 @@ def _inbox_model_to_message(inbox_msg: InboxModel) -> InboxMessage:
 def _review_attempt_projection(
     db: Any, assignment: Optional[ChildAssignmentModel]
 ) -> Optional[Dict[str, Any]]:
-    if assignment is None or assignment.review_subject_kind is None:
+    if assignment is None:
         return None
+    kind = assignment.review_subject_kind
+    if kind is None:
+        child = db.query(TerminalModel).filter_by(id=assignment.child_terminal_id).first()
+        if not _terminal_is_reviewer(child):
+            return None
+        # A pre-upgrade process may write through the DB-compatible schema
+        # after the one-time migration has run.  Its server-generated attempt
+        # identity is useful for transport dedupe, but missing request/revision
+        # provenance remains explicitly historical and cannot become review
+        # authority.
+        kind = "legacy_unscoped"
     current = False
     authority_state = "historical"
     parent_workflow = _open_workflow(db, assignment.parent_terminal_id, create=False)
@@ -12326,10 +12348,10 @@ def _review_attempt_projection(
         )
         current = bool(latest is not None and int(latest[0]) == int(assignment.id))
         authority_state = "current" if current else "historical"
-    if assignment.review_subject_kind in {"legacy_unscoped", "unbound"}:
-        authority_state = assignment.review_subject_kind
+    if kind in {"legacy_unscoped", "unbound"}:
+        authority_state = kind
         current = False
-    elif current and assignment.review_subject_kind == "git_commit":
+    elif current and kind == "git_commit":
         snapshot = (
             _git_review_snapshot(assignment.review_subject_worktree)
             if assignment.review_subject_worktree
@@ -12347,7 +12369,7 @@ def _review_attempt_projection(
         "child_workflow_turn_id": assignment.child_workflow_turn_id,
         "scope_sha256": assignment.review_scope_sha256,
         "subject_id": assignment.review_subject_id,
-        "subject_kind": assignment.review_subject_kind,
+        "subject_kind": kind,
         "revision": assignment.review_subject_revision,
         "authority_state": authority_state,
         "current_authority": current,
@@ -14433,7 +14455,10 @@ def _git_review_snapshot(worktree: str) -> Optional[tuple[str, bool]]:
 
 
 def _review_subject_for_child(
-    child: Optional[TerminalModel], request_sha256: str
+    child: Optional[TerminalModel],
+    request_sha256: str,
+    *,
+    allow_source_advance: bool = False,
 ) -> Dict[str, Optional[str]]:
     if not _terminal_is_reviewer(child):
         return {}
@@ -14457,13 +14482,56 @@ def _review_subject_for_child(
         and _REVIEW_REVISION_PATTERN.fullmatch(child.managed_worktree_commit.lower())
         else None
     )
-    if snapshot is None or not snapshot[1] or (expected is not None and snapshot[0] != expected):
+    if snapshot is None or not snapshot[1]:
         return {
             "review_scope_sha256": scope_sha256,
             "review_subject_kind": "unbound",
             "review_subject_worktree": canonical_source,
         }
-    revision = expected or snapshot[0]
+    if expected is not None and snapshot[0] != expected and not allow_source_advance:
+        return {
+            "review_scope_sha256": scope_sha256,
+            "review_subject_kind": "unbound",
+            "review_subject_worktree": canonical_source,
+        }
+    revision = snapshot[0] if allow_source_advance else expected or snapshot[0]
+    if allow_source_advance:
+        # A warm reviewer remains in its immutable, clean read-only worktree.
+        # It can inspect a later commit through the shared Git object store;
+        # prove both properties before binding the new request to that commit.
+        reviewer_snapshot = (
+            _git_review_snapshot(child.launch_worktree)
+            if child is not None and isinstance(child.launch_worktree, str)
+            else None
+        )
+        try:
+            revision_available = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    cast(str, child.launch_worktree),
+                    "cat-file",
+                    "-e",
+                    f"{revision}^{{commit}}",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            revision_available = None
+        if (
+            reviewer_snapshot is None
+            or not reviewer_snapshot[1]
+            or revision_available is None
+            or revision_available.returncode != 0
+        ):
+            return {
+                "review_scope_sha256": scope_sha256,
+                "review_subject_kind": "unbound",
+                "review_subject_worktree": canonical_source,
+            }
     subject_id = hashlib.sha256(
         "\x1f".join((scope_sha256, revision, request_sha256)).encode("utf-8", "strict")
     ).hexdigest()
@@ -14547,7 +14615,9 @@ def _register_child_attempt(
             workflow_turn_id,
             workflow_effect_id,
         )
+        child = db.query(TerminalModel).filter_by(id=child_terminal_id).first()
         prior = _latest_child_assignment(db, child_terminal_id)
+        reused_review_child = False
         if prior is not None:
             if prior.parent_terminal_id != parent_terminal_id:
                 raise ValueError(
@@ -14558,6 +14628,12 @@ def _register_child_attempt(
                 return False
             # Reuse is deliberately reviewer-only. Ordinary assigned work and
             # direct handoffs retain one callback expectation per terminal.
+            if prior.review_subject_kind is None and _terminal_is_reviewer(child):
+                # Rolling compatibility permits an old process to create the
+                # relation after migration.  Classify it durably before a new
+                # exact attempt is admitted; never infer a revision for it.
+                prior.review_subject_kind = "legacy_unscoped"
+                prior.updated_at = datetime.now()
             if prior.review_subject_kind is None or delegation_kind != "assign":
                 db.rollback()
                 return False
@@ -14576,14 +14652,18 @@ def _register_child_attempt(
             ):
                 db.rollback()
                 return False
+            reused_review_child = True
         request_sha256 = (
             hashlib.sha256(request_message.encode("utf-8", "strict")).hexdigest()
             if isinstance(request_message, str)
             else None
         )
-        child = db.query(TerminalModel).filter_by(id=child_terminal_id).first()
         review_subject = (
-            _review_subject_for_child(child, cast(str, request_sha256))
+            _review_subject_for_child(
+                child,
+                cast(str, request_sha256),
+                allow_source_advance=reused_review_child,
+            )
             if request_sha256 is not None
             else (
                 {"review_subject_kind": "legacy_unscoped"} if _terminal_is_reviewer(child) else {}
@@ -14696,6 +14776,38 @@ def register_child_assignment(
         workflow_effect_id=workflow_effect_id,
         request_message=request_message,
     )
+
+
+def get_child_assignment_request_authority(
+    parent_terminal_id: str,
+    child_terminal_id: str,
+    request_workflow_effect_id: int,
+) -> Optional[Dict[str, str]]:
+    """Return public immutable authority for one exact registered review request."""
+    _ensure_child_assignment_schema()
+    with SessionLocal() as db:
+        assignment = (
+            db.query(ChildAssignmentModel)
+            .filter_by(
+                parent_terminal_id=parent_terminal_id,
+                child_terminal_id=child_terminal_id,
+                request_workflow_effect_id=request_workflow_effect_id,
+            )
+            .first()
+        )
+        if (
+            assignment is None
+            or assignment.review_subject_kind != "git_commit"
+            or not assignment.attempt_id
+            or not assignment.review_subject_id
+            or not assignment.review_subject_revision
+        ):
+            return None
+        return {
+            "attempt_id": assignment.attempt_id,
+            "subject_id": assignment.review_subject_id,
+            "revision": assignment.review_subject_revision,
+        }
 
 
 def register_handoff_child(
@@ -15223,6 +15335,10 @@ def _review_acknowledgement_reason(
 ) -> Optional[str]:
     """Fail closed unless this is the current exact Git review authority."""
     kind = assignment.review_subject_kind
+    if kind is None:
+        child = db.query(TerminalModel).filter_by(id=assignment.child_terminal_id).first()
+        if _terminal_is_reviewer(child):
+            kind = "legacy_unscoped"
     if kind is None:
         return None
     if assignment.review_superseded_at is not None:

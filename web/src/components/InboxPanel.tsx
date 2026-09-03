@@ -10,13 +10,14 @@ interface InboxPanelProps {
   onClose: () => void
 }
 
-type StatusFilter = 'all' | 'pending' | 'delivered' | 'failed'
+type StatusFilter = 'all' | 'pending' | 'delivered' | 'failed' | 'superseded'
 
 const STATUS_FILTERS: { key: StatusFilter; labelKey: TranslationKey }[] = [
   { key: 'all', labelKey: 'inbox.all' },
   { key: 'pending', labelKey: 'inbox.pending' },
   { key: 'delivered', labelKey: 'inbox.delivered' },
   { key: 'failed', labelKey: 'inbox.failed' },
+  { key: 'superseded', labelKey: 'inbox.superseded' },
 ]
 
 const OWNER_MESSAGE_PREVIEW_LENGTH = 1028
@@ -51,6 +52,7 @@ function MessageStatusBadge({ status }: { status: InboxMessage['status'] }) {
     delivered: { bg: 'bg-emerald-400/10', text: 'text-emerald-400', labelKey: 'inbox.delivered' as TranslationKey },
     pending: { bg: 'bg-amber-400/10', text: 'text-amber-400', labelKey: 'inbox.pending' as TranslationKey },
     failed: { bg: 'bg-red-400/10', text: 'text-red-400', labelKey: 'inbox.failed' as TranslationKey },
+    superseded: { bg: 'bg-violet-400/10', text: 'text-violet-300', labelKey: 'inbox.superseded' as TranslationKey },
   }
   const c = config[status] || config.pending
   return (
@@ -348,6 +350,7 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
                       <MessageStatusBadge status={msg.status} />
                       {msg.result_id && <span className="text-[10px] text-sky-400">{t('inbox.result')}</span>}
                       {msg.superseded_at && <span className="text-[10px] text-gray-500">{t('inbox.authoritative')}</span>}
+                      {msg.callback_reconciled_at && <span className="text-[10px] text-violet-300">{t('inbox.callbackReconciled')}</span>}
                     </div>
                     {msg.result_id ? (
                       <button

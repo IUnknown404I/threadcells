@@ -2774,7 +2774,8 @@ async def get_inbox_messages_endpoint(
     Args:
         terminal_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10, max: 100)
-        status_param: Optional filter by message status ('pending', 'delivered', 'failed')
+        status_param: Optional filter by message status
+            ('pending', 'delivered', 'failed', 'superseded')
 
     Returns:
         List of inbox messages with sender_id, message, created_at, status
@@ -2788,7 +2789,10 @@ async def get_inbox_messages_endpoint(
             except ValueError:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid status: {status_param}. Valid values: pending, delivered, failed",
+                    detail=(
+                        f"Invalid status: {status_param}. Valid values: "
+                        "pending, delivered, failed, superseded"
+                    ),
                 )
 
         # Get messages using existing database function
@@ -2809,6 +2813,12 @@ async def get_inbox_messages_endpoint(
                     "result_id": msg.result_id,
                     "kind": msg.kind,
                     "superseded_at": (msg.superseded_at.isoformat() if msg.superseded_at else None),
+                    "callback_reconciled_at": (
+                        msg.callback_reconciled_at.isoformat()
+                        if msg.callback_reconciled_at
+                        else None
+                    ),
+                    "callback_reconciled_from_turn_id": (msg.callback_reconciled_from_turn_id),
                     "created_at": msg.created_at.isoformat() if msg.created_at else None,
                 }
             )

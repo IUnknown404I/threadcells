@@ -453,15 +453,21 @@ def test_stale_ready_observer_cannot_release_successor_lease(capacity_db):
     ] == [("term-0", 301)]
 
 
-def test_workflow_closure_atomically_releases_and_fences_provider_lease(capacity_db):
+def test_workflow_closure_fences_successors_but_retains_execution_until_provider_final(
+    capacity_db,
+):
     turn_id = database.start_workflow_input("term-0")
     assert turn_id is not None
     assert acquire_provider_execution("term-0", turn_id, 3)
 
     assert database.set_workflow_terminal_state("term-0", "terminal")
-    assert list_provider_execution_leases() == []
-    assert acquire_provider_execution("term-0", turn_id, 3) is False
-    assert list_provider_execution_leases() == []
+    assert [
+        (row["terminal_id"], row["workflow_turn_id"]) for row in list_provider_execution_leases()
+    ] == [("term-0", turn_id)]
+    # An exact retry observes the one still-owned lease; it cannot add a
+    # second execution or acquire any successor after workflow closure.
+    assert acquire_provider_execution("term-0", turn_id, 3) is True
+    assert len(list_provider_execution_leases()) == 1
 
 
 def test_workflow_closure_commit_failure_retains_open_root_and_lease(capacity_db):
@@ -483,6 +489,179 @@ def test_workflow_closure_commit_failure_retains_open_root_and_lease(capacity_db
     assert [
         (row["terminal_id"], row["workflow_turn_id"]) for row in list_provider_execution_leases()
     ] == [("term-0", turn_id)]
+
+
+def _seed_completed_assigned_child_execution(
+    parent: str,
+    child: str,
+    *,
+    result_complete: bool = True,
+) -> tuple[int, str, int]:
+    assert database.register_child_assignment(parent, child)
+    child_turn = database.start_workflow_input(child)
+    assert child_turn is not None
+    assert acquire_provider_execution(child, child_turn, 3)
+    with database.SessionLocal() as db:
+        child_workflow = db.query(database.WorkflowModel).filter_by(root_terminal_id=child).one()
+        assignment = (
+            db.query(database.ChildAssignmentModel).filter_by(child_terminal_id=child).one()
+        )
+        result = (
+            db.query(database.DelegationResultModel)
+            .filter_by(child_assignment_id=assignment.id)
+            .one()
+        )
+        assignment.child_workflow_id = child_workflow.id
+        assignment.child_workflow_turn_id = child_turn
+        if result_complete:
+            now = datetime.now()
+            result.status = "complete"
+            result.finalized_at = now
+            result.updated_at = now
+            notice = InboxModel(
+                sender_id=child,
+                receiver_id=parent,
+                message=f"result from {child}",
+                status="pending",
+                result_id=result.id,
+                kind="delegation_result_notice",
+            )
+            db.add(notice)
+            db.flush()
+            assignment.result_message_id = notice.id
+            assignment.status = "result_queued"
+            callback = WorkflowTurnModel(
+                workflow_id=result.parent_workflow_id,
+                kind="assigned_result",
+                dedupe_key=f"assigned-result:{assignment.attempt_id}",
+                payload=notice.message,
+                inbox_message_id=notice.id,
+                state="queued",
+            )
+            db.add(callback)
+            db.flush()
+            result.workflow_turn_id = callback.id
+        child_workflow.status = "terminal"
+        child_workflow.terminal_reason = "authoritative delegated result accepted"
+        db.commit()
+        return child_turn, result.id, assignment.result_message_id or 0
+
+
+def _provider_final_observation(monkeypatch, statuses: dict[str, TerminalStatus]) -> None:
+    providers: dict[str, MagicMock] = {}
+    for terminal_id in statuses:
+        provider = MagicMock()
+        provider.get_status.side_effect = lambda terminal_id=terminal_id: statuses[terminal_id]
+        provider.is_process_alive.return_value = True
+        providers[terminal_id] = provider
+    monkeypatch.setattr(
+        terminal_service.provider_manager,
+        "get_provider",
+        lambda terminal_id: providers[terminal_id],
+    )
+    monkeypatch.setattr(terminal_service, "reconcile_terminal_runtime", lambda *_: False)
+    monkeypatch.setattr(
+        terminal_service,
+        "provider_turn_execution_active",
+        lambda terminal_id, _provider=None: statuses[terminal_id] == TerminalStatus.PROCESSING,
+    )
+    monkeypatch.setattr(terminal_service, "_wake_queued_provider_execution", lambda *_: None)
+    from cli_agent_orchestrator.services import usage_service
+
+    monkeypatch.setattr(usage_service, "observe_provider_usage", lambda *_args, **_kwargs: None)
+
+
+def test_three_completed_children_release_capacity_without_ack_or_exit(capacity_db, monkeypatch):
+    """#112: three durable completed children cannot deadlock a three-slot parent."""
+    parent = "term-4"
+    assert database.start_workflow_input(parent) is not None
+    results: list[tuple[str, int]] = []
+    for child in ("term-0", "term-1", "term-2"):
+        _turn, result_id, notice_id = _seed_completed_assigned_child_execution(parent, child)
+        results.append((result_id, notice_id))
+    assert len(list_provider_execution_leases()) == 3
+    before = database.list_terminal_ui_summary_page(limit=10, query="term-0")["items"][0]
+    assert before["execution_state"] == "processing"
+    assert before["workflow_state"] == "completed"
+    assert before["result_status"] == "complete"
+    assert before["delivery_status"] == "result_queued"
+    _provider_final_observation(
+        monkeypatch,
+        {
+            "term-0": TerminalStatus.IDLE,
+            "term-1": TerminalStatus.COMPLETED,
+            "term-2": TerminalStatus.IDLE,
+        },
+    )
+
+    assert inbox_service._reconcile_terminal_workflow_provider_executions_with_admission() == 3
+    assert list_provider_execution_leases() == []
+    assert inbox_service._reconcile_terminal_workflow_provider_executions_with_admission() == 0
+
+    after = database.list_terminal_ui_summary_page(limit=10, query="term-0")["items"][0]
+    assert after["activity"] == "ready"
+    assert after["execution_state"] == "ready"
+    assert after["workflow_state"] == "completed"
+    assert after["result_status"] == "complete"
+    assert after["delivery_status"] == "result_queued"
+
+    with database.SessionLocal() as db:
+        for result_id, notice_id in results:
+            result = db.get(database.DelegationResultModel, result_id)
+            notice = db.get(InboxModel, notice_id)
+            assignment = db.get(database.ChildAssignmentModel, result.child_assignment_id)
+            assert result.status == "complete"
+            assert result.finalized_at is not None
+            assert notice.status == "pending"
+            assert assignment.status == "result_queued"
+            child = db.get(TerminalModel, assignment.child_terminal_id)
+            assert child.runtime_lifecycle == "running"
+
+    waiting_turn = database.start_workflow_input("term-3")
+    assert waiting_turn is not None
+    assert acquire_provider_execution("term-3", waiting_turn, 3)
+
+
+def test_terminal_child_provider_final_before_result_durability_retains_lease(
+    capacity_db, monkeypatch
+):
+    """#112: provider final alone cannot bypass immutable result durability."""
+    parent = "term-4"
+    assert database.start_workflow_input(parent) is not None
+    child_turn, _result_id, _notice_id = _seed_completed_assigned_child_execution(
+        parent,
+        "term-0",
+        result_complete=False,
+    )
+    _provider_final_observation(monkeypatch, {"term-0": TerminalStatus.COMPLETED})
+
+    assert inbox_service._reconcile_terminal_workflow_provider_executions_with_admission() == 0
+    assert database.get_provider_execution_turn("term-0") == child_turn
+
+
+def test_durable_child_result_while_provider_processing_retains_then_releases_after_restart(
+    capacity_db, monkeypatch
+):
+    """#112: result durability cannot lie about a genuinely active model turn."""
+    parent = "term-4"
+    assert database.start_workflow_input(parent) is not None
+    child_turn, result_id, _notice_id = _seed_completed_assigned_child_execution(
+        parent,
+        "term-0",
+    )
+    statuses = {"term-0": TerminalStatus.PROCESSING}
+    _provider_final_observation(monkeypatch, statuses)
+
+    assert inbox_service._reconcile_terminal_workflow_provider_executions_with_admission() == 0
+    assert database.get_provider_execution_turn("term-0") == child_turn
+    assert database.get_delegation_result(result_id)["status"] == "complete"
+
+    # A fresh daemon process observes the same durable candidate after the
+    # provider task settles. The exact release is idempotent across restart.
+    statuses["term-0"] = TerminalStatus.IDLE
+    assert inbox_service._reconcile_terminal_workflow_provider_executions_with_admission() == 1
+    assert database.get_provider_execution_turn("term-0") is None
+    assert inbox_service._reconcile_terminal_workflow_provider_executions_with_admission() == 0
 
 
 def test_runtime_exit_commit_failure_retains_lifecycle_and_lease(capacity_db):

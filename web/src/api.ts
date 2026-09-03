@@ -497,10 +497,12 @@ export interface InboxMessage {
   sender_id: string
   receiver_id: string
   message: string
-  status: 'pending' | 'delivered' | 'failed'
+  status: 'pending' | 'delivered' | 'failed' | 'superseded'
   result_id?: string | null
   kind?: 'message' | 'delegation_result_notice'
   superseded_at?: string | null
+  callback_reconciled_at?: string | null
+  callback_reconciled_from_turn_id?: number | null
   created_at: string | null
 }
 

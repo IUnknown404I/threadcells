@@ -509,4 +509,37 @@ describe('InboxPanel composer and fullscreen', () => {
 
     await waitFor(() => expect(send).toHaveBeenCalledWith('terminal-1', 'ui', 'first line\nsecond line — ✓'))
   })
+
+  it('distinguishes a reconciled valid result from a superseded callback transport', async () => {
+    vi.mocked(api.getInboxMessages).mockResolvedValueOnce([
+      {
+        id: '41',
+        sender_id: 'reviewer-a',
+        receiver_id: 'terminal-1',
+        message: 'durable result remains valid',
+        status: 'delivered',
+        result_id: 'result-valid',
+        kind: 'delegation_result_notice',
+        callback_reconciled_at: '2026-09-03T12:00:00Z',
+        callback_reconciled_from_turn_id: 3252,
+        created_at: '2026-09-03T11:59:00Z',
+      },
+      {
+        id: '42',
+        sender_id: 'reviewer-old',
+        receiver_id: 'terminal-1',
+        message: 'historical transport only',
+        status: 'superseded',
+        result_id: 'result-historical',
+        kind: 'delegation_result_notice',
+        created_at: '2026-09-03T11:58:00Z',
+      },
+    ])
+
+    render(<InboxPanel terminalId="terminal-1" onClose={() => {}} />)
+
+    expect(await screen.findByText('Stale callback reconciled')).toBeInTheDocument()
+    expect(screen.getAllByText('Superseded').length).toBeGreaterThanOrEqual(2)
+    expect(screen.queryByText('Delivery failed')).not.toBeInTheDocument()
+  })
 })

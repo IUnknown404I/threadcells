@@ -83,6 +83,14 @@ export function resultLifecycleKey(status: string, delivery?: string): Translati
   return status === 'complete' ? 'inbox.complete' : 'inbox.waitingResult'
 }
 
+export function reviewAuthorityKey(result: DelegationResult): TranslationKey | null {
+  if (!result.review) return null
+  if (result.review.authority_state === 'current') return 'inbox.reviewCurrent'
+  if (result.review.authority_state === 'historical') return 'inbox.reviewHistorical'
+  if (result.review.authority_state === 'stale_revision') return 'inbox.reviewStaleRevision'
+  return 'inbox.reviewUnbound'
+}
+
 export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
   const { locale, t } = useI18n()
   const showSnackbar = useStore(state => state.showSnackbar)
@@ -301,6 +309,7 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
                   title={t('inbox.copyResult')}
                 >
                   {t(resultLifecycleKey(result.status, result.delivery_status))} · {result.id.slice(0, 8)}
+                  {reviewAuthorityKey(result) && <> · {t(reviewAuthorityKey(result)!)}{result.review?.revision ? ` ${result.review.revision.slice(0, 8)}` : ''}</>}
                 </button>
               ))}
             </div>
@@ -355,6 +364,7 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
                         {resultErrors[msg.result_id] && <p className="text-xs text-red-300">{t('inbox.resultLoadFailed')}</p>}
                         {resultCache[msg.result_id] && <>
                           <p className="mb-2 text-[10px] font-mono text-sky-300">{resultCache[msg.result_id].id} · {t(resultLifecycleKey(resultCache[msg.result_id].status, resultCache[msg.result_id].delivery_status))}</p>
+                          {reviewAuthorityKey(resultCache[msg.result_id]) && <p className="mb-2 text-[10px] text-violet-300">{t(reviewAuthorityKey(resultCache[msg.result_id])!)}{resultCache[msg.result_id].review?.revision ? ` · ${resultCache[msg.result_id].review!.revision!.slice(0, 12)}` : ''}{resultCache[msg.result_id].attempt_id ? ` · ${t('inbox.reviewAttempt')} ${resultCache[msg.result_id].attempt_id!.slice(0, 8)}` : ''}</p>}
                           {resultCache[msg.result_id].document?.summary && <p className="mb-2 font-medium">{resultCache[msg.result_id].document?.summary}</p>}
                           <div className="whitespace-pre-wrap break-words text-gray-300">{resultCache[msg.result_id].document?.body_markdown || t('inbox.noResultBody')}</div>
                         </>}

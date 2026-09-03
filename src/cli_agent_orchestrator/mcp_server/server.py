@@ -19,6 +19,8 @@ from pydantic import Field
 from cli_agent_orchestrator.clients.database import (
     acknowledge_child_assignment_result_outcome,
     acknowledge_handoff_child_result_direct,
+    bind_child_assignment_input_turn,
+    cancel_child_assignment_attempt,
     cancel_child_assignments_for_terminal,
     cancel_reserved_completed_assigned_child_retirement_exit,
     claim_completed_assigned_child_retirement,
@@ -1449,6 +1451,8 @@ async def _handoff_impl(
     working_directory: Optional[str] = None,
     *,
     runtime_fence: bool = True,
+    request_effect: Optional[Dict[str, Any]] = None,
+    request_workflow_turn_id: Optional[int] = None,
 ) -> HandoffResult:
     """Create a child, submit one task, then wait through one resumable slice."""
     start_time = time.time()
@@ -1484,15 +1488,30 @@ async def _handoff_impl(
         # restart its valid final result can be persisted into the parent's
         # Inbox and trigger that same parent's next model turn.
         parent_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+        request_effect_id = request_effect.get("id") if request_effect is not None else None
+        registered = False
         if parent_terminal_id:
-            if (
-                not register_handoff_child(parent_terminal_id, terminal_id)
-                and get_workflow_status(parent_terminal_id) != "open"
+            registered = (
+                register_handoff_child(parent_terminal_id, terminal_id)
+                if request_effect is None
+                else register_handoff_child(
+                    parent_terminal_id,
+                    terminal_id,
+                    workflow_turn_id=request_workflow_turn_id,
+                    workflow_effect_id=request_effect.get("id"),
+                    request_message=message,
+                )
+            )
+            if not registered and (
+                request_effect is not None or get_workflow_status(parent_terminal_id) != "open"
             ):
-                cancel_child_assignments_for_terminal(terminal_id)
                 return HandoffResult(
                     success=False,
-                    message="Parent workflow closed before handoff input could be sent",
+                    message=(
+                        "Could not register exact handoff authority"
+                        if request_effect is not None
+                        else "Parent workflow closed before handoff input could be sent"
+                    ),
                     output=None,
                     terminal_id=terminal_id,
                     state=HandoffState.FAILED,
@@ -1506,10 +1525,21 @@ async def _handoff_impl(
                 binding = issue_workflow_input_binding(terminal_id)
             if binding is None:
                 raise RuntimeError("Could not create handoff child workflow binding")
+            if (
+                parent_terminal_id
+                and request_effect is not None
+                and not bind_child_assignment_input_turn(terminal_id, binding)
+            ):
+                raise RuntimeError("Could not bind handoff child workflow authority")
             _send_direct_input_handoff(terminal_id, provider, message, binding)
         except Exception:
-            if parent_terminal_id:
-                cancel_child_assignments_for_terminal(terminal_id)
+            if parent_terminal_id and registered:
+                if request_effect_id is None:
+                    cancel_child_assignments_for_terminal(terminal_id)
+                else:
+                    cancel_child_assignment_attempt(
+                        parent_terminal_id, terminal_id, int(request_effect_id)
+                    )
             raise
         remaining = max(0, deadline - time.monotonic())
         result = await _await_handoff_impl(terminal_id, timeout=remaining)
@@ -1615,7 +1645,13 @@ if ENABLE_WORKING_DIRECTORY:
         execution_terminal, execution_suspended = _suspend_provider_execution(logical_turn_id)
         try:
             result = await _handoff_impl(
-                agent_profile, message, timeout, working_directory, runtime_fence=False
+                agent_profile,
+                message,
+                timeout,
+                working_directory,
+                runtime_fence=False,
+                request_effect=effect,
+                request_workflow_turn_id=logical_turn_id,
             )
         except Exception:
             _finish_privileged_effect(effect, "indeterminate")
@@ -1689,7 +1725,15 @@ else:
             )
         execution_terminal, execution_suspended = _suspend_provider_execution(logical_turn_id)
         try:
-            result = await _handoff_impl(agent_profile, message, timeout, None, runtime_fence=False)
+            result = await _handoff_impl(
+                agent_profile,
+                message,
+                timeout,
+                None,
+                runtime_fence=False,
+                request_effect=effect,
+                request_workflow_turn_id=logical_turn_id,
+            )
         except Exception:
             _finish_privileged_effect(effect, "indeterminate")
             raise
@@ -1786,7 +1830,12 @@ async def submit_handoff_result_v1(
 
 # Implementation function for assign
 def _assign_impl(
-    agent_profile: str, message: str, working_directory: Optional[str] = None
+    agent_profile: str,
+    message: str,
+    working_directory: Optional[str] = None,
+    *,
+    request_effect: Optional[Dict[str, Any]] = None,
+    request_workflow_turn_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic."""
     try:
@@ -1814,16 +1863,31 @@ def _assign_impl(
         # durable completion barrier. Top-level assigns have no parent ID and
         # retain their existing fire-and-forget behavior.
         parent_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+        request_effect_id = request_effect.get("id") if request_effect is not None else None
+        registered = False
         if parent_terminal_id:
-            if (
-                not register_child_assignment(parent_terminal_id, terminal_id)
-                and get_workflow_status(parent_terminal_id) != "open"
+            registered = (
+                register_child_assignment(parent_terminal_id, terminal_id)
+                if request_effect is None
+                else register_child_assignment(
+                    parent_terminal_id,
+                    terminal_id,
+                    workflow_turn_id=request_workflow_turn_id,
+                    workflow_effect_id=request_effect.get("id"),
+                    request_message=message,
+                )
+            )
+            if not registered and (
+                request_effect is not None or get_workflow_status(parent_terminal_id) != "open"
             ):
-                cancel_child_assignments_for_terminal(terminal_id)
                 return {
                     "success": False,
                     "terminal_id": terminal_id,
-                    "message": "Parent workflow closed before assignment input could be sent",
+                    "message": (
+                        "Could not register exact assignment authority"
+                        if request_effect is not None
+                        else "Parent workflow closed before assignment input could be sent"
+                    ),
                 }
         try:
             from cli_agent_orchestrator.services.operations_service import (
@@ -1834,10 +1898,21 @@ def _assign_impl(
                 binding = issue_workflow_input_binding(terminal_id)
             if binding is None:
                 raise RuntimeError("Could not create assigned child workflow binding")
+            if (
+                parent_terminal_id
+                and request_effect is not None
+                and not bind_child_assignment_input_turn(terminal_id, binding)
+            ):
+                raise RuntimeError("Could not bind assigned child workflow authority")
             _send_direct_input_assign(terminal_id, message, binding)
         except Exception:
-            if parent_terminal_id:
-                cancel_child_assignments_for_terminal(terminal_id)
+            if parent_terminal_id and registered:
+                if request_effect_id is None:
+                    cancel_child_assignments_for_terminal(terminal_id)
+                else:
+                    cancel_child_assignment_attempt(
+                        parent_terminal_id, terminal_id, int(request_effect_id)
+                    )
             raise
 
         return {
@@ -1929,7 +2004,13 @@ if ENABLE_WORKING_DIRECTORY:
         if effect is None:
             return _privileged_effect_rejection(logical_turn_id, "assign", agent_profile, message)
         try:
-            result = _assign_impl(agent_profile, message, working_directory)
+            result = _assign_impl(
+                agent_profile,
+                message,
+                working_directory,
+                request_effect=effect,
+                request_workflow_turn_id=logical_turn_id,
+            )
         except Exception:
             _finish_privileged_effect(effect, "indeterminate")
             raise
@@ -1952,7 +2033,13 @@ else:
         if effect is None:
             return _privileged_effect_rejection(logical_turn_id, "assign", agent_profile, message)
         try:
-            result = _assign_impl(agent_profile, message, None)
+            result = _assign_impl(
+                agent_profile,
+                message,
+                None,
+                request_effect=effect,
+                request_workflow_turn_id=logical_turn_id,
+            )
         except Exception:
             _finish_privileged_effect(effect, "indeterminate")
             raise

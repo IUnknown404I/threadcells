@@ -6,10 +6,12 @@ import json
 import logging
 import re
 import secrets
+import subprocess
 import threading
 import time
 import uuid
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, cast
 
 from sqlalchemy import (
@@ -576,9 +578,29 @@ class ChildAssignmentModel(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     parent_terminal_id = Column(String, nullable=False)
-    child_terminal_id = Column(String, nullable=False, unique=True)
+    child_terminal_id = Column(String, nullable=False, index=True)
     status = Column(String, nullable=False)
     result_message_id = Column(Integer, nullable=True)
+    # Every callback expectation is one immutable attempt.  The child
+    # terminal is a producer identity, not an attempt identity: a bounded
+    # rereview may reuse the same reviewer runtime without rebinding history.
+    attempt_id = Column(String, nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
+    request_workflow_id = Column(Integer, nullable=True, index=True)
+    request_workflow_turn_id = Column(Integer, nullable=True, index=True)
+    request_workflow_effect_id = Column(Integer, nullable=True, unique=True)
+    request_sha256 = Column(String, nullable=True)
+    child_workflow_id = Column(Integer, nullable=True, unique=True)
+    child_workflow_turn_id = Column(Integer, nullable=True, unique=True)
+    # Reviewer-only immutable subject authority.  The source worktree is
+    # internal revalidation state and is deliberately omitted from public
+    # result projections.  Legacy rows remain explicitly unscoped rather than
+    # receiving fabricated revision authority during migration.
+    review_scope_sha256 = Column(String, nullable=True, index=True)
+    review_subject_id = Column(String, nullable=True, index=True)
+    review_subject_kind = Column(String, nullable=True)
+    review_subject_revision = Column(String, nullable=True)
+    review_subject_worktree = Column(String, nullable=True)
+    review_superseded_at = Column(DateTime, nullable=True)
     # Recovery must not wake a parent until the completed child has been
     # cleaned up.  Keep that receipt independent from Inbox delivery state.
     cleanup_acknowledged = Column(Boolean, nullable=False, default=False)
@@ -2867,9 +2889,83 @@ def _migrate_child_assignment_columns() -> bool:
 
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
+    conn = None
     try:
         conn = sqlite3.connect(str(DATABASE_FILE))
+        # Multiple service processes can enter rolling-upgrade schema checks.
+        # Serialize discovery with mutation so a waiter re-reads the schema
+        # produced by the winning migrator instead of rebuilding stale state.
+        conn.execute("BEGIN IMMEDIATE")
         columns = {row[1] for row in conn.execute("PRAGMA table_info(child_assignments)")}
+        unique_child_terminal = any(
+            bool(index_row[2])
+            and [
+                column_row[2]
+                for column_row in conn.execute(f"PRAGMA index_info('{index_row[1]}')").fetchall()
+            ]
+            == ["child_terminal_id"]
+            for index_row in conn.execute("PRAGMA index_list(child_assignments)").fetchall()
+        )
+        # #81 changes the child terminal from the semantic attempt identity to
+        # the result producer.  Rebuild the legacy table once to remove its
+        # UNIQUE(child_terminal_id) constraint while preserving every row and
+        # immutable result foreign identity.  SQLite cannot drop that inline
+        # constraint additively.
+        if "attempt_id" not in columns or unique_child_terminal:
+            conn.execute("DROP TABLE IF EXISTS child_assignments_review_v1")
+            conn.execute(
+                "CREATE TABLE child_assignments_review_v1 ("
+                "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+                "parent_terminal_id VARCHAR NOT NULL, "
+                "child_terminal_id VARCHAR NOT NULL, "
+                "status VARCHAR NOT NULL, "
+                "result_message_id INTEGER, "
+                "attempt_id VARCHAR NOT NULL, "
+                "request_workflow_id INTEGER, "
+                "request_workflow_turn_id INTEGER, "
+                "request_workflow_effect_id INTEGER, "
+                "request_sha256 VARCHAR, "
+                "child_workflow_id INTEGER, "
+                "child_workflow_turn_id INTEGER, "
+                "review_scope_sha256 VARCHAR, "
+                "review_subject_id VARCHAR, "
+                "review_subject_kind VARCHAR, "
+                "review_subject_revision VARCHAR, "
+                "review_subject_worktree VARCHAR, "
+                "review_superseded_at DATETIME, "
+                "cleanup_acknowledged BOOLEAN NOT NULL DEFAULT 0, "
+                "direct_result_output TEXT, "
+                "handoff_input_received BOOLEAN NOT NULL DEFAULT 0, "
+                "retirement_claim_token VARCHAR, "
+                "retirement_claimed_at DATETIME, "
+                "retirement_exit_dispatched_at DATETIME, "
+                "retirement_cleanup_intent TEXT, "
+                "retirement_cleanup_completed_at DATETIME, "
+                "retirement_completed_at DATETIME, "
+                "created_at DATETIME, "
+                "updated_at DATETIME)"
+            )
+            legacy_rows = conn.execute("SELECT * FROM child_assignments ORDER BY id").fetchall()
+            legacy_names = [row[1] for row in conn.execute("PRAGMA table_info(child_assignments)")]
+            target_names = [
+                row[1]
+                for row in conn.execute("PRAGMA table_info(child_assignments_review_v1)").fetchall()
+            ]
+            for legacy_row in legacy_rows:
+                values = dict(zip(legacy_names, legacy_row))
+                values["attempt_id"] = values.get("attempt_id") or str(uuid.uuid4())
+                selected = [name for name in target_names if name in values]
+                conn.execute(
+                    "INSERT INTO child_assignments_review_v1 ("
+                    + ", ".join(selected)
+                    + ") VALUES ("
+                    + ", ".join("?" for _ in selected)
+                    + ")",
+                    [values[name] for name in selected],
+                )
+            conn.execute("DROP TABLE child_assignments")
+            conn.execute("ALTER TABLE child_assignments_review_v1 RENAME TO child_assignments")
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(child_assignments)")}
         if "cleanup_acknowledged" not in columns:
             conn.execute(
                 "ALTER TABLE child_assignments "
@@ -2901,6 +2997,93 @@ def _migrate_child_assignment_columns() -> bool:
                 "ALTER TABLE child_assignments "
                 "ADD COLUMN retirement_cleanup_completed_at DATETIME"
             )
+        additive_columns = {
+            "attempt_id": "VARCHAR",
+            "request_workflow_id": "INTEGER",
+            "request_workflow_turn_id": "INTEGER",
+            "request_workflow_effect_id": "INTEGER",
+            "request_sha256": "VARCHAR",
+            "child_workflow_id": "INTEGER",
+            "child_workflow_turn_id": "INTEGER",
+            "review_scope_sha256": "VARCHAR",
+            "review_subject_id": "VARCHAR",
+            "review_subject_kind": "VARCHAR",
+            "review_subject_revision": "VARCHAR",
+            "review_subject_worktree": "VARCHAR",
+            "review_superseded_at": "DATETIME",
+        }
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(child_assignments)")}
+        for name, sql_type in additive_columns.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE child_assignments ADD COLUMN {name} {sql_type}")
+        for (assignment_id,) in conn.execute(
+            "SELECT id FROM child_assignments WHERE attempt_id IS NULL OR attempt_id = ''"
+        ).fetchall():
+            conn.execute(
+                "UPDATE child_assignments SET attempt_id = ? WHERE id = ?",
+                (str(uuid.uuid4()), assignment_id),
+            )
+        # Historical reviewer relations remain readable but cannot acquire
+        # exact-revision authority retroactively.  Their launch metadata is
+        # evidence that review occurred, not proof of the exact request that
+        # the result answered.
+        terminal_columns = {row[1] for row in conn.execute("PRAGMA table_info(terminals)")}
+        reviewer_predicates = []
+        if "managed_worktree_kind" in terminal_columns:
+            reviewer_predicates.append("managed_worktree_kind = 'reviewer'")
+        if "agent_profile" in terminal_columns:
+            reviewer_predicates.append(
+                "(agent_profile = 'reviewer' OR agent_profile LIKE 'reviewer\\_%' ESCAPE '\\')"
+            )
+        if "launch_snapshot_json" in terminal_columns:
+            reviewer_predicates.append(
+                "(launch_snapshot_json LIKE '%\"execution_mode\"%' "
+                "AND launch_snapshot_json LIKE '%reviewer%')"
+            )
+        if reviewer_predicates:
+            conn.execute(
+                "UPDATE child_assignments SET review_subject_kind = 'legacy_unscoped' "
+                "WHERE review_subject_kind IS NULL AND child_terminal_id IN ("
+                "SELECT id FROM terminals WHERE " + " OR ".join(reviewer_predicates) + ")"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_child_assignments_child_terminal_id "
+            "ON child_assignments(child_terminal_id)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_child_assignments_attempt_id "
+            "ON child_assignments(attempt_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_child_assignments_request_workflow_id "
+            "ON child_assignments(request_workflow_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_child_assignments_request_workflow_turn_id "
+            "ON child_assignments(request_workflow_turn_id)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_child_assignments_request_workflow_effect_id "
+            "ON child_assignments(request_workflow_effect_id) "
+            "WHERE request_workflow_effect_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_child_assignments_child_workflow_id "
+            "ON child_assignments(child_workflow_id) WHERE child_workflow_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_child_assignments_child_workflow_turn_id "
+            "ON child_assignments(child_workflow_turn_id) "
+            "WHERE child_workflow_turn_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_child_assignments_review_scope_sha256 "
+            "ON child_assignments(review_scope_sha256)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_child_assignments_review_subject_id "
+            "ON child_assignments(review_subject_id)"
+        )
         conn.commit()
         columns = {row[1] for row in conn.execute("PRAGMA table_info(child_assignments)")}
         expected = {column.name for column in ChildAssignmentModel.__table__.columns}
@@ -2914,6 +3097,9 @@ def _migrate_child_assignment_columns() -> bool:
             return False
         return True
     except Exception as exc:
+        if conn is not None:
+            conn.rollback()
+            conn.close()
         logger.warning("Child-assignment schema migration failed: %s", exc)
         return False
 
@@ -7482,29 +7668,32 @@ def _retirement_quiescence_allows_commit(db, terminal_id: str) -> bool:
     locks receive the same compare-and-mutate boundary rather than relying on
     ``FOR UPDATE``.
     """
-    assignment = (
+    assignments = (
         db.query(ChildAssignmentModel)
         .filter(ChildAssignmentModel.child_terminal_id == terminal_id)
-        .first()
+        .all()
     )
-    if assignment is None:
+    if not assignments:
         return True
-    return (
-        cast(
-            int,
-            db.query(ChildAssignmentModel)
-            .filter(
-                ChildAssignmentModel.child_terminal_id == terminal_id,
-                ChildAssignmentModel.retirement_claim_token.is_(None),
-                ChildAssignmentModel.retirement_cleanup_completed_at.is_(None),
-            )
-            .update(
-                {ChildAssignmentModel.updated_at: datetime.now()},
-                synchronize_session=False,
-            ),
+    if any(
+        assignment.retirement_claim_token is not None
+        and assignment.retirement_cleanup_completed_at is None
+        for assignment in assignments
+    ):
+        return False
+    return cast(
+        int,
+        db.query(ChildAssignmentModel)
+        .filter(
+            ChildAssignmentModel.child_terminal_id == terminal_id,
+            ChildAssignmentModel.retirement_claim_token.is_(None),
+            ChildAssignmentModel.retirement_cleanup_completed_at.is_(None),
         )
-        == 1
-    )
+        .update(
+            {ChildAssignmentModel.updated_at: datetime.now()},
+            synchronize_session=False,
+        ),
+    ) == len(assignments)
 
 
 def _resume_owner_gated_successor_in_transaction(
@@ -8459,7 +8648,7 @@ def is_managed_structured_handoff_child(terminal_id: str) -> bool:
     """Whether terminal capture must never promote this child to legacy success."""
     _ensure_child_assignment_schema()
     with SessionLocal() as db:
-        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id=terminal_id).first()
+        assignment = _latest_child_assignment(db, terminal_id)
         return bool(
             assignment
             and assignment.status.startswith("handoff_")
@@ -12110,8 +12299,68 @@ def _inbox_model_to_message(inbox_msg: InboxModel) -> InboxMessage:
     )
 
 
+def _review_attempt_projection(
+    db: Any, assignment: Optional[ChildAssignmentModel]
+) -> Optional[Dict[str, Any]]:
+    if assignment is None or assignment.review_subject_kind is None:
+        return None
+    current = False
+    authority_state = "historical"
+    parent_workflow = _open_workflow(db, assignment.parent_terminal_id, create=False)
+    if (
+        assignment.review_superseded_at is None
+        and parent_workflow is not None
+        and parent_workflow.status == WORKFLOW_OPEN
+        and assignment.request_workflow_id == parent_workflow.id
+    ):
+        latest = (
+            db.query(ChildAssignmentModel.id)
+            .filter(
+                ChildAssignmentModel.parent_terminal_id == assignment.parent_terminal_id,
+                ChildAssignmentModel.request_workflow_id == assignment.request_workflow_id,
+                ChildAssignmentModel.review_scope_sha256 == assignment.review_scope_sha256,
+                ChildAssignmentModel.review_superseded_at.is_(None),
+            )
+            .order_by(ChildAssignmentModel.id.desc())
+            .first()
+        )
+        current = bool(latest is not None and int(latest[0]) == int(assignment.id))
+        authority_state = "current" if current else "historical"
+    if assignment.review_subject_kind in {"legacy_unscoped", "unbound"}:
+        authority_state = assignment.review_subject_kind
+        current = False
+    elif current and assignment.review_subject_kind == "git_commit":
+        snapshot = (
+            _git_review_snapshot(assignment.review_subject_worktree)
+            if assignment.review_subject_worktree
+            else None
+        )
+        if snapshot is None or not snapshot[1] or snapshot[0] != assignment.review_subject_revision:
+            authority_state = "stale_revision"
+            current = False
+    return {
+        "attempt_id": assignment.attempt_id,
+        "request_workflow_id": assignment.request_workflow_id,
+        "request_workflow_turn_id": assignment.request_workflow_turn_id,
+        "request_workflow_effect_id": assignment.request_workflow_effect_id,
+        "child_workflow_id": assignment.child_workflow_id,
+        "child_workflow_turn_id": assignment.child_workflow_turn_id,
+        "scope_sha256": assignment.review_scope_sha256,
+        "subject_id": assignment.review_subject_id,
+        "subject_kind": assignment.review_subject_kind,
+        "revision": assignment.review_subject_revision,
+        "authority_state": authority_state,
+        "current_authority": current,
+        "superseded_at": assignment.review_superseded_at,
+    }
+
+
 def _result_to_dict(
-    result: DelegationResultModel, delivery_status: Optional[str] = None
+    result: DelegationResultModel,
+    delivery_status: Optional[str] = None,
+    *,
+    assignment: Optional[ChildAssignmentModel] = None,
+    db: Any = None,
 ) -> Dict[str, Any]:
     payload = {
         "id": result.id,
@@ -12137,6 +12386,12 @@ def _result_to_dict(
         "updated_at": result.updated_at,
         "content_purged_at": result.content_purged_at,
     }
+    if assignment is not None:
+        payload["attempt_id"] = assignment.attempt_id
+        if db is not None:
+            review = _review_attempt_projection(db, assignment)
+            if review is not None:
+                payload["review"] = review
     if delivery_status is not None:
         payload["delivery_status"] = delivery_status
     return payload
@@ -12152,7 +12407,12 @@ def get_delegation_result(result_id: str) -> Optional[Dict[str, Any]]:
         # A missing mutable assignment row is not durable evidence that the
         # immutable result was superseded.  Keep the result and omit only the
         # delivery projection when it is no longer available.
-        return _result_to_dict(result, assignment.status if assignment else None)
+        return _result_to_dict(
+            result,
+            assignment.status if assignment else None,
+            assignment=assignment,
+            db=db,
+        )
 
 
 def list_delegation_results(
@@ -12181,29 +12441,37 @@ def list_delegation_results(
             .limit(limit)
             .all()
         )
-        assignment_states = {
-            assignment.id: assignment.status
+        assignments = {
+            assignment.id: assignment
             for assignment in db.query(ChildAssignmentModel)
             .filter(ChildAssignmentModel.id.in_([row.child_assignment_id for row in rows]))
             .all()
         }
         return [
-            _result_to_dict(row, assignment_states.get(row.child_assignment_id)) for row in rows
+            _result_to_dict(
+                row,
+                (
+                    assignments[row.child_assignment_id].status
+                    if row.child_assignment_id in assignments
+                    else None
+                ),
+                assignment=assignments.get(row.child_assignment_id),
+                db=db,
+            )
+            for row in rows
         ]
 
 
 def get_delegation_result_for_assignment(child_terminal_id: str) -> Optional[Dict[str, Any]]:
     _ensure_delegation_result_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel).filter_by(child_terminal_id=child_terminal_id).first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         if not assignment:
             return None
         result = (
             db.query(DelegationResultModel).filter_by(child_assignment_id=assignment.id).first()
         )
-        return _result_to_dict(result) if result else None
+        return _result_to_dict(result, assignment=assignment, db=db) if result else None
 
 
 def _exact_retirement_cleanup_intent(
@@ -12282,11 +12550,7 @@ def get_child_retirement_cleanup_intent(
     """Return a validated pending/final cleanup intent without live inference."""
     _ensure_child_assignment_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         if assignment is None:
             return None
         if claim_token is not None and assignment.retirement_claim_token != claim_token:
@@ -12326,6 +12590,7 @@ def list_completed_assigned_child_retirement_candidates(
             db.query(ChildAssignmentModel)
             .filter(
                 ChildAssignmentModel.status == ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
+                ChildAssignmentModel.review_superseded_at.is_(None),
                 ChildAssignmentModel.retirement_completed_at.is_(None),
             )
             .order_by(ChildAssignmentModel.updated_at, ChildAssignmentModel.id)
@@ -12534,11 +12799,7 @@ def managed_handoff_retirement_required(
     _ensure_child_assignment_schema()
     _ensure_terminal_worktree_authority_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         if assignment is None:
             return None
         if assignment.parent_terminal_id != parent_terminal_id or not assignment.status.startswith(
@@ -12664,11 +12925,7 @@ def claim_completed_child_retirement(
     _ensure_delegation_result_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         if assignment is None:
             return {"eligible": False, "error": "child_assignment_not_found"}
         historical_supervisor = assignment.parent_terminal_id != parent_terminal_id
@@ -12847,7 +13104,7 @@ def claim_completed_child_retirement(
         claimed = (
             db.query(ChildAssignmentModel)
             .filter(
-                ChildAssignmentModel.child_terminal_id == child_terminal_id,
+                ChildAssignmentModel.id == assignment.id,
                 ChildAssignmentModel.parent_terminal_id == assignment.parent_terminal_id,
                 ChildAssignmentModel.status == expected_status,
                 ChildAssignmentModel.retirement_claim_token.is_(None),
@@ -12866,9 +13123,7 @@ def claim_completed_child_retirement(
             # hidden behind the earlier snapshot.
             db.expire_all()
             refreshed_assignment = (
-                db.query(ChildAssignmentModel)
-                .filter_by(child_terminal_id=child_terminal_id)
-                .first()
+                db.query(ChildAssignmentModel).filter_by(id=assignment.id).first()
             )
             refreshed_terminal = db.query(TerminalModel).filter_by(id=child_terminal_id).first()
             historical_error = (
@@ -13285,9 +13540,7 @@ def _terminal_for_handoff_submission(db: Any, token_digest: str) -> TerminalMode
 def _submission_relation(
     db: Any, child_terminal_id: str, logical_turn_id: int
 ) -> tuple[ChildAssignmentModel, WorkflowModel, DelegationResultModel]:
-    assignment = (
-        db.query(ChildAssignmentModel).filter_by(child_terminal_id=child_terminal_id).first()
-    )
+    assignment = _latest_child_assignment(db, child_terminal_id)
     if assignment is None or not assignment.status.startswith("handoff_"):
         raise HandoffResultSubmissionError(409, "not_handoff_child")
     if assignment.status not in (
@@ -13304,6 +13557,10 @@ def _submission_relation(
         child_workflow is None
         or child_workflow.status != WORKFLOW_OPEN
         or child_workflow.active_turn_id != logical_turn_id
+        or (
+            assignment.child_workflow_id is not None
+            and int(assignment.child_workflow_id) != int(child_workflow.id)
+        )
         or db.query(WorkflowTurnReceiptModel)
         .filter_by(workflow_turn_id=logical_turn_id, receiver_terminal_id=child_terminal_id)
         .first()
@@ -13359,9 +13616,7 @@ def _submit_handoff_result_v1_once(
     with SessionLocal() as db:
         terminal = _terminal_for_handoff_submission(db, token_digest)
         child_terminal_id = cast(str, terminal.id)
-        existing_assignment = (
-            db.query(ChildAssignmentModel).filter_by(child_terminal_id=child_terminal_id).first()
-        )
+        existing_assignment = _latest_child_assignment(db, child_terminal_id)
         if existing_assignment is not None:
             existing_result = (
                 db.query(DelegationResultModel)
@@ -13513,9 +13768,7 @@ def _resolve_committed_handoff_submission(
     with SessionLocal() as db:
         terminal = _terminal_for_handoff_submission(db, token_digest)
         child_terminal_id = cast(str, terminal.id)
-        assignment = (
-            db.query(ChildAssignmentModel).filter_by(child_terminal_id=child_terminal_id).first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         result = (
             db.query(DelegationResultModel).filter_by(child_assignment_id=assignment.id).first()
             if assignment is not None
@@ -13887,7 +14140,7 @@ def _finalize_managed_delegation_result(
             dedupe_key=(
                 cast(str, boundary_key)
                 if kind == "handoff"
-                else f"assigned-result:{assignment.child_terminal_id}"
+                else f"assigned-result:{assignment.attempt_id}"
             ),
             payload=result_body,
             inbox_message_id=inbox.id,
@@ -13913,9 +14166,7 @@ def finalize_delegation_result_incomplete(
     """System/lifecycle-only terminalization of an awaiting result."""
     _ensure_delegation_result_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel).filter_by(child_terminal_id=child_terminal_id).first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         if not assignment:
             return False
         kind = "handoff" if assignment.status.startswith("handoff_") else "assign"
@@ -14086,41 +14337,336 @@ def purge_expired_delegation_results(cutoff: datetime) -> int:
         return removed
 
 
-def register_child_assignment(parent_terminal_id: str, child_terminal_id: str) -> bool:
-    """Persist a parent's expectation of one callback from an assigned child.
+_REVIEW_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
-    Registration is idempotent for the same parent, but a child cannot be
-    silently adopted by a second parent.
-    """
+
+def _latest_child_assignment(
+    db: Any,
+    child_terminal_id: str,
+    *,
+    statuses: Optional[Sequence[str]] = None,
+) -> Optional[ChildAssignmentModel]:
+    """Select the newest immutable attempt produced by one child terminal."""
+    query = db.query(ChildAssignmentModel).filter(
+        ChildAssignmentModel.child_terminal_id == child_terminal_id
+    )
+    if statuses is not None:
+        query = query.filter(ChildAssignmentModel.status.in_(tuple(statuses)))
+    return cast(
+        Optional[ChildAssignmentModel],
+        query.order_by(ChildAssignmentModel.id.desc()).first(),
+    )
+
+
+def _assignment_for_child_workflow(
+    db: Any,
+    child_terminal_id: str,
+    child_workflow_id: int,
+    *,
+    parent_terminal_id: Optional[str] = None,
+) -> Optional[ChildAssignmentModel]:
+    """Resolve a callback to its immutable attempt, with a legacy-only fallback."""
+    query = db.query(ChildAssignmentModel).filter(
+        ChildAssignmentModel.child_terminal_id == child_terminal_id
+    )
+    if parent_terminal_id is not None:
+        query = query.filter(ChildAssignmentModel.parent_terminal_id == parent_terminal_id)
+    exact = query.filter(ChildAssignmentModel.child_workflow_id == child_workflow_id).first()
+    if exact is not None:
+        return cast(ChildAssignmentModel, exact)
+    return cast(
+        Optional[ChildAssignmentModel],
+        query.filter(
+            ChildAssignmentModel.child_workflow_id.is_(None),
+            ChildAssignmentModel.request_workflow_effect_id.is_(None),
+        )
+        .order_by(ChildAssignmentModel.id.desc())
+        .first(),
+    )
+
+
+def _terminal_is_reviewer(terminal: Optional[TerminalModel]) -> bool:
+    if terminal is None:
+        return False
+    if terminal.managed_worktree_kind == "reviewer":
+        return True
+    if terminal.agent_profile == "reviewer" or str(terminal.agent_profile or "").startswith(
+        "reviewer_"
+    ):
+        return True
+    try:
+        snapshot = json.loads(terminal.launch_snapshot_json or "{}")
+    except (TypeError, ValueError):
+        return False
+    authority = snapshot.get("authority") if isinstance(snapshot, dict) else None
+    return bool(isinstance(authority, dict) and authority.get("execution_mode") == "reviewer")
+
+
+def _git_review_snapshot(worktree: str) -> Optional[tuple[str, bool]]:
+    """Return exact HEAD and cleanliness for one server-owned review source."""
+    try:
+        root = Path(worktree).resolve(strict=True)
+        revision = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--verify", "HEAD^{commit}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if revision.returncode != 0:
+            return None
+        exact = revision.stdout.strip().lower()
+        if not _REVIEW_REVISION_PATTERN.fullmatch(exact):
+            return None
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=normal"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if status.returncode != 0:
+            return None
+        return exact, not bool(status.stdout)
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return None
+
+
+def _review_subject_for_child(
+    child: Optional[TerminalModel], request_sha256: str
+) -> Dict[str, Optional[str]]:
+    if not _terminal_is_reviewer(child):
+        return {}
+    source = (
+        child.managed_worktree_source
+        if child is not None and child.managed_worktree_kind == "reviewer"
+        else child.launch_worktree if child is not None else None
+    )
+    if not isinstance(source, str) or not source.startswith("/"):
+        return {"review_subject_kind": "unbound"}
+    try:
+        canonical_source = str(Path(source).resolve(strict=True))
+    except (OSError, RuntimeError):
+        return {"review_subject_kind": "unbound"}
+    scope_sha256 = hashlib.sha256(canonical_source.encode("utf-8", "strict")).hexdigest()
+    snapshot = _git_review_snapshot(canonical_source)
+    expected = (
+        child.managed_worktree_commit.lower()
+        if child is not None
+        and isinstance(child.managed_worktree_commit, str)
+        and _REVIEW_REVISION_PATTERN.fullmatch(child.managed_worktree_commit.lower())
+        else None
+    )
+    if snapshot is None or not snapshot[1] or (expected is not None and snapshot[0] != expected):
+        return {
+            "review_scope_sha256": scope_sha256,
+            "review_subject_kind": "unbound",
+            "review_subject_worktree": canonical_source,
+        }
+    revision = expected or snapshot[0]
+    subject_id = hashlib.sha256(
+        "\x1f".join((scope_sha256, revision, request_sha256)).encode("utf-8", "strict")
+    ).hexdigest()
+    return {
+        "review_scope_sha256": scope_sha256,
+        "review_subject_id": subject_id,
+        "review_subject_kind": "git_commit",
+        "review_subject_revision": revision,
+        "review_subject_worktree": canonical_source,
+    }
+
+
+def _request_effect_for_assignment(
+    db: Any,
+    parent_terminal_id: str,
+    delegation_kind: str,
+    workflow_turn_id: Optional[int],
+    workflow_effect_id: Optional[int],
+) -> tuple[WorkflowModel, Optional[WorkflowEffectModel]]:
+    workflow = _open_workflow(db, parent_terminal_id, create=True)
+    assert workflow is not None
+    if workflow.status != WORKFLOW_OPEN:
+        raise ValueError("parent workflow is not open")
+    if workflow_turn_id is None and workflow_effect_id is None:
+        return workflow, None
+    if workflow_turn_id is None or workflow_effect_id is None:
+        raise ValueError("assignment request authority is incomplete")
+    effect = (
+        db.query(WorkflowEffectModel)
+        .filter(
+            WorkflowEffectModel.id == workflow_effect_id,
+            WorkflowEffectModel.workflow_id == workflow.id,
+            WorkflowEffectModel.workflow_turn_id == workflow_turn_id,
+            WorkflowEffectModel.effect_kind == delegation_kind,
+            WorkflowEffectModel.state == "claimed",
+        )
+        .first()
+    )
+    if effect is None or workflow.active_turn_id != workflow_turn_id:
+        raise ValueError("assignment request authority is not current")
+    return workflow, cast(WorkflowEffectModel, effect)
+
+
+def _register_child_attempt(
+    parent_terminal_id: str,
+    child_terminal_id: str,
+    delegation_kind: str,
+    *,
+    workflow_turn_id: Optional[int] = None,
+    workflow_effect_id: Optional[int] = None,
+    request_message: Optional[str] = None,
+) -> bool:
+    """Persist one immutable callback attempt and its exact review subject."""
     _ensure_child_assignment_schema()
     _ensure_delegation_result_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         if not _retirement_quiescence_allows_commit(db, parent_terminal_id):
             return False
-        workflow = _open_workflow(db, parent_terminal_id, create=True)
-        assert workflow is not None
-        if workflow.status != WORKFLOW_OPEN:
-            return False
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
+        if workflow_effect_id is not None:
+            exact_retry = (
+                db.query(ChildAssignmentModel)
+                .filter(ChildAssignmentModel.request_workflow_effect_id == workflow_effect_id)
+                .first()
+            )
+            if exact_retry is not None:
+                if (
+                    exact_retry.parent_terminal_id != parent_terminal_id
+                    or exact_retry.child_terminal_id != child_terminal_id
+                ):
+                    raise ValueError(
+                        "assignment request effect already belongs to another relation"
+                    )
+                db.rollback()
+                return False
+        workflow, effect = _request_effect_for_assignment(
+            db,
+            parent_terminal_id,
+            delegation_kind,
+            workflow_turn_id,
+            workflow_effect_id,
         )
-        if assignment:
-            if assignment.parent_terminal_id != parent_terminal_id:
+        prior = _latest_child_assignment(db, child_terminal_id)
+        if prior is not None:
+            if prior.parent_terminal_id != parent_terminal_id:
                 raise ValueError(
                     f"Child terminal {child_terminal_id} already belongs to another parent"
                 )
-            return False
+            if effect is None or prior.request_workflow_effect_id == effect.id:
+                db.rollback()
+                return False
+            # Reuse is deliberately reviewer-only. Ordinary assigned work and
+            # direct handoffs retain one callback expectation per terminal.
+            if prior.review_subject_kind is None or delegation_kind != "assign":
+                db.rollback()
+                return False
+            prior_result = (
+                db.query(DelegationResultModel).filter_by(child_assignment_id=prior.id).first()
+            )
+            prior_workflow = (
+                db.get(WorkflowModel, prior.child_workflow_id)
+                if prior.child_workflow_id is not None
+                else None
+            )
+            if (
+                prior_result is None
+                or prior_result.status == DelegationResultStatus.AWAITING.value
+                or (prior_workflow is not None and prior_workflow.status == WORKFLOW_OPEN)
+            ):
+                db.rollback()
+                return False
+        request_sha256 = (
+            hashlib.sha256(request_message.encode("utf-8", "strict")).hexdigest()
+            if isinstance(request_message, str)
+            else None
+        )
+        child = db.query(TerminalModel).filter_by(id=child_terminal_id).first()
+        review_subject = (
+            _review_subject_for_child(child, cast(str, request_sha256))
+            if request_sha256 is not None
+            else (
+                {"review_subject_kind": "legacy_unscoped"} if _terminal_is_reviewer(child) else {}
+            )
+        )
         assignment = ChildAssignmentModel(
             parent_terminal_id=parent_terminal_id,
             child_terminal_id=child_terminal_id,
-            status=ChildAssignmentStatus.AWAITING_RESULT.value,
+            status=(
+                ChildAssignmentStatus.HANDOFF_AWAITING_RESULT.value
+                if delegation_kind == "handoff"
+                else ChildAssignmentStatus.AWAITING_RESULT.value
+            ),
+            attempt_id=str(uuid.uuid4()),
+            request_workflow_id=workflow.id if effect is not None else None,
+            request_workflow_turn_id=workflow_turn_id if effect is not None else None,
+            request_workflow_effect_id=effect.id if effect is not None else None,
+            request_sha256=request_sha256,
+            **review_subject,
         )
+        if assignment.review_subject_kind is not None:
+            now = datetime.now()
+            superseded_query = db.query(ChildAssignmentModel).filter(
+                ChildAssignmentModel.parent_terminal_id == parent_terminal_id,
+                ChildAssignmentModel.review_superseded_at.is_(None),
+            )
+            if assignment.review_scope_sha256 is not None:
+                superseded_query = superseded_query.filter(
+                    or_(
+                        (
+                            (ChildAssignmentModel.request_workflow_id == workflow.id)
+                            & (
+                                ChildAssignmentModel.review_scope_sha256
+                                == assignment.review_scope_sha256
+                            )
+                        ),
+                        ChildAssignmentModel.review_subject_kind.in_(
+                            ("legacy_unscoped", "unbound")
+                        ),
+                    )
+                )
+            else:
+                # An admitted reviewer request whose source cannot be bound is
+                # itself non-authoritative, but it still proves that an older
+                # verdict must not silently remain the current gate.
+                superseded_query = superseded_query.filter(
+                    ChildAssignmentModel.review_subject_kind.is_not(None)
+                )
+            superseded = superseded_query.all()
+            for previous in superseded:
+                previous.review_superseded_at = now
+                previous.updated_at = now
+                if previous.status in (
+                    ChildAssignmentStatus.AWAITING_RESULT.value,
+                    ChildAssignmentStatus.RESULT_QUEUED.value,
+                    ChildAssignmentStatus.RESULT_DELIVERED.value,
+                    ChildAssignmentStatus.RESULT_FAILED.value,
+                ):
+                    previous.status = ChildAssignmentStatus.RESULT_SUPERSEDED.value
+                result = (
+                    db.query(DelegationResultModel)
+                    .filter_by(child_assignment_id=previous.id)
+                    .first()
+                )
+                if result is not None and result.status == DelegationResultStatus.AWAITING.value:
+                    result.status = DelegationResultStatus.CANCELLED.value
+                    result.reason_code = "review_attempt_superseded"
+                    result.finalized_at = result.updated_at = now
+                    _record_result_event(
+                        db,
+                        result.id,
+                        f"review-attempt-superseded:{previous.id}",
+                        "review_attempt_superseded",
+                        "cao_lifecycle",
+                        parent_terminal_id,
+                    )
+                if previous.result_message_id is not None:
+                    notice = db.get(InboxModel, previous.result_message_id)
+                    if notice is not None and notice.status == MessageStatus.PENDING.value:
+                        notice.status = MessageStatus.FAILED.value
         db.add(assignment)
         db.flush()
-        _create_result_for_assignment(db, assignment, "assign", workflow)
+        _create_result_for_assignment(db, assignment, delegation_kind, workflow)
         if not _retirement_quiescence_allows_commit(db, parent_terminal_id):
             db.rollback()
             return False
@@ -14128,44 +14674,175 @@ def register_child_assignment(parent_terminal_id: str, child_terminal_id: str) -
         return True
 
 
-def register_handoff_child(parent_terminal_id: str, child_terminal_id: str) -> bool:
+def register_child_assignment(
+    parent_terminal_id: str,
+    child_terminal_id: str,
+    *,
+    workflow_turn_id: Optional[int] = None,
+    workflow_effect_id: Optional[int] = None,
+    request_message: Optional[str] = None,
+) -> bool:
+    """Persist one assigned-child result attempt.
+
+    Calls without request provenance retain the legacy idempotent relation for
+    compatibility.  MCP-created attempts bind the exact parent effect and, for
+    reviewer terminals, a server-observed immutable Git subject.
+    """
+    return _register_child_attempt(
+        parent_terminal_id,
+        child_terminal_id,
+        "assign",
+        workflow_turn_id=workflow_turn_id,
+        workflow_effect_id=workflow_effect_id,
+        request_message=request_message,
+    )
+
+
+def register_handoff_child(
+    parent_terminal_id: str,
+    child_terminal_id: str,
+    *,
+    workflow_turn_id: Optional[int] = None,
+    workflow_effect_id: Optional[int] = None,
+    request_message: Optional[str] = None,
+) -> bool:
     """Persist a blocking handoff before its task can produce a result.
 
     The distinct initial state needs no schema migration and lets restart
     reconciliation resume only ordinary handoffs, not callback-driven assigns.
     """
+    return _register_child_attempt(
+        parent_terminal_id,
+        child_terminal_id,
+        "handoff",
+        workflow_turn_id=workflow_turn_id,
+        workflow_effect_id=workflow_effect_id,
+        request_message=request_message,
+    )
+
+
+def bind_child_assignment_input_turn(child_terminal_id: str, transport_binding: str) -> bool:
+    """Bind the newest attempt to the exact child workflow created for its input.
+
+    The opaque transport binding is server-issued before provider delivery.
+    Persisting its workflow identity on the attempt prevents a delayed result
+    from an earlier use of the same reviewer terminal from being rebound to a
+    later review request.
+    """
     _ensure_child_assignment_schema()
-    _ensure_delegation_result_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
-        if not _retirement_quiescence_allows_commit(db, parent_terminal_id):
-            return False
-        workflow = _open_workflow(db, parent_terminal_id, create=True)
-        assert workflow is not None
-        if workflow.status != WORKFLOW_OPEN:
-            return False
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        assignment = _latest_child_assignment(db, child_terminal_id)
+        turn = (
+            db.query(WorkflowTurnModel)
+            .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+            .filter(
+                WorkflowModel.root_terminal_id == child_terminal_id,
+                WorkflowModel.status == WORKFLOW_OPEN,
+                WorkflowModel.active_turn_id == WorkflowTurnModel.id,
+                WorkflowTurnModel.transport_binding == transport_binding,
+            )
             .first()
         )
-        if assignment:
-            if assignment.parent_terminal_id != parent_terminal_id:
-                raise ValueError(
-                    f"Child terminal {child_terminal_id} already belongs to another parent"
-                )
-            return False
-        assignment = ChildAssignmentModel(
-            parent_terminal_id=parent_terminal_id,
-            child_terminal_id=child_terminal_id,
-            status=ChildAssignmentStatus.HANDOFF_AWAITING_RESULT.value,
-        )
-        db.add(assignment)
-        db.flush()
-        _create_result_for_assignment(db, assignment, "handoff", workflow)
-        if not _retirement_quiescence_allows_commit(db, parent_terminal_id):
+        if assignment is None or turn is None:
             db.rollback()
             return False
+        if (
+            assignment.child_workflow_id is not None
+            or assignment.child_workflow_turn_id is not None
+        ):
+            matches = (
+                assignment.child_workflow_id is not None
+                and assignment.child_workflow_turn_id is not None
+                and int(assignment.child_workflow_id) == int(turn.workflow_id)
+                and int(assignment.child_workflow_turn_id) == int(turn.id)
+            )
+            db.rollback()
+            return matches
+        changed = (
+            db.query(ChildAssignmentModel)
+            .filter(
+                ChildAssignmentModel.id == assignment.id,
+                ChildAssignmentModel.child_workflow_id.is_(None),
+                ChildAssignmentModel.child_workflow_turn_id.is_(None),
+            )
+            .update(
+                {
+                    ChildAssignmentModel.child_workflow_id: turn.workflow_id,
+                    ChildAssignmentModel.child_workflow_turn_id: turn.id,
+                    ChildAssignmentModel.updated_at: datetime.now(),
+                },
+                synchronize_session=False,
+            )
+        )
+        if changed != 1:
+            db.rollback()
+            return False
+        db.commit()
+        return True
+
+
+def cancel_child_assignment_attempt(
+    parent_terminal_id: str,
+    child_terminal_id: str,
+    workflow_effect_id: int,
+    *,
+    reason_code: str = "input_delivery_failed",
+) -> bool:
+    """Cancel only one pre-delivery attempt identified by its parent effect.
+
+    Reviewer terminals may be reused for later immutable attempts.  A failure
+    while binding or sending that later input must not rewrite earlier review
+    history merely because all attempts share one child terminal.
+    """
+    _ensure_child_assignment_schema()
+    _ensure_delegation_result_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        assignment = (
+            db.query(ChildAssignmentModel)
+            .filter(
+                ChildAssignmentModel.parent_terminal_id == parent_terminal_id,
+                ChildAssignmentModel.child_terminal_id == child_terminal_id,
+                ChildAssignmentModel.request_workflow_effect_id == workflow_effect_id,
+            )
+            .first()
+        )
+        if assignment is None:
+            db.rollback()
+            return False
+        if assignment.status == ChildAssignmentStatus.CANCELLED.value:
+            db.rollback()
+            return True
+        if assignment.status not in (
+            ChildAssignmentStatus.AWAITING_RESULT.value,
+            ChildAssignmentStatus.HANDOFF_AWAITING_RESULT.value,
+        ):
+            db.rollback()
+            return False
+        delegation_kind = "handoff" if assignment.status.startswith("handoff_") else "assign"
+        now = datetime.now()
+        assignment.status = ChildAssignmentStatus.CANCELLED.value
+        assignment.updated_at = now
+        result = _create_result_for_assignment(
+            db,
+            assignment,
+            delegation_kind,
+            _open_workflow(db, parent_terminal_id, create=False),
+        )
+        if result.status == DelegationResultStatus.AWAITING.value:
+            result.status = DelegationResultStatus.CANCELLED.value
+            result.reason_code = reason_code
+            result.finalized_at = result.updated_at = now
+            _record_result_event(
+                db,
+                result.id,
+                f"attempt-cancelled:{assignment.attempt_id}:{reason_code}",
+                "attempt_cancelled",
+                "cao_lifecycle",
+                parent_terminal_id,
+            )
         db.commit()
         return True
 
@@ -14180,11 +14857,7 @@ def mark_handoff_child_input_received(child_terminal_id: str) -> bool:
     """
     _ensure_child_assignment_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         if (
             assignment is None
             or assignment.status == ChildAssignmentStatus.CANCELLED.value
@@ -14208,11 +14881,7 @@ def handoff_child_input_received(child_terminal_id: str) -> bool:
     """
     _ensure_child_assignment_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         if (
             assignment is None
             or assignment.status == ChildAssignmentStatus.CANCELLED.value
@@ -14297,18 +14966,6 @@ def create_child_assignment_result_message(
     _ensure_delegation_result_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(
-                ChildAssignmentModel.parent_terminal_id == receiver_id,
-                ChildAssignmentModel.child_terminal_id == sender_id,
-            )
-            .first()
-        )
-        if assignment is None:
-            return None, False
-        if assignment.status == ChildAssignmentStatus.CANCELLED.value:
-            return None, True
         workflow = _open_workflow(db, receiver_id, create=False)
         if workflow is None or workflow.status != WORKFLOW_OPEN:
             # A terminal/owner/cancel transition fences all parent edges in
@@ -14335,9 +14992,23 @@ def create_child_assignment_result_message(
             .first()
         )
         if effect is None:
+            legacy_assignment = _latest_child_assignment(db, sender_id)
+            if (
+                legacy_assignment is not None
+                and legacy_assignment.parent_terminal_id == receiver_id
+                and legacy_assignment.status == ChildAssignmentStatus.CANCELLED.value
+            ):
+                return None, True
             raise PermissionError(
                 "assigned result requires the registered child's admitted send_message effect"
             )
+        assignment = _assignment_for_child_workflow(
+            db, sender_id, int(effect.workflow_id), parent_terminal_id=receiver_id
+        )
+        if assignment is None:
+            return None, False
+        if assignment.status == ChildAssignmentStatus.CANCELLED.value:
+            return None, True
         # An existing delivery may have survived the former split transaction
         # while its child workflow remained OPEN.  Enter the common finalizer
         # before declaring this effect a replay so it can repair that edge
@@ -14389,16 +15060,6 @@ def create_assigned_child_completion_result_message(
     _ensure_delegation_result_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
-        )
-        if assignment is None or assignment.status == ChildAssignmentStatus.CANCELLED.value:
-            return None, False
-        parent_workflow = _open_workflow(db, assignment.parent_terminal_id, create=False)
-        if parent_workflow is None or parent_workflow.status != WORKFLOW_OPEN:
-            return None, True
         effect = (
             db.query(WorkflowEffectModel)
             .join(WorkflowModel, WorkflowModel.id == WorkflowEffectModel.workflow_id)
@@ -14417,6 +15078,12 @@ def create_assigned_child_completion_result_message(
             raise PermissionError(
                 "assigned completion requires the child's admitted complete_workflow effect"
             )
+        assignment = _assignment_for_child_workflow(db, child_terminal_id, int(effect.workflow_id))
+        if assignment is None or assignment.status == ChildAssignmentStatus.CANCELLED.value:
+            return None, False
+        parent_workflow = _open_workflow(db, assignment.parent_terminal_id, create=False)
+        if parent_workflow is None or parent_workflow.status != WORKFLOW_OPEN:
+            return None, True
 
         if assignment.result_message_id is not None:
             inbox_msg, duplicate, reason = _finalize_managed_delegation_result(
@@ -14533,13 +15200,99 @@ def get_parent_completion_barrier(parent_terminal_id: str) -> tuple[int, int]:
             .all()
         )
         active_statuses = _active_child_assignment_statuses()
-        active = sum(assignment.status in active_statuses for assignment in assignments)
+        active = sum(
+            assignment.review_superseded_at is None and assignment.status in active_statuses
+            for assignment in assignments
+        )
         failed = sum(
-            assignment.status == ChildAssignmentStatus.RESULT_FAILED.value
-            or assignment.status == ChildAssignmentStatus.HANDOFF_RESULT_FAILED.value
+            assignment.review_superseded_at is None
+            and (
+                assignment.status == ChildAssignmentStatus.RESULT_FAILED.value
+                or assignment.status == ChildAssignmentStatus.HANDOFF_RESULT_FAILED.value
+            )
             for assignment in assignments
         )
         return active, failed
+
+
+def _review_acknowledgement_reason(
+    db: Any,
+    assignment: ChildAssignmentModel,
+    parent_workflow: WorkflowModel,
+    result: Optional[DelegationResultModel],
+) -> Optional[str]:
+    """Fail closed unless this is the current exact Git review authority."""
+    kind = assignment.review_subject_kind
+    if kind is None:
+        return None
+    if assignment.review_superseded_at is not None:
+        return "RESULT_REVIEW_ATTEMPT_SUPERSEDED"
+    if (
+        kind != "git_commit"
+        or assignment.request_workflow_id != parent_workflow.id
+        or assignment.request_workflow_turn_id is None
+        or assignment.request_workflow_effect_id is None
+        or assignment.child_workflow_id is None
+        or assignment.child_workflow_turn_id is None
+        or assignment.request_sha256 is None
+        or not assignment.review_scope_sha256
+        or not assignment.review_subject_id
+        or not assignment.review_subject_revision
+        or not assignment.review_subject_worktree
+    ):
+        return "RESULT_REVIEW_AUTHORITY_UNBOUND"
+    latest = (
+        db.query(ChildAssignmentModel.id)
+        .filter(
+            ChildAssignmentModel.parent_terminal_id == assignment.parent_terminal_id,
+            ChildAssignmentModel.request_workflow_id == assignment.request_workflow_id,
+            ChildAssignmentModel.review_scope_sha256 == assignment.review_scope_sha256,
+            ChildAssignmentModel.review_superseded_at.is_(None),
+        )
+        .order_by(ChildAssignmentModel.id.desc())
+        .first()
+    )
+    if latest is None or int(latest[0]) != int(assignment.id):
+        return "RESULT_REVIEW_ATTEMPT_SUPERSEDED"
+    request_effect = db.get(WorkflowEffectModel, assignment.request_workflow_effect_id)
+    child_effect = (
+        db.get(WorkflowEffectModel, result.workflow_effect_id)
+        if result is not None and result.workflow_effect_id is not None
+        else None
+    )
+    expected_subject = hashlib.sha256(
+        "\x1f".join(
+            (
+                assignment.review_scope_sha256,
+                assignment.review_subject_revision,
+                assignment.request_sha256,
+            )
+        ).encode("utf-8", "strict")
+    ).hexdigest()
+    if (
+        request_effect is None
+        or request_effect.workflow_id != parent_workflow.id
+        or request_effect.workflow_turn_id != assignment.request_workflow_turn_id
+        or request_effect.effect_kind != "assign"
+        or request_effect.state != "completed"
+        or result is None
+        or result.child_assignment_id != assignment.id
+        or result.parent_workflow_id != parent_workflow.id
+        or result.child_terminal_id != assignment.child_terminal_id
+        or child_effect is None
+        or child_effect.workflow_id != assignment.child_workflow_id
+        or child_effect.workflow_turn_id != assignment.child_workflow_turn_id
+        or child_effect.effect_kind not in {"send_message", "complete_workflow"}
+        or child_effect.state not in {"claimed", "completed"}
+        or not hmac.compare_digest(expected_subject, assignment.review_subject_id)
+    ):
+        return "RESULT_REVIEW_AUTHORITY_UNBOUND"
+    snapshot = _git_review_snapshot(assignment.review_subject_worktree)
+    if snapshot is None:
+        return "RESULT_REVIEW_SUBJECT_UNAVAILABLE"
+    if not snapshot[1] or snapshot[0] != assignment.review_subject_revision:
+        return "RESULT_REVIEW_REVISION_STALE"
+    return None
 
 
 def acknowledge_child_assignment_result(
@@ -14602,7 +15355,7 @@ def acknowledge_child_assignment_result_outcome(
             ).filter(DelegationResultModel.id == result_id)
         if child_terminal_id:
             query = query.filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-        assignment = query.first()
+        assignment = query.order_by(ChildAssignmentModel.id.desc()).first()
         if assignment is None:
             return {
                 "accepted": False,
@@ -14623,6 +15376,14 @@ def acknowledge_child_assignment_result_outcome(
             "child_terminal_id": assignment.child_terminal_id,
             "result_id": canonical_result.id if canonical_result is not None else None,
         }
+        if result_id is None and assignment.review_subject_kind is not None:
+            return {
+                "accepted": False,
+                "reason_code": "RESULT_REVIEW_IDENTITY_REQUIRED",
+                "workflow_state": parent_workflow.status,
+                "assignment_status": assignment.status,
+                **canonical_identity,
+            }
         if assignment.status in (
             ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
             ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value,
@@ -14630,6 +15391,17 @@ def acknowledge_child_assignment_result_outcome(
             return {
                 "accepted": False,
                 "reason_code": "RESULT_ALREADY_ACKNOWLEDGED",
+                "workflow_state": parent_workflow.status,
+                "assignment_status": assignment.status,
+                **canonical_identity,
+            }
+        review_reason = _review_acknowledgement_reason(
+            db, assignment, parent_workflow, canonical_result
+        )
+        if review_reason is not None:
+            return {
+                "accepted": False,
+                "reason_code": review_reason,
                 "workflow_state": parent_workflow.status,
                 "assignment_status": assignment.status,
                 **canonical_identity,
@@ -14695,7 +15467,7 @@ def describe_child_assignment_acknowledgement(
             ).filter(DelegationResultModel.id == result_id)
         if child_terminal_id:
             query = query.filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-        assignment = query.first()
+        assignment = query.order_by(ChildAssignmentModel.id.desc()).first()
         if assignment is None:
             return {
                 "reason_code": (
@@ -14714,6 +15486,13 @@ def describe_child_assignment_acknowledgement(
             "child_terminal_id": assignment.child_terminal_id,
             "result_id": canonical_result.id if canonical_result is not None else None,
         }
+        if result_id is None and assignment.review_subject_kind is not None:
+            return {
+                "reason_code": "RESULT_REVIEW_IDENTITY_REQUIRED",
+                "workflow_state": workflow.status,
+                "assignment_status": assignment.status,
+                **canonical_identity,
+            }
         if assignment.status in (
             ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
             ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value,
@@ -14721,6 +15500,14 @@ def describe_child_assignment_acknowledgement(
             return {
                 "reason_code": "RESULT_ALREADY_ACKNOWLEDGED",
                 "workflow_state": workflow.status,
+                **canonical_identity,
+            }
+        review_reason = _review_acknowledgement_reason(db, assignment, workflow, canonical_result)
+        if review_reason is not None:
+            return {
+                "reason_code": review_reason,
+                "workflow_state": workflow.status,
+                "assignment_status": assignment.status,
                 **canonical_identity,
             }
         if assignment.status in (
@@ -14763,7 +15550,8 @@ def requeue_unacknowledged_child_assignment_results() -> int:
                         ChildAssignmentStatus.HANDOFF_RESULT_DELIVERED.value,
                         ChildAssignmentStatus.HANDOFF_RESULT_FAILED.value,
                     )
-                )
+                ),
+                ChildAssignmentModel.review_superseded_at.is_(None),
             )
             .all()
         )
@@ -14912,11 +15700,7 @@ def get_handoff_child_status(child_terminal_id: str) -> Optional[str]:
     """Return a direct-handoff relation state, if this child has one."""
     _ensure_child_assignment_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         if assignment is None:
             return None
         if assignment.status == ChildAssignmentStatus.CANCELLED.value:
@@ -14930,11 +15714,7 @@ def get_handoff_parent_terminal_id(child_terminal_id: str) -> Optional[str]:
     """Return the owning parent for a live/recovery direct handoff."""
     _ensure_child_assignment_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         if (
             assignment is None
             or assignment.status == ChildAssignmentStatus.CANCELLED.value
@@ -14952,11 +15732,7 @@ def create_handoff_child_result_message(
     _ensure_delegation_result_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         if assignment is None or assignment.status == ChildAssignmentStatus.CANCELLED.value:
             return None, True
         workflow = _open_workflow(db, assignment.parent_terminal_id, create=False)
@@ -14999,11 +15775,7 @@ def get_handoff_child_result_message(child_terminal_id: str) -> Optional[InboxMe
     """Return the one durable recovery result, if it has already been created."""
     _ensure_child_assignment_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         if assignment is None or assignment.result_message_id is None:
             return None
         inbox_msg = (
@@ -15016,11 +15788,7 @@ def handoff_child_cleanup_acknowledged(child_terminal_id: str) -> bool:
     """Record the once-only cleanup receipt after a durable recovery result."""
     _ensure_child_assignment_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         if assignment is None or not assignment.status.startswith("handoff_"):
             return False
         if assignment.result_message_id is None:
@@ -15037,11 +15805,7 @@ def handoff_child_cleanup_is_acknowledged(child_terminal_id: str) -> bool:
     """Return whether recovery may wake the parent without redoing cleanup."""
     _ensure_child_assignment_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         return bool(assignment and assignment.cleanup_acknowledged)
 
 
@@ -15057,11 +15821,7 @@ def claim_handoff_child_result_direct(
     _ensure_child_assignment_schema()
     _ensure_delegation_result_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         if assignment is None or not assignment.status.startswith("handoff_"):
             return None
         # The injected bearer capability identifies new managed structured
@@ -15100,11 +15860,7 @@ def claim_staged_handoff_result_direct(
     _ensure_delegation_result_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         if assignment is None or not assignment.status.startswith("handoff_"):
             return None
         if assignment.parent_terminal_id != parent_terminal_id:
@@ -15182,11 +15938,7 @@ def get_acknowledged_handoff_child_result_direct(
     """
     _ensure_child_assignment_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         if (
             assignment is None
             or assignment.parent_terminal_id != parent_terminal_id
@@ -15222,11 +15974,7 @@ def get_claimed_handoff_child_result_direct(
     """
     _ensure_child_assignment_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         if (
             assignment is None
             or assignment.parent_terminal_id != parent_terminal_id
@@ -15253,11 +16001,7 @@ def acknowledge_handoff_child_result_direct(
     """Record direct cleanup while retaining a parent acknowledgement barrier."""
     _ensure_child_assignment_schema()
     with SessionLocal() as db:
-        assignment = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.child_terminal_id == child_terminal_id)
-            .first()
-        )
+        assignment = _latest_child_assignment(db, child_terminal_id)
         if assignment is None or assignment.parent_terminal_id != parent_terminal_id:
             return None
         if assignment.status in (

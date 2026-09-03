@@ -31,6 +31,7 @@ class ChildAssignmentStatus(str, Enum):
     RESULT_DELIVERED = "result_delivered"
     RESULT_FAILED = "result_failed"
     RESULT_ACKNOWLEDGED = "result_acknowledged"
+    RESULT_SUPERSEDED = "result_superseded"
     HANDOFF_AWAITING_RESULT = "handoff_awaiting_result"
     HANDOFF_RECOVERY_AWAITING_RESULT = "handoff_recovery_awaiting_result"
     HANDOFF_DIRECT_RESULT_CLAIMED = "handoff_direct_result_claimed"

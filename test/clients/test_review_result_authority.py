@@ -288,11 +288,11 @@ def test_mcp_assign_reuses_same_reviewer_with_exact_new_attempt_and_ack(
                 parent_turn_id,
                 "reviewer_sol_high",
                 "Blocker-only rereview revision B",
-                working_directory=None,
                 reviewer_terminal_id="reviewer",
+                **({"working_directory": None} if mcp_server.ENABLE_WORKING_DIRECTORY else {}),
             )
         )
-    assert rereview["success"] is True
+    assert rereview["success"] is True, rereview
     assert rereview["terminal_id"] == "reviewer"
     assert rereview["reviewer_reused"] is True
     assert rereview["review_attempt"]["revision"] == revision_b
@@ -377,8 +377,8 @@ def test_mcp_assign_cannot_reuse_an_ordinary_child_as_reviewer(authority_db, mon
                 turn_id,
                 "reviewer_sol_high",
                 "Do not reuse an ordinary child",
-                working_directory=None,
                 reviewer_terminal_id="ordinary-child",
+                **({"working_directory": None} if mcp_server.ENABLE_WORKING_DIRECTORY else {}),
             )
         )
     assert rejected["success"] is False
@@ -408,8 +408,8 @@ def test_mcp_assign_cannot_claim_unrelated_reviewer_as_first_attempt(
                 turn_id,
                 "reviewer_sol_high",
                 "Caller-selected reviewer must already belong to this parent",
-                working_directory=None,
                 reviewer_terminal_id="unrelated-reviewer",
+                **({"working_directory": None} if mcp_server.ENABLE_WORKING_DIRECTORY else {}),
             )
         )
     assert rejected["success"] is False

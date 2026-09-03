@@ -27,6 +27,7 @@ from cli_agent_orchestrator.providers.codex import (
 )
 from cli_agent_orchestrator.services.terminal_service import (
     COMPRESSED_OUTPUT_MAX_BYTES,
+    COMPRESSED_OUTPUT_SOURCE_MAX_BYTES,
     LAST_OUTPUT_READ_MAX_BYTES,
     LAST_OUTPUT_RESPONSE_MAX_BYTES,
     OUTPUT_CHUNK_MAX_BYTES,
@@ -2947,6 +2948,38 @@ class TestGetOutput:
 
         assert "".join(chunks).encode() == payload
 
+    @pytest.mark.parametrize("boundary_effect", ["osc", "backspace"])
+    def test_full_output_sanitization_is_stable_across_hard_boundaries(
+        self, monkeypatch, tmp_path, boundary_effect
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        total = OUTPUT_CHUNK_MAX_BYTES * 2
+        boundary = total - (OUTPUT_CHUNK_MAX_BYTES - 4)
+        payload = bytearray(b"a" * total)
+        if boundary_effect == "osc":
+            control = b"\x1b]0;page-boundary-secret\x07"
+            start = boundary - 8
+            payload[start : start + len(control)] = control
+        else:
+            payload[boundary - 10 : boundary] = b"0123456789"
+            payload[boundary : boundary + 10] = b"\b" * 10
+        raw = bytes(payload)
+        (tmp_path / "test1234.log").write_bytes(raw)
+
+        cursor = None
+        chunks = []
+        while True:
+            chunk = get_output_chunk("test1234", cursor)
+            chunks.insert(0, chunk.output)
+            if not chunk.has_older:
+                break
+            cursor = chunk.cursor
+
+        paged = "".join(chunks)
+        assert paged == _sanitize_human_terminal_output(raw.decode())
+        if boundary_effect == "osc":
+            assert "page-boundary-secret" not in paged
+
     def test_full_output_keeps_crlf_atomic_at_a_chunk_boundary(self, monkeypatch, tmp_path):
         self._durable_terminal(monkeypatch, tmp_path)
         total = OUTPUT_CHUNK_MAX_BYTES * 2
@@ -3012,6 +3045,23 @@ class TestGetOutput:
             get_output_chunk("test1234")
 
         assert error.value.reason_code == "COMPRESSED_OUTPUT_REQUIRES_INDEX"
+
+    def test_concatenated_gzip_members_have_a_compressed_input_ceiling(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        member = gzip.compress(b"")
+        member_count = (COMPRESSED_OUTPUT_SOURCE_MAX_BYTES // len(member)) + 1
+        source = member * member_count
+        assert len(source) > COMPRESSED_OUTPUT_SOURCE_MAX_BYTES
+        (tmp_path / "test1234.log.gz").write_bytes(source)
+
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service.os.pread", wraps=os.pread
+        ) as bounded_read:
+            with pytest.raises(TerminalOutputUnavailable) as error:
+                get_output_chunk("test1234")
+
+        assert error.value.reason_code == "COMPRESSED_OUTPUT_REQUIRES_INDEX"
+        bounded_read.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")

@@ -22,6 +22,7 @@ import binascii
 import gzip
 import hashlib
 import hmac
+import io
 import logging
 import os
 import secrets
@@ -440,7 +441,9 @@ OUTPUT_CHUNK_MAX_BYTES = 256 * 1024
 LAST_OUTPUT_READ_MAX_BYTES = 1024 * 1024
 LAST_OUTPUT_RESPONSE_MAX_BYTES = 256 * 1024
 COMPRESSED_OUTPUT_MAX_BYTES = 256 * 1024
+COMPRESSED_OUTPUT_SOURCE_MAX_BYTES = 256 * 1024
 _OUTPUT_BOUNDARY_SCAN_BYTES = 16 * 1024
+_OUTPUT_SANITIZER_CONTEXT_BYTES = 64 * 1024
 _OUTPUT_CURSOR = struct.Struct(">BQQQQ")
 _OUTPUT_CURSOR_VERSION = 1
 _OUTPUT_CURSOR_ENCODED_LENGTH = len(
@@ -562,11 +565,21 @@ def _bounded_suffix_bytes(
     return start_offset, chunk
 
 
-def _read_small_compressed_output(descriptor: int) -> bytes:
-    """Preserve small gzip history while rejecting sources that need a full scan."""
-    with os.fdopen(os.dup(descriptor), "rb") as raw:
-        with gzip.GzipFile(fileobj=raw, mode="rb") as stream:
-            payload = stream.read(COMPRESSED_OUTPUT_MAX_BYTES + 1)
+def _read_small_compressed_output(descriptor: int, *, source_size: int) -> bytes:
+    """Preserve small gzip history with input and decompressed-output ceilings."""
+    if source_size > COMPRESSED_OUTPUT_SOURCE_MAX_BYTES:
+        raise TerminalOutputUnavailable(
+            "Compressed output is too large for bounded random access",
+            "COMPRESSED_OUTPUT_REQUIRES_INDEX",
+        )
+    compressed = os.pread(descriptor, COMPRESSED_OUTPUT_SOURCE_MAX_BYTES + 1, 0)
+    if len(compressed) > COMPRESSED_OUTPUT_SOURCE_MAX_BYTES:
+        raise TerminalOutputUnavailable(
+            "Compressed output is too large for bounded random access",
+            "COMPRESSED_OUTPUT_REQUIRES_INDEX",
+        )
+    with gzip.GzipFile(fileobj=io.BytesIO(compressed), mode="rb") as stream:
+        payload = stream.read(COMPRESSED_OUTPUT_MAX_BYTES + 1)
     if len(payload) > COMPRESSED_OUTPUT_MAX_BYTES:
         raise TerminalOutputUnavailable(
             "Compressed output is too large for bounded random access",
@@ -613,18 +626,21 @@ def _consume_terminal_csi(value: str, index: int) -> int:
     return len(value)
 
 
-def _sanitize_human_terminal_output(value: str) -> str:
+def _sanitize_human_terminal_output_owned(value: str, owners: list[int] | None = None) -> str:
     """Remove terminal effects while preserving readable Unicode text.
 
     Raw tmux history and durable logs intentionally retain controls for
     provider parsing and diagnostics.  This renderer is applied only to the
     human-facing FULL output boundary.
     """
-    rendered: list[str] = []
+    if owners is not None and len(owners) != len(value):
+        raise ValueError("Terminal output ownership must match the input")
+    rendered: list[tuple[str, int]] = []
     index = 0
     while index < len(value):
         character = value[index]
         codepoint = ord(character)
+        owner = owners[index] if owners is not None else 0
 
         if character == "\x1b":
             if index + 1 >= len(value):
@@ -666,30 +682,64 @@ def _sanitize_human_terminal_output(value: str) -> str:
 
         if character == "\r":
             if index + 1 < len(value) and value[index + 1] == "\n":
-                if not rendered or rendered[-1] != "\n":
-                    rendered.append("\n")
+                newline_owner = owners[index + 1] if owners is not None else 0
+                if not rendered or rendered[-1][0] != "\n":
+                    rendered.append(("\n", newline_owner))
                 index += 2
                 continue
-            if not rendered or rendered[-1] != "\n":
-                rendered.append("\n")
+            if not rendered or rendered[-1][0] != "\n":
+                rendered.append(("\n", owner))
             index += 1
             continue
         if character == "\b":
-            if rendered and rendered[-1] not in {"\n", "\t"}:
+            if rendered and rendered[-1][0] not in {"\n", "\t"}:
                 rendered.pop()
             index += 1
             continue
         if character in {"\n", "\t"}:
-            rendered.append(character)
+            rendered.append((character, owner))
             index += 1
             continue
         if codepoint < 0x20 or codepoint == 0x7F:
             index += 1
             continue
 
-        rendered.append(character)
+        rendered.append((character, owner))
         index += 1
-    return "".join(rendered)
+    return "".join(character for character, owner in rendered if owners is None or owner == 0)
+
+
+def _sanitize_human_terminal_output(value: str) -> str:
+    return _sanitize_human_terminal_output_owned(value)
+
+
+def _read_output_sanitizer_context(
+    descriptor: int,
+    *,
+    start_offset: int,
+    end_offset: int,
+    snapshot_size: int,
+) -> tuple[bytes, bytes]:
+    """Read fixed look-behind/ahead for stateful terminal effects at page edges."""
+    prefix_start = max(0, start_offset - _OUTPUT_SANITIZER_CONTEXT_BYTES)
+    prefix = os.pread(descriptor, start_offset - prefix_start, prefix_start)
+    suffix_end = min(snapshot_size, end_offset + _OUTPUT_SANITIZER_CONTEXT_BYTES)
+    suffix = os.pread(descriptor, suffix_end - end_offset, end_offset)
+    if len(prefix) != start_offset - prefix_start or len(suffix) != suffix_end - end_offset:
+        raise TerminalOutputCursorError(
+            "Output source changed during the read", "OUTPUT_CURSOR_STALE"
+        )
+    return prefix, suffix
+
+
+def _sanitize_human_terminal_output_slice(prefix: bytes, payload: bytes, suffix: bytes) -> str:
+    """Sanitize one page with bounded context and return only page-owned text."""
+    prefix_text = prefix.decode("utf-8", errors="replace")
+    payload_text = payload.decode("utf-8", errors="replace")
+    suffix_text = suffix.decode("utf-8", errors="replace")
+    value = prefix_text + payload_text + suffix_text
+    owners = [-1] * len(prefix_text) + [0] * len(payload_text) + [1] * len(suffix_text)
+    return _sanitize_human_terminal_output_owned(value, owners)
 
 
 # Providers that accept a runtime skill_prompt kwarg and append it to the
@@ -3159,7 +3209,7 @@ def get_output_chunk(terminal_id: str, cursor: str | None = None) -> TerminalOut
                 raise TerminalOutputCursorError(
                     "Compressed output cursor is invalid", "OUTPUT_CURSOR_INVALID"
                 )
-            payload = _read_small_compressed_output(descriptor)
+            payload = _read_small_compressed_output(descriptor, source_size=source.st_size)
             rendered = _sanitize_human_terminal_output(payload.decode("utf-8", errors="replace"))
             return TerminalOutputChunk(
                 output=rendered,
@@ -3185,7 +3235,13 @@ def get_output_chunk(terminal_id: str, cursor: str | None = None) -> TerminalOut
             before_offset=before_offset,
             maximum_bytes=OUTPUT_CHUNK_MAX_BYTES,
         )
-        rendered = _sanitize_human_terminal_output(payload.decode("utf-8", errors="replace"))
+        prefix, suffix = _read_output_sanitizer_context(
+            descriptor,
+            start_offset=start_offset,
+            end_offset=before_offset,
+            snapshot_size=snapshot_size,
+        )
+        rendered = _sanitize_human_terminal_output_slice(prefix, payload, suffix)
         has_older = start_offset > 0
         next_cursor = (
             _encode_output_cursor(

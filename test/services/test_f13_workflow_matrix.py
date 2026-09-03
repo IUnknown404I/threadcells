@@ -2392,6 +2392,131 @@ def test_f13_resume_reconciles_one_handoff_batch_without_splitting_results(
         assert all(db.get(InboxModel, notice.id).status == "pending" for notice in notices)
 
 
+def test_f13_stale_handoff_claim_after_resume_never_rolls_active_authority_back(
+    workflow_db,
+):
+    """A stale FIFO scan yields to one post-resume callback successor."""
+    parent = "parent-resume-handoff-claim-race"
+    child = "child-resume-handoff-claim-race"
+    _ensure_running_test_terminal(parent)
+    interrupted_turn = start_workflow_input(parent)
+    assert interrupted_turn is not None
+    receipt = claim_or_resume_workflow_turn_receipt(parent, interrupted_turn)
+    assert receipt["accepted"] is True
+    assert register_handoff_child(parent, child)
+    notice, duplicate = create_handoff_child_result_message(child, "durable raced callback")
+    assert notice is not None and notice.result_id is not None and duplicate is False
+    callback = get_workflow_turn_for_inbox(notice.id)
+    assert callback is not None
+    callback_turn = callback["turn_id"]
+
+    # The dispatcher selected this Inbox head before the concurrent resume
+    # committed. Its later transactional batch claim must re-check monotonic
+    # receiver authority rather than trusting the stale scan.
+    stale_queue = database.get_provider_execution_admission_queue()
+    assert stale_queue[0]["source"] == "inbox"
+    assert stale_queue[0]["source_id"] == notice.id
+
+    resumed = claim_or_resume_workflow_turn_receipt(
+        parent,
+        interrupted_turn,
+        resume_token=receipt["resume_token"],
+    )
+    assert resumed["accepted"] is True and resumed["resumed"] is True
+    resume_turn = resumed["logical_turn_id"]
+    assert callback_turn < resume_turn
+    assert database.acquire_provider_execution(parent, resume_turn, 3)
+
+    assert claim_handoff_result_batch_for_inbox(notice.id) is None
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=parent).one()
+        assert workflow.active_turn_id == resume_turn
+        assert db.get(WorkflowTurnModel, callback_turn).state == "queued"
+        assert db.get(database.ProviderExecutionLeaseModel, parent).workflow_turn_id == resume_turn
+
+    assert database.reconcile_result_callbacks_superseded_by_resume() == 1
+    assert database.reconcile_result_callbacks_superseded_by_resume() == 0
+    with database.SessionLocal() as db:
+        stale = db.get(WorkflowTurnModel, callback_turn)
+        assert stale.state == "cancelled"
+        assert stale.superseded_by_turn_id is not None
+        successor_turn = stale.superseded_by_turn_id
+        successor = db.get(WorkflowTurnModel, successor_turn)
+        result = db.get(database.DelegationResultModel, notice.result_id)
+        immutable_result = (
+            result.id,
+            result.document_json,
+            result.content_sha256,
+            result.content_bytes,
+        )
+        assert successor_turn > resume_turn
+        assert successor.state == "queued"
+        assert result.workflow_turn_id == successor_turn
+        assert (
+            db.query(WorkflowTurnModel)
+            .filter_by(
+                workflow_id=workflow.id,
+                dedupe_key=f"resume-reconciled:{resume_turn}:{callback_turn}",
+            )
+            .count()
+            == 1
+        )
+
+    # A stale Ready projection can claim the correct successor while the
+    # resumed provider execution still owns capacity. The admission failure
+    # requeues that successor without restoring either the old callback or R.
+    successor_claim = claim_handoff_result_batch_for_inbox(notice.id)
+    assert isinstance(successor_claim, dict)
+    assert successor_claim["id"] == successor_turn
+    assert requeue_workflow_turn(
+        successor_turn,
+        successor_claim["claim_token"],
+        successor_claim["claim_generation"],
+        admission_reason_code="PROVIDER_EXECUTION_TERMINAL_BUSY",
+    )
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=parent).one()
+        assert workflow.active_turn_id == successor_turn
+        assert db.get(WorkflowTurnModel, callback_turn).state == "cancelled"
+        assert db.get(WorkflowTurnModel, successor_turn).state == "queued"
+        assert db.get(database.ProviderExecutionLeaseModel, parent).workflow_turn_id == resume_turn
+        assert (
+            db.query(WorkflowTurnReceiptModel)
+            .filter_by(workflow_turn_id=successor_turn, receiver_terminal_id=parent)
+            .count()
+            == 0
+        )
+
+    assert database.release_provider_execution(parent, resume_turn)
+    delivered = claim_handoff_result_batch_for_inbox(notice.id)
+    assert isinstance(delivered, dict) and delivered["id"] == successor_turn
+    assert mark_workflow_turn_sent(
+        successor_turn,
+        delivered["claim_token"],
+        delivered["claim_generation"],
+    )
+    assert database.update_pending_message_status(notice.id, database.MessageStatus.DELIVERED)
+    assert mark_child_assignment_result_delivered(notice.id)
+    assert claim_workflow_turn_receipt(parent, successor_turn)
+    assert not claim_workflow_turn_receipt(parent, successor_turn)
+
+    with database.SessionLocal() as db:
+        result = db.get(database.DelegationResultModel, notice.result_id)
+        assert (
+            result.id,
+            result.document_json,
+            result.content_sha256,
+            result.content_bytes,
+        ) == immutable_result
+        turns = (
+            db.query(WorkflowTurnModel)
+            .filter_by(workflow_id=result.parent_workflow_id, kind="handoff_result")
+            .all()
+        )
+        assert len(turns) == 2
+        assert {turn.id for turn in turns} == {callback_turn, successor_turn}
+
+
 def test_f13_closed_ordinary_inbox_is_not_a_new_owner_input_predecessor(workflow_db):
     """A terminal workflow's transport row cannot defer a new semantic workflow."""
     parent = "parent-closed-inbox-submit"

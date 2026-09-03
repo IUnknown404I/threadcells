@@ -37,6 +37,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     _active_worktree_lanes,
     _canonical_worktree,
     _create_terminal_after_admission,
+    _render_progressive_terminal_output,
     _resolve_context_role,
     _sanitize_human_terminal_output,
     _write_enabled_lane,
@@ -63,6 +64,7 @@ from cli_agent_orchestrator.services.terminal_service import (
         ("plain\x1b]unterminated", "plain"),
         ("plain\x90unterminated", "plain"),
         ("plain\x1b[\nnext", "plain\nnext"),
+        ("plain\x1b]metadata\nnext", "plain\nnext"),
     ],
 )
 def test_human_output_sanitizer_fails_closed_on_partial_controls(raw, expected):
@@ -2874,6 +2876,22 @@ class TestGetOutput:
         assert len(result.encode()) <= LAST_OUTPUT_RESPONSE_MAX_BYTES
         assert result.endswith("x" * 100)
 
+    def test_last_response_reads_a_bounded_compressed_source(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        with gzip.open(tmp_path / "test1234.log.gz", "wb") as stream:
+            stream.write(b"latest compressed response")
+        provider = MagicMock()
+        provider.extract_last_message_from_script.return_value = "latest compressed response"
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.provider_manager.get_provider",
+            lambda *_: provider,
+        )
+
+        assert get_output("test1234", OutputMode.LAST) == "latest compressed response"
+        provider.extract_last_message_from_script.assert_called_once_with(
+            "latest compressed response"
+        )
+
     def test_full_output_pages_newest_first_without_gaps_or_overlap(self, monkeypatch, tmp_path):
         self._durable_terminal(monkeypatch, tmp_path)
         expected = "".join(
@@ -2949,7 +2967,7 @@ class TestGetOutput:
         assert "".join(chunks).encode() == payload
 
     @pytest.mark.parametrize("boundary_effect", ["osc", "backspace"])
-    def test_full_output_sanitization_is_stable_across_hard_boundaries(
+    def test_full_output_rendering_is_composable_across_unbounded_terminal_state(
         self, monkeypatch, tmp_path, boundary_effect
     ):
         self._durable_terminal(monkeypatch, tmp_path)
@@ -2957,12 +2975,14 @@ class TestGetOutput:
         boundary = total - (OUTPUT_CHUNK_MAX_BYTES - 4)
         payload = bytearray(b"a" * total)
         if boundary_effect == "osc":
-            control = b"\x1b]0;page-boundary-secret\x07"
-            start = boundary - 8
+            distance = (64 * 1024) + 128
+            control = b"\x1b]" + b"x" * (distance - 2) + b"PAGE_MARKER\x07"
+            start = boundary - distance
             payload[start : start + len(control)] = control
         else:
-            payload[boundary - 10 : boundary] = b"0123456789"
-            payload[boundary : boundary + 10] = b"\b" * 10
+            erase_count = (64 * 1024) + 32
+            payload[boundary - erase_count : boundary] = b"z" * erase_count
+            payload[boundary : boundary + erase_count] = b"\b" * erase_count
         raw = bytes(payload)
         (tmp_path / "test1234.log").write_bytes(raw)
 
@@ -2976,9 +2996,33 @@ class TestGetOutput:
             cursor = chunk.cursor
 
         paged = "".join(chunks)
-        assert paged == _sanitize_human_terminal_output(raw.decode())
+        assert paged == _render_progressive_terminal_output(raw)
         if boundary_effect == "osc":
-            assert "page-boundary-secret" not in paged
+            assert "PAGE_MARKER" in paged
+        assert all(
+            character in {"\n", "\t"}
+            or (ord(character) >= 0x20 and not 0x7F <= ord(character) <= 0x9F)
+            for character in paged
+        )
+
+    def test_full_output_preserves_terminal_cleanup_for_line_isolated_pages(
+        self, monkeypatch, tmp_path
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        raw_line = b"\x1b[31mvisible\x1b[0m\n"
+        line_count = ((OUTPUT_CHUNK_MAX_BYTES * 2) // len(raw_line)) + 100
+        (tmp_path / "test1234.log").write_bytes(raw_line * line_count)
+
+        cursor = None
+        chunks = []
+        while True:
+            chunk = get_output_chunk("test1234", cursor)
+            chunks.insert(0, chunk.output)
+            if not chunk.has_older:
+                break
+            cursor = chunk.cursor
+
+        assert "".join(chunks) == "visible\n" * line_count
 
     def test_full_output_keeps_crlf_atomic_at_a_chunk_boundary(self, monkeypatch, tmp_path):
         self._durable_terminal(monkeypatch, tmp_path)

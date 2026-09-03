@@ -443,7 +443,6 @@ LAST_OUTPUT_RESPONSE_MAX_BYTES = 256 * 1024
 COMPRESSED_OUTPUT_MAX_BYTES = 256 * 1024
 COMPRESSED_OUTPUT_SOURCE_MAX_BYTES = 256 * 1024
 _OUTPUT_BOUNDARY_SCAN_BYTES = 16 * 1024
-_OUTPUT_SANITIZER_CONTEXT_BYTES = 64 * 1024
 _OUTPUT_CURSOR = struct.Struct(">BQQQQ")
 _OUTPUT_CURSOR_VERSION = 1
 _OUTPUT_CURSOR_ENCODED_LENGTH = len(
@@ -601,6 +600,11 @@ def _bounded_text_suffix(value: str, maximum_bytes: int) -> str:
 def _consume_terminal_control_string(value: str, index: int) -> int:
     """Return the first index after an OSC/DCS-style control string."""
     while index < len(value):
+        # Durable output pagination uses line boundaries as bounded parser
+        # resynchronization points. Terminal metadata/control strings are not
+        # allowed to hide subsequent human-visible lines.
+        if value[index] in {"\n", "\r"}:
+            return index
         if value[index] in {"\x07", "\x9c"}:
             return index + 1
         if value[index] == "\x1b" and index + 1 < len(value) and value[index + 1] == "\\":
@@ -626,21 +630,18 @@ def _consume_terminal_csi(value: str, index: int) -> int:
     return len(value)
 
 
-def _sanitize_human_terminal_output_owned(value: str, owners: list[int] | None = None) -> str:
+def _sanitize_human_terminal_output(value: str) -> str:
     """Remove terminal effects while preserving readable Unicode text.
 
     Raw tmux history and durable logs intentionally retain controls for
     provider parsing and diagnostics.  This renderer is applied only to the
     human-facing FULL output boundary.
     """
-    if owners is not None and len(owners) != len(value):
-        raise ValueError("Terminal output ownership must match the input")
-    rendered: list[tuple[str, int]] = []
+    rendered: list[str] = []
     index = 0
     while index < len(value):
         character = value[index]
         codepoint = ord(character)
-        owner = owners[index] if owners is not None else 0
 
         if character == "\x1b":
             if index + 1 >= len(value):
@@ -682,64 +683,75 @@ def _sanitize_human_terminal_output_owned(value: str, owners: list[int] | None =
 
         if character == "\r":
             if index + 1 < len(value) and value[index + 1] == "\n":
-                newline_owner = owners[index + 1] if owners is not None else 0
-                if not rendered or rendered[-1][0] != "\n":
-                    rendered.append(("\n", newline_owner))
+                if not rendered or rendered[-1] != "\n":
+                    rendered.append("\n")
                 index += 2
                 continue
-            if not rendered or rendered[-1][0] != "\n":
-                rendered.append(("\n", owner))
+            if not rendered or rendered[-1] != "\n":
+                rendered.append("\n")
             index += 1
             continue
         if character == "\b":
-            if rendered and rendered[-1][0] not in {"\n", "\t"}:
+            if rendered and rendered[-1] not in {"\n", "\t"}:
                 rendered.pop()
             index += 1
             continue
         if character in {"\n", "\t"}:
-            rendered.append((character, owner))
+            rendered.append(character)
             index += 1
             continue
         if codepoint < 0x20 or codepoint == 0x7F:
             index += 1
             continue
 
-        rendered.append((character, owner))
+        rendered.append(character)
         index += 1
-    return "".join(character for character, owner in rendered if owners is None or owner == 0)
+    return "".join(rendered)
 
 
-def _sanitize_human_terminal_output(value: str) -> str:
-    return _sanitize_human_terminal_output_owned(value)
+def _render_progressive_terminal_output(payload: bytes) -> str:
+    """Render a page without state that could cross an arbitrary byte range.
+
+    Browsers do not emulate terminal escape grammars. Dropping only control
+    codepoints makes the text safe to place in the DOM while preserving every
+    printable byte independently. This deliberately does not interpret ANSI,
+    OSC, backspace, or carriage-return state: doing so for a newest-first
+    random-access suffix would require an unbounded scan or a durable index.
+    """
+    value = payload.decode("utf-8", errors="replace")
+    return "".join(
+        character
+        for character in value
+        if character in {"\n", "\t"}
+        or (ord(character) >= 0x20 and not 0x7F <= ord(character) <= 0x9F)
+    )
 
 
-def _read_output_sanitizer_context(
-    descriptor: int,
-    *,
-    start_offset: int,
-    end_offset: int,
-    snapshot_size: int,
-) -> tuple[bytes, bytes]:
-    """Read fixed look-behind/ahead for stateful terminal effects at page edges."""
-    prefix_start = max(0, start_offset - _OUTPUT_SANITIZER_CONTEXT_BYTES)
-    prefix = os.pread(descriptor, start_offset - prefix_start, prefix_start)
-    suffix_end = min(snapshot_size, end_offset + _OUTPUT_SANITIZER_CONTEXT_BYTES)
-    suffix = os.pread(descriptor, suffix_end - end_offset, end_offset)
-    if len(prefix) != start_offset - prefix_start or len(suffix) != suffix_end - end_offset:
-        raise TerminalOutputCursorError(
-            "Output source changed during the read", "OUTPUT_CURSOR_STALE"
-        )
-    return prefix, suffix
-
-
-def _sanitize_human_terminal_output_slice(prefix: bytes, payload: bytes, suffix: bytes) -> str:
-    """Sanitize one page with bounded context and return only page-owned text."""
-    prefix_text = prefix.decode("utf-8", errors="replace")
-    payload_text = payload.decode("utf-8", errors="replace")
-    suffix_text = suffix.decode("utf-8", errors="replace")
-    value = prefix_text + payload_text + suffix_text
-    owners = [-1] * len(prefix_text) + [0] * len(payload_text) + [1] * len(suffix_text)
-    return _sanitize_human_terminal_output_owned(value, owners)
+def _output_range_is_line_isolated(
+    descriptor: int, *, start_offset: int, end_offset: int, snapshot_size: int
+) -> bool:
+    """Return whether terminal grammar state cannot cross this byte range."""
+    if start_offset == 0:
+        start_isolated = True
+    else:
+        preceding = os.pread(descriptor, 1, start_offset - 1)
+        if len(preceding) != 1:
+            raise TerminalOutputCursorError(
+                "Output source changed during the read", "OUTPUT_CURSOR_STALE"
+            )
+        start_isolated = preceding in {b"\n", b"\r"}
+    if end_offset == snapshot_size:
+        end_isolated = True
+    elif end_offset > 0:
+        preceding = os.pread(descriptor, 1, end_offset - 1)
+        if len(preceding) != 1:
+            raise TerminalOutputCursorError(
+                "Output source changed during the read", "OUTPUT_CURSOR_STALE"
+            )
+        end_isolated = preceding in {b"\n", b"\r"}
+    else:
+        end_isolated = True
+    return start_isolated and end_isolated
 
 
 # Providers that accept a runtime skill_prompt kwarg and append it to the
@@ -3235,13 +3247,20 @@ def get_output_chunk(terminal_id: str, cursor: str | None = None) -> TerminalOut
             before_offset=before_offset,
             maximum_bytes=OUTPUT_CHUNK_MAX_BYTES,
         )
-        prefix, suffix = _read_output_sanitizer_context(
+        # A complete bounded source retains the legacy terminal-aware cleanup.
+        # Progressive sources use a page-composable renderer because terminal
+        # grammar state may otherwise begin arbitrarily far before this range.
+        line_isolated = _output_range_is_line_isolated(
             descriptor,
             start_offset=start_offset,
             end_offset=before_offset,
             snapshot_size=snapshot_size,
         )
-        rendered = _sanitize_human_terminal_output_slice(prefix, payload, suffix)
+        rendered = (
+            _sanitize_human_terminal_output(payload.decode("utf-8", errors="replace"))
+            if snapshot_size <= OUTPUT_CHUNK_MAX_BYTES or line_isolated
+            else _render_progressive_terminal_output(payload)
+        )
         has_older = start_offset > 0
         next_cursor = (
             _encode_output_cursor(
@@ -3269,7 +3288,7 @@ def _get_last_output(terminal_id: str) -> str:
     descriptor, source, compressed = _open_durable_output(terminal_id)
     try:
         if compressed:
-            payload = _read_small_compressed_output(descriptor)
+            payload = _read_small_compressed_output(descriptor, source_size=source.st_size)
         else:
             _, payload = _bounded_suffix_bytes(
                 descriptor,

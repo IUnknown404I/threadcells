@@ -496,6 +496,7 @@ def _seed_completed_assigned_child_execution(
     child: str,
     *,
     result_complete: bool = True,
+    bind_child_workflow: bool = True,
 ) -> tuple[int, str, int]:
     assert database.register_child_assignment(parent, child)
     child_turn = database.start_workflow_input(child)
@@ -511,8 +512,13 @@ def _seed_completed_assigned_child_execution(
             .filter_by(child_assignment_id=assignment.id)
             .one()
         )
-        assignment.child_workflow_id = child_workflow.id
-        assignment.child_workflow_turn_id = child_turn
+        if bind_child_workflow:
+            assignment.child_workflow_id = child_workflow.id
+            assignment.child_workflow_turn_id = child_turn
+        else:
+            assignment.request_workflow_id = None
+            assignment.request_workflow_turn_id = None
+            assignment.request_workflow_effect_id = None
         if result_complete:
             now = datetime.now()
             result.status = "complete"
@@ -543,6 +549,7 @@ def _seed_completed_assigned_child_execution(
             result.workflow_turn_id = callback.id
         child_workflow.status = "terminal"
         child_workflow.terminal_reason = "authoritative delegated result accepted"
+        child_workflow.updated_at = datetime.now()
         db.commit()
         return child_turn, result.id, assignment.result_message_id or 0
 
@@ -636,6 +643,53 @@ def test_terminal_child_provider_final_before_result_durability_retains_lease(
     _provider_final_observation(monkeypatch, {"term-0": TerminalStatus.COMPLETED})
 
     assert inbox_service._reconcile_terminal_workflow_provider_executions_with_admission() == 0
+    assert database.get_provider_execution_turn("term-0") == child_turn
+
+
+def test_legacy_unbound_completed_child_releases_only_with_exact_causal_proof(
+    capacity_db, monkeypatch
+):
+    """#112 rolling upgrade: pre-binding results retain a bounded exact proof."""
+    parent = "term-4"
+    assert database.start_workflow_input(parent) is not None
+    child_turn, result_id, notice_id = _seed_completed_assigned_child_execution(
+        parent,
+        "term-0",
+        bind_child_workflow=False,
+    )
+    _provider_final_observation(monkeypatch, {"term-0": TerminalStatus.IDLE})
+
+    candidates = database.list_terminal_workflow_provider_execution_candidates()
+    assert [(row["terminal_id"], row["workflow_turn_id"]) for row in candidates] == [
+        ("term-0", child_turn)
+    ]
+    assert inbox_service._reconcile_terminal_workflow_provider_executions_with_admission() == 1
+    assert database.get_provider_execution_turn("term-0") is None
+    with database.SessionLocal() as db:
+        result = db.get(database.DelegationResultModel, result_id)
+        assignment = db.get(database.ChildAssignmentModel, result.child_assignment_id)
+        notice = db.get(InboxModel, notice_id)
+        assert result.status == "complete"
+        assert assignment.status == "result_queued"
+        assert assignment.child_workflow_id is None
+        assert notice.status == "pending"
+
+
+def test_legacy_unbound_result_from_before_exact_lease_fails_closed(capacity_db):
+    parent = "term-4"
+    assert database.start_workflow_input(parent) is not None
+    child_turn, result_id, _notice_id = _seed_completed_assigned_child_execution(
+        parent,
+        "term-0",
+        bind_child_workflow=False,
+    )
+    with database.SessionLocal() as db:
+        result = db.get(database.DelegationResultModel, result_id)
+        lease = db.get(database.ProviderExecutionLeaseModel, "term-0")
+        result.finalized_at = lease.acquired_at - timedelta(seconds=1)
+        db.commit()
+
+    assert database.list_terminal_workflow_provider_execution_candidates() == []
     assert database.get_provider_execution_turn("term-0") == child_turn
 
 

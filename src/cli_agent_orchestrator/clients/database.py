@@ -5373,16 +5373,20 @@ def list_terminal_workflow_provider_execution_candidates(
                 )
                 .first()
             )
-            # An old, unbound live relation cannot be proven unrelated to the
-            # terminal workflow. Fail closed until its result/authority is
-            # migrated; a completed, exactly bound relation follows the
-            # durable-result gate below. Historical bound assignments from an
-            # earlier workflow do not poison a later top-level execution.
-            legacy_unbound_assignment = (
-                db.query(ChildAssignmentModel.id)
+            # Before child-input turn binding was introduced, one assignment
+            # could remain unbound even though result finalization and child
+            # workflow terminalization committed together.  Retain that
+            # compatibility only for a single legacy relation; the causal
+            # timestamps and canonical terminal reason are checked below.
+            legacy_unbound_assignments = (
+                db.query(ChildAssignmentModel)
                 .filter(
                     ChildAssignmentModel.child_terminal_id == lease.terminal_id,
                     ChildAssignmentModel.child_workflow_id.is_(None),
+                    ChildAssignmentModel.child_workflow_turn_id.is_(None),
+                    ChildAssignmentModel.request_workflow_id.is_(None),
+                    ChildAssignmentModel.request_workflow_turn_id.is_(None),
+                    ChildAssignmentModel.request_workflow_effect_id.is_(None),
                     ChildAssignmentModel.status.notin_(
                         (
                             ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
@@ -5392,16 +5396,21 @@ def list_terminal_workflow_provider_execution_candidates(
                         )
                     ),
                 )
-                .first()
+                .order_by(ChildAssignmentModel.id.asc())
+                .all()
             )
-            delegated = exact_assignment is not None or legacy_unbound_assignment is not None
+            legacy_assignment = (
+                legacy_unbound_assignments[0] if len(legacy_unbound_assignments) == 1 else None
+            )
+            delegated = exact_assignment is not None or bool(legacy_unbound_assignments)
             if delegated:
-                if exact_assignment is None:
+                assignment = exact_assignment or legacy_assignment
+                if assignment is None:
                     continue
                 durable_result = (
-                    db.query(DelegationResultModel.id)
+                    db.query(DelegationResultModel)
                     .filter(
-                        DelegationResultModel.child_assignment_id == exact_assignment.id,
+                        DelegationResultModel.child_assignment_id == assignment.id,
                         DelegationResultModel.child_terminal_id == lease.terminal_id,
                         DelegationResultModel.status == DelegationResultStatus.COMPLETE.value,
                         DelegationResultModel.finalized_at.is_not(None),
@@ -5410,6 +5419,28 @@ def list_terminal_workflow_provider_execution_candidates(
                 )
                 if durable_result is None:
                     continue
+                if exact_assignment is None:
+                    # This bounded legacy proof mirrors the old atomic result
+                    # finalization contour: the assignment predates the exact
+                    # provider lease, the result finalized during that lease,
+                    # and child terminalization immediately followed it.  A
+                    # result from an earlier workflow or a later top-level
+                    # execution therefore cannot authorize release.
+                    if (
+                        workflow.terminal_reason
+                        not in {
+                            "authoritative delegated result accepted",
+                            "repaired authoritative delegated result",
+                        }
+                        or assignment.created_at is None
+                        or lease.acquired_at is None
+                        or durable_result.finalized_at is None
+                        or workflow.updated_at is None
+                        or assignment.created_at > lease.acquired_at
+                        or durable_result.finalized_at < lease.acquired_at
+                        or durable_result.finalized_at > workflow.updated_at
+                    ):
+                        continue
             candidates.append(
                 {
                     "terminal_id": str(lease.terminal_id),

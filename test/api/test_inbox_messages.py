@@ -39,6 +39,16 @@ def sample_inbox_messages():
             status=MessageStatus.FAILED,
             created_at=datetime(2025, 12, 6, 12, 10, 0),
         ),
+        InboxMessage(
+            id=4,
+            sender_id="sender4",
+            receiver_id="abcdef12",
+            message="Historical callback",
+            status=MessageStatus.SUPERSEDED,
+            callback_reconciled_at=datetime(2025, 12, 6, 12, 15, 0),
+            callback_reconciled_from_turn_id=42,
+            created_at=datetime(2025, 12, 6, 12, 15, 0),
+        ),
     ]
 
 
@@ -54,7 +64,7 @@ class TestGetInboxMessagesEndpoint:
 
             assert response.status_code == 200
             data = response.json()
-            assert len(data) == 3
+            assert len(data) == 4
 
             # Check response format
             for msg_data in data:
@@ -112,6 +122,8 @@ class TestGetInboxMessagesEndpoint:
                 "result_id": "result-123",
                 "kind": "delegation_result_notice",
                 "superseded_at": sample_inbox_messages[0].created_at,
+                "callback_reconciled_at": sample_inbox_messages[0].created_at,
+                "callback_reconciled_from_turn_id": 42,
             }
         )
         with patch("cli_agent_orchestrator.api.main.get_inbox_messages", return_value=[message]):
@@ -122,6 +134,8 @@ class TestGetInboxMessagesEndpoint:
         assert payload["result_id"] == "result-123"
         assert payload["kind"] == "delegation_result_notice"
         assert payload["superseded_at"] is not None
+        assert payload["callback_reconciled_at"] is not None
+        assert payload["callback_reconciled_from_turn_id"] == 42
 
     def test_public_inbox_post_is_transport_only_not_assigned_result_finalization(
         self, client, sample_inbox_messages
@@ -150,7 +164,7 @@ class TestGetInboxMessagesEndpoint:
         data = response.json()
         assert "detail" in data
         assert "Invalid status" in data["detail"]
-        assert "pending, delivered, failed" in data["detail"]
+        assert "pending, delivered, failed, superseded" in data["detail"]
 
     def test_limit_exceeds_maximum(self, client):
         """Test that limit parameter is properly validated."""
@@ -219,7 +233,7 @@ class TestGetInboxMessagesEndpoint:
 
     def test_all_status_values(self, client, sample_inbox_messages):
         """Test filtering by each possible status value."""
-        for status_value in ["pending", "delivered", "failed"]:
+        for status_value in ["pending", "delivered", "failed", "superseded"]:
             filtered_messages = [
                 msg for msg in sample_inbox_messages if msg.status.value == status_value
             ]

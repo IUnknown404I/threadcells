@@ -52,6 +52,7 @@ from cli_agent_orchestrator.clients.database import (
     get_pending_handoff_child_terminal_ids,
     get_pending_messages,
     get_provider_execution_admission_queue,
+    get_provider_execution_turn,
     get_terminal_metadata,
     get_workflow_status,
     get_workflow_turn_for_inbox,
@@ -59,6 +60,7 @@ from cli_agent_orchestrator.clients.database import (
     handoff_child_cleanup_is_acknowledged,
     keep_managed_handoff_continuation_retryable,
     list_completed_assigned_child_retirement_candidates,
+    list_terminal_workflow_provider_execution_candidates,
     mark_child_assignment_result_delivered,
     mark_child_assignment_result_failed,
     mark_workflow_turn_sent,
@@ -67,6 +69,7 @@ from cli_agent_orchestrator.clients.database import (
     reconcile_closed_workflow_inbox_transports,
     reconcile_exited_terminal_workflow_authorities,
     reconcile_owner_gated_workflow_successors,
+    reconcile_result_callbacks_superseded_by_resume,
     reconcile_superseded_workflow_turns_for_restart,
     release_completed_assigned_child_retirement,
     release_undispatched_completed_child_retirement_claims_for_restart,
@@ -668,10 +671,29 @@ def _reconcile_provider_execution_queue_with_admission(
     if not _provider_queue_reconcile_lock.acquire(blocking=False):
         return 0
     try:
+        released_terminal_executions = (
+            _reconcile_terminal_workflow_provider_executions_with_admission()
+        )
+        if released_terminal_executions:
+            logger.info(
+                "Released %s provider executions after terminal workflow completion",
+                released_terminal_executions,
+            )
         # Rolling-upgrade repair: older runtimes could materialize ordinary
         # Inbox work after the receiver had already crossed to Exited. Retire
         # that false authority before it can occupy the shared FIFO.
         reconcile_exited_terminal_workflow_authorities()
+        # A fresh execution-resume receipt can supersede older callback turn
+        # IDs without superseding their immutable results. Rebuild that
+        # workflow's queued suffix once before FIFO selection so the callbacks
+        # and later Composer input all advance under monotonically current
+        # authority in their original semantic order.
+        reconciled_callbacks = reconcile_result_callbacks_superseded_by_resume()
+        if reconciled_callbacks:
+            logger.info(
+                "Reconciled %s queued workflow turns superseded by execution resume",
+                reconciled_callbacks,
+            )
         # A Composer successor committed just before its predecessor exhausted
         # transport retries is the owner's durable decision to continue. Make
         # that exact turn claimable before constructing the shared FIFO.
@@ -710,6 +732,30 @@ def _reconcile_provider_execution_queue_with_admission(
         return admitted
     finally:
         _provider_queue_reconcile_lock.release()
+
+
+def _reconcile_terminal_workflow_provider_executions_with_admission() -> int:
+    """Observe exact leases left behind by semantically terminal workflows."""
+    # A terminal workflow no longer participates in the OPEN-workflow
+    # observer, but its final model invocation may still own an exact provider
+    # lease. The terminal service releases only the snapshotted turn after
+    # strong provider-final proof; a processing/ambiguous provider remains
+    # capacity-authoritative and is retried by the next daemon tick.
+    released = 0
+    for candidate in list_terminal_workflow_provider_execution_candidates():
+        terminal_id = str(candidate["terminal_id"])
+        observed_turn = int(candidate["workflow_turn_id"])
+        try:
+            terminal_service.get_terminal(terminal_id)
+        except Exception as exc:
+            logger.debug(
+                "Terminal workflow provider boundary not yet observable for %s: %s",
+                terminal_id,
+                exc,
+            )
+            continue
+        released += int(get_provider_execution_turn(terminal_id) != observed_turn)
+    return released
 
 
 def reconcile_provider_execution_queue(

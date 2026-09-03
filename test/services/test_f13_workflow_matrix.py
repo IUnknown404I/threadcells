@@ -929,9 +929,11 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
             "id INTEGER PRIMARY KEY, workflow_turn_id INTEGER NOT NULL, "
             "receiver_terminal_id TEXT NOT NULL, consumed_at DATETIME NOT NULL)"
         )
+        connection.execute("CREATE TABLE inbox (id INTEGER PRIMARY KEY)")
     monkeypatch.setattr(constants, "DATABASE_FILE", database_file)
 
     database._migrate_workflow_turn_columns()
+    database._migrate_inbox_result_columns()
 
     with sqlite3.connect(database_file) as connection:
         workflow_columns = {row[1] for row in connection.execute("PRAGMA table_info(workflows)")}
@@ -939,6 +941,7 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
         receipt_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(workflow_turn_receipts)")
         }
+        inbox_columns = {row[1] for row in connection.execute("PRAGMA table_info(inbox)")}
     assert "resumed_from_owner_gate_workflow_id" in workflow_columns
     assert "queue_reason" in columns
     assert "provider_processing_observed_at" in columns
@@ -956,6 +959,10 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
     assert "resume_token_sha256" in receipt_columns
     assert "resumed_by_turn_id" in receipt_columns
     assert "resumed_at" in receipt_columns
+    assert "superseded_by_turn_id" in columns
+    assert "superseded_at" in columns
+    assert "callback_reconciled_at" in inbox_columns
+    assert "callback_reconciled_from_turn_id" in inbox_columns
 
 
 def _queue_inbox_workflow_turn(root: str, key: str = "inbox-result") -> tuple[int, int]:
@@ -1673,6 +1680,336 @@ def test_f13_restart_resumes_two_results_before_queued_owner_input_once(workflow
             .all()
         )
         assert len([turn for turn in owner_turns if turn.payload == owner_payload]) == 1
+
+
+def test_f13_resume_reconciles_older_result_callbacks_before_composer_once(
+    workflow_db, monkeypatch
+):
+    """A newer execution-resume rematerializes the complete queued FIFO suffix."""
+    parent = "parent-resume-result-suffix"
+    children = tuple(f"child-resume-result-{index}" for index in range(3))
+    _ensure_running_test_terminal(parent)
+    interrupted_turn = start_workflow_input(parent)
+    assert interrupted_turn is not None
+    initial_receipt = claim_or_resume_workflow_turn_receipt(parent, interrupted_turn)
+    assert initial_receipt["accepted"] is True
+
+    notices = []
+    for child in children:
+        assert register_child_assignment(parent, child)
+        notice, duplicate = create_child_assignment_result_message(
+            child,
+            parent,
+            f"durable result from {child}",
+            **_authorized_callback(child),
+        )
+        assert notice is not None and notice.result_id is not None
+        assert duplicate is False
+        notices.append(notice)
+
+    with database.SessionLocal() as db:
+        callback_turn_ids = [
+            db.query(WorkflowTurnModel).filter_by(inbox_message_id=notice.id).one().id
+            for notice in notices
+        ]
+        result_identity = {
+            result.id: (
+                result.child_assignment_id,
+                db.get(database.ChildAssignmentModel, result.child_assignment_id).attempt_id,
+                db.get(
+                    database.ChildAssignmentModel, result.child_assignment_id
+                ).review_subject_revision,
+            )
+            for result in db.query(database.DelegationResultModel).filter(
+                database.DelegationResultModel.id.in_([notice.result_id for notice in notices])
+            )
+        }
+
+    resumed = claim_or_resume_workflow_turn_receipt(
+        parent,
+        interrupted_turn,
+        resume_token=initial_receipt["resume_token"],
+    )
+    assert resumed["accepted"] is True and resumed["resumed"] is True
+    resume_turn = resumed["logical_turn_id"]
+    composer_payload = "continue after every historical callback"
+    composer = database.prepare_workflow_input(
+        parent,
+        composer_payload,
+        request_id="resume-result-suffix-composer",
+    )
+    assert composer is not None and composer["queued"] is True
+    composer_turn = composer["turn_id"]
+    assert callback_turn_ids[-1] < resume_turn < composer_turn
+
+    # A server restart after the newer receipt sees only durable state.
+    workflow_db.dispose()
+    assert database.reconcile_result_callbacks_superseded_by_resume() == 4
+    assert database.reconcile_result_callbacks_superseded_by_resume() == 0
+
+    with database.SessionLocal() as db:
+        old_callbacks = [db.get(WorkflowTurnModel, turn_id) for turn_id in callback_turn_ids]
+        old_composer = db.get(WorkflowTurnModel, composer_turn)
+        assert all(turn is not None and turn.state == "cancelled" for turn in old_callbacks)
+        assert old_composer is not None and old_composer.state == "cancelled"
+        successor_ids = [turn.superseded_by_turn_id for turn in old_callbacks]
+        composer_successor_id = old_composer.superseded_by_turn_id
+        assert all(isinstance(turn_id, int) for turn_id in successor_ids)
+        assert successor_ids == sorted(successor_ids)
+        assert successor_ids[-1] < composer_successor_id
+        assert all(turn_id > composer_turn for turn_id in successor_ids)
+        assert composer_successor_id > composer_turn
+        assert db.get(WorkflowTurnModel, composer_successor_id).payload == composer_payload
+        for notice, successor_id in zip(notices, successor_ids, strict=True):
+            inbox = db.get(InboxModel, notice.id)
+            result = db.get(database.DelegationResultModel, notice.result_id)
+            assignment = db.get(database.ChildAssignmentModel, result.child_assignment_id)
+            assert inbox.status == "pending"
+            assert inbox.callback_reconciled_from_turn_id in callback_turn_ids
+            assert inbox.callback_reconciled_at is not None
+            assert result.workflow_turn_id == successor_id
+            assert (
+                result.child_assignment_id,
+                assignment.attempt_id,
+                assignment.review_subject_revision,
+            ) == result_identity[result.id]
+        assert (
+            db.query(database.DelegationResultEventModel)
+            .filter_by(event_type="callback_transport_reconciled")
+            .count()
+            == 3
+        )
+
+    provider = MagicMock()
+    provider.get_status.return_value = TerminalStatus.IDLE
+    provider.is_process_alive.return_value = True
+    terminal_state = {"lifecycle": "running", "status": TerminalStatus.COMPLETED.value}
+    monkeypatch.setenv("CAO_TERMINAL_ID", parent)
+    with (
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.provider_manager.get_provider",
+            return_value=provider,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.inbox_service.terminal_service.provider_runtime_sidecar_reconnect_required",
+            return_value=False,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.workflow_service.terminal_service.get_terminal",
+            return_value=terminal_state,
+        ),
+        patch("cli_agent_orchestrator.services.terminal_service.send_input") as send,
+    ):
+        for notice, successor_id in zip(notices, successor_ids, strict=True):
+            assert check_and_send_pending_messages(parent) is True
+            assert f"logical-turn={successor_id}" in send.call_args.args[1]
+            assert claim_workflow_turn_receipt(parent, successor_id)
+            read = asyncio.run(mcp_server.read_delegation_result(successor_id, notice.result_id))
+            assert read["success"] is True
+            acknowledged = asyncio.run(
+                mcp_server.acknowledge_assigned_result(
+                    successor_id,
+                    result_id=notice.result_id,
+                    child_terminal_id=notice.sender_id,
+                )
+            )
+            assert acknowledged["success"] is True
+
+        assert inbox_service.reconcile_provider_execution_queue() >= 1
+        assert send.call_count == 4
+        assert f"logical-turn={composer_successor_id}" in send.call_args.args[1]
+        assert send.call_args.args[1].endswith(composer_payload)
+
+    assert claim_workflow_turn_receipt(parent, composer_successor_id)
+    duplicate_composer = database.prepare_workflow_input(
+        parent,
+        composer_payload,
+        request_id="resume-result-suffix-composer",
+    )
+    assert duplicate_composer is not None
+    assert duplicate_composer["accepted"] is True
+    assert duplicate_composer["duplicate"] is True
+    assert duplicate_composer["turn_id"] == composer_successor_id
+    assert get_parent_completion_barrier(parent) == (0, 0)
+    with database.SessionLocal() as db:
+        assert db.query(InboxModel).filter_by(status="delivered").count() == 3
+        assert db.query(database.DelegationResultModel).count() == 3
+
+
+def test_f13_resume_callback_reconciliation_is_atomic_across_restart(
+    workflow_db,
+):
+    parent = "parent-resume-callback-atomic"
+    child = "child-resume-callback-atomic"
+    _ensure_running_test_terminal(parent)
+    interrupted_turn = start_workflow_input(parent)
+    receipt = claim_or_resume_workflow_turn_receipt(parent, interrupted_turn)
+    assert receipt["accepted"] is True
+    assert register_child_assignment(parent, child)
+    notice, duplicate = create_child_assignment_result_message(
+        child,
+        parent,
+        "atomic durable result",
+        **_authorized_callback(child),
+    )
+    assert notice is not None and duplicate is False
+    with database.SessionLocal() as db:
+        old_turn_id = db.query(WorkflowTurnModel).filter_by(inbox_message_id=notice.id).one().id
+
+    resumed = claim_or_resume_workflow_turn_receipt(
+        parent, interrupted_turn, resume_token=receipt["resume_token"]
+    )
+    assert resumed["accepted"] is True
+
+    def fail_commit(_session):
+        raise RuntimeError("injected reconciliation commit failure")
+
+    event.listen(database.SessionLocal.class_, "before_commit", fail_commit)
+    try:
+        with pytest.raises(RuntimeError, match="injected reconciliation commit failure"):
+            database.reconcile_result_callbacks_superseded_by_resume()
+    finally:
+        event.remove(database.SessionLocal.class_, "before_commit", fail_commit)
+
+    workflow_db.dispose()
+    with database.SessionLocal() as db:
+        old_turn = db.get(WorkflowTurnModel, old_turn_id)
+        result = db.get(database.DelegationResultModel, notice.result_id)
+        inbox = db.get(InboxModel, notice.id)
+        assert old_turn.state == "queued"
+        assert old_turn.superseded_by_turn_id is None
+        assert result.workflow_turn_id == old_turn_id
+        assert inbox.status == "pending"
+        assert inbox.callback_reconciled_at is None
+        assert (
+            db.query(database.DelegationResultEventModel)
+            .filter_by(event_type="callback_transport_reconciled")
+            .count()
+            == 0
+        )
+
+    assert database.reconcile_result_callbacks_superseded_by_resume() == 1
+    assert database.reconcile_result_callbacks_superseded_by_resume() == 0
+
+
+def test_f13_resume_terminalizes_acknowledged_superseded_and_wrong_callbacks(
+    workflow_db,
+):
+    parent = "parent-resume-mixed-callbacks"
+    children = tuple(f"child-resume-mixed-{index}" for index in range(4))
+    _ensure_running_test_terminal(parent)
+    interrupted_turn = start_workflow_input(parent)
+    receipt = claim_or_resume_workflow_turn_receipt(parent, interrupted_turn)
+    assert receipt["accepted"] is True
+    notices = []
+    for child in children:
+        assert register_child_assignment(parent, child)
+        notice, duplicate = create_child_assignment_result_message(
+            child,
+            parent,
+            f"mixed durable result {child}",
+            **_authorized_callback(child),
+        )
+        assert notice is not None and duplicate is False
+        notices.append(notice)
+
+    with database.SessionLocal() as db:
+        assignments = [
+            db.query(database.ChildAssignmentModel).filter_by(child_terminal_id=child).one()
+            for child in children
+        ]
+        assignments[0].status = "result_acknowledged"
+        assignments[1].status = "result_superseded"
+        assignments[1].review_superseded_at = datetime.now()
+        assignments[3].review_scope_sha256 = "exact-scope"
+        assignments[3].review_subject_id = "exact-subject"
+        assignments[3].review_subject_kind = "git_commit"
+        assignments[3].review_subject_revision = "a" * 40
+        review_authority = (
+            assignments[3].attempt_id,
+            assignments[3].review_scope_sha256,
+            assignments[3].review_subject_id,
+            assignments[3].review_subject_revision,
+        )
+        wrong = db.get(database.DelegationResultModel, notices[2].result_id)
+        assert wrong.parent_workflow_id is not None
+        wrong.parent_workflow_id += 1000
+        valid_result_id = notices[3].result_id
+        db.commit()
+
+    resumed = claim_or_resume_workflow_turn_receipt(
+        parent, interrupted_turn, resume_token=receipt["resume_token"]
+    )
+    assert resumed["accepted"] is True
+    assert database.reconcile_result_callbacks_superseded_by_resume() == 4
+
+    with database.SessionLocal() as db:
+        assert db.get(InboxModel, notices[0].id).status == "superseded"
+        assert db.get(InboxModel, notices[1].id).status == "superseded"
+        assert db.get(InboxModel, notices[2].id).status == "failed"
+        valid_inbox = db.get(InboxModel, notices[3].id)
+        valid_result = db.get(database.DelegationResultModel, valid_result_id)
+        valid_assignment = db.get(database.ChildAssignmentModel, valid_result.child_assignment_id)
+        valid_turn = db.get(WorkflowTurnModel, valid_result.workflow_turn_id)
+        assert valid_inbox.status == "pending"
+        assert valid_inbox.callback_reconciled_at is not None
+        assert valid_turn.state == "queued"
+        assert valid_turn.id > resumed["logical_turn_id"]
+        assert (
+            valid_assignment.attempt_id,
+            valid_assignment.review_scope_sha256,
+            valid_assignment.review_subject_id,
+            valid_assignment.review_subject_revision,
+        ) == review_authority
+        assert db.query(database.DelegationResultModel).count() == 4
+
+
+def test_f13_resume_reconciles_one_handoff_batch_without_splitting_results(
+    workflow_db,
+):
+    parent = "parent-resume-handoff-batch"
+    children = ("child-resume-handoff-one", "child-resume-handoff-two")
+    _ensure_running_test_terminal(parent)
+    interrupted_turn = start_workflow_input(parent)
+    receipt = claim_or_resume_workflow_turn_receipt(parent, interrupted_turn)
+    assert receipt["accepted"] is True
+    notices = []
+    for child in children:
+        assert register_handoff_child(parent, child)
+        notice, duplicate = create_handoff_child_result_message(child, f"handoff from {child}")
+        assert notice is not None and duplicate is False
+        notices.append(notice)
+    with database.SessionLocal() as db:
+        result_ids = [notice.result_id for notice in notices]
+        old_turn_ids = {
+            result.workflow_turn_id
+            for result in db.query(database.DelegationResultModel).filter(
+                database.DelegationResultModel.id.in_(result_ids)
+            )
+        }
+        assert len(old_turn_ids) == 1
+
+    resumed = claim_or_resume_workflow_turn_receipt(
+        parent, interrupted_turn, resume_token=receipt["resume_token"]
+    )
+    assert resumed["accepted"] is True
+    assert database.reconcile_result_callbacks_superseded_by_resume() == 1
+
+    with database.SessionLocal() as db:
+        results = (
+            db.query(database.DelegationResultModel)
+            .filter(database.DelegationResultModel.id.in_(result_ids))
+            .all()
+        )
+        successor_ids = {result.workflow_turn_id for result in results}
+        assert len(successor_ids) == 1
+        successor_id = successor_ids.pop()
+        assert successor_id > resumed["logical_turn_id"]
+        successor = db.get(WorkflowTurnModel, successor_id)
+        assert successor.kind == "handoff_result"
+        assert successor.state == "queued"
+        assert {result.id for result in results} == set(result_ids)
+        assert all(db.get(InboxModel, notice.id).status == "pending" for notice in notices)
 
 
 def test_f13_closed_ordinary_inbox_is_not_a_new_owner_input_predecessor(workflow_db):

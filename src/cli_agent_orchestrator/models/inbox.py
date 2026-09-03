@@ -21,6 +21,7 @@ class MessageStatus(str, Enum):
     PENDING = "pending"
     DELIVERED = "delivered"
     FAILED = "failed"
+    SUPERSEDED = "superseded"
 
 
 class ChildAssignmentStatus(str, Enum):
@@ -53,4 +54,10 @@ class InboxMessage(BaseModel):
     result_id: Optional[str] = Field(None, description="Linked durable delegation result")
     kind: str = Field("message", description="message or delegation_result_notice")
     superseded_at: Optional[datetime] = Field(None, description="Legacy body superseded by result")
+    callback_reconciled_at: Optional[datetime] = Field(
+        None, description="Stale callback transport replaced by a current continuation"
+    )
+    callback_reconciled_from_turn_id: Optional[int] = Field(
+        None, description="Historical callback turn replaced during resume reconciliation"
+    )
     created_at: datetime = Field(..., description="Creation timestamp")

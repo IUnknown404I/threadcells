@@ -628,6 +628,7 @@ def test_missing_tmux_session_converges_running_runtime_and_repeated_exit(
     presence.server.sessions.get.side_effect = ObjectDoesNotExist("cao-session")
     presence.server.cmd.return_value.returncode = 0
     presence.server.cmd.return_value.stderr = []
+    presence.server.cmd.return_value.stdout = []
     monkeypatch.setattr(terminal_service.tmux_client, "window_exists", presence.window_exists)
     monkeypatch.setattr(
         terminal_service.tmux_client,

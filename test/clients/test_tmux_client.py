@@ -821,8 +821,19 @@ class TestSessionExists:
         tmux.server.sessions.get.side_effect = ObjectDoesNotExist("ses")
         tmux.server.cmd.return_value.returncode = 0
         tmux.server.cmd.return_value.stderr = []
+        tmux.server.cmd.return_value.stdout = []
 
         assert tmux.session_exists("ses") is False
+
+    def test_session_exists_recovers_present_target_after_suppressed_inventory_failure(self, tmux):
+        from libtmux._internal.query_list import ObjectDoesNotExist
+
+        tmux.server.sessions.get.side_effect = ObjectDoesNotExist("ses")
+        tmux.server.cmd.return_value.returncode = 0
+        tmux.server.cmd.return_value.stderr = []
+        tmux.server.cmd.return_value.stdout = ["ses"]
+
+        assert tmux.session_exists("ses") is True
 
     def test_session_exists_treats_missing_server_as_unknown(self, tmux):
         from libtmux._internal.query_list import ObjectDoesNotExist
@@ -861,8 +872,22 @@ class TestWindowExists:
         tmux.server.sessions.get.side_effect = ObjectDoesNotExist("ses")
         tmux.server.cmd.return_value.returncode = 0
         tmux.server.cmd.return_value.stderr = []
+        tmux.server.cmd.return_value.stdout = []
 
         assert tmux.window_exists("ses", "win") is False
+
+    def test_window_exists_recovers_present_target_after_suppressed_session_inventory_failure(
+        self, tmux
+    ):
+        from libtmux._internal.query_list import ObjectDoesNotExist
+
+        tmux.server.sessions.get.side_effect = ObjectDoesNotExist("ses")
+        tmux.server.cmd.side_effect = [
+            MagicMock(returncode=0, stderr=[], stdout=["ses"]),
+            MagicMock(returncode=0, stderr=[], stdout=["win"]),
+        ]
+
+        assert tmux.window_exists("ses", "win") is True
 
     def test_window_exists_treats_real_libtmux_missing_window_as_false(self, tmux):
         from libtmux._internal.query_list import ObjectDoesNotExist
@@ -872,8 +897,21 @@ class TestWindowExists:
         tmux.server.sessions.get.return_value = mock_session
         tmux.server.cmd.return_value.returncode = 0
         tmux.server.cmd.return_value.stderr = []
+        tmux.server.cmd.return_value.stdout = []
 
         assert tmux.window_exists("ses", "win") is False
+
+    def test_window_exists_recovers_present_target_after_suppressed_inventory_failure(self, tmux):
+        from libtmux._internal.query_list import ObjectDoesNotExist
+
+        mock_session = MagicMock()
+        mock_session.windows.get.side_effect = ObjectDoesNotExist("win")
+        tmux.server.sessions.get.return_value = mock_session
+        tmux.server.cmd.return_value.returncode = 0
+        tmux.server.cmd.return_value.stderr = []
+        tmux.server.cmd.return_value.stdout = ["win"]
+
+        assert tmux.window_exists("ses", "win") is True
 
     def test_window_exists_treats_missing_server_as_unknown(self, tmux):
         from libtmux._internal.query_list import ObjectDoesNotExist
@@ -881,6 +919,7 @@ class TestWindowExists:
         tmux.server.sessions.get.side_effect = ObjectDoesNotExist("ses")
         tmux.server.cmd.return_value.returncode = 1
         tmux.server.cmd.return_value.stderr = ["tmux server unavailable"]
+        tmux.server.cmd.return_value.stdout = []
 
         assert tmux.window_exists("ses", "win") is None
 
@@ -892,6 +931,7 @@ class TestWindowExists:
         tmux.server.sessions.get.return_value = mock_session
         tmux.server.cmd.return_value.returncode = 1
         tmux.server.cmd.return_value.stderr = ["window inventory unavailable"]
+        tmux.server.cmd.return_value.stdout = []
 
         assert tmux.window_exists("ses", "win") is None
 

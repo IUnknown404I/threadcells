@@ -105,6 +105,7 @@ def test_real_libtmux_absence_keeps_recovery_required_capability_eligible(monkey
     presence.server.sessions.get.side_effect = ObjectDoesNotExist("cao-old")
     presence.server.cmd.return_value.returncode = 0
     presence.server.cmd.return_value.stderr = []
+    presence.server.cmd.return_value.stdout = []
     monkeypatch.setattr(service, "tmux_client", presence)
     monkeypatch.setattr(
         service,

@@ -37,6 +37,7 @@ from cli_agent_orchestrator.clients.database import (
     register_child_assignment,
     requeue_unacknowledged_child_assignment_results,
     resolve_workflow_input_binding,
+    set_workflow_terminal_state,
     start_workflow_input,
 )
 
@@ -211,6 +212,65 @@ def test_correction_and_rereview_preserve_history_but_only_b_is_current(authorit
     )
     assert accepted["accepted"] is True
     assert get_parent_completion_barrier("parent") == (0, 0)
+
+
+def test_superseded_review_does_not_block_transactional_terminal_guard(authority_db, tmp_path):
+    repo, revision_a = _repository(tmp_path)
+    with database.SessionLocal() as db:
+        db.add(_reviewer("reviewer-a", repo, revision_a))
+        db.commit()
+    _start_review("parent", "reviewer-a", "Review exact revision A")
+    result_a = _submit_result("parent", "reviewer-a", "BLOCK revision A")
+
+    revision_b = _advance(repo, "B")
+    with database.SessionLocal() as db:
+        db.add(_reviewer("reviewer-b", repo, revision_b))
+        db.commit()
+    _start_review("parent", "reviewer-b", "Review exact revision B")
+    result_b = _submit_result("parent", "reviewer-b", "PASS revision B")
+
+    stale = acknowledge_child_assignment_result_outcome("parent", result_id=result_a["result_id"])
+    assert stale["reason_code"] == "RESULT_REVIEW_ATTEMPT_SUPERSEDED"
+    accepted = acknowledge_child_assignment_result_outcome(
+        "parent", result_id=result_b["result_id"]
+    )
+    assert accepted["accepted"] is True
+
+    # Historical handoff reviews can retain a delivered transport status after
+    # a newer exact attempt supersedes their authority. The superseded marker,
+    # not transport cleanup, removes them from the completion barrier.
+    with database.SessionLocal() as db:
+        old = (
+            db.query(ChildAssignmentModel)
+            .filter_by(parent_terminal_id="parent")
+            .order_by(ChildAssignmentModel.id)
+            .first()
+        )
+        old.status = "handoff_result_delivered"
+        db.commit()
+    assert get_parent_completion_barrier("parent") == (0, 0)
+
+    assert set_workflow_terminal_state(
+        "parent",
+        "terminal",
+        "exact review accepted",
+        require_no_active_children=True,
+    )
+
+    with database.SessionLocal() as db:
+        assignments = (
+            db.query(ChildAssignmentModel)
+            .filter_by(parent_terminal_id="parent")
+            .order_by(ChildAssignmentModel.id)
+            .all()
+        )
+        assert assignments[0].review_superseded_at is not None
+        assert assignments[0].status == "cancelled"
+        assert assignments[1].review_superseded_at is None
+        assert assignments[1].status == "result_acknowledged"
+        assert db.query(WorkflowModel).filter_by(root_terminal_id="parent").one().status == (
+            "terminal"
+        )
 
 
 def test_same_reviewer_terminal_two_attempts_do_not_collapse_delivery(authority_db, tmp_path):

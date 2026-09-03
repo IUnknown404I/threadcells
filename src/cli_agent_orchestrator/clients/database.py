@@ -12566,6 +12566,7 @@ def set_workflow_terminal_state(
                 db.query(ChildAssignmentModel)
                 .filter(
                     ChildAssignmentModel.parent_terminal_id == root_terminal_id,
+                    ChildAssignmentModel.review_superseded_at.is_(None),
                     ChildAssignmentModel.status.in_(
                         (
                             ChildAssignmentStatus.AWAITING_RESULT.value,

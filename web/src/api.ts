@@ -506,6 +506,7 @@ export interface InboxMessage {
 
 export interface DelegationResult {
   id: string
+  attempt_id?: string
   delegation_kind: 'assign' | 'handoff'
   status: 'awaiting' | 'complete' | 'incomplete' | 'cancelled'
   delivery_status?: string
@@ -513,6 +514,21 @@ export interface DelegationResult {
   document: { summary?: string; body_markdown?: string; changed_files?: string[]; checks?: { command: string; outcome: string }[]; risks?: string[]; blockers?: string[] } | null
   created_at: string | null
   finalized_at: string | null
+  review?: {
+    attempt_id: string
+    request_workflow_id: number | null
+    request_workflow_turn_id: number | null
+    request_workflow_effect_id: number | null
+    child_workflow_id: number | null
+    child_workflow_turn_id: number | null
+    scope_sha256: string | null
+    subject_id: string | null
+    subject_kind: 'git_commit' | 'unbound' | 'legacy_unscoped'
+    revision: string | null
+    authority_state: 'current' | 'historical' | 'stale_revision' | 'unbound' | 'legacy_unscoped'
+    current_authority: boolean
+    superseded_at: string | null
+  }
 }
 
 export interface Flow {

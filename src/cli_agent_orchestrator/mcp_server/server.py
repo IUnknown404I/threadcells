@@ -19,6 +19,8 @@ from pydantic import Field
 from cli_agent_orchestrator.clients.database import (
     acknowledge_child_assignment_result_outcome,
     acknowledge_handoff_child_result_direct,
+    bind_child_assignment_input_turn,
+    cancel_child_assignment_attempt,
     cancel_child_assignments_for_terminal,
     cancel_reserved_completed_assigned_child_retirement_exit,
     claim_completed_assigned_child_retirement,
@@ -36,6 +38,7 @@ from cli_agent_orchestrator.clients.database import (
     finish_workflow_effect,
     get_acknowledged_handoff_child_result_direct,
     get_assigned_child_retirement_cleanup_intent,
+    get_child_assignment_request_authority,
     get_child_retirement_cleanup_intent,
     get_claimed_handoff_child_result_direct,
     get_delegation_result,
@@ -95,6 +98,7 @@ _SAFE_PRE_EFFECT_ADMISSION_REASONS = {
     "PROVIDER_EXECUTION_CAPACITY_EXHAUSTED",
     "RESIDENT_SUPERVISOR_CAPACITY_EXHAUSTED",
     "RESOURCE_HEALTH_REJECTED",
+    "REVIEWER_REUSE_NOT_ELIGIBLE",
     "SESSION_IDENTITY_AMBIGUOUS",
     "SESSION_IDENTITY_UNAVAILABLE",
     "TOTAL_PROVIDER_CAPACITY_EXHAUSTED",
@@ -1449,6 +1453,8 @@ async def _handoff_impl(
     working_directory: Optional[str] = None,
     *,
     runtime_fence: bool = True,
+    request_effect: Optional[Dict[str, Any]] = None,
+    request_workflow_turn_id: Optional[int] = None,
 ) -> HandoffResult:
     """Create a child, submit one task, then wait through one resumable slice."""
     start_time = time.time()
@@ -1484,15 +1490,30 @@ async def _handoff_impl(
         # restart its valid final result can be persisted into the parent's
         # Inbox and trigger that same parent's next model turn.
         parent_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+        request_effect_id = request_effect.get("id") if request_effect is not None else None
+        registered = False
         if parent_terminal_id:
-            if (
-                not register_handoff_child(parent_terminal_id, terminal_id)
-                and get_workflow_status(parent_terminal_id) != "open"
+            registered = (
+                register_handoff_child(parent_terminal_id, terminal_id)
+                if request_effect is None
+                else register_handoff_child(
+                    parent_terminal_id,
+                    terminal_id,
+                    workflow_turn_id=request_workflow_turn_id,
+                    workflow_effect_id=request_effect.get("id"),
+                    request_message=message,
+                )
+            )
+            if not registered and (
+                request_effect is not None or get_workflow_status(parent_terminal_id) != "open"
             ):
-                cancel_child_assignments_for_terminal(terminal_id)
                 return HandoffResult(
                     success=False,
-                    message="Parent workflow closed before handoff input could be sent",
+                    message=(
+                        "Could not register exact handoff authority"
+                        if request_effect is not None
+                        else "Parent workflow closed before handoff input could be sent"
+                    ),
                     output=None,
                     terminal_id=terminal_id,
                     state=HandoffState.FAILED,
@@ -1506,10 +1527,21 @@ async def _handoff_impl(
                 binding = issue_workflow_input_binding(terminal_id)
             if binding is None:
                 raise RuntimeError("Could not create handoff child workflow binding")
+            if (
+                parent_terminal_id
+                and request_effect is not None
+                and not bind_child_assignment_input_turn(terminal_id, binding)
+            ):
+                raise RuntimeError("Could not bind handoff child workflow authority")
             _send_direct_input_handoff(terminal_id, provider, message, binding)
         except Exception:
-            if parent_terminal_id:
-                cancel_child_assignments_for_terminal(terminal_id)
+            if parent_terminal_id and registered:
+                if request_effect_id is None:
+                    cancel_child_assignments_for_terminal(terminal_id)
+                else:
+                    cancel_child_assignment_attempt(
+                        parent_terminal_id, terminal_id, int(request_effect_id)
+                    )
             raise
         remaining = max(0, deadline - time.monotonic())
         result = await _await_handoff_impl(terminal_id, timeout=remaining)
@@ -1615,7 +1647,13 @@ if ENABLE_WORKING_DIRECTORY:
         execution_terminal, execution_suspended = _suspend_provider_execution(logical_turn_id)
         try:
             result = await _handoff_impl(
-                agent_profile, message, timeout, working_directory, runtime_fence=False
+                agent_profile,
+                message,
+                timeout,
+                working_directory,
+                runtime_fence=False,
+                request_effect=effect,
+                request_workflow_turn_id=logical_turn_id,
             )
         except Exception:
             _finish_privileged_effect(effect, "indeterminate")
@@ -1689,7 +1727,15 @@ else:
             )
         execution_terminal, execution_suspended = _suspend_provider_execution(logical_turn_id)
         try:
-            result = await _handoff_impl(agent_profile, message, timeout, None, runtime_fence=False)
+            result = await _handoff_impl(
+                agent_profile,
+                message,
+                timeout,
+                None,
+                runtime_fence=False,
+                request_effect=effect,
+                request_workflow_turn_id=logical_turn_id,
+            )
         except Exception:
             _finish_privileged_effect(effect, "indeterminate")
             raise
@@ -1786,12 +1832,44 @@ async def submit_handoff_result_v1(
 
 # Implementation function for assign
 def _assign_impl(
-    agent_profile: str, message: str, working_directory: Optional[str] = None
+    agent_profile: str,
+    message: str,
+    working_directory: Optional[str] = None,
+    *,
+    reviewer_terminal_id: Optional[str] = None,
+    request_effect: Optional[Dict[str, Any]] = None,
+    request_workflow_turn_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic."""
     try:
-        # Create terminal
-        terminal_id, _ = _create_terminal(agent_profile, working_directory)
+        reused_reviewer = isinstance(reviewer_terminal_id, str) and bool(
+            reviewer_terminal_id.strip()
+        )
+        review_authority: Optional[Dict[str, str]] = None
+        if reused_reviewer:
+            terminal_id = reviewer_terminal_id.strip()
+            metadata = get_terminal_metadata(terminal_id)
+            actual_profile = metadata.get("agent_profile") if metadata is not None else None
+            reviewer_profile = actual_profile == "reviewer" or str(actual_profile or "").startswith(
+                "reviewer_"
+            )
+            if (
+                metadata is None
+                or not reviewer_profile
+                or actual_profile != agent_profile
+                or metadata.get("runtime_lifecycle") != _LIVE_TERMINAL_LIFECYCLE
+                or working_directory is not None
+            ):
+                return {
+                    "success": False,
+                    "terminal_id": None,
+                    "reviewer_terminal_id": terminal_id,
+                    "reason_code": "REVIEWER_REUSE_NOT_ELIGIBLE",
+                    "message": ("Existing reviewer is not eligible for an exact bounded rereview"),
+                }
+        else:
+            # A new assignment retains the existing terminal-admission path.
+            terminal_id, _ = _create_terminal(agent_profile, working_directory)
 
         # Guard: wait for the terminal to be genuinely ready before sending
         # the task message. create_terminal() calls provider.initialize() which
@@ -1805,7 +1883,9 @@ def _assign_impl(
         ):
             return {
                 "success": False,
-                "terminal_id": terminal_id,
+                "terminal_id": None if reused_reviewer else terminal_id,
+                "reviewer_terminal_id": terminal_id if reused_reviewer else None,
+                "reason_code": ("REVIEWER_REUSE_NOT_ELIGIBLE" if reused_reviewer else None),
                 "message": f"Terminal {terminal_id} did not reach ready status within 60 seconds — agent may not have started",
             }
 
@@ -1814,35 +1894,94 @@ def _assign_impl(
         # durable completion barrier. Top-level assigns have no parent ID and
         # retain their existing fire-and-forget behavior.
         parent_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+        request_effect_id = request_effect.get("id") if request_effect is not None else None
+        registered = False
         if parent_terminal_id:
-            if (
-                not register_child_assignment(parent_terminal_id, terminal_id)
-                and get_workflow_status(parent_terminal_id) != "open"
+            registered = (
+                register_child_assignment(parent_terminal_id, terminal_id)
+                if request_effect is None
+                else register_child_assignment(
+                    parent_terminal_id,
+                    terminal_id,
+                    workflow_turn_id=request_workflow_turn_id,
+                    workflow_effect_id=request_effect.get("id"),
+                    request_message=message,
+                    require_existing_reviewer_attempt=reused_reviewer,
+                )
+            )
+            if not registered and (
+                request_effect is not None or get_workflow_status(parent_terminal_id) != "open"
             ):
-                cancel_child_assignments_for_terminal(terminal_id)
                 return {
                     "success": False,
-                    "terminal_id": terminal_id,
-                    "message": "Parent workflow closed before assignment input could be sent",
+                    "terminal_id": None if reused_reviewer else terminal_id,
+                    "reviewer_terminal_id": terminal_id if reused_reviewer else None,
+                    "reason_code": ("REVIEWER_REUSE_NOT_ELIGIBLE" if reused_reviewer else None),
+                    "message": (
+                        "Could not register exact assignment authority"
+                        if request_effect is not None
+                        else "Parent workflow closed before assignment input could be sent"
+                    ),
                 }
         try:
             from cli_agent_orchestrator.services.operations_service import (
                 workflow_execution_admission_fence,
             )
 
+            if parent_terminal_id and request_effect_id is not None:
+                review_authority = get_child_assignment_request_authority(
+                    parent_terminal_id, terminal_id, int(request_effect_id)
+                )
+                if reused_reviewer and review_authority is None:
+                    cancel_child_assignment_attempt(
+                        parent_terminal_id,
+                        terminal_id,
+                        int(request_effect_id),
+                        reason_code="review_authority_unbound",
+                    )
+                    return {
+                        "success": False,
+                        "terminal_id": terminal_id,
+                        "reviewer_terminal_id": terminal_id,
+                        "reason_code": "REVIEWER_REVIEW_AUTHORITY_UNBOUND",
+                        "message": (
+                            "Existing reviewer could not be bound to an exact immutable revision"
+                        ),
+                    }
+                if review_authority is not None:
+                    message = (
+                        f"{message.rstrip()}\n\n"
+                        "[CAO immutable review authority: "
+                        f"attempt_id={review_authority['attempt_id']} "
+                        f"subject_id={review_authority['subject_id']} "
+                        f"exact_revision={review_authority['revision']}]"
+                    )
             with workflow_execution_admission_fence():
                 binding = issue_workflow_input_binding(terminal_id)
             if binding is None:
                 raise RuntimeError("Could not create assigned child workflow binding")
+            if (
+                parent_terminal_id
+                and request_effect is not None
+                and not bind_child_assignment_input_turn(terminal_id, binding)
+            ):
+                raise RuntimeError("Could not bind assigned child workflow authority")
             _send_direct_input_assign(terminal_id, message, binding)
         except Exception:
-            if parent_terminal_id:
-                cancel_child_assignments_for_terminal(terminal_id)
+            if parent_terminal_id and registered:
+                if request_effect_id is None:
+                    cancel_child_assignments_for_terminal(terminal_id)
+                else:
+                    cancel_child_assignment_attempt(
+                        parent_terminal_id, terminal_id, int(request_effect_id)
+                    )
             raise
 
         return {
             "success": True,
             "terminal_id": terminal_id,
+            "reviewer_reused": reused_reviewer,
+            **({"review_attempt": review_authority} if review_authority is not None else {}),
             "message": f"Task assigned to {agent_profile} (terminal: {terminal_id})",
         }
 
@@ -1894,6 +2033,11 @@ Args:
     working_directory: Optional working directory where the agent should execute"""
 
     desc += """
+    reviewer_terminal_id: Optional existing assigned reviewer terminal for one bounded rereview.
+        The reviewer profile and parent relation must match, its prior result must be final,
+        and its prior workflow must be terminal. Omit this to create a new child."""
+
+    desc += """
 
 Returns:
     Dict with success status, worker terminal_id, and message"""
@@ -1924,12 +2068,31 @@ if ENABLE_WORKING_DIRECTORY:
         working_directory: Optional[str] = Field(
             default=None, description="Optional working directory where the agent should execute"
         ),
+        reviewer_terminal_id: Optional[str] = Field(
+            default=None,
+            description="Existing assigned reviewer terminal to reuse for a bounded rereview",
+        ),
     ) -> Dict[str, Any]:
-        effect = _claim_privileged_effect(logical_turn_id, "assign", agent_profile, message)
+        reviewer_terminal_id = (
+            reviewer_terminal_id if isinstance(reviewer_terminal_id, str) else None
+        )
+        effect_identity = (
+            (agent_profile, message)
+            if reviewer_terminal_id is None
+            else (agent_profile, reviewer_terminal_id, message)
+        )
+        effect = _claim_privileged_effect(logical_turn_id, "assign", *effect_identity)
         if effect is None:
-            return _privileged_effect_rejection(logical_turn_id, "assign", agent_profile, message)
+            return _privileged_effect_rejection(logical_turn_id, "assign", *effect_identity)
         try:
-            result = _assign_impl(agent_profile, message, working_directory)
+            result = _assign_impl(
+                agent_profile,
+                message,
+                working_directory,
+                reviewer_terminal_id=reviewer_terminal_id,
+                request_effect=effect,
+                request_workflow_turn_id=logical_turn_id,
+            )
         except Exception:
             _finish_privileged_effect(effect, "indeterminate")
             raise
@@ -1947,12 +2110,31 @@ else:
             description='The agent profile for the worker agent (e.g., "developer", "analyst")'
         ),
         message: str = Field(description=_assign_message_field_desc),
+        reviewer_terminal_id: Optional[str] = Field(
+            default=None,
+            description="Existing assigned reviewer terminal to reuse for a bounded rereview",
+        ),
     ) -> Dict[str, Any]:
-        effect = _claim_privileged_effect(logical_turn_id, "assign", agent_profile, message)
+        reviewer_terminal_id = (
+            reviewer_terminal_id if isinstance(reviewer_terminal_id, str) else None
+        )
+        effect_identity = (
+            (agent_profile, message)
+            if reviewer_terminal_id is None
+            else (agent_profile, reviewer_terminal_id, message)
+        )
+        effect = _claim_privileged_effect(logical_turn_id, "assign", *effect_identity)
         if effect is None:
-            return _privileged_effect_rejection(logical_turn_id, "assign", agent_profile, message)
+            return _privileged_effect_rejection(logical_turn_id, "assign", *effect_identity)
         try:
-            result = _assign_impl(agent_profile, message, None)
+            result = _assign_impl(
+                agent_profile,
+                message,
+                None,
+                reviewer_terminal_id=reviewer_terminal_id,
+                request_effect=effect,
+                request_workflow_turn_id=logical_turn_id,
+            )
         except Exception:
             _finish_privileged_effect(effect, "indeterminate")
             raise

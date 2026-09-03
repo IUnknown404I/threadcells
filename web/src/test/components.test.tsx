@@ -4,7 +4,7 @@ import { StatusBadge, lifecycleBadgeStatus } from '../components/StatusBadge'
 import { SessionStatusSummary } from '../components/SessionStatusSummary'
 import { ErrorBoundary } from '../components/ErrorBoundary'
 import { ConfirmModal } from '../components/ConfirmModal'
-import { resultLifecycleLabel, OwnerMessageBody } from '../components/InboxPanel'
+import { resultLifecycleLabel, reviewAuthorityKey, OwnerMessageBody } from '../components/InboxPanel'
 import { InboxPanel } from '../components/InboxPanel'
 import { OutputViewer } from '../components/OutputViewer'
 import { api } from '../api'
@@ -249,6 +249,17 @@ describe('result lifecycle labels', () => {
     expect(resultLifecycleLabel('complete', 'handoff_result_failed')).toBe('Delivery failed')
     expect(resultLifecycleLabel('incomplete', 'handoff_result_failed')).toBe('Incomplete')
     expect(resultLifecycleLabel('cancelled', 'handoff_result_failed')).toBe('Cancelled')
+  })
+
+  it('distinguishes current, historical, and unbound review authority', () => {
+    const result = (authority_state: 'current' | 'historical' | 'stale_revision' | 'legacy_unscoped') => ({
+      review: { authority_state },
+    })
+    expect(reviewAuthorityKey(result('current') as never)).toBe('inbox.reviewCurrent')
+    expect(reviewAuthorityKey(result('historical') as never)).toBe('inbox.reviewHistorical')
+    expect(reviewAuthorityKey(result('stale_revision') as never)).toBe('inbox.reviewStaleRevision')
+    expect(reviewAuthorityKey(result('legacy_unscoped') as never)).toBe('inbox.reviewUnbound')
+    expect(reviewAuthorityKey({} as never)).toBeNull()
   })
 })
 

@@ -9903,13 +9903,250 @@ def mark_workflow_turn_sent_for_inbox(message_id: int) -> bool:
         return True
 
 
-def _provider_reconnect_receipt_turn(
+def _child_workflow_authority_descends_from_assignment(
+    db: Any,
+    child_workflow: WorkflowModel,
+    assignment_turn_id: int,
+    child_terminal_id: str,
+) -> bool:
+    """Prove the child's current authority is its bound input or admitted resume.
+
+    The assignment binding is immutable, while an interrupted model execution
+    legitimately advances through one or more ``execution_resume`` turns.
+    Every hop must be the exact receipt-linked successor created by the
+    one-use resume-token transaction; an unrelated later child input therefore
+    cannot borrow the assignment's result authority.
+    """
+    active_turn_id = child_workflow.active_turn_id
+    if active_turn_id is None:
+        return False
+    current = db.get(WorkflowTurnModel, cast(int, active_turn_id))
+    visited: set[int] = set()
+    while current is not None:
+        current_id = cast(int, current.id)
+        if (
+            current_id in visited
+            or current.workflow_id != child_workflow.id
+            or current.state not in {TURN_SENT, TURN_FINISHED}
+            or current.superseded_by_turn_id is not None
+            or current.superseded_at is not None
+        ):
+            return False
+        visited.add(current_id)
+        receipt = (
+            db.query(WorkflowTurnReceiptModel)
+            .filter_by(
+                workflow_turn_id=current_id,
+                receiver_terminal_id=child_terminal_id,
+            )
+            .one_or_none()
+        )
+        if receipt is None:
+            return False
+        if current_id == assignment_turn_id:
+            return True
+        parent_id = current.resume_parent_turn_id
+        if (
+            current.kind != "execution_resume"
+            or parent_id is None
+            or cast(int, parent_id) >= current_id
+        ):
+            return False
+        parent = db.get(WorkflowTurnModel, cast(int, parent_id))
+        parent_receipt = (
+            db.query(WorkflowTurnReceiptModel)
+            .filter_by(
+                workflow_turn_id=parent_id,
+                receiver_terminal_id=child_terminal_id,
+            )
+            .one_or_none()
+        )
+        if (
+            parent is None
+            or parent.workflow_id != child_workflow.id
+            or parent.state != TURN_FINISHED
+            or parent_receipt is None
+            or parent_receipt.resumed_by_turn_id != current_id
+            or parent_receipt.resumed_at is None
+        ):
+            return False
+        current = parent
+    return False
+
+
+def _queued_result_turn_authorizes_provider_reconnect(
+    db: Any,
+    workflow: WorkflowModel,
+    turn: WorkflowTurnModel,
+    root_terminal_id: str,
+) -> bool:
+    """Prove one current queued handoff callback is safe reconnect provenance.
+
+    The callback has intentionally not crossed provider transport, so it must
+    not have a receiver receipt.  Its authority instead comes from the exact
+    immutable delegation result and the already-admitted parent/child request
+    relation.  Ordinary queued Inbox or Composer input can never satisfy this
+    join.
+    """
+    if (
+        workflow.status != WORKFLOW_OPEN
+        or workflow.root_terminal_id != root_terminal_id
+        or workflow.active_turn_id != turn.id
+        or turn.workflow_id != workflow.id
+        or turn.state != TURN_QUEUED
+        or turn.kind != "handoff_result"
+        or turn.inbox_message_id is None
+        or turn.claim_token is not None
+        or turn.claim_expires_at is not None
+        or turn.superseded_by_turn_id is not None
+        or turn.superseded_at is not None
+    ):
+        return False
+    if (
+        db.query(WorkflowTurnReceiptModel.id)
+        .filter_by(
+            workflow_turn_id=turn.id,
+            receiver_terminal_id=root_terminal_id,
+        )
+        .first()
+        is not None
+    ):
+        return False
+    newer_admission = (
+        db.query(WorkflowTurnReceiptModel.id)
+        .join(
+            WorkflowTurnModel,
+            WorkflowTurnModel.id == WorkflowTurnReceiptModel.workflow_turn_id,
+        )
+        .filter(
+            WorkflowTurnModel.workflow_id == workflow.id,
+            WorkflowTurnModel.id > turn.id,
+            WorkflowTurnReceiptModel.receiver_terminal_id == root_terminal_id,
+        )
+        .first()
+    )
+    if newer_admission is not None:
+        return False
+
+    results = (
+        db.query(DelegationResultModel)
+        .filter(DelegationResultModel.workflow_turn_id == turn.id)
+        .order_by(DelegationResultModel.created_at.asc(), DelegationResultModel.id.asc())
+        .all()
+    )
+    if not results:
+        return False
+
+    inbox_rows: List[InboxModel] = []
+    for result in results:
+        assignment = db.get(ChildAssignmentModel, result.child_assignment_id)
+        notices = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.result_id == result.id,
+                InboxModel.kind == "delegation_result_notice",
+            )
+            .all()
+        )
+        if assignment is None or len(notices) != 1:
+            return False
+        inbox = notices[0]
+        child_workflow = (
+            db.get(WorkflowModel, assignment.child_workflow_id)
+            if assignment.child_workflow_id is not None
+            else None
+        )
+        child_authority_valid = bool(
+            child_workflow is not None
+            and assignment.child_workflow_turn_id is not None
+            and _child_workflow_authority_descends_from_assignment(
+                db,
+                child_workflow,
+                cast(int, assignment.child_workflow_turn_id),
+                cast(str, assignment.child_terminal_id),
+            )
+        )
+        request_effect = (
+            db.get(WorkflowEffectModel, assignment.request_workflow_effect_id)
+            if assignment.request_workflow_effect_id is not None
+            else None
+        )
+        try:
+            document = json.loads(result.document_json) if result.document_json else None
+        except (TypeError, ValueError):
+            return False
+        body = document.get("body_markdown") if isinstance(document, dict) else None
+        if (
+            result.status != DelegationResultStatus.COMPLETE.value
+            or result.finalized_at is None
+            or result.content_purged_at is not None
+            or not isinstance(result.content_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", result.content_sha256) is None
+            or not isinstance(result.content_bytes, int)
+            or result.content_bytes <= 0
+            or result.delegation_kind != "handoff"
+            or result.parent_terminal_id != root_terminal_id
+            or result.parent_workflow_id != workflow.id
+            or result.child_terminal_id != assignment.child_terminal_id
+            or assignment.parent_terminal_id != root_terminal_id
+            or assignment.status != ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value
+            or assignment.result_message_id != inbox.id
+            or assignment.request_workflow_id != workflow.id
+            or assignment.request_workflow_turn_id is None
+            or assignment.review_superseded_at is not None
+            or child_workflow is None
+            or child_workflow.root_terminal_id != assignment.child_terminal_id
+            or child_workflow.status != WORKFLOW_TERMINAL
+            or assignment.child_workflow_turn_id is None
+            or not child_authority_valid
+            or request_effect is None
+            or request_effect.workflow_id != workflow.id
+            or request_effect.workflow_turn_id != assignment.request_workflow_turn_id
+            or request_effect.effect_kind != "handoff"
+            or request_effect.state not in {"claimed", "completed", "indeterminate"}
+            or inbox.receiver_id != root_terminal_id
+            or inbox.sender_id != assignment.child_terminal_id
+            or inbox.status != MessageStatus.PENDING.value
+            or not isinstance(body, str)
+            or not body.strip()
+            or inbox.message != body
+        ):
+            return False
+        parent_receipt = (
+            db.query(WorkflowTurnReceiptModel.id)
+            .filter_by(
+                workflow_turn_id=assignment.request_workflow_turn_id,
+                receiver_terminal_id=root_terminal_id,
+            )
+            .first()
+        )
+        child_receipt = (
+            db.query(WorkflowTurnReceiptModel.id)
+            .filter_by(
+                workflow_turn_id=assignment.child_workflow_turn_id,
+                receiver_terminal_id=assignment.child_terminal_id,
+            )
+            .first()
+        )
+        if parent_receipt is None or child_receipt is None:
+            return False
+        inbox_rows.append(inbox)
+
+    inbox_rows.sort(key=lambda row: (row.created_at, row.id))
+    return bool(
+        inbox_rows
+        and inbox_rows[0].id == turn.inbox_message_id
+        and inbox_rows[0].message == turn.payload
+    )
+
+
+def _provider_reconnect_authority_turn(
     db: Any,
     workflow: WorkflowModel,
     turn: WorkflowTurnModel,
     root_terminal_id: str,
 ) -> Optional[WorkflowTurnModel]:
-    """Resolve the admitted turn which authorizes one active reconnect.
+    """Resolve the durable provenance which authorizes one active reconnect.
 
     A stale-sidecar marker can become visible only after the provider's final
     observation has activated an unreceipted ``open_final``. In that exact
@@ -9917,6 +10154,11 @@ def _provider_reconnect_receipt_turn(
     receipted predecessor is the model-execution provenance. Bind the
     relationship once and let the successor own reconnect state; this avoids
     rolling ``active_turn_id`` backwards or manufacturing a receipt.
+
+    A current queued result callback is the other deliberately narrow case.
+    It is authorized only by its immutable result plus exact admitted
+    parent/child relation; the callback itself remains unreceipted until the
+    fresh runtime physically receives this same logical turn.
     """
     candidate = turn
     if turn.state == TURN_QUEUED and turn.kind == "open_final":
@@ -9945,6 +10187,8 @@ def _provider_reconnect_receipt_turn(
         if turn.resume_parent_turn_id is None:
             turn.resume_parent_turn_id = predecessor.id
         candidate = predecessor
+    elif _queued_result_turn_authorizes_provider_reconnect(db, workflow, turn, root_terminal_id):
+        return turn
     elif turn.state not in (TURN_SENT, TURN_FINISHED):
         return None
     admitted = (
@@ -9981,12 +10225,14 @@ def request_workflow_provider_reconnect(
         if turn is None or turn.workflow_id != workflow.id:
             db.rollback()
             return False
-        if _provider_reconnect_receipt_turn(db, workflow, turn, root_terminal_id) is None:
+        if _provider_reconnect_authority_turn(db, workflow, turn, root_terminal_id) is None:
             db.rollback()
             return False
         if turn.provider_reconnect_requested_at is None:
             turn.provider_reconnect_requested_at = now
             turn.provider_reconnect_claim_token = None
+            if turn.state == TURN_QUEUED:
+                turn.queue_reason = "TERMINAL_RUNTIME_RECONNECT_PENDING"
             turn.updated_at = now
             workflow.updated_at = now
         db.commit()
@@ -10028,7 +10274,8 @@ def claim_workflow_provider_reconnect(
         active_turn = db.get(WorkflowTurnModel, active_turn_id)
         if (
             active_turn is None
-            or _provider_reconnect_receipt_turn(db, workflow, active_turn, root_terminal_id) is None
+            or _provider_reconnect_authority_turn(db, workflow, active_turn, root_terminal_id)
+            is None
         ):
             db.rollback()
             return None
@@ -10651,20 +10898,33 @@ def complete_workflow_provider_reconnect(
         # only that synthetic transport and promote the FIFO head across both
         # Composer and Inbox inputs. The next dispatcher tick injects it into
         # this already-resident provider without purchasing another reconnect.
-        successor = (
-            db.query(WorkflowTurnModel)
-            .filter(
-                WorkflowTurnModel.workflow_id == workflow.id,
-                WorkflowTurnModel.id > turn.id,
-                WorkflowTurnModel.state == TURN_QUEUED,
-                or_(
-                    WorkflowTurnModel.kind == "external_input",
-                    WorkflowTurnModel.inbox_message_id.is_not(None),
-                ),
+        # A queued result callback is itself the executable transport whose
+        # stale runtime caused this reconnect.  It must retain authority until
+        # physical delivery and receipt even if newer work was persisted while
+        # the reconnect was in flight.  Admitted predecessors and synthetic
+        # ``open_final`` turns, by contrast, need their queued successor
+        # promoted once the replacement runtime is ready.
+        queued_result_transport = turn.state == TURN_QUEUED and turn.kind == "handoff_result"
+        successor = None
+        if queued_result_transport:
+            turn.not_before = None
+            turn.queue_reason = "WORKFLOW_CONTINUATION_PENDING"
+            turn.updated_at = now
+        else:
+            successor = (
+                db.query(WorkflowTurnModel)
+                .filter(
+                    WorkflowTurnModel.workflow_id == workflow.id,
+                    WorkflowTurnModel.id > turn.id,
+                    WorkflowTurnModel.state == TURN_QUEUED,
+                    or_(
+                        WorkflowTurnModel.kind == "external_input",
+                        WorkflowTurnModel.inbox_message_id.is_not(None),
+                    ),
+                )
+                .order_by(WorkflowTurnModel.created_at.asc(), WorkflowTurnModel.id.asc())
+                .first()
             )
-            .order_by(WorkflowTurnModel.created_at.asc(), WorkflowTurnModel.id.asc())
-            .first()
-        )
         if successor is not None:
             if turn.kind == "open_final" and turn.state in (TURN_QUEUED, TURN_CLAIMED):
                 turn.state = TURN_CANCELLED

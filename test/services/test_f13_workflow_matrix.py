@@ -1,6 +1,7 @@
 """Focused F13 matrix: durable top-level workflow/run-loop semantics."""
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
@@ -36,6 +37,7 @@ from cli_agent_orchestrator.clients.database import (
     activate_workflow_turn,
     activate_workflow_turn_for_inbox,
     arm_handoff_continuations_for_restart,
+    bind_child_assignment_input_turn,
     bind_workflow_turn_provider_outcome_cursor,
     cancel_workflows_for_terminal,
     claim_handoff_child_result_direct,
@@ -49,6 +51,7 @@ from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     finish_workflow_effect,
     get_delegation_result_for_assignment,
+    get_handoff_child_result_message,
     get_parent_completion_barrier,
     get_pending_handoff_child_terminal_ids,
     get_workflow_provider_outcome,
@@ -75,9 +78,11 @@ from cli_agent_orchestrator.clients.database import (
     resolve_workflow_input_binding,
     set_workflow_terminal_state,
     start_workflow_input,
+    submit_handoff_result_v1,
 )
 from cli_agent_orchestrator.mcp_server import server as mcp_server
 from cli_agent_orchestrator.models.provider import ProviderTurnOutcome
+from cli_agent_orchestrator.models.result import HandoffResultDocumentV1
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.codex import CodexProvider
@@ -767,6 +772,381 @@ def _complete_ready_test_reconnect(root: str, turn_id: int) -> None:
         reconnect["claim_token"],
         reconnect["attempt_token"],
     )
+
+
+def _queued_authoritative_handoff_result(
+    parent: str,
+    child: str,
+    body: str = "immutable reviewer verdict",
+    *,
+    resumed_child: bool = False,
+) -> tuple[int, database.InboxMessage]:
+    """Build the exact current queued callback authority used by #116."""
+    parent_turn = _start_admitted_input(parent)
+    request_effect = claim_workflow_effect(parent, parent_turn, "handoff", child)
+    assert request_effect is not None
+    _ensure_running_test_terminal(child)
+    auth_token = f"{child}-authenticated-v1-token"
+    if resumed_child:
+        with database.SessionLocal() as db:
+            terminal = db.get(TerminalModel, child)
+            terminal.auth_token_sha256 = hashlib.sha256(auth_token.encode()).hexdigest()
+            db.commit()
+    assert register_handoff_child(
+        parent,
+        child,
+        workflow_turn_id=parent_turn,
+        workflow_effect_id=request_effect["id"],
+        request_message=f"review {child}",
+    )
+    child_binding = issue_workflow_input_binding(child)
+    assert child_binding is not None
+    child_turn = resolve_workflow_input_binding(child, child_binding)
+    assert child_turn is not None
+    assert bind_child_assignment_input_turn(child, child_binding)
+    child_receipt = claim_or_resume_workflow_turn_receipt(child, child_turn)
+    assert child_receipt["accepted"] is True
+    if resumed_child:
+        resumed = claim_or_resume_workflow_turn_receipt(
+            child,
+            child_turn,
+            resume_token=child_receipt["resume_token"],
+        )
+        assert resumed["accepted"] is True and resumed["resumed"] is True
+        submission = submit_handoff_result_v1(
+            auth_token,
+            resumed["logical_turn_id"],
+            HandoffResultDocumentV1(
+                format="v1",
+                summary="resumed child complete",
+                body_markdown=body,
+                changed_files=[],
+                checks=[],
+                risks=[],
+                blockers=[],
+            ),
+        )
+        assert submission["accepted"] is True and submission["duplicate"] is False
+        notice = get_handoff_child_result_message(child)
+        assert notice is not None and notice.result_id == submission["result_id"]
+    else:
+        notice, duplicate = create_handoff_child_result_message(child, body)
+        assert notice is not None and duplicate is False and notice.result_id is not None
+    assert finish_workflow_effect(
+        parent,
+        request_effect["id"],
+        request_effect["claim_token"],
+        "completed",
+    )
+    callback = get_workflow_turn_for_inbox(notice.id)
+    assert callback is not None
+    now = datetime(2026, 9, 3, 12, 0, 0)
+    claim = claim_handoff_result_batch_for_inbox(notice.id, now=now)
+    assert isinstance(claim, dict)
+    assert requeue_workflow_turn(
+        claim["id"],
+        claim["claim_token"],
+        claim["claim_generation"],
+        now=now,
+        admission_reason_code="TERMINAL_RUNTIME_RECONNECT_PENDING",
+    )
+    return claim["id"], notice
+
+
+@pytest.mark.parametrize("resumed_child", [False, True], ids=["bound-child", "resumed-child-v1"])
+@patch("cli_agent_orchestrator.services.workflow_service.terminal_service")
+def test_f13_active_queued_handoff_result_reconnects_then_delivers_same_turn_once(
+    mock_terminal, workflow_db, monkeypatch, resumed_child
+):
+    """Provider 0/N recovers one exact callback without fabricated admission."""
+    root, child = "root-queued-result-reconnect", "child-queued-result-reconnect"
+    turn_id, notice = _queued_authoritative_handoff_result(root, child, resumed_child=resumed_child)
+    with database.SessionLocal() as db:
+        db.add(
+            database.CapacitySettingsModel(
+                id=1,
+                max_resident_supervisors=6,
+                max_provider_executions=3,
+                max_work_contexts=6,
+                max_heavy_execution_slots=1,
+            )
+        )
+        result = db.get(database.DelegationResultModel, notice.result_id)
+        immutable_before = (
+            result.id,
+            result.document_json,
+            result.content_sha256,
+            result.content_bytes,
+        )
+        initial_turn_count = db.query(WorkflowTurnModel).count()
+        assert db.query(database.ProviderExecutionLeaseModel).count() == 0
+        db.commit()
+
+    provider = MagicMock()
+    provider.get_status.return_value = TerminalStatus.IDLE
+    provider.is_process_alive.return_value = True
+    provider.runtime_sidecar_reconnect_required.side_effect = [True, False]
+    monkeypatch.setattr(inbox_service.provider_manager, "get_provider", lambda *_: provider)
+    send = MagicMock(return_value=True)
+    monkeypatch.setattr(inbox_service.terminal_service, "send_input", send)
+    mock_terminal.get_terminal.return_value = {
+        "status": TerminalStatus.COMPLETED.value,
+        "lifecycle": "running",
+    }
+    mock_terminal.provider_runtime_sidecar_reconnect_required.return_value = False
+    mock_terminal.provider_turn_execution_active.return_value = False
+    mock_terminal.provider_turn_outcome.return_value = None
+
+    def reconnect_request(
+        terminal_id,
+        requested_turn_id,
+        resume_identity,
+        *,
+        registry,
+        claim_token,
+        attempt_token,
+        attempt_state,
+        side_effect_guard,
+    ):
+        assert terminal_id == root
+        assert requested_turn_id == turn_id
+        assert resume_identity == TEST_CODEX_RESUME_IDENTITY
+        assert registry is None
+        assert attempt_state == "reserved"
+        assert side_effect_guard()
+        assert database.mark_workflow_provider_reconnect_launch_dispatched(
+            root, turn_id, claim_token, attempt_token
+        )
+        assert database.record_workflow_provider_reconnect_runtime_ready(
+            root, attempt_token, ACTIVE_RUNTIME_GENERATION, 4321, 987654
+        )
+        assert database.record_workflow_provider_reconnect_output_boundary(
+            root, attempt_token, 11, 22, 333
+        )
+
+    mock_terminal.request_provider_runtime_sidecar_reconnect.side_effect = reconnect_request
+
+    assert inbox_service.reconcile_provider_execution_queue() == 0
+    assert mock_terminal.request_provider_runtime_sidecar_reconnect.call_count == 1
+    send.assert_not_called()
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, turn_id)
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        attempt = db.query(WorkflowProviderReconnectAttemptModel).one()
+        assert workflow.active_turn_id == turn_id
+        assert turn.state == "queued"
+        assert turn.provider_reconnect_requested_at is None
+        assert attempt.workflow_turn_id == turn_id
+        assert attempt.state == "succeeded"
+        assert db.query(WorkflowTurnReceiptModel).filter_by(workflow_turn_id=turn_id).count() == 0
+
+    assert inbox_service.reconcile_provider_execution_queue() == 1
+    assert send.call_count == 1
+    assert f"[CAO workflow input: logical-turn={turn_id}]" in send.call_args.args[1]
+    assert claim_workflow_turn_receipt(root, turn_id)
+    assert not claim_workflow_turn_receipt(root, turn_id)
+    assert inbox_service.reconcile_provider_execution_queue() == 0
+    with database.SessionLocal() as db:
+        result = db.get(database.DelegationResultModel, notice.result_id)
+        immutable_after = (
+            result.id,
+            result.document_json,
+            result.content_sha256,
+            result.content_bytes,
+        )
+        assert immutable_after == immutable_before
+        assert db.query(WorkflowTurnModel).count() == initial_turn_count
+        assert db.get(WorkflowTurnModel, turn_id).state == "sent"
+        assert db.get(InboxModel, notice.id).status == database.MessageStatus.DELIVERED.value
+        assert db.query(database.ProviderExecutionLeaseModel).count() == 0
+
+
+def test_f13_queued_result_reconnect_provenance_fails_closed(workflow_db):
+    roots = {
+        "ordinary": ("root-reconnect-ordinary", "child-reconnect-ordinary"),
+        "wrong_result": ("root-reconnect-wrong-result", "child-reconnect-wrong-result"),
+        "superseded": ("root-reconnect-superseded", "child-reconnect-superseded"),
+        "newer_receipt": ("root-reconnect-newer-receipt", "child-reconnect-newer-receipt"),
+        "unrelated_child": (
+            "root-reconnect-unrelated-child",
+            "child-reconnect-unrelated-child",
+        ),
+        "closed": ("root-reconnect-closed", "child-reconnect-closed"),
+    }
+
+    ordinary_root, _ = roots["ordinary"]
+    _start_admitted_input(ordinary_root)
+    _inbox, ordinary_turn = _pending_inbox_turn(ordinary_root, "arbitrary queued input")
+    assert activate_workflow_turn_for_inbox(_inbox.id) == ordinary_turn
+    ordinary_claim = claim_workflow_turn(ordinary_root, inbox_message_id=_inbox.id)
+    assert ordinary_claim is not None
+    assert requeue_workflow_turn(
+        ordinary_turn,
+        ordinary_claim["claim_token"],
+        ordinary_claim["claim_generation"],
+        admission_reason_code="TERMINAL_RUNTIME_RECONNECT_PENDING",
+    )
+
+    prepared = {}
+    for case in ("wrong_result", "superseded", "newer_receipt", "unrelated_child", "closed"):
+        root, child = roots[case]
+        prepared[case] = _queued_authoritative_handoff_result(root, child)
+    with database.SessionLocal() as db:
+        wrong_turn, wrong_notice = prepared["wrong_result"]
+        wrong_result = db.get(database.DelegationResultModel, wrong_notice.result_id)
+        wrong_result.parent_workflow_id = None
+        superseded_turn, _ = prepared["superseded"]
+        db.get(WorkflowTurnModel, superseded_turn).superseded_at = datetime.now()
+        newer_turn, _ = prepared["newer_receipt"]
+        newer_workflow = (
+            db.query(WorkflowModel).filter_by(root_terminal_id=roots["newer_receipt"][0]).one()
+        )
+        newer_authority = WorkflowTurnModel(
+            workflow_id=newer_workflow.id,
+            kind="execution_resume",
+            dedupe_key="newer-reconnect-authority",
+            state="sent",
+        )
+        db.add(newer_authority)
+        db.flush()
+        db.add(
+            WorkflowTurnReceiptModel(
+                workflow_turn_id=newer_authority.id,
+                receiver_terminal_id=roots["newer_receipt"][0],
+            )
+        )
+        assert newer_authority.id > newer_turn
+        unrelated_turn, unrelated_notice = prepared["unrelated_child"]
+        unrelated_result = db.get(database.DelegationResultModel, unrelated_notice.result_id)
+        unrelated_assignment = db.get(
+            database.ChildAssignmentModel, unrelated_result.child_assignment_id
+        )
+        child_workflow = db.get(WorkflowModel, unrelated_assignment.child_workflow_id)
+        unrelated_authority = WorkflowTurnModel(
+            workflow_id=child_workflow.id,
+            kind="external_input",
+            dedupe_key="unrelated-child-current-authority",
+            state="sent",
+        )
+        db.add(unrelated_authority)
+        db.flush()
+        db.add(
+            WorkflowTurnReceiptModel(
+                workflow_turn_id=unrelated_authority.id,
+                receiver_terminal_id=roots["unrelated_child"][1],
+            )
+        )
+        child_workflow.active_turn_id = unrelated_authority.id
+        assert unrelated_authority.id != unrelated_turn
+        closed_root, _ = roots["closed"]
+        db.query(WorkflowModel).filter_by(root_terminal_id=closed_root).one().status = "terminal"
+        db.commit()
+
+    assert not database.request_workflow_provider_reconnect(ordinary_root)
+    assert not database.request_workflow_provider_reconnect(roots["wrong_result"][0])
+    assert not database.request_workflow_provider_reconnect(roots["superseded"][0])
+    assert not database.request_workflow_provider_reconnect(roots["newer_receipt"][0])
+    assert not database.request_workflow_provider_reconnect(roots["unrelated_child"][0])
+    assert not database.request_workflow_provider_reconnect(roots["closed"][0])
+    with database.SessionLocal() as db:
+        for case, (root, _child) in roots.items():
+            workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+            turn = db.get(WorkflowTurnModel, workflow.active_turn_id)
+            assert turn.provider_reconnect_requested_at is None
+
+
+def test_f13_queued_result_reconnect_claim_is_single_and_processing_fenced(workflow_db):
+    root, child = "root-reconnect-queued-race", "child-reconnect-queued-race"
+    turn_id, _notice = _queued_authoritative_handoff_result(root, child)
+    assert database.acquire_provider_execution(root, turn_id, 3)
+    assert database.request_workflow_provider_reconnect(root)
+    assert database.claim_workflow_provider_reconnect(root) is None
+    assert database.release_provider_execution(root, turn_id)
+    assert database.get_terminal_execution_wait_reason(root) == "runtime_recovery"
+
+    now = datetime(2026, 9, 3, 12, 30, 0)
+    barrier = Barrier(2)
+
+    def claim_reconnect():
+        barrier.wait()
+        return database.claim_workflow_provider_reconnect(root, now=now)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        claims = list(executor.map(lambda _index: claim_reconnect(), range(2)))
+
+    admitted = [claim for claim in claims if claim is not None]
+    assert len(admitted) == 1
+    assert admitted[0]["turn_id"] == turn_id
+    first_attempt_token = admitted[0]["attempt_token"]
+    workflow_db.dispose()
+    assert (
+        database.claim_workflow_provider_reconnect(
+            root,
+            now=now + timedelta(seconds=database.WORKFLOW_PROVIDER_RECONNECT_LEASE_SECONDS - 1),
+        )
+        is None
+    )
+    reclaimed = database.claim_workflow_provider_reconnect(
+        root,
+        now=now + timedelta(seconds=database.WORKFLOW_PROVIDER_RECONNECT_LEASE_SECONDS + 1),
+    )
+    assert reclaimed is not None
+    assert reclaimed["attempt_token"] == first_attempt_token
+    assert reclaimed["attempt_state"] == "reserved"
+    with database.SessionLocal() as db:
+        attempts = db.query(WorkflowProviderReconnectAttemptModel).all()
+        assert len(attempts) == 1
+        assert attempts[0].workflow_turn_id == turn_id
+        assert attempts[0].state == "reserved"
+
+
+def test_f13_newer_input_does_not_overtake_reconnecting_queued_result(workflow_db):
+    root, child = "root-reconnect-result-fifo", "child-reconnect-result-fifo"
+    turn_id, notice = _queued_authoritative_handoff_result(root, child)
+    assert database.request_workflow_provider_reconnect(root)
+    reconnect = database.claim_workflow_provider_reconnect(root)
+    assert reconnect is not None and reconnect.get("exhausted") is not True
+
+    prepared = database.prepare_workflow_input(
+        root,
+        "newer input must remain behind immutable callback",
+        request_id="queued-result-reconnect-fifo",
+        require_live_terminal=True,
+    )
+    assert prepared["queued"] is True
+    assert database.mark_workflow_provider_reconnect_launch_dispatched(
+        root,
+        turn_id,
+        reconnect["claim_token"],
+        reconnect["attempt_token"],
+    )
+    assert database.record_workflow_provider_reconnect_runtime_ready(
+        root, reconnect["attempt_token"], ACTIVE_RUNTIME_GENERATION, 4321, 987654
+    )
+    assert database.record_workflow_provider_reconnect_output_boundary(
+        root, reconnect["attempt_token"], 11, 22, 333
+    )
+    assert database.complete_workflow_provider_reconnect(
+        root,
+        turn_id,
+        reconnect["claim_token"],
+        reconnect["attempt_token"],
+    )
+    assert database.get_terminal_execution_wait_reason(root) == "workflow_continuation"
+
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        callback = db.get(WorkflowTurnModel, turn_id)
+        successor = db.get(WorkflowTurnModel, prepared["turn_id"])
+        assert workflow.active_turn_id == turn_id
+        assert callback.state == "queued"
+        assert successor.state == "queued"
+        assert db.get(InboxModel, notice.id).status == database.MessageStatus.PENDING.value
+        assert db.query(WorkflowTurnReceiptModel).filter_by(workflow_turn_id=turn_id).count() == 0
+
+    claim = claim_handoff_result_batch_for_inbox(notice.id)
+    assert isinstance(claim, dict)
+    assert claim["id"] == turn_id
 
 
 @pytest.mark.parametrize("deferred_relation", ["assigned_child", "handoff_child"])

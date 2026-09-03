@@ -1,5 +1,5 @@
-import { useState, useEffect, useLayoutEffect, useRef } from 'react'
-import { api } from '../api'
+import { useState, useEffect, useLayoutEffect, useMemo, useRef } from 'react'
+import { api, type TerminalOutputResponse } from '../api'
 import { X, RefreshCw, Copy, Check, FileText, Maximize2, Minimize2 } from 'lucide-react'
 import { ModalLoadingBody } from './ModalLoadingBody'
 import { useI18n } from '../i18n'
@@ -13,34 +13,80 @@ interface OutputViewerProps {
   onClose: () => void
 }
 
+const MAX_CLIENT_OUTPUT_CHUNKS = 8
+const MAX_CLIENT_OUTPUT_CHARACTERS = 2 * 1024 * 1024
+
+function boundedChunkWindow(chunks: TerminalOutputResponse[]): { chunks: TerminalOutputResponse[]; trimmed: boolean } {
+  const retained = [...chunks]
+  let characters = retained.reduce((total, chunk) => total + chunk.output.length, 0)
+  let trimmed = false
+  while (retained.length > 1 && (retained.length > MAX_CLIENT_OUTPUT_CHUNKS || characters > MAX_CLIENT_OUTPUT_CHARACTERS)) {
+    const removed = retained.pop()
+    characters -= removed?.output.length || 0
+    trimmed = true
+  }
+  return { chunks: retained, trimmed }
+}
+
+function formatBytes(value?: number | null): string {
+  if (value === undefined || value === null) return '—'
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`
+  return `${(value / (1024 * 1024)).toFixed(1)} MiB`
+}
+
 export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
   const { t } = useI18n()
   const [mode, setMode] = useState<'last' | 'full'>('last')
-  const [output, setOutput] = useState('')
+  const [chunks, setChunks] = useState<TerminalOutputResponse[]>([])
   const [availability, setAvailability] = useState<'available' | 'unavailable' | 'error'>('available')
   const [loading, setLoading] = useState(true)
+  const [loadingOlder, setLoadingOlder] = useState(false)
+  const [olderLoadFailed, setOlderLoadFailed] = useState(false)
+  const [discardedNewer, setDiscardedNewer] = useState(false)
   const [copied, setCopied] = useState(false)
   const [fullscreen, setFullscreen] = useState(false)
   const outputRef = useRef<HTMLPreElement>(null)
   const dialogRef = useRef<HTMLDivElement>(null)
   const returnFocusRef = useRef<HTMLElement | null>(null)
   const scrollPositionRef = useRef<number | null>(null)
+  const scrollIntentRef = useRef<
+    | { kind: 'bottom' }
+    | { kind: 'preserve'; height: number; top: number }
+    | null
+  >(null)
+  const requestRef = useRef<AbortController | null>(null)
+
+  const output = useMemo(() => chunks.map(chunk => chunk.output).join(''), [chunks])
+  const oldestChunk = chunks[0]
 
   const fetchOutput = async (m: 'last' | 'full') => {
+    requestRef.current?.abort()
+    const controller = new AbortController()
+    requestRef.current = controller
     setLoading(true)
+    setLoadingOlder(false)
+    setOlderLoadFailed(false)
+    setDiscardedNewer(false)
     try {
-      const data = await api.getTerminalOutput(terminalId, m)
-      setOutput(data.output || '')
+      const data = await api.getTerminalOutput(terminalId, m, undefined, controller.signal)
+      if (controller.signal.aborted) return
+      scrollIntentRef.current = m === 'full' ? { kind: 'bottom' } : null
+      setChunks([{ ...data, output: data.output || '' }])
       setAvailability(data.availability || 'available')
     } catch {
-      setOutput('')
+      if (controller.signal.aborted) return
+      setChunks([])
       setAvailability('error')
+    } finally {
+      if (requestRef.current === controller) requestRef.current = null
+      if (!controller.signal.aborted) setLoading(false)
     }
-    setLoading(false)
   }
 
   useEffect(() => {
     fetchOutput(mode)
+    return () => requestRef.current?.abort()
   }, [mode, terminalId])
 
   useEffect(() => {
@@ -49,12 +95,14 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
     return () => returnFocusRef.current?.focus()
   }, [])
 
-  // Auto-scroll to bottom on full output mode
-  useEffect(() => {
-    if (mode === 'full' && outputRef.current) {
-      outputRef.current.scrollTop = outputRef.current.scrollHeight
-    }
-  }, [output, mode])
+  useLayoutEffect(() => {
+    const surface = outputRef.current
+    const intent = scrollIntentRef.current
+    if (!surface || !intent) return
+    if (intent.kind === 'bottom') surface.scrollTop = surface.scrollHeight
+    else surface.scrollTop = intent.top + (surface.scrollHeight - intent.height)
+    scrollIntentRef.current = null
+  }, [chunks])
 
   useLayoutEffect(() => {
     if (scrollPositionRef.current !== null && outputRef.current) {
@@ -68,13 +116,18 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
     setFullscreen(value => !value)
   }
 
+  const closeViewer = () => {
+    requestRef.current?.abort()
+    onClose()
+  }
+
   // Close on Escape
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return
       e.preventDefault()
       if (fullscreen) toggleFullscreen()
-      else onClose()
+      else closeViewer()
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
@@ -95,12 +148,37 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
     fetchOutput(mode)
   }
 
+  const handleLoadOlder = async () => {
+    if (mode !== 'full' || loadingOlder || requestRef.current || !oldestChunk?.has_older || !oldestChunk.cursor) return
+    const controller = new AbortController()
+    requestRef.current = controller
+    setLoadingOlder(true)
+    setOlderLoadFailed(false)
+    const surface = outputRef.current
+    scrollIntentRef.current = surface
+      ? { kind: 'preserve', height: surface.scrollHeight, top: surface.scrollTop }
+      : null
+    try {
+      const data = await api.getTerminalOutput(terminalId, 'full', oldestChunk.cursor, controller.signal)
+      if (controller.signal.aborted) return
+      const bounded = boundedChunkWindow([{ ...data, output: data.output || '' }, ...chunks])
+      setChunks(bounded.chunks)
+      if (bounded.trimmed) setDiscardedNewer(true)
+      setAvailability(data.availability || 'available')
+    } catch {
+      if (!controller.signal.aborted) setOlderLoadFailed(true)
+    } finally {
+      if (requestRef.current === controller) requestRef.current = null
+      if (!controller.signal.aborted) setLoadingOlder(false)
+    }
+  }
+
   const cleanOutput = stripAnsi(output)
 
   return (
     <div className={`fixed inset-0 z-[60] flex items-center justify-center ${fullscreen ? 'p-0' : 'p-3 sm:p-4'}`}>
       {/* Backdrop */}
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={closeViewer} />
 
       {/* Modal */}
       <div
@@ -153,7 +231,7 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
             </button>
             {/* Close button */}
             <button
-              onClick={onClose}
+              onClick={closeViewer}
               className="min-w-11 min-h-11 inline-flex items-center justify-center text-gray-500 hover:text-white transition-colors rounded-lg hover:bg-gray-800"
               title={t('common.close')}
             >
@@ -196,14 +274,45 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
             </div>
           ) : availability === 'error' ? (
             <div className="flex h-full min-h-[200px] items-center justify-center"><p className="text-sm text-red-300">{t('output.loadFailed')}</p></div>
-          ) : cleanOutput ? (
-            <pre
-              ref={outputRef}
-              data-testid="terminal-output-surface"
-              className="block h-full min-h-0 min-w-0 w-full max-w-full flex-1 self-stretch overflow-x-hidden overflow-y-auto rounded-lg bg-gray-950 p-3 font-mono text-xs text-gray-300 whitespace-pre-wrap [overflow-wrap:anywhere] [word-break:break-word] sm:p-4 sm:text-sm"
-            >
-              {cleanOutput}
-            </pre>
+          ) : cleanOutput || (mode === 'full' && oldestChunk?.has_older) ? (
+            <div className="flex h-full min-h-0 min-w-0 w-full max-w-full flex-1 flex-col gap-2">
+              {mode === 'full' && (
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-gray-500">
+                  <div className="flex items-center gap-2">
+                    {oldestChunk?.has_older && (
+                      <button
+                        onClick={handleLoadOlder}
+                        disabled={loadingOlder}
+                        className="min-h-9 rounded-lg bg-gray-800 px-3 text-gray-300 hover:bg-gray-700 disabled:opacity-50"
+                      >
+                        {loadingOlder ? t('output.loadingOlder') : t('output.loadOlder')}
+                      </button>
+                    )}
+                    {discardedNewer && (
+                      <button
+                        onClick={() => fetchOutput('full')}
+                        className="min-h-9 rounded-lg px-3 text-emerald-400 hover:bg-gray-800"
+                      >
+                        {t('output.returnLatest')}
+                      </button>
+                    )}
+                  </div>
+                  <span data-testid="terminal-output-range">
+                    {formatBytes(oldestChunk?.range_start)}–{formatBytes(chunks[chunks.length - 1]?.range_end)} / {formatBytes(oldestChunk?.snapshot_size)}
+                  </span>
+                </div>
+              )}
+              {olderLoadFailed && (
+                <p className="text-xs text-red-300">{t('output.loadOlderFailed')}</p>
+              )}
+              <pre
+                ref={outputRef}
+                data-testid="terminal-output-surface"
+                className="block h-full min-h-0 min-w-0 w-full max-w-full flex-1 self-stretch overflow-x-hidden overflow-y-auto rounded-lg bg-gray-950 p-3 font-mono text-xs text-gray-300 whitespace-pre-wrap [overflow-wrap:anywhere] [word-break:break-word] sm:p-4 sm:text-sm"
+              >
+                {cleanOutput}
+              </pre>
+            </div>
           ) : (
             <div className="flex items-center justify-center h-full min-h-[200px]">
               <p className="text-gray-500 text-sm">{t('output.empty')}</p>

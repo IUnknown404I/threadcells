@@ -388,6 +388,18 @@ describe('API wrapper', () => {
     )
   })
 
+  it('getTerminalOutput sends an opaque cursor and caller cancellation signal', async () => {
+    mockResponse({ output: 'older output', mode: 'full', has_older: false })
+    const controller = new AbortController()
+
+    await api.getTerminalOutput('t1', 'full', 'opaque+/cursor=', controller.signal)
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringContaining('/terminals/t1/output?mode=full&cursor=opaque%2B%2Fcursor%3D'),
+      expect.objectContaining({ signal: controller.signal }),
+    )
+  })
+
   it('listFlows fetches /flows', async () => {
     const flows = [{ name: 'test-flow', schedule: '0 9 * * *', enabled: true }]
     mockResponse(flows)

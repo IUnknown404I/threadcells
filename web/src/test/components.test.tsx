@@ -411,7 +411,12 @@ describe('OutputViewer fullscreen', () => {
     const onClose = vi.fn()
     render(<OutputViewer terminalId="terminal-with-a-long-id" onClose={onClose} />)
 
-    await waitFor(() => expect(api.getTerminalOutput).toHaveBeenCalledWith('terminal-with-a-long-id', 'last'))
+    await waitFor(() => expect(api.getTerminalOutput).toHaveBeenCalledWith(
+      'terminal-with-a-long-id',
+      'last',
+      undefined,
+      expect.any(AbortSignal),
+    ))
     fireEvent.click(screen.getByRole('button', { name: 'Fullscreen' }))
     expect(screen.getByRole('button', { name: 'Exit fullscreen' })).toBeInTheDocument()
     expect(api.getTerminalOutput).toHaveBeenCalledTimes(1)
@@ -460,6 +465,111 @@ describe('OutputViewer fullscreen', () => {
     expect(await screen.findByText('Output unavailable')).toBeInTheDocument()
     expect(screen.getByText(/durable log may have been cleaned by Housekeeping/)).toBeInTheDocument()
     expect(screen.queryByText('No output available')).not.toBeInTheDocument()
+  })
+
+  it('loads older chunks through cursors in exact display order', async () => {
+    vi.mocked(api.getTerminalOutput)
+      .mockResolvedValueOnce({ output: 'latest response', mode: 'last' })
+      .mockResolvedValueOnce({
+        output: 'newest\n',
+        mode: 'full',
+        cursor: 'cursor-1',
+        has_older: true,
+        range_start: 100,
+        range_end: 200,
+        snapshot_size: 200,
+      })
+      .mockResolvedValueOnce({
+        output: 'older\n',
+        mode: 'full',
+        cursor: null,
+        has_older: false,
+        range_start: 0,
+        range_end: 100,
+        snapshot_size: 200,
+      })
+    render(<OutputViewer terminalId="terminal-1" onClose={() => {}} />)
+    await screen.findByText('latest response')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Full Output' }))
+    await screen.findByText('newest')
+    fireEvent.click(screen.getByRole('button', { name: 'Load older output' }))
+
+    await waitFor(() => expect(screen.getByTestId('terminal-output-surface')).toHaveTextContent('older newest'))
+    expect(api.getTerminalOutput).toHaveBeenLastCalledWith(
+      'terminal-1',
+      'full',
+      'cursor-1',
+      expect.any(AbortSignal),
+    )
+    expect(screen.getByTestId('terminal-output-range')).toHaveTextContent('0 B–200 B / 200 B')
+  })
+
+  it('keeps a bounded chunk window while browsing arbitrarily older output', async () => {
+    let fullPage = 0
+    vi.mocked(api.getTerminalOutput).mockImplementation(async (_id, mode, cursor) => {
+      if (mode === 'last') return { output: 'latest response', mode: 'last' }
+      const page = cursor ? fullPage + 1 : 0
+      fullPage = page
+      return {
+        output: `page-${page}\n`,
+        mode: 'full',
+        cursor: page < 9 ? `cursor-${page + 1}` : null,
+        has_older: page < 9,
+        range_start: 900 - page * 100,
+        range_end: 1000 - page * 100,
+        snapshot_size: 1000,
+      }
+    })
+    render(<OutputViewer terminalId="terminal-1" onClose={() => {}} />)
+    await screen.findByText('latest response')
+    fireEvent.click(screen.getByRole('button', { name: 'Full Output' }))
+    await screen.findByText('page-0')
+
+    for (let page = 1; page <= 8; page += 1) {
+      fireEvent.click(screen.getByRole('button', { name: 'Load older output' }))
+      await screen.findByText(`page-${page}`, { exact: false })
+    }
+
+    expect(screen.getByTestId('terminal-output-surface')).not.toHaveTextContent('page-0')
+    expect(screen.getByRole('button', { name: 'Return to latest' })).toBeInTheDocument()
+  })
+
+  it('refreshes full output from the newest snapshot', async () => {
+    vi.mocked(api.getTerminalOutput)
+      .mockResolvedValueOnce({ output: 'latest response', mode: 'last' })
+      .mockResolvedValueOnce({ output: 'snapshot one', mode: 'full', cursor: null, has_older: false })
+      .mockResolvedValueOnce({ output: 'snapshot two', mode: 'full', cursor: null, has_older: false })
+    render(<OutputViewer terminalId="terminal-1" onClose={() => {}} />)
+    await screen.findByText('latest response')
+    fireEvent.click(screen.getByRole('button', { name: 'Full Output' }))
+    await screen.findByText('snapshot one')
+
+    fireEvent.click(screen.getByTitle('Refresh output'))
+
+    await screen.findByText('snapshot two')
+    expect(api.getTerminalOutput).toHaveBeenLastCalledWith(
+      'terminal-1',
+      'full',
+      undefined,
+      expect.any(AbortSignal),
+    )
+  })
+
+  it('aborts an in-flight output request before closing', async () => {
+    const onClose = vi.fn()
+    let requestSignal: AbortSignal | undefined
+    vi.mocked(api.getTerminalOutput).mockImplementation((_id, _mode, _cursor, signal) => {
+      requestSignal = signal
+      return new Promise(() => {})
+    })
+    render(<OutputViewer terminalId="terminal-1" onClose={onClose} />)
+    await waitFor(() => expect(requestSignal).toBeDefined())
+
+    fireEvent.click(screen.getByTitle('Close'))
+
+    expect(requestSignal?.aborted).toBe(true)
+    expect(onClose).toHaveBeenCalledTimes(1)
   })
 })
 

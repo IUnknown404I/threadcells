@@ -14583,6 +14583,7 @@ def _register_child_attempt(
     workflow_turn_id: Optional[int] = None,
     workflow_effect_id: Optional[int] = None,
     request_message: Optional[str] = None,
+    require_existing_reviewer_attempt: bool = False,
 ) -> bool:
     """Persist one immutable callback attempt and its exact review subject."""
     _ensure_child_assignment_schema()
@@ -14618,6 +14619,9 @@ def _register_child_attempt(
         child = db.query(TerminalModel).filter_by(id=child_terminal_id).first()
         prior = _latest_child_assignment(db, child_terminal_id)
         reused_review_child = False
+        if require_existing_reviewer_attempt and prior is None:
+            db.rollback()
+            return False
         if prior is not None:
             if prior.parent_terminal_id != parent_terminal_id:
                 raise ValueError(
@@ -14761,6 +14765,7 @@ def register_child_assignment(
     workflow_turn_id: Optional[int] = None,
     workflow_effect_id: Optional[int] = None,
     request_message: Optional[str] = None,
+    require_existing_reviewer_attempt: bool = False,
 ) -> bool:
     """Persist one assigned-child result attempt.
 
@@ -14775,6 +14780,7 @@ def register_child_assignment(
         workflow_turn_id=workflow_turn_id,
         workflow_effect_id=workflow_effect_id,
         request_message=request_message,
+        require_existing_reviewer_attempt=require_existing_reviewer_attempt,
     )
 
 

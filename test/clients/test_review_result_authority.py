@@ -388,6 +388,37 @@ def test_mcp_assign_cannot_reuse_an_ordinary_child_as_reviewer(authority_db, mon
         assert db.query(ChildAssignmentModel).count() == 0
 
 
+def test_mcp_assign_cannot_claim_unrelated_reviewer_as_first_attempt(
+    authority_db, monkeypatch, tmp_path
+):
+    repo, revision = _repository(tmp_path)
+    with database.SessionLocal() as db:
+        db.add(_reviewer("unrelated-reviewer", repo, revision))
+        db.commit()
+    turn_id = start_workflow_input("parent")
+    assert turn_id is not None
+    assert database.claim_workflow_turn_receipt("parent", turn_id)
+    monkeypatch.setenv("CAO_TERMINAL_ID", "parent")
+    with (
+        patch.object(mcp_server, "_fence_privileged_runtime"),
+        patch.object(mcp_server, "wait_until_terminal_status", return_value=True),
+    ):
+        rejected = asyncio.run(
+            mcp_server.assign(
+                turn_id,
+                "reviewer_sol_high",
+                "Caller-selected reviewer must already belong to this parent",
+                working_directory=None,
+                reviewer_terminal_id="unrelated-reviewer",
+            )
+        )
+    assert rejected["success"] is False
+    assert rejected["terminal_id"] is None
+    assert rejected["reason_code"] == "REVIEWER_REUSE_NOT_ELIGIBLE"
+    with database.SessionLocal() as db:
+        assert db.query(ChildAssignmentModel).count() == 0
+
+
 def test_cancelling_new_attempt_does_not_rewrite_prior_review_history(authority_db, tmp_path):
     repo, revision = _repository(tmp_path)
     with database.SessionLocal() as db:

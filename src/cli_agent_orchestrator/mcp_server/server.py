@@ -1906,6 +1906,7 @@ def _assign_impl(
                     workflow_turn_id=request_workflow_turn_id,
                     workflow_effect_id=request_effect.get("id"),
                     request_message=message,
+                    require_existing_reviewer_attempt=reused_reviewer,
                 )
             )
             if not registered and (

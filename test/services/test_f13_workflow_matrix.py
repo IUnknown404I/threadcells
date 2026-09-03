@@ -4969,6 +4969,7 @@ def test_f14_assigned_child_completion_wakes_its_same_idle_parent_once(
     provider = MagicMock()
     provider.get_status.return_value = TerminalStatus.IDLE
     mock_provider.return_value = provider
+    monkeypatch.setattr(terminal_service.tmux_client, "window_exists", lambda *_args: True)
 
     monkeypatch.setenv("CAO_TERMINAL_ID", child)
     assert asyncio.run(mcp_server.claim_workflow_turn_receipt(child_turn))["accepted"] is True

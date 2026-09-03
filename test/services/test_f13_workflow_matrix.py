@@ -1,6 +1,7 @@
 """Focused F13 matrix: durable top-level workflow/run-loop semantics."""
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
@@ -50,6 +51,7 @@ from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     finish_workflow_effect,
     get_delegation_result_for_assignment,
+    get_handoff_child_result_message,
     get_parent_completion_barrier,
     get_pending_handoff_child_terminal_ids,
     get_workflow_provider_outcome,
@@ -76,9 +78,11 @@ from cli_agent_orchestrator.clients.database import (
     resolve_workflow_input_binding,
     set_workflow_terminal_state,
     start_workflow_input,
+    submit_handoff_result_v1,
 )
 from cli_agent_orchestrator.mcp_server import server as mcp_server
 from cli_agent_orchestrator.models.provider import ProviderTurnOutcome
+from cli_agent_orchestrator.models.result import HandoffResultDocumentV1
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.codex import CodexProvider
@@ -771,13 +775,23 @@ def _complete_ready_test_reconnect(root: str, turn_id: int) -> None:
 
 
 def _queued_authoritative_handoff_result(
-    parent: str, child: str, body: str = "immutable reviewer verdict"
+    parent: str,
+    child: str,
+    body: str = "immutable reviewer verdict",
+    *,
+    resumed_child: bool = False,
 ) -> tuple[int, database.InboxMessage]:
     """Build the exact current queued callback authority used by #116."""
     parent_turn = _start_admitted_input(parent)
     request_effect = claim_workflow_effect(parent, parent_turn, "handoff", child)
     assert request_effect is not None
     _ensure_running_test_terminal(child)
+    auth_token = f"{child}-authenticated-v1-token"
+    if resumed_child:
+        with database.SessionLocal() as db:
+            terminal = db.get(TerminalModel, child)
+            terminal.auth_token_sha256 = hashlib.sha256(auth_token.encode()).hexdigest()
+            db.commit()
     assert register_handoff_child(
         parent,
         child,
@@ -790,10 +804,34 @@ def _queued_authoritative_handoff_result(
     child_turn = resolve_workflow_input_binding(child, child_binding)
     assert child_turn is not None
     assert bind_child_assignment_input_turn(child, child_binding)
-    assert claim_workflow_turn_receipt(child, child_turn)
-
-    notice, duplicate = create_handoff_child_result_message(child, body)
-    assert notice is not None and duplicate is False and notice.result_id is not None
+    child_receipt = claim_or_resume_workflow_turn_receipt(child, child_turn)
+    assert child_receipt["accepted"] is True
+    if resumed_child:
+        resumed = claim_or_resume_workflow_turn_receipt(
+            child,
+            child_turn,
+            resume_token=child_receipt["resume_token"],
+        )
+        assert resumed["accepted"] is True and resumed["resumed"] is True
+        submission = submit_handoff_result_v1(
+            auth_token,
+            resumed["logical_turn_id"],
+            HandoffResultDocumentV1(
+                format="v1",
+                summary="resumed child complete",
+                body_markdown=body,
+                changed_files=[],
+                checks=[],
+                risks=[],
+                blockers=[],
+            ),
+        )
+        assert submission["accepted"] is True and submission["duplicate"] is False
+        notice = get_handoff_child_result_message(child)
+        assert notice is not None and notice.result_id == submission["result_id"]
+    else:
+        notice, duplicate = create_handoff_child_result_message(child, body)
+        assert notice is not None and duplicate is False and notice.result_id is not None
     assert finish_workflow_effect(
         parent,
         request_effect["id"],
@@ -815,13 +853,14 @@ def _queued_authoritative_handoff_result(
     return claim["id"], notice
 
 
+@pytest.mark.parametrize("resumed_child", [False, True], ids=["bound-child", "resumed-child-v1"])
 @patch("cli_agent_orchestrator.services.workflow_service.terminal_service")
 def test_f13_active_queued_handoff_result_reconnects_then_delivers_same_turn_once(
-    mock_terminal, workflow_db, monkeypatch
+    mock_terminal, workflow_db, monkeypatch, resumed_child
 ):
     """Provider 0/N recovers one exact callback without fabricated admission."""
     root, child = "root-queued-result-reconnect", "child-queued-result-reconnect"
-    turn_id, notice = _queued_authoritative_handoff_result(root, child)
+    turn_id, notice = _queued_authoritative_handoff_result(root, child, resumed_child=resumed_child)
     with database.SessionLocal() as db:
         db.add(
             database.CapacitySettingsModel(
@@ -928,6 +967,10 @@ def test_f13_queued_result_reconnect_provenance_fails_closed(workflow_db):
         "wrong_result": ("root-reconnect-wrong-result", "child-reconnect-wrong-result"),
         "superseded": ("root-reconnect-superseded", "child-reconnect-superseded"),
         "newer_receipt": ("root-reconnect-newer-receipt", "child-reconnect-newer-receipt"),
+        "unrelated_child": (
+            "root-reconnect-unrelated-child",
+            "child-reconnect-unrelated-child",
+        ),
         "closed": ("root-reconnect-closed", "child-reconnect-closed"),
     }
 
@@ -945,7 +988,7 @@ def test_f13_queued_result_reconnect_provenance_fails_closed(workflow_db):
     )
 
     prepared = {}
-    for case in ("wrong_result", "superseded", "newer_receipt", "closed"):
+    for case in ("wrong_result", "superseded", "newer_receipt", "unrelated_child", "closed"):
         root, child = roots[case]
         prepared[case] = _queued_authoritative_handoff_result(root, child)
     with database.SessionLocal() as db:
@@ -973,6 +1016,28 @@ def test_f13_queued_result_reconnect_provenance_fails_closed(workflow_db):
             )
         )
         assert newer_authority.id > newer_turn
+        unrelated_turn, unrelated_notice = prepared["unrelated_child"]
+        unrelated_result = db.get(database.DelegationResultModel, unrelated_notice.result_id)
+        unrelated_assignment = db.get(
+            database.ChildAssignmentModel, unrelated_result.child_assignment_id
+        )
+        child_workflow = db.get(WorkflowModel, unrelated_assignment.child_workflow_id)
+        unrelated_authority = WorkflowTurnModel(
+            workflow_id=child_workflow.id,
+            kind="external_input",
+            dedupe_key="unrelated-child-current-authority",
+            state="sent",
+        )
+        db.add(unrelated_authority)
+        db.flush()
+        db.add(
+            WorkflowTurnReceiptModel(
+                workflow_turn_id=unrelated_authority.id,
+                receiver_terminal_id=roots["unrelated_child"][1],
+            )
+        )
+        child_workflow.active_turn_id = unrelated_authority.id
+        assert unrelated_authority.id != unrelated_turn
         closed_root, _ = roots["closed"]
         db.query(WorkflowModel).filter_by(root_terminal_id=closed_root).one().status = "terminal"
         db.commit()
@@ -981,6 +1046,7 @@ def test_f13_queued_result_reconnect_provenance_fails_closed(workflow_db):
     assert not database.request_workflow_provider_reconnect(roots["wrong_result"][0])
     assert not database.request_workflow_provider_reconnect(roots["superseded"][0])
     assert not database.request_workflow_provider_reconnect(roots["newer_receipt"][0])
+    assert not database.request_workflow_provider_reconnect(roots["unrelated_child"][0])
     assert not database.request_workflow_provider_reconnect(roots["closed"][0])
     with database.SessionLocal() as db:
         for case, (root, _child) in roots.items():

@@ -9903,6 +9903,77 @@ def mark_workflow_turn_sent_for_inbox(message_id: int) -> bool:
         return True
 
 
+def _child_workflow_authority_descends_from_assignment(
+    db: Any,
+    child_workflow: WorkflowModel,
+    assignment_turn_id: int,
+    child_terminal_id: str,
+) -> bool:
+    """Prove the child's current authority is its bound input or admitted resume.
+
+    The assignment binding is immutable, while an interrupted model execution
+    legitimately advances through one or more ``execution_resume`` turns.
+    Every hop must be the exact receipt-linked successor created by the
+    one-use resume-token transaction; an unrelated later child input therefore
+    cannot borrow the assignment's result authority.
+    """
+    active_turn_id = child_workflow.active_turn_id
+    if active_turn_id is None:
+        return False
+    current = db.get(WorkflowTurnModel, cast(int, active_turn_id))
+    visited: set[int] = set()
+    while current is not None:
+        current_id = cast(int, current.id)
+        if (
+            current_id in visited
+            or current.workflow_id != child_workflow.id
+            or current.state not in {TURN_SENT, TURN_FINISHED}
+            or current.superseded_by_turn_id is not None
+            or current.superseded_at is not None
+        ):
+            return False
+        visited.add(current_id)
+        receipt = (
+            db.query(WorkflowTurnReceiptModel)
+            .filter_by(
+                workflow_turn_id=current_id,
+                receiver_terminal_id=child_terminal_id,
+            )
+            .one_or_none()
+        )
+        if receipt is None:
+            return False
+        if current_id == assignment_turn_id:
+            return True
+        parent_id = current.resume_parent_turn_id
+        if (
+            current.kind != "execution_resume"
+            or parent_id is None
+            or cast(int, parent_id) >= current_id
+        ):
+            return False
+        parent = db.get(WorkflowTurnModel, cast(int, parent_id))
+        parent_receipt = (
+            db.query(WorkflowTurnReceiptModel)
+            .filter_by(
+                workflow_turn_id=parent_id,
+                receiver_terminal_id=child_terminal_id,
+            )
+            .one_or_none()
+        )
+        if (
+            parent is None
+            or parent.workflow_id != child_workflow.id
+            or parent.state != TURN_FINISHED
+            or parent_receipt is None
+            or parent_receipt.resumed_by_turn_id != current_id
+            or parent_receipt.resumed_at is None
+        ):
+            return False
+        current = parent
+    return False
+
+
 def _queued_result_turn_authorizes_provider_reconnect(
     db: Any,
     workflow: WorkflowModel,
@@ -9985,6 +10056,16 @@ def _queued_result_turn_authorizes_provider_reconnect(
             if assignment.child_workflow_id is not None
             else None
         )
+        child_authority_valid = bool(
+            child_workflow is not None
+            and assignment.child_workflow_turn_id is not None
+            and _child_workflow_authority_descends_from_assignment(
+                db,
+                child_workflow,
+                cast(int, assignment.child_workflow_turn_id),
+                cast(str, assignment.child_terminal_id),
+            )
+        )
         request_effect = (
             db.get(WorkflowEffectModel, assignment.request_workflow_effect_id)
             if assignment.request_workflow_effect_id is not None
@@ -10017,7 +10098,7 @@ def _queued_result_turn_authorizes_provider_reconnect(
             or child_workflow.root_terminal_id != assignment.child_terminal_id
             or child_workflow.status != WORKFLOW_TERMINAL
             or assignment.child_workflow_turn_id is None
-            or child_workflow.active_turn_id != assignment.child_workflow_turn_id
+            or not child_authority_valid
             or request_effect is None
             or request_effect.workflow_id != workflow.id
             or request_effect.workflow_turn_id != assignment.request_workflow_turn_id

@@ -1045,9 +1045,10 @@ class TmuxClient:
             session = self.server.sessions.get(session_name=session_name)
             return session is not None
         except ObjectDoesNotExist:
-            # libtmux uses this exact exception to report a completed lookup
-            # whose requested object is absent.  It is not an inventory error.
-            return False
+            # Server.sessions suppresses its underlying inventory exception and
+            # exposes an empty QueryList.  Confirm the parent inventory before
+            # accepting ObjectDoesNotExist as authoritative target absence.
+            return False if self._session_inventory_is_available() else None
         except Exception as exc:
             logger.warning("Failed to inventory tmux session %s: %s", session_name, exc)
             return None
@@ -1058,12 +1059,41 @@ class TmuxClient:
             session = self.server.sessions.get(session_name=session_name)
             if not session:
                 return False
-            return session.windows.get(window_name=window_name) is not None
+        except ObjectDoesNotExist:
+            return False if self._session_inventory_is_available() else None
         except Exception as exc:
             logger.warning(
                 "Failed to inventory tmux window %s:%s: %s", session_name, window_name, exc
             )
             return None
+        try:
+            return session.windows.get(window_name=window_name) is not None
+        except ObjectDoesNotExist:
+            # Session.windows has the same exception-suppression behavior.
+            # A direct successful list-windows query proves that the missing
+            # exact window is absence rather than transport uncertainty.
+            return False if self._window_inventory_is_available(session_name) else None
+        except Exception as exc:
+            logger.warning(
+                "Failed to inventory tmux window %s:%s: %s", session_name, window_name, exc
+            )
+            return None
+
+    def _session_inventory_is_available(self) -> bool:
+        """Return whether the tmux server supplied a certain session inventory."""
+        try:
+            result = self.server.cmd("list-sessions")
+        except Exception:
+            return False
+        return result.returncode == 0 and not result.stderr
+
+    def _window_inventory_is_available(self, session_name: str) -> bool:
+        """Return whether tmux supplied a certain window inventory for a session."""
+        try:
+            result = self.server.cmd("list-windows", "-t", session_name)
+        except Exception:
+            return False
+        return result.returncode == 0 and not result.stderr
 
     def get_pane_current_command(self, session_name: str, window_name: str) -> Optional[str]:
         """Return the foreground pane command, preserving uncertainty as ``None``."""

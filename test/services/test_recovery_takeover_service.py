@@ -10,6 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from cli_agent_orchestrator.clients.tmux import TmuxClient
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services import recovery_takeover_service as service
 
@@ -89,6 +90,48 @@ def test_missing_tmux_window_does_not_override_live_process_tree(monkeypatch, tm
         False,
         "RECOVERY_RUNTIME_PROCESS_TREE_ACTIVE",
     )
+
+
+def test_real_libtmux_absence_keeps_recovery_required_capability_eligible(monkeypatch):
+    from libtmux._internal.query_list import ObjectDoesNotExist
+
+    terminal = {
+        **_metadata(),
+        "runtime_lifecycle": "recovery_required",
+        "launch_worktree": "/managed/recovery-worktree",
+    }
+    presence = TmuxClient()
+    presence.server = Mock()
+    presence.server.sessions.get.side_effect = ObjectDoesNotExist("cao-old")
+    presence.server.cmd.return_value.returncode = 0
+    presence.server.cmd.return_value.stderr = []
+    monkeypatch.setattr(service, "tmux_client", presence)
+    monkeypatch.setattr(
+        service,
+        "recovery_takeover_durable_eligibility",
+        lambda *_args, **_kwargs: {
+            "eligible": True,
+            "reason_code": None,
+            "terminal": terminal,
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "_runtime_process_tree_absent",
+        lambda *_args, **_kwargs: (True, None),
+    )
+    monkeypatch.setattr(
+        service,
+        "_worktree_snapshot",
+        lambda *_args: {"state": "clean", "dirty": False, "reason_code": None},
+    )
+
+    first = service._recovery_takeover_capability("a11ce001")
+    second = service._recovery_takeover_capability("a11ce001")
+
+    assert first["eligible"] is True
+    assert second["eligible"] is True
+    assert first["runtime_absent"] is second["runtime_absent"] is True
 
 
 def test_generation_mismatch_fails_closed(monkeypatch):

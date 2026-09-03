@@ -30,6 +30,7 @@ from cli_agent_orchestrator.clients.tmux import (
     PaneDeliveryTarget,
     PaneTargetError,
     RuntimePaneTarget,
+    TmuxClient,
 )
 from cli_agent_orchestrator.services import operations_service, terminal_service
 from cli_agent_orchestrator.services.housekeeping_service import (
@@ -620,7 +621,14 @@ def test_missing_tmux_session_converges_running_runtime_and_repeated_exit(
     monkeypatch.setattr(
         terminal_service, "_retire_observed_dead_runtime", lambda *_args, **_kwargs: (True, None)
     )
-    monkeypatch.setattr(terminal_service.tmux_client, "window_exists", lambda *_: False)
+    from libtmux._internal.query_list import ObjectDoesNotExist
+
+    presence = TmuxClient()
+    presence.server = MagicMock()
+    presence.server.sessions.get.side_effect = ObjectDoesNotExist("cao-session")
+    presence.server.cmd.return_value.returncode = 0
+    presence.server.cmd.return_value.stderr = []
+    monkeypatch.setattr(terminal_service.tmux_client, "window_exists", presence.window_exists)
     monkeypatch.setattr(
         terminal_service.tmux_client,
         "exact_pane_target",

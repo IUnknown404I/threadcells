@@ -9341,6 +9341,12 @@ def claim_handoff_result_batch_for_inbox(
             return None
 
         active_turn_id = workflow.active_turn_id
+        if active_turn_id is not None and cast(int, active_turn_id) > cast(int, turn.id):
+            # A callback selected before a concurrent execution-resume commit
+            # cannot roll the receiver capability back after that newer turn
+            # was admitted. Leave the stale callback queued so the ordinary
+            # resume reconciler can materialize its one current successor.
+            return None
         if active_turn_id != turn.id and _workflow_has_unadmitted_active_turn(db, workflow):
             return DEFER_UNADMITTED
 

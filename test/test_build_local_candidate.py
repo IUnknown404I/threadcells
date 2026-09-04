@@ -22,10 +22,12 @@ def create_tar_archive(entries: dict[str, bytes]) -> io.BytesIO:
 
 
 def test_safe_extract_valid_archive_without_deprecation_warnings(tmp_path: Path):
-    archive_data = create_tar_archive({
-        "manifest.json": b'{"name": "test"}',
-        "nested/script.py": b"print('hello')\n",
-    })
+    archive_data = create_tar_archive(
+        {
+            "manifest.json": b'{"name": "test"}',
+            "nested/script.py": b"print('hello')\n",
+        }
+    )
 
     with warnings.catch_warnings(record=True) as recorded_warnings:
         warnings.simplefilter("always")
@@ -33,7 +35,9 @@ def test_safe_extract_valid_archive_without_deprecation_warnings(tmp_path: Path)
             safe_extract(archive, tmp_path)
 
     tar_warnings = [
-        w for w in recorded_warnings if issubclass(w.category, DeprecationWarning) and "TarFile" in str(w.message)
+        w
+        for w in recorded_warnings
+        if issubclass(w.category, DeprecationWarning) and "TarFile" in str(w.message)
     ]
     assert len(tar_warnings) == 0
     assert (tmp_path / "manifest.json").read_text() == '{"name": "test"}'
@@ -41,9 +45,11 @@ def test_safe_extract_valid_archive_without_deprecation_warnings(tmp_path: Path)
 
 
 def test_safe_extract_rejects_parent_traversal(tmp_path: Path):
-    archive_data = create_tar_archive({
-        "../escape.txt": b"malicious content",
-    })
+    archive_data = create_tar_archive(
+        {
+            "../escape.txt": b"malicious content",
+        }
+    )
 
     with tarfile.open(fileobj=archive_data, mode="r:gz") as archive:
         with pytest.raises(ValueError, match="unsafe archive member"):
@@ -51,9 +57,11 @@ def test_safe_extract_rejects_parent_traversal(tmp_path: Path):
 
 
 def test_safe_extract_rejects_nested_parent_traversal(tmp_path: Path):
-    archive_data = create_tar_archive({
-        "nested/../../escape.txt": b"malicious content",
-    })
+    archive_data = create_tar_archive(
+        {
+            "nested/../../escape.txt": b"malicious content",
+        }
+    )
 
     with tarfile.open(fileobj=archive_data, mode="r:gz") as archive:
         with pytest.raises(ValueError, match="unsafe archive member"):
@@ -75,14 +83,15 @@ def test_safe_extract_rejects_absolute_path(tmp_path: Path):
 
 
 def test_safe_extract_preserves_content_and_structure(tmp_path: Path):
-    archive_data = create_tar_archive({
-        "dir/subdir/file.txt": b"nested file content",
-        "README.md": b"# Readme",
-    })
+    archive_data = create_tar_archive(
+        {
+            "dir/subdir/file.txt": b"nested file content",
+            "README.md": b"# Readme",
+        }
+    )
 
     with tarfile.open(fileobj=archive_data, mode="r:gz") as archive:
         safe_extract(archive, tmp_path)
 
     assert (tmp_path / "dir" / "subdir" / "file.txt").read_bytes() == b"nested file content"
     assert (tmp_path / "README.md").read_bytes() == b"# Readme"
-

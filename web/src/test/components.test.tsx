@@ -51,6 +51,29 @@ describe('WorkflowRecoveryNotice', () => {
     />)
     expect(container).toBeEmptyDOMElement()
   })
+
+  it('asks for owner-authorized recovery when takeover is available', () => {
+    render(<WorkflowRecoveryNotice
+      agent={{
+        id: 'owner-recovery',
+        activity: 'ready',
+        execution_state: 'ready',
+        lifecycle: 'running',
+        workflow_state: 'active',
+        workflow_status: 'open',
+        queued_task_count: 1,
+      } as never}
+      capability={{
+        terminal_id: 'owner-recovery',
+        eligible: true,
+        reason_code: null,
+      }}
+    />)
+
+    expect(screen.getByRole('status')).toHaveTextContent(/cannot advance automatically/i)
+    expect(screen.getByRole('status')).toHaveTextContent(/owner-authorized recovery action/i)
+    expect(screen.queryByText(/resuming this durable work automatically/i)).not.toBeInTheDocument()
+  })
 })
 
 describe('StatusBadge', () => {

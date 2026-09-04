@@ -2570,6 +2570,19 @@ def test_f13_ready_reconnect_wakes_receipted_result_then_preserves_composer_fifo
     assert mark_child_assignment_result_delivered(notice.id)
     callback_receipt = claim_or_resume_workflow_turn_receipt(parent, callback_turn)
     assert callback_receipt["accepted"] is True
+    monkeypatch.setenv("CAO_TERMINAL_ID", parent)
+    with patch.object(
+        mcp_server, "_send_message_impl", return_value={"success": True}
+    ) as original_send:
+        sent_before_restart = asyncio.run(
+            mcp_server.send_message(callback_turn, "effect-target", "effect payload")
+        )
+    assert sent_before_restart["success"] is True
+    original_send.assert_called_once()
+    claimed_lineage_effect = claim_workflow_effect(
+        parent, callback_turn, "assign", "claimed-lineage-effect"
+    )
+    assert claimed_lineage_effect is not None
 
     # Startup redelivery precedes the provider's one-use execution resume.
     assert requeue_unacknowledged_child_assignment_results() == 1
@@ -2691,9 +2704,19 @@ def test_f13_ready_reconnect_wakes_receipted_result_then_preserves_composer_fifo
             result.content_bytes,
         )
 
-    monkeypatch.setenv("CAO_TERMINAL_ID", parent)
     callback_successor_receipt = claim_or_resume_workflow_turn_receipt(parent, callback_successor)
     assert callback_successor_receipt["accepted"] is True
+    with patch.object(mcp_server, "_send_message_impl") as duplicate_send:
+        blocked_duplicate = asyncio.run(
+            mcp_server.send_message(callback_successor, "effect-target", "effect payload")
+        )
+    assert blocked_duplicate["success"] is False
+    assert blocked_duplicate["reason_code"] == "DUPLICATE_EFFECT"
+    duplicate_send.assert_not_called()
+    assert (
+        claim_workflow_effect(parent, callback_successor, "assign", "claimed-lineage-effect")
+        is None
+    )
     read = asyncio.run(mcp_server.read_delegation_result(callback_successor, notice.result_id))
     assert read["success"] is True
     acknowledged = asyncio.run(
@@ -2764,6 +2787,17 @@ def test_f13_ready_reconnect_wakes_receipted_result_then_preserves_composer_fifo
             .count()
             == 1
         )
+        successor_effects = {
+            effect.effect_kind: effect.state
+            for effect in db.query(WorkflowEffectModel).filter_by(
+                workflow_turn_id=callback_successor
+            )
+        }
+        assert successor_effects == {
+            "send_message": "completed",
+            "assign": "indeterminate",
+            "acknowledge_assignment": "completed",
+        }
 
 
 def test_f13_completion_fails_closed_on_claimed_composer_successor(workflow_db):

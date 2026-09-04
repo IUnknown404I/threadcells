@@ -31,6 +31,11 @@ export function WorkflowRecoveryNotice({
   const reasonKey = capability?.reason_code
     ? AUTHORITY_REASON_KEYS[capability.reason_code] || 'agents.queueRecovery.safeGate'
     : null
+  const recoveryKey: TranslationKey = capability?.eligible === true
+    ? 'agents.queueRecovery.ownerRecovery'
+    : capability?.eligible === false
+      ? 'agents.queueRecovery.automatic'
+      : 'agents.queueRecovery.checking'
 
   return <div data-testid={`workflow-queue-recovery-${agent.id}`} role="status" className="rounded-lg border border-blue-700/40 bg-blue-950/20 p-3 text-xs text-blue-100">
     <div className="flex items-start gap-2">
@@ -41,7 +46,7 @@ export function WorkflowRecoveryNotice({
           workflow: t('status.workflow.open'),
           count: queued,
         })}</p>
-        <p className="mt-1 text-blue-200/80">{t('agents.queueRecovery.automatic')}</p>
+        <p className="mt-1 text-blue-200/80">{t(recoveryKey)}</p>
         {capability?.eligible === false && reasonKey && (
           <p className="mt-1 text-blue-200/70">{t(reasonKey)}</p>
         )}

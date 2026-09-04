@@ -9460,6 +9460,37 @@ def claim_handoff_result_batch_for_inbox(
         }
 
 
+def _mirror_workflow_effect_ledger(
+    db: Any,
+    workflow_id: int,
+    source_turn_id: int,
+    target_turn_id: int,
+    now: datetime,
+) -> None:
+    """Fence a successor with the source execution's durable effect truth."""
+    prior_effects = (
+        db.query(WorkflowEffectModel)
+        .filter(
+            WorkflowEffectModel.workflow_id == workflow_id,
+            WorkflowEffectModel.workflow_turn_id == source_turn_id,
+        )
+        .all()
+    )
+    for prior in prior_effects:
+        db.add(
+            WorkflowEffectModel(
+                workflow_id=workflow_id,
+                workflow_turn_id=target_turn_id,
+                effect_kind=prior.effect_kind,
+                effect_key=prior.effect_key,
+                state=("indeterminate" if prior.state == "claimed" else prior.state),
+                claim_token=uuid.uuid4().hex,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+
 def claim_or_resume_workflow_turn_receipt(
     receiver_terminal_id: str,
     logical_turn_id: int,
@@ -9574,27 +9605,9 @@ def claim_or_resume_workflow_turn_receipt(
             # indeterminate operation cannot acquire a new capability merely
             # because execution resumed. Only proven pre-effect rejections
             # remain reclaimable.
-            prior_effects = (
-                db.query(WorkflowEffectModel)
-                .filter(
-                    WorkflowEffectModel.workflow_id == workflow.id,
-                    WorkflowEffectModel.workflow_turn_id == logical_turn_id,
-                )
-                .all()
+            _mirror_workflow_effect_ledger(
+                db, int(workflow.id), logical_turn_id, int(resumed.id), now
             )
-            for prior in prior_effects:
-                db.add(
-                    WorkflowEffectModel(
-                        workflow_id=workflow.id,
-                        workflow_turn_id=resumed.id,
-                        effect_kind=prior.effect_kind,
-                        effect_key=prior.effect_key,
-                        state=("indeterminate" if prior.state == "claimed" else prior.state),
-                        claim_token=uuid.uuid4().hex,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
 
             next_resume_token = secrets.token_urlsafe(32)
             db.add(
@@ -12254,6 +12267,18 @@ def reconcile_result_callbacks_superseded_by_resume(
             if active is None or resume_turn is None or int(active.id) < int(resume_turn.id):
                 continue
 
+            resume_ancestry = {int(resume_turn.id)}
+            ancestor = resume_turn
+            while ancestor.resume_parent_turn_id is not None:
+                parent_id = int(ancestor.resume_parent_turn_id)
+                if parent_id in resume_ancestry:
+                    break
+                parent = db.get(WorkflowTurnModel, parent_id)
+                if parent is None or parent.workflow_id != workflow.id:
+                    break
+                resume_ancestry.add(parent_id)
+                ancestor = parent
+
             # A restart can requeue an already-delivered result notice after
             # its original provider turn was receipted and finished.  If the
             # interrupted parent then resumes, that FINISHED transport is just
@@ -12477,6 +12502,22 @@ def reconcile_result_callbacks_superseded_by_resume(
                     db.add(successor)
                     db.flush()
                     turn.superseded_by_turn_id = successor.id
+                    if turn.state == TURN_FINISHED:
+                        # This is the same semantic callback execution after a
+                        # restart requeued its unacknowledged result. Preserve
+                        # every completed/indeterminate effect from its latest
+                        # uninterrupted resume descendant. A FINISHED callback
+                        # outside that chain still carries its own ledger.
+                        effect_source_turn_id = (
+                            int(resume_turn.id) if int(turn.id) in resume_ancestry else int(turn.id)
+                        )
+                        _mirror_workflow_effect_ledger(
+                            db,
+                            int(workflow.id),
+                            effect_source_turn_id,
+                            int(successor.id),
+                            now,
+                        )
                     for inbox, result, assignment in callback_pairs:
                         result.workflow_turn_id = successor.id
                         inbox.callback_reconciled_at = now

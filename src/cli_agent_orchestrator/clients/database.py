@@ -9957,6 +9957,8 @@ def _child_workflow_authority_descends_from_assignment(
     child_workflow: WorkflowModel,
     assignment_turn_id: int,
     child_terminal_id: str,
+    *,
+    authority_turn_id: Optional[int] = None,
 ) -> bool:
     """Prove the child's current authority is its bound input or admitted resume.
 
@@ -9966,10 +9968,14 @@ def _child_workflow_authority_descends_from_assignment(
     one-use resume-token transaction; an unrelated later child input therefore
     cannot borrow the assignment's result authority.
     """
-    active_turn_id = child_workflow.active_turn_id
-    if active_turn_id is None:
+    current_turn_id = (
+        authority_turn_id
+        if authority_turn_id is not None
+        else cast(Optional[int], child_workflow.active_turn_id)
+    )
+    if current_turn_id is None:
         return False
-    current = db.get(WorkflowTurnModel, cast(int, active_turn_id))
+    current = db.get(WorkflowTurnModel, cast(int, current_turn_id))
     visited: set[int] = set()
     while current is not None:
         current_id = cast(int, current.id)
@@ -12216,6 +12222,117 @@ def _restore_unreceipted_inbox_transport_for_replay(
     replay when their immutable authority is no longer exact.
     """
     if turn.inbox_message_id is None:
+        return True
+    if turn.kind in {"inbox_message", "handoff_recovery"}:
+        message = db.get(InboxModel, turn.inbox_message_id)
+        if (
+            message is None
+            or message.receiver_id != workflow.root_terminal_id
+            or message.message != turn.payload
+            or message.result_id is not None
+            or message.status not in (MessageStatus.PENDING.value, MessageStatus.DELIVERED.value)
+        ):
+            return False
+        if turn.kind == "inbox_message":
+            if (
+                message.kind != "message"
+                or turn.dedupe_key != f"inbox:{message.id}"
+                or message.superseded_at is not None
+            ):
+                return False
+        else:
+            if message.kind != "handoff_recovery_continuation":
+                return False
+            assignments = (
+                db.query(ChildAssignmentModel)
+                .filter(
+                    ChildAssignmentModel.parent_terminal_id == message.sender_id,
+                    ChildAssignmentModel.child_terminal_id == message.receiver_id,
+                    ChildAssignmentModel.status
+                    == ChildAssignmentStatus.HANDOFF_RECOVERY_AWAITING_RESULT.value,
+                )
+                .all()
+            )
+            if len(assignments) != 1:
+                return False
+            assignment = assignments[0]
+            prefix = f"handoff-recovery:{assignment.id}:"
+            if not turn.dedupe_key.startswith(prefix):
+                return False
+            try:
+                predecessor_id = int(turn.dedupe_key[len(prefix) :])
+            except (TypeError, ValueError):
+                return False
+            predecessor = db.get(WorkflowTurnModel, predecessor_id)
+            result = (
+                db.query(DelegationResultModel)
+                .filter_by(
+                    child_assignment_id=assignment.id,
+                    delegation_kind="handoff",
+                )
+                .one_or_none()
+            )
+            if (
+                predecessor is None
+                or predecessor.workflow_id != workflow.id
+                or predecessor.id >= turn.id
+                or predecessor.state not in {TURN_SENT, TURN_FINISHED}
+                or result is None
+                or result.status != DelegationResultStatus.AWAITING.value
+                or result.parent_terminal_id != assignment.parent_terminal_id
+                or result.child_terminal_id != assignment.child_terminal_id
+                or assignment.review_superseded_at is not None
+                or db.query(WorkflowTurnReceiptModel.id)
+                .filter_by(
+                    workflow_turn_id=predecessor.id,
+                    receiver_terminal_id=message.receiver_id,
+                )
+                .one_or_none()
+                is None
+            ):
+                return False
+            exact_fields = (
+                assignment.request_workflow_id,
+                assignment.request_workflow_turn_id,
+                assignment.request_workflow_effect_id,
+                assignment.child_workflow_id,
+                assignment.child_workflow_turn_id,
+            )
+            if any(value is not None for value in exact_fields):
+                if any(value is None for value in exact_fields):
+                    return False
+                request_workflow = db.get(WorkflowModel, cast(int, assignment.request_workflow_id))
+                request_effect = db.get(
+                    WorkflowEffectModel,
+                    cast(int, assignment.request_workflow_effect_id),
+                )
+                if (
+                    request_workflow is None
+                    or request_workflow.root_terminal_id != message.sender_id
+                    or result.parent_workflow_id != request_workflow.id
+                    or assignment.child_workflow_id != workflow.id
+                    or request_effect is None
+                    or request_effect.workflow_id != request_workflow.id
+                    or request_effect.workflow_turn_id != assignment.request_workflow_turn_id
+                    or request_effect.effect_kind != "handoff"
+                    or request_effect.state not in {"claimed", "completed", "indeterminate"}
+                    or db.query(WorkflowTurnReceiptModel.id)
+                    .filter_by(
+                        workflow_turn_id=assignment.request_workflow_turn_id,
+                        receiver_terminal_id=message.sender_id,
+                    )
+                    .one_or_none()
+                    is None
+                    or not _child_workflow_authority_descends_from_assignment(
+                        db,
+                        workflow,
+                        cast(int, assignment.child_workflow_turn_id),
+                        cast(str, message.receiver_id),
+                        authority_turn_id=predecessor_id,
+                    )
+                ):
+                    return False
+        message.status = MessageStatus.PENDING.value
         return True
     members = _validated_result_callback_transport(
         db,

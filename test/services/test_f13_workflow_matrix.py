@@ -76,6 +76,7 @@ from cli_agent_orchestrator.clients.database import (
     requeue_unadmitted_workflow_turns_for_restart,
     requeue_workflow_turn,
     resolve_workflow_input_binding,
+    schedule_managed_handoff_continuation,
     set_workflow_terminal_state,
     start_workflow_input,
     submit_handoff_result_v1,
@@ -2900,6 +2901,83 @@ def test_f13_settled_unreceipted_callback_owner_gates_when_result_replay_is_unsa
         assert workflow.terminal_reason == database.UNRECEIPTED_INBOX_REPLAY_GUARD_REASON
         assert turn.state == "sent"
         assert turn.queue_reason == "UNRECEIPTED_INBOX_REPLAY_UNSAFE"
+
+
+def test_f13_settled_unreceipted_ordinary_inbox_restores_same_transport(workflow_db):
+    root = "root-unreceipted-ordinary-inbox"
+    _ensure_running_test_terminal(root)
+    inbox, turn_id = _pending_inbox_turn(root, "ordinary durable Inbox input")
+    assert activate_workflow_turn_for_inbox(inbox.id) == turn_id
+    claim = claim_workflow_turn(root, inbox_message_id=inbox.id)
+    assert claim is not None
+    assert mark_workflow_turn_sent(turn_id, claim["claim_token"], claim["claim_generation"])
+    assert database.update_pending_message_status(inbox.id, database.MessageStatus.DELIVERED)
+    assert database.acquire_provider_execution(root, turn_id, 3)
+    assert database.release_provider_execution(root, turn_id)
+
+    assert database.requeue_settled_unadmitted_workflow_turn(root, turn_id)
+    with database.SessionLocal() as db:
+        assert db.get(InboxModel, inbox.id).status == "pending"
+        turn = db.get(WorkflowTurnModel, turn_id)
+        assert turn.state == "queued"
+        assert turn.queue_reason == "PROVIDER_SETTLED_BEFORE_RECEIPT"
+
+
+@pytest.mark.parametrize("exact_authority", (False, True))
+def test_f13_settled_unreceipted_handoff_recovery_restores_same_transport(
+    workflow_db,
+    exact_authority,
+):
+    parent = f"root-unreceipted-handoff-recovery-{exact_authority}"
+    child = f"child-unreceipted-handoff-recovery-{exact_authority}"
+    parent_turn = _start_admitted_input(parent)
+    if exact_authority:
+        request_effect = claim_workflow_effect(parent, parent_turn, "handoff", child)
+        assert request_effect is not None
+        assert register_handoff_child(
+            parent,
+            child,
+            workflow_turn_id=parent_turn,
+            workflow_effect_id=request_effect["id"],
+            request_message="continue the managed handoff",
+        )
+        _ensure_running_test_terminal(child)
+        child_binding = issue_workflow_input_binding(child)
+        assert child_binding is not None
+        child_turn = resolve_workflow_input_binding(child, child_binding)
+        assert child_turn is not None
+        assert bind_child_assignment_input_turn(child, child_binding)
+        assert claim_workflow_turn_receipt(child, child_turn)
+    else:
+        assert register_handoff_child(parent, child)
+        child_turn = _start_admitted_input(child)
+
+    scheduled = schedule_managed_handoff_continuation(
+        parent,
+        child,
+        "continue the exact managed handoff",
+    )
+    assert scheduled["accepted"] is True
+    inbox = scheduled["message"]
+    turn_id = scheduled["turn_id"]
+    assert activate_workflow_turn_for_inbox(inbox.id) == turn_id
+    claim = claim_workflow_turn(child, inbox_message_id=inbox.id)
+    assert claim is not None
+    assert mark_workflow_turn_sent(turn_id, claim["claim_token"], claim["claim_generation"])
+    assert database.update_pending_message_status(inbox.id, database.MessageStatus.DELIVERED)
+    assert database.acquire_provider_execution(child, turn_id, 3)
+    assert database.release_provider_execution(child, turn_id)
+
+    assert database.requeue_settled_unadmitted_workflow_turn(child, turn_id)
+    with database.SessionLocal() as db:
+        assert db.get(InboxModel, inbox.id).status == "pending"
+        turn = db.get(WorkflowTurnModel, turn_id)
+        assert turn.state == "queued"
+        assert turn.queue_reason == "PROVIDER_SETTLED_BEFORE_RECEIPT"
+        assignment = (
+            db.query(database.ChildAssignmentModel).filter_by(child_terminal_id=child).one()
+        )
+        assert assignment.status == "handoff_recovery_awaiting_result"
 
 
 def test_f13_settled_unreceipted_handoff_batch_restores_every_sealed_member(workflow_db):

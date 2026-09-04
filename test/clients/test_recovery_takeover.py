@@ -367,6 +367,18 @@ def test_processing_and_genuine_owner_gate_fail_closed(takeover_db):
     )
 
 
+def test_historical_owner_gate_does_not_mask_current_open_workflow(takeover_db):
+    sessions, _worktree = takeover_db
+    with sessions() as db:
+        db.add(database.WorkflowModel(root_terminal_id=OLD_ID, status="owner_gate"))
+        db.add(database.WorkflowModel(root_terminal_id=OLD_ID, status="open"))
+        db.commit()
+
+    eligibility = database.recovery_takeover_durable_eligibility(OLD_ID)
+    assert eligibility["eligible"] is True
+    assert eligibility["reason_code"] is None
+
+
 def test_claimed_privileged_effect_blocks_takeover(takeover_db):
     sessions, _worktree = takeover_db
     with sessions() as db:

@@ -312,6 +312,66 @@ def test_home_lifecycle_counts_and_filters_are_mutually_truthful(monkeypatch):
     assert [item["id"] for item in completed["items"]] == ["completed"]
 
 
+def test_open_workflow_projects_queued_composer_count(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 4, 6, 0, 0)
+    with database.SessionLocal() as db:
+        db.add(
+            TerminalModel(
+                id="queued-composer",
+                tmux_session="cao-queued-composer",
+                session_id="lifetime-queued-composer",
+                tmux_window="conductor",
+                provider="codex",
+                runtime_lifecycle="running",
+                last_active=now,
+            )
+        )
+        workflow = WorkflowModel(
+            root_terminal_id="queued-composer",
+            status="open",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(workflow)
+        db.flush()
+        active = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="execution_resume",
+            dedupe_key="active-resume",
+            state="sent",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(active)
+        db.flush()
+        workflow.active_turn_id = active.id
+        db.add(
+            WorkflowTurnReceiptModel(
+                workflow_turn_id=active.id,
+                receiver_terminal_id="queued-composer",
+            )
+        )
+        for index in range(2):
+            db.add(
+                WorkflowTurnModel(
+                    workflow_id=workflow.id,
+                    kind="external_input",
+                    dedupe_key=f"external_request:queued-{index}",
+                    payload=f"queued payload {index}",
+                    state="queued",
+                    created_at=now + timedelta(seconds=index + 1),
+                    updated_at=now + timedelta(seconds=index + 1),
+                )
+            )
+        db.commit()
+
+    item = ui_read_model_service.list_agent_summaries(limit=10)["items"][0]
+    assert item["workflow_status"] == "open"
+    assert item["queued_task_count"] == 2
+    assert item["activity"] == "processing"
+
+
 def test_execution_wait_labels_and_owner_reason_are_exact_durable_mappings(monkeypatch):
     _install_database(monkeypatch)
     now = datetime(2026, 8, 21, 8, 0, 0)

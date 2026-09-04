@@ -22,6 +22,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    and_,
     create_engine,
     func,
     inspect,
@@ -4292,12 +4293,19 @@ WITH selected_terminals AS MATERIALIZED (
         + (selected_where.replace(" WHERE ", " AND ", 1) if selected_where else "")
         + """
 ), workflow_ranked AS (
-    SELECT w.root_terminal_id, w.status, w.terminal_reason, w.active_turn_id,
+    SELECT w.id, w.root_terminal_id, w.status, w.terminal_reason, w.active_turn_id,
            ROW_NUMBER() OVER (PARTITION BY w.root_terminal_id ORDER BY w.id DESC) AS rank
     FROM workflows w JOIN selected_terminals st ON st.id = w.root_terminal_id
 ), latest_workflow AS (
-    SELECT root_terminal_id, status, terminal_reason, active_turn_id
+    SELECT id, root_terminal_id, status, terminal_reason, active_turn_id
     FROM workflow_ranked WHERE rank = 1
+), queued_tasks AS (
+    SELECT w.root_terminal_id, COUNT(*) AS queued_task_count
+    FROM latest_workflow w
+    JOIN workflow_turns wt ON wt.workflow_id = w.id
+    WHERE w.status = 'open' AND wt.kind = 'external_input'
+      AND wt.state = 'queued' AND wt.superseded_by_turn_id IS NULL
+    GROUP BY w.root_terminal_id
 ), assignment_relations AS (
     SELECT ca.id AS assignment_id, ca.parent_terminal_id AS terminal_id,
            0 AS is_child, ca.status, ca.updated_at
@@ -4445,6 +4453,7 @@ WITH selected_terminals AS MATERIALIZED (
              ELSE COALESCE(br.relation_state, CASE WHEN lw.status = 'open' THEN 'active' END)
            END AS workflow_state,
            lw.status AS workflow_status, lw.terminal_reason AS workflow_reason,
+           COALESCE(qt.queued_task_count, 0) AS queued_task_count,
            awt.provider_outcome_code, awt.provider_outcome_detail,
            lr.status AS assignment_status,
            lr.result_status, lr.status AS delivery_status,
@@ -4459,6 +4468,7 @@ WITH selected_terminals AS MATERIALIZED (
     LEFT JOIN workflow_turns awt ON awt.id = lw.active_turn_id
     LEFT JOIN workflow_turn_receipts awr
            ON awr.workflow_turn_id = awt.id AND awr.receiver_terminal_id = t.id
+    LEFT JOIN queued_tasks qt ON qt.root_terminal_id = t.id
     LEFT JOIN latest_relations lr ON lr.terminal_id = t.id AND lr.latest_rank = 1
     LEFT JOIN best_relations br ON br.terminal_id = t.id AND br.state_rank = 1
     LEFT JOIN provider_execution_leases pel ON pel.terminal_id = t.id
@@ -6364,6 +6374,12 @@ def recovery_takeover_durable_eligibility(
     _ensure_workflow_schema()
     with SessionLocal() as db:
         terminal = db.get(TerminalModel, old_terminal_id)
+        current_workflow = (
+            db.query(WorkflowModel)
+            .filter(WorkflowModel.root_terminal_id == old_terminal_id)
+            .order_by(WorkflowModel.id.desc())
+            .first()
+        )
         reason = None
         if terminal is None:
             reason = "RECOVERY_TARGET_NOT_FOUND"
@@ -6403,15 +6419,7 @@ def recovery_takeover_durable_eligibility(
             reason = "RECOVERY_RUNTIME_OPERATION_ACTIVE"
         elif db.get(ProviderExecutionLeaseModel, old_terminal_id) is not None:
             reason = "RECOVERY_PROVIDER_EXECUTION_ACTIVE"
-        elif (
-            db.query(WorkflowModel.id)
-            .filter(
-                WorkflowModel.root_terminal_id == old_terminal_id,
-                WorkflowModel.status == WORKFLOW_OWNER_GATE,
-            )
-            .first()
-            is not None
-        ):
+        elif current_workflow is not None and current_workflow.status == WORKFLOW_OWNER_GATE:
             reason = "RECOVERY_GENUINE_OWNER_GATE"
         elif (
             db.query(WorkflowEffectModel.id)
@@ -8010,9 +8018,15 @@ def _prepare_workflow_input(
                         effective_turn = existing
                         break
                     successor = db.get(WorkflowTurnModel, successor_id)
+                    successor_workflow = (
+                        db.get(WorkflowModel, cast(int, successor.workflow_id))
+                        if successor is not None
+                        else None
+                    )
                     if (
                         successor is None
-                        or successor.workflow_id != existing.workflow_id
+                        or successor_workflow is None
+                        or successor_workflow.root_terminal_id != root_terminal_id
                         or successor.kind != existing.kind
                         or successor.payload != existing.payload
                         or not str(successor.dedupe_key).startswith("resume-reconciled:")
@@ -8027,7 +8041,7 @@ def _prepare_workflow_input(
                         "accepted": False,
                         "reason_code": "WORKFLOW_INPUT_NO_LONGER_EXECUTABLE",
                     }
-                existing_workflow = db.get(WorkflowModel, cast(int, existing.workflow_id))
+                existing_workflow = db.get(WorkflowModel, cast(int, effective_turn.workflow_id))
                 if existing_workflow is not None:
                     # A retry of the stable request can arrive before the
                     # background queue's first recovery tick. Reopen the exact
@@ -8671,7 +8685,7 @@ def reconcile_owner_gated_workflow_successors(now: Optional[datetime] = None) ->
     return reopened
 
 
-def get_terminal_workflow_projection(terminal_id: str) -> Dict[str, Optional[str]]:
+def get_terminal_workflow_projection(terminal_id: str) -> Dict[str, Any]:
     """Project durable workflow/result truth for one terminal's primary UI state.
 
     Provider process state is deliberately absent here. The projection is a
@@ -8805,10 +8819,23 @@ def get_terminal_workflow_projection(terminal_id: str) -> Dict[str, Optional[str
 
         assignment_status = assignment.status if assignment is not None else None
         result_status = result.status if result is not None else None
+        queued_task_count = (
+            db.query(WorkflowTurnModel.id)
+            .filter(
+                WorkflowTurnModel.workflow_id == workflow.id,
+                WorkflowTurnModel.kind == "external_input",
+                WorkflowTurnModel.state == TURN_QUEUED,
+                WorkflowTurnModel.superseded_by_turn_id.is_(None),
+            )
+            .count()
+            if workflow is not None and workflow.status == WORKFLOW_OPEN
+            else 0
+        )
         return {
             "state": state,
             "workflow_status": raw_workflow,
             "workflow_reason": owner_reason,
+            "queued_task_count": queued_task_count,
             "provider_outcome_code": provider_outcome_code,
             "provider_outcome_detail": provider_outcome_detail,
             "assignment_status": assignment_status,
@@ -10911,12 +10938,41 @@ def complete_workflow_provider_reconnect(
         # ``open_final`` turns, by contrast, need their queued successor
         # promoted once the replacement runtime is ready.
         queued_result_transport = turn.state == TURN_QUEUED and turn.kind == "handoff_result"
+        stale_requeued_result_transport = (
+            db.query(InboxModel.id)
+            .join(
+                DelegationResultModel,
+                DelegationResultModel.id == InboxModel.result_id,
+            )
+            .join(
+                WorkflowTurnModel,
+                WorkflowTurnModel.id == DelegationResultModel.workflow_turn_id,
+            )
+            .filter(
+                InboxModel.receiver_id == root_terminal_id,
+                InboxModel.kind == "delegation_result_notice",
+                InboxModel.status == MessageStatus.PENDING.value,
+                WorkflowTurnModel.workflow_id == workflow.id,
+                WorkflowTurnModel.id < turn.id,
+                WorkflowTurnModel.state == TURN_FINISHED,
+                WorkflowTurnModel.kind.in_(("assigned_result", "handoff_result")),
+                WorkflowTurnModel.superseded_by_turn_id.is_(None),
+                db.query(WorkflowTurnReceiptModel.id)
+                .filter(
+                    WorkflowTurnReceiptModel.workflow_turn_id == WorkflowTurnModel.id,
+                    WorkflowTurnReceiptModel.receiver_terminal_id == root_terminal_id,
+                )
+                .exists(),
+            )
+            .first()
+            is not None
+        )
         successor = None
         if queued_result_transport:
             turn.not_before = None
             turn.queue_reason = "WORKFLOW_CONTINUATION_PENDING"
             turn.updated_at = now
-        else:
+        elif not stale_requeued_result_transport:
             successor = (
                 db.query(WorkflowTurnModel)
                 .filter(
@@ -10931,6 +10987,11 @@ def complete_workflow_provider_reconnect(
                 .order_by(WorkflowTurnModel.created_at.asc(), WorkflowTurnModel.id.asc())
                 .first()
             )
+        # A restart-requeued Inbox result can retain a FINISHED, receipted
+        # transport older than this resumed turn.  Do not promote a later
+        # Composer row ahead of it merely because the replacement runtime is
+        # Ready.  The next ordinary queue tick rematerializes that callback
+        # and the queued suffix under one monotonic successor generation.
         if successor is not None:
             if turn.kind == "open_final" and turn.state in (TURN_QUEUED, TURN_CLAIMED):
                 turn.state = TURN_CANCELLED
@@ -12193,18 +12254,61 @@ def reconcile_result_callbacks_superseded_by_resume(
             if active is None or resume_turn is None or int(active.id) < int(resume_turn.id):
                 continue
 
+            # A restart can requeue an already-delivered result notice after
+            # its original provider turn was receipted and finished.  If the
+            # interrupted parent then resumes, that FINISHED transport is just
+            # as stale as an older QUEUED callback: the Inbox row is again the
+            # durable at-least-once authority, but monotonic activation must not
+            # move the workflow back behind the admitted resume turn.
+            #
+            # Include only FINISHED result transports which still own a pending
+            # immutable-result notice.  Receipted ordinary turns, acknowledged
+            # callbacks, and already-reconciled transports remain historical.
+            pending_result_transport = (
+                db.query(InboxModel.id)
+                .join(
+                    DelegationResultModel,
+                    DelegationResultModel.id == InboxModel.result_id,
+                )
+                .filter(
+                    InboxModel.receiver_id == workflow.root_terminal_id,
+                    InboxModel.kind == "delegation_result_notice",
+                    InboxModel.status == MessageStatus.PENDING.value,
+                    or_(
+                        InboxModel.id == WorkflowTurnModel.inbox_message_id,
+                        DelegationResultModel.workflow_turn_id == WorkflowTurnModel.id,
+                    ),
+                )
+                .exists()
+            )
+            receiver_receipt = (
+                db.query(WorkflowTurnReceiptModel.id)
+                .filter(
+                    WorkflowTurnReceiptModel.workflow_turn_id == WorkflowTurnModel.id,
+                    WorkflowTurnReceiptModel.receiver_terminal_id == workflow.root_terminal_id,
+                )
+                .exists()
+            )
             queued = (
                 db.query(WorkflowTurnModel)
                 .filter(
                     WorkflowTurnModel.workflow_id == workflow.id,
                     WorkflowTurnModel.id != active.id,
-                    WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
-                    ~db.query(WorkflowTurnReceiptModel.id)
-                    .filter(
-                        WorkflowTurnReceiptModel.workflow_turn_id == WorkflowTurnModel.id,
-                        WorkflowTurnReceiptModel.receiver_terminal_id == workflow.root_terminal_id,
-                    )
-                    .exists(),
+                    or_(
+                        and_(
+                            WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+                            ~receiver_receipt,
+                        ),
+                        and_(
+                            WorkflowTurnModel.id < resume_turn.id,
+                            WorkflowTurnModel.state == TURN_FINISHED,
+                            WorkflowTurnModel.kind.in_(("assigned_result", "handoff_result")),
+                            WorkflowTurnModel.superseded_by_turn_id.is_(None),
+                            WorkflowTurnModel.superseded_at.is_(None),
+                            pending_result_transport,
+                            receiver_receipt,
+                        ),
+                    ),
                 )
                 .order_by(WorkflowTurnModel.created_at.asc(), WorkflowTurnModel.id.asc())
                 .all()
@@ -12396,14 +12500,20 @@ def reconcile_result_callbacks_superseded_by_resume(
                             assignment.status = ChildAssignmentStatus.RESULT_QUEUED.value
                         assignment.updated_at = now
 
-                turn.state = TURN_CANCELLED
-                turn.claim_token = None
-                turn.claim_expires_at = None
+                was_finished_transport = turn.state == TURN_FINISHED
+                if not was_finished_transport:
+                    turn.state = TURN_CANCELLED
+                    turn.claim_token = None
+                    turn.claim_expires_at = None
                 turn.superseded_at = now
                 turn.queue_reason = (
-                    "RESULT_CALLBACK_SUPERSEDED_BY_RESUME"
-                    if turn.kind in {"assigned_result", "handoff_result"}
-                    else "WORKFLOW_TURN_SUPERSEDED_BY_RESUME"
+                    "RESULT_CALLBACK_REQUEUED_AFTER_RESUME"
+                    if was_finished_transport
+                    else (
+                        "RESULT_CALLBACK_SUPERSEDED_BY_RESUME"
+                        if turn.kind in {"assigned_result", "handoff_result"}
+                        else "WORKFLOW_TURN_SUPERSEDED_BY_RESUME"
+                    )
                 )
                 turn.updated_at = now
                 changed += 1
@@ -12544,11 +12654,13 @@ def set_workflow_terminal_state(
     reason: Optional[str] = None,
     require_no_active_children: bool = False,
 ) -> bool:
-    """Explicitly end a workflow and suppress every unsent durable wake.
+    """Explicitly end one workflow while preserving accepted future missions.
 
-    Normal completion may opt into the active-child guard. Explicit owner
-    gates and lifecycle cancellation intentionally remain able to fence live
-    children, because those paths carry an explicit decision to stop work.
+    Normal completion carries pristine queued Composer turns into one successor
+    workflow in the same transaction. It may opt into the active-child guard.
+    Explicit owner gates and lifecycle cancellation intentionally remain able
+    to fence live children and every queued turn, because those paths carry an
+    explicit decision to stop work.
     """
     if status not in {WORKFLOW_TERMINAL, WORKFLOW_OWNER_GATE, WORKFLOW_CANCELLED}:
         raise ValueError(f"Invalid terminal workflow state: {status}")
@@ -12586,29 +12698,93 @@ def set_workflow_terminal_state(
             )
             if active_children:
                 return False
+        queued_external_inputs: list[WorkflowTurnModel] = []
+        if status == WORKFLOW_TERMINAL:
+            # Composer requests accepted while this workflow was still active
+            # are durable future missions, not work which semantic completion
+            # may silently discard.  Move only pristine QUEUED external turns;
+            # a concurrent claim is an unsafe transport boundary and keeps the
+            # completion retryable instead of being cancelled or rebound.
+            claimed_external = (
+                db.query(WorkflowTurnModel.id)
+                .filter(
+                    WorkflowTurnModel.workflow_id == workflow.id,
+                    WorkflowTurnModel.kind == "external_input",
+                    WorkflowTurnModel.inbox_message_id.is_(None),
+                    WorkflowTurnModel.state == TURN_CLAIMED,
+                )
+                .first()
+            )
+            if claimed_external is not None:
+                db.rollback()
+                return False
+            queued_external_inputs = (
+                db.query(WorkflowTurnModel)
+                .filter(
+                    WorkflowTurnModel.workflow_id == workflow.id,
+                    WorkflowTurnModel.kind == "external_input",
+                    WorkflowTurnModel.inbox_message_id.is_(None),
+                    WorkflowTurnModel.state == TURN_QUEUED,
+                    WorkflowTurnModel.claim_token.is_(None),
+                    WorkflowTurnModel.superseded_by_turn_id.is_(None),
+                    WorkflowTurnModel.superseded_at.is_(None),
+                    ~db.query(WorkflowTurnReceiptModel.id)
+                    .filter(
+                        WorkflowTurnReceiptModel.workflow_turn_id == WorkflowTurnModel.id,
+                        WorkflowTurnReceiptModel.receiver_terminal_id == root_terminal_id,
+                    )
+                    .exists(),
+                )
+                .order_by(WorkflowTurnModel.created_at.asc(), WorkflowTurnModel.id.asc())
+                .all()
+            )
         workflow.status = status
         workflow.terminal_reason = reason
         workflow.updated_at = now
-        (
-            db.query(WorkflowTurnModel)
-            .filter(
-                WorkflowTurnModel.workflow_id == workflow.id,
-                WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+        turns_to_cancel = db.query(WorkflowTurnModel).filter(
+            WorkflowTurnModel.workflow_id == workflow.id,
+            WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+        )
+        if queued_external_inputs:
+            turns_to_cancel = turns_to_cancel.filter(
+                WorkflowTurnModel.id.notin_(
+                    [int(queued_turn.id) for queued_turn in queued_external_inputs]
+                )
             )
-            .update(
-                {
-                    WorkflowTurnModel.state: TURN_CANCELLED,
-                    WorkflowTurnModel.claim_token: None,
-                    WorkflowTurnModel.claim_expires_at: None,
-                },
-                synchronize_session=False,
-            )
+        turns_to_cancel.update(
+            {
+                WorkflowTurnModel.state: TURN_CANCELLED,
+                WorkflowTurnModel.claim_token: None,
+                WorkflowTurnModel.claim_expires_at: None,
+            },
+            synchronize_session=False,
         )
         _fail_closed_workflow_inbox_transports_in_transaction(db, workflow_id=int(workflow.id))
         # State transition and callback fence share this transaction: no late
         # child result can observe a terminal workflow while retaining a live
         # assignment edge that would wake it again.
         _cancel_parent_assignments(db, root_terminal_id, now)
+        if queued_external_inputs:
+            # Create the successor only after old-workflow callback cleanup.
+            # Otherwise assignment cancellation would resolve the newest OPEN
+            # workflow and incorrectly bind old-mission result history to the
+            # preserved Composer mission.
+            successor_workflow = WorkflowModel(
+                root_terminal_id=root_terminal_id,
+                status=WORKFLOW_OPEN,
+                no_progress_count=0,
+                active_turn_id=queued_external_inputs[0].id,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(successor_workflow)
+            db.flush()
+            for queued_turn in queued_external_inputs:
+                queued_turn.workflow_id = successor_workflow.id
+                queued_turn.not_before = None
+                queued_turn.queue_reason = "WORKFLOW_CONTINUATION_PENDING"
+                queued_turn.updated_at = now
+            db.flush()
         # Semantic completion fences every successor acquisition through the
         # OPEN-workflow predicate, but it is not evidence that the provider
         # invocation which called this function has returned.  Retain the

@@ -17,6 +17,7 @@ import { AgentViewControls, type AgentViewLayout } from './AgentViewControls'
 import { useI18n, type TranslationKey } from '../i18n'
 import { ProviderOutcomeNotice } from './ProviderOutcomeNotice'
 import { RecoveryTakeoverAction } from './RecoveryTakeoverAction'
+import { WorkflowRecoveryNotice } from './WorkflowRecoveryNotice'
 import { useRecoveryTakeoverCapabilities } from '../recoveryCapabilities'
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })))
@@ -489,6 +490,7 @@ export function AgentPanel({
         </div>
       </div>
       <ProviderOutcomeNotice code={terminal.provider_outcome_code} />
+      <WorkflowRecoveryNotice agent={terminal} capability={recoveryCapabilities[terminal.id]} />
       {terminal.launch_worktree && <div className="flex items-center gap-1.5" title={terminal.launch_worktree}><FolderOpen size={12} className="text-gray-600 shrink-0" /><span className="text-xs text-gray-500">{t(terminal.workspace_classification === 'managed_isolated' ? 'agents.isolatedWorkspace' : 'agents.legacyWorkspace')} ·</span><span className="text-xs font-mono text-gray-500 truncate max-w-[400px]">{terminal.launch_worktree}</span></div>}
       {terminal.writable_work_context_id && <div className="text-xs text-gray-600 font-mono truncate" title={`${terminal.writable_work_context_id}${terminal.writer_authority_generation ? ` · ${terminal.writer_authority_generation}` : ''}`}>{t('agents.writerAuthority')} · {terminal.writable_work_context_id.slice(0, 12)}{terminal.writer_authority_generation ? ` · ${terminal.writer_authority_generation.slice(0, 12)}` : ''}</div>}
       <button onClick={() => openTerminal(terminal.id, terminal.provider, terminal.agent_profile)} className="text-xs text-gray-500 hover:text-gray-300 transition-colors">{t('agents.openComposer')}</button>

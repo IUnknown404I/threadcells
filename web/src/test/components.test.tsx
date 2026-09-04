@@ -7,8 +7,51 @@ import { ConfirmModal } from '../components/ConfirmModal'
 import { resultLifecycleLabel, reviewAuthorityKey, OwnerMessageBody } from '../components/InboxPanel'
 import { InboxPanel } from '../components/InboxPanel'
 import { OutputViewer } from '../components/OutputViewer'
+import { WorkflowRecoveryNotice } from '../components/WorkflowRecoveryNotice'
 import { api } from '../api'
 import { APP_LOCALE_STORAGE_KEY, I18nProvider } from '../i18n'
+
+describe('WorkflowRecoveryNotice', () => {
+  it('explains automatic durable queue recovery without offering a resend', () => {
+    render(<WorkflowRecoveryNotice
+      agent={{
+        id: 'queued-owner',
+        activity: 'processing',
+        execution_state: 'processing',
+        lifecycle: 'running',
+        workflow_state: 'result_ready',
+        workflow_status: 'open',
+        queued_task_count: 2,
+      } as never}
+      capability={{
+        terminal_id: 'queued-owner',
+        eligible: false,
+        reason_code: 'RECOVERY_HEALTHY_RUNTIME_ACTIVE',
+      }}
+    />)
+
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Agent: Processing · Workflow: Open · Queued tasks: 2',
+    )
+    expect(screen.getByText(/resuming this durable work automatically/i)).toBeInTheDocument()
+    expect(screen.getByText(/manual takeover is unavailable/i)).toBeInTheDocument()
+  })
+
+  it('stays hidden without an open durable Composer queue', () => {
+    const { container } = render(<WorkflowRecoveryNotice
+      agent={{
+        id: 'ready-owner',
+        activity: 'ready',
+        execution_state: 'ready',
+        lifecycle: 'running',
+        workflow_state: 'active',
+        workflow_status: 'open',
+        queued_task_count: 0,
+      } as never}
+    />)
+    expect(container).toBeEmptyDOMElement()
+  })
+})
 
 describe('StatusBadge', () => {
   it('renders idle status', () => {

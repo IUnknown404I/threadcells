@@ -1062,6 +1062,62 @@ def execute_plan(
                         )
                         report.executed.append(candidate.canonical_identity)
                     continue
+                if candidate.resource_kind == "session_workspace":
+                    from cli_agent_orchestrator.services.operations_service import (
+                        context_lifecycle_fence,
+                    )
+                    from cli_agent_orchestrator.services.workspace_retirement_service import (
+                        retire_session_workspace,
+                        revalidate_session_workspace_candidate,
+                    )
+
+                    fence = (
+                        nullcontext(True)
+                        if lifecycle_fence_held
+                        else context_lifecycle_fence(config, nonblocking=True)
+                    )
+                    with fence as acquired:
+                        if not acquired:
+                            report.skipped.append(
+                                {
+                                    "candidate": candidate.canonical_identity,
+                                    "reason_code": "WORKTREE_LIFECYCLE_BUSY",
+                                }
+                            )
+                            continue
+                        current = revalidate_session_workspace_candidate(candidate)
+                        if current is None:
+                            report.skipped.append(
+                                {
+                                    "candidate": candidate.canonical_identity,
+                                    "reason_code": "CANDIDATE_NO_LONGER_ELIGIBLE",
+                                }
+                            )
+                            continue
+                        if current.action != "retire" or current.protection_reason:
+                            report.skipped.append(
+                                {
+                                    "candidate": candidate.canonical_identity,
+                                    "reason_code": current.protection_reason
+                                    or "CANDIDATE_NO_LONGER_ELIGIBLE",
+                                }
+                            )
+                            continue
+                        if (
+                            dict(candidate.attributes).get("allow_dirty") != "true"
+                            and current.fingerprint != candidate.fingerprint
+                        ):
+                            raise RuntimeError("candidate fingerprint changed")
+                        reclaimed = retire_session_workspace(candidate)
+                        report.freed_bytes += reclaimed
+                        report.reclaimed_bytes_by_class[candidate.category] = (
+                            report.reclaimed_bytes_by_class.get(candidate.category, 0) + reclaimed
+                        )
+                        report.executed_count_by_class[candidate.category] = (
+                            report.executed_count_by_class.get(candidate.category, 0) + 1
+                        )
+                        report.executed.append(candidate.canonical_identity)
+                    continue
                 if candidate.resource_kind == "git_worktree":
                     from cli_agent_orchestrator.services.operations_service import (
                         context_lifecycle_fence,

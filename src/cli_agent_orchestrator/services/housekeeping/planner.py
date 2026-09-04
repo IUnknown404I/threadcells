@@ -1800,6 +1800,19 @@ def build_plan(
         full_cleanup=full_cleanup,
     )
     candidates.extend(runtime_candidates)
+    try:
+        from cli_agent_orchestrator.services.workspace_retirement_service import (
+            plan_session_workspaces,
+        )
+
+        candidates.extend(
+            plan_session_workspaces(
+                allow_dirty=bool(config.get("_retire_dirty_session_workspaces", False))
+            )
+        )
+    except Exception:
+        # Missing or uncertain durable authority can never turn into deletion.
+        runtime_warnings.append("session_workspace_inventory_failed")
     if mode in {"weekly", "pressure", "full"}:
         from .worktrees import plan_worktrees
 
@@ -1849,7 +1862,8 @@ def build_plan(
             specialized_paths = {
                 Path(item.path)
                 for item in candidates
-                if item.resource_kind in {"git_worktree", "package_cache", "reproducible_cache"}
+                if item.resource_kind
+                in {"git_worktree", "session_workspace", "package_cache", "reproducible_cache"}
                 or item.category == "browser_cache"
             }
             artifacts, artifact_warnings = _plan_full_cleanup_artifacts(

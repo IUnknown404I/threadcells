@@ -3199,7 +3199,7 @@ def prepare_terminal_for_destruction(terminal_id: str) -> None:
         raise RuntimeError(f"Could not persist durable result snapshot for {terminal_id}")
 
 
-def cleanup_managed_worktree(metadata: Dict) -> None:
+def cleanup_managed_worktree(metadata: Dict, *, allow_dirty: bool = False) -> None:
     """Remove a clean managed worktree or retain all authority fail-closed."""
     if not metadata.get("managed_worktree_kind"):
         return
@@ -3207,7 +3207,7 @@ def cleanup_managed_worktree(metadata: Dict) -> None:
         remove_managed_worktree,
     )
 
-    cleanup = remove_managed_worktree(metadata)
+    cleanup = remove_managed_worktree(metadata, allow_dirty=allow_dirty)
     if not cleanup.get("removed"):
         raise ManagedWorktreeCleanupError(cleanup.get("reason_code", "MANAGED_WORKTREE_UNVERIFIED"))
 

@@ -71,6 +71,7 @@ def execute_via_privileged_helper(
     session_token: str | None = None,
     bearer_secret: str | None = None,
     config: Mapping[str, Any] | None = None,
+    retire_dirty_worktrees: bool = False,
 ) -> Any:
     """Execute the release subplan through the root one-shot; never fall back."""
     if confirmed is not True:
@@ -87,6 +88,7 @@ def execute_via_privileged_helper(
         "operation": "full_cleanup",
         "expected_plan_id": expected_plan_id,
         "confirmed": True,
+        "retire_dirty_worktrees": retire_dirty_worktrees,
     }
     if session_token is not None:
         request["operator_session_token"] = session_token
@@ -277,12 +279,13 @@ def _handle_request(connection: socket.socket) -> dict[str, Any]:
         request = json.loads(raw.decode("utf-8", "strict"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise FullCleanupHelperError("FULL_CLEANUP_HELPER_PROTOCOL_INVALID") from exc
-    expected_keys = {
+    required_keys = {
         "schema_version",
         "operation",
         "expected_plan_id",
         "confirmed",
     }
+    allowed_keys = required_keys | {"retire_dirty_worktrees"}
     if isinstance(request, dict):
         credential_keys = {
             key for key in ("operator_session_token", "operator_bearer_secret") if key in request
@@ -291,17 +294,21 @@ def _handle_request(connection: socket.socket) -> dict[str, Any]:
         credential_keys = set()
     if (
         not isinstance(request, dict)
-        or set(request) != expected_keys | credential_keys
+        or not (required_keys | credential_keys).issubset(request)
+        or not set(request).issubset(allowed_keys | credential_keys)
         or len(credential_keys) != 1
         or request.get("schema_version") != 1
         or request.get("operation") != "full_cleanup"
         or request.get("confirmed") is not True
+        or not isinstance(request.get("retire_dirty_worktrees", False), bool)
         or not isinstance(request.get("expected_plan_id"), str)
         or not _PLAN_ID.fullmatch(request["expected_plan_id"])
     ):
         raise FullCleanupHelperError("FULL_CLEANUP_HELPER_PROTOCOL_INVALID")
     with _runtime_identity(runtime_user):
         config = load_operations_config()
+        config = dict(config)
+        config["_retire_dirty_session_workspaces"] = request.get("retire_dirty_worktrees", False)
         if str(config.get("runtime_user")) != runtime_user:
             raise FullCleanupHelperError("FULL_CLEANUP_HELPER_CONFIG_INVALID")
         if not _peer_holds_full_cleanup_fences(peer_pid, config):

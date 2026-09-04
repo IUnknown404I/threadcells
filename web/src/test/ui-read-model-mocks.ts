@@ -79,6 +79,7 @@ async function allAgents(): Promise<AgentSummary[]> {
         managed_worktree_kind: state.managed_worktree_kind || null,
         managed_worktree_commit: state.managed_worktree_commit || null,
         managed_worktree_branch: state.managed_worktree_branch || null,
+        workspace_state: state.workspace_state || (session as Session & { workspace_state?: string }).workspace_state || null,
         projectId: terminal.project_id || null,
         project_name: terminal.project_name || null,
         project_path: terminal.project_path || null,

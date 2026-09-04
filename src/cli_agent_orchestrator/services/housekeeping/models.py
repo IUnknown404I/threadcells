@@ -28,6 +28,7 @@ CandidateKind = Literal[
     "retirement_cleanup",
     "workflow_authority",
     "git_worktree",
+    "session_workspace",
     "reproducible_cache",
     "inventory",
 ]
@@ -165,6 +166,33 @@ def resource_fingerprint(payload: Mapping[str, Any]) -> str:
 
 def _plan_identity_candidate(candidate: HousekeepingCandidate) -> dict[str, Any]:
     """Bind destructive state exactly without letting protected byte drift churn plans."""
+    attributes = dict(candidate.attributes)
+    if (
+        candidate.action != "preserve"
+        and candidate.resource_kind == "session_workspace"
+        and attributes.get("allow_dirty") == "true"
+    ):
+        # Explicit dirty deletion authorizes removing this exact inactive
+        # managed workspace, including its contents at deletion time. Content
+        # size/status remains useful preview data but is not plan authority.
+        return {
+            "category": candidate.category,
+            "path": candidate.path,
+            "canonical_identity": candidate.canonical_identity,
+            "action": candidate.action,
+            "retention_reason": candidate.retention_reason,
+            "protection_reason": candidate.protection_reason,
+            "resource_kind": candidate.resource_kind,
+            "attributes": [
+                (key, attributes[key])
+                for key in (
+                    "allow_dirty",
+                    "context_id",
+                    "session_id",
+                    "authority_fingerprint",
+                )
+            ],
+        }
     if candidate.action != "preserve":
         return candidate.as_dict()
     return {

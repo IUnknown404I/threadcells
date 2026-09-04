@@ -85,6 +85,15 @@ export function SessionStatusSummary({ session, trailing }: { session: SessionSu
       <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1.5">
         <BoundaryStatus kind="first" agent={session.first_agent} sessionId={session.id} />
         <BoundaryStatus kind="last" agent={session.last_agent} sessionId={session.id} />
+        {(session.workspace_state === 'retired' || session.workspace_state === 'retiring') && (
+          <span
+            data-testid={`session-workspace-${session.id}`}
+            className="rounded-full border border-gray-600 bg-gray-800 px-2 py-1 text-xs text-gray-300"
+            title={t('agents.workspaceRetiredHelp')}
+          >
+            {t(session.workspace_state === 'retired' ? 'agents.workspaceRetired' : 'agents.workspaceRetiring')}
+          </span>
+        )}
       </div>
       <div
         data-testid={`session-status-total-${session.id}`}

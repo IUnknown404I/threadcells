@@ -93,6 +93,7 @@ def _public_agent_summary(terminal: Dict[str, Any]) -> Dict[str, Any]:
         "writable_work_context_id",
         "writer_authority_generation",
         "workspace_classification",
+        "workspace_state",
         "projectId",
         "project_name",
         "project_path",

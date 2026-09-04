@@ -8,6 +8,7 @@ import { useI18n, type AppLocale, type TranslationKey } from '../i18n'
 interface InboxPanelProps {
   terminalId: string
   onClose: () => void
+  readOnly?: boolean
 }
 
 type StatusFilter = 'all' | 'pending' | 'delivered' | 'failed' | 'superseded'
@@ -93,7 +94,7 @@ export function reviewAuthorityKey(result: DelegationResult): TranslationKey | n
   return 'inbox.reviewUnbound'
 }
 
-export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
+export function InboxPanel({ terminalId, onClose, readOnly = false }: InboxPanelProps) {
   const { locale, t } = useI18n()
   const showSnackbar = useStore(state => state.showSnackbar)
   const [messages, setMessages] = useState<InboxMessage[]>([])
@@ -203,8 +204,8 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
   }, [fullscreen, onClose])
 
   useEffect(() => {
-    inputRef.current?.focus()
-  }, [])
+    if (!readOnly) inputRef.current?.focus()
+  }, [readOnly])
 
   useLayoutEffect(() => {
     if (scrollPositionRef.current !== null && messagesRef.current) {
@@ -214,6 +215,7 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
   }, [fullscreen])
 
   const handleSend = async () => {
+    if (readOnly) return
     const text = draft.trim()
     if (!text || sending) return
     setSending(true)
@@ -387,6 +389,11 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
 
         {/* Send Form */}
         <div className="px-4 sm:px-5 py-4 border-t border-gray-700/50 shrink-0">
+          {readOnly ? (
+            <p className="rounded-lg border border-gray-700 bg-gray-800/60 p-3 text-xs text-gray-300">
+              {t('agents.workspaceRetiredHelp')}
+            </p>
+          ) : (
           <div className="flex flex-col gap-2">
             <textarea
               ref={inputRef}
@@ -409,6 +416,7 @@ export function InboxPanel({ terminalId, onClose }: InboxPanelProps) {
               </button>
             </div>
           </div>
+          )}
         </div>
       </div>
     </div>

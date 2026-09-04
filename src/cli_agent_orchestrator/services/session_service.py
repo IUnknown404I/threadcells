@@ -26,7 +26,10 @@ from typing import Dict, List
 from cli_agent_orchestrator.clients.database import (
     AmbiguousSessionIdentity,
     cancel_workflows_for_terminal,
+    claim_session_workspace_retirement,
     delete_terminals_by_session_lifetime,
+    get_session_workspace_retirement_snapshot,
+    get_writable_work_context_by_session,
     resolve_session_lifetime,
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
@@ -46,7 +49,6 @@ from cli_agent_orchestrator.services.terminal_service import (
     prepare_terminal_for_destruction,
     prove_live_session_runtime_authority,
     retire_exited_terminal_runtime,
-    validate_managed_worktree_cleanup,
 )
 
 logger = logging.getLogger(__name__)
@@ -111,6 +113,12 @@ def resolve_session_authority(identifier: str, *, require_live: bool = False) ->
     )
     if not require_live:
         return authority
+    workspace = get_writable_work_context_by_session(authority.session_id)
+    if workspace is not None and workspace.get("state") in {"retiring", "retired"}:
+        raise SessionLifecycleError(
+            "WORKSPACE_RETIRED",
+            "This Session's writable workspace was retired; create a new Session to continue",
+        )
     if authority.deleted or not authority.has_live_runtime_owner:
         raise SessionLifecycleError(
             "SESSION_HISTORY_INELIGIBLE",
@@ -221,7 +229,67 @@ def get_session_root_working_directory(session_name: str) -> str | None:
     return tmux_client.get_session_root_working_directory(authority.session_name)
 
 
-def delete_session(session_name: str, registry: PluginRegistry | None = None) -> Dict:
+def _session_deletion_preflight(authority: SessionAuthority) -> Dict[str, object]:
+    """Inspect destructive Session deletion without changing durable state."""
+    if authority.deleted:
+        return {
+            "eligible": True,
+            "already_deleted": True,
+            "requires_dirty_confirmation": False,
+            "modified_files": 0,
+            "untracked_files": 0,
+            "reason_code": None,
+        }
+    reason_code: str | None = None
+    if authority.has_recovery_fenced_history:
+        reason_code = "SESSION_RECOVERY_EVIDENCE_PROTECTED"
+    elif authority.has_live_runtime_owner:
+        reason_code = "SESSION_RUNTIME_ACTIVE"
+    context = get_writable_work_context_by_session(authority.session_id)
+    if reason_code is None and context is not None:
+        snapshot = get_session_workspace_retirement_snapshot(str(context["id"]))
+        snapshot_reason = snapshot.get("reason_code") if snapshot is not None else None
+        if snapshot_reason not in {None, "WORKSPACE_ALREADY_RETIRED"}:
+            reason_code = str(snapshot_reason)
+
+    modified_files = 0
+    untracked_files = 0
+    if reason_code is None:
+        from cli_agent_orchestrator.services.managed_worktree_service import (
+            managed_worktree_status,
+        )
+
+        for terminal in authority.terminals:
+            if not terminal.get("managed_worktree_kind"):
+                continue
+            worktree = managed_worktree_status(terminal)
+            if not worktree.get("safe"):
+                reason_code = str(worktree.get("reason_code") or "MANAGED_WORKTREE_UNVERIFIED")
+                break
+            modified_files += int(worktree.get("modified_files") or 0)
+            untracked_files += int(worktree.get("untracked_files") or 0)
+    dirty = modified_files > 0 or untracked_files > 0
+    return {
+        "eligible": reason_code is None,
+        "already_deleted": False,
+        "requires_dirty_confirmation": reason_code is None and dirty,
+        "modified_files": modified_files,
+        "untracked_files": untracked_files,
+        "reason_code": reason_code,
+    }
+
+
+def get_session_deletion_preflight(session_name: str) -> Dict[str, object]:
+    """Return the exact confirmation and active-authority state for deletion."""
+    return _session_deletion_preflight(resolve_session_authority(session_name))
+
+
+def delete_session(
+    session_name: str,
+    registry: PluginRegistry | None = None,
+    *,
+    confirm_dirty_workspace: bool = False,
+) -> Dict:
     """Delete session and cleanup.
 
     Returns:
@@ -238,38 +306,26 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                 result["retained_resources"] = authority.retained_resources
                 return result
             terminals = authority.terminals
-
-            # A recovery-fenced predecessor is terminalized, but its durable
-            # relation to the successor remains protected takeover evidence.
-            if authority.has_recovery_fenced_history:
+            preflight = _session_deletion_preflight(authority)
+            if not preflight["eligible"]:
+                reason = str(preflight["reason_code"])
+                messages = {
+                    "SESSION_RECOVERY_EVIDENCE_PROTECTED": (
+                        "This session contains recovery-takeover evidence and must be retained"
+                    ),
+                    "SESSION_RUNTIME_ACTIVE": (
+                        "Every agent must be durably exited before deleting this session"
+                    ),
+                }
                 raise SessionLifecycleError(
-                    "SESSION_RECOVERY_EVIDENCE_PROTECTED",
-                    "This session contains recovery-takeover evidence and must be retained",
+                    reason,
+                    messages.get(reason, "Session authority is still active; deletion is blocked"),
                 )
-
-            # A live session remains usable authority even while its provider
-            # is Ready.  Session deletion is a historical operation: callers
-            # must gracefully exit every terminal before removing the session
-            # from the operational read model.
-            if authority.has_live_runtime_owner:
+            if preflight["requires_dirty_confirmation"] and not confirm_dirty_workspace:
                 raise SessionLifecycleError(
-                    "SESSION_RUNTIME_ACTIVE",
-                    "Every agent must be durably exited before deleting this session",
+                    "SESSION_DIRTY_CONFIRMATION_REQUIRED",
+                    "The workspace has uncommitted changes; explicit destructive confirmation is required",
                 )
-
-            # Worktree validation classifies filesystem cleanup, not logical
-            # session eligibility.  A protected worktree is retained with its
-            # terminal metadata after the session is tombstoned.
-            retained_resources: list[dict[str, str]] = []
-            cleanup_eligible: set[str] = set()
-            for terminal in terminals:
-                try:
-                    validate_managed_worktree_cleanup(terminal)
-                    cleanup_eligible.add(str(terminal["id"]))
-                except ManagedWorktreeCleanupError as exc:
-                    retained_resources.append(
-                        {"terminal_id": str(terminal["id"]), "reason_code": exc.reason_code}
-                    )
 
             # Capture every child result before cancelling workflows, cleaning
             # providers, or killing the session. Any failure aborts while live
@@ -303,16 +359,41 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                 except Exception as e:
                     logger.warning(f"Provider cleanup failed for {terminal['id']}: {e}")
 
-            # Cleanup is best effort after positive runtime-death proof.  A
-            # race or newly protected Git state is preserved and represented
-            # by retained terminal metadata rather than half-deleting it.
+            # The destructive confirmation covers dirty bytes, never active
+            # authority. Any Git identity change still aborts fail-closed.
+            claimed_contexts: dict[str, bool] = {}
             for terminal in terminals:
-                terminal_id = str(terminal["id"])
-                if terminal_id not in cleanup_eligible:
-                    continue
                 try:
-                    cleanup_managed_worktree(terminal)
                     work_context_id = terminal.get("writable_work_context_id")
+                    if work_context_id and str(work_context_id) not in claimed_contexts:
+                        snapshot = get_session_workspace_retirement_snapshot(str(work_context_id))
+                        if snapshot is None:
+                            raise SessionLifecycleError(
+                                "WORKSPACE_NOT_FOUND",
+                                "Managed workspace authority disappeared during deletion",
+                            )
+                        durable_allow_dirty = bool(
+                            snapshot["context"].get("state") == "retiring"
+                            and snapshot["context"].get("retirement_allow_dirty")
+                        )
+                        allow_dirty = bool(confirm_dirty_workspace or durable_allow_dirty)
+                        claim = claim_session_workspace_retirement(
+                            str(work_context_id),
+                            str(snapshot["authority_fingerprint"]),
+                            allow_dirty=allow_dirty,
+                        )
+                        if not claim.get("claimed"):
+                            raise SessionLifecycleError(
+                                str(claim.get("reason_code") or "WORKSPACE_AUTHORITY_CHANGED"),
+                                "Managed workspace authority changed during deletion",
+                            )
+                        claimed_contexts[str(work_context_id)] = allow_dirty
+                    cleanup_managed_worktree(
+                        terminal,
+                        allow_dirty=claimed_contexts.get(
+                            str(work_context_id), bool(confirm_dirty_workspace)
+                        ),
+                    )
                     if work_context_id:
                         from cli_agent_orchestrator.clients.database import (
                             transition_writable_work_context,
@@ -320,22 +401,22 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
 
                         transition_writable_work_context(
                             str(work_context_id),
-                            expected_states=("admitted", "preserved"),
+                            expected_states=("admitted", "preserved", "retiring"),
                             state="retired",
                             event_type="managed_worktree_retired",
                         )
                 except ManagedWorktreeCleanupError as exc:
-                    cleanup_eligible.discard(terminal_id)
-                    retained_resources.append(
-                        {"terminal_id": terminal_id, "reason_code": exc.reason_code}
-                    )
+                    raise SessionLifecycleError(
+                        exc.reason_code,
+                        "Managed workspace identity changed during deletion; history was preserved",
+                    ) from exc
 
             try:
                 deletion = delete_terminals_by_session_lifetime(
                     authority.session_id,
                     authority.session_name,
                     expected_terminal_ids=[terminal["id"] for terminal in terminals],
-                    retained_resources=retained_resources,
+                    retained_resources=[],
                 )
             except AmbiguousSessionIdentity as exc:
                 raise SessionLifecycleError(

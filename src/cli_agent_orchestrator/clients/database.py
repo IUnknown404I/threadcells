@@ -205,6 +205,14 @@ class WritableWorkContextModel(Base):
     base_revision = Column(String, nullable=False)
     state = Column(String, nullable=False, default="reserved", index=True)
     writer_authority_generation = Column(String, nullable=True, unique=True)
+    # Persist only the exact owner-approved destructive retirement bit. It is
+    # false for ordinary cleanup and authorizes deleting the exact managed
+    # workspace, including its contents at deletion time, after lifecycle and
+    # identity authority are revalidated.
+    retirement_allow_dirty = Column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    retirement_authority_fingerprint = Column(String, nullable=True)
     failure_reason = Column(String, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.now)
     updated_at = Column(DateTime, nullable=False, default=datetime.now)
@@ -3316,6 +3324,23 @@ def _ensure_terminal_worktree_authority_schema() -> None:
         RecoveryTakeoverAuditModel.__table__.create(bind=engine, checkfirst=True)
         WritableWorkContextModel.__table__.create(bind=engine, checkfirst=True)
         WritableWorkContextAuditModel.__table__.create(bind=engine, checkfirst=True)
+        with engine.begin() as connection:
+            columns = {
+                row[1]
+                for row in connection.exec_driver_sql(
+                    "PRAGMA table_info(writable_work_contexts)"
+                ).fetchall()
+            }
+            if "retirement_allow_dirty" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE writable_work_contexts ADD COLUMN "
+                    "retirement_allow_dirty BOOLEAN NOT NULL DEFAULT 0"
+                )
+            if "retirement_authority_fingerprint" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE writable_work_contexts ADD COLUMN "
+                    "retirement_authority_fingerprint VARCHAR"
+                )
 
 
 def _work_context_dict(row: WritableWorkContextModel) -> Dict[str, Any]:
@@ -3331,6 +3356,8 @@ def _work_context_dict(row: WritableWorkContextModel) -> Dict[str, Any]:
         "base_revision": row.base_revision,
         "state": row.state,
         "writer_authority_generation": row.writer_authority_generation,
+        "retirement_allow_dirty": bool(row.retirement_allow_dirty),
+        "retirement_authority_fingerprint": row.retirement_authority_fingerprint,
         "failure_reason": row.failure_reason,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
@@ -3410,6 +3437,18 @@ def get_writable_work_context_by_request(request_id: str) -> Optional[Dict[str, 
         return _work_context_dict(row) if row is not None else None
 
 
+def get_writable_work_context_by_session(session_id: str) -> Optional[Dict[str, Any]]:
+    """Resolve the one durable writable workspace owned by a Session."""
+    _ensure_terminal_worktree_authority_schema()
+    with SessionLocal() as db:
+        row = (
+            db.query(WritableWorkContextModel)
+            .filter(WritableWorkContextModel.session_id == session_id)
+            .first()
+        )
+        return _work_context_dict(row) if row is not None else None
+
+
 def list_writable_work_contexts(*, states: Sequence[str] | None = None) -> List[Dict[str, Any]]:
     _ensure_terminal_worktree_authority_schema()
     with SessionLocal() as db:
@@ -3474,6 +3513,276 @@ def transition_writable_work_context(
         )
         db.commit()
         return True
+
+
+_WORKSPACE_RETIREMENT_ACTIVE_ASSIGNMENT_STATES = (
+    ChildAssignmentStatus.AWAITING_RESULT.value,
+    ChildAssignmentStatus.RESULT_QUEUED.value,
+    ChildAssignmentStatus.RESULT_DELIVERED.value,
+    ChildAssignmentStatus.RESULT_FAILED.value,
+    ChildAssignmentStatus.HANDOFF_AWAITING_RESULT.value,
+    ChildAssignmentStatus.HANDOFF_RECOVERY_AWAITING_RESULT.value,
+    ChildAssignmentStatus.HANDOFF_DIRECT_RESULT_CLAIMED.value,
+    ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value,
+    ChildAssignmentStatus.HANDOFF_RESULT_DELIVERED.value,
+    ChildAssignmentStatus.HANDOFF_RESULT_FAILED.value,
+)
+
+
+def _session_workspace_snapshot_in_transaction(
+    db: Any, context: WritableWorkContextModel
+) -> Dict[str, Any]:
+    """Return the exact durable authority that can block workspace retirement."""
+    terminals = (
+        db.query(TerminalModel)
+        .filter(TerminalModel.session_id == context.session_id)
+        .order_by(TerminalModel.creation_order.asc(), TerminalModel.id.asc())
+        .all()
+    )
+    terminal_ids = [str(terminal.id) for terminal in terminals]
+    reason_code: str | None = None
+    if context.state == "retired":
+        reason_code = "WORKSPACE_ALREADY_RETIRED"
+    elif context.state not in {"admitted", "retiring"}:
+        reason_code = "WORKSPACE_STATE_NOT_RETIRABLE"
+    elif not terminals:
+        reason_code = "WORKSPACE_HISTORY_MISSING"
+    elif any(
+        terminal.runtime_lifecycle in {"recovery_fenced", "recovery_required"}
+        for terminal in terminals
+    ):
+        reason_code = "RECOVERY_PROTECTED"
+    elif any(terminal.runtime_lifecycle != "exited" for terminal in terminals):
+        reason_code = "WORKTREE_ACTIVE"
+    elif any(terminal.runtime_operation_kind is not None for terminal in terminals):
+        reason_code = "RECOVERY_PROTECTED"
+    elif terminal_ids:
+        owner_gate = (
+            db.query(WorkflowModel.id)
+            .filter(
+                WorkflowModel.root_terminal_id.in_(terminal_ids),
+                WorkflowModel.status == "owner_gate",
+            )
+            .first()
+        )
+        open_workflow = (
+            db.query(WorkflowModel.id)
+            .filter(
+                WorkflowModel.root_terminal_id.in_(terminal_ids),
+                WorkflowModel.status == "open",
+            )
+            .first()
+        )
+        queued_turn = (
+            db.query(WorkflowTurnModel.id)
+            .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+            .filter(
+                WorkflowModel.root_terminal_id.in_(terminal_ids),
+                WorkflowTurnModel.state.in_(("queued", "claimed", "sent")),
+            )
+            .first()
+        )
+        pending_inbox = (
+            db.query(InboxModel.id)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                or_(
+                    InboxModel.sender_id.in_(terminal_ids), InboxModel.receiver_id.in_(terminal_ids)
+                ),
+            )
+            .first()
+        )
+        active_assignment = (
+            db.query(ChildAssignmentModel.id)
+            .filter(
+                or_(
+                    ChildAssignmentModel.parent_terminal_id.in_(terminal_ids),
+                    ChildAssignmentModel.child_terminal_id.in_(terminal_ids),
+                ),
+                ChildAssignmentModel.status.in_(_WORKSPACE_RETIREMENT_ACTIVE_ASSIGNMENT_STATES),
+            )
+            .first()
+        )
+        active_effect = (
+            db.query(WorkflowEffectModel.id)
+            .join(WorkflowModel, WorkflowModel.id == WorkflowEffectModel.workflow_id)
+            .filter(
+                WorkflowModel.root_terminal_id.in_(terminal_ids),
+                WorkflowEffectModel.state.in_(("claimed", "indeterminate")),
+            )
+            .first()
+        )
+        provider_execution = (
+            db.query(ProviderExecutionLeaseModel.terminal_id)
+            .filter(ProviderExecutionLeaseModel.terminal_id.in_(terminal_ids))
+            .first()
+        )
+        writer_lease = (
+            db.query(WorktreeWriterLeaseModel.terminal_id)
+            .filter(WorktreeWriterLeaseModel.terminal_id.in_(terminal_ids))
+            .first()
+        )
+        recovery = (
+            db.query(RecoveryTakeoverModel.id)
+            .filter(
+                or_(
+                    RecoveryTakeoverModel.old_terminal_id.in_(terminal_ids),
+                    RecoveryTakeoverModel.new_terminal_id.in_(terminal_ids),
+                ),
+                RecoveryTakeoverModel.state.in_(("claimed", "fenced", "dispatching", "admitted")),
+            )
+            .first()
+        )
+        if owner_gate is not None:
+            reason_code = "OWNER_GATE"
+        elif open_workflow is not None:
+            reason_code = "WORKFLOW_OPEN"
+        elif (
+            queued_turn is not None
+            or pending_inbox is not None
+            or active_assignment is not None
+            or active_effect is not None
+        ):
+            reason_code = "QUEUED_WORK"
+        elif provider_execution is not None:
+            reason_code = "PROVIDER_EXECUTION_ACTIVE"
+        elif writer_lease is not None:
+            reason_code = "WRITER_LEASE_ACTIVE"
+        elif recovery is not None:
+            reason_code = "RECOVERY_PROTECTED"
+
+    terminal_documents = [
+        {
+            "id": str(terminal.id),
+            "session_id": terminal.session_id,
+            "tmux_session": terminal.tmux_session,
+            "runtime_lifecycle": terminal.runtime_lifecycle,
+            "runtime_operation_kind": terminal.runtime_operation_kind,
+            "launch_worktree": terminal.launch_worktree,
+            "write_enabled": terminal.write_enabled,
+            "writer_authority_generation": terminal.writer_authority_generation,
+            "managed_worktree_kind": terminal.managed_worktree_kind,
+            "managed_worktree_source": terminal.managed_worktree_source,
+            "managed_worktree_branch": terminal.managed_worktree_branch,
+            "managed_worktree_commit": terminal.managed_worktree_commit,
+            "managed_worktree_origin_terminal_id": terminal.managed_worktree_origin_terminal_id,
+            "writable_work_context_id": terminal.writable_work_context_id,
+            "workspace_classification": terminal.workspace_classification,
+        }
+        for terminal in terminals
+    ]
+    fingerprint_document = {
+        "context_id": context.id,
+        "session_id": context.session_id,
+        # Both values are the same claimed retirement generation. Excluding
+        # their spelling keeps the post-claim filesystem revalidation bound
+        # to the exact authority inspected before the claim.
+        "state": "retirable" if context.state in {"admitted", "retiring"} else context.state,
+        "terminal_id": context.terminal_id,
+        "canonical_source": context.canonical_source,
+        "canonical_worktree": context.canonical_worktree,
+        "branch": context.branch,
+        "base_revision": context.base_revision,
+        "writer_authority_generation": context.writer_authority_generation,
+        "reason_code": reason_code,
+        "terminals": terminal_documents,
+    }
+    return {
+        "context": _work_context_dict(context),
+        "terminals": terminal_documents,
+        "reason_code": reason_code,
+        "authority_fingerprint": hashlib.sha256(
+            json.dumps(fingerprint_document, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+    }
+
+
+def list_session_workspace_retirement_snapshots() -> List[Dict[str, Any]]:
+    """List every managed Session workspace, including already-retired history."""
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_workflow_schema()
+    _ensure_child_assignment_schema()
+    _ensure_provider_execution_schema()
+    with SessionLocal() as db:
+        contexts = (
+            db.query(WritableWorkContextModel)
+            .order_by(WritableWorkContextModel.created_at.asc(), WritableWorkContextModel.id.asc())
+            .all()
+        )
+        return [_session_workspace_snapshot_in_transaction(db, context) for context in contexts]
+
+
+def get_session_workspace_retirement_snapshot(context_id: str) -> Optional[Dict[str, Any]]:
+    """Read one workspace retirement boundary without changing authority."""
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_workflow_schema()
+    _ensure_child_assignment_schema()
+    _ensure_provider_execution_schema()
+    with SessionLocal() as db:
+        context = db.get(WritableWorkContextModel, context_id)
+        return (
+            _session_workspace_snapshot_in_transaction(db, context) if context is not None else None
+        )
+
+
+def claim_session_workspace_retirement(
+    context_id: str,
+    authority_fingerprint: str,
+    *,
+    allow_dirty: bool = False,
+) -> Dict[str, Any]:
+    """Atomically claim one inactive Session before any Git deletion starts."""
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_workflow_schema()
+    _ensure_child_assignment_schema()
+    _ensure_provider_execution_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        context = db.get(WritableWorkContextModel, context_id)
+        if context is None:
+            db.rollback()
+            return {"claimed": False, "reason_code": "WORKSPACE_NOT_FOUND"}
+        snapshot = _session_workspace_snapshot_in_transaction(db, context)
+        if snapshot["authority_fingerprint"] != authority_fingerprint:
+            db.rollback()
+            return {"claimed": False, "reason_code": "WORKSPACE_AUTHORITY_CHANGED"}
+        if snapshot["reason_code"] is not None:
+            db.rollback()
+            return {"claimed": False, "reason_code": snapshot["reason_code"]}
+        if context.state == "retiring":
+            if (
+                bool(context.retirement_allow_dirty) != allow_dirty
+                or context.retirement_authority_fingerprint != authority_fingerprint
+            ):
+                db.rollback()
+                return {"claimed": False, "reason_code": "WORKSPACE_AUTHORITY_CHANGED"}
+            db.rollback()
+            return {"claimed": True, "already_claimed": True}
+        if context.state != "admitted":
+            db.rollback()
+            return {"claimed": False, "reason_code": "WORKSPACE_STATE_NOT_RETIRABLE"}
+        context.state = "retiring"
+        context.retirement_allow_dirty = allow_dirty
+        context.retirement_authority_fingerprint = authority_fingerprint
+        context.failure_reason = None
+        context.updated_at = datetime.now()
+        event_key = f"{context.id}:workspace-retirement-claimed:{context.terminal_id}"
+        if (
+            db.query(WritableWorkContextAuditModel.id)
+            .filter(WritableWorkContextAuditModel.event_key == event_key)
+            .first()
+            is None
+        ):
+            db.add(
+                WritableWorkContextAuditModel(
+                    work_context_id=context.id,
+                    event_key=event_key,
+                    event_type="workspace_retirement_claimed",
+                    terminal_id=context.terminal_id,
+                )
+            )
+        db.commit()
+        return {"claimed": True, "already_claimed": False}
 
 
 def create_terminal(
@@ -3553,6 +3862,14 @@ def create_terminal(
             if session_lifetime_id
             else str(existing_session[0]) if existing_session else str(uuid.uuid4())
         )
+        session_context = (
+            db.query(WritableWorkContextModel)
+            .filter(WritableWorkContextModel.session_id == session_id)
+            .first()
+        )
+        if session_context is not None and session_context.state in {"retiring", "retired"}:
+            db.rollback()
+            raise WritableWorkContextConflict("WORKSPACE_RETIRED")
         # New isolated primary supervisors are session-singleton at the DB
         # boundary. Historical rows may be temporarily misclassified as a
         # supervisor until topology reconciliation repairs them, so the
@@ -4270,21 +4587,28 @@ def _terminal_ui_projection_cte(
                 parameters[name] = value
                 placeholders.append(f":{name}")
             selected_where = (
-                " WHERE COALESCE(session_id, 'legacy:' || tmux_session) "
+                " WHERE COALESCE(terminals.session_id, 'legacy:' || terminals.tmux_session) "
                 f"IN ({', '.join(placeholders)})"
             )
     return (
         """
 WITH selected_terminals AS MATERIALIZED (
-    SELECT id, tmux_window, provider, tmux_session,
-           COALESCE(session_id, 'legacy:' || tmux_session) AS stable_session_id,
-           agent_profile, runtime_lifecycle, context_role, launch_worktree,
-           runtime_operation_kind,
-           managed_worktree_kind, managed_worktree_commit, managed_worktree_branch,
-           writable_work_context_id, writer_authority_generation, workspace_classification,
-           project_id, project_name, project_path,
-           COALESCE(creation_order, rowid) AS creation_order, last_active
+    SELECT terminals.id, terminals.tmux_window, terminals.provider, terminals.tmux_session,
+           COALESCE(terminals.session_id, 'legacy:' || terminals.tmux_session)
+             AS stable_session_id,
+           terminals.agent_profile, terminals.runtime_lifecycle, terminals.context_role,
+           terminals.launch_worktree, terminals.runtime_operation_kind,
+           terminals.managed_worktree_kind, terminals.managed_worktree_commit,
+           terminals.managed_worktree_branch, terminals.writable_work_context_id,
+           terminals.writer_authority_generation, terminals.workspace_classification,
+           writable_work_contexts.state AS workspace_state,
+           terminals.project_id, terminals.project_name, terminals.project_path,
+           COALESCE(terminals.creation_order, terminals.rowid) AS creation_order,
+           terminals.last_active
     FROM terminals
+    LEFT JOIN writable_work_contexts
+      ON writable_work_contexts.session_id =
+         COALESCE(terminals.session_id, 'legacy:' || terminals.tmux_session)
     WHERE NOT EXISTS (
         SELECT 1 FROM session_deletion_receipts sdr
         WHERE sdr.session_id = COALESCE(terminals.session_id, 'legacy:' || terminals.tmux_session)
@@ -4466,7 +4790,7 @@ WITH selected_terminals AS MATERIALIZED (
            t.context_role, t.launch_worktree, t.managed_worktree_kind,
            t.managed_worktree_commit, t.managed_worktree_branch,
            t.writable_work_context_id, t.writer_authority_generation,
-           t.workspace_classification,
+           t.workspace_classification, t.workspace_state,
            t.project_id AS projectId, t.project_name, t.project_path,
            t.creation_order, t.last_active
     FROM selected_terminals t
@@ -4703,6 +5027,7 @@ def list_terminal_ui_session_page(*, limit: int, offset: int, query: str = "") -
                                                 || char(31) || project_path) = 1
                   THEN MAX(project_name) ELSE NULL END AS project_name,
              MAX(last_active) AS last_active
+             , MAX(workspace_state) AS workspace_state
       FROM projected GROUP BY session_id
     ), filtered AS MATERIALIZED (SELECT * FROM aggregates"""
         + search
@@ -5887,6 +6212,9 @@ def acquire_terminal_runtime_transport(
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal is None or terminal.runtime_lifecycle not in (None, "running"):
+            db.commit()
+            return None
+        if not _workspace_accepts_new_work(db, terminal_id):
             db.commit()
             return None
         if _terminal_has_pending_provider_reconnect(db, terminal_id):
@@ -7133,6 +7461,8 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
         terminal = db.get(TerminalModel, receiver_id)
         if terminal is None:
             raise ValueError(f"Terminal '{receiver_id}' not found")
+        if not _workspace_accepts_new_work(db, receiver_id):
+            raise ValueError(f"Terminal '{receiver_id}' workspace is retired")
         if terminal.runtime_lifecycle in {
             "recovery_required",
             "exit_pending",
@@ -7886,6 +8216,23 @@ def _open_workflow(db, root_terminal_id: str, create: bool) -> Optional[Workflow
     return workflow
 
 
+def _workspace_accepts_new_work(db: Any, terminal_id: str) -> bool:
+    terminal = db.get(TerminalModel, terminal_id)
+    if terminal is None:
+        # Existing relation-registration paths may durably bind child
+        # authority before a terminal row is materialized. Retirement is an
+        # explicit state on a present Session workspace, never an inference
+        # from missing historical metadata.
+        return True
+    session_id = terminal.session_id or f"legacy:{terminal.tmux_session}"
+    context = (
+        db.query(WritableWorkContextModel)
+        .filter(WritableWorkContextModel.session_id == session_id)
+        .first()
+    )
+    return context is None or context.state not in {"retiring", "retired"}
+
+
 def _retirement_quiescence_allows_commit(db, terminal_id: str) -> bool:
     """Atomically fence a pending input/descendant write against retirement.
 
@@ -8022,6 +8369,12 @@ def _prepare_workflow_input(
             return {
                 "accepted": False,
                 "reason_code": "TERMINAL_NOT_FOUND",
+            }
+        if terminal is not None and not _workspace_accepts_new_work(db, root_terminal_id):
+            db.rollback()
+            return {
+                "accepted": False,
+                "reason_code": "WORKSPACE_RETIRED",
             }
         if terminal is not None and terminal.runtime_lifecycle in (
             "recovery_required",
@@ -16414,6 +16767,11 @@ def _register_child_attempt(
     _ensure_workflow_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        if not _workspace_accepts_new_work(
+            db, parent_terminal_id
+        ) or not _workspace_accepts_new_work(db, child_terminal_id):
+            db.rollback()
+            return False
         if not _retirement_quiescence_allows_commit(db, parent_terminal_id):
             return False
         if workflow_effect_id is not None:

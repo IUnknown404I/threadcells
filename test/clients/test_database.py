@@ -1548,6 +1548,49 @@ class TestInitDb:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(child_assignments)")}
         assert columns == {column.name for column in ChildAssignmentModel.__table__.columns}
 
+    def test_workspace_retirement_authority_column_upgrades_idempotently(
+        self, tmp_path, monkeypatch
+    ):
+        database_file = tmp_path / "pre-workspace-retirement.db"
+        isolated_engine, _isolated_session = self._bind_isolated_database(
+            database_file, monkeypatch
+        )
+        Base.metadata.create_all(isolated_engine)
+        with isolated_engine.begin() as connection:
+            connection.exec_driver_sql(
+                "ALTER TABLE writable_work_contexts DROP COLUMN retirement_allow_dirty"
+            )
+            connection.exec_driver_sql(
+                "ALTER TABLE writable_work_contexts " "DROP COLUMN retirement_authority_fingerprint"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO writable_work_contexts "
+                "(id, request_id, project_id, session_id, terminal_id, canonical_source, "
+                "canonical_worktree, branch, base_revision, state, writer_authority_generation, "
+                "created_at, updated_at) "
+                "VALUES ('context-history', 'request-history', 'project-history', "
+                "'session-history', 'terminal-history', '/source', '/worktree', "
+                "'cao/session/history', 'abc123', 'admitted', 'writer-history', "
+                "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+
+        database_client._ensure_terminal_worktree_authority_schema()
+        monkeypatch.setattr(database_client, "_terminal_authority_schema_ready", False)
+        database_client._ensure_terminal_worktree_authority_schema()
+
+        with sqlite3.connect(database_file) as connection:
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(writable_work_contexts)")
+            }
+            history = connection.execute(
+                "SELECT id, state, retirement_allow_dirty, "
+                "retirement_authority_fingerprint "
+                "FROM writable_work_contexts"
+            ).fetchall()
+        assert "retirement_allow_dirty" in columns
+        assert "retirement_authority_fingerprint" in columns
+        assert history == [("context-history", "admitted", 0, None)]
+
     @patch("cli_agent_orchestrator.clients.database.Base")
     def test_init_db(self, mock_base):
         """Test database initialization."""

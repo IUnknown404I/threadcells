@@ -47,6 +47,7 @@ from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
     get_inbox_messages,
     get_terminal_metadata,
+    get_writable_work_context_by_session,
     init_db,
     queue_workflow_input_for_provider,
     release_terminal_runtime_operation,
@@ -295,6 +296,7 @@ class FullCleanupRunRequest(BaseModel):
 
     expected_plan_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     confirmed: Literal[True]
+    retire_dirty_worktrees: bool = False
 
 
 class TelegramSettingsUpdate(BaseModel):
@@ -377,6 +379,16 @@ async def _workflow_reconciliation_tick(
             logger.info("Reconciled %s managed supervisor workspaces", workspaces)
     except Exception as exc:
         logger.warning("Managed workspace reconciliation failed: %s", exc)
+    try:
+        from cli_agent_orchestrator.services.workspace_retirement_service import (
+            reconcile_retiring_session_workspaces,
+        )
+
+        retired = await _run_workflow_io(reconcile_retiring_session_workspaces)
+        if retired:
+            logger.info("Finished %s interrupted Session workspace retirements", retired)
+    except Exception as exc:
+        logger.warning("Session workspace retirement reconciliation failed: %s", exc)
     try:
         recovered = await _run_workflow_io(
             recovery_takeover_service.reconcile_recovery_takeovers,
@@ -1420,7 +1432,7 @@ async def run_housekeeping_endpoint(
 
 
 @app.get("/api/v1/housekeeping/full-cleanup/plan")
-async def get_full_cleanup_plan_endpoint() -> Dict:
+async def get_full_cleanup_plan_endpoint(retire_dirty_worktrees: bool = False) -> Dict:
     from starlette.concurrency import run_in_threadpool
 
     from cli_agent_orchestrator.services.housekeeping_service import (
@@ -1428,7 +1440,10 @@ async def get_full_cleanup_plan_endpoint() -> Dict:
     )
 
     try:
-        return await run_in_threadpool(plan_full_cleanup_serialized)
+        return await run_in_threadpool(
+            plan_full_cleanup_serialized,
+            retire_dirty_worktrees=retire_dirty_worktrees,
+        )
     except RuntimeError as exc:
         if str(exc) == "HOUSEKEEPING_BUSY":
             raise HTTPException(
@@ -1470,11 +1485,13 @@ async def run_full_cleanup_endpoint(
             lambda: run_full_cleanup(
                 expected_plan_id=body.expected_plan_id,
                 confirmed=body.confirmed,
+                retire_dirty_worktrees=body.retire_dirty_worktrees,
                 privileged_cleanup_executor=lambda **_kwargs: execute_via_privileged_helper(
                     expected_plan_id=body.expected_plan_id,
                     confirmed=True,
                     session_token=session_token,
                     bearer_secret=bearer_secret,
+                    retire_dirty_worktrees=body.retire_dirty_worktrees,
                 ),
             )
         )
@@ -1598,6 +1615,7 @@ def _admission_http_exception(exc: AdmissionDenied) -> HTTPException:
         "TERMINAL_RUNTIME_NOT_WRITABLE": status.HTTP_409_CONFLICT,
         "WORKFLOW_INPUT_IDEMPOTENCY_CONFLICT": status.HTTP_409_CONFLICT,
         "WORKFLOW_INPUT_NO_LONGER_EXECUTABLE": status.HTTP_409_CONFLICT,
+        "WORKSPACE_RETIRED": status.HTTP_409_CONFLICT,
     }
     return HTTPException(
         status_code=status_by_reason.get(exc.reason_code, status.HTTP_503_SERVICE_UNAVAILABLE),
@@ -1966,12 +1984,17 @@ async def get_session_root_working_directory(session_name: str) -> WorkingDirect
 
 
 @app.delete("/sessions/{session_name}")
-async def delete_session(request: Request, session_name: str) -> Dict:
+async def delete_session(
+    request: Request,
+    session_name: str,
+    confirm_dirty_workspace: bool = False,
+) -> Dict:
     try:
         result = await run_in_threadpool(
             session_service.delete_session,
             session_name,
             registry=get_plugin_registry(request),
+            confirm_dirty_workspace=confirm_dirty_workspace,
         )
         return {"success": True, **result}
     except (SessionNotFoundError, ValueError, SessionLifecycleError) as e:
@@ -1981,6 +2004,17 @@ async def delete_session(request: Request, session_name: str) -> Dict:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete session: {str(e)}",
         )
+
+
+@app.get("/sessions/{session_name}/deletion-preflight")
+async def get_session_deletion_preflight(session_name: str) -> Dict:
+    try:
+        return await _run_ui_read(
+            session_service.get_session_deletion_preflight,
+            session_name,
+        )
+    except (SessionNotFoundError, ValueError, SessionLifecycleError) as exc:
+        raise _session_http_exception(exc) from exc
 
 
 @app.post(
@@ -2903,6 +2937,12 @@ async def terminal_ws(websocket: WebSocket, terminal_id: str):
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         await websocket.close(code=4004, reason="Terminal not found")
+        return
+    workspace = get_writable_work_context_by_session(
+        metadata.get("session_id") or f"legacy:{metadata['tmux_session']}"
+    )
+    if workspace is not None and workspace.get("state") in {"retiring", "retired"}:
+        await websocket.close(code=4009, reason="Workspace retired")
         return
 
     session_name = metadata["tmux_session"]

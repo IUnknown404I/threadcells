@@ -39,9 +39,11 @@ from cli_agent_orchestrator.clients.database import (
     get_inbox_messages,
     get_pending_messages,
     get_terminal_metadata,
+    get_terminal_provider_last_response,
     init_db,
     list_flows,
     list_terminals_by_session,
+    persist_terminal_provider_last_response,
     reserve_writable_work_context,
     terminal_auth_token_matches,
     transition_writable_work_context,
@@ -110,6 +112,10 @@ class TestTerminalOperations:
             "runtime_operation_expires_at",
             "provider_resume_identity",
             "provider_resume_runtime_generation",
+            "provider_last_response_identity",
+            "provider_last_response",
+            "provider_last_response_offset",
+            "provider_last_response_at",
             "recovery_fenced_at",
             "recovery_fenced_reason",
             "recovery_takeover_id",
@@ -431,6 +437,51 @@ class TestTerminalOperations:
             assert [(row.provider_session_id, row.terminal_id, row.source) for row in bindings] == [
                 (identity, "managed", "managed_runtime_ready_v1")
             ]
+
+    def test_provider_last_response_cache_is_exact_and_monotonic(self, test_db, monkeypatch):
+        identity = "01234567-89ab-cdef-0123-456789abcdef"
+        monkeypatch.setattr(database_client, "SessionLocal", test_db)
+        monkeypatch.setattr(database_client, "_terminal_authority_schema_ready", True)
+        with test_db() as db:
+            db.add(
+                TerminalModel(
+                    id="managed-response",
+                    tmux_session="session",
+                    tmux_window="agent",
+                    provider="codex",
+                    provider_resume_identity=identity,
+                )
+            )
+            db.commit()
+
+        assert persist_terminal_provider_last_response(
+            "managed-response",
+            provider="codex",
+            provider_session_id=identity,
+            completion_offset=120,
+            response="latest completed response",
+        )
+        assert not persist_terminal_provider_last_response(
+            "managed-response",
+            provider="codex",
+            provider_session_id=identity,
+            completion_offset=100,
+            response="stale response",
+        )
+        assert (
+            get_terminal_provider_last_response(
+                "managed-response", provider="codex", provider_session_id=identity
+            )
+            == "latest completed response"
+        )
+        assert (
+            get_terminal_provider_last_response(
+                "managed-response",
+                provider="codex",
+                provider_session_id="fedcba98-7654-3210-fedc-ba9876543210",
+            )
+            is None
+        )
 
     def test_provider_resume_identity_existing_only_cannot_introduce_identity(
         self, test_db, monkeypatch

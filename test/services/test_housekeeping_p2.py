@@ -203,6 +203,31 @@ def test_unreadable_file_is_deleted_without_read_permission_after_quarantine(tmp
     assert not list(candidate_path.parent.glob(".threadcells-housekeeping-*"))
 
 
+def test_terminal_log_compression_precomputes_bounded_output_sidecars(tmp_path):
+    candidate_path = tmp_path / "state/cao/logs/terminal/terminal-1.log"
+    candidate_path.parent.mkdir(parents=True)
+    candidate_path.write_bytes((b"durable output\n" * 100_000))
+    fingerprint, size = candidate_fingerprint(candidate_path)
+    candidate = HousekeepingCandidate(
+        category="logs",
+        path=str(candidate_path),
+        canonical_identity=f"logs:{candidate_path}",
+        fingerprint=fingerprint,
+        bytes=size,
+        estimated_reclaim_bytes=size,
+        action="compress",
+        retention_reason="test",
+    )
+
+    reclaimed = housekeeping_executor._execute_candidate(candidate_path, candidate)
+
+    assert reclaimed > 0
+    assert not candidate_path.exists()
+    assert candidate_path.with_suffix(".log.gz").is_file()
+    assert candidate_path.with_suffix(".log.tci").is_file()
+    assert candidate_path.with_suffix(".log.tcd").is_file()
+
+
 def test_interrupted_log_quarantine_is_replanned_and_reclaimed(tmp_path, monkeypatch):
     quarantine = tmp_path / "state/cao/logs/.threadcells-housekeeping-crash"
     quarantine.mkdir(parents=True, mode=0o700)

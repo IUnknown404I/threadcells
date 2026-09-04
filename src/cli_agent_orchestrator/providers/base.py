@@ -161,6 +161,15 @@ class BaseProvider(ABC):
         """
         return None
 
+    def durable_last_response_is_authoritative(self) -> bool:
+        """Return whether a missing native response must fail closed.
+
+        Providers with an exact completion stream override this so a newer
+        in-progress terminal tail can never masquerade as the last completed
+        response when the bounded native lookup is temporarily unavailable.
+        """
+        return False
+
     @abstractmethod
     def exit_cli(self) -> str:
         """Get the command to exit the provider CLI.

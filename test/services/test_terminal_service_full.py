@@ -25,6 +25,9 @@ from cli_agent_orchestrator.providers.codex import (
     CodexStartupNoReadyError,
     ProviderError,
 )
+from cli_agent_orchestrator.services.compressed_output_index import (
+    precompute_compressed_output_index,
+)
 from cli_agent_orchestrator.services.terminal_service import (
     LAST_OUTPUT_READ_MAX_BYTES,
     LAST_OUTPUT_RESPONSE_MAX_BYTES,
@@ -107,6 +110,20 @@ def test_human_output_applies_c1_cursor_and_erase_semantics():
     raw = "\x9b4;1HWorking\x9bK\x9b4;1HDone\x9bK"
 
     assert _sanitize_human_terminal_output(raw) == "Done"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("abc\x1b7def\x1b8X", "abcXef"),
+        ("one\x1bEtwo", "one\ntwo"),
+        ("A\tB\rXX", "XX      B"),
+        ("\n\nhello\rX", "\n\nXello"),
+        ("界B\rX", "X B"),
+    ],
+)
+def test_human_output_applies_esc_tab_wide_and_leading_row_semantics(raw, expected):
+    assert _sanitize_human_terminal_output(raw) == expected
 
 
 def test_human_output_semantic_expansion_stays_bounded():
@@ -2796,6 +2813,52 @@ class TestSendInput:
         mock_release.assert_called_once_with("test1234", 42)
         wake.assert_called_once_with(None)
 
+    @patch("cli_agent_orchestrator.services.terminal_service.release_provider_execution")
+    @patch("cli_agent_orchestrator.services.operations_service.acquire_provider_execution_slot")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_fences_retry_after_receipt_without_releasing_admitted_execution(
+        self, mock_get_metadata, mock_tmux, mock_pm, mock_acquire, mock_release
+    ):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "supervisor-window",
+            "runtime_lifecycle": "running",
+        }
+        mock_pm.get_provider.return_value.paste_enter_count = 1
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.acquire_terminal_runtime_transport",
+                return_value="transport-token",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.workflow_turn_transport_fence",
+                return_value=nullcontext(False),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.has_admitted_workflow_turn",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.release_terminal_runtime_operation",
+                return_value=True,
+            ),
+            pytest.raises(RuntimeError, match="fenced before provider transport"),
+        ):
+            send_input(
+                "test1234",
+                "task",
+                logical_turn_id=42,
+                workflow_turn_claim_token="claim-token",
+                workflow_turn_claim_generation=2,
+            )
+
+        mock_acquire.assert_called_once_with("test1234", 42)
+        mock_tmux.send_keys.assert_not_called()
+        mock_release.assert_not_called()
+
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch(
         "cli_agent_orchestrator.services.terminal_service.bind_workflow_turn_provider_outcome_cursor"
@@ -3081,6 +3144,9 @@ class TestGetOutput:
         self._durable_terminal(monkeypatch, tmp_path)
         with gzip.open(tmp_path / "test1234.log.gz", "wb") as stream:
             stream.write(b"latest compressed response")
+        precompute_compressed_output_index(
+            tmp_path / "test1234.log.gz", expected_raw_size=len(b"latest compressed response")
+        )
         provider = MagicMock()
         provider.extract_last_message_from_script.return_value = "latest compressed response"
         monkeypatch.setattr(
@@ -3108,6 +3174,32 @@ class TestGetOutput:
         assert get_output("test1234", OutputMode.LAST) == "bounded actual latest response"
         provider.extract_last_message_from_script.assert_not_called()
         assert not (tmp_path / "test1234.log.tci").exists()
+
+    def test_authoritative_provider_last_response_never_falls_back_to_active_tail(
+        self, monkeypatch, tmp_path
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+            lambda _terminal_id: {
+                "id": "test1234",
+                "provider": "codex",
+                "provider_resume_identity": "exact-provider-session",
+            },
+        )
+        (tmp_path / "test1234.log").write_text(
+            "newer in-progress provider output", encoding="utf-8"
+        )
+        provider = MagicMock()
+        provider.durable_last_response_is_authoritative.return_value = True
+        provider.get_durable_last_response.return_value = None
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.provider_manager.get_provider",
+            lambda *_: provider,
+        )
+
+        assert get_output("test1234", OutputMode.LAST) == ""
+        provider.extract_last_message_from_script.assert_not_called()
 
     def test_full_output_pages_newest_first_without_gaps_or_overlap(self, monkeypatch, tmp_path):
         self._durable_terminal(monkeypatch, tmp_path)
@@ -3418,6 +3510,9 @@ class TestGetOutput:
         )
         with gzip.open(tmp_path / "test1234.log.gz", "wb") as stream:
             stream.write(expected)
+        precompute_compressed_output_index(
+            tmp_path / "test1234.log.gz", expected_raw_size=len(expected)
+        )
 
         cursor = None
         chunks = []
@@ -3436,10 +3531,38 @@ class TestGetOutput:
         assert (tmp_path / "test1234.log.tci").is_file()
         assert (tmp_path / "test1234.log.tcd").is_file()
 
+    def test_precomputed_512_mib_compressed_history_opens_with_bounded_page_reads(
+        self, monkeypatch, tmp_path
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        path = tmp_path / "test1234.log.gz"
+        block = b"x" * (1024 * 1024)
+        with gzip.open(path, "wb", compresslevel=1) as stream:
+            for _ in range(512):
+                stream.write(block)
+        precompute_compressed_output_index(path, expected_raw_size=512 * 1024 * 1024)
+
+        original_pread = os.pread
+        reads = []
+
+        def tracked_pread(descriptor, count, offset):
+            reads.append((count, offset))
+            return original_pread(descriptor, count, offset)
+
+        monkeypatch.setattr(os, "pread", tracked_pread)
+        chunk = get_output_chunk("test1234")
+
+        assert chunk.snapshot_size == 512 * 1024 * 1024
+        assert len(chunk.output.encode()) <= OUTPUT_CHUNK_MAX_BYTES
+        assert max(count for count, _offset in reads) <= OUTPUT_CHUNK_MAX_BYTES + 4096
+
     def test_compressed_cursor_rejects_replaced_history(self, monkeypatch, tmp_path):
         self._durable_terminal(monkeypatch, tmp_path)
         path = tmp_path / "test1234.log.gz"
         path.write_bytes(gzip.compress(b"older\n" + b"x" * OUTPUT_CHUNK_MAX_BYTES))
+        precompute_compressed_output_index(
+            path, expected_raw_size=len(b"older\n") + OUTPUT_CHUNK_MAX_BYTES
+        )
         first = get_output_chunk("test1234")
         assert first.cursor is not None
 
@@ -3460,12 +3583,39 @@ class TestGetOutput:
         source = member * member_count
         assert len(source) > 256 * 1024
         (tmp_path / "test1234.log.gz").write_bytes(source)
+        precompute_compressed_output_index(tmp_path / "test1234.log.gz", expected_raw_size=0)
 
         chunk = get_output_chunk("test1234")
 
         assert chunk.output == ""
         assert chunk.has_older is False
         assert chunk.snapshot_size == 0
+
+    def test_compressed_output_request_never_builds_a_missing_high_ratio_index(
+        self, monkeypatch, tmp_path
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        path = tmp_path / "test1234.log.gz"
+        path.write_bytes(gzip.compress(b"x" * (32 * 1024 * 1024)))
+
+        with pytest.raises(TerminalOutputUnavailable, match="bounded pagination index"):
+            get_output_chunk("test1234")
+
+        assert not (tmp_path / "test1234.log.tci").exists()
+        assert not (tmp_path / "test1234.log.tcd").exists()
+
+    def test_precompute_rejects_high_ratio_history_beyond_exact_source_ceiling(
+        self, monkeypatch, tmp_path
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        path = tmp_path / "test1234.log.gz"
+        path.write_bytes(gzip.compress(b"x" * (32 * 1024 * 1024)))
+
+        with pytest.raises(OSError, match="exact source size"):
+            precompute_compressed_output_index(path, expected_raw_size=1024 * 1024)
+
+        assert not (tmp_path / "test1234.log.tci").exists()
+        assert not (tmp_path / "test1234.log.tcd").exists()
 
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
@@ -3505,7 +3655,9 @@ class TestGetOutput:
 
         result = get_output("test1234", OutputMode.FULL)
 
-        assert result == "Привет, мир\nТекст\tданные"
+        # ESC M is reverse-index, not decoration: after LF it returns to the
+        # preceding row, where the later text and tab overwrite the old frame.
+        assert result == "Текст\tданные"
         assert "\x1b" not in result
 
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")

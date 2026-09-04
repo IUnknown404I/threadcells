@@ -3635,6 +3635,50 @@ def test_f13_settled_unreceipted_ordinary_inbox_restores_same_transport(workflow
         assert lease is not None and lease.workflow_turn_id == turn_id
 
 
+def test_f13_late_receipt_fences_already_claimed_settled_retry(workflow_db):
+    root = "root-receipt-after-retry-claim"
+    _ensure_running_test_terminal(root)
+    inbox, turn_id = _pending_inbox_turn(root, "one durable transport")
+    assert activate_workflow_turn_for_inbox(inbox.id) == turn_id
+    original = claim_workflow_turn(root, inbox_message_id=inbox.id)
+    assert original is not None
+    assert mark_workflow_turn_sent(turn_id, original["claim_token"], original["claim_generation"])
+    assert database.update_pending_message_status(inbox.id, database.MessageStatus.DELIVERED)
+    assert database.acquire_provider_execution(root, turn_id, 3)
+    assert database.release_provider_execution(root, turn_id)
+    assert database.requeue_settled_unadmitted_workflow_turn(root, turn_id)
+
+    retry = claim_workflow_turn(root, inbox_message_id=inbox.id)
+    assert retry is not None
+    assert retry["id"] == turn_id
+    assert database.acquire_provider_execution(root, turn_id, 3)
+    operation_token = database.acquire_terminal_runtime_transport(root)
+    assert operation_token is not None
+
+    # The original model execution receipts after the dispatcher claimed its
+    # same-turn retry. Receipt admission atomically invalidates that claimant,
+    # so its mandatory renewal and mark-sent fences cannot authorize another
+    # physical transport.
+    assert claim_workflow_turn_receipt(root, turn_id)
+    assert not renew_workflow_turn_claim(turn_id, retry["claim_token"], retry["claim_generation"])
+    assert not mark_workflow_turn_sent(turn_id, retry["claim_token"], retry["claim_generation"])
+    with database.workflow_turn_transport_fence(
+        root,
+        turn_id,
+        retry["claim_token"],
+        retry["claim_generation"],
+        operation_token,
+    ) as permitted:
+        assert permitted is False
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, turn_id)
+        assert turn.state == "sent"
+        assert turn.claim_token is None
+        assert turn.queue_reason is None
+        assert db.get(InboxModel, inbox.id).status == "delivered"
+        assert db.query(WorkflowTurnReceiptModel).count() == 1
+
+
 @pytest.mark.parametrize("exact_authority", (False, True))
 def test_f13_settled_unreceipted_handoff_recovery_restores_same_transport(
     workflow_db,

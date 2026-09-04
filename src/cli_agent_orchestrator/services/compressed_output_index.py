@@ -1,4 +1,9 @@
-"""Persistent bounded random access for immutable gzip terminal history."""
+"""Precomputed bounded random access for immutable gzip terminal history.
+
+Index construction is deliberately a Housekeeping/compression operation. An
+interactive Output request only validates and opens already-published sidecars;
+it never inflates historical gzip content or starts background indexing work.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 CHUNK_BYTES = 256 * 1024
-MAX_INDEXED_RAW_BYTES = 64 * 1024 * 1024 * 1024
+MAX_INDEXED_RAW_BYTES = 8 * 1024 * 1024 * 1024
 _MAGIC = b"TCGZIDX1"
 _VERSION = 1
 _HEADER = struct.Struct(">8sBQQQQQII")
@@ -84,9 +89,17 @@ class CompressedOutputIndex:
                 raise OSError("compressed output data is incomplete")
             inflater = zlib.decompressobj()
             raw = inflater.decompress(compressed, raw_size + 1)
-            raw += inflater.flush()
-            if len(raw) != raw_size or not inflater.eof or inflater.unused_data:
+            # Do not call ``flush`` while compressed input remains: on a corrupt
+            # high-ratio sidecar that would discard the output ceiling above.
+            if (
+                len(raw) != raw_size
+                or inflater.unconsumed_tail
+                or not inflater.eof
+                or inflater.unused_data
+            ):
                 raise OSError("compressed output data failed validation")
+            if inflater.flush():
+                raise OSError("compressed output data has trailing output")
             left = max(start, raw_start) - raw_start
             right = min(start + length, raw_start + raw_size) - raw_start
             output.extend(raw[left:right])
@@ -174,6 +187,7 @@ def _build(
     terminal_id: str,
     source_descriptor: int,
     source: os.stat_result,
+    expected_raw_size: int,
 ) -> None:
     token = secrets.token_hex(8)
     index_temp = f".{terminal_id}.{token}.tci"
@@ -193,8 +207,8 @@ def _build(
                 raw = stream.read(CHUNK_BYTES)
                 if not raw:
                     break
-                if raw_offset + len(raw) > MAX_INDEXED_RAW_BYTES:
-                    raise OSError("compressed terminal output exceeds the indexing ceiling")
+                if raw_offset + len(raw) > expected_raw_size:
+                    raise OSError("compressed terminal output exceeds its exact source size")
                 compressed = zlib.compress(raw, level=1)
                 _write_all(data_descriptor, compressed)
                 _write_all(
@@ -204,6 +218,8 @@ def _build(
                 raw_offset += len(raw)
                 data_offset += len(compressed)
                 chunk_count += 1
+        if raw_offset != expected_raw_size:
+            raise OSError("compressed terminal output does not match its exact source size")
         if _source_identity(os.fstat(source_descriptor)) != _source_identity(source):
             raise OSError("compressed terminal output changed while indexing")
         header = _HEADER.pack(
@@ -219,6 +235,8 @@ def _build(
         )
         if os.pwrite(index_descriptor, header, 0) != len(header):
             raise OSError("compressed output index header write was incomplete")
+        for descriptor in (data_descriptor, index_descriptor):
+            os.utime(descriptor, ns=(source.st_atime_ns, source.st_mtime_ns))
         os.fsync(data_descriptor)
         os.fsync(index_descriptor)
         os.close(data_descriptor)
@@ -253,14 +271,47 @@ def open_compressed_output_index(
     source_descriptor: int,
     source: os.stat_result,
 ) -> CompressedOutputIndex:
-    """Open or create the exact source's persistent page index."""
+    """Open a precomputed page index without doing source-sized work."""
+    del source_descriptor  # The caller-owned descriptor only binds ``source``.
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
     if hasattr(os, "O_NOFOLLOW"):
         directory_flags |= os.O_NOFOLLOW
+    directory_fd = os.open(directory, directory_flags)
+    try:
+        opened = _open_valid(directory_fd, terminal_id, source)
+        if opened is None:
+            raise OSError("compressed output index has not been precomputed")
+        return opened
+    finally:
+        os.close(directory_fd)
+
+
+def precompute_compressed_output_index(
+    source_path: Path, *, expected_raw_size: int
+) -> tuple[Path, Path]:
+    """Build page sidecars during canonical compression, never during viewing."""
+    if not 0 <= expected_raw_size <= MAX_INDEXED_RAW_BYTES:
+        raise ValueError("compressed terminal output exceeds the indexing ceiling")
+    if source_path.name.endswith(".log.gz"):
+        terminal_id = source_path.name[: -len(".log.gz")]
+    else:
+        raise ValueError("compressed terminal history must end with .log.gz")
+    if not terminal_id or "/" in terminal_id or terminal_id in {".", ".."}:
+        raise ValueError("compressed terminal history has an invalid identity")
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    source_flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+        source_flags |= os.O_NOFOLLOW
     with _lock_for(terminal_id):
-        directory_fd = os.open(directory, directory_flags)
-        lock_descriptor = -1
+        directory_fd = os.open(source_path.parent, directory_flags)
+        source_descriptor = lock_descriptor = -1
         try:
+            source_descriptor = os.open(source_path.name, source_flags, dir_fd=directory_fd)
+            source = os.fstat(source_descriptor)
+            if not stat.S_ISREG(source.st_mode):
+                raise OSError("compressed terminal output is not a regular file")
             lock_flags = os.O_RDWR | os.O_CREAT | os.O_CLOEXEC
             if hasattr(os, "O_NOFOLLOW"):
                 lock_flags |= os.O_NOFOLLOW
@@ -275,13 +326,32 @@ def open_compressed_output_index(
             fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
             opened = _open_valid(directory_fd, terminal_id, source)
             if opened is not None:
-                return opened
-            _build(directory_fd, terminal_id, source_descriptor, source)
-            opened = _open_valid(directory_fd, terminal_id, source)
-            if opened is None:
-                raise OSError("compressed output index publication failed")
-            return opened
+                try:
+                    if opened.raw_size != expected_raw_size:
+                        raise OSError(
+                            "compressed terminal output index has a different source size"
+                        )
+                finally:
+                    opened.close()
+            else:
+                _build(
+                    directory_fd,
+                    terminal_id,
+                    source_descriptor,
+                    source,
+                    expected_raw_size,
+                )
+                opened = _open_valid(directory_fd, terminal_id, source)
+                if opened is None:
+                    raise OSError("compressed output index publication failed")
+                opened.close()
+            return (
+                source_path.parent / f"{terminal_id}.log.tci",
+                source_path.parent / f"{terminal_id}.log.tcd",
+            )
         finally:
             if lock_descriptor >= 0:
                 os.close(lock_descriptor)
+            if source_descriptor >= 0:
+                os.close(source_descriptor)
             os.close(directory_fd)

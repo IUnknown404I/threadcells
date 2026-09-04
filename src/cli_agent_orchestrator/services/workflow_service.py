@@ -474,6 +474,8 @@ def _reconcile_root_workflow_with_admission(
                 sender_id="cao-workflow",
                 orchestration_type=OrchestrationType.SEND_MESSAGE,
                 logical_turn_id=turn["id"],
+                workflow_turn_claim_token=turn["claim_token"],
+                workflow_turn_claim_generation=turn["claim_generation"],
             )
         if heartbeat.lost or not mark_workflow_turn_sent(
             turn["id"], turn["claim_token"], turn["claim_generation"], now=now

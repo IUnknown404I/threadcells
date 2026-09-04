@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, cast
@@ -131,6 +132,13 @@ class TerminalModel(Base):
     # replace it from provider-global state.
     provider_resume_identity = Column(String, nullable=True)
     provider_resume_runtime_generation = Column(String, nullable=True)
+    # Bounded provider-native response cache. It is readable only through an
+    # exact provider/session binding and cannot be replaced by terminal-tail
+    # inference from a newer in-progress turn.
+    provider_last_response_identity = Column(String, nullable=True)
+    provider_last_response = Column(Text, nullable=True)
+    provider_last_response_offset = Column(Integer, nullable=True)
+    provider_last_response_at = Column(DateTime, nullable=True)
     # Exactly one operation may mutate a live pane at a time.  Provider
     # execution capacity is deliberately separate: status observation may
     # release that capacity while a physical paste is still completing.
@@ -3196,6 +3204,7 @@ def _migrate_terminal_worktree_authority_columns() -> bool:
             "runtime_operation_token",
             "provider_resume_identity",
             "provider_resume_runtime_generation",
+            "provider_last_response_identity",
             "recovery_fenced_reason",
             "recovery_takeover_id",
             "replaced_by_terminal_id",
@@ -3208,6 +3217,7 @@ def _migrate_terminal_worktree_authority_columns() -> bool:
             "runtime_operation_claimed_at",
             "runtime_operation_expires_at",
             "recovery_fenced_at",
+            "provider_last_response_at",
         ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE terminals ADD COLUMN {name} DATETIME")
@@ -3216,9 +3226,12 @@ def _migrate_terminal_worktree_authority_columns() -> bool:
             "runtime_process_start_ticks",
             "runtime_process_group_id",
             "runtime_process_session_id",
+            "provider_last_response_offset",
         ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE terminals ADD COLUMN {name} INTEGER")
+        if "provider_last_response" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN provider_last_response TEXT")
         if "creation_order" not in columns:
             conn.execute("ALTER TABLE terminals ADD COLUMN creation_order INTEGER")
         conn.execute(
@@ -5909,6 +5922,74 @@ def bind_terminal_provider_resume_identity(
             db.rollback()
             return False
         return True
+
+
+def persist_terminal_provider_last_response(
+    terminal_id: str,
+    *,
+    provider: str,
+    provider_session_id: str,
+    completion_offset: int,
+    response: str,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Cache one latest completed provider response under exact session authority."""
+    if (
+        not terminal_id
+        or not provider
+        or not provider_session_id
+        or completion_offset < 0
+        or not response.strip()
+    ):
+        return False
+    _ensure_terminal_worktree_authority_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.get(TerminalModel, terminal_id)
+        if (
+            terminal is None
+            or terminal.provider != provider
+            or terminal.provider_resume_identity != provider_session_id
+        ):
+            db.rollback()
+            return False
+        if (
+            terminal.provider_last_response_identity == provider_session_id
+            and terminal.provider_last_response_offset is not None
+        ):
+            current_offset = cast(int, terminal.provider_last_response_offset)
+            if current_offset > completion_offset:
+                db.rollback()
+                return False
+            if current_offset == completion_offset:
+                matches = cast(Optional[str], terminal.provider_last_response) == response
+                db.rollback()
+                return matches
+        terminal.provider_last_response_identity = provider_session_id
+        terminal.provider_last_response = response
+        terminal.provider_last_response_offset = completion_offset
+        terminal.provider_last_response_at = now
+        db.commit()
+        return True
+
+
+def get_terminal_provider_last_response(
+    terminal_id: str, *, provider: str, provider_session_id: str
+) -> Optional[str]:
+    """Read a cached completion only for the terminal's current exact session."""
+    _ensure_terminal_worktree_authority_schema()
+    with SessionLocal() as db:
+        terminal = db.get(TerminalModel, terminal_id)
+        if (
+            terminal is None
+            or terminal.provider != provider
+            or terminal.provider_resume_identity != provider_session_id
+            or terminal.provider_last_response_identity != provider_session_id
+            or not terminal.provider_last_response
+        ):
+            return None
+        return str(terminal.provider_last_response)
 
 
 def replace_starting_terminal_runtime_identity(
@@ -9992,7 +10073,8 @@ def _bind_receipted_provider_execution(
     if turn.workflow_id != workflow.id or workflow.active_turn_id != turn.id:
         return "duplicate_or_closed_workflow"
     settled_before_receipt = (
-        turn.state == TURN_QUEUED and turn.queue_reason == "PROVIDER_SETTLED_BEFORE_RECEIPT"
+        turn.state in {TURN_QUEUED, TURN_CLAIMED}
+        and turn.queue_reason == "PROVIDER_SETTLED_BEFORE_RECEIPT"
     )
     if turn.state not in {TURN_CLAIMED, TURN_SENT} and not settled_before_receipt:
         return "workflow_turn_not_dispatched"
@@ -10060,7 +10142,11 @@ def _bind_receipted_provider_execution(
 
     if settled_before_receipt:
         # The semantic receipt supersedes the settled-before-receipt retry
-        # envelope. It does not create a successor or alter result authority.
+        # envelope. This includes a retry which the dispatcher has already
+        # claimed: clearing its exact token under the same BEGIN IMMEDIATE
+        # transaction makes the sender's mandatory renewal/mark-sent fences
+        # fail before a second transport. It does not create a successor or
+        # alter result authority.
         turn.state = TURN_SENT
         turn.queue_reason = None
         turn.claim_token = None
@@ -12909,6 +12995,69 @@ def renew_workflow_turn_claim(
         if renewed:
             db.commit()
         return renewed == 1
+
+
+@contextmanager
+def workflow_turn_transport_fence(
+    root_terminal_id: str,
+    turn_id: int,
+    claim_token: str,
+    claim_generation: int,
+    runtime_operation_token: str,
+    now: Optional[datetime] = None,
+):
+    """Serialize the final retry-send boundary against receiver admission.
+
+    SQLite's write transaction spans only the final short tmux transport. If
+    a late receipt commits first, this claimant observes its cleared token and
+    cannot send. If this fence wins, the physical send occurs before receipt
+    admission can commit, preserving a single causal order at that boundary.
+    """
+    _ensure_workflow_schema()
+    _ensure_provider_execution_schema()
+    _ensure_terminal_worktree_authority_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        turn = db.get(WorkflowTurnModel, turn_id)
+        workflow = db.get(WorkflowModel, turn.workflow_id) if turn is not None else None
+        terminal = db.get(TerminalModel, root_terminal_id)
+        lease = db.get(ProviderExecutionLeaseModel, root_terminal_id)
+        receipted = (
+            db.query(WorkflowTurnReceiptModel.id)
+            .filter_by(
+                workflow_turn_id=turn_id,
+                receiver_terminal_id=root_terminal_id,
+            )
+            .first()
+            is not None
+        )
+        permitted = bool(
+            turn is not None
+            and _claim_matches(turn, claim_token, claim_generation, now)
+            and workflow is not None
+            and workflow.status == WORKFLOW_OPEN
+            and workflow.root_terminal_id == root_terminal_id
+            and workflow.active_turn_id == turn_id
+            and terminal is not None
+            and terminal.runtime_operation_kind == "transport"
+            and terminal.runtime_operation_token == runtime_operation_token
+            and lease is not None
+            and lease.workflow_turn_id == turn_id
+            and not receipted
+        )
+        if not permitted:
+            db.rollback()
+            yield False
+            return
+        turn.updated_at = now
+        try:
+            yield True
+        except Exception:
+            db.rollback()
+            raise
+        else:
+            db.commit()
 
 
 def mark_workflow_turn_sent(

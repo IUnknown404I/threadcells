@@ -63,6 +63,7 @@ from cli_agent_orchestrator.clients.database import (
     get_workflow_provider_reconnect_runtime_ready,
     get_workflow_turn_provider_outcome_cursor_bootstrap,
     get_writable_work_context_by_request,
+    has_admitted_workflow_turn,
     list_all_terminals,
     mark_handoff_child_input_received,
     mark_recovery_takeover_completed,
@@ -91,6 +92,7 @@ from cli_agent_orchestrator.clients.database import (
     transition_writable_work_context,
     update_last_active,
     validate_owner_launch_grant,
+    workflow_turn_transport_fence,
 )
 from cli_agent_orchestrator.clients.tmux import PaneTargetError, tmux_client
 from cli_agent_orchestrator.constants import SESSION_PREFIX, TERMINAL_LOG_DIR
@@ -3014,6 +3016,8 @@ def send_input(
     orchestration_type: OrchestrationType | None = None,
     logical_turn_id: int | None = None,
     runtime_operation_claim_token: str | None = None,
+    workflow_turn_claim_token: str | None = None,
+    workflow_turn_claim_generation: int | None = None,
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
 
@@ -3086,15 +3090,40 @@ def send_input(
                     terminal_id, logical_turn_id, outcome_cursor
                 ):
                     raise RuntimeError("provider outcome boundary lost workflow-turn ownership")
-            tmux_client.send_keys(
-                metadata["tmux_session"],
-                metadata["tmux_window"],
-                message,
-                enter_count=enter_count,
-            )
+
+            def transport() -> None:
+                tmux_client.send_keys(
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    message,
+                    enter_count=enter_count,
+                )
+
+            if (
+                logical_turn_id is not None
+                and workflow_turn_claim_token is not None
+                and workflow_turn_claim_generation is not None
+            ):
+                assert runtime_operation_token is not None
+                with workflow_turn_transport_fence(
+                    terminal_id,
+                    logical_turn_id,
+                    workflow_turn_claim_token,
+                    workflow_turn_claim_generation,
+                    runtime_operation_token,
+                ) as permitted:
+                    if not permitted:
+                        raise RuntimeError("workflow turn was fenced before provider transport")
+                    transport()
+            else:
+                transport()
             transport_accepted = True
         finally:
-            if execution_acquired and not transport_accepted:
+            receipted_execution = bool(
+                logical_turn_id is not None
+                and has_admitted_workflow_turn(terminal_id, logical_turn_id)
+            )
+            if execution_acquired and not transport_accepted and not receipted_execution:
                 provider_execution_released = release_provider_execution(
                     terminal_id, logical_turn_id
                 )
@@ -3558,16 +3587,25 @@ def _get_compressed_output_chunk(
     source: os.stat_result,
     cursor: str | None,
 ) -> TerminalOutputChunk:
-    index = open_compressed_output_index(TERMINAL_LOG_DIR, terminal_id, descriptor, source)
+    decoded_cursor = _decode_output_cursor(cursor) if cursor is not None else None
+    if decoded_cursor is not None and decoded_cursor[:2] != (source.st_dev, source.st_ino):
+        raise TerminalOutputCursorError(
+            "Output source changed after the viewer opened", "OUTPUT_CURSOR_STALE"
+        )
+    try:
+        index = open_compressed_output_index(TERMINAL_LOG_DIR, terminal_id, descriptor, source)
+    except OSError as exc:
+        raise TerminalOutputUnavailable(
+            "Compressed terminal output has no bounded pagination index"
+        ) from exc
     try:
         if cursor is None:
             snapshot_size = index.raw_size
             before_offset = snapshot_size
             expected_end_state = None
         else:
-            device, inode, snapshot_size, before_offset, expected_end_state = _decode_output_cursor(
-                cursor
-            )
+            assert decoded_cursor is not None
+            device, inode, snapshot_size, before_offset, expected_end_state = decoded_cursor
             if (device, inode) != (source.st_dev, source.st_ino) or snapshot_size != index.raw_size:
                 raise TerminalOutputCursorError(
                     "Output source changed after the viewer opened", "OUTPUT_CURSOR_STALE"
@@ -3735,19 +3773,41 @@ def get_output_chunk(terminal_id: str, cursor: str | None = None) -> TerminalOut
 
 def _get_last_output(terminal_id: str) -> str:
     provider = None
+    metadata = get_terminal_metadata(terminal_id)
+    exact_native_identity = bool(
+        metadata
+        and metadata.get("provider") == "codex"
+        and isinstance(metadata.get("provider_resume_identity"), str)
+    )
+    authoritative_native_response = exact_native_identity
     try:
         provider = provider_manager.get_provider(terminal_id)
+        native_authority = getattr(provider, "durable_last_response_is_authoritative", None)
+        if callable(native_authority) and exact_native_identity:
+            authoritative_native_response = native_authority() is True
         durable_response = provider.get_durable_last_response() if provider is not None else None
         if isinstance(durable_response, str) and durable_response.strip():
             rendered = _sanitize_human_terminal_output(durable_response)
             return _bounded_text_suffix(rendered, LAST_OUTPUT_RESPONSE_MAX_BYTES)
     except Exception as exc:
         logger.debug("Provider-native last response unavailable for %s: %s", terminal_id, exc)
+    if authoritative_native_response:
+        # An exact provider session may have an older cached completion beyond
+        # the bounded suffix, but its absence is never permission to expose a
+        # newer in-progress terminal tail as a completed response.
+        return ""
 
     descriptor, source, compressed = _open_durable_output(terminal_id)
     try:
         if compressed:
-            index = open_compressed_output_index(TERMINAL_LOG_DIR, terminal_id, descriptor, source)
+            try:
+                index = open_compressed_output_index(
+                    TERMINAL_LOG_DIR, terminal_id, descriptor, source
+                )
+            except OSError as exc:
+                raise TerminalOutputUnavailable(
+                    "Compressed terminal output has no bounded pagination index"
+                ) from exc
             try:
                 _, payload = _bounded_index_suffix_bytes(
                     index,

@@ -31,6 +31,8 @@ class ParserState(IntEnum):
 
 _CSI_PATTERN = re.compile(r"(?:\x1b\[|\x9b)([0-9:;<=>?]*)([ -/]*)([@-~])")
 _SCREEN_FINALS = frozenset("@ABCDEFGHJKLMPSTX`abcdefgrsu")
+_ESC_SCREEN_FINALS = frozenset("78DEM")
+_TAB_CONTINUATION = "\x00"
 MAX_VIEWPORT_ROWS = 200
 MAX_CURSOR_COLUMN = 4_096
 MAX_RENDERED_CHARACTERS = 256 * 1024
@@ -39,6 +41,8 @@ MAX_RENDERED_CHARACTERS = 256 * 1024
 def has_screen_semantics(value: str) -> bool:
     """Return whether a bounded stream contains cursor/screen mutations."""
     if "\b" in value or re.search(r"\r(?!\n)", value):
+        return True
+    if any(f"\x1b{final}" in value for final in _ESC_SCREEN_FINALS):
         return True
     return any(match.group(3) in _SCREEN_FINALS for match in _CSI_PATTERN.finditer(value))
 
@@ -98,15 +102,17 @@ class _Viewport:
         self.collect = False
         self.committed: deque[str] = deque()
         self.committed_characters = 0
+        self.leading_linefeed_rows = 0
 
     @staticmethod
     def _text(row: list[str]) -> str:
-        return "".join(row).rstrip(" ")
+        return "".join("" if cell == _TAB_CONTINUATION else cell for cell in row).rstrip(" ")
 
     def begin_collecting(self) -> None:
         self.collect = True
         self.committed.clear()
         self.committed_characters = 0
+        self.leading_linefeed_rows = 0
 
     def _commit(self, row: list[str]) -> None:
         if self.collect:
@@ -128,7 +134,14 @@ class _Viewport:
             self.rows.pop(self.scroll_bottom)
             self.rows.insert(self.scroll_top, [])
 
-    def linefeed(self) -> None:
+    def linefeed(self, *, preserve_blank: bool = False) -> None:
+        if (
+            preserve_blank
+            and self.collect
+            and not self.committed
+            and not any(self._text(row) for row in self.rows[: self.row + 1])
+        ):
+            self.leading_linefeed_rows = max(self.leading_linefeed_rows, self.row + 1)
         if self.row == self.scroll_bottom:
             self._scroll_up()
         else:
@@ -139,13 +152,25 @@ class _Viewport:
         if width == 0:
             if self.column > 0 and self.rows[self.row]:
                 index = min(self.column - 1, len(self.rows[self.row]) - 1)
-                self.rows[self.row][index] += character
+                while index >= 0 and self.rows[self.row][index] in {
+                    "",
+                    _TAB_CONTINUATION,
+                }:
+                    index -= 1
+                if index >= 0:
+                    self.rows[self.row][index] += character
             return
         if self.column >= MAX_CURSOR_COLUMN:
             return
         row = self.rows[self.row]
         if len(row) < self.column:
             row.extend(" " for _ in range(self.column - len(row)))
+        # A zero-width sentinel is the second cell of a wide glyph. Replacing
+        # either half must first clear the old glyph so no orphaned display
+        # cell survives an overwrite.
+        self._clear_cell(row, self.column)
+        if width == 2:
+            self._clear_cell(row, self.column + 1)
         if self.column < len(row):
             row[self.column] = character
         else:
@@ -156,6 +181,48 @@ class _Viewport:
             else:
                 row.append("")
         self.column = min(MAX_CURSOR_COLUMN, self.column + width)
+
+    @staticmethod
+    def _clear_cell(row: list[str], column: int) -> None:
+        if not 0 <= column < len(row):
+            return
+        if row[column] == "\t":
+            row[column] = " "
+            following = column + 1
+            while following < len(row) and row[following] == _TAB_CONTINUATION:
+                row[following] = " "
+                following += 1
+        elif row[column] == _TAB_CONTINUATION:
+            origin = column - 1
+            while origin >= 0 and row[origin] == _TAB_CONTINUATION:
+                origin -= 1
+            if origin >= 0 and row[origin] == "\t":
+                row[origin] = " "
+                following = origin + 1
+                while following < len(row) and row[following] == _TAB_CONTINUATION:
+                    row[following] = " "
+                    following += 1
+        elif row[column] == "":
+            if column > 0:
+                row[column - 1] = " "
+            row[column] = " "
+        elif _cell_width(row[column][:1]) == 2:
+            if column + 1 < len(row) and row[column + 1] == "":
+                row[column + 1] = " "
+
+    def horizontal_tab(self) -> None:
+        """Advance to the next conventional eight-column terminal tab stop."""
+        target = min(MAX_CURSOR_COLUMN, ((self.column // 8) + 1) * 8)
+        row = self.rows[self.row]
+        if len(row) < target:
+            row.extend(" " for _ in range(target - len(row)))
+        for column in range(self.column, target):
+            self._clear_cell(row, column)
+        if self.column < target:
+            row[self.column] = "\t"
+            for column in range(self.column + 1, target):
+                row[column] = _TAB_CONTINUATION
+        self.column = target
 
     def erase_line(self, mode: int) -> None:
         row = self.rows[self.row]
@@ -248,8 +315,10 @@ class _Viewport:
         lines = list(self.committed)
         if include_screen:
             screen = [self._text(row) for row in self.rows]
-            while screen and not screen[0]:
-                screen.pop(0)
+            leading = 0
+            while leading < len(screen) and not screen[leading]:
+                leading += 1
+            del screen[: max(0, leading - self.leading_linefeed_rows)]
             while screen and not screen[-1]:
                 screen.pop()
             lines.extend(screen)
@@ -382,13 +451,13 @@ def render_terminal_stream(
             # also contain bare LF. Human text treats either form as a fresh
             # line rather than preserving a terminal column indentation.
             viewport.column = 0
-            viewport.linefeed()
+            viewport.linefeed(preserve_blank=True)
             index += 1
         elif character == "\b":
             viewport.column = max(0, viewport.column - 1)
             index += 1
         elif character == "\t":
-            viewport.write("\t")
+            viewport.horizontal_tab()
             index += 1
         elif codepoint < 0x20 or codepoint == 0x7F or 0x80 <= codepoint <= 0x9F:
             index += 1

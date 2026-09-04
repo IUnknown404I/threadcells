@@ -1103,7 +1103,10 @@ def execute_plan(
                                 }
                             )
                             continue
-                        if current.fingerprint != candidate.fingerprint:
+                        if (
+                            dict(candidate.attributes).get("allow_dirty") != "true"
+                            and current.fingerprint != candidate.fingerprint
+                        ):
                             raise RuntimeError("candidate fingerprint changed")
                         reclaimed = retire_session_workspace(candidate)
                         report.freed_bytes += reclaimed

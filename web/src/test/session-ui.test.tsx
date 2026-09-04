@@ -1022,7 +1022,7 @@ describe('session deletion confirmation', () => {
 
     fireEvent.click(await screen.findByTitle('Delete session'))
     expect(await screen.findByText(
-      'The workspace contains unfinished changes. Deleting this Session will permanently discard them.',
+      'The workspace contains unfinished changes. Deleting the Session will permanently delete all unfinished changes in this workspace.',
     )).toBeInTheDocument()
     expect(screen.getByText('Modified files')).toBeInTheDocument()
     expect(screen.getByText('3')).toBeInTheDocument()

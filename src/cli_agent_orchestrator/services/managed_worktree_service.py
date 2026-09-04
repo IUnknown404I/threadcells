@@ -299,14 +299,12 @@ def managed_worktree_status(metadata: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def remove_managed_worktree(
-    metadata: Mapping[str, Any],
-    *,
-    allow_dirty: bool = False,
-    expected_status: Mapping[str, Any] | None = None,
+    metadata: Mapping[str, Any], *, allow_dirty: bool = False
 ) -> dict[str, Any]:
-    """Remove a clean managed worktree without deleting its task branch.
+    """Remove an authorized managed worktree without deleting its task branch.
 
-    Dirty or unverifiable worktrees are retained fail-closed. A task branch is
+    Dirty worktrees require the caller's explicit destructive authority;
+    unverifiable worktrees are always retained fail-closed. A task branch is
     intentionally preserved so committed but not-yet-integrated work remains
     recoverable after terminal retirement.
     """
@@ -315,41 +313,6 @@ def remove_managed_worktree(
         return {"removed": False, "managed": False}
     if not status.get("safe"):
         return {"removed": False, **status}
-    if expected_status is not None:
-        for field in (
-            "path",
-            "source",
-            "kind",
-            "expected_commit",
-            "expected_branch",
-        ):
-            if status.get(field) != expected_status.get(field):
-                return {
-                    "removed": False,
-                    **status,
-                    "reason_code": "WORKSPACE_AUTHORITY_CHANGED",
-                }
-        if not status.get("absent"):
-            if expected_status.get("absent"):
-                return {
-                    "removed": False,
-                    **status,
-                    "reason_code": "WORKSPACE_AUTHORITY_CHANGED",
-                }
-            for field in (
-                "commit",
-                "branch",
-                "clean",
-                "modified_files",
-                "untracked_files",
-                "content_fingerprint",
-            ):
-                if status.get(field) != expected_status.get(field):
-                    return {
-                        "removed": False,
-                        **status,
-                        "reason_code": "WORKSPACE_AUTHORITY_CHANGED",
-                    }
     if not status.get("clean") and not allow_dirty:
         return {
             "removed": False,

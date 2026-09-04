@@ -26,6 +26,7 @@ from typing import Dict, List
 from cli_agent_orchestrator.clients.database import (
     AmbiguousSessionIdentity,
     cancel_workflows_for_terminal,
+    claim_session_workspace_retirement,
     delete_terminals_by_session_lifetime,
     get_session_workspace_retirement_snapshot,
     get_writable_work_context_by_session,
@@ -360,13 +361,39 @@ def delete_session(
 
             # The destructive confirmation covers dirty bytes, never active
             # authority. Any Git identity change still aborts fail-closed.
+            claimed_contexts: dict[str, bool] = {}
             for terminal in terminals:
                 try:
+                    work_context_id = terminal.get("writable_work_context_id")
+                    if work_context_id and str(work_context_id) not in claimed_contexts:
+                        snapshot = get_session_workspace_retirement_snapshot(str(work_context_id))
+                        if snapshot is None:
+                            raise SessionLifecycleError(
+                                "WORKSPACE_NOT_FOUND",
+                                "Managed workspace authority disappeared during deletion",
+                            )
+                        durable_allow_dirty = bool(
+                            snapshot["context"].get("state") == "retiring"
+                            and snapshot["context"].get("retirement_allow_dirty")
+                        )
+                        allow_dirty = bool(confirm_dirty_workspace or durable_allow_dirty)
+                        claim = claim_session_workspace_retirement(
+                            str(work_context_id),
+                            str(snapshot["authority_fingerprint"]),
+                            allow_dirty=allow_dirty,
+                        )
+                        if not claim.get("claimed"):
+                            raise SessionLifecycleError(
+                                str(claim.get("reason_code") or "WORKSPACE_AUTHORITY_CHANGED"),
+                                "Managed workspace authority changed during deletion",
+                            )
+                        claimed_contexts[str(work_context_id)] = allow_dirty
                     cleanup_managed_worktree(
                         terminal,
-                        allow_dirty=bool(confirm_dirty_workspace),
+                        allow_dirty=claimed_contexts.get(
+                            str(work_context_id), bool(confirm_dirty_workspace)
+                        ),
                     )
-                    work_context_id = terminal.get("writable_work_context_id")
                     if work_context_id:
                         from cli_agent_orchestrator.clients.database import (
                             transition_writable_work_context,
@@ -374,7 +401,7 @@ def delete_session(
 
                         transition_writable_work_context(
                             str(work_context_id),
-                            expected_states=("admitted", "preserved"),
+                            expected_states=("admitted", "preserved", "retiring"),
                             state="retired",
                             event_type="managed_worktree_retired",
                         )

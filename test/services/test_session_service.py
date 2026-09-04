@@ -333,7 +333,10 @@ class TestDeleteSession:
     ):
         mock_tmux.session_exists.return_value = False
         retire.return_value = True
-        contexts = self._patch_common(_durable_session(lifecycle="exited"))
+        durable = _durable_session(lifecycle="exited")
+        for terminal in durable["terminals"]:
+            terminal["writable_work_context_id"] = "context-1"
+        contexts = self._patch_common(durable)
         with (
             contexts[0],
             contexts[1],
@@ -354,6 +357,21 @@ class TestDeleteSession:
                     "reason_code": None,
                 },
             ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.get_session_workspace_retirement_snapshot",
+                return_value={
+                    "authority_fingerprint": "exact-session-workspace",
+                    "context": {"state": "admitted", "retirement_allow_dirty": False},
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.claim_session_workspace_retirement",
+                return_value={"claimed": True},
+            ) as claim,
+            patch(
+                "cli_agent_orchestrator.clients.database.transition_writable_work_context",
+                return_value=True,
+            ),
         ):
             with pytest.raises(SessionLifecycleError) as error:
                 delete_session("session-lifetime-1")
@@ -365,8 +383,9 @@ class TestDeleteSession:
 
         assert result["deleted"] == ["cao-test"]
         assert result["retained_resources"] == []
+        claim.assert_called_once_with("context-1", "exact-session-workspace", allow_dirty=True)
         assert cleanup.call_count == 2
-        for terminal in _durable_session(lifecycle="exited")["terminals"]:
+        for terminal in durable["terminals"]:
             cleanup.assert_any_call(terminal, allow_dirty=True)
         delete.assert_called_once_with(
             "session-lifetime-1",

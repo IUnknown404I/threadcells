@@ -21,7 +21,8 @@ export function WorkflowRecoveryNotice({
 }) {
   const { t } = useI18n()
   const queued = agent.queued_task_count || 0
-  if (agent.workflow_status !== 'open' || queued < 1) return null
+  const reconnectRecovery = agent.workflow_recovery_pending === true
+  if (agent.workflow_status !== 'open' || (queued < 1 && !reconnectRecovery)) return null
 
   const agentStatus = t(statusTranslationKey(
     agent.lifecycle === 'exited' || agent.lifecycle === 'recovery_fenced'
@@ -31,7 +32,9 @@ export function WorkflowRecoveryNotice({
   const reasonKey = capability?.reason_code
     ? AUTHORITY_REASON_KEYS[capability.reason_code] || 'agents.queueRecovery.safeGate'
     : null
-  const recoveryKey: TranslationKey = capability?.eligible === true
+  const recoveryKey: TranslationKey = reconnectRecovery
+    ? 'agents.queueRecovery.reconnect'
+    : capability?.eligible === true
     ? 'agents.queueRecovery.ownerRecovery'
     : capability?.eligible === false
       ? 'agents.queueRecovery.automatic'
@@ -41,11 +44,16 @@ export function WorkflowRecoveryNotice({
     <div className="flex items-start gap-2">
       <Clock3 size={14} className="mt-0.5 shrink-0 text-blue-300"/>
       <div>
-        <p className="font-medium">{t('agents.queueRecovery.summary', {
-          agent: agentStatus,
-          workflow: t('status.workflow.open'),
-          count: queued,
-        })}</p>
+        <p className="font-medium">{reconnectRecovery
+          ? t('agents.queueRecovery.reconnectSummary', {
+            agent: agentStatus,
+            workflow: t('status.workflow.open'),
+          })
+          : t('agents.queueRecovery.summary', {
+            agent: agentStatus,
+            workflow: t('status.workflow.open'),
+            count: queued,
+          })}</p>
         <p className="mt-1 text-blue-200/80">{t(recoveryKey)}</p>
         {capability?.eligible === false && reasonKey && (
           <p className="mt-1 text-blue-200/70">{t(reasonKey)}</p>

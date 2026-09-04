@@ -365,6 +365,7 @@ export interface AgentSummary {
   workflow_status: string | null
   workflow_reason: string | null
   queued_task_count?: number
+  workflow_recovery_pending?: boolean
   provider_outcome_code?: string | null
   provider_outcome_detail?: string | null
   assignment_status: string | null
@@ -411,6 +412,7 @@ export interface Terminal {
   workflow_status?: string | null
   workflow_reason?: string | null
   queued_task_count?: number
+  workflow_recovery_pending?: boolean
   provider_outcome_code?: string | null
   provider_outcome_detail?: string | null
   assignment_status?: string | null

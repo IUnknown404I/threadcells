@@ -36,7 +36,7 @@ from cli_agent_orchestrator.clients.database import (
     requeue_workflow_turn,
     set_workflow_terminal_state,
     start_workflow_input,
-    workflow_has_active_queued_external_input,
+    workflow_has_active_queued_priority_input,
     workflow_provider_reconnect_pending,
 )
 from cli_agent_orchestrator.models.inbox import ChildAssignmentStatus, OrchestrationType
@@ -390,7 +390,7 @@ def _reconcile_root_workflow_with_admission(
     # must win over a synthetic open-final successor. This also gives the
     # workflow daemon durable retry ownership when a Ready transition occurs
     # without a fresh terminal-log event.
-    active_external_head = workflow_has_active_queued_external_input(root_terminal_id)
+    active_external_head = workflow_has_active_queued_priority_input(root_terminal_id)
     if pending_inbox is None:
         pending_inbox = root_terminal_id in set(get_pending_message_receiver_ids())
     if pending_inbox and not active_external_head:

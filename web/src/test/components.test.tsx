@@ -52,6 +52,28 @@ describe('WorkflowRecoveryNotice', () => {
     expect(container).toBeEmptyDOMElement()
   })
 
+  it('explains reconnect continuation without overclaiming runtime readiness', () => {
+    render(<WorkflowRecoveryNotice
+      agent={{
+        id: 'reconnect-owner',
+        activity: 'idle',
+        execution_state: 'ready',
+        lifecycle: 'running',
+        workflow_state: 'active',
+        workflow_status: 'open',
+        queued_task_count: 0,
+        workflow_recovery_pending: true,
+      } as never}
+    />)
+
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Interrupted workflow recovery is pending',
+    )
+    expect(screen.getByRole('status')).toHaveTextContent(/restoring the provider/i)
+    expect(screen.getByRole('status')).not.toHaveTextContent(/provider is ready/i)
+    expect(screen.getByRole('status')).toHaveTextContent(/No resend is needed/i)
+  })
+
   it('asks for owner-authorized recovery when takeover is available', () => {
     render(<WorkflowRecoveryNotice
       agent={{

@@ -438,6 +438,7 @@ class TerminalOutputCursorError(Exception):
 
 
 OUTPUT_CHUNK_MAX_BYTES = 256 * 1024
+OUTPUT_RENDER_CONTEXT_MAX_BYTES = OUTPUT_CHUNK_MAX_BYTES
 LAST_OUTPUT_READ_MAX_BYTES = 1024 * 1024
 LAST_OUTPUT_RESPONSE_MAX_BYTES = 256 * 1024
 COMPRESSED_OUTPUT_MAX_BYTES = 256 * 1024
@@ -630,7 +631,7 @@ def _consume_terminal_csi(value: str, index: int) -> int:
     return len(value)
 
 
-def _sanitize_human_terminal_output(value: str) -> str:
+def _sanitize_human_terminal_output(value: str, *, emit_from: int = 0) -> str:
     """Remove terminal effects while preserving readable Unicode text.
 
     Raw tmux history and durable logs intentionally retain controls for
@@ -684,10 +685,11 @@ def _sanitize_human_terminal_output(value: str) -> str:
         if character == "\r":
             if index + 1 < len(value) and value[index + 1] == "\n":
                 if not rendered or rendered[-1] != "\n":
-                    rendered.append("\n")
+                    if index >= emit_from:
+                        rendered.append("\n")
                 index += 2
                 continue
-            if not rendered or rendered[-1] != "\n":
+            if index >= emit_from and (not rendered or rendered[-1] != "\n"):
                 rendered.append("\n")
             index += 1
             continue
@@ -697,33 +699,53 @@ def _sanitize_human_terminal_output(value: str) -> str:
             index += 1
             continue
         if character in {"\n", "\t"}:
-            rendered.append(character)
+            if index >= emit_from:
+                rendered.append(character)
             index += 1
             continue
         if codepoint < 0x20 or codepoint == 0x7F:
             index += 1
             continue
 
-        rendered.append(character)
+        if index >= emit_from:
+            rendered.append(character)
         index += 1
     return "".join(rendered)
 
 
-def _render_progressive_terminal_output(payload: bytes) -> str:
-    """Render a page without state that could cross an arbitrary byte range.
+def _bounded_output_render_context(descriptor: int, *, start_offset: int) -> bytes:
+    """Read bounded history needed to settle terminal grammar at a page edge."""
+    if start_offset <= 0:
+        return b""
+    context_start = max(0, start_offset - OUTPUT_RENDER_CONTEXT_MAX_BYTES)
+    requested = start_offset - context_start
+    context = os.pread(descriptor, requested, context_start)
+    if len(context) != requested:
+        raise TerminalOutputCursorError(
+            "Output source changed during the read", "OUTPUT_CURSOR_STALE"
+        )
 
-    Browsers do not emulate terminal escape grammars. Dropping only control
-    codepoints makes the text safe to place in the DOM while preserving every
-    printable byte independently. This deliberately does not interpret ANSI,
-    OSC, backspace, or carriage-return state: doing so for a newest-first
-    random-access suffix would require an unbounded scan or a durable index.
+    # The sanitizer deliberately resynchronizes at hard line boundaries. Keep
+    # only the current line so ordinary paginated logs pay a tiny parse cost.
+    newline = context.rfind(b"\n")
+    carriage = context.rfind(b"\r")
+    boundary = max(newline, carriage)
+    return context[boundary + 1 :] if boundary >= 0 else context
+
+
+def _render_progressive_terminal_output(payload: bytes, *, prefix_context: bytes = b"") -> str:
+    """Render one bounded page with bounded terminal-parser look-behind.
+
+    Hard page edges can split CSI, OSC, DCS, and related terminal controls.
+    Parsing at most one bounded page of preceding bytes establishes the state
+    for practical terminal sequences without scanning or materializing the
+    historical stream. Context is never emitted in the response.
     """
-    value = payload.decode("utf-8", errors="replace")
-    return "".join(
-        character
-        for character in value
-        if character in {"\n", "\t"}
-        or (ord(character) >= 0x20 and not 0x7F <= ord(character) <= 0x9F)
+    context_text = prefix_context.decode("utf-8", errors="replace")
+    payload_text = payload.decode("utf-8", errors="replace")
+    return _sanitize_human_terminal_output(
+        context_text + payload_text,
+        emit_from=len(context_text),
     )
 
 
@@ -3268,9 +3290,9 @@ def get_output_chunk(terminal_id: str, cursor: str | None = None) -> TerminalOut
             before_offset=before_offset,
             maximum_bytes=OUTPUT_CHUNK_MAX_BYTES,
         )
-        # A complete bounded source retains the legacy terminal-aware cleanup.
-        # Progressive sources use a page-composable renderer because terminal
-        # grammar state may otherwise begin arbitrarily far before this range.
+        # A complete or line-isolated source needs no parser look-behind. Hard
+        # long-line page edges receive one bounded page of context so printable
+        # CSI/OSC/DCS parameters do not leak after their control bytes.
         line_isolated = _output_range_is_line_isolated(
             descriptor,
             start_offset=start_offset,
@@ -3280,7 +3302,13 @@ def get_output_chunk(terminal_id: str, cursor: str | None = None) -> TerminalOut
         rendered = (
             _sanitize_human_terminal_output(payload.decode("utf-8", errors="replace"))
             if snapshot_size <= OUTPUT_CHUNK_MAX_BYTES or line_isolated
-            else _render_progressive_terminal_output(payload)
+            else _render_progressive_terminal_output(
+                payload,
+                prefix_context=_bounded_output_render_context(
+                    descriptor,
+                    start_offset=start_offset,
+                ),
+            )
         )
         has_older = start_offset > 0
         next_cursor = (

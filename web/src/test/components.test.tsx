@@ -568,7 +568,7 @@ describe('OutputViewer fullscreen', () => {
       'cursor-1',
       expect.any(AbortSignal),
     )
-    expect(screen.getByTestId('terminal-output-range')).toHaveTextContent('0 B–200 B / 200 B')
+    expect(screen.getByTestId('terminal-output-range')).toHaveTextContent('Loaded 0 B–200 B of 200 B')
   })
 
   it('keeps a bounded chunk window while browsing arbitrarily older output', async () => {

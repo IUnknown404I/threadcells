@@ -298,7 +298,11 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
                     )}
                   </div>
                   <span data-testid="terminal-output-range">
-                    {formatBytes(oldestChunk?.range_start)}–{formatBytes(chunks[chunks.length - 1]?.range_end)} / {formatBytes(oldestChunk?.snapshot_size)}
+                    {t('output.loadedRange', {
+                      start: formatBytes(oldestChunk?.range_start),
+                      end: formatBytes(chunks[chunks.length - 1]?.range_end),
+                      total: formatBytes(oldestChunk?.snapshot_size),
+                    })}
                   </span>
                 </div>
               )}

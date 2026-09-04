@@ -405,6 +405,7 @@ class TestTerminalOperations:
             provider="codex",
             resume_identity=identity,
             runtime_generation="generation-1",
+            require_existing_binding=True,
         )
         assert not bind_terminal_provider_resume_identity(
             "managed",
@@ -430,6 +431,161 @@ class TestTerminalOperations:
             assert [(row.provider_session_id, row.terminal_id, row.source) for row in bindings] == [
                 (identity, "managed", "managed_runtime_ready_v1")
             ]
+
+    def test_provider_resume_identity_existing_only_cannot_introduce_identity(
+        self, test_db, monkeypatch
+    ):
+        identity = "01234567-89ab-cdef-0123-456789abcdef"
+        monkeypatch.setattr(database_client, "SessionLocal", test_db)
+        monkeypatch.setattr(database_client, "_terminal_authority_schema_ready", True)
+        monkeypatch.setattr(database_client, "_usage_schema_ready", True)
+        with test_db() as db:
+            db.add(
+                TerminalModel(
+                    id="managed-unbound",
+                    tmux_session="cao-managed",
+                    tmux_window="managed",
+                    provider="codex",
+                    runtime_lifecycle="running",
+                    runtime_generation="generation-1",
+                )
+            )
+            db.commit()
+
+        assert not bind_terminal_provider_resume_identity(
+            "managed-unbound",
+            provider="codex",
+            resume_identity=identity,
+            runtime_generation="generation-1",
+            require_existing_binding=True,
+        )
+        with test_db() as db:
+            terminal = db.get(TerminalModel, "managed-unbound")
+            assert terminal.provider_resume_identity is None
+            assert db.query(ProviderUsageBindingModel).count() == 0
+
+    @pytest.mark.parametrize("corruption", [None, "writer_lease", "work_context"])
+    def test_provider_resume_identity_requires_exact_managed_worktree_authority(
+        self, test_db, monkeypatch, corruption
+    ):
+        identity = "01234567-89ab-cdef-0123-456789abcdef"
+        authority = "writer-generation"
+        monkeypatch.setattr(database_client, "SessionLocal", test_db)
+        monkeypatch.setattr(database_client, "_terminal_authority_schema_ready", True)
+        monkeypatch.setattr(database_client, "_usage_schema_ready", True)
+        with test_db() as db:
+            db.add(
+                WritableWorkContextModel(
+                    id="managed-context",
+                    request_id="request-managed-context",
+                    project_id="project-managed",
+                    session_id="session-managed",
+                    terminal_id="managed-authority",
+                    canonical_source="/source/project",
+                    canonical_worktree=(
+                        "/managed/other" if corruption == "work_context" else "/managed/context"
+                    ),
+                    branch="cao/session/managed-authority",
+                    base_revision="a" * 40,
+                    state="admitted",
+                    writer_authority_generation=authority,
+                )
+            )
+            db.add(
+                TerminalModel(
+                    id="managed-authority",
+                    tmux_session="cao-managed",
+                    session_id="session-managed",
+                    tmux_window="managed",
+                    provider="codex",
+                    write_enabled=True,
+                    writer_authority_generation=authority,
+                    managed_worktree_kind="supervisor",
+                    managed_worktree_source="/source/project",
+                    managed_worktree_branch="cao/session/managed-authority",
+                    managed_worktree_commit="a" * 40,
+                    launch_worktree="/managed/context",
+                    writable_work_context_id="managed-context",
+                    project_id="project-managed",
+                    runtime_lifecycle="running",
+                    runtime_generation="generation-1",
+                )
+            )
+            db.add(
+                WorktreeWriterLeaseModel(
+                    canonical_worktree="/managed/context",
+                    terminal_id="managed-authority",
+                    authority_generation=(
+                        "stale-writer-generation" if corruption == "writer_lease" else authority
+                    ),
+                )
+            )
+            db.commit()
+
+        accepted = bind_terminal_provider_resume_identity(
+            "managed-authority",
+            provider="codex",
+            resume_identity=identity,
+            runtime_generation="generation-1",
+        )
+        assert accepted is (corruption is None)
+        with test_db() as db:
+            terminal = db.get(TerminalModel, "managed-authority")
+            assert terminal.provider_resume_identity == (identity if accepted else None)
+            assert db.query(ProviderUsageBindingModel).count() == (1 if accepted else 0)
+
+    def test_concurrent_provider_identity_binding_selects_one_identity(self, tmp_path, monkeypatch):
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'provider-identity.db'}",
+            connect_args={"check_same_thread": False},
+        )
+        Base.metadata.create_all(bind=engine)
+        sessions = sessionmaker(bind=engine)
+        monkeypatch.setattr(database_client, "SessionLocal", sessions)
+        monkeypatch.setattr(
+            database_client, "_ensure_terminal_worktree_authority_schema", lambda: None
+        )
+        monkeypatch.setattr(database_client, "_ensure_usage_schema", lambda: None)
+        identities = (
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "fedcba98-7654-3210-fedc-ba9876543210",
+        )
+        with sessions() as db:
+            db.add(
+                TerminalModel(
+                    id="managed-concurrent",
+                    tmux_session="cao-managed",
+                    tmux_window="managed",
+                    provider="codex",
+                    runtime_lifecycle="running",
+                    runtime_generation="generation-1",
+                )
+            )
+            db.commit()
+
+        def bind(index):
+            identity = identities[index % len(identities)]
+            accepted = bind_terminal_provider_resume_identity(
+                "managed-concurrent",
+                provider="codex",
+                resume_identity=identity,
+                runtime_generation="generation-1",
+            )
+            return identity, accepted
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(bind, range(8)))
+
+        accepted_identities = {identity for identity, accepted in results if accepted}
+        assert len(accepted_identities) == 1
+        assert any(not accepted for _identity, accepted in results)
+        with sessions() as db:
+            terminal = db.get(TerminalModel, "managed-concurrent")
+            assert terminal.provider_resume_identity in accepted_identities
+            bindings = db.query(ProviderUsageBindingModel).all()
+            assert len(bindings) == 1
+            assert bindings[0].provider_session_id == terminal.provider_resume_identity
+            assert bindings[0].terminal_id == "managed-concurrent"
 
     def test_provider_resume_identity_binds_after_idle_runtime_is_running(
         self, test_db, monkeypatch

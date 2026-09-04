@@ -2311,13 +2311,16 @@ def bind_provider_runtime_session_identity(
     working_directory: str,
     source: str,
     runtime_generation: str,
+    require_existing_binding: bool = False,
 ) -> str:
     """Prove and bind Codex's exact root session at its synchronous start hook.
 
     A fresh Codex TUI has no conversation while idle. The provider-native
     identity first exists at ``SessionStart``, before the first model request;
     this method fences that callback to the managed terminal generation and
-    exact foreground writable transcript.
+    exact foreground writable transcript. An immutable pre-promotion hook may
+    request only an exact rebind of the already-durable provider identity; it
+    cannot introduce or rotate provider authority under the new service.
     """
     metadata = get_terminal_metadata(terminal_id)
     if (
@@ -2333,6 +2336,22 @@ def bind_provider_runtime_session_identity(
         or not os.path.isabs(transcript_path)
     ):
         raise RuntimeError("Codex session identity callback is stale or malformed")
+    if require_existing_binding and (
+        not isinstance(metadata.get("provider_resume_identity"), str)
+        or not hmac.compare_digest(str(metadata["provider_resume_identity"]), resume_identity)
+        or not isinstance(metadata.get("provider_resume_runtime_generation"), str)
+        or not hmac.compare_digest(
+            str(metadata["provider_resume_runtime_generation"]), runtime_generation
+        )
+    ):
+        raise RuntimeError("Codex session identity has no exact durable rebind authority")
+    if metadata.get("managed_worktree_kind") is not None and (
+        not isinstance(metadata.get("launch_worktree"), str)
+        or not os.path.isabs(str(metadata["launch_worktree"]))
+        or Path(str(metadata["launch_worktree"])).resolve(strict=False)
+        != Path(working_directory).resolve(strict=False)
+    ):
+        raise RuntimeError("Codex session identity is outside its managed worktree")
 
     provider = provider_manager.get_provider(terminal_id)
     resolver = getattr(provider, "runtime_sidecar_resume_identity", None)
@@ -2363,6 +2382,7 @@ def bind_provider_runtime_session_identity(
         provider=ProviderType.CODEX.value,
         resume_identity=verified,
         runtime_generation=runtime_generation,
+        require_existing_binding=require_existing_binding,
     ):
         raise RuntimeError("Could not durably bind Codex session identity")
     bootstrap_turn_id = get_workflow_turn_provider_outcome_cursor_bootstrap(

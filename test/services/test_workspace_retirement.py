@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from contextlib import nullcontext
 from pathlib import Path
@@ -142,6 +143,20 @@ def _candidate(identity: dict, *, allow_dirty: bool = False):
     snapshot = database.get_session_workspace_retirement_snapshot(identity["context_id"])
     assert snapshot is not None
     return candidate_from_snapshot(snapshot, allow_dirty=allow_dirty)
+
+
+def _claim(identity: dict, *, allow_dirty: bool = False):
+    candidate = _candidate(identity, allow_dirty=allow_dirty)
+    snapshot = database.get_session_workspace_retirement_snapshot(identity["context_id"])
+    assert snapshot is not None
+    claim = database.claim_session_workspace_retirement(
+        identity["context_id"],
+        snapshot["authority_fingerprint"],
+        allow_dirty=allow_dirty,
+        retirement_plan_json=dict(candidate.attributes)["retirement_plan_json"],
+    )
+    assert claim["claimed"] is True
+    return candidate
 
 
 def _execute(candidate, root: Path):
@@ -370,7 +385,9 @@ def test_missing_managed_worktree_metadata_fails_closed(workspace_factory):
 def test_retiring_workspace_converges_across_restart_and_second_reconcile_is_noop(
     workspace_factory, monkeypatch, removal_before_restart
 ):
-    identity = workspace_factory(state="retiring")
+    identity = workspace_factory()
+    candidate = _claim(identity)
+    plan = json.loads(dict(candidate.attributes)["retirement_plan_json"])
     if removal_before_restart:
         removed = managed_worktree_service.remove_managed_worktree(
             {
@@ -381,7 +398,8 @@ def test_retiring_workspace_converges_across_restart_and_second_reconcile_is_noo
                 "managed_worktree_source": identity["managed"].source,
                 "managed_worktree_branch": identity["managed"].branch,
                 "managed_worktree_commit": identity["managed"].commit,
-            }
+            },
+            expected_status=plan["worktrees"][0],
         )
         assert removed["removed"] is True
     monkeypatch.setattr(
@@ -409,18 +427,15 @@ def test_confirmed_dirty_retirement_authority_survives_restart_exactly(
     identity = workspace_factory()
     dirty = Path(identity["managed"].path, "unfinished.txt")
     dirty.write_text("owner approved deletion\n", encoding="utf-8")
-    candidate = _candidate(identity, allow_dirty=True)
-    snapshot = database.get_session_workspace_retirement_snapshot(identity["context_id"])
-    assert snapshot is not None
-    claim = database.claim_session_workspace_retirement(
-        identity["context_id"],
-        snapshot["authority_fingerprint"],
-        allow_dirty=True,
-    )
-    assert claim["claimed"] is True
+    candidate = _claim(identity, allow_dirty=True)
+    plan = json.loads(dict(candidate.attributes)["retirement_plan_json"])
     if removal_before_restart:
+        snapshot = database.get_session_workspace_retirement_snapshot(identity["context_id"])
+        assert snapshot is not None
         removed = managed_worktree_service.remove_managed_worktree(
-            snapshot["terminals"][0], allow_dirty=True
+            snapshot["terminals"][0],
+            allow_dirty=True,
+            expected_status=plan["worktrees"][0],
         )
         assert removed["removed"] is True
     monkeypatch.setattr(
@@ -437,6 +452,70 @@ def test_confirmed_dirty_retirement_authority_survives_restart_exactly(
     assert context["retirement_allow_dirty"] is True
     # Replaying a candidate from the original plan is now historical only.
     assert candidate.canonical_identity == f"session-workspace:{identity['context_id']}"
+
+
+def test_confirmed_dirty_retirement_rejects_changed_contents_after_claim(
+    workspace_factory, monkeypatch
+):
+    identity = workspace_factory()
+    dirty = Path(identity["managed"].path, "unfinished.txt")
+    dirty.write_text("owner approved deletion\n", encoding="utf-8")
+    candidate = _claim(identity, allow_dirty=True)
+    dirty.write_text("changed after confirmation\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.operations_service.context_lifecycle_fence",
+        lambda **_kwargs: nullcontext(True),
+    )
+
+    assert reconcile_retiring_session_workspaces() == 0
+    assert dirty.read_text(encoding="utf-8") == "changed after confirmation\n"
+    context = database.get_writable_work_context_by_session(identity["session_id"])
+    assert context is not None and context["state"] == "retiring"
+    assert context["retirement_plan_json"] == dict(candidate.attributes)["retirement_plan_json"]
+
+
+def test_final_git_removal_rejects_contents_changed_after_claim(workspace_factory):
+    identity = workspace_factory()
+    dirty = Path(identity["managed"].path, "unfinished.txt")
+    dirty.write_text("owner approved deletion\n", encoding="utf-8")
+    candidate = _claim(identity, allow_dirty=True)
+    approved = json.loads(dict(candidate.attributes)["retirement_plan_json"])["worktrees"][0]
+    dirty.write_text("changed at final boundary\n", encoding="utf-8")
+    snapshot = database.get_session_workspace_retirement_snapshot(identity["context_id"])
+    assert snapshot is not None
+
+    removed = managed_worktree_service.remove_managed_worktree(
+        snapshot["terminals"][0],
+        allow_dirty=True,
+        expected_status=approved,
+    )
+
+    assert removed["removed"] is False
+    assert removed["reason_code"] == "WORKSPACE_AUTHORITY_CHANGED"
+    assert dirty.read_text(encoding="utf-8") == "changed at final boundary\n"
+
+
+def test_legacy_retiring_dirty_workspace_without_content_plan_fails_closed(
+    workspace_factory, monkeypatch
+):
+    identity = workspace_factory(state="retiring")
+    dirty = Path(identity["managed"].path, "unfinished.txt")
+    dirty.write_text("unbound historical bytes\n", encoding="utf-8")
+    with database.SessionLocal() as db:
+        context = db.get(WritableWorkContextModel, identity["context_id"])
+        assert context is not None
+        context.retirement_allow_dirty = True
+        db.commit()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.operations_service.context_lifecycle_fence",
+        lambda **_kwargs: nullcontext(True),
+    )
+
+    assert reconcile_retiring_session_workspaces() == 0
+    assert dirty.read_text(encoding="utf-8") == "unbound historical bytes\n"
+    candidate = _candidate(identity)
+    assert candidate.action == "preserve"
+    assert candidate.protection_reason == "WORKSPACE_RETIREMENT_AUTHORITY_MISSING"
 
 
 def test_housekeeping_inventory_reports_exact_skip_reason(workspace_factory):

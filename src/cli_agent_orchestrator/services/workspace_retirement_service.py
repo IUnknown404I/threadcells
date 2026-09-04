@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from cli_agent_orchestrator.clients.database import (
     claim_session_workspace_retirement,
@@ -53,6 +54,120 @@ def _managed_terminals(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
         seen.add(path)
         result.append(terminal)
     return result
+
+
+_RETIREMENT_STATUS_FIELDS = (
+    "path",
+    "source",
+    "kind",
+    "commit",
+    "branch",
+    "expected_commit",
+    "expected_branch",
+    "clean",
+    "absent",
+    "modified_files",
+    "untracked_files",
+    "content_fingerprint",
+)
+
+
+def _status_authority(status: Mapping[str, Any]) -> dict[str, Any]:
+    return {field: status.get(field) for field in _RETIREMENT_STATUS_FIELDS}
+
+
+def _retirement_plan_json(
+    snapshot: Mapping[str, Any],
+    statuses: list[dict[str, Any]],
+    *,
+    allow_dirty: bool,
+    candidate_fingerprint: str,
+) -> str:
+    return json.dumps(
+        {
+            "version": 1,
+            "authority_fingerprint": snapshot["authority_fingerprint"],
+            "candidate_fingerprint": candidate_fingerprint,
+            "allow_dirty": allow_dirty,
+            "worktrees": [_status_authority(status) for status in statuses],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _parse_retirement_plan(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        plan = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isinstance(plan, dict)
+        or plan.get("version") != 1
+        or not isinstance(plan.get("authority_fingerprint"), str)
+        or not isinstance(plan.get("candidate_fingerprint"), str)
+        or not isinstance(plan.get("allow_dirty"), bool)
+        or not isinstance(plan.get("worktrees"), list)
+    ):
+        return None
+    return plan
+
+
+def _validate_claimed_plan(
+    snapshot: Mapping[str, Any], statuses: list[dict[str, Any]], *, allow_dirty: bool
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Bind resumed retirement to the exact owner-confirmed filesystem plan."""
+    plan = _parse_retirement_plan(snapshot["context"].get("retirement_plan_json"))
+    if plan is None:
+        return None, "WORKSPACE_RETIREMENT_AUTHORITY_MISSING"
+    if (
+        plan["authority_fingerprint"] != snapshot["authority_fingerprint"]
+        or plan["allow_dirty"] is not allow_dirty
+    ):
+        return None, "WORKSPACE_AUTHORITY_CHANGED"
+    expected_rows = plan["worktrees"]
+    if not all(isinstance(row, dict) for row in expected_rows):
+        return None, "WORKSPACE_RETIREMENT_AUTHORITY_INVALID"
+    expected = {row.get("path"): row for row in expected_rows}
+    current = {row.get("path"): row for row in statuses}
+    if (
+        None in expected
+        or None in current
+        or len(expected) != len(expected_rows)
+        or len(current) != len(statuses)
+        or set(expected) != set(current)
+    ):
+        return None, "WORKSPACE_AUTHORITY_CHANGED"
+    for path, current_status in current.items():
+        expected_status = expected[path]
+        for field in (
+            "path",
+            "source",
+            "kind",
+            "expected_commit",
+            "expected_branch",
+        ):
+            if current_status.get(field) != expected_status.get(field):
+                return None, "WORKSPACE_AUTHORITY_CHANGED"
+        if current_status.get("absent"):
+            # Absence is the positive restart proof that this exact registered
+            # worktree already crossed the canonical Git removal boundary.
+            continue
+        if expected_status.get("absent"):
+            return None, "WORKSPACE_AUTHORITY_CHANGED"
+        for field in (
+            "commit",
+            "branch",
+            "clean",
+            "modified_files",
+            "untracked_files",
+            "content_fingerprint",
+        ):
+            if current_status.get(field) != expected_status.get(field):
+                return None, "WORKSPACE_AUTHORITY_CHANGED"
+    return plan, None
 
 
 def candidate_from_snapshot(
@@ -130,7 +245,19 @@ def candidate_from_snapshot(
             ],
         }
     )
-    action = "retire" if reason is None else "preserve"
+    plan_json = ""
+    if reason is None and context.get("state") == "retiring":
+        _plan, reason = _validate_claimed_plan(snapshot, statuses, allow_dirty=allow_dirty)
+        if reason is None:
+            plan_json = str(context.get("retirement_plan_json") or "")
+    elif reason is None:
+        plan_json = _retirement_plan_json(
+            snapshot,
+            statuses,
+            allow_dirty=allow_dirty,
+            candidate_fingerprint=fingerprint,
+        )
+    action: Literal["retire", "preserve"] = "retire" if reason is None else "preserve"
     return HousekeepingCandidate(
         category="session_workspaces",
         path=str(context["canonical_worktree"]),
@@ -152,6 +279,7 @@ def candidate_from_snapshot(
             ("session_id", str(context["session_id"])),
             ("modified_files", str(modified_files)),
             ("untracked_files", str(untracked_files)),
+            ("retirement_plan_json", plan_json),
         ),
     )
 
@@ -182,8 +310,11 @@ def retire_session_workspace(candidate: HousekeepingCandidate) -> int:
     attributes = dict(candidate.attributes)
     context_id = attributes.get("context_id")
     allow_dirty = attributes.get("allow_dirty") == "true"
+    retirement_plan_json = attributes.get("retirement_plan_json")
     if not context_id or candidate.canonical_identity != f"session-workspace:{context_id}":
         raise RuntimeError("WORKSPACE_CANDIDATE_INVALID")
+    if not retirement_plan_json or _parse_retirement_plan(retirement_plan_json) is None:
+        raise RuntimeError("WORKSPACE_RETIREMENT_AUTHORITY_INVALID")
     current = revalidate_session_workspace_candidate(candidate)
     if current is None:
         raise RuntimeError("WORKSPACE_NOT_FOUND")
@@ -197,6 +328,7 @@ def retire_session_workspace(candidate: HousekeepingCandidate) -> int:
         context_id,
         str(snapshot["authority_fingerprint"]),
         allow_dirty=allow_dirty,
+        retirement_plan_json=retirement_plan_json,
     )
     if not claim.get("claimed"):
         raise RuntimeError(str(claim.get("reason_code") or "WORKSPACE_AUTHORITY_CHANGED"))
@@ -214,8 +346,19 @@ def retire_session_workspace(candidate: HousekeepingCandidate) -> int:
     assert claimed_snapshot is not None
     if bool(claimed_snapshot["context"].get("retirement_allow_dirty")) != allow_dirty:
         raise RuntimeError("WORKSPACE_AUTHORITY_CHANGED")
+    plan = _parse_retirement_plan(claimed_snapshot["context"].get("retirement_plan_json"))
+    if plan is None:
+        raise RuntimeError("WORKSPACE_RETIREMENT_AUTHORITY_INVALID")
+    approved_by_path = {row["path"]: row for row in plan["worktrees"]}
     for terminal in _managed_terminals(claimed_snapshot):
-        cleanup = remove_managed_worktree(terminal, allow_dirty=allow_dirty)
+        approved = approved_by_path.get(terminal.get("launch_worktree"))
+        if approved is None:
+            raise RuntimeError("WORKSPACE_AUTHORITY_CHANGED")
+        cleanup = remove_managed_worktree(
+            terminal,
+            allow_dirty=allow_dirty,
+            expected_status=approved,
+        )
         if not cleanup.get("removed"):
             raise RuntimeError(str(cleanup.get("reason_code") or "WORKTREE_UNVERIFIED"))
     if not transition_writable_work_context(

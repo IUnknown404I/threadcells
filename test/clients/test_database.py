@@ -1561,6 +1561,9 @@ class TestInitDb:
                 "ALTER TABLE writable_work_contexts DROP COLUMN retirement_allow_dirty"
             )
             connection.exec_driver_sql(
+                "ALTER TABLE writable_work_contexts DROP COLUMN retirement_plan_json"
+            )
+            connection.exec_driver_sql(
                 "INSERT INTO writable_work_contexts "
                 "(id, request_id, project_id, session_id, terminal_id, canonical_source, "
                 "canonical_worktree, branch, base_revision, state, writer_authority_generation, "
@@ -1580,10 +1583,12 @@ class TestInitDb:
                 row[1] for row in connection.execute("PRAGMA table_info(writable_work_contexts)")
             }
             history = connection.execute(
-                "SELECT id, state, retirement_allow_dirty FROM writable_work_contexts"
+                "SELECT id, state, retirement_allow_dirty, retirement_plan_json "
+                "FROM writable_work_contexts"
             ).fetchall()
         assert "retirement_allow_dirty" in columns
-        assert history == [("context-history", "admitted", 0)]
+        assert "retirement_plan_json" in columns
+        assert history == [("context-history", "admitted", 0, None)]
 
     @patch("cli_agent_orchestrator.clients.database.Base")
     def test_init_db(self, mock_base):

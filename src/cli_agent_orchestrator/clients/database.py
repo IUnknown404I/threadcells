@@ -205,13 +205,16 @@ class WritableWorkContextModel(Base):
     base_revision = Column(String, nullable=False)
     state = Column(String, nullable=False, default="reserved", index=True)
     writer_authority_generation = Column(String, nullable=True, unique=True)
-    # Persist only the exact owner-approved destructive retirement bit. It is
-    # false for ordinary/automatic cleanup and lets a crash after the claim
-    # finish the already-authorized dirty-worktree removal without asking the
-    # reconciler to infer authority from filesystem state.
+    # Persist the exact owner-approved destructive retirement bit. It is false
+    # for ordinary cleanup; the adjacent content-bound plan prevents a restart
+    # from interpreting the bit as authority over newly observed dirty bytes.
     retirement_allow_dirty = Column(
         Boolean, nullable=False, default=False, server_default=text("0")
     )
+    # Exact content-bound plan approved when retirement is claimed.  The
+    # reconciler may resume only this plan; the allow-dirty bit alone is not
+    # authority to delete filesystem contents observed after the claim.
+    retirement_plan_json = Column(Text, nullable=True)
     failure_reason = Column(String, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.now)
     updated_at = Column(DateTime, nullable=False, default=datetime.now)
@@ -3335,6 +3338,10 @@ def _ensure_terminal_worktree_authority_schema() -> None:
                     "ALTER TABLE writable_work_contexts ADD COLUMN "
                     "retirement_allow_dirty BOOLEAN NOT NULL DEFAULT 0"
                 )
+            if "retirement_plan_json" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE writable_work_contexts ADD COLUMN retirement_plan_json TEXT"
+                )
 
 
 def _work_context_dict(row: WritableWorkContextModel) -> Dict[str, Any]:
@@ -3351,6 +3358,7 @@ def _work_context_dict(row: WritableWorkContextModel) -> Dict[str, Any]:
         "state": row.state,
         "writer_authority_generation": row.writer_authority_generation,
         "retirement_allow_dirty": bool(row.retirement_allow_dirty),
+        "retirement_plan_json": row.retirement_plan_json,
         "failure_reason": row.failure_reason,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
@@ -3723,6 +3731,7 @@ def claim_session_workspace_retirement(
     authority_fingerprint: str,
     *,
     allow_dirty: bool = False,
+    retirement_plan_json: str,
 ) -> Dict[str, Any]:
     """Atomically claim one inactive Session before any Git deletion starts."""
     _ensure_terminal_worktree_authority_schema()
@@ -3743,7 +3752,10 @@ def claim_session_workspace_retirement(
             db.rollback()
             return {"claimed": False, "reason_code": snapshot["reason_code"]}
         if context.state == "retiring":
-            if bool(context.retirement_allow_dirty) != allow_dirty:
+            if (
+                bool(context.retirement_allow_dirty) != allow_dirty
+                or context.retirement_plan_json != retirement_plan_json
+            ):
                 db.rollback()
                 return {"claimed": False, "reason_code": "WORKSPACE_AUTHORITY_CHANGED"}
             db.rollback()
@@ -3753,6 +3765,7 @@ def claim_session_workspace_retirement(
             return {"claimed": False, "reason_code": "WORKSPACE_STATE_NOT_RETIRABLE"}
         context.state = "retiring"
         context.retirement_allow_dirty = allow_dirty
+        context.retirement_plan_json = retirement_plan_json
         context.failure_reason = None
         context.updated_at = datetime.now()
         event_key = f"{context.id}:workspace-retirement-claimed:{context.terminal_id}"

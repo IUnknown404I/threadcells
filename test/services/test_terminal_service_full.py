@@ -127,7 +127,148 @@ def test_bind_provider_runtime_session_identity_proves_exact_hook_path(monkeypat
         provider="codex",
         resume_identity=identity,
         runtime_generation=generation,
+        require_existing_binding=False,
     )
+
+
+def test_bind_provider_runtime_session_identity_rebinds_exact_durable_identity(
+    monkeypatch, tmp_path
+):
+    identity = "01234567-89ab-cdef-0123-456789abcdef"
+    generation = "a" * 64
+    working_directory = tmp_path / "project"
+    working_directory.mkdir()
+    transcript = tmp_path / "codex/sessions/rollout.jsonl"
+    provider = MagicMock()
+    provider.runtime_sidecar_resume_identity.return_value = identity
+    manager = MagicMock()
+    manager.get_provider.return_value = provider
+    tmux = MagicMock()
+    tmux.get_pane_working_directory.return_value = str(working_directory)
+    bind = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_workflow_turn_provider_outcome_cursor_bootstrap",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+        lambda _terminal_id: {
+            "provider": "codex",
+            "runtime_lifecycle": "running",
+            "runtime_generation": generation,
+            "provider_resume_identity": identity,
+            "provider_resume_runtime_generation": generation,
+            "managed_worktree_kind": "supervisor",
+            "launch_worktree": str(working_directory),
+            "tmux_session": "cao-managed",
+            "tmux_window": "managed",
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.provider_manager", manager
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.services.terminal_service.tmux_client", tmux)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.bind_terminal_provider_resume_identity",
+        bind,
+    )
+
+    assert (
+        bind_provider_runtime_session_identity(
+            "abcdef12",
+            resume_identity=identity,
+            transcript_path=str(transcript),
+            working_directory=str(working_directory),
+            source="resume",
+            runtime_generation=generation,
+            require_existing_binding=True,
+        )
+        == identity
+    )
+    provider.runtime_sidecar_resume_identity.assert_called_once_with(
+        expected_identity=identity,
+        expected_rollout_path=str(transcript),
+    )
+    bind.assert_called_once_with(
+        "abcdef12",
+        provider="codex",
+        resume_identity=identity,
+        runtime_generation=generation,
+        require_existing_binding=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("durable_identity", "durable_generation"),
+    (
+        (None, None),
+        ("fedcba98-7654-3210-fedc-ba9876543210", "a" * 64),
+        ("01234567-89ab-cdef-0123-456789abcdef", "b" * 64),
+    ),
+)
+def test_bind_provider_runtime_session_identity_rebind_fails_closed_without_exact_authority(
+    monkeypatch, tmp_path, durable_identity, durable_generation
+):
+    identity = "01234567-89ab-cdef-0123-456789abcdef"
+    generation = "a" * 64
+    manager = MagicMock()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+        lambda _terminal_id: {
+            "provider": "codex",
+            "runtime_lifecycle": "running",
+            "runtime_generation": generation,
+            "provider_resume_identity": durable_identity,
+            "provider_resume_runtime_generation": durable_generation,
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.provider_manager", manager
+    )
+
+    with pytest.raises(RuntimeError, match="no exact durable rebind authority"):
+        bind_provider_runtime_session_identity(
+            "abcdef12",
+            resume_identity=identity,
+            transcript_path=str(tmp_path / "rollout.jsonl"),
+            working_directory=str(tmp_path),
+            source="resume",
+            runtime_generation=generation,
+            require_existing_binding=True,
+        )
+    manager.get_provider.assert_not_called()
+
+
+def test_bind_provider_runtime_session_identity_rejects_managed_worktree_mismatch(
+    monkeypatch, tmp_path
+):
+    identity = "01234567-89ab-cdef-0123-456789abcdef"
+    generation = "a" * 64
+    manager = MagicMock()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+        lambda _terminal_id: {
+            "provider": "codex",
+            "runtime_lifecycle": "running",
+            "runtime_generation": generation,
+            "managed_worktree_kind": "supervisor",
+            "launch_worktree": str(tmp_path / "canonical"),
+        },
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service.provider_manager", manager
+    )
+
+    with pytest.raises(RuntimeError, match="outside its managed worktree"):
+        bind_provider_runtime_session_identity(
+            "abcdef12",
+            resume_identity=identity,
+            transcript_path=str(tmp_path / "rollout.jsonl"),
+            working_directory=str(tmp_path / "different"),
+            source="resume",
+            runtime_generation=generation,
+        )
+    manager.get_provider.assert_not_called()
 
 
 def test_bind_provider_runtime_session_identity_completes_first_turn_cursor_bootstrap(

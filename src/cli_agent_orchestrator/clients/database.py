@@ -5487,13 +5487,16 @@ def bind_terminal_provider_resume_identity(
     provider: str,
     resume_identity: str,
     runtime_generation: str,
+    require_existing_binding: bool = False,
 ) -> bool:
     """Bind one provider-native resume identity at the initial session boundary.
 
     The terminal row and provider-session ownership row are committed together.
     An existing exact live-process usage binding may be promoted into this
     launch authority only for the same terminal; a provider session can never
-    be reassigned or replaced here.
+    be reassigned or replaced here. ``require_existing_binding`` narrows an
+    older immutable hook to an idempotent rebind and cannot introduce a fresh
+    provider identity after the service generation changed.
     """
     _ensure_terminal_worktree_authority_schema()
     _ensure_usage_schema()
@@ -5513,11 +5516,50 @@ def bind_terminal_provider_resume_identity(
         ):
             db.rollback()
             return False
+        if terminal.managed_worktree_kind is not None:
+            if (
+                terminal.write_enabled is not True
+                or not terminal.launch_worktree
+                or not terminal.launch_worktree.startswith("/")
+            ):
+                db.rollback()
+                return False
+            lease = db.get(WorktreeWriterLeaseModel, terminal.launch_worktree)
+            if (
+                lease is None
+                or lease.terminal_id != terminal_id
+                or not terminal.writer_authority_generation
+                or lease.authority_generation != terminal.writer_authority_generation
+            ):
+                db.rollback()
+                return False
+            if terminal.writable_work_context_id is not None:
+                writable_context = db.get(
+                    WritableWorkContextModel, terminal.writable_work_context_id
+                )
+                if (
+                    writable_context is None
+                    or writable_context.state not in {"launching", "admitted"}
+                    or writable_context.terminal_id != terminal_id
+                    or writable_context.session_id != terminal.session_id
+                    or writable_context.project_id != terminal.project_id
+                    or writable_context.canonical_worktree != terminal.launch_worktree
+                    or writable_context.canonical_source != terminal.managed_worktree_source
+                    or writable_context.branch != terminal.managed_worktree_branch
+                    or writable_context.base_revision != terminal.managed_worktree_commit
+                    or writable_context.writer_authority_generation
+                    != terminal.writer_authority_generation
+                ):
+                    db.rollback()
+                    return False
         current = (
             terminal.provider_resume_identity,
             terminal.provider_resume_runtime_generation,
         )
         expected = (resume_identity, runtime_generation)
+        if require_existing_binding and current != expected:
+            db.rollback()
+            return False
         if current not in {(None, None), expected}:
             db.rollback()
             return False

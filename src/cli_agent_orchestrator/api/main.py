@@ -2469,7 +2469,12 @@ async def bind_codex_session_identity_endpoint(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_terminal_auth"
         )
     caller_generation = request.headers.get(RUNTIME_GENERATION_HEADER, "")
-    if not hmac.compare_digest(caller_generation, ACTIVE_RUNTIME_GENERATION):
+    caller_generation_is_current = hmac.compare_digest(caller_generation, ACTIVE_RUNTIME_GENERATION)
+    # Codex can defer SessionStart until the first post-promotion prompt, so a
+    # valid hash from an older immutable release is not by itself stale
+    # terminal authority. It may request only the exact durable rebind below;
+    # malformed/missing generations and every fresh identity remain fenced.
+    if not caller_generation_is_current and not re.fullmatch(r"[0-9a-f]{64}", caller_generation):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="stale_runtime_generation")
     try:
         identity = await run_in_threadpool(
@@ -2481,11 +2486,17 @@ async def bind_codex_session_identity_endpoint(
                 working_directory=body.cwd,
                 source=body.source,
                 runtime_generation=body.runtime_generation,
+                require_existing_binding=not caller_generation_is_current,
             )
         )
     except RuntimeError as exc:
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="identity_not_proven"
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "identity_not_proven"
+                if caller_generation_is_current
+                else "stale_identity_rebind_not_proven"
+            ),
         ) from exc
     return {"session_id": identity}
 

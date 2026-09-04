@@ -10023,6 +10023,142 @@ def _child_workflow_authority_descends_from_assignment(
     return False
 
 
+def _validated_result_callback_transport(
+    db: Any,
+    workflow: WorkflowModel,
+    turn: WorkflowTurnModel,
+    root_terminal_id: str,
+    *,
+    allow_delivered: bool,
+) -> Optional[List[tuple[InboxModel, ChildAssignmentModel]]]:
+    """Resolve every member of an exact immutable-result callback boundary."""
+    if turn.kind == "handoff_result":
+        delegation_kind = "handoff"
+        effect_kind = "handoff"
+        assignment_statuses = {ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value}
+        if allow_delivered:
+            assignment_statuses.add(ChildAssignmentStatus.HANDOFF_RESULT_DELIVERED.value)
+    elif turn.kind == "assigned_result":
+        delegation_kind = "assign"
+        effect_kind = "assign"
+        assignment_statuses = {ChildAssignmentStatus.RESULT_QUEUED.value}
+        if allow_delivered:
+            assignment_statuses.add(ChildAssignmentStatus.RESULT_DELIVERED.value)
+    else:
+        return None
+
+    message_statuses = {MessageStatus.PENDING.value}
+    if allow_delivered:
+        message_statuses.add(MessageStatus.DELIVERED.value)
+    results = (
+        db.query(DelegationResultModel)
+        .filter(DelegationResultModel.workflow_turn_id == turn.id)
+        .order_by(DelegationResultModel.created_at.asc(), DelegationResultModel.id.asc())
+        .all()
+    )
+    if not results or (turn.kind == "assigned_result" and len(results) != 1):
+        return None
+
+    members: List[tuple[InboxModel, ChildAssignmentModel]] = []
+    for result in results:
+        assignment = db.get(ChildAssignmentModel, result.child_assignment_id)
+        notices = db.query(InboxModel).filter(InboxModel.result_id == result.id).all()
+        if assignment is None or len(notices) != 1:
+            return None
+        inbox = notices[0]
+        child_workflow = (
+            db.get(WorkflowModel, assignment.child_workflow_id)
+            if assignment.child_workflow_id is not None
+            else None
+        )
+        child_authority_valid = bool(
+            child_workflow is not None
+            and assignment.child_workflow_turn_id is not None
+            and _child_workflow_authority_descends_from_assignment(
+                db,
+                child_workflow,
+                cast(int, assignment.child_workflow_turn_id),
+                cast(str, assignment.child_terminal_id),
+            )
+        )
+        request_effect = (
+            db.get(WorkflowEffectModel, assignment.request_workflow_effect_id)
+            if assignment.request_workflow_effect_id is not None
+            else None
+        )
+        try:
+            document = json.loads(result.document_json) if result.document_json else None
+        except (TypeError, ValueError):
+            return None
+        body = document.get("body_markdown") if isinstance(document, dict) else None
+        if (
+            result.status != DelegationResultStatus.COMPLETE.value
+            or result.finalized_at is None
+            or result.content_purged_at is not None
+            or not isinstance(result.content_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", result.content_sha256) is None
+            or not isinstance(result.content_bytes, int)
+            or result.content_bytes <= 0
+            or result.delegation_kind != delegation_kind
+            or result.parent_terminal_id != root_terminal_id
+            or result.parent_workflow_id != workflow.id
+            or result.workflow_turn_id != turn.id
+            or result.child_terminal_id != assignment.child_terminal_id
+            or assignment.parent_terminal_id != root_terminal_id
+            or assignment.status not in assignment_statuses
+            or assignment.result_message_id != inbox.id
+            or assignment.request_workflow_id != workflow.id
+            or assignment.request_workflow_turn_id is None
+            or assignment.review_superseded_at is not None
+            or child_workflow is None
+            or child_workflow.root_terminal_id != assignment.child_terminal_id
+            or child_workflow.status != WORKFLOW_TERMINAL
+            or assignment.child_workflow_turn_id is None
+            or not child_authority_valid
+            or request_effect is None
+            or request_effect.workflow_id != workflow.id
+            or request_effect.workflow_turn_id != assignment.request_workflow_turn_id
+            or request_effect.effect_kind != effect_kind
+            or request_effect.state not in {"claimed", "completed", "indeterminate"}
+            or inbox.kind != "delegation_result_notice"
+            or inbox.receiver_id != root_terminal_id
+            or inbox.sender_id != assignment.child_terminal_id
+            or inbox.status not in message_statuses
+            or not isinstance(body, str)
+            or not body.strip()
+            or inbox.message != body
+        ):
+            return None
+        parent_receipt = (
+            db.query(WorkflowTurnReceiptModel.id)
+            .filter_by(
+                workflow_turn_id=assignment.request_workflow_turn_id,
+                receiver_terminal_id=root_terminal_id,
+            )
+            .first()
+        )
+        child_receipt = (
+            db.query(WorkflowTurnReceiptModel.id)
+            .filter_by(
+                workflow_turn_id=assignment.child_workflow_turn_id,
+                receiver_terminal_id=assignment.child_terminal_id,
+            )
+            .first()
+        )
+        if parent_receipt is None or child_receipt is None:
+            return None
+        members.append((inbox, assignment))
+
+    members.sort(key=lambda item: (item[0].created_at, item[0].id))
+    if (
+        not members
+        or members[0][0].id != turn.inbox_message_id
+        or members[0][0].message != turn.payload
+    ):
+        return None
+    return members
+
+
 def _queued_result_turn_authorizes_provider_reconnect(
     db: Any,
     workflow: WorkflowModel,
@@ -10077,115 +10213,15 @@ def _queued_result_turn_authorizes_provider_reconnect(
     if newer_admission is not None:
         return False
 
-    results = (
-        db.query(DelegationResultModel)
-        .filter(DelegationResultModel.workflow_turn_id == turn.id)
-        .order_by(DelegationResultModel.created_at.asc(), DelegationResultModel.id.asc())
-        .all()
-    )
-    if not results:
-        return False
-
-    inbox_rows: List[InboxModel] = []
-    for result in results:
-        assignment = db.get(ChildAssignmentModel, result.child_assignment_id)
-        notices = (
-            db.query(InboxModel)
-            .filter(
-                InboxModel.result_id == result.id,
-                InboxModel.kind == "delegation_result_notice",
-            )
-            .all()
+    return (
+        _validated_result_callback_transport(
+            db,
+            workflow,
+            turn,
+            root_terminal_id,
+            allow_delivered=False,
         )
-        if assignment is None or len(notices) != 1:
-            return False
-        inbox = notices[0]
-        child_workflow = (
-            db.get(WorkflowModel, assignment.child_workflow_id)
-            if assignment.child_workflow_id is not None
-            else None
-        )
-        child_authority_valid = bool(
-            child_workflow is not None
-            and assignment.child_workflow_turn_id is not None
-            and _child_workflow_authority_descends_from_assignment(
-                db,
-                child_workflow,
-                cast(int, assignment.child_workflow_turn_id),
-                cast(str, assignment.child_terminal_id),
-            )
-        )
-        request_effect = (
-            db.get(WorkflowEffectModel, assignment.request_workflow_effect_id)
-            if assignment.request_workflow_effect_id is not None
-            else None
-        )
-        try:
-            document = json.loads(result.document_json) if result.document_json else None
-        except (TypeError, ValueError):
-            return False
-        body = document.get("body_markdown") if isinstance(document, dict) else None
-        if (
-            result.status != DelegationResultStatus.COMPLETE.value
-            or result.finalized_at is None
-            or result.content_purged_at is not None
-            or not isinstance(result.content_sha256, str)
-            or re.fullmatch(r"[0-9a-f]{64}", result.content_sha256) is None
-            or not isinstance(result.content_bytes, int)
-            or result.content_bytes <= 0
-            or result.delegation_kind != "handoff"
-            or result.parent_terminal_id != root_terminal_id
-            or result.parent_workflow_id != workflow.id
-            or result.child_terminal_id != assignment.child_terminal_id
-            or assignment.parent_terminal_id != root_terminal_id
-            or assignment.status != ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value
-            or assignment.result_message_id != inbox.id
-            or assignment.request_workflow_id != workflow.id
-            or assignment.request_workflow_turn_id is None
-            or assignment.review_superseded_at is not None
-            or child_workflow is None
-            or child_workflow.root_terminal_id != assignment.child_terminal_id
-            or child_workflow.status != WORKFLOW_TERMINAL
-            or assignment.child_workflow_turn_id is None
-            or not child_authority_valid
-            or request_effect is None
-            or request_effect.workflow_id != workflow.id
-            or request_effect.workflow_turn_id != assignment.request_workflow_turn_id
-            or request_effect.effect_kind != "handoff"
-            or request_effect.state not in {"claimed", "completed", "indeterminate"}
-            or inbox.receiver_id != root_terminal_id
-            or inbox.sender_id != assignment.child_terminal_id
-            or inbox.status != MessageStatus.PENDING.value
-            or not isinstance(body, str)
-            or not body.strip()
-            or inbox.message != body
-        ):
-            return False
-        parent_receipt = (
-            db.query(WorkflowTurnReceiptModel.id)
-            .filter_by(
-                workflow_turn_id=assignment.request_workflow_turn_id,
-                receiver_terminal_id=root_terminal_id,
-            )
-            .first()
-        )
-        child_receipt = (
-            db.query(WorkflowTurnReceiptModel.id)
-            .filter_by(
-                workflow_turn_id=assignment.child_workflow_turn_id,
-                receiver_terminal_id=assignment.child_terminal_id,
-            )
-            .first()
-        )
-        if parent_receipt is None or child_receipt is None:
-            return False
-        inbox_rows.append(inbox)
-
-    inbox_rows.sort(key=lambda row: (row.created_at, row.id))
-    return bool(
-        inbox_rows
-        and inbox_rows[0].id == turn.inbox_message_id
-        and inbox_rows[0].message == turn.payload
+        is not None
     )
 
 
@@ -12181,72 +12217,23 @@ def _restore_unreceipted_inbox_transport_for_replay(
     """
     if turn.inbox_message_id is None:
         return True
-    rows = (
-        db.query(InboxModel, DelegationResultModel)
-        .outerjoin(DelegationResultModel, DelegationResultModel.id == InboxModel.result_id)
-        .filter(
-            InboxModel.receiver_id == workflow.root_terminal_id,
-            or_(
-                InboxModel.id == turn.inbox_message_id,
-                DelegationResultModel.workflow_turn_id == turn.id,
-            ),
-        )
-        .order_by(InboxModel.created_at.asc(), InboxModel.id.asc())
-        .all()
+    members = _validated_result_callback_transport(
+        db,
+        workflow,
+        turn,
+        cast(str, workflow.root_terminal_id),
+        allow_delivered=True,
     )
-    if not rows or int(turn.inbox_message_id) not in {int(message.id) for message, _ in rows}:
+    if members is None:
         return False
 
-    assignment_updates: List[tuple[ChildAssignmentModel, str]] = []
-    for message, result in rows:
-        if message.status not in (
-            MessageStatus.PENDING.value,
-            MessageStatus.DELIVERED.value,
-        ):
-            return False
-        if message.kind != "delegation_result_notice":
-            if result is not None or turn.kind in {"assigned_result", "handoff_result"}:
-                return False
-            continue
-        if (
-            result is None
-            or result.status != DelegationResultStatus.COMPLETE.value
-            or result.finalized_at is None
-            or result.parent_terminal_id != workflow.root_terminal_id
-            or result.parent_workflow_id != workflow.id
-            or result.workflow_turn_id != turn.id
-        ):
-            return False
-        assignment = db.get(ChildAssignmentModel, result.child_assignment_id)
-        if (
-            assignment is None
-            or assignment.parent_terminal_id != workflow.root_terminal_id
-            or assignment.child_terminal_id != result.child_terminal_id
-            or assignment.result_message_id != message.id
-            or assignment.review_superseded_at is not None
-        ):
-            return False
-        if turn.kind == "handoff_result":
-            allowed = (
-                ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value,
-                ChildAssignmentStatus.HANDOFF_RESULT_DELIVERED.value,
-            )
-            queued_status = ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value
-        elif turn.kind == "assigned_result":
-            allowed = (
-                ChildAssignmentStatus.RESULT_QUEUED.value,
-                ChildAssignmentStatus.RESULT_DELIVERED.value,
-            )
-            queued_status = ChildAssignmentStatus.RESULT_QUEUED.value
-        else:
-            return False
-        if assignment.status not in allowed:
-            return False
-        assignment_updates.append((assignment, queued_status))
-
-    for message, _result in rows:
+    queued_status = (
+        ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value
+        if turn.kind == "handoff_result"
+        else ChildAssignmentStatus.RESULT_QUEUED.value
+    )
+    for message, assignment in members:
         message.status = MessageStatus.PENDING.value
-    for assignment, queued_status in assignment_updates:
         assignment.status = queued_status
         assignment.updated_at = now
     return True
@@ -12294,6 +12281,22 @@ def requeue_settled_unadmitted_workflow_turn(
             is not None
         ):
             db.rollback()
+            return False
+        if cast(int, turn.attempt_count) >= 3:
+            workflow.status = WORKFLOW_OWNER_GATE
+            workflow.terminal_reason = BOUNDED_TRANSPORT_RETRY_GUARD_REASON
+            workflow.updated_at = now
+            turn.state = TURN_CANCELLED
+            turn.claim_token = None
+            turn.claim_expires_at = None
+            turn.queue_reason = "PROVIDER_TRANSPORT_RETRY_EXHAUSTED"
+            turn.dispatch_recovery_count = 1
+            turn.updated_at = now
+            _fail_closed_workflow_inbox_transports_in_transaction(db, workflow_id=int(workflow.id))
+            db.commit()
+            _dispatch_workflow_notification_fail_open(
+                root_terminal_id, "owner_attention", int(workflow.id)
+            )
             return False
         if not _restore_unreceipted_inbox_transport_for_replay(db, workflow, turn, now):
             workflow.status = WORKFLOW_OWNER_GATE

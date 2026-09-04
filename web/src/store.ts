@@ -25,7 +25,7 @@ interface Store {
   fetchSessions: () => Promise<void>
   selectSession: (name: string | null) => Promise<void>
   createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string, projectId?: string, ownerGrant?: OwnerLaunchGrant, workContextRequestId?: string) => Promise<void>
-  deleteSession: (name: string) => Promise<void>
+  deleteSession: (name: string, confirmDirtyWorkspace?: boolean) => Promise<void>
   showSnackbar: (snackbar: Snackbar) => void
   hideSnackbar: () => void
   setConnected: (connected: boolean) => void
@@ -87,9 +87,9 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
-  deleteSession: async (name) => {
+  deleteSession: async (name, confirmDirtyWorkspace = false) => {
     try {
-      await api.deleteSession(name)
+      await api.deleteSession(name, confirmDirtyWorkspace)
       get().showSnackbar({ type: 'success', message: appText('store.sessionDeleted', { name }) })
       if (get().activeSession === name) {
         set({ activeSession: null, activeSessionDetail: null })

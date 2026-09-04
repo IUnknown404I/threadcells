@@ -567,7 +567,8 @@ class TestPublicControlPlaneApi:
         assert response.status_code == 409
         assert response.json()["detail"]["reason_code"] == "HOUSEKEEPING_PLAN_CHANGED"
 
-    def test_full_cleanup_preview_is_read_only(self, client):
+    @pytest.mark.parametrize("retire_dirty_worktrees", [False, True])
+    def test_full_cleanup_preview_is_read_only(self, client, retire_dirty_worktrees):
         preview = {
             "schema_version": 1,
             "mode": "full",
@@ -578,11 +579,14 @@ class TestPublicControlPlaneApi:
             "cli_agent_orchestrator.services.housekeeping_service.plan_full_cleanup_serialized",
             return_value=preview,
         ) as service:
-            response = client.get("/api/v1/housekeeping/full-cleanup/plan")
+            response = client.get(
+                "/api/v1/housekeeping/full-cleanup/plan",
+                params={"retire_dirty_worktrees": retire_dirty_worktrees},
+            )
 
         assert response.status_code == 200
         assert response.json() == preview
-        service.assert_called_once_with()
+        service.assert_called_once_with(retire_dirty_worktrees=retire_dirty_worktrees)
 
     @pytest.mark.parametrize(
         "path",
@@ -606,7 +610,10 @@ class TestPublicControlPlaneApi:
         assert response.status_code == 423
         assert response.json()["detail"]["reason_code"] == "HOUSEKEEPING_BUSY"
 
-    def test_full_cleanup_execution_uses_operator_and_explicit_confirmation(self, client):
+    @pytest.mark.parametrize("retire_dirty_worktrees", [False, True])
+    def test_full_cleanup_execution_uses_operator_and_explicit_confirmation(
+        self, client, retire_dirty_worktrees
+    ):
         plan_id = "b" * 64
         summary = MagicMock()
         summary.as_dict.return_value = {"ok": True, "full_cleanup": True}
@@ -631,7 +638,11 @@ class TestPublicControlPlaneApi:
         ):
             response = client.post(
                 "/api/v1/housekeeping/full-cleanup/run",
-                json={"expected_plan_id": plan_id, "confirmed": True},
+                json={
+                    "expected_plan_id": plan_id,
+                    "confirmed": True,
+                    "retire_dirty_worktrees": retire_dirty_worktrees,
+                },
                 headers={"Authorization": "Bearer existing-secret"},
             )
 
@@ -640,12 +651,14 @@ class TestPublicControlPlaneApi:
         helper.assert_called_once_with(
             expected_plan_id=plan_id,
             confirmed=True,
+            retire_dirty_worktrees=retire_dirty_worktrees,
             session_token=None,
             bearer_secret="existing-secret",
         )
         service.assert_called_once_with(
             expected_plan_id=plan_id,
             confirmed=True,
+            retire_dirty_worktrees=retire_dirty_worktrees,
             privileged_cleanup_executor=ANY,
         )
 
@@ -1488,6 +1501,24 @@ class TestGetSession:
 class TestDeleteSession:
     """Tests for DELETE /sessions/{session_name} endpoint."""
 
+    def test_deletion_preflight_exposes_dirty_counts_without_mutation(self, client):
+        preflight = {
+            "eligible": True,
+            "already_deleted": False,
+            "requires_dirty_confirmation": True,
+            "modified_files": 2,
+            "untracked_files": 1,
+            "reason_code": None,
+        }
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.get_session_deletion_preflight.return_value = preflight
+
+            response = client.get("/sessions/test-session/deletion-preflight")
+
+        assert response.status_code == 200
+        assert response.json() == preflight
+        mock_svc.get_session_deletion_preflight.assert_called_once_with("test-session")
+
     def test_delete_session_success(self, client):
         """DELETE /sessions/{name} deletes session and returns success."""
         with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
@@ -1502,7 +1533,22 @@ class TestDeleteSession:
         data = response.json()
         assert data["success"] is True
         assert data["deleted"] == ["test-session"]
-        mock_svc.delete_session.assert_called_once_with("test-session", registry=ANY)
+        mock_svc.delete_session.assert_called_once_with(
+            "test-session", registry=ANY, confirm_dirty_workspace=False
+        )
+
+    def test_delete_session_forwards_explicit_dirty_confirmation(self, client):
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.delete_session.return_value = {"deleted": ["test-session"], "errors": []}
+
+            response = client.delete(
+                "/sessions/test-session", params={"confirm_dirty_workspace": True}
+            )
+
+        assert response.status_code == 200
+        mock_svc.delete_session.assert_called_once_with(
+            "test-session", registry=ANY, confirm_dirty_workspace=True
+        )
 
     def test_delete_session_not_found(self, client):
         """DELETE /sessions/{name} returns 404 for nonexistent session."""

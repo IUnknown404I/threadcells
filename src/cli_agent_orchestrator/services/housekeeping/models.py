@@ -28,6 +28,7 @@ CandidateKind = Literal[
     "retirement_cleanup",
     "workflow_authority",
     "git_worktree",
+    "session_workspace",
     "reproducible_cache",
     "inventory",
 ]

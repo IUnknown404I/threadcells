@@ -338,6 +338,7 @@ export interface SessionSummary extends Session {
   last_active: string | null
   first_agent: SessionBoundaryAgent | null
   last_agent: SessionBoundaryAgent | null
+  workspace_state?: 'reserved' | 'provisioned' | 'launching' | 'admitted' | 'preserved' | 'retiring' | 'retired' | 'abandoned' | null
 }
 
 export interface SessionBoundaryAgent {
@@ -347,6 +348,15 @@ export interface SessionBoundaryAgent {
   lifecycle: string | null
   workflow_state: string | null
   workflow_reason: string | null
+}
+
+export interface SessionDeletionPreflight {
+  eligible: boolean
+  already_deleted: boolean
+  requires_dirty_confirmation: boolean
+  modified_files: number
+  untracked_files: number
+  reason_code: string | null
 }
 
 export type TerminalLifecycle = 'starting' | 'running' | 'recovery_required' | 'exit_pending' | 'exited' | 'recovery_fenced'
@@ -379,6 +389,7 @@ export interface AgentSummary {
   writable_work_context_id?: string | null
   writer_authority_generation?: string | null
   workspace_classification?: 'managed_isolated' | 'legacy_shared_root' | null
+  workspace_state?: string | null
   projectId: string | null
   project_name: string | null
   project_path: string | null
@@ -818,10 +829,10 @@ export const api = {
     }
   },
   runHousekeeping: (mode: HousekeepingMode, dry_run: boolean, expectedPlanId?: string) => fetchJSON<Record<string, any>>('/api/v1/housekeeping/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode, dry_run, expected_plan_id: expectedPlanId }), timeoutMs: null }),
-  getFullCleanupPlan: async (signal?: AbortSignal) => {
+  getFullCleanupPlan: async (signal?: AbortSignal, retireDirtyWorktrees = false) => {
     const locale = readStoredAppLocale()
     try {
-      return await fetchJSON<FullCleanupPlan>('/api/v1/housekeeping/full-cleanup/plan', {
+      return await fetchJSON<FullCleanupPlan>(`/api/v1/housekeeping/full-cleanup/plan?retire_dirty_worktrees=${retireDirtyWorktrees}`, {
         signal,
         timeoutMs: HOUSEKEEPING_PLAN_TIMEOUT_MS,
         timeoutError: {
@@ -834,7 +845,7 @@ export const api = {
       planningNetworkError(reason, true)
     }
   },
-  runFullCleanup: (expectedPlanId: string) => fetchJSON<Record<string, any>>('/api/v1/housekeeping/full-cleanup/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_plan_id: expectedPlanId, confirmed: true }), timeoutMs: null }),
+  runFullCleanup: (expectedPlanId: string, retireDirtyWorktrees = false) => fetchJSON<Record<string, any>>('/api/v1/housekeeping/full-cleanup/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_plan_id: expectedPlanId, confirmed: true, retire_dirty_worktrees: retireDirtyWorktrees }), timeoutMs: null }),
   getHousekeepingReport: () => fetchJSON<Record<string, any>>('/api/v1/housekeeping/report'),
   getUsageStatistics: () => fetchJSON<UsageStatistics>('/usage/statistics'),
   getBranding: () => fetchJSON<RuntimeBranding>('/settings/branding'),
@@ -876,7 +887,8 @@ export const api = {
     // the UI until it settles so the backend cancellation reconciliation only
     // runs for genuine caller cancellation (navigation, disconnect, etc.).
     fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}${projectId ? `&projectId=${encodeURIComponent(projectId)}` : ''}${ownerGrant ? `&owner_grant_launch_id=${encodeURIComponent(ownerGrant.launch_id)}` : ''}${workContextRequestId ? `&workContextRequestId=${encodeURIComponent(workContextRequestId)}` : ''}`, { method: 'POST', headers: ownerGrant ? { 'X-ThreadCells-Owner-Grant': ownerGrant.grant } : undefined, timeoutMs: null }),
-  deleteSession: (name: string) => fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  getSessionDeletionPreflight: (name: string) => fetchJSON<SessionDeletionPreflight>(`/sessions/${encodeURIComponent(name)}/deletion-preflight`),
+  deleteSession: (name: string, confirmDirtyWorkspace = false) => fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${encodeURIComponent(name)}?confirm_dirty_workspace=${confirmDirtyWorkspace}`, { method: 'DELETE' }),
 
   // Terminals
   getTerminalStatus: (id: string) => fetchJSON<Terminal>(`/terminals/${id}`),

@@ -275,7 +275,7 @@ describe('API wrapper', () => {
 
     mockResponse({ mode: 'full', plan_id: planId })
     await api.getFullCleanupPlan()
-    expect(mockFetch).toHaveBeenCalledWith('/api/v1/housekeeping/full-cleanup/plan', expect.objectContaining({ signal: expect.any(AbortSignal) }))
+    expect(mockFetch).toHaveBeenCalledWith('/api/v1/housekeeping/full-cleanup/plan?retire_dirty_worktrees=false', expect.objectContaining({ signal: expect.any(AbortSignal) }))
 
     mockResponse({ ok: true })
     await api.runFullCleanup(planId)
@@ -283,10 +283,23 @@ describe('API wrapper', () => {
       '/api/v1/housekeeping/full-cleanup/run',
       expect.objectContaining({
         method: 'POST',
-        body: JSON.stringify({ expected_plan_id: planId, confirmed: true }),
+        body: JSON.stringify({ expected_plan_id: planId, confirmed: true, retire_dirty_worktrees: false }),
       })
     )
     expect(JSON.stringify(mockFetch.mock.calls[mockFetch.mock.calls.length - 1])).not.toMatch(/secret|password/i)
+
+    mockResponse({ mode: 'full', plan_id: planId })
+    await api.getFullCleanupPlan(undefined, true)
+    expect(mockFetch).toHaveBeenCalledWith('/api/v1/housekeeping/full-cleanup/plan?retire_dirty_worktrees=true', expect.any(Object))
+
+    mockResponse({ ok: true })
+    await api.runFullCleanup(planId, true)
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/v1/housekeeping/full-cleanup/run',
+      expect.objectContaining({
+        body: JSON.stringify({ expected_plan_id: planId, confirmed: true, retire_dirty_worktrees: true }),
+      })
+    )
   })
 
   it('uses the canonical operator session status and revocation endpoints', async () => {
@@ -302,7 +315,7 @@ describe('API wrapper', () => {
   it('deleteSession sends DELETE', async () => {
     mockResponse({ success: true, deleted: [], errors: [] })
     await api.deleteSession('s1')
-    expect(mockFetch).toHaveBeenCalledWith('/sessions/s1', expect.objectContaining({ method: 'DELETE' }))
+    expect(mockFetch).toHaveBeenCalledWith('/sessions/s1?confirm_dirty_workspace=false', expect.objectContaining({ method: 'DELETE' }))
   })
 
   it('sendInput sends POST with message', async () => {

@@ -1187,9 +1187,11 @@ def plan_full_cleanup(
     config: Mapping[str, Any] | None = None,
     now: float | None = None,
     proc_root: Path = Path("/proc"),
+    retire_dirty_worktrees: bool = False,
 ) -> dict[str, Any]:
     """Build the canonical maximum proven-safe cleanup preview."""
     cfg = dict(config or load_operations_config())
+    cfg["_retire_dirty_session_workspaces"] = retire_dirty_worktrees
     plan = plan_housekeeping(config=cfg, mode="full", now=now, proc_root=proc_root)
     result = cast(dict[str, Any], plan.as_dict())
     result["idle_gate"] = full_cleanup_idle_gate(cfg)
@@ -1202,13 +1204,19 @@ def plan_full_cleanup_serialized(
     config: Mapping[str, Any] | None = None,
     now: float | None = None,
     proc_root: Path = Path("/proc"),
+    retire_dirty_worktrees: bool = False,
 ) -> dict[str, Any]:
     """Build one Full Cleanup preview under the canonical Housekeeping lock."""
     cfg = dict(config or load_operations_config())
     lock_dir = Path(str(cfg["lock_dir"]))
     lock_dir.mkdir(parents=True, exist_ok=True)
     with _housekeeping_execution_lock(lock_dir):
-        return plan_full_cleanup(config=cfg, now=now, proc_root=proc_root)
+        return plan_full_cleanup(
+            config=cfg,
+            now=now,
+            proc_root=proc_root,
+            retire_dirty_worktrees=retire_dirty_worktrees,
+        )
 
 
 def run_full_cleanup(
@@ -1219,12 +1227,15 @@ def run_full_cleanup(
     now: float | None = None,
     proc_root: Path = Path("/proc"),
     privileged_cleanup_executor: Callable[..., Any] | None = None,
+    retire_dirty_worktrees: bool = False,
 ) -> HousekeepingSummary:
     """Execute one confirmed Full Cleanup through canonical Housekeeping."""
     if confirmed is not True:
         raise RuntimeError("FULL_CLEANUP_CONFIRMATION_REQUIRED")
+    cfg = dict(config or load_operations_config())
+    cfg["_retire_dirty_session_workspaces"] = retire_dirty_worktrees
     return run_housekeeping(
-        config=config,
+        config=cfg,
         dry_run=False,
         mode="full",
         now=now,
@@ -1391,7 +1402,8 @@ def run_housekeeping(
                 candidate.category == "package_cache" for candidate in actionable
             )
             summary.worktrees_retired += sum(
-                candidate.resource_kind == "git_worktree" for candidate in actionable
+                candidate.resource_kind in {"git_worktree", "session_workspace"}
+                for candidate in actionable
             )
             summary.reproducible_caches_removed += sum(
                 candidate.resource_kind == "reproducible_cache" for candidate in actionable
@@ -1511,7 +1523,7 @@ def run_housekeeping(
             )
             summary.worktrees_retired += sum(
                 candidate.canonical_identity in executed
-                and candidate.resource_kind == "git_worktree"
+                and candidate.resource_kind in {"git_worktree", "session_workspace"}
                 for candidate in actionable
             )
             summary.reproducible_caches_removed += sum(

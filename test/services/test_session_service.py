@@ -229,7 +229,8 @@ class TestDeleteSession:
             ),
             patch("cli_agent_orchestrator.services.session_service.cancel_workflows_for_terminal"),
             patch(
-                "cli_agent_orchestrator.services.session_service.validate_managed_worktree_cleanup"
+                "cli_agent_orchestrator.services.session_service.validate_managed_worktree_cleanup",
+                create=True,
             ),
             patch("cli_agent_orchestrator.services.session_service.cleanup_managed_worktree"),
             patch("cli_agent_orchestrator.services.session_service.provider_manager"),
@@ -327,7 +328,7 @@ class TestDeleteSession:
 
     @patch("cli_agent_orchestrator.services.session_service.retire_exited_terminal_runtime")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_historical_session_tombstones_while_retaining_protected_worktree(
+    def test_historical_dirty_session_requires_and_honors_explicit_confirmation(
         self, mock_tmux, retire
     ):
         mock_tmux.session_exists.return_value = False
@@ -337,39 +338,41 @@ class TestDeleteSession:
             contexts[0],
             contexts[1],
             contexts[2],
-            contexts[3] as validate,
+            contexts[3],
             contexts[4] as cleanup,
             contexts[5],
             contexts[6] as delete,
             contexts[7],
+            patch(
+                "cli_agent_orchestrator.services.session_service._session_deletion_preflight",
+                return_value={
+                    "eligible": True,
+                    "already_deleted": False,
+                    "requires_dirty_confirmation": True,
+                    "modified_files": 1,
+                    "untracked_files": 1,
+                    "reason_code": None,
+                },
+            ),
         ):
-            validate.side_effect = [
-                None,
-                ManagedWorktreeCleanupError("MANAGED_WORKTREE_DIRTY"),
-            ]
-            delete.return_value = {
-                "deleted": 1,
-                "logical_deleted": 2,
-                "retained": 1,
-                "retained_resources": [
-                    {"terminal_id": "terminal2", "reason_code": "MANAGED_WORKTREE_DIRTY"}
-                ],
-                "already_deleted": False,
-            }
-            result = delete_session("session-lifetime-1")
+            with pytest.raises(SessionLifecycleError) as error:
+                delete_session("session-lifetime-1")
+            assert error.value.reason_code == "SESSION_DIRTY_CONFIRMATION_REQUIRED"
+            cleanup.assert_not_called()
+            delete.assert_not_called()
+
+            result = delete_session("session-lifetime-1", confirm_dirty_workspace=True)
 
         assert result["deleted"] == ["cao-test"]
-        assert result["retained_resources"] == [
-            {"terminal_id": "terminal2", "reason_code": "MANAGED_WORKTREE_DIRTY"}
-        ]
-        cleanup.assert_called_once_with(_durable_session(lifecycle="exited")["terminals"][0])
+        assert result["retained_resources"] == []
+        assert cleanup.call_count == 2
+        for terminal in _durable_session(lifecycle="exited")["terminals"]:
+            cleanup.assert_any_call(terminal, allow_dirty=True)
         delete.assert_called_once_with(
             "session-lifetime-1",
             "cao-test",
             expected_terminal_ids=["terminal1", "terminal2"],
-            retained_resources=[
-                {"terminal_id": "terminal2", "reason_code": "MANAGED_WORKTREE_DIRTY"}
-            ],
+            retained_resources=[],
         )
 
     @patch("cli_agent_orchestrator.services.session_service.resolve_session_lifetime")

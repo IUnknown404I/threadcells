@@ -68,6 +68,7 @@ def test_privileged_helper_client_uses_bounded_unix_protocol(tmp_path):
         "operation": "full_cleanup",
         "expected_plan_id": "a" * 64,
         "confirmed": True,
+        "retire_dirty_worktrees": False,
         "operator_session_token": "opaque-session-token",
     }
 

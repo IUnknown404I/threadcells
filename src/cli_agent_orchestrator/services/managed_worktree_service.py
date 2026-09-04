@@ -38,6 +38,42 @@ def _git(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProce
     )
 
 
+def _dirty_content_fingerprint(path: Path, *, status: str, head: str) -> str:
+    """Bind a dirty worktree candidate to the exact changed file contents.
+
+    This deliberately hashes only Git-reported changed and untracked paths, so
+    ordinary Housekeeping does not crawl immutable dependency trees.  Clean
+    worktrees are already bound by HEAD and the empty porcelain status.
+    """
+    changed = _git("diff", "--name-only", "-z", "HEAD", "--", cwd=path).stdout
+    untracked = _git("ls-files", "--others", "--exclude-standard", "-z", cwd=path).stdout
+    relative_paths = sorted({item for item in f"{changed}\0{untracked}".split("\0") if item})
+    digest = hashlib.sha256()
+    digest.update(head.encode("utf-8", "surrogateescape"))
+    digest.update(b"\0")
+    digest.update(status.encode("utf-8", "surrogateescape"))
+    for relative in relative_paths:
+        digest.update(b"\0path\0")
+        digest.update(relative.encode("utf-8", "surrogateescape"))
+        candidate = path / relative
+        try:
+            resolved_parent = candidate.parent.resolve(strict=True)
+            resolved_parent.relative_to(path)
+            metadata = candidate.lstat()
+        except (OSError, ValueError):
+            digest.update(b"\0absent")
+            continue
+        digest.update(f"\0{metadata.st_mode}:{metadata.st_size}".encode())
+        if candidate.is_symlink():
+            digest.update(b"\0symlink\0")
+            digest.update(candidate.readlink().as_posix().encode("utf-8", "surrogateescape"))
+        elif candidate.is_file():
+            with candidate.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+    return digest.hexdigest()
+
+
 _MANAGED_KINDS = frozenset({"supervisor", "task", "reviewer"})
 
 
@@ -212,6 +248,8 @@ def managed_worktree_status(metadata: Mapping[str, Any]) -> dict[str, Any]:
             "expected_commit": metadata.get("managed_worktree_commit"),
             "expected_branch": expected_branch,
             "branch": expected_branch,
+            "modified_files": 0,
+            "untracked_files": 0,
         }
         if expected_branch is not None:
             branch = _git(
@@ -235,8 +273,14 @@ def managed_worktree_status(metadata: Mapping[str, Any]) -> dict[str, Any]:
             "reason_code": "MANAGED_WORKTREE_NOT_REGISTERED",
         }
     status = _git("status", "--porcelain", "--untracked-files=all", cwd=path)
+    status_lines = [line for line in status.stdout.splitlines() if line]
     head = _git("rev-parse", "HEAD", cwd=path).stdout.strip()
     branch = _git("symbolic-ref", "--quiet", "--short", "HEAD", cwd=path, check=False)
+    content_fingerprint = _dirty_content_fingerprint(
+        resolved_path,
+        status=status.stdout,
+        head=head,
+    )
     return {
         "managed": True,
         "safe": True,
@@ -246,12 +290,17 @@ def managed_worktree_status(metadata: Mapping[str, Any]) -> dict[str, Any]:
         "commit": head,
         "branch": branch.stdout.strip() if branch.returncode == 0 else None,
         "clean": not bool(status.stdout),
+        "modified_files": sum(not line.startswith("??") for line in status_lines),
+        "untracked_files": sum(line.startswith("??") for line in status_lines),
+        "content_fingerprint": content_fingerprint,
         "expected_commit": metadata.get("managed_worktree_commit"),
         "expected_branch": expected_branch,
     }
 
 
-def remove_managed_worktree(metadata: Mapping[str, Any]) -> dict[str, Any]:
+def remove_managed_worktree(
+    metadata: Mapping[str, Any], *, allow_dirty: bool = False
+) -> dict[str, Any]:
     """Remove a clean managed worktree without deleting its task branch.
 
     Dirty or unverifiable worktrees are retained fail-closed. A task branch is
@@ -263,7 +312,7 @@ def remove_managed_worktree(metadata: Mapping[str, Any]) -> dict[str, Any]:
         return {"removed": False, "managed": False}
     if not status.get("safe"):
         return {"removed": False, **status}
-    if not status.get("clean"):
+    if not status.get("clean") and not allow_dirty:
         return {
             "removed": False,
             **status,
@@ -289,7 +338,11 @@ def remove_managed_worktree(metadata: Mapping[str, Any]) -> dict[str, Any]:
                 "reason_code": "REVIEW_WORKTREE_AUTHORITY_CHANGED",
             }
     source = Path(str(status["source"]))
-    completed = _git("worktree", "remove", str(status["path"]), cwd=source, check=False)
+    arguments = ["worktree", "remove"]
+    if allow_dirty:
+        arguments.append("--force")
+    arguments.append(str(status["path"]))
+    completed = _git(*arguments, cwd=source, check=False)
     if completed.returncode != 0:
         return {
             "removed": False,

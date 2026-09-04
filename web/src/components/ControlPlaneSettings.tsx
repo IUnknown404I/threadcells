@@ -329,6 +329,7 @@ function HousekeepingSettingsPage() {
   const [fullRunning, setFullRunning] = useState(false)
   const [fullConfirm, setFullConfirm] = useState(false)
   const [fullError, setFullError] = useState('')
+  const [retireDirtyWorktrees, setRetireDirtyWorktrees] = useState(false)
   const [error, setError] = useState('')
   const [planning, setPlanning] = useState<'normal' | 'full' | null>(null)
   const planningRef = useRef<'normal' | 'full' | null>(null)
@@ -410,7 +411,10 @@ function HousekeepingSettingsPage() {
     setFullReport(null)
     setFullPlan(null)
     try {
-      const nextPlan = await api.getFullCleanupPlan(controller.signal)
+      const nextPlan = await api.getFullCleanupPlan(
+        controller.signal,
+        retireDirtyWorktrees,
+      )
       if (!controller.signal.aborted && mountedRef.current) setFullPlan(nextPlan)
     } catch (reason) {
       if (!controller.signal.aborted && mountedRef.current) {
@@ -427,7 +431,7 @@ function HousekeepingSettingsPage() {
     setFullRunning(true)
     setFullError('')
     try {
-      const result = await api.runFullCleanup(fullPlan.plan_id)
+      const result = await api.runFullCleanup(fullPlan.plan_id, retireDirtyWorktrees)
       setFullReport(result)
       setReport(result)
       setFullPlan(null)
@@ -521,6 +525,19 @@ function HousekeepingSettingsPage() {
         <p className="mt-3 rounded-lg border border-red-800/60 bg-red-950/40 p-3 text-sm font-medium text-red-100">{!fullPlan || fullPlan.release_state.active_only_expected ? t('housekeeping.full.activeOnly') : t('housekeeping.full.ambiguous', { count: fullPlan.release_state.protected_non_active_releases })}</p>
       </div>
       <div className="space-y-4 p-4 sm:p-5">
+        <label className="flex min-h-11 items-start gap-3 rounded-lg border border-red-900/60 bg-red-950/30 p-3 text-xs leading-5 text-red-100">
+          <input
+            type="checkbox"
+            checked={retireDirtyWorktrees}
+            onChange={event => {
+              setRetireDirtyWorktrees(event.target.checked)
+              setFullPlan(null)
+              setFullReport(null)
+            }}
+            className="mt-0.5 h-4 w-4 shrink-0 accent-red-500"
+          />
+          <span><span className="block font-medium">{t('housekeeping.full.retireDirty')}</span><span className="mt-0.5 block text-red-200/70">{t('housekeeping.full.retireDirtyHelp')}</span></span>
+        </label>
         <div className="flex flex-col gap-3 sm:flex-row">
           <button aria-busy={planning === 'full'} disabled={Boolean(planning) || fullRunning || running} className="min-h-11 rounded-lg bg-gray-700 px-4 text-sm disabled:opacity-50" onClick={() => void buildFullPlan()}>{planning === 'full' ? <span className="inline-flex items-center gap-2">
 <Loader2 size={15} className="animate-spin" aria-hidden="true"/>{t('housekeeping.full.building')}</span> : t('housekeeping.full.build')}</button>
@@ -537,7 +554,7 @@ function HousekeepingSettingsPage() {
             <Summary label={t('housekeeping.full.idleGate')} value={t(fullPlan.idle_gate.eligible ? 'status.ready' : 'housekeeping.full.blocked')} detail={t('housekeeping.full.agentCounts', { ready: fullPlan.idle_gate.ready_agents, exited: fullPlan.idle_gate.exited_agents })} />
           </div>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            {['worktrees', 'build_artifact', 'reproducible_cache', 'package_cache', 'logs', 'ephemeral', 'browser_cache', 'releases'].map(category => <Summary key={category} label={category} value={bytes(fullClasses[category]?.reclaimable_bytes || 0)} detail={tp('resources', fullClasses[category]?.actionable_count || 0)} />)}
+            {['session_workspaces', 'worktrees', 'build_artifact', 'reproducible_cache', 'package_cache', 'logs', 'ephemeral', 'browser_cache', 'releases'].map(category => <Summary key={category} label={category} value={bytes(fullClasses[category]?.reclaimable_bytes || 0)} detail={tp('resources', fullClasses[category]?.actionable_count || 0)} />)}
             <Summary label={t('housekeeping.protected')} value={String(fullProtected)} detail={t('housekeeping.full.requiredProtected')} />
           </div>
           {!fullPlan.idle_gate.eligible && <ul className="list-disc space-y-1 pl-5 text-xs text-amber-200">{fullPlan.idle_gate.blockers.map((item, index) => <li key={`${item.terminal_id}-${item.reason_code}-${index}`}>{item.terminal_id ? `${t('housekeeping.full.agentBlocker', { id: item.terminal_id })} ` : ''}{item.reason_code}</li>)}</ul>}

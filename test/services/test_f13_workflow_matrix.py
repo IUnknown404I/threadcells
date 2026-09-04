@@ -2704,6 +2704,34 @@ def test_f13_ready_reconnect_wakes_receipted_result_then_preserves_composer_fifo
             result.content_bytes,
         )
 
+    # Production can accept the pane write and report Ready before the
+    # replacement provider claims its workflow receipt. Releasing the exact
+    # provider lease must restore both the same callback turn and its
+    # Inbox/result transport; otherwise the Inbox-owned FIFO cannot see the
+    # queued turn and no later daemon tick can retry it.
+    assert database.release_provider_execution(parent, callback_successor)
+    assert database.requeue_settled_unadmitted_workflow_turn(parent, callback_successor)
+    assert not database.requeue_settled_unadmitted_workflow_turn(parent, callback_successor)
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowTurnModel, callback_successor).state == "queued"
+        assert db.get(InboxModel, notice.id).status == "pending"
+        assert (
+            db.query(database.ChildAssignmentModel).filter_by(child_terminal_id=child).one().status
+            == "handoff_result_queued"
+        )
+        assert db.query(WorkflowTurnModel).filter_by(kind="handoff_result").count() == 2
+
+    assert inbox_service.reconcile_provider_execution_queue(observe_open_workflows=False) == 1
+    assert send.call_count == 2
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowTurnModel, callback_successor).state == "sent"
+        assert db.get(WorkflowTurnModel, callback_successor).attempt_count == 3
+        assert db.get(InboxModel, notice.id).status == "delivered"
+        assert (
+            db.query(database.ChildAssignmentModel).filter_by(child_terminal_id=child).one().status
+            == "handoff_result_delivered"
+        )
+
     callback_successor_receipt = claim_or_resume_workflow_turn_receipt(parent, callback_successor)
     assert callback_successor_receipt["accepted"] is True
     with patch.object(mcp_server, "_send_message_impl") as duplicate_send:
@@ -2798,6 +2826,38 @@ def test_f13_ready_reconnect_wakes_receipted_result_then_preserves_composer_fifo
             "assign": "indeterminate",
             "acknowledge_assignment": "completed",
         }
+
+
+def test_f13_settled_unreceipted_callback_owner_gates_when_result_replay_is_unsafe(
+    workflow_db,
+):
+    parent = "root-unsafe-unreceipted-result"
+    child = "child-unsafe-unreceipted-result"
+    _start_admitted_input(parent)
+    assert register_handoff_child(parent, child)
+    notice, duplicate = create_handoff_child_result_message(child, "immutable result")
+    assert notice is not None and duplicate is False
+    claim = claim_handoff_result_batch_for_inbox(notice.id)
+    assert isinstance(claim, dict)
+    assert mark_workflow_turn_sent(claim["id"], claim["claim_token"], claim["claim_generation"])
+    assert database.update_pending_message_status(notice.id, database.MessageStatus.DELIVERED)
+    assert mark_child_assignment_result_delivered(notice.id)
+    assert database.acquire_provider_execution(parent, claim["id"], 3)
+    assert database.release_provider_execution(parent, claim["id"])
+
+    # A terminal transport state is not safe to rewrite into another delivery.
+    with database.SessionLocal() as db:
+        db.get(InboxModel, notice.id).status = "failed"
+        db.commit()
+
+    assert not database.requeue_settled_unadmitted_workflow_turn(parent, claim["id"])
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=parent).one()
+        turn = db.get(WorkflowTurnModel, claim["id"])
+        assert workflow.status == "owner_gate"
+        assert workflow.terminal_reason == database.UNRECEIPTED_INBOX_REPLAY_GUARD_REASON
+        assert turn.state == "sent"
+        assert turn.queue_reason == "UNRECEIPTED_INBOX_REPLAY_UNSAFE"
 
 
 def test_f13_completion_fails_closed_on_claimed_composer_successor(workflow_db):

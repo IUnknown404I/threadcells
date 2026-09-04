@@ -7622,6 +7622,9 @@ PROVIDER_RECONNECT_RECOVERY_EXHAUSTED_REASON = (
     "No further provider launch will occur automatically."
 )
 BOUNDED_TRANSPORT_RETRY_GUARD_REASON = "bounded continuation transport retry guard"
+UNRECEIPTED_INBOX_REPLAY_GUARD_REASON = (
+    "unreceipted Inbox transport could not be safely restored for replay"
+)
 WORKFLOW_READY_AFTER_PROCESSING_GRACE_SECONDS = 3
 WORKFLOW_READY_WITHOUT_PROCESSING_GRACE_SECONDS = 30
 # Provider finals are transport observations, not semantic mission outcomes.
@@ -12161,6 +12164,94 @@ def requeue_unadmitted_workflow_turns_for_restart(now: Optional[datetime] = None
         return unreceived
 
 
+def _restore_unreceipted_inbox_transport_for_replay(
+    db: Any,
+    workflow: WorkflowModel,
+    turn: WorkflowTurnModel,
+    now: datetime,
+) -> bool:
+    """Restore the transport half of one settled, unreceipted Inbox turn.
+
+    Inbox ``delivered`` records pane acceptance, while the workflow receipt
+    records semantic admission by the receiver.  If the provider settles
+    between those boundaries, requeueing only the workflow turn makes it
+    invisible to the Inbox-owned FIFO.  Restore both halves in this one write
+    transaction, including every sealed result-batch member, or decline the
+    replay when their immutable authority is no longer exact.
+    """
+    if turn.inbox_message_id is None:
+        return True
+    rows = (
+        db.query(InboxModel, DelegationResultModel)
+        .outerjoin(DelegationResultModel, DelegationResultModel.id == InboxModel.result_id)
+        .filter(
+            InboxModel.receiver_id == workflow.root_terminal_id,
+            or_(
+                InboxModel.id == turn.inbox_message_id,
+                DelegationResultModel.workflow_turn_id == turn.id,
+            ),
+        )
+        .order_by(InboxModel.created_at.asc(), InboxModel.id.asc())
+        .all()
+    )
+    if not rows or int(turn.inbox_message_id) not in {int(message.id) for message, _ in rows}:
+        return False
+
+    assignment_updates: List[tuple[ChildAssignmentModel, str]] = []
+    for message, result in rows:
+        if message.status not in (
+            MessageStatus.PENDING.value,
+            MessageStatus.DELIVERED.value,
+        ):
+            return False
+        if message.kind != "delegation_result_notice":
+            if result is not None or turn.kind in {"assigned_result", "handoff_result"}:
+                return False
+            continue
+        if (
+            result is None
+            or result.status != DelegationResultStatus.COMPLETE.value
+            or result.finalized_at is None
+            or result.parent_terminal_id != workflow.root_terminal_id
+            or result.parent_workflow_id != workflow.id
+            or result.workflow_turn_id != turn.id
+        ):
+            return False
+        assignment = db.get(ChildAssignmentModel, result.child_assignment_id)
+        if (
+            assignment is None
+            or assignment.parent_terminal_id != workflow.root_terminal_id
+            or assignment.child_terminal_id != result.child_terminal_id
+            or assignment.result_message_id != message.id
+            or assignment.review_superseded_at is not None
+        ):
+            return False
+        if turn.kind == "handoff_result":
+            allowed = (
+                ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value,
+                ChildAssignmentStatus.HANDOFF_RESULT_DELIVERED.value,
+            )
+            queued_status = ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value
+        elif turn.kind == "assigned_result":
+            allowed = (
+                ChildAssignmentStatus.RESULT_QUEUED.value,
+                ChildAssignmentStatus.RESULT_DELIVERED.value,
+            )
+            queued_status = ChildAssignmentStatus.RESULT_QUEUED.value
+        else:
+            return False
+        if assignment.status not in allowed:
+            return False
+        assignment_updates.append((assignment, queued_status))
+
+    for message, _result in rows:
+        message.status = MessageStatus.PENDING.value
+    for assignment, queued_status in assignment_updates:
+        assignment.status = queued_status
+        assignment.updated_at = now
+    return True
+
+
 def requeue_settled_unadmitted_workflow_turn(
     root_terminal_id: str,
     logical_turn_id: int,
@@ -12203,6 +12294,17 @@ def requeue_settled_unadmitted_workflow_turn(
             is not None
         ):
             db.rollback()
+            return False
+        if not _restore_unreceipted_inbox_transport_for_replay(db, workflow, turn, now):
+            workflow.status = WORKFLOW_OWNER_GATE
+            workflow.terminal_reason = UNRECEIPTED_INBOX_REPLAY_GUARD_REASON
+            workflow.updated_at = now
+            turn.queue_reason = "UNRECEIPTED_INBOX_REPLAY_UNSAFE"
+            turn.updated_at = now
+            db.commit()
+            _dispatch_workflow_notification_fail_open(
+                root_terminal_id, "owner_attention", int(workflow.id)
+            )
             return False
         turn.state = TURN_QUEUED
         turn.claim_token = None

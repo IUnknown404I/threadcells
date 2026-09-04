@@ -4454,6 +4454,12 @@ WITH selected_terminals AS MATERIALIZED (
            END AS workflow_state,
            lw.status AS workflow_status, lw.terminal_reason AS workflow_reason,
            COALESCE(qt.queued_task_count, 0) AS queued_task_count,
+           CASE
+             WHEN lw.status = 'open' AND awt.state IN ('queued', 'claimed', 'sent')
+                  AND (awt.provider_reconnect_requested_at IS NOT NULL
+                       OR awt.dedupe_key LIKE 'provider-reconnect-%') THEN 1
+             ELSE 0
+           END AS workflow_recovery_pending,
            awt.provider_outcome_code, awt.provider_outcome_detail,
            lr.status AS assignment_status,
            lr.result_status, lr.status AS delivery_status,
@@ -7663,6 +7669,10 @@ PROVIDER_RECONNECT_RECOVERY_EXHAUSTED_REASON = (
     "Provider reconnect recovery exhausted after three bounded exact-resume attempts. "
     "No further provider launch will occur automatically."
 )
+PROVIDER_RECONNECT_CONTINUATION_UNSAFE_REASON = (
+    "Provider runtime recovered, but the interrupted workflow authority could not be "
+    "continued safely. No queued owner input was consumed."
+)
 BOUNDED_TRANSPORT_RETRY_GUARD_REASON = "bounded continuation transport retry guard"
 UNRECEIPTED_INBOX_REPLAY_GUARD_REASON = (
     "unreceipted Inbox transport could not be safely restored for replay"
@@ -8876,11 +8886,21 @@ def get_terminal_workflow_projection(terminal_id: str) -> Dict[str, Any]:
             if workflow is not None and workflow.status == WORKFLOW_OPEN
             else 0
         )
+        workflow_recovery_pending = bool(
+            raw_workflow == WORKFLOW_OPEN
+            and active_turn is not None
+            and active_turn.state in {TURN_QUEUED, TURN_CLAIMED, TURN_SENT}
+            and (
+                active_turn.provider_reconnect_requested_at is not None
+                or active_turn.dedupe_key.startswith("provider-reconnect-")
+            )
+        )
         return {
             "state": state,
             "workflow_status": raw_workflow,
             "workflow_reason": owner_reason,
             "queued_task_count": queued_task_count,
+            "workflow_recovery_pending": workflow_recovery_pending,
             "provider_outcome_code": provider_outcome_code,
             "provider_outcome_detail": provider_outcome_detail,
             "assignment_status": assignment_status,
@@ -9006,17 +9026,23 @@ def get_provider_execution_admission_queue() -> List[Dict[str, Any]]:
         for turn, root_terminal_id, active_turn_id in workflow_rows:
             terminal_id = str(root_terminal_id)
             # A resident's explicit Inbox payload is semantic authority over
-            # its synthetic OPEN-workflow continuation. An active external
-            # Composer turn is different: reconnect completion selected that
-            # exact canonical item as the FIFO head, so a later pending Inbox
-            # row may not hide it and then defer against its active binding.
+            # its synthetic OPEN-workflow continuation. Active external input
+            # and a server-authored reconnect resume are different: each is
+            # exact canonical authority, so a later pending Inbox row may not
+            # hide it and then defer against its active binding.
             if terminal_id in seen_inbox:
-                active_external = (
-                    turn.kind == "external_input"
-                    and turn.inbox_message_id is None
+                active_priority = (
+                    turn.inbox_message_id is None
                     and active_turn_id == turn.id
+                    and (
+                        turn.kind == "external_input"
+                        or (
+                            turn.kind == "execution_resume"
+                            and turn.dedupe_key.startswith("provider-reconnect-execution:")
+                        )
+                    )
                 )
-                if not active_external:
+                if not active_priority:
                     continue
                 candidates = [
                     candidate
@@ -9079,6 +9105,32 @@ def workflow_has_active_queued_external_input(root_terminal_id: str) -> bool:
                 WorkflowTurnModel.state == TURN_QUEUED,
                 WorkflowTurnModel.kind == "external_input",
                 WorkflowTurnModel.inbox_message_id.is_(None),
+            )
+            .first()
+            is not None
+        )
+
+
+def workflow_has_active_queued_priority_input(root_terminal_id: str) -> bool:
+    """Whether exact queued authority must run before unrelated Inbox work."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        return (
+            db.query(WorkflowTurnModel.id)
+            .join(WorkflowModel, WorkflowTurnModel.workflow_id == WorkflowModel.id)
+            .filter(
+                WorkflowModel.root_terminal_id == root_terminal_id,
+                WorkflowModel.status == WORKFLOW_OPEN,
+                WorkflowModel.active_turn_id == WorkflowTurnModel.id,
+                WorkflowTurnModel.state == TURN_QUEUED,
+                WorkflowTurnModel.inbox_message_id.is_(None),
+                or_(
+                    WorkflowTurnModel.kind == "external_input",
+                    and_(
+                        WorkflowTurnModel.kind == "execution_resume",
+                        WorkflowTurnModel.dedupe_key.like("provider-reconnect-execution:%"),
+                    ),
+                ),
             )
             .first()
             is not None
@@ -9511,8 +9563,11 @@ def _mirror_workflow_effect_ledger(
     source_turn_id: int,
     target_turn_id: int,
     now: datetime,
+    *,
+    retryable_rejected_effects: Optional[set[tuple[str, str]]] = None,
 ) -> None:
     """Fence a successor with the source execution's durable effect truth."""
+    retryable_rejected_effects = retryable_rejected_effects or set()
     prior_effects = (
         db.query(WorkflowEffectModel)
         .filter(
@@ -9522,13 +9577,49 @@ def _mirror_workflow_effect_ledger(
         .all()
     )
     for prior in prior_effects:
+        state = "indeterminate" if prior.state == "claimed" else prior.state
+        if (
+            state == "rejected"
+            and (str(prior.effect_kind), str(prior.effect_key)) in retryable_rejected_effects
+        ):
+            # A rejected acknowledgement never mutated its assignment.  Only
+            # exact immutable-result reconciliation can place its key in this
+            # allowlist after the missing delivery/request authority is now
+            # proven.  The historical row remains rejected; the successor
+            # receives the sole safely reclaimable pre-effect state.
+            state = "not_admitted"
+        existing = (
+            db.query(WorkflowEffectModel)
+            .filter_by(
+                workflow_id=workflow_id,
+                workflow_turn_id=target_turn_id,
+                effect_kind=prior.effect_kind,
+                effect_key=prior.effect_key,
+            )
+            .one_or_none()
+        )
+        if existing is not None:
+            # Rolling recovery can combine the current admitted execution's
+            # ledger with an older callback transport.  Preserve the strongest
+            # fence rather than inserting a duplicate capability.
+            states = {str(existing.state), state}
+            if "completed" in states:
+                existing.state = "completed"
+            elif "indeterminate" in states or "claimed" in states:
+                existing.state = "indeterminate"
+            elif "rejected" in states:
+                existing.state = "rejected"
+            else:
+                existing.state = "not_admitted"
+            existing.updated_at = now
+            continue
         db.add(
             WorkflowEffectModel(
                 workflow_id=workflow_id,
                 workflow_turn_id=target_turn_id,
                 effect_kind=prior.effect_kind,
                 effect_key=prior.effect_key,
-                state=("indeterminate" if prior.state == "claimed" else prior.state),
+                state=state,
                 claim_token=uuid.uuid4().hex,
                 created_at=now,
                 updated_at=now,
@@ -9705,6 +9796,36 @@ def claim_or_resume_workflow_turn_receipt(
         if eligible != 1:
             db.rollback()
             return {"accepted": False, "reason": "duplicate_or_closed_workflow"}
+        turn = db.get(WorkflowTurnModel, logical_turn_id)
+        reconnect_parent_receipt = None
+        reconnect_parent_turn_id: Optional[int] = None
+        if (
+            turn is not None
+            and turn.resume_parent_turn_id is not None
+            and turn.dedupe_key.startswith("provider-reconnect-")
+        ):
+            reconnect_parent_turn_id = int(turn.resume_parent_turn_id)
+            parent_turn = db.get(WorkflowTurnModel, reconnect_parent_turn_id)
+            reconnect_parent_receipt = (
+                db.query(WorkflowTurnReceiptModel)
+                .filter_by(
+                    workflow_turn_id=reconnect_parent_turn_id,
+                    receiver_terminal_id=receiver_terminal_id,
+                )
+                .one_or_none()
+            )
+            if (
+                turn.state != TURN_SENT
+                or reconnect_parent_turn_id >= logical_turn_id
+                or parent_turn is None
+                or parent_turn.workflow_id != turn.workflow_id
+                or parent_turn.state != TURN_FINISHED
+                or reconnect_parent_receipt is None
+                or reconnect_parent_receipt.resumed_by_turn_id is not None
+                or reconnect_parent_receipt.resumed_at is not None
+            ):
+                db.rollback()
+                return {"accepted": False, "reason": "duplicate_or_closed_workflow"}
         next_resume_token = secrets.token_urlsafe(32)
         db.add(
             WorkflowTurnReceiptModel(
@@ -9716,6 +9837,9 @@ def claim_or_resume_workflow_turn_receipt(
                 consumed_at=now,
             )
         )
+        if reconnect_parent_receipt is not None:
+            reconnect_parent_receipt.resumed_by_turn_id = logical_turn_id
+            reconnect_parent_receipt.resumed_at = now
         try:
             db.commit()
         except IntegrityError:
@@ -9725,10 +9849,19 @@ def claim_or_resume_workflow_turn_receipt(
             return {"accepted": False, "reason": "duplicate_or_closed_workflow"}
         return {
             "accepted": True,
-            "resumed": False,
+            "resumed": reconnect_parent_turn_id is not None,
             "logical_turn_id": logical_turn_id,
+            **(
+                {"resumed_from_logical_turn_id": reconnect_parent_turn_id}
+                if reconnect_parent_turn_id is not None
+                else {}
+            ),
             "resume_token": next_resume_token,
-            "reason": "admitted",
+            "reason": (
+                "provider_reconnect_execution_resumed"
+                if reconnect_parent_turn_id is not None
+                else "admitted"
+            ),
         }
 
 
@@ -10078,6 +10211,8 @@ def _validated_result_callback_transport(
     root_terminal_id: str,
     *,
     allow_delivered: bool,
+    allow_acknowledged: bool = False,
+    allow_acknowledged_superseded: bool = False,
 ) -> Optional[List[tuple[InboxModel, ChildAssignmentModel]]]:
     """Resolve every member of an exact immutable-result callback boundary."""
     if turn.kind == "handoff_result":
@@ -10086,12 +10221,16 @@ def _validated_result_callback_transport(
         assignment_statuses = {ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value}
         if allow_delivered:
             assignment_statuses.add(ChildAssignmentStatus.HANDOFF_RESULT_DELIVERED.value)
+        if allow_acknowledged:
+            assignment_statuses.add(ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value)
     elif turn.kind == "assigned_result":
         delegation_kind = "assign"
         effect_kind = "assign"
         assignment_statuses = {ChildAssignmentStatus.RESULT_QUEUED.value}
         if allow_delivered:
             assignment_statuses.add(ChildAssignmentStatus.RESULT_DELIVERED.value)
+        if allow_acknowledged:
+            assignment_statuses.add(ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value)
     else:
         return None
 
@@ -10157,7 +10296,17 @@ def _validated_result_callback_transport(
             or assignment.result_message_id != inbox.id
             or assignment.request_workflow_id != workflow.id
             or assignment.request_workflow_turn_id is None
-            or assignment.review_superseded_at is not None
+            or (
+                assignment.review_superseded_at is not None
+                and not (
+                    allow_acknowledged_superseded
+                    and assignment.status
+                    in {
+                        ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
+                        ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value,
+                    }
+                )
+            )
             or child_workflow is None
             or child_workflow.root_terminal_id != assignment.child_terminal_id
             or child_workflow.status != WORKFLOW_TERMINAL
@@ -10205,6 +10354,261 @@ def _validated_result_callback_transport(
     ):
         return None
     return members
+
+
+def _provider_reconnect_result_callback_state(
+    db: Any,
+    workflow: WorkflowModel,
+    turn: WorkflowTurnModel,
+    root_terminal_id: str,
+) -> str:
+    """Classify one callback as replayable, already complete, or unsafe.
+
+    An acknowledged assignment is durable proof that the callback effect no
+    longer needs replay.  It is distinct from malformed or stale authority:
+    live reconnect must continue the interrupted execution, while the bounded
+    rolling repair must leave an already-running Composer turn untouched.
+    Batched callbacks are complete only when every sealed member is
+    acknowledged; a mixed or otherwise unprovable boundary remains unsafe.
+    """
+    replayable = _validated_result_callback_transport(
+        db,
+        workflow,
+        turn,
+        root_terminal_id,
+        allow_delivered=True,
+    )
+    if replayable is not None:
+        return "replayable"
+    completed = _validated_result_callback_transport(
+        db,
+        workflow,
+        turn,
+        root_terminal_id,
+        allow_delivered=True,
+        allow_acknowledged=True,
+        allow_acknowledged_superseded=True,
+    )
+    acknowledged_status = (
+        ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value
+        if turn.kind == "handoff_result"
+        else ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value
+    )
+    if completed is not None and all(
+        assignment.status == acknowledged_status for _, assignment in completed
+    ):
+        return "acknowledged"
+    return "unsafe"
+
+
+def _canonical_acknowledgement_effect_key(result_id: str) -> str:
+    """Match the MCP acknowledgement key without importing the MCP server."""
+    digest = hashlib.sha256(result_id.encode("utf-8", "strict")).hexdigest()
+    return f"acknowledge_assignment:{digest}"
+
+
+def _reconcile_proven_result_effect_authority(
+    db: Any,
+    workflow: WorkflowModel,
+    source_turn: WorkflowTurnModel,
+    members: Sequence[tuple[InboxModel, ChildAssignmentModel]],
+    now: datetime,
+) -> set[tuple[str, str]]:
+    """Resolve only effect truth proven by one exact immutable callback.
+
+    A completed child result proves that its request-side assign/handoff
+    operation crossed the effect boundary even when a service restart left
+    that request ledger ``claimed`` or ``indeterminate``.  Once that truth is
+    sealed, a prior rejected acknowledgement may become retryable, but only
+    when the exact current review/result authority is valid.  The source
+    rejection remains immutable audit history; the returned key allowlist is
+    used solely while fencing one canonical successor.
+    """
+    retryable: set[tuple[str, str]] = set()
+    for inbox, assignment in members:
+        if inbox.result_id is None:
+            continue
+        result = db.get(DelegationResultModel, inbox.result_id)
+        request_effect = (
+            db.get(WorkflowEffectModel, assignment.request_workflow_effect_id)
+            if assignment.request_workflow_effect_id is not None
+            else None
+        )
+        if result is None or request_effect is None:
+            continue
+        if request_effect.state in {"claimed", "indeterminate"}:
+            # The exact finalized result/assignment join was validated by the
+            # caller. It is positive evidence that the request effect created
+            # this child and ran to completion, not an assumption that an
+            # uncertain external operation may be replayed.
+            request_effect.state = "completed"
+            request_effect.updated_at = now
+        if _review_acknowledgement_reason(db, assignment, workflow, result) is not None:
+            continue
+        effect_key = _canonical_acknowledgement_effect_key(str(result.id))
+        retryable.add(("acknowledge_assignment", effect_key))
+    return retryable
+
+
+def _materialize_provider_reconnect_result_successor(
+    db: Any,
+    workflow: WorkflowModel,
+    source_turn: WorkflowTurnModel,
+    resume_parent_turn: WorkflowTurnModel,
+    root_terminal_id: str,
+    now: datetime,
+    *,
+    dedupe_key: str,
+    additional_effect_source_turn_id: Optional[int] = None,
+) -> Optional[WorkflowTurnModel]:
+    """Create one receiptable callback successor after provider replacement."""
+    members = _validated_result_callback_transport(
+        db,
+        workflow,
+        source_turn,
+        root_terminal_id,
+        allow_delivered=True,
+    )
+    if members is None:
+        return None
+    retryable = _reconcile_proven_result_effect_authority(db, workflow, source_turn, members, now)
+    # Transport provenance alone cannot turn a stale or unbound review into
+    # executable acknowledgement authority. The request-effect reconciliation
+    # above is narrowly proven by the immutable child result; after applying
+    # that fact, every member must also pass the existing exact-review gate.
+    # Otherwise leave the queued owner suffix untouched and let the caller
+    # enter the truthful owner gate.
+    for inbox, assignment in members:
+        result = db.get(DelegationResultModel, inbox.result_id)
+        if (
+            result is None
+            or _review_acknowledgement_reason(db, assignment, workflow, result) is not None
+        ):
+            return None
+    existing = (
+        db.query(WorkflowTurnModel)
+        .filter_by(workflow_id=workflow.id, dedupe_key=dedupe_key)
+        .one_or_none()
+    )
+    if existing is not None:
+        return cast(WorkflowTurnModel, existing)
+
+    anchor = members[0][0]
+    source_turn.inbox_message_id = None
+    db.flush()
+    successor = WorkflowTurnModel(
+        workflow_id=workflow.id,
+        kind=source_turn.kind,
+        dedupe_key=dedupe_key,
+        payload=source_turn.payload,
+        state=TURN_QUEUED,
+        inbox_message_id=anchor.id,
+        attempt_count=0,
+        not_before=None,
+        queue_reason="PROVIDER_RECONNECT_RESULT_CONTINUATION_PENDING",
+        resume_parent_turn_id=resume_parent_turn.id,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(successor)
+    db.flush()
+    _mirror_workflow_effect_ledger(
+        db,
+        int(workflow.id),
+        int(source_turn.id),
+        int(successor.id),
+        now,
+        retryable_rejected_effects=retryable,
+    )
+    if (
+        additional_effect_source_turn_id is not None
+        and additional_effect_source_turn_id != source_turn.id
+    ):
+        _mirror_workflow_effect_ledger(
+            db,
+            int(workflow.id),
+            additional_effect_source_turn_id,
+            int(successor.id),
+            now,
+            retryable_rejected_effects=retryable,
+        )
+    for inbox, assignment in members:
+        result = db.get(DelegationResultModel, inbox.result_id)
+        assert result is not None
+        result.workflow_turn_id = successor.id
+        inbox.status = MessageStatus.PENDING.value
+        inbox.callback_reconciled_at = now
+        inbox.callback_reconciled_from_turn_id = source_turn.id
+        assignment.status = (
+            ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value
+            if source_turn.kind == "handoff_result"
+            else ChildAssignmentStatus.RESULT_QUEUED.value
+        )
+        assignment.updated_at = now
+        _record_result_event(
+            db,
+            str(result.id),
+            f"provider-reconnect-successor:{source_turn.id}:{successor.id}",
+            "callback_transport_reconciled",
+            "cao_lifecycle",
+            root_terminal_id,
+            workflow_turn_id=successor.id,
+            detail={
+                "superseded_workflow_turn_id": int(source_turn.id),
+                "successor_workflow_turn_id": int(successor.id),
+            },
+        )
+    source_turn.state = TURN_FINISHED
+    source_turn.superseded_by_turn_id = successor.id
+    source_turn.superseded_at = now
+    source_turn.queue_reason = "RESULT_CALLBACK_REQUEUED_AFTER_PROVIDER_RECONNECT"
+    source_turn.claim_token = None
+    source_turn.claim_expires_at = None
+    source_turn.updated_at = now
+    if resume_parent_turn.id != source_turn.id:
+        resume_parent_turn.state = TURN_FINISHED
+        resume_parent_turn.updated_at = now
+    workflow.active_turn_id = successor.id
+    workflow.no_progress_count = 0
+    workflow.updated_at = now
+    return successor
+
+
+def _materialize_provider_reconnect_execution_successor(
+    db: Any,
+    workflow: WorkflowModel,
+    source_turn: WorkflowTurnModel,
+    now: datetime,
+) -> WorkflowTurnModel:
+    """Create the single server-authored resume prompt for a replaced runtime."""
+    successor = WorkflowTurnModel(
+        workflow_id=workflow.id,
+        kind="execution_resume",
+        dedupe_key=f"provider-reconnect-execution:{source_turn.id}",
+        payload=(
+            "Provider runtime recovery completed while this workflow remained OPEN. "
+            "Resume the interrupted workflow work using durable result/effect authority; "
+            "do not repeat completed privileged effects."
+        ),
+        state=TURN_QUEUED,
+        attempt_count=0,
+        not_before=None,
+        queue_reason="PROVIDER_RECONNECT_CONTINUATION_PENDING",
+        resume_parent_turn_id=source_turn.id,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(successor)
+    db.flush()
+    _mirror_workflow_effect_ledger(
+        db, int(workflow.id), int(source_turn.id), int(successor.id), now
+    )
+    source_turn.state = TURN_FINISHED
+    source_turn.updated_at = now
+    workflow.active_turn_id = successor.id
+    workflow.no_progress_count = 0
+    workflow.updated_at = now
+    return successor
 
 
 def _queued_result_turn_authorizes_provider_reconnect(
@@ -11025,38 +11429,46 @@ def complete_workflow_provider_reconnect(
         )
         for inbox in pending_inbox_rows:
             _materialize_pending_inbox_turn_in_transaction(db, inbox, workflow, now)
-        # Canonical work submitted during reconnect is durable successor
-        # authority, but it must not cancel the turn that owns the exact
-        # resume attempt. Once the sidecar is proven Ready, atomically retire
-        # only that synthetic transport and promote the FIFO head across both
-        # Composer and Inbox inputs. The next dispatcher tick injects it into
-        # this already-resident provider without purchasing another reconnect.
-        # A queued result callback is itself the executable transport whose
-        # stale runtime caused this reconnect.  It must retain authority until
-        # physical delivery and receipt even if newer work was persisted while
-        # the reconnect was in flight.  Admitted predecessors and synthetic
-        # ``open_final`` turns, by contrast, need their queued successor
-        # promoted once the replacement runtime is ready.
+        # A reconnect of an admitted execution is an interruption boundary,
+        # not permission to promote unrelated queued work. Runtime Ready says
+        # only that transport is available; one fresh receiptable successor
+        # must carry the interrupted workflow/effect authority first. Result
+        # callbacks retain their immutable artifact and are redelivered under
+        # that successor. Other turns receive a server-authored execution
+        # resume. Queued Composer/Inbox work remains behind this authority.
+        receiver_receipt = (
+            db.query(WorkflowTurnReceiptModel)
+            .filter_by(
+                workflow_turn_id=turn.id,
+                receiver_terminal_id=root_terminal_id,
+            )
+            .one_or_none()
+        )
+        admitted_reconnect = receiver_receipt is not None and turn.state in {
+            TURN_SENT,
+            TURN_FINISHED,
+        }
         queued_result_transport = turn.state == TURN_QUEUED and turn.kind == "handoff_result"
-        stale_requeued_result_transport = (
+        pending_result_for_turn = (
             db.query(InboxModel.id)
-            .join(
-                DelegationResultModel,
-                DelegationResultModel.id == InboxModel.result_id,
-            )
-            .join(
-                WorkflowTurnModel,
-                WorkflowTurnModel.id == DelegationResultModel.workflow_turn_id,
-            )
+            .join(DelegationResultModel, DelegationResultModel.id == InboxModel.result_id)
             .filter(
                 InboxModel.receiver_id == root_terminal_id,
                 InboxModel.kind == "delegation_result_notice",
                 InboxModel.status == MessageStatus.PENDING.value,
+                DelegationResultModel.workflow_turn_id == WorkflowTurnModel.id,
+            )
+            .exists()
+        )
+        stale_requeued_result_turn = (
+            db.query(WorkflowTurnModel)
+            .filter(
                 WorkflowTurnModel.workflow_id == workflow.id,
                 WorkflowTurnModel.id < turn.id,
                 WorkflowTurnModel.state == TURN_FINISHED,
                 WorkflowTurnModel.kind.in_(("assigned_result", "handoff_result")),
                 WorkflowTurnModel.superseded_by_turn_id.is_(None),
+                pending_result_for_turn,
                 db.query(WorkflowTurnReceiptModel.id)
                 .filter(
                     WorkflowTurnReceiptModel.workflow_turn_id == WorkflowTurnModel.id,
@@ -11064,15 +11476,80 @@ def complete_workflow_provider_reconnect(
                 )
                 .exists(),
             )
+            .order_by(WorkflowTurnModel.created_at.asc(), WorkflowTurnModel.id.asc())
             .first()
-            is not None
         )
         successor = None
-        if queued_result_transport:
+        continuation_unsafe = False
+        if admitted_reconnect:
+            admitted_receipt = cast(WorkflowTurnReceiptModel, receiver_receipt)
+            if (
+                admitted_receipt.resumed_by_turn_id is not None
+                or admitted_receipt.resumed_at is not None
+            ):
+                db.rollback()
+                return False
+            execution_lease = db.get(ProviderExecutionLeaseModel, root_terminal_id)
+            if execution_lease is not None:
+                if execution_lease.workflow_turn_id != turn.id:
+                    db.rollback()
+                    return False
+                db.delete(execution_lease)
+            if turn.kind in {"assigned_result", "handoff_result"}:
+                callback_state = _provider_reconnect_result_callback_state(
+                    db, workflow, turn, root_terminal_id
+                )
+                if callback_state == "replayable":
+                    successor = _materialize_provider_reconnect_result_successor(
+                        db,
+                        workflow,
+                        turn,
+                        turn,
+                        root_terminal_id,
+                        now,
+                        dedupe_key=f"provider-reconnect-result:{turn.id}",
+                    )
+                    continuation_unsafe = successor is None
+                elif callback_state == "acknowledged":
+                    successor = _materialize_provider_reconnect_execution_successor(
+                        db, workflow, turn, now
+                    )
+                else:
+                    continuation_unsafe = True
+            elif stale_requeued_result_turn is not None:
+                callback_state = _provider_reconnect_result_callback_state(
+                    db, workflow, stale_requeued_result_turn, root_terminal_id
+                )
+                if callback_state == "replayable":
+                    successor = _materialize_provider_reconnect_result_successor(
+                        db,
+                        workflow,
+                        stale_requeued_result_turn,
+                        turn,
+                        root_terminal_id,
+                        now,
+                        dedupe_key=(
+                            f"provider-reconnect-pending-result:{turn.id}:"
+                            f"{stale_requeued_result_turn.id}"
+                        ),
+                        additional_effect_source_turn_id=int(turn.id),
+                    )
+                    continuation_unsafe = successor is None
+                elif callback_state == "acknowledged":
+                    successor = _materialize_provider_reconnect_execution_successor(
+                        db, workflow, turn, now
+                    )
+                else:
+                    continuation_unsafe = True
+            else:
+                successor = _materialize_provider_reconnect_execution_successor(
+                    db, workflow, turn, now
+                )
+        elif queued_result_transport:
             turn.not_before = None
             turn.queue_reason = "WORKFLOW_CONTINUATION_PENDING"
             turn.updated_at = now
-        elif not stale_requeued_result_transport:
+        elif stale_requeued_result_turn is None:
             successor = (
                 db.query(WorkflowTurnModel)
                 .filter(
@@ -11092,7 +11569,13 @@ def complete_workflow_provider_reconnect(
         # Composer row ahead of it merely because the replacement runtime is
         # Ready.  The next ordinary queue tick rematerializes that callback
         # and the queued suffix under one monotonic successor generation.
-        if successor is not None:
+        if continuation_unsafe:
+            workflow.status = WORKFLOW_OWNER_GATE
+            workflow.terminal_reason = PROVIDER_RECONNECT_CONTINUATION_UNSAFE_REASON
+            workflow.updated_at = now
+            turn.queue_reason = "PROVIDER_RECONNECT_CONTINUATION_UNSAFE"
+            turn.updated_at = now
+        elif successor is not None and not admitted_reconnect:
             if turn.kind == "open_final" and turn.state in (TURN_QUEUED, TURN_CLAIMED):
                 turn.state = TURN_CANCELLED
                 turn.queue_reason = None
@@ -11109,10 +11592,16 @@ def complete_workflow_provider_reconnect(
         terminal.runtime_operation_claimed_at = None
         terminal.runtime_operation_expires_at = None
         attempt.state = PROVIDER_RECONNECT_SUCCEEDED
-        attempt.outcome_code = "runtime_ready"
+        attempt.outcome_code = (
+            "runtime_ready_authority_gate" if continuation_unsafe else "runtime_ready"
+        )
         attempt.finished_at = now
         attempt.updated_at = now
         db.commit()
+        if continuation_unsafe:
+            _dispatch_workflow_notification_fail_open(
+                root_terminal_id, "owner_attention", int(workflow.id)
+            )
         return True
 
 
@@ -12480,6 +12969,143 @@ def requeue_settled_unadmitted_workflow_turn(
         turn.updated_at = now
         db.commit()
         return True
+
+
+def reconcile_receipted_callback_after_reconnect_promotion(
+    now: Optional[datetime] = None,
+) -> int:
+    """Repair the bounded pre-fix case where Ready promoted Composer early.
+
+    Releases prior to the reconnect-continuation contract could select an
+    already-queued external turn immediately after ``runtime_ready`` even
+    though the reconnect source was a receipted, unacknowledged result
+    callback.  Wait until that accidentally admitted external execution has a
+    receiver receipt *and* its exact provider lease has settled, then create
+    one current callback successor.  The successful reconnect attempt, turn
+    timestamps, immutable result graph, and absence of execution capacity are
+    all required; any broader shape remains untouched.
+    """
+    _ensure_workflow_schema()
+    _ensure_child_assignment_schema()
+    _ensure_delegation_result_schema()
+    now = now or datetime.now()
+    changed = 0
+    gated_workflows: list[tuple[str, int]] = []
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        workflows = db.query(WorkflowModel).filter_by(status=WORKFLOW_OPEN).all()
+        for workflow in workflows:
+            if workflow.active_turn_id is None:
+                continue
+            active = db.get(WorkflowTurnModel, workflow.active_turn_id)
+            active_receipt = (
+                db.query(WorkflowTurnReceiptModel)
+                .filter_by(
+                    workflow_turn_id=workflow.active_turn_id,
+                    receiver_terminal_id=workflow.root_terminal_id,
+                )
+                .one_or_none()
+            )
+            if (
+                active is None
+                or active.workflow_id != workflow.id
+                or active.kind != "external_input"
+                or active.state not in {TURN_SENT, TURN_FINISHED}
+                or active_receipt is None
+                or active_receipt.resumed_by_turn_id is not None
+                or db.get(ProviderExecutionLeaseModel, workflow.root_terminal_id) is not None
+            ):
+                continue
+            candidate = (
+                db.query(WorkflowProviderReconnectAttemptModel, WorkflowTurnModel)
+                .join(
+                    WorkflowTurnModel,
+                    WorkflowTurnModel.id == WorkflowProviderReconnectAttemptModel.workflow_turn_id,
+                )
+                .filter(
+                    WorkflowProviderReconnectAttemptModel.workflow_id == workflow.id,
+                    WorkflowProviderReconnectAttemptModel.root_terminal_id
+                    == workflow.root_terminal_id,
+                    WorkflowProviderReconnectAttemptModel.state == PROVIDER_RECONNECT_SUCCEEDED,
+                    WorkflowProviderReconnectAttemptModel.outcome_code == "runtime_ready",
+                    WorkflowProviderReconnectAttemptModel.finished_at.is_not(None),
+                    WorkflowProviderReconnectAttemptModel.output_boundary_at.is_not(None),
+                    WorkflowTurnModel.id < active.id,
+                    WorkflowTurnModel.kind.in_(("assigned_result", "handoff_result")),
+                    WorkflowTurnModel.state.in_((TURN_SENT, TURN_FINISHED)),
+                    WorkflowTurnModel.superseded_by_turn_id.is_(None),
+                    WorkflowTurnModel.superseded_at.is_(None),
+                )
+                .order_by(WorkflowProviderReconnectAttemptModel.id.desc())
+                .first()
+            )
+            if candidate is None:
+                continue
+            attempt, callback_turn = candidate
+            if (
+                attempt.finished_at is None
+                or active.created_at is None
+                or active.updated_at is None
+                or active_receipt.consumed_at is None
+                or active.created_at > attempt.finished_at
+                or active.updated_at < attempt.finished_at
+                or active_receipt.consumed_at < attempt.finished_at
+                or db.query(WorkflowTurnReceiptModel.id)
+                .filter_by(
+                    workflow_turn_id=callback_turn.id,
+                    receiver_terminal_id=workflow.root_terminal_id,
+                )
+                .one_or_none()
+                is None
+            ):
+                continue
+            callback_state = _provider_reconnect_result_callback_state(
+                db, workflow, callback_turn, str(workflow.root_terminal_id)
+            )
+            if callback_state == "acknowledged":
+                # The accidentally promoted Composer execution is already the
+                # correct current authority.  Its older callback completed
+                # before this rolling repair ran, so neither replay nor an
+                # owner gate is necessary.
+                continue
+            if callback_state != "replayable":
+                workflow.status = WORKFLOW_OWNER_GATE
+                workflow.terminal_reason = PROVIDER_RECONNECT_CONTINUATION_UNSAFE_REASON
+                workflow.updated_at = now
+                callback_turn.queue_reason = "PROVIDER_RECONNECT_CONTINUATION_UNSAFE"
+                callback_turn.updated_at = now
+                gated_workflows.append((str(workflow.root_terminal_id), int(workflow.id)))
+                changed += 1
+                continue
+            successor = _materialize_provider_reconnect_result_successor(
+                db,
+                workflow,
+                callback_turn,
+                active,
+                str(workflow.root_terminal_id),
+                now,
+                dedupe_key=(
+                    f"provider-reconnect-reconciled:{attempt.id}:" f"{active.id}:{callback_turn.id}"
+                ),
+                additional_effect_source_turn_id=int(active.id),
+            )
+            if successor is None:
+                workflow.status = WORKFLOW_OWNER_GATE
+                workflow.terminal_reason = PROVIDER_RECONNECT_CONTINUATION_UNSAFE_REASON
+                workflow.updated_at = now
+                callback_turn.queue_reason = "PROVIDER_RECONNECT_CONTINUATION_UNSAFE"
+                callback_turn.updated_at = now
+                gated_workflows.append((str(workflow.root_terminal_id), int(workflow.id)))
+                changed += 1
+                continue
+            changed += 1
+        if changed:
+            db.commit()
+        else:
+            db.rollback()
+    for root_terminal_id, workflow_id in gated_workflows:
+        _dispatch_workflow_notification_fail_open(root_terminal_id, "owner_attention", workflow_id)
+    return changed
 
 
 def reconcile_result_callbacks_superseded_by_resume(
@@ -16592,16 +17218,18 @@ def _review_acknowledgement_reason(
         request_effect is None
         or request_effect.workflow_id != parent_workflow.id
         or request_effect.workflow_turn_id != assignment.request_workflow_turn_id
-        or request_effect.effect_kind != "assign"
         or request_effect.state != "completed"
         or result is None
+        or request_effect.effect_kind not in {"assign", "handoff"}
+        or request_effect.effect_kind != result.delegation_kind
         or result.child_assignment_id != assignment.id
         or result.parent_workflow_id != parent_workflow.id
         or result.child_terminal_id != assignment.child_terminal_id
         or child_effect is None
         or child_effect.workflow_id != assignment.child_workflow_id
         or child_effect.workflow_turn_id != assignment.child_workflow_turn_id
-        or child_effect.effect_kind not in {"send_message", "complete_workflow"}
+        or child_effect.effect_kind
+        not in {"send_message", "complete_workflow", "submit_handoff_result_v1"}
         or child_effect.state not in {"claimed", "completed"}
         or not hmac.compare_digest(expected_subject, assignment.review_subject_id)
     ):
@@ -16840,8 +17468,9 @@ def describe_child_assignment_acknowledgement(
                 **canonical_identity,
             }
         return {
-            "reason_code": "WRONG_DISPATCH_MODE",
+            "reason_code": None,
             "workflow_state": workflow.status,
+            "assignment_status": assignment.status,
             **canonical_identity,
         }
 

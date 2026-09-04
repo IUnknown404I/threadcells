@@ -338,7 +338,7 @@ def test_open_workflow_projects_queued_composer_count(monkeypatch):
         active = WorkflowTurnModel(
             workflow_id=workflow.id,
             kind="execution_resume",
-            dedupe_key="active-resume",
+            dedupe_key="provider-reconnect-execution:1",
             state="sent",
             created_at=now,
             updated_at=now,
@@ -369,6 +369,7 @@ def test_open_workflow_projects_queued_composer_count(monkeypatch):
     item = ui_read_model_service.list_agent_summaries(limit=10)["items"][0]
     assert item["workflow_status"] == "open"
     assert item["queued_task_count"] == 2
+    assert item["workflow_recovery_pending"] is True
     assert item["activity"] == "processing"
 
 
@@ -564,6 +565,7 @@ def test_execution_wait_labels_and_owner_reason_are_exact_durable_mappings(monke
     }
     assert items["continuation"]["activity"] == "queued"
     assert items["continuation"]["execution_state"] == "waiting_workflow_continuation"
+    assert items["continuation"]["workflow_recovery_pending"] is True
 
     with database.SessionLocal() as db:
         turn = (

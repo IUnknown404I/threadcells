@@ -2320,6 +2320,13 @@ async def acknowledge_assigned_result(
             **replay,
             "error": "The result was already acknowledged; no lifecycle mutation was repeated.",
         }
+    if replay.get("reason_code") is not None:
+        return {
+            "success": False,
+            "accepted": False,
+            **replay,
+            "error": "The result acknowledgement is not eligible in its current durable state.",
+        }
     canonical_identity = replay.get("result_id") or replay.get("child_terminal_id") or identity
     effect = _claim_privileged_effect(
         logical_turn_id,
@@ -2335,7 +2342,7 @@ async def acknowledge_assigned_result(
     outcome = acknowledge_child_assignment_result_outcome(
         parent_terminal_id, child_terminal_id, result_id
     )
-    _finish_privileged_effect(effect, "completed" if outcome["accepted"] else "rejected")
+    _finish_privileged_effect(effect, "completed" if outcome["accepted"] else "not_admitted")
     if not outcome["accepted"]:
         return {
             "success": False,

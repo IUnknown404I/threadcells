@@ -69,6 +69,7 @@ from cli_agent_orchestrator.clients.database import (
     reconcile_closed_workflow_inbox_transports,
     reconcile_exited_terminal_workflow_authorities,
     reconcile_owner_gated_workflow_successors,
+    reconcile_receipted_callback_after_reconnect_promotion,
     reconcile_result_callbacks_superseded_by_resume,
     reconcile_superseded_workflow_turns_for_restart,
     release_completed_assigned_child_retirement,
@@ -683,6 +684,16 @@ def _reconcile_provider_execution_queue_with_admission(
         # Inbox work after the receiver had already crossed to Exited. Retire
         # that false authority before it can occupy the shared FIFO.
         reconcile_exited_terminal_workflow_authorities()
+        # Rolling-upgrade repair for the pre-fix composition where a Ready
+        # reconnect promoted Composer before a receipted callback could finish
+        # its acknowledgement. It runs only after the promoted execution's
+        # exact provider lease has settled.
+        reconciled_promotions = reconcile_receipted_callback_after_reconnect_promotion()
+        if reconciled_promotions:
+            logger.info(
+                "Reconciled %s callback authorities after reconnect promotion",
+                reconciled_promotions,
+            )
         # A fresh execution-resume receipt can supersede older callback turn
         # IDs without superseding their immutable results. Rebuild that
         # workflow's queued suffix once before FIFO selection so the callbacks

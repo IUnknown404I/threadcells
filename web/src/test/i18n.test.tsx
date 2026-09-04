@@ -120,6 +120,16 @@ describe('typed catalog contract', () => {
     expect(translate('ru', 'home.loadMoreAgents', { loaded: 2, total: 5 })).toContain('2')
   })
 
+  it('labels the loaded Output interval explicitly in both locales', () => {
+    const params = { start: '39.0 MiB', end: '39.5 MiB', total: '39.5 MiB' }
+    expect(translate('en', 'output.loadedRange', params)).toBe(
+      'Loaded 39.0 MiB–39.5 MiB of 39.5 MiB',
+    )
+    expect(translate('ru', 'output.loadedRange', params)).toBe(
+      'Загружено 39.0 MiB–39.5 MiB из 39.5 MiB',
+    )
+  })
+
   it('uses Russian plural categories through Intl.PluralRules', () => {
     expect(translatePlural('ru', 'sessions', 1)).toBe('1 сессия')
     expect(translatePlural('ru', 'sessions', 2)).toBe('2 сессии')

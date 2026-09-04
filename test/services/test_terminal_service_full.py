@@ -31,6 +31,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     LAST_OUTPUT_READ_MAX_BYTES,
     LAST_OUTPUT_RESPONSE_MAX_BYTES,
     OUTPUT_CHUNK_MAX_BYTES,
+    OUTPUT_RENDER_CONTEXT_MAX_BYTES,
     OutputMode,
     TerminalOutputCursorError,
     TerminalOutputUnavailable,
@@ -3017,6 +3018,20 @@ class TestGetOutput:
         assert len(result.encode()) <= LAST_OUTPUT_RESPONSE_MAX_BYTES
         assert result.endswith("x" * 100)
 
+    def test_last_response_strips_terminal_control_parameters(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        (tmp_path / "test1234.log").write_text("bounded tail", encoding="utf-8")
+        provider = MagicMock()
+        provider.extract_last_message_from_script.return_value = (
+            "\x1b[?2026h\x1b[38;2;12;34;56mПоследний `ответ`\x1b[49m\x1b[K"
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.provider_manager.get_provider",
+            lambda *_: provider,
+        )
+
+        assert get_output("test1234", OutputMode.LAST) == "Последний `ответ`"
+
     def test_last_response_reads_a_bounded_compressed_source(self, monkeypatch, tmp_path):
         self._durable_terminal(monkeypatch, tmp_path)
         with gzip.open(tmp_path / "test1234.log.gz", "wb") as stream:
@@ -3107,23 +3122,24 @@ class TestGetOutput:
 
         assert "".join(chunks).encode() == payload
 
-    @pytest.mark.parametrize("boundary_effect", ["osc", "backspace"])
-    def test_full_output_rendering_is_composable_across_unbounded_terminal_state(
+    @pytest.mark.parametrize("boundary_effect", ["osc", "dcs", "csi"])
+    def test_full_output_rendering_is_control_safe_across_a_hard_page_boundary(
         self, monkeypatch, tmp_path, boundary_effect
     ):
         self._durable_terminal(monkeypatch, tmp_path)
         total = OUTPUT_CHUNK_MAX_BYTES * 2
         boundary = total - (OUTPUT_CHUNK_MAX_BYTES - 4)
         payload = bytearray(b"a" * total)
-        if boundary_effect == "osc":
-            distance = (64 * 1024) + 128
-            control = b"\x1b]" + b"x" * (distance - 2) + b"PAGE_MARKER\x07"
-            start = boundary - distance
-            payload[start : start + len(control)] = control
+        distance = (64 * 1024) + 128
+        if boundary_effect in {"osc", "dcs"}:
+            introducer = b"\x1b]" if boundary_effect == "osc" else b"\x1bP"
+            terminator = b"\x07" if boundary_effect == "osc" else b"\x1b\\"
+            control = introducer + b"CONTROL_PAYLOAD" + b"x" * distance + terminator
         else:
-            erase_count = (64 * 1024) + 32
-            payload[boundary - erase_count : boundary] = b"z" * erase_count
-            payload[boundary : boundary + erase_count] = b"\b" * erase_count
+            parameters = (b"38;2;12;34;56;" * ((distance // 15) + 1))[:distance]
+            control = b"\x1b[" + parameters + b"49m"
+        start = boundary - distance
+        payload[start : start + len(control)] = control
         raw = bytes(payload)
         (tmp_path / "test1234.log").write_bytes(raw)
 
@@ -3138,13 +3154,87 @@ class TestGetOutput:
 
         paged = "".join(chunks)
         assert paged == _render_progressive_terminal_output(raw)
-        if boundary_effect == "osc":
-            assert "PAGE_MARKER" in paged
+        assert "CONTROL_PAYLOAD" not in paged
+        assert "38;2;12;34;56" not in paged
         assert all(
             character in {"\n", "\t"}
             or (ord(character) >= 0x20 and not 0x7F <= ord(character) <= 0x9F)
             for character in paged
         )
+
+    @pytest.mark.parametrize("control_kind", ["osc", "dcs", "csi"])
+    def test_control_state_is_carried_across_four_older_pages(
+        self, monkeypatch, tmp_path, control_kind
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        repeated_bytes = OUTPUT_CHUNK_MAX_BYTES * 4
+        if control_kind == "osc":
+            control = b"\x1b]" + b"PRIVATE_OSC" * (repeated_bytes // 11) + b"\x07"
+            forbidden = "PRIVATE_OSC"
+        elif control_kind == "dcs":
+            control = b"\x1bP" + b"PRIVATE_DCS" * (repeated_bytes // 11) + b"\x1b\\"
+            forbidden = "PRIVATE_DCS"
+        else:
+            control = b"\x1b[" + b"38;2;12;34;56;" * (repeated_bytes // 15) + b"49m"
+            forbidden = "38;2;12;34;56"
+        raw = "before `code` привет\t".encode() + control + b"after"
+        (tmp_path / "test1234.log").write_bytes(raw)
+
+        cursor = None
+        chunks = []
+        ranges = []
+        while True:
+            chunk = get_output_chunk("test1234", cursor)
+            chunks.insert(0, chunk.output)
+            ranges.insert(0, (chunk.start_offset, chunk.end_offset))
+            if not chunk.has_older:
+                break
+            cursor = chunk.cursor
+
+        assert len(chunks) >= 4
+        assert "".join(chunks) == "before `code` привет\tafter"
+        assert forbidden not in "".join(chunks)
+        assert all(older[1] == newer[0] for older, newer in zip(ranges, ranges[1:]))
+
+    def test_older_hard_pages_strip_production_terminal_fragments_and_bound_reads(
+        self, monkeypatch, tmp_path
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        ordinary = "обычный `код`\ttext".encode()
+        controls = b"\x1b[49m\x1b[K\x1b[?2026h\x1b[38;2;12;34;56m"
+        raw = (ordinary + controls) * ((OUTPUT_CHUNK_MAX_BYTES * 5) // 55)
+        (tmp_path / "test1234.log").write_bytes(raw)
+        original_pread = os.pread
+        reads = []
+
+        def tracked_pread(descriptor, count, offset):
+            reads.append((count, offset))
+            return original_pread(descriptor, count, offset)
+
+        monkeypatch.setattr(os, "pread", tracked_pread)
+
+        cursor = None
+        chunks = []
+        ranges = []
+        for _ in range(4):
+            before = len(reads)
+            chunk = get_output_chunk("test1234", cursor)
+            page_reads = reads[before:]
+            chunks.insert(0, chunk.output)
+            ranges.insert(0, (chunk.start_offset, chunk.end_offset))
+            assert chunk.end_offset - chunk.start_offset <= OUTPUT_CHUNK_MAX_BYTES
+            assert max(count for count, _ in page_reads) <= OUTPUT_CHUNK_MAX_BYTES
+            assert sum(count for count, _ in page_reads) <= (
+                OUTPUT_CHUNK_MAX_BYTES + OUTPUT_RENDER_CONTEXT_MAX_BYTES + 2
+            )
+            assert chunk.cursor
+            cursor = chunk.cursor
+
+        rendered = "".join(chunks)
+        assert "обычный `код`\ttext" in rendered
+        for fragment in ("[49m", "[K", "[?2026h", "[38;2;"):
+            assert fragment not in rendered
+        assert all(older[1] == newer[0] for older, newer in zip(ranges, ranges[1:]))
 
     def test_full_output_preserves_terminal_cleanup_for_line_isolated_pages(
         self, monkeypatch, tmp_path

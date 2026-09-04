@@ -2723,6 +2723,7 @@ def test_f13_ready_reconnect_wakes_receipted_result_then_preserves_composer_fifo
 
     assert inbox_service.reconcile_provider_execution_queue(observe_open_workflows=False) == 1
     assert send.call_count == 2
+    assert all(f"logical-turn={callback_successor}" in call.args[1] for call in send.call_args_list)
     with database.SessionLocal() as db:
         assert db.get(WorkflowTurnModel, callback_successor).state == "sent"
         assert db.get(WorkflowTurnModel, callback_successor).attempt_count == 3
@@ -2730,6 +2731,13 @@ def test_f13_ready_reconnect_wakes_receipted_result_then_preserves_composer_fifo
         assert (
             db.query(database.ChildAssignmentModel).filter_by(child_terminal_id=child).one().status
             == "handoff_result_delivered"
+        )
+        assert db.query(database.ProviderExecutionLeaseModel).count() == 1
+        assert (
+            db.query(WorkflowTurnReceiptModel)
+            .filter_by(workflow_turn_id=callback_successor, receiver_terminal_id=parent)
+            .count()
+            == 0
         )
 
     callback_successor_receipt = claim_or_resume_workflow_turn_receipt(parent, callback_successor)
@@ -2858,6 +2866,42 @@ def test_f13_settled_unreceipted_callback_owner_gates_when_result_replay_is_unsa
         assert workflow.terminal_reason == database.UNRECEIPTED_INBOX_REPLAY_GUARD_REASON
         assert turn.state == "sent"
         assert turn.queue_reason == "UNRECEIPTED_INBOX_REPLAY_UNSAFE"
+
+
+def test_f13_settled_unreceipted_handoff_batch_restores_every_sealed_member(workflow_db):
+    parent = "root-unreceipted-result-batch"
+    children = ("child-unreceipted-result-one", "child-unreceipted-result-two")
+    _start_admitted_input(parent)
+    notices = []
+    for child in children:
+        assert register_handoff_child(parent, child)
+        notice, duplicate = create_handoff_child_result_message(child, f"result from {child}")
+        assert notice is not None and duplicate is False
+        notices.append(notice)
+
+    claim = claim_handoff_result_batch_for_inbox(notices[0].id)
+    assert isinstance(claim, dict)
+    assert [message.id for message in claim["messages"]] == [notice.id for notice in notices]
+    assert mark_workflow_turn_sent(claim["id"], claim["claim_token"], claim["claim_generation"])
+    for notice in notices:
+        assert database.update_pending_message_status(notice.id, database.MessageStatus.DELIVERED)
+        assert mark_child_assignment_result_delivered(notice.id)
+    assert database.acquire_provider_execution(parent, claim["id"], 3)
+    assert database.release_provider_execution(parent, claim["id"])
+
+    assert database.requeue_settled_unadmitted_workflow_turn(parent, claim["id"])
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowTurnModel, claim["id"]).state == "queued"
+        assert {db.get(InboxModel, notice.id).status for notice in notices} == {"pending"}
+        assert {
+            db.query(database.ChildAssignmentModel).filter_by(child_terminal_id=child).one().status
+            for child in children
+        } == {"handoff_result_queued"}
+        assert {
+            db.get(database.DelegationResultModel, notice.result_id).workflow_turn_id
+            for notice in notices
+        } == {claim["id"]}
+    assert database.get_provider_execution_admission_queue()[0]["source"] == "inbox"
 
 
 def test_f13_completion_fails_closed_on_claimed_composer_successor(workflow_db):

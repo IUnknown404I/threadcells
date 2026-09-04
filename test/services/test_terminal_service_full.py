@@ -3162,6 +3162,40 @@ class TestGetOutput:
             for character in paged
         )
 
+    @pytest.mark.parametrize("control_kind", ["osc", "dcs", "csi"])
+    def test_control_state_is_carried_across_four_older_pages(
+        self, monkeypatch, tmp_path, control_kind
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        repeated_bytes = OUTPUT_CHUNK_MAX_BYTES * 4
+        if control_kind == "osc":
+            control = b"\x1b]" + b"PRIVATE_OSC" * (repeated_bytes // 11) + b"\x07"
+            forbidden = "PRIVATE_OSC"
+        elif control_kind == "dcs":
+            control = b"\x1bP" + b"PRIVATE_DCS" * (repeated_bytes // 11) + b"\x1b\\"
+            forbidden = "PRIVATE_DCS"
+        else:
+            control = b"\x1b[" + b"38;2;12;34;56;" * (repeated_bytes // 15) + b"49m"
+            forbidden = "38;2;12;34;56"
+        raw = "before `code` привет\t".encode() + control + b"after"
+        (tmp_path / "test1234.log").write_bytes(raw)
+
+        cursor = None
+        chunks = []
+        ranges = []
+        while True:
+            chunk = get_output_chunk("test1234", cursor)
+            chunks.insert(0, chunk.output)
+            ranges.insert(0, (chunk.start_offset, chunk.end_offset))
+            if not chunk.has_older:
+                break
+            cursor = chunk.cursor
+
+        assert len(chunks) >= 4
+        assert "".join(chunks) == "before `code` привет\tafter"
+        assert forbidden not in "".join(chunks)
+        assert all(older[1] == newer[0] for older, newer in zip(ranges, ranges[1:]))
+
     def test_older_hard_pages_strip_production_terminal_fragments_and_bound_reads(
         self, monkeypatch, tmp_path
     ):

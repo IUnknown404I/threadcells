@@ -32,7 +32,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
+from enum import Enum, IntEnum
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -444,8 +444,8 @@ LAST_OUTPUT_RESPONSE_MAX_BYTES = 256 * 1024
 COMPRESSED_OUTPUT_MAX_BYTES = 256 * 1024
 COMPRESSED_OUTPUT_SOURCE_MAX_BYTES = 256 * 1024
 _OUTPUT_BOUNDARY_SCAN_BYTES = 16 * 1024
-_OUTPUT_CURSOR = struct.Struct(">BQQQQ")
-_OUTPUT_CURSOR_VERSION = 1
+_OUTPUT_CURSOR = struct.Struct(">BQQQQB")
+_OUTPUT_CURSOR_VERSION = 2
 _OUTPUT_CURSOR_ENCODED_LENGTH = len(
     base64.urlsafe_b64encode(bytes(_OUTPUT_CURSOR.size)).rstrip(b"=")
 )
@@ -463,29 +463,53 @@ class TerminalOutputChunk:
     snapshot_size: int
 
 
+class _TerminalRenderState(IntEnum):
+    NORMAL = 0
+    ESCAPE = 1
+    ESCAPE_INTERMEDIATE = 2
+    CSI = 3
+    CONTROL_STRING = 4
+    CONTROL_STRING_ESCAPE = 5
+
+
 def _encode_output_cursor(
-    *, device: int, inode: int, snapshot_size: int, before_offset: int
+    *,
+    device: int,
+    inode: int,
+    snapshot_size: int,
+    before_offset: int,
+    render_state: _TerminalRenderState,
 ) -> str:
     payload = _OUTPUT_CURSOR.pack(
-        _OUTPUT_CURSOR_VERSION, device, inode, snapshot_size, before_offset
+        _OUTPUT_CURSOR_VERSION,
+        device,
+        inode,
+        snapshot_size,
+        before_offset,
+        int(render_state),
     )
     return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
 
 
-def _decode_output_cursor(cursor: str) -> tuple[int, int, int, int]:
+def _decode_output_cursor(
+    cursor: str,
+) -> tuple[int, int, int, int, _TerminalRenderState]:
     if len(cursor) != _OUTPUT_CURSOR_ENCODED_LENGTH:
         raise TerminalOutputCursorError("Output cursor is malformed", "OUTPUT_CURSOR_INVALID")
     try:
         padding = "=" * (-len(cursor) % 4)
         payload = base64.b64decode(cursor + padding, altchars=b"-_", validate=True)
-        version, device, inode, snapshot_size, before_offset = _OUTPUT_CURSOR.unpack(payload)
+        version, device, inode, snapshot_size, before_offset, raw_state = _OUTPUT_CURSOR.unpack(
+            payload
+        )
+        render_state = _TerminalRenderState(raw_state)
     except (ValueError, binascii.Error, struct.error) as exc:
         raise TerminalOutputCursorError(
             "Output cursor is malformed", "OUTPUT_CURSOR_INVALID"
         ) from exc
     if version != _OUTPUT_CURSOR_VERSION or before_offset > snapshot_size:
         raise TerminalOutputCursorError("Output cursor is malformed", "OUTPUT_CURSOR_INVALID")
-    return device, inode, snapshot_size, before_offset
+    return device, inode, snapshot_size, before_offset, render_state
 
 
 def _open_durable_output(terminal_id: str) -> tuple[int, os.stat_result, bool]:
@@ -631,7 +655,7 @@ def _consume_terminal_csi(value: str, index: int) -> int:
     return len(value)
 
 
-def _sanitize_human_terminal_output(value: str, *, emit_from: int = 0) -> str:
+def _sanitize_human_terminal_output(value: str) -> str:
     """Remove terminal effects while preserving readable Unicode text.
 
     Raw tmux history and durable logs intentionally retain controls for
@@ -685,8 +709,159 @@ def _sanitize_human_terminal_output(value: str, *, emit_from: int = 0) -> str:
         if character == "\r":
             if index + 1 < len(value) and value[index + 1] == "\n":
                 if not rendered or rendered[-1] != "\n":
-                    if index >= emit_from:
-                        rendered.append("\n")
+                    rendered.append("\n")
+                index += 2
+                continue
+            if not rendered or rendered[-1] != "\n":
+                rendered.append("\n")
+            index += 1
+            continue
+        if character == "\b":
+            if rendered and rendered[-1] not in {"\n", "\t"}:
+                rendered.pop()
+            index += 1
+            continue
+        if character in {"\n", "\t"}:
+            rendered.append(character)
+            index += 1
+            continue
+        if codepoint < 0x20 or codepoint == 0x7F:
+            index += 1
+            continue
+
+        rendered.append(character)
+        index += 1
+    return "".join(rendered)
+
+
+@dataclass(frozen=True)
+class _TerminalRenderResult:
+    output: str
+    state_at_emit: _TerminalRenderState
+    final_state: _TerminalRenderState
+    orphan_string_terminator: bool
+
+
+def _scan_progressive_terminal_output(
+    value: str,
+    *,
+    initial_state: _TerminalRenderState = _TerminalRenderState.NORMAL,
+    emit_from: int = 0,
+) -> _TerminalRenderResult:
+    """Run the terminal grammar while emitting only one bounded page window."""
+    if not 0 <= emit_from <= len(value):
+        raise ValueError("emit_from is outside the terminal-render input")
+    rendered: list[str] = []
+    state = initial_state
+    state_at_emit: _TerminalRenderState | None = None
+    orphan_string_terminator = False
+    index = 0
+
+    while index < len(value):
+        if index == emit_from:
+            state_at_emit = state
+        character = value[index]
+        codepoint = ord(character)
+
+        if state == _TerminalRenderState.CONTROL_STRING:
+            if character in {"\n", "\r"}:
+                state = _TerminalRenderState.NORMAL
+                continue
+            if character in {"\x07", "\x9c"}:
+                state = _TerminalRenderState.NORMAL
+                index += 1
+                continue
+            if character == "\x1b":
+                state = _TerminalRenderState.CONTROL_STRING_ESCAPE
+                index += 1
+                continue
+            index += 1
+            continue
+
+        if state == _TerminalRenderState.CONTROL_STRING_ESCAPE:
+            if character == "\\":
+                state = _TerminalRenderState.NORMAL
+                index += 1
+                continue
+            state = _TerminalRenderState.CONTROL_STRING
+            continue
+
+        if state == _TerminalRenderState.CSI:
+            if character in {"\n", "\r", "\t"}:
+                state = _TerminalRenderState.NORMAL
+                continue
+            if 0x40 <= codepoint <= 0x7E:
+                state = _TerminalRenderState.NORMAL
+                index += 1
+                continue
+            if 0x20 <= codepoint <= 0x3F or codepoint < 0x20 or codepoint == 0x7F:
+                index += 1
+                continue
+            state = _TerminalRenderState.NORMAL
+            continue
+
+        if state == _TerminalRenderState.ESCAPE_INTERMEDIATE:
+            if 0x20 <= codepoint <= 0x2F:
+                index += 1
+                continue
+            if 0x30 <= codepoint <= 0x7E:
+                state = _TerminalRenderState.NORMAL
+                index += 1
+                continue
+            state = _TerminalRenderState.NORMAL
+            continue
+
+        if state == _TerminalRenderState.ESCAPE:
+            if character == "[":
+                state = _TerminalRenderState.CSI
+                index += 1
+                continue
+            if character in "]PX^_":
+                state = _TerminalRenderState.CONTROL_STRING
+                index += 1
+                continue
+            if character == "\\":
+                orphan_string_terminator = True
+                state = _TerminalRenderState.NORMAL
+                index += 1
+                continue
+            if 0x20 <= codepoint <= 0x2F:
+                state = _TerminalRenderState.ESCAPE_INTERMEDIATE
+                index += 1
+                continue
+            if 0x30 <= codepoint <= 0x7E:
+                state = _TerminalRenderState.NORMAL
+                index += 1
+                continue
+            state = _TerminalRenderState.NORMAL
+            continue
+
+        if character == "\x1b":
+            state = _TerminalRenderState.ESCAPE
+            index += 1
+            continue
+        if character == "\x9b":
+            state = _TerminalRenderState.CSI
+            index += 1
+            continue
+        if character in {"\x90", "\x98", "\x9d", "\x9e", "\x9f"}:
+            state = _TerminalRenderState.CONTROL_STRING
+            index += 1
+            continue
+        if character in {"\x07", "\x9c"}:
+            orphan_string_terminator = True
+            index += 1
+            continue
+        if 0x80 <= codepoint <= 0x9F:
+            index += 1
+            continue
+
+        if character == "\r":
+            if index + 1 < len(value) and value[index + 1] == "\n":
+                if state_at_emit is None and index < emit_from <= index + 1:
+                    state_at_emit = _TerminalRenderState.NORMAL
+                if index >= emit_from and (not rendered or rendered[-1] != "\n"):
+                    rendered.append("\n")
                 index += 2
                 continue
             if index >= emit_from and (not rendered or rendered[-1] != "\n"):
@@ -710,13 +885,39 @@ def _sanitize_human_terminal_output(value: str, *, emit_from: int = 0) -> str:
         if index >= emit_from:
             rendered.append(character)
         index += 1
-    return "".join(rendered)
+
+    if state_at_emit is None:
+        state_at_emit = state
+    return _TerminalRenderResult(
+        output="".join(rendered),
+        state_at_emit=state_at_emit,
+        final_state=state,
+        orphan_string_terminator=orphan_string_terminator,
+    )
 
 
-def _bounded_output_render_context(descriptor: int, *, start_offset: int) -> bytes:
+def _looks_like_orphan_csi_prefix(value: str) -> bool:
+    """Recognize a hard-page CSI body whose introducer is in an older page."""
+    index = 0
+    suspicious_parameter = False
+    while index < len(value) and 0x30 <= ord(value[index]) <= 0x3F:
+        suspicious_parameter = suspicious_parameter or not value[index].isdigit()
+        index += 1
+    while index < len(value) and 0x20 <= ord(value[index]) <= 0x2F:
+        suspicious_parameter = True
+        index += 1
+    return bool(
+        index
+        and index < len(value)
+        and 0x40 <= ord(value[index]) <= 0x7E
+        and (suspicious_parameter or index >= 64)
+    )
+
+
+def _bounded_output_render_context(descriptor: int, *, start_offset: int) -> tuple[bytes, bool]:
     """Read bounded history needed to settle terminal grammar at a page edge."""
     if start_offset <= 0:
-        return b""
+        return b"", False
     context_start = max(0, start_offset - OUTPUT_RENDER_CONTEXT_MAX_BYTES)
     requested = start_offset - context_start
     context = os.pread(descriptor, requested, context_start)
@@ -730,23 +931,100 @@ def _bounded_output_render_context(descriptor: int, *, start_offset: int) -> byt
     newline = context.rfind(b"\n")
     carriage = context.rfind(b"\r")
     boundary = max(newline, carriage)
-    return context[boundary + 1 :] if boundary >= 0 else context
+    if boundary >= 0:
+        return context[boundary + 1 :], False
+    return context, context_start > 0
 
 
-def _render_progressive_terminal_output(payload: bytes, *, prefix_context: bytes = b"") -> str:
+def _render_progressive_terminal_page(
+    payload: bytes,
+    *,
+    prefix_context: bytes,
+    prefix_truncated: bool,
+    expected_end_state: _TerminalRenderState | None,
+) -> _TerminalRenderResult:
     """Render one bounded page with bounded terminal-parser look-behind.
 
-    Hard page edges can split CSI, OSC, DCS, and related terminal controls.
-    Parsing at most one bounded page of preceding bytes establishes the state
-    for practical terminal sequences without scanning or materializing the
-    historical stream. Context is never emitted in the response.
+    A cursor carries the finite parser state backward when one control spans
+    more than the look-behind ceiling. That keeps every request bounded while
+    allowing middle OSC/DCS/CSI pages to remain non-visible until the older
+    introducer page is reached. Context is never emitted in the response.
     """
     context_text = prefix_context.decode("utf-8", errors="replace")
     payload_text = payload.decode("utf-8", errors="replace")
-    return _sanitize_human_terminal_output(
-        context_text + payload_text,
-        emit_from=len(context_text),
-    )
+    value = context_text + payload_text
+    emit_from = len(context_text)
+    selected = _scan_progressive_terminal_output(value, emit_from=emit_from)
+    if not prefix_truncated:
+        return selected
+
+    if selected.orphan_string_terminator:
+        control_candidate = _scan_progressive_terminal_output(
+            value,
+            initial_state=_TerminalRenderState.CONTROL_STRING,
+            emit_from=emit_from,
+        )
+        if expected_end_state is None or control_candidate.final_state == expected_end_state:
+            selected = control_candidate
+    elif _looks_like_orphan_csi_prefix(value):
+        csi_candidate = _scan_progressive_terminal_output(
+            value,
+            initial_state=_TerminalRenderState.CSI,
+            emit_from=emit_from,
+        )
+        if expected_end_state is None or csi_candidate.final_state == expected_end_state:
+            selected = csi_candidate
+
+    if expected_end_state is not None and selected.final_state != expected_end_state:
+        likely_initial_states = (
+            (
+                _TerminalRenderState.CONTROL_STRING,
+                _TerminalRenderState.CONTROL_STRING_ESCAPE,
+            )
+            if expected_end_state
+            in {
+                _TerminalRenderState.CONTROL_STRING,
+                _TerminalRenderState.CONTROL_STRING_ESCAPE,
+            }
+            else (expected_end_state,)
+        )
+        candidates = [
+            _scan_progressive_terminal_output(
+                value,
+                initial_state=initial_state,
+                emit_from=emit_from,
+            )
+            for initial_state in likely_initial_states
+        ]
+        matching = [
+            candidate for candidate in candidates if candidate.final_state == expected_end_state
+        ]
+        if not matching:
+            candidates = [
+                _scan_progressive_terminal_output(
+                    value,
+                    initial_state=initial_state,
+                    emit_from=emit_from,
+                )
+                for initial_state in _TerminalRenderState
+                if initial_state not in likely_initial_states
+            ]
+            matching = [
+                candidate for candidate in candidates if candidate.final_state == expected_end_state
+            ]
+        if matching:
+            selected = min(matching, key=lambda candidate: len(candidate.output))
+    return selected
+
+
+def _render_progressive_terminal_output(payload: bytes, *, prefix_context: bytes = b"") -> str:
+    """Compatibility helper for rendering a bounded standalone payload."""
+    return _render_progressive_terminal_page(
+        payload,
+        prefix_context=prefix_context,
+        prefix_truncated=False,
+        expected_end_state=None,
+    ).output
 
 
 def _output_range_is_line_isolated(
@@ -3278,8 +3556,11 @@ def get_output_chunk(terminal_id: str, cursor: str | None = None) -> TerminalOut
         if cursor is None:
             snapshot_size = source.st_size
             before_offset = snapshot_size
+            expected_end_state = None
         else:
-            device, inode, snapshot_size, before_offset = _decode_output_cursor(cursor)
+            device, inode, snapshot_size, before_offset, expected_end_state = _decode_output_cursor(
+                cursor
+            )
             if (device, inode) != (source.st_dev, source.st_ino) or source.st_size < snapshot_size:
                 raise TerminalOutputCursorError(
                     "Output source changed after the viewer opened", "OUTPUT_CURSOR_STALE"
@@ -3299,17 +3580,22 @@ def get_output_chunk(terminal_id: str, cursor: str | None = None) -> TerminalOut
             end_offset=before_offset,
             snapshot_size=snapshot_size,
         )
-        rendered = (
-            _sanitize_human_terminal_output(payload.decode("utf-8", errors="replace"))
-            if snapshot_size <= OUTPUT_CHUNK_MAX_BYTES or line_isolated
-            else _render_progressive_terminal_output(
-                payload,
-                prefix_context=_bounded_output_render_context(
-                    descriptor,
-                    start_offset=start_offset,
-                ),
+        if snapshot_size <= OUTPUT_CHUNK_MAX_BYTES or line_isolated:
+            rendered = _sanitize_human_terminal_output(payload.decode("utf-8", errors="replace"))
+            start_render_state = _TerminalRenderState.NORMAL
+        else:
+            prefix_context, prefix_truncated = _bounded_output_render_context(
+                descriptor,
+                start_offset=start_offset,
             )
-        )
+            render_result = _render_progressive_terminal_page(
+                payload,
+                prefix_context=prefix_context,
+                prefix_truncated=prefix_truncated,
+                expected_end_state=expected_end_state,
+            )
+            rendered = render_result.output
+            start_render_state = render_result.state_at_emit
         has_older = start_offset > 0
         next_cursor = (
             _encode_output_cursor(
@@ -3317,6 +3603,7 @@ def get_output_chunk(terminal_id: str, cursor: str | None = None) -> TerminalOut
                 inode=source.st_ino,
                 snapshot_size=snapshot_size,
                 before_offset=start_offset,
+                render_state=start_render_state,
             )
             if has_older
             else None

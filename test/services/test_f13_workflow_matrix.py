@@ -2517,6 +2517,363 @@ def test_f13_stale_handoff_claim_after_resume_never_rolls_active_authority_back(
         assert {turn.id for turn in turns} == {callback_turn, successor_turn}
 
 
+def test_f13_ready_reconnect_wakes_receipted_result_then_preserves_composer_fifo(
+    workflow_db, monkeypatch
+):
+    """A Ready replacement runtime cannot strand a requeued FINISHED callback.
+
+    This is the post-deploy composition from #122: the callback transport was
+    already delivered and receipted, restart made its unacknowledged Inbox row
+    pending again, and the provider resumed under a newer admitted turn before
+    the stale sidecar fence was observed.  Reconciliation must create one
+    monotonic callback transport, then carry untouched Composer authority into
+    successive workflows in FIFO order.
+    """
+    parent = "root-ready-reconnect-finished-result"
+    child = "child-ready-reconnect-finished-result"
+    _ensure_running_test_terminal(parent)
+    parent_turn = _start_admitted_input(parent)
+    request_effect = claim_workflow_effect(parent, parent_turn, "handoff", child)
+    assert request_effect is not None
+    _ensure_running_test_terminal(child)
+    assert register_handoff_child(
+        parent,
+        child,
+        workflow_turn_id=parent_turn,
+        workflow_effect_id=request_effect["id"],
+        request_message="review the exact restart composition",
+    )
+    child_binding = issue_workflow_input_binding(child)
+    assert child_binding is not None
+    child_turn = resolve_workflow_input_binding(child, child_binding)
+    assert child_turn is not None
+    assert bind_child_assignment_input_turn(child, child_binding)
+    assert claim_workflow_turn_receipt(child, child_turn)
+    notice, duplicate = create_handoff_child_result_message(child, "immutable accepted result")
+    assert notice is not None and notice.result_id is not None and duplicate is False
+    assert finish_workflow_effect(
+        parent,
+        request_effect["id"],
+        request_effect["claim_token"],
+        "completed",
+    )
+
+    callback_claim = claim_handoff_result_batch_for_inbox(notice.id)
+    assert isinstance(callback_claim, dict)
+    callback_turn = callback_claim["id"]
+    assert mark_workflow_turn_sent(
+        callback_turn,
+        callback_claim["claim_token"],
+        callback_claim["claim_generation"],
+    )
+    assert database.update_pending_message_status(notice.id, database.MessageStatus.DELIVERED)
+    assert mark_child_assignment_result_delivered(notice.id)
+    callback_receipt = claim_or_resume_workflow_turn_receipt(parent, callback_turn)
+    assert callback_receipt["accepted"] is True
+    monkeypatch.setenv("CAO_TERMINAL_ID", parent)
+    with patch.object(
+        mcp_server, "_send_message_impl", return_value={"success": True}
+    ) as original_send:
+        sent_before_restart = asyncio.run(
+            mcp_server.send_message(callback_turn, "effect-target", "effect payload")
+        )
+    assert sent_before_restart["success"] is True
+    original_send.assert_called_once()
+    claimed_lineage_effect = claim_workflow_effect(
+        parent, callback_turn, "assign", "claimed-lineage-effect"
+    )
+    assert claimed_lineage_effect is not None
+
+    # Startup redelivery precedes the provider's one-use execution resume.
+    assert requeue_unacknowledged_child_assignment_results() == 1
+    resumed = claim_or_resume_workflow_turn_receipt(
+        parent,
+        callback_turn,
+        resume_token=callback_receipt["resume_token"],
+    )
+    assert resumed["accepted"] is True and resumed["resumed"] is True
+    resume_turn = resumed["logical_turn_id"]
+
+    composer = [
+        database.prepare_workflow_input(
+            parent,
+            payload,
+            request_id=request_id,
+            require_live_terminal=True,
+        )
+        for payload, request_id in (
+            ("first queued Composer mission", "ready-reconnect-composer-first"),
+            ("second queued Composer mission", "ready-reconnect-composer-second"),
+        )
+    ]
+    assert all(item is not None and item["queued"] is True for item in composer)
+    original_composer_turns = [item["turn_id"] for item in composer]
+    assert database.get_terminal_workflow_projection(parent)["queued_task_count"] == 2
+
+    # The privileged acknowledgement was fenced before its effect started.
+    assert database.request_workflow_provider_reconnect(parent)
+    reconnect = database.claim_workflow_provider_reconnect(parent)
+    assert reconnect is not None and reconnect.get("exhausted") is not True
+    assert reconnect["turn_id"] == resume_turn
+    assert database.mark_workflow_provider_reconnect_launch_dispatched(
+        parent,
+        resume_turn,
+        reconnect["claim_token"],
+        reconnect["attempt_token"],
+    )
+    replacement_provider_generation = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, parent)
+        terminal.runtime_generation = replacement_provider_generation
+        terminal.provider_resume_runtime_generation = replacement_provider_generation
+        db.commit()
+    assert database.record_workflow_provider_reconnect_runtime_ready(
+        parent,
+        reconnect["attempt_token"],
+        ACTIVE_RUNTIME_GENERATION,
+        4321,
+        987654,
+    )
+    assert database.record_workflow_provider_reconnect_output_boundary(
+        parent, reconnect["attempt_token"], 11, 22, 333
+    )
+    assert database.complete_workflow_provider_reconnect(
+        parent,
+        resume_turn,
+        reconnect["claim_token"],
+        reconnect["attempt_token"],
+    )
+    assert not database.record_workflow_provider_reconnect_runtime_ready(
+        parent,
+        reconnect["attempt_token"],
+        ACTIVE_RUNTIME_GENERATION,
+        4321,
+        987654,
+    )
+    assert not database.complete_workflow_provider_reconnect(
+        parent,
+        resume_turn,
+        reconnect["claim_token"],
+        reconnect["attempt_token"],
+    )
+
+    provider = MagicMock()
+    provider.get_status.return_value = TerminalStatus.IDLE
+    provider.is_process_alive.return_value = True
+    provider.runtime_sidecar_reconnect_required.return_value = False
+
+    def admit_provider_execution(terminal_id, _payload, **kwargs):
+        logical_turn_id = kwargs.get("logical_turn_id")
+        assert isinstance(logical_turn_id, int)
+        assert database.acquire_provider_execution(terminal_id, logical_turn_id, 3)
+        return True
+
+    send = MagicMock(side_effect=admit_provider_execution)
+    monkeypatch.setattr(inbox_service.provider_manager, "get_provider", lambda *_: provider)
+    monkeypatch.setattr(inbox_service.terminal_service, "send_input", send)
+    monkeypatch.setattr(
+        workflow_service.terminal_service,
+        "get_terminal",
+        lambda *_: {"lifecycle": "running", "status": TerminalStatus.IDLE.value},
+    )
+    monkeypatch.setattr(workflow_service.terminal_service, "send_input", send)
+
+    # The ordinary durable queue tick performs the missing autonomous wake.
+    assert inbox_service.reconcile_provider_execution_queue(observe_open_workflows=False) == 1
+    assert send.call_count == 1
+    with database.SessionLocal() as db:
+        old_callback = db.get(WorkflowTurnModel, callback_turn)
+        result = db.get(database.DelegationResultModel, notice.result_id)
+        callback_successor = result.workflow_turn_id
+        assert old_callback.state == "finished"
+        assert old_callback.superseded_by_turn_id == callback_successor
+        assert old_callback.queue_reason == "RESULT_CALLBACK_REQUEUED_AFTER_RESUME"
+        assert callback_successor > original_composer_turns[-1]
+        assert db.get(WorkflowTurnModel, callback_successor).state == "sent"
+        assert db.query(WorkflowProviderReconnectAttemptModel).count() == 1
+        assert db.query(database.ProviderExecutionLeaseModel).count() == 1
+        reconciled_composer_turns = [
+            db.get(WorkflowTurnModel, turn_id).superseded_by_turn_id
+            for turn_id in original_composer_turns
+        ]
+        assert callback_successor < reconciled_composer_turns[0] < reconciled_composer_turns[1]
+        immutable_result = (
+            result.id,
+            result.document_json,
+            result.content_sha256,
+            result.content_bytes,
+        )
+
+    callback_successor_receipt = claim_or_resume_workflow_turn_receipt(parent, callback_successor)
+    assert callback_successor_receipt["accepted"] is True
+    with patch.object(mcp_server, "_send_message_impl") as duplicate_send:
+        blocked_duplicate = asyncio.run(
+            mcp_server.send_message(callback_successor, "effect-target", "effect payload")
+        )
+    assert blocked_duplicate["success"] is False
+    assert blocked_duplicate["reason_code"] == "DUPLICATE_EFFECT"
+    duplicate_send.assert_not_called()
+    assert (
+        claim_workflow_effect(parent, callback_successor, "assign", "claimed-lineage-effect")
+        is None
+    )
+    read = asyncio.run(mcp_server.read_delegation_result(callback_successor, notice.result_id))
+    assert read["success"] is True
+    acknowledged = asyncio.run(
+        mcp_server.acknowledge_assigned_result(
+            callback_successor,
+            result_id=notice.result_id,
+            child_terminal_id=child,
+        )
+    )
+    duplicate_ack = asyncio.run(
+        mcp_server.acknowledge_assigned_result(
+            callback_successor,
+            result_id=notice.result_id,
+            child_terminal_id=child,
+        )
+    )
+    assert acknowledged["success"] is True
+    assert duplicate_ack["success"] is False
+
+    # Completing the current mission promotes, rather than cancels, the exact
+    # durable Composer requests. Each later completion advances one FIFO item.
+    assert database.release_provider_execution(parent, callback_successor)
+    assert set_workflow_terminal_state(
+        parent, "terminal", "result incorporated", require_no_active_children=True
+    )
+    assert inbox_service.reconcile_provider_execution_queue(observe_open_workflows=False) == 1
+    first_successor, second_successor = reconciled_composer_turns
+    assert f"logical-turn={first_successor}" in send.call_args.args[1]
+    assert send.call_args.args[1].endswith("first queued Composer mission")
+    assert claim_workflow_turn_receipt(parent, first_successor)
+    assert database.release_provider_execution(parent, first_successor)
+    assert set_workflow_terminal_state(parent, "terminal", "first mission complete")
+    assert inbox_service.reconcile_provider_execution_queue(observe_open_workflows=False) == 1
+    assert f"logical-turn={second_successor}" in send.call_args.args[1]
+    assert send.call_args.args[1].endswith("second queued Composer mission")
+    assert claim_workflow_turn_receipt(parent, second_successor)
+
+    duplicate_first = database.prepare_workflow_input(
+        parent,
+        "first queued Composer mission",
+        request_id="ready-reconnect-composer-first",
+        require_live_terminal=True,
+    )
+    assert duplicate_first is not None and duplicate_first["duplicate"] is True
+    assert duplicate_first["turn_id"] == first_successor
+    assert database.reconcile_result_callbacks_superseded_by_resume() == 0
+    with database.SessionLocal() as db:
+        result = db.get(database.DelegationResultModel, notice.result_id)
+        assert (
+            result.id,
+            result.document_json,
+            result.content_sha256,
+            result.content_bytes,
+        ) == immutable_result
+        assert db.query(WorkflowProviderReconnectAttemptModel).count() == 1
+        assert (
+            db.query(WorkflowTurnReceiptModel)
+            .filter_by(workflow_turn_id=callback_successor, receiver_terminal_id=parent)
+            .count()
+            == 1
+        )
+        assert (
+            db.query(WorkflowEffectModel)
+            .filter_by(
+                workflow_turn_id=callback_successor,
+                effect_kind="acknowledge_assignment",
+            )
+            .count()
+            == 1
+        )
+        successor_effects = {
+            effect.effect_kind: effect.state
+            for effect in db.query(WorkflowEffectModel).filter_by(
+                workflow_turn_id=callback_successor
+            )
+        }
+        assert successor_effects == {
+            "send_message": "completed",
+            "assign": "indeterminate",
+            "acknowledge_assignment": "completed",
+        }
+
+
+def test_f13_completion_fails_closed_on_claimed_composer_successor(workflow_db):
+    root = "root-claimed-composer-completion"
+    active_turn = _start_admitted_input(root)
+    assert database.acquire_provider_execution(root, active_turn, 3)
+    prepared = database.prepare_workflow_input(
+        root,
+        "claimed concurrently with completion",
+        request_id="claimed-composer-completion",
+        require_live_terminal=True,
+    )
+    assert prepared is not None and prepared["queued"] is True
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, prepared["turn_id"])
+        turn.state = "claimed"
+        turn.claim_token = "concurrent-claim"
+        turn.claim_expires_at = datetime.now() + timedelta(seconds=30)
+        db.commit()
+
+    assert set_workflow_terminal_state(root, "terminal", "must not steal claim") is False
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        turn = db.get(WorkflowTurnModel, prepared["turn_id"])
+        assert workflow.status == "open"
+        assert turn.workflow_id == workflow.id
+        assert turn.state == "claimed"
+        assert turn.claim_token == "concurrent-claim"
+
+
+def test_f13_completion_keeps_old_child_cancellation_out_of_next_composer_mission(
+    workflow_db,
+):
+    root = "root-completion-child-affinity"
+    child = "child-completion-child-affinity"
+    active_turn = _start_admitted_input(root)
+    assert database.acquire_provider_execution(root, active_turn, 3)
+    assert register_child_assignment(root, child)
+    prepared = database.prepare_workflow_input(
+        root,
+        "next mission stays independent",
+        request_id="completion-child-affinity",
+        require_live_terminal=True,
+    )
+    assert prepared is not None and prepared["queued"] is True
+
+    with database.SessionLocal() as db:
+        old_workflow_id = db.get(WorkflowTurnModel, active_turn).workflow_id
+
+    assert set_workflow_terminal_state(root, "terminal", "current mission stopped")
+    with database.SessionLocal() as db:
+        workflows = (
+            db.query(WorkflowModel)
+            .filter_by(root_terminal_id=root)
+            .order_by(WorkflowModel.id.asc())
+            .all()
+        )
+        assert len(workflows) == 2
+        assert workflows[0].id == old_workflow_id
+        assert workflows[0].status == "terminal"
+        assert workflows[1].status == "open"
+        assert workflows[1].active_turn_id == prepared["turn_id"]
+        assert db.get(WorkflowTurnModel, prepared["turn_id"]).workflow_id == workflows[1].id
+        assignment = (
+            db.query(database.ChildAssignmentModel).filter_by(child_terminal_id=child).one()
+        )
+        result = (
+            db.query(database.DelegationResultModel)
+            .filter_by(child_assignment_id=assignment.id)
+            .one()
+        )
+        assert assignment.status == "cancelled"
+        assert result.status == "cancelled"
+        assert result.parent_workflow_id == old_workflow_id
+
+
 def test_f13_closed_ordinary_inbox_is_not_a_new_owner_input_predecessor(workflow_db):
     """A terminal workflow's transport row cannot defer a new semantic workflow."""
     parent = "parent-closed-inbox-submit"

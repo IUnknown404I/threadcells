@@ -364,6 +364,7 @@ export interface AgentSummary {
   workflow_state: string | null
   workflow_status: string | null
   workflow_reason: string | null
+  queued_task_count?: number
   provider_outcome_code?: string | null
   provider_outcome_detail?: string | null
   assignment_status: string | null
@@ -409,6 +410,7 @@ export interface Terminal {
   workflow_state?: 'open' | 'active' | 'waiting' | 'recoverable' | 'result_ready' | 'owner_gate' | 'completed' | 'incomplete' | 'failed' | 'cancelled' | null
   workflow_status?: string | null
   workflow_reason?: string | null
+  queued_task_count?: number
   provider_outcome_code?: string | null
   provider_outcome_detail?: string | null
   assignment_status?: string | null

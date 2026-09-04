@@ -2603,6 +2603,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "workflow_state": workflow["state"],
             "workflow_status": workflow["workflow_status"],
             "workflow_reason": workflow.get("workflow_reason"),
+            "queued_task_count": workflow.get("queued_task_count", 0),
             "provider_outcome_code": workflow.get("provider_outcome_code"),
             "provider_outcome_detail": workflow.get("provider_outcome_detail"),
             "assignment_status": workflow["assignment_status"],

@@ -14,6 +14,7 @@ import { AgentViewControls } from './AgentViewControls'
 import { useI18n } from '../i18n'
 import { ProviderOutcomeNotice } from './ProviderOutcomeNotice'
 import { RecoveryTakeoverAction } from './RecoveryTakeoverAction'
+import { WorkflowRecoveryNotice } from './WorkflowRecoveryNotice'
 import { useRecoveryTakeoverCapabilities } from '../recoveryCapabilities'
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })))
@@ -86,6 +87,7 @@ function ExpandedSessionAgents({
           </div>
         </div>
         <ProviderOutcomeNotice code={agent.provider_outcome_code} />
+        <WorkflowRecoveryNotice agent={agent} capability={recoveryCapabilities[agent.id]} />
         {ownerGated && <div data-testid={`owner-decision-${agent.id}`} className="flex flex-col gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 sm:flex-row sm:items-center sm:justify-between"><div className="flex items-start gap-2 text-xs text-amber-100"><MessageSquareWarning size={15} className="mt-0.5 shrink-0 text-amber-400"/><span><strong className="font-semibold">{t('home.ownerDecision')}</strong>{agent.workflow_reason ? ` ${agent.workflow_reason}` : ''} {' '}{agent.execution_state === 'processing' ? t('home.agentProcessing') : agent.lifecycle === 'exited' ? t('home.agentExited') : t('home.agentReady')}</span></div><button type="button" onClick={() => onTerminal(agent)} className="min-h-10 shrink-0 rounded-lg border border-amber-500/50 px-3 text-xs font-medium text-amber-200 hover:bg-amber-500/10">{t('home.continueWorkflow')}</button></div>}
         <button type="button" onClick={() => onInbox(agent.id)} className="inline-flex items-center gap-1.5 text-xs text-gray-400 hover:text-emerald-300"><Mail size={13}/>{t('home.messageInbox')}</button>
       </div>

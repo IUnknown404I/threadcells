@@ -78,6 +78,7 @@ def _public_agent_summary(terminal: Dict[str, Any]) -> Dict[str, Any]:
         "workflow_state",
         "workflow_status",
         "workflow_reason",
+        "queued_task_count",
         "provider_outcome_code",
         "provider_outcome_detail",
         "assignment_status",
@@ -97,6 +98,7 @@ def _public_agent_summary(terminal: Dict[str, Any]) -> Dict[str, Any]:
         "creation_order",
     )
     result = {key: terminal.get(key) for key in keys}
+    result["queued_task_count"] = int(result.get("queued_task_count") or 0)
     result["last_active"] = _iso(terminal.get("last_active"))
     return result
 

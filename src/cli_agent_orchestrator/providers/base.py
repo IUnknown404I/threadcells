@@ -152,6 +152,15 @@ class BaseProvider(ABC):
         """
         pass
 
+    def get_durable_last_response(self) -> Optional[str]:
+        """Return a provider-native completed response when one is available.
+
+        The default provider contract has no independent response artifact and
+        therefore falls back to bounded terminal-log extraction. Providers
+        with an exact durable transcript may override this method.
+        """
+        return None
+
     @abstractmethod
     def exit_cli(self) -> str:
         """Get the command to exit the provider CLI.

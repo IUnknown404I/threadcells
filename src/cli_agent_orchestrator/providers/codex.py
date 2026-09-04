@@ -104,6 +104,7 @@ STARTUP_ERROR_PATTERN = (
     r"codex: command not found|command not found:)"
 )
 STARTUP_EVIDENCE_LIMIT = 12_000
+CODEX_LAST_RESPONSE_SCAN_MAX_BYTES = 8 * 1024 * 1024
 # Resuming a long conversation can redraw more than the ordinary 200-line
 # status window before the TUI becomes idle. Keep reconnect evidence bounded,
 # but large enough that the shell marker cannot disappear during that redraw.
@@ -543,6 +544,44 @@ def _codex_turn_execution_active(path: Path) -> Optional[bool]:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def _latest_completed_codex_response(path: Path) -> Optional[str]:
+    """Read the latest provider-native completed response from a bounded suffix."""
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        source = os.fstat(descriptor)
+        if not stat.S_ISREG(source.st_mode):
+            return None
+        start = max(0, source.st_size - CODEX_LAST_RESPONSE_SCAN_MAX_BYTES)
+        raw = os.pread(descriptor, source.st_size - start, start)
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if start:
+        _partial, separator, raw = raw.partition(b"\n")
+        if not separator:
+            return None
+    for line in reversed(raw.splitlines()):
+        if len(line) > 4 * 1024 * 1024:
+            continue
+        try:
+            row = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        payload = row.get("payload") if isinstance(row, dict) else None
+        if (
+            row.get("type") == "event_msg"
+            and isinstance(payload, dict)
+            and payload.get("type") == "task_complete"
+            and isinstance(payload.get("last_agent_message"), str)
+            and payload["last_agent_message"].strip()
+        ):
+            return payload["last_agent_message"]
+    return None
 
 
 def _latest_structured_codex_outcome(
@@ -2143,6 +2182,27 @@ class CodexProvider(BaseProvider):
             if values["total_tokens"] is not None:
                 values["total_tokens"] += cached_input_tokens
         return values
+
+    def get_durable_last_response(self) -> Optional[str]:
+        """Return the latest exact-session response without reading terminal history."""
+        from cli_agent_orchestrator.clients.database import get_terminal_metadata
+
+        metadata = get_terminal_metadata(self.terminal_id)
+        if metadata is None:
+            return None
+        identity = metadata.get("provider_resume_identity")
+        working_directory = metadata.get("launch_worktree")
+        if (
+            not isinstance(identity, str)
+            or not isinstance(working_directory, str)
+            or not os.path.isabs(working_directory)
+        ):
+            return None
+        rollout = _rollout_path_for_identity(
+            identity,
+            Path(working_directory).resolve(strict=False),
+        )
+        return _latest_completed_codex_response(rollout) if rollout is not None else None
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Codex's final response from terminal output.

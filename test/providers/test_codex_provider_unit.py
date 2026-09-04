@@ -1466,6 +1466,51 @@ class TestCodexBulletFormatStatusDetection:
             handle.write('{"type":"event_msg","payload":{"type":"task_started"}')
         assert provider.turn_execution_active(provider_session_id=identity) is None
 
+    def test_provider_native_last_response_is_exact_bounded_and_independent_of_tui(
+        self, tmp_path, monkeypatch
+    ):
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        working_directory = tmp_path / "project"
+        working_directory.mkdir()
+        codex_home = tmp_path / "codex"
+        identity = "01234567-89ab-cdef-0123-456789abcdef"
+        rollout = _open_rollout_fixture(
+            tmp_path / "proc",
+            codex_home,
+            process_id=200,
+            descriptor="8",
+            session_id=identity,
+            working_directory=working_directory,
+        )
+        with rollout.open("a", encoding="utf-8") as handle:
+            for message in ("older response", "latest response — ✓"):
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "task_complete",
+                                "last_agent_message": message,
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            handle.write(
+                json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}) + "\n"
+            )
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            lambda terminal_id: {
+                "id": terminal_id,
+                "provider_resume_identity": identity,
+                "launch_worktree": str(working_directory),
+            },
+        )
+
+        assert provider.get_durable_last_response() == "latest response — ✓"
+
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
     def test_structured_policy_outcome_uses_exact_rollout_without_response_content(
         self, mock_tmux, tmp_path, monkeypatch

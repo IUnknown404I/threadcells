@@ -253,6 +253,7 @@ def test_home_lifecycle_counts_and_filters_are_mutually_truthful(monkeypatch):
         for terminal_id, workflow_status, lifecycle in (
             ("ready", "open", "running"),
             ("processing", "open", "running"),
+            ("queued", "open", "running"),
             ("owner", "owner_gate", "running"),
             ("cancelled", "cancelled", "running"),
             ("completed", "terminal", "running"),
@@ -278,22 +279,23 @@ def test_home_lifecycle_counts_and_filters_are_mutually_truthful(monkeypatch):
             )
             db.add(workflow)
             db.flush()
-            if terminal_id == "processing":
+            if terminal_id in {"processing", "queued"}:
                 turn = WorkflowTurnModel(
                     workflow_id=workflow.id,
                     kind="continuation",
-                    dedupe_key="processing-turn",
-                    state="claimed",
+                    dedupe_key=f"{terminal_id}-turn",
+                    state="claimed" if terminal_id == "processing" else "queued",
                 )
                 db.add(turn)
                 db.flush()
                 workflow.active_turn_id = turn.id
-                db.add(
-                    ProviderExecutionLeaseModel(
-                        terminal_id=terminal_id,
-                        workflow_turn_id=turn.id,
+                if terminal_id == "processing":
+                    db.add(
+                        ProviderExecutionLeaseModel(
+                            terminal_id=terminal_id,
+                            workflow_turn_id=turn.id,
+                        )
                     )
-                )
         db.commit()
 
     overview = ui_read_model_service.get_overview()
@@ -301,15 +303,29 @@ def test_home_lifecycle_counts_and_filters_are_mutually_truthful(monkeypatch):
     owner = ui_read_model_service.list_agent_summaries(limit=20, home_filter="owner_gate")
     cancelled = ui_read_model_service.list_agent_summaries(limit=20, home_filter="cancelled")
     completed = ui_read_model_service.list_agent_summaries(limit=20, home_filter="completed")
+    session = ui_read_model_service.list_session_summaries(limit=10)["items"][0]
 
     assert overview["waiting"] == 1
     assert overview["owner_gate"] == 1
     assert overview["cancelled"] == 1
     assert overview["completed"] == 1
-    assert [item["id"] for item in waiting["items"]] == ["ready"]
+    assert [item["id"] for item in waiting["items"]] == ["queued"]
     assert [item["id"] for item in owner["items"]] == ["owner"]
     assert [item["id"] for item in cancelled["items"]] == ["cancelled"]
     assert [item["id"] for item in completed["items"]] == ["completed"]
+    assert session["activity_counts"] == {
+        "exited": 1,
+        "processing": 1,
+        "queued": 1,
+        "ready": 4,
+    }
+    assert session["workflow_counts"] == {
+        "active": 4,
+        "cancelled": 1,
+        "completed": 1,
+        "owner_gate": 1,
+    }
+    assert session["active_agent_count"] == 6
 
 
 def test_open_workflow_projects_queued_composer_count(monkeypatch):
@@ -345,6 +361,7 @@ def test_open_workflow_projects_queued_composer_count(monkeypatch):
         )
         db.add(active)
         db.flush()
+        active_turn_id = active.id
         workflow.active_turn_id = active.id
         db.add(
             WorkflowTurnReceiptModel(
@@ -370,7 +387,137 @@ def test_open_workflow_projects_queued_composer_count(monkeypatch):
     assert item["workflow_status"] == "open"
     assert item["queued_task_count"] == 2
     assert item["workflow_recovery_pending"] is True
+    assert item["activity"] == "queued"
+    assert item["execution_state"] == "waiting_workflow_continuation"
+
+    # A future Composer item remains secondary while an exact provider
+    # execution lease is active.
+    with database.SessionLocal() as db:
+        db.add(
+            ProviderExecutionLeaseModel(
+                terminal_id="queued-composer",
+                workflow_turn_id=active_turn_id,
+            )
+        )
+        db.commit()
+    item = ui_read_model_service.list_agent_summaries(limit=10)["items"][0]
     assert item["activity"] == "processing"
+    assert item["execution_state"] == "processing"
+    assert item["queued_task_count"] == 2
+
+
+def test_late_receipt_restores_same_physical_turn_and_keeps_future_queue_secondary(
+    monkeypatch,
+):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 4, 16, 0, 0)
+    with database.SessionLocal() as db:
+        db.add(
+            TerminalModel(
+                id="receipt-race",
+                tmux_session="cao-receipt-race",
+                session_id="lifetime-receipt-race",
+                tmux_window="owner",
+                provider="codex",
+                runtime_lifecycle="running",
+                last_active=now,
+            )
+        )
+        workflow = WorkflowModel(
+            root_terminal_id="receipt-race",
+            status="open",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(workflow)
+        db.flush()
+        active = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="external_request:active",
+            payload="already delivered exact input",
+            state="queued",
+            queue_reason="PROVIDER_SETTLED_BEFORE_RECEIPT",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(active)
+        db.flush()
+        workflow.active_turn_id = active.id
+        db.add(
+            WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="external_input",
+                dedupe_key="external_request:future",
+                payload="future Composer input",
+                state="queued",
+                queue_reason="WORKFLOW_CONTINUATION_PENDING",
+                created_at=now + timedelta(seconds=1),
+                updated_at=now + timedelta(seconds=1),
+            )
+        )
+        active_id = active.id
+        db.commit()
+
+    assert database.claim_workflow_turn_receipt("receipt-race", active_id)
+    assert not database.claim_workflow_turn_receipt("receipt-race", active_id)
+    item = ui_read_model_service.list_agent_summaries(limit=10)["items"][0]
+    assert item["activity"] == "processing"
+    assert item["execution_state"] == "processing"
+    assert item["workflow_state"] == "active"
+    assert item["queued_task_count"] == 1
+    with database.SessionLocal() as db:
+        active = db.get(WorkflowTurnModel, active_id)
+        assert active.state == "sent"
+        assert active.queue_reason is None
+        assert db.query(WorkflowTurnReceiptModel).count() == 1
+        lease = db.get(ProviderExecutionLeaseModel, "receipt-race")
+        assert lease is not None and lease.workflow_turn_id == active_id
+
+
+def test_never_dispatched_queued_turn_cannot_fabricate_physical_receipt(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 4, 16, 5, 0)
+    with database.SessionLocal() as db:
+        db.add(
+            TerminalModel(
+                id="never-dispatched",
+                tmux_session="cao-never-dispatched",
+                session_id="lifetime-never-dispatched",
+                tmux_window="owner",
+                provider="codex",
+                runtime_lifecycle="running",
+                last_active=now,
+            )
+        )
+        workflow = WorkflowModel(
+            root_terminal_id="never-dispatched",
+            status="open",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(workflow)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="external_request:waiting",
+            payload="not yet delivered",
+            state="queued",
+            queue_reason="RESOURCE_HEALTH_REJECTED",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(turn)
+        db.flush()
+        workflow.active_turn_id = turn.id
+        turn_id = turn.id
+        db.commit()
+
+    assert not database.claim_workflow_turn_receipt("never-dispatched", turn_id)
+    with database.SessionLocal() as db:
+        assert db.query(WorkflowTurnReceiptModel).count() == 0
+        assert db.query(ProviderExecutionLeaseModel).count() == 0
 
 
 def test_execution_wait_labels_and_owner_reason_are_exact_durable_mappings(monkeypatch):
@@ -465,8 +612,9 @@ def test_execution_wait_labels_and_owner_reason_are_exact_durable_mappings(monke
     assert items["provider-slot"]["execution_state"] == "waiting_workflow_continuation"
     assert items["continuation"]["execution_state"] == "waiting_workflow_continuation"
 
-    # An admitted in-flight workflow turn remains Processing even if a live
-    # provider observation is momentarily Ready while it performs MCP work.
+    # A receipt is durable workflow authority, not physical execution truth.
+    # Without an execution lease, the runtime is Ready while the workflow
+    # remains independently Active.
     with database.SessionLocal() as db:
         workflow = db.query(WorkflowModel).filter_by(root_terminal_id="continuation").one()
         turn = db.query(WorkflowTurnModel).filter_by(workflow_id=workflow.id).one()
@@ -482,8 +630,9 @@ def test_execution_wait_labels_and_owner_reason_are_exact_durable_mappings(monke
     items = {
         item["id"]: item for item in ui_read_model_service.list_agent_summaries(limit=20)["items"]
     }
-    assert items["continuation"]["activity"] == "processing"
-    assert items["continuation"]["execution_state"] == "processing"
+    assert items["continuation"]["activity"] == "ready"
+    assert items["continuation"]["execution_state"] == "ready"
+    assert items["continuation"]["workflow_state"] == "active"
 
     # New semantic input can advance the receiver capability during the
     # narrow post-paste/pre-ack race. The old provider lease still means a

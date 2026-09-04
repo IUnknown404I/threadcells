@@ -26,8 +26,6 @@ from cli_agent_orchestrator.providers.codex import (
     ProviderError,
 )
 from cli_agent_orchestrator.services.terminal_service import (
-    COMPRESSED_OUTPUT_MAX_BYTES,
-    COMPRESSED_OUTPUT_SOURCE_MAX_BYTES,
     LAST_OUTPUT_READ_MAX_BYTES,
     LAST_OUTPUT_RESPONSE_MAX_BYTES,
     OUTPUT_CHUNK_MAX_BYTES,
@@ -70,6 +68,53 @@ from cli_agent_orchestrator.services.terminal_service import (
 )
 def test_human_output_sanitizer_fails_closed_on_partial_controls(raw, expected):
     assert _sanitize_human_terminal_output(raw) == expected
+
+
+def test_human_output_collapses_codex_cursor_repaint_without_matching_words():
+    raw = "".join(
+        f"\x1b[4;1H{prefix}\x1b[K"
+        for prefix in ("W", "Wo", "Wor", "Work", "Worki", "Workin", "Working")
+    )
+    raw += "\x1b[4;1HFinal answer\x1b[K"
+
+    assert _sanitize_human_terminal_output(raw) == "Final answer"
+
+
+def test_human_output_collapses_spinner_and_background_counter_frames():
+    raw = (
+        "\x1b[8;1H• Working (1s • esc to interrupt)\x1b[K"
+        "\x1b[9;1H1 background terminal running\x1b[K"
+        "\x1b[8;1H◐ Working (2s • esc to interrupt)\x1b[K"
+        "\x1b[9;1H2 background terminals running\x1b[K"
+        "\x1b[8;1HCompleted\x1b[K\x1b[9;1H\x1b[K"
+    )
+
+    assert _sanitize_human_terminal_output(raw) == "Completed"
+
+
+def test_human_output_preserves_ordinary_working_code_unicode_tabs_and_lines():
+    expected = (
+        "Working is legitimate prose.\n"
+        "print('• Working')\n"
+        r"print('literal \x1b[31m ANSI example')"
+        "\nПривет\t✓\n"
+    )
+
+    assert _sanitize_human_terminal_output(expected) == expected
+
+
+def test_human_output_applies_c1_cursor_and_erase_semantics():
+    raw = "\x9b4;1HWorking\x9bK\x9b4;1HDone\x9bK"
+
+    assert _sanitize_human_terminal_output(raw) == "Done"
+
+
+def test_human_output_semantic_expansion_stays_bounded():
+    raw = "wide" + "\x1b[4096GX\x1b[S" * 20_000
+
+    rendered = _sanitize_human_terminal_output(raw)
+
+    assert len(rendered) <= OUTPUT_CHUNK_MAX_BYTES
 
 
 def test_bind_provider_runtime_session_identity_proves_exact_hook_path(monkeypatch, tmp_path):
@@ -2974,7 +3019,7 @@ class TestGetOutput:
         self._durable_terminal(monkeypatch, tmp_path)
         path = tmp_path / "test1234.log"
         with path.open("wb") as stream:
-            stream.seek(64 * 1024 * 1024)
+            stream.seek(512 * 1024 * 1024)
             stream.write(b"\nlatest response\n")
         provider = MagicMock()
         provider.extract_last_message_from_script.return_value = "latest response"
@@ -3047,6 +3092,22 @@ class TestGetOutput:
         provider.extract_last_message_from_script.assert_called_once_with(
             "latest compressed response"
         )
+
+    def test_provider_native_last_response_bypasses_huge_terminal_history(
+        self, monkeypatch, tmp_path
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        (tmp_path / "test1234.log.gz").write_bytes(b"large historical gzip is not consulted")
+        provider = MagicMock()
+        provider.get_durable_last_response.return_value = "bounded actual latest response"
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.provider_manager.get_provider",
+            lambda *_: provider,
+        )
+
+        assert get_output("test1234", OutputMode.LAST) == "bounded actual latest response"
+        provider.extract_last_message_from_script.assert_not_called()
+        assert not (tmp_path / "test1234.log.tci").exists()
 
     def test_full_output_pages_newest_first_without_gaps_or_overlap(self, monkeypatch, tmp_path):
         self._durable_terminal(monkeypatch, tmp_path)
@@ -3196,6 +3257,42 @@ class TestGetOutput:
         assert forbidden not in "".join(chunks)
         assert all(older[1] == newer[0] for older, newer in zip(ranges, ranges[1:]))
 
+    def test_codex_repaints_collapse_across_four_progressive_pages(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        frames = []
+        prefixes = ("W", "Wo", "Wor", "Work", "Worki", "Workin", "Working")
+        size = 0
+        while size < OUTPUT_CHUNK_MAX_BYTES * 4:
+            prefix = prefixes[len(frames) % len(prefixes)]
+            frame = (
+                f"\x1b[?2026h\x1b[20;1H• {prefix} (1s • esc to interrupt)"
+                "\x1b[K\x1b[21;1H1 background terminal running\x1b[K\x1b[?2026l"
+            )
+            frames.append(frame)
+            size += len(frame.encode())
+        frames.append(
+            "\x1b[?2026h\x1b[20;1HOrdinary Working prose\x1b[K"
+            "\x1b[21;1Hprint('Working')\t✓\x1b[K\x1b[?2026l"
+        )
+        (tmp_path / "test1234.log").write_text("".join(frames), encoding="utf-8")
+
+        cursor = None
+        chunks = []
+        for _ in range(8):
+            chunk = get_output_chunk("test1234", cursor)
+            chunks.insert(0, chunk.output)
+            if not chunk.has_older:
+                break
+            cursor = chunk.cursor
+
+        rendered = "".join(chunks)
+        assert len(chunks) >= 4
+        assert "Ordinary Working prose" in rendered
+        assert "print('Working')\t✓" in rendered
+        assert "esc to interrupt" not in rendered
+        assert "background terminal running" not in rendered
+        assert "Working•Working" not in rendered
+
     def test_older_hard_pages_strip_production_terminal_fragments_and_bound_reads(
         self, monkeypatch, tmp_path
     ):
@@ -3311,32 +3408,64 @@ class TestGetOutput:
         with pytest.raises(TerminalOutputUnavailable):
             get_output_chunk("test1234")
 
-    def test_large_compressed_history_fails_without_an_unbounded_scan(self, monkeypatch, tmp_path):
+    def test_large_compressed_history_is_indexed_for_bounded_pagination(
+        self, monkeypatch, tmp_path
+    ):
         self._durable_terminal(monkeypatch, tmp_path)
+        expected = b"".join(
+            f"{number:07d}:{'x' * 113}\n".encode()
+            for number in range((OUTPUT_CHUNK_MAX_BYTES * 3) // 122)
+        )
         with gzip.open(tmp_path / "test1234.log.gz", "wb") as stream:
-            stream.write(b"x" * (COMPRESSED_OUTPUT_MAX_BYTES + 1))
+            stream.write(expected)
 
-        with pytest.raises(TerminalOutputUnavailable) as error:
-            get_output_chunk("test1234")
+        cursor = None
+        chunks = []
+        ranges = []
+        while True:
+            chunk = get_output_chunk("test1234", cursor)
+            chunks.insert(0, chunk.output)
+            ranges.insert(0, (chunk.start_offset, chunk.end_offset))
+            if not chunk.has_older:
+                break
+            cursor = chunk.cursor
 
-        assert error.value.reason_code == "COMPRESSED_OUTPUT_REQUIRES_INDEX"
+        assert "".join(chunks).encode() == expected
+        assert len(chunks) >= 3
+        assert all(older[1] == newer[0] for older, newer in zip(ranges, ranges[1:]))
+        assert (tmp_path / "test1234.log.tci").is_file()
+        assert (tmp_path / "test1234.log.tcd").is_file()
 
-    def test_concatenated_gzip_members_have_a_compressed_input_ceiling(self, monkeypatch, tmp_path):
+    def test_compressed_cursor_rejects_replaced_history(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        path = tmp_path / "test1234.log.gz"
+        path.write_bytes(gzip.compress(b"older\n" + b"x" * OUTPUT_CHUNK_MAX_BYTES))
+        first = get_output_chunk("test1234")
+        assert first.cursor is not None
+
+        replacement = tmp_path / "replacement.gz"
+        replacement.write_bytes(gzip.compress(b"newer\n" + b"y" * OUTPUT_CHUNK_MAX_BYTES))
+        os.replace(replacement, path)
+
+        with pytest.raises(TerminalOutputCursorError) as error:
+            get_output_chunk("test1234", first.cursor)
+        assert error.value.reason_code == "OUTPUT_CURSOR_STALE"
+
+    def test_concatenated_gzip_members_are_indexed_without_visible_artifacts(
+        self, monkeypatch, tmp_path
+    ):
         self._durable_terminal(monkeypatch, tmp_path)
         member = gzip.compress(b"")
-        member_count = (COMPRESSED_OUTPUT_SOURCE_MAX_BYTES // len(member)) + 1
+        member_count = ((256 * 1024) // len(member)) + 1
         source = member * member_count
-        assert len(source) > COMPRESSED_OUTPUT_SOURCE_MAX_BYTES
+        assert len(source) > 256 * 1024
         (tmp_path / "test1234.log.gz").write_bytes(source)
 
-        with patch(
-            "cli_agent_orchestrator.services.terminal_service.os.pread", wraps=os.pread
-        ) as bounded_read:
-            with pytest.raises(TerminalOutputUnavailable) as error:
-                get_output_chunk("test1234")
+        chunk = get_output_chunk("test1234")
 
-        assert error.value.reason_code == "COMPRESSED_OUTPUT_REQUIRES_INDEX"
-        bounded_read.assert_not_called()
+        assert chunk.output == ""
+        assert chunk.has_older is False
+        assert chunk.snapshot_size == 0
 
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
@@ -3422,7 +3551,9 @@ class TestGetOutput:
 
         result = get_output("test1234", OutputMode.FULL)
 
-        assert result == "Русский\nтекст\t✓\nprogressOK\nnext\nplain"
+        # A lone carriage return rewrites the current terminal row. Without
+        # an erase-line control the untouched suffix remains visible.
+        assert result == "Русский\nтекст\t✓\nnextressOK\nplain"
         assert "\x1b" not in result
 
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")

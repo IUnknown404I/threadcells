@@ -19,10 +19,8 @@ Terminal Workflow:
 
 import base64
 import binascii
-import gzip
 import hashlib
 import hmac
-import io
 import logging
 import os
 import secrets
@@ -32,7 +30,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum, IntEnum
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -110,7 +108,16 @@ from cli_agent_orchestrator.providers.codex import (
 )
 from cli_agent_orchestrator.providers.codex import ProviderError as CodexProviderError
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.services.compressed_output_index import (
+    CompressedOutputIndex,
+    open_compressed_output_index,
+)
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
+from cli_agent_orchestrator.services.terminal_render import ParserState as _TerminalRenderState
+from cli_agent_orchestrator.services.terminal_render import (
+    has_screen_semantics,
+    render_terminal_stream,
+)
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
@@ -441,11 +448,9 @@ OUTPUT_CHUNK_MAX_BYTES = 256 * 1024
 OUTPUT_RENDER_CONTEXT_MAX_BYTES = OUTPUT_CHUNK_MAX_BYTES
 LAST_OUTPUT_READ_MAX_BYTES = 1024 * 1024
 LAST_OUTPUT_RESPONSE_MAX_BYTES = 256 * 1024
-COMPRESSED_OUTPUT_MAX_BYTES = 256 * 1024
-COMPRESSED_OUTPUT_SOURCE_MAX_BYTES = 256 * 1024
 _OUTPUT_BOUNDARY_SCAN_BYTES = 16 * 1024
 _OUTPUT_CURSOR = struct.Struct(">BQQQQB")
-_OUTPUT_CURSOR_VERSION = 2
+_OUTPUT_CURSOR_VERSION = 3
 _OUTPUT_CURSOR_ENCODED_LENGTH = len(
     base64.urlsafe_b64encode(bytes(_OUTPUT_CURSOR.size)).rstrip(b"=")
 )
@@ -461,15 +466,6 @@ class TerminalOutputChunk:
     start_offset: int
     end_offset: int
     snapshot_size: int
-
-
-class _TerminalRenderState(IntEnum):
-    NORMAL = 0
-    ESCAPE = 1
-    ESCAPE_INTERMEDIATE = 2
-    CSI = 3
-    CONTROL_STRING = 4
-    CONTROL_STRING_ESCAPE = 5
 
 
 def _encode_output_cursor(
@@ -570,18 +566,15 @@ def _bounded_suffix_bytes(
     start_offset = probe_start + boundary
     chunk = payload[boundary:]
 
-    # Prefer a complete hard line boundary near the oldest edge. Very long
-    # individual lines deliberately fall back to the fixed byte ceiling.
+    # Prefer a complete hard line boundary near the oldest edge. A lone
+    # carriage return is an in-place rewrite, not a durable line boundary.
+    # Starting after it would preserve an intermediate repaint as plain text.
     if start_offset > 0:
         search = chunk[:_OUTPUT_BOUNDARY_SCAN_BYTES]
         newline = search.find(b"\n")
-        carriage = search.find(b"\r")
-        separators = [position for position in (newline, carriage) if position >= 0]
-        if separators:
-            separator = min(separators)
+        if newline >= 0:
+            separator = newline
             skip = separator + 1
-            if chunk[separator : separator + 2] == b"\r\n":
-                skip += 1
             start_offset += skip
             chunk = chunk[skip:]
     if len(chunk) > maximum_bytes:
@@ -589,27 +582,30 @@ def _bounded_suffix_bytes(
     return start_offset, chunk
 
 
-def _read_small_compressed_output(descriptor: int, *, source_size: int) -> bytes:
-    """Preserve small gzip history with input and decompressed-output ceilings."""
-    if source_size > COMPRESSED_OUTPUT_SOURCE_MAX_BYTES:
-        raise TerminalOutputUnavailable(
-            "Compressed output is too large for bounded random access",
-            "COMPRESSED_OUTPUT_REQUIRES_INDEX",
-        )
-    compressed = os.pread(descriptor, COMPRESSED_OUTPUT_SOURCE_MAX_BYTES + 1, 0)
-    if len(compressed) > COMPRESSED_OUTPUT_SOURCE_MAX_BYTES:
-        raise TerminalOutputUnavailable(
-            "Compressed output is too large for bounded random access",
-            "COMPRESSED_OUTPUT_REQUIRES_INDEX",
-        )
-    with gzip.GzipFile(fileobj=io.BytesIO(compressed), mode="rb") as stream:
-        payload = stream.read(COMPRESSED_OUTPUT_MAX_BYTES + 1)
-    if len(payload) > COMPRESSED_OUTPUT_MAX_BYTES:
-        raise TerminalOutputUnavailable(
-            "Compressed output is too large for bounded random access",
-            "COMPRESSED_OUTPUT_REQUIRES_INDEX",
-        )
-    return payload
+def _bounded_index_suffix_bytes(
+    index: CompressedOutputIndex, *, before_offset: int, maximum_bytes: int
+) -> tuple[int, bytes]:
+    """Indexed-gzip equivalent of :func:`_bounded_suffix_bytes`."""
+    if before_offset <= 0:
+        return 0, b""
+    candidate = max(0, before_offset - max(1, maximum_bytes - 4))
+    probe_start = max(0, candidate - 3)
+    payload = index.read(probe_start, before_offset - probe_start)
+    boundary = candidate - probe_start
+    moves = 0
+    while boundary > 0 and 0x80 <= payload[boundary] <= 0xBF and moves < 3:
+        boundary -= 1
+        moves += 1
+    start_offset = probe_start + boundary
+    chunk = payload[boundary:]
+    if start_offset > 0:
+        newline = chunk[:_OUTPUT_BOUNDARY_SCAN_BYTES].find(b"\n")
+        if newline >= 0:
+            start_offset += newline + 1
+            chunk = chunk[newline + 1 :]
+    if len(chunk) > maximum_bytes:
+        raise RuntimeError("bounded indexed output read exceeded its internal ceiling")
+    return start_offset, chunk
 
 
 def _bounded_text_suffix(value: str, maximum_bytes: int) -> str:
@@ -656,12 +652,15 @@ def _consume_terminal_csi(value: str, index: int) -> int:
 
 
 def _sanitize_human_terminal_output(value: str) -> str:
-    """Remove terminal effects while preserving readable Unicode text.
+    """Apply terminal effects while preserving readable Unicode text.
 
     Raw tmux history and durable logs intentionally retain controls for
     provider parsing and diagnostics.  This renderer is applied only to the
     human-facing FULL output boundary.
     """
+    if has_screen_semantics(value):
+        return render_terminal_stream(value).output
+
     rendered: list[str] = []
     index = 0
     while index < len(value):
@@ -926,14 +925,18 @@ def _bounded_output_render_context(descriptor: int, *, start_offset: int) -> tup
             "Output source changed during the read", "OUTPUT_CURSOR_STALE"
         )
 
-    # The sanitizer deliberately resynchronizes at hard line boundaries. Keep
-    # only the current line so ordinary paginated logs pay a tiny parse cost.
-    newline = context.rfind(b"\n")
-    carriage = context.rfind(b"\r")
-    boundary = max(newline, carriage)
-    if boundary >= 0:
-        return context[boundary + 1 :], False
+    # Repaint-aware rendering needs the bounded preceding viewport, not merely
+    # the current hard line. Context is parsed but never emitted.
     return context, context_start > 0
+
+
+def _bounded_index_render_context(
+    index: CompressedOutputIndex, *, start_offset: int
+) -> tuple[bytes, bool]:
+    if start_offset <= 0:
+        return b"", False
+    context_start = max(0, start_offset - OUTPUT_RENDER_CONTEXT_MAX_BYTES)
+    return index.read(context_start, start_offset - context_start), context_start > 0
 
 
 def _render_progressive_terminal_page(
@@ -954,6 +957,20 @@ def _render_progressive_terminal_page(
     payload_text = payload.decode("utf-8", errors="replace")
     value = context_text + payload_text
     emit_from = len(context_text)
+    if has_screen_semantics(value):
+        semantic = render_terminal_stream(
+            value,
+            emit_from=emit_from,
+            # Only the newest page owns the current viewport. Residual screens
+            # from older pages are superseded by the later byte ranges.
+            include_screen=expected_end_state is None,
+        )
+        return _TerminalRenderResult(
+            output=semantic.output,
+            state_at_emit=_TerminalRenderState(semantic.state_at_emit),
+            final_state=_TerminalRenderState(semantic.final_state),
+            orphan_string_terminator=semantic.orphan_string_terminator,
+        )
     selected = _scan_progressive_terminal_output(value, emit_from=emit_from)
     if not prefix_truncated:
         return selected
@@ -1039,7 +1056,7 @@ def _output_range_is_line_isolated(
             raise TerminalOutputCursorError(
                 "Output source changed during the read", "OUTPUT_CURSOR_STALE"
             )
-        start_isolated = preceding in {b"\n", b"\r"}
+        start_isolated = preceding == b"\n"
     if end_offset == snapshot_size:
         end_isolated = True
     elif end_offset > 0:
@@ -1048,9 +1065,19 @@ def _output_range_is_line_isolated(
             raise TerminalOutputCursorError(
                 "Output source changed during the read", "OUTPUT_CURSOR_STALE"
             )
-        end_isolated = preceding in {b"\n", b"\r"}
+        end_isolated = preceding == b"\n"
     else:
         end_isolated = True
+    return start_isolated and end_isolated
+
+
+def _indexed_output_range_is_line_isolated(
+    index: CompressedOutputIndex, *, start_offset: int, end_offset: int, snapshot_size: int
+) -> bool:
+    start_isolated = start_offset == 0 or index.read(start_offset - 1, 1) == b"\n"
+    end_isolated = (
+        end_offset == snapshot_size or end_offset == 0 or index.read(end_offset - 1, 1) == b"\n"
+    )
     return start_isolated and end_isolated
 
 
@@ -3525,6 +3552,89 @@ def exit_terminal(terminal_id: str) -> ExitTerminalResult:
         time.sleep(EXIT_CONFIRMATION_POLL_SECONDS)
 
 
+def _get_compressed_output_chunk(
+    terminal_id: str,
+    descriptor: int,
+    source: os.stat_result,
+    cursor: str | None,
+) -> TerminalOutputChunk:
+    index = open_compressed_output_index(TERMINAL_LOG_DIR, terminal_id, descriptor, source)
+    try:
+        if cursor is None:
+            snapshot_size = index.raw_size
+            before_offset = snapshot_size
+            expected_end_state = None
+        else:
+            device, inode, snapshot_size, before_offset, expected_end_state = _decode_output_cursor(
+                cursor
+            )
+            if (device, inode) != (source.st_dev, source.st_ino) or snapshot_size != index.raw_size:
+                raise TerminalOutputCursorError(
+                    "Output source changed after the viewer opened", "OUTPUT_CURSOR_STALE"
+                )
+        start_offset, payload = _bounded_index_suffix_bytes(
+            index,
+            before_offset=before_offset,
+            maximum_bytes=OUTPUT_CHUNK_MAX_BYTES,
+        )
+        payload_text = payload.decode("utf-8", errors="replace")
+        line_isolated = _indexed_output_range_is_line_isolated(
+            index,
+            start_offset=start_offset,
+            end_offset=before_offset,
+            snapshot_size=snapshot_size,
+        )
+        if has_screen_semantics(payload_text):
+            prefix_context, prefix_truncated = _bounded_index_render_context(
+                index, start_offset=start_offset
+            )
+            render_result = _render_progressive_terminal_page(
+                payload,
+                prefix_context=prefix_context,
+                prefix_truncated=prefix_truncated,
+                expected_end_state=expected_end_state,
+            )
+            rendered = render_result.output
+            start_render_state = render_result.state_at_emit
+        elif snapshot_size <= OUTPUT_CHUNK_MAX_BYTES or line_isolated:
+            rendered = _sanitize_human_terminal_output(payload_text)
+            start_render_state = _TerminalRenderState.NORMAL
+        else:
+            prefix_context, prefix_truncated = _bounded_index_render_context(
+                index, start_offset=start_offset
+            )
+            render_result = _render_progressive_terminal_page(
+                payload,
+                prefix_context=prefix_context,
+                prefix_truncated=prefix_truncated,
+                expected_end_state=expected_end_state,
+            )
+            rendered = render_result.output
+            start_render_state = render_result.state_at_emit
+        has_older = start_offset > 0
+        next_cursor = (
+            _encode_output_cursor(
+                device=source.st_dev,
+                inode=source.st_ino,
+                snapshot_size=snapshot_size,
+                before_offset=start_offset,
+                render_state=start_render_state,
+            )
+            if has_older
+            else None
+        )
+        return TerminalOutputChunk(
+            output=rendered,
+            cursor=next_cursor,
+            has_older=has_older,
+            start_offset=start_offset,
+            end_offset=before_offset,
+            snapshot_size=snapshot_size,
+        )
+    finally:
+        index.close()
+
+
 def get_output_chunk(terminal_id: str, cursor: str | None = None) -> TerminalOutputChunk:
     """Return one newest-first, bounded chunk from durable terminal history.
 
@@ -3539,20 +3649,7 @@ def get_output_chunk(terminal_id: str, cursor: str | None = None) -> TerminalOut
     descriptor, source, compressed = _open_durable_output(terminal_id)
     try:
         if compressed:
-            if cursor is not None:
-                raise TerminalOutputCursorError(
-                    "Compressed output cursor is invalid", "OUTPUT_CURSOR_INVALID"
-                )
-            payload = _read_small_compressed_output(descriptor, source_size=source.st_size)
-            rendered = _sanitize_human_terminal_output(payload.decode("utf-8", errors="replace"))
-            return TerminalOutputChunk(
-                output=rendered,
-                cursor=None,
-                has_older=False,
-                start_offset=0,
-                end_offset=len(payload),
-                snapshot_size=len(payload),
-            )
+            return _get_compressed_output_chunk(terminal_id, descriptor, source, cursor)
 
         if cursor is None:
             snapshot_size = source.st_size
@@ -3581,8 +3678,23 @@ def get_output_chunk(terminal_id: str, cursor: str | None = None) -> TerminalOut
             end_offset=before_offset,
             snapshot_size=snapshot_size,
         )
-        if snapshot_size <= OUTPUT_CHUNK_MAX_BYTES or line_isolated:
-            rendered = _sanitize_human_terminal_output(payload.decode("utf-8", errors="replace"))
+        payload_text = payload.decode("utf-8", errors="replace")
+        semantic_controls = has_screen_semantics(payload_text)
+        if semantic_controls:
+            prefix_context, prefix_truncated = _bounded_output_render_context(
+                descriptor,
+                start_offset=start_offset,
+            )
+            render_result = _render_progressive_terminal_page(
+                payload,
+                prefix_context=prefix_context,
+                prefix_truncated=prefix_truncated,
+                expected_end_state=expected_end_state,
+            )
+            rendered = render_result.output
+            start_render_state = render_result.state_at_emit
+        elif snapshot_size <= OUTPUT_CHUNK_MAX_BYTES or line_isolated:
+            rendered = _sanitize_human_terminal_output(payload_text)
             start_render_state = _TerminalRenderState.NORMAL
         else:
             prefix_context, prefix_truncated = _bounded_output_render_context(
@@ -3622,10 +3734,28 @@ def get_output_chunk(terminal_id: str, cursor: str | None = None) -> TerminalOut
 
 
 def _get_last_output(terminal_id: str) -> str:
+    provider = None
+    try:
+        provider = provider_manager.get_provider(terminal_id)
+        durable_response = provider.get_durable_last_response() if provider is not None else None
+        if isinstance(durable_response, str) and durable_response.strip():
+            rendered = _sanitize_human_terminal_output(durable_response)
+            return _bounded_text_suffix(rendered, LAST_OUTPUT_RESPONSE_MAX_BYTES)
+    except Exception as exc:
+        logger.debug("Provider-native last response unavailable for %s: %s", terminal_id, exc)
+
     descriptor, source, compressed = _open_durable_output(terminal_id)
     try:
         if compressed:
-            payload = _read_small_compressed_output(descriptor, source_size=source.st_size)
+            index = open_compressed_output_index(TERMINAL_LOG_DIR, terminal_id, descriptor, source)
+            try:
+                _, payload = _bounded_index_suffix_bytes(
+                    index,
+                    before_offset=index.raw_size,
+                    maximum_bytes=LAST_OUTPUT_READ_MAX_BYTES,
+                )
+            finally:
+                index.close()
         else:
             _, payload = _bounded_suffix_bytes(
                 descriptor,
@@ -3640,7 +3770,6 @@ def _get_last_output(terminal_id: str) -> str:
         return ""
     extracted: str | None = None
     try:
-        provider = provider_manager.get_provider(terminal_id)
         if provider is not None:
             extracted = provider.extract_last_message_from_script(raw_tail)
     except Exception as exc:

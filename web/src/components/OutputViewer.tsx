@@ -16,6 +16,25 @@ interface OutputViewerProps {
 const MAX_CLIENT_OUTPUT_CHUNKS = 8
 const MAX_CLIENT_OUTPUT_CHARACTERS = 2 * 1024 * 1024
 
+type OutputMode = 'last' | 'full'
+type OutputViewState = {
+  chunks: TerminalOutputResponse[]
+  availability: 'available' | 'unavailable' | 'error'
+  loading: boolean
+  loadingOlder: boolean
+  olderLoadFailed: boolean
+  discardedNewer: boolean
+}
+
+const emptyOutputState = (): OutputViewState => ({
+  chunks: [],
+  availability: 'available',
+  loading: true,
+  loadingOlder: false,
+  olderLoadFailed: false,
+  discardedNewer: false,
+})
+
 function boundedChunkWindow(chunks: TerminalOutputResponse[]): { chunks: TerminalOutputResponse[]; trimmed: boolean } {
   const retained = [...chunks]
   let characters = retained.reduce((total, chunk) => total + chunk.output.length, 0)
@@ -37,13 +56,11 @@ function formatBytes(value?: number | null): string {
 
 export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
   const { t } = useI18n()
-  const [mode, setMode] = useState<'last' | 'full'>('last')
-  const [chunks, setChunks] = useState<TerminalOutputResponse[]>([])
-  const [availability, setAvailability] = useState<'available' | 'unavailable' | 'error'>('available')
-  const [loading, setLoading] = useState(true)
-  const [loadingOlder, setLoadingOlder] = useState(false)
-  const [olderLoadFailed, setOlderLoadFailed] = useState(false)
-  const [discardedNewer, setDiscardedNewer] = useState(false)
+  const [mode, setMode] = useState<OutputMode>('last')
+  const [views, setViews] = useState<Record<OutputMode, OutputViewState>>({
+    last: emptyOutputState(),
+    full: emptyOutputState(),
+  })
   const [copied, setCopied] = useState(false)
   const [fullscreen, setFullscreen] = useState(false)
   const outputRef = useRef<HTMLPreElement>(null)
@@ -56,31 +73,40 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
     | null
   >(null)
   const requestRef = useRef<AbortController | null>(null)
+  const requestGenerationRef = useRef(0)
+  const userScrolledUpRef = useRef(false)
 
+  const view = views[mode]
+  const { chunks, availability, loading, loadingOlder, olderLoadFailed, discardedNewer } = view
   const output = useMemo(() => chunks.map(chunk => chunk.output).join(''), [chunks])
   const oldestChunk = chunks[0]
 
-  const fetchOutput = async (m: 'last' | 'full') => {
+  const updateView = (target: OutputMode, update: (current: OutputViewState) => OutputViewState) => {
+    setViews(current => ({ ...current, [target]: update(current[target]) }))
+  }
+
+  const fetchOutput = async (m: OutputMode) => {
     requestRef.current?.abort()
     const controller = new AbortController()
+    const generation = ++requestGenerationRef.current
     requestRef.current = controller
-    setLoading(true)
-    setLoadingOlder(false)
-    setOlderLoadFailed(false)
-    setDiscardedNewer(false)
+    updateView(m, () => emptyOutputState())
     try {
       const data = await api.getTerminalOutput(terminalId, m, undefined, controller.signal)
-      if (controller.signal.aborted) return
-      scrollIntentRef.current = m === 'full' ? { kind: 'bottom' } : null
-      setChunks([{ ...data, output: data.output || '' }])
-      setAvailability(data.availability || 'available')
+      if (controller.signal.aborted || generation !== requestGenerationRef.current) return
+      userScrolledUpRef.current = false
+      scrollIntentRef.current = { kind: 'bottom' }
+      updateView(m, current => ({
+        ...current,
+        chunks: [{ ...data, output: data.output || '' }],
+        availability: data.availability || 'available',
+        loading: false,
+      }))
     } catch {
-      if (controller.signal.aborted) return
-      setChunks([])
-      setAvailability('error')
+      if (controller.signal.aborted || generation !== requestGenerationRef.current) return
+      updateView(m, current => ({ ...current, chunks: [], availability: 'error', loading: false }))
     } finally {
       if (requestRef.current === controller) requestRef.current = null
-      if (!controller.signal.aborted) setLoading(false)
     }
   }
 
@@ -99,8 +125,11 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
     const surface = outputRef.current
     const intent = scrollIntentRef.current
     if (!surface || !intent) return
-    if (intent.kind === 'bottom') surface.scrollTop = surface.scrollHeight
-    else surface.scrollTop = intent.top + (surface.scrollHeight - intent.height)
+    if (intent.kind === 'bottom') {
+      if (!userScrolledUpRef.current) surface.scrollTop = surface.scrollHeight
+    } else {
+      surface.scrollTop = intent.top + (surface.scrollHeight - intent.height)
+    }
     scrollIntentRef.current = null
   }, [chunks])
 
@@ -151,26 +180,48 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
   const handleLoadOlder = async () => {
     if (mode !== 'full' || loadingOlder || requestRef.current || !oldestChunk?.has_older || !oldestChunk.cursor) return
     const controller = new AbortController()
+    const generation = ++requestGenerationRef.current
     requestRef.current = controller
-    setLoadingOlder(true)
-    setOlderLoadFailed(false)
+    updateView('full', current => ({ ...current, loadingOlder: true, olderLoadFailed: false }))
     const surface = outputRef.current
     scrollIntentRef.current = surface
       ? { kind: 'preserve', height: surface.scrollHeight, top: surface.scrollTop }
       : null
     try {
       const data = await api.getTerminalOutput(terminalId, 'full', oldestChunk.cursor, controller.signal)
-      if (controller.signal.aborted) return
+      if (controller.signal.aborted || generation !== requestGenerationRef.current) return
       const bounded = boundedChunkWindow([{ ...data, output: data.output || '' }, ...chunks])
-      setChunks(bounded.chunks)
-      if (bounded.trimmed) setDiscardedNewer(true)
-      setAvailability(data.availability || 'available')
+      updateView('full', current => ({
+        ...current,
+        chunks: bounded.chunks,
+        discardedNewer: current.discardedNewer || bounded.trimmed,
+        availability: data.availability || 'available',
+        loadingOlder: false,
+      }))
     } catch {
-      if (!controller.signal.aborted) setOlderLoadFailed(true)
+      if (!controller.signal.aborted && generation === requestGenerationRef.current) {
+        scrollIntentRef.current = null
+        updateView('full', current => ({ ...current, olderLoadFailed: true, loadingOlder: false }))
+      }
     } finally {
       if (requestRef.current === controller) requestRef.current = null
-      if (!controller.signal.aborted) setLoadingOlder(false)
     }
+  }
+
+  const switchMode = (nextMode: OutputMode) => {
+    if (nextMode === mode) return
+    requestRef.current?.abort()
+    requestGenerationRef.current += 1
+    scrollIntentRef.current = { kind: 'bottom' }
+    userScrolledUpRef.current = false
+    updateView(nextMode, () => emptyOutputState())
+    setMode(nextMode)
+  }
+
+  const trackUserScroll = () => {
+    const surface = outputRef.current
+    if (!surface) return
+    userScrolledUpRef.current = surface.scrollHeight - surface.scrollTop - surface.clientHeight > 24
   }
 
   const cleanOutput = stripAnsi(output)
@@ -243,7 +294,7 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
         {/* Tab Toggle */}
         <div className="flex items-center gap-2 px-4 sm:px-6 py-3 border-b border-gray-700/30 shrink-0 overflow-x-auto">
           <button
-            onClick={() => setMode('last')}
+            onClick={() => switchMode('last')}
             className={`shrink-0 min-h-10 px-3 py-1.5 text-xs font-medium rounded-full transition-colors ${
               mode === 'last'
                 ? 'bg-emerald-600 text-white'
@@ -253,7 +304,7 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
             {t('output.last')}
           </button>
           <button
-            onClick={() => setMode('full')}
+            onClick={() => switchMode('full')}
             className={`shrink-0 min-h-10 px-3 py-1.5 text-xs font-medium rounded-full transition-colors ${
               mode === 'full'
                 ? 'bg-emerald-600 text-white'
@@ -312,6 +363,8 @@ export function OutputViewer({ terminalId, onClose }: OutputViewerProps) {
               <pre
                 ref={outputRef}
                 data-testid="terminal-output-surface"
+                data-output-mode={mode}
+                onScroll={trackUserScroll}
                 className="block h-full min-h-0 min-w-0 w-full max-w-full flex-1 self-stretch overflow-x-hidden overflow-y-auto rounded-lg bg-gray-950 p-3 font-mono text-xs text-gray-300 whitespace-pre-wrap [overflow-wrap:anywhere] [word-break:break-word] sm:p-4 sm:text-sm"
               >
                 {cleanOutput}

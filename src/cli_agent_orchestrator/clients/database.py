@@ -4706,18 +4706,15 @@ WITH selected_terminals AS MATERIALIZED (
              WHEN COALESCE(t.runtime_lifecycle, 'starting') = 'exited' THEN 'exited'
              WHEN COALESCE(t.runtime_lifecycle, 'starting') = 'recovery_required'
                   THEN 'queued'
-             WHEN pel.terminal_id IS NOT NULL
-                  OR (lw.status = 'open' AND (
-                    awt.state = 'claimed'
-                    OR (awt.state = 'sent' AND awr.id IS NOT NULL
-                        AND awt.provider_reconnect_requested_at IS NULL)
-                  ))
-                  THEN 'processing'
+             WHEN pel.terminal_id IS NOT NULL THEN 'processing'
              WHEN EXISTS (
                SELECT 1 FROM workflows qw JOIN workflow_turns qt ON qt.workflow_id = qw.id
                WHERE qw.root_terminal_id = t.id AND qw.status = 'open' AND qt.state = 'queued'
-             ) OR (lw.status = 'open' AND awt.state = 'sent' AND (
-                    awr.id IS NULL OR awt.provider_reconnect_requested_at IS NOT NULL
+             ) OR (lw.status = 'open' AND (
+                    awt.state = 'claimed'
+                    OR (awt.state = 'sent' AND (
+                      awr.id IS NULL OR awt.provider_reconnect_requested_at IS NOT NULL
+                    ))
                   )) THEN 'queued'
              ELSE 'ready'
            END AS activity,
@@ -4727,13 +4724,7 @@ WITH selected_terminals AS MATERIALIZED (
              WHEN COALESCE(t.runtime_lifecycle, 'starting') = 'exited' THEN 'exited'
              WHEN COALESCE(t.runtime_lifecycle, 'starting') = 'recovery_required'
                   THEN 'waiting_runtime_recovery'
-             WHEN pel.terminal_id IS NOT NULL
-                  OR (lw.status = 'open' AND (
-                    awt.state = 'claimed'
-                    OR (awt.state = 'sent' AND awr.id IS NOT NULL
-                        AND awt.provider_reconnect_requested_at IS NULL)
-                  ))
-                  THEN 'processing'
+             WHEN pel.terminal_id IS NOT NULL THEN 'processing'
              WHEN t.runtime_operation_kind = 'retire'
                   OR EXISTS (SELECT 1 FROM relation_states rr
                              WHERE rr.terminal_id = t.id
@@ -4754,15 +4745,21 @@ WITH selected_terminals AS MATERIALIZED (
              WHEN (EXISTS (
                SELECT 1 FROM workflows qw JOIN workflow_turns qt ON qt.workflow_id = qw.id
                WHERE qw.root_terminal_id = t.id AND qw.status = 'open' AND qt.state = 'queued'
-             ) OR (lw.status = 'open' AND awt.state = 'sent' AND (
-                    awr.id IS NULL OR awt.provider_reconnect_requested_at IS NOT NULL
+             ) OR (lw.status = 'open' AND (
+                    awt.state = 'claimed'
+                    OR (awt.state = 'sent' AND (
+                      awr.id IS NULL OR awt.provider_reconnect_requested_at IS NOT NULL
+                    ))
                   ))) AND pc.active_count >= pc.execution_limit
                   THEN 'queued_provider_execution'
              WHEN EXISTS (
                SELECT 1 FROM workflows qw JOIN workflow_turns qt ON qt.workflow_id = qw.id
                WHERE qw.root_terminal_id = t.id AND qw.status = 'open' AND qt.state = 'queued'
-             ) OR (lw.status = 'open' AND awt.state = 'sent' AND (
-                    awr.id IS NULL OR awt.provider_reconnect_requested_at IS NOT NULL
+             ) OR (lw.status = 'open' AND (
+                    awt.state = 'claimed'
+                    OR (awt.state = 'sent' AND (
+                      awr.id IS NULL OR awt.provider_reconnect_requested_at IS NOT NULL
+                    ))
                   )) THEN 'waiting_workflow_continuation'
              ELSE 'ready'
            END AS execution_state,
@@ -4891,17 +4888,9 @@ def _ui_projection_filters(
     add_values("agent_profile", profiles, "profile")
     if home_filter and home_filter != "all":
         if home_filter == "active":
-            clauses.append(
-                "lifecycle NOT IN ('exited', 'recovery_fenced') "
-                "AND COALESCE(workflow_state, '') != 'completed'"
-            )
+            clauses.append("lifecycle NOT IN ('exited', 'recovery_fenced')")
         elif home_filter == "waiting":
-            clauses.append(
-                "workflow_state IS NOT NULL "
-                "AND workflow_state NOT IN ('owner_gate', 'cancelled', 'completed') "
-                "AND lifecycle NOT IN ('exited', 'recovery_fenced') "
-                "AND activity != 'processing'"
-            )
+            clauses.append("activity = 'queued'")
         elif home_filter in {"owner_gate", "cancelled", "completed"}:
             clauses.append("workflow_state = :home_filter")
             parameters["home_filter"] = home_filter
@@ -4982,11 +4971,8 @@ def get_terminal_ui_overview_counts() -> Dict[str, int]:
     sql = projection_cte + """
         SELECT COUNT(DISTINCT session_id) AS sessions, COUNT(*) AS agents,
                SUM(CASE WHEN lifecycle NOT IN ('exited', 'recovery_fenced')
-                         AND COALESCE(workflow_state, '') != 'completed' THEN 1 ELSE 0 END) AS active,
-               SUM(CASE WHEN workflow_state IS NOT NULL
-                         AND workflow_state NOT IN ('owner_gate', 'cancelled', 'completed')
-                         AND lifecycle NOT IN ('exited', 'recovery_fenced')
-                         AND activity != 'processing' THEN 1 ELSE 0 END) AS waiting,
+                        THEN 1 ELSE 0 END) AS active,
+               SUM(CASE WHEN activity = 'queued' THEN 1 ELSE 0 END) AS waiting,
                SUM(CASE WHEN workflow_state = 'owner_gate' THEN 1 ELSE 0 END) AS owner_gate,
                SUM(CASE WHEN workflow_state = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
                SUM(CASE WHEN workflow_state = 'completed' THEN 1 ELSE 0 END) AS completed
@@ -5018,8 +5004,7 @@ def list_terminal_ui_session_page(*, limit: int, offset: int, query: str = "") -
                                 THEN 1 ELSE 0 END) > 0
                   THEN 'active' ELSE 'history' END AS status,
              MIN(last_active) AS created_at, COUNT(*) AS agent_count,
-             SUM(CASE WHEN lifecycle NOT IN ('exited', 'recovery_fenced')
-                       AND COALESCE(workflow_state, '') != 'completed' THEN 1 ELSE 0 END)
+             SUM(CASE WHEN lifecycle NOT IN ('exited', 'recovery_fenced') THEN 1 ELSE 0 END)
                   AS active_agent_count,
              CASE WHEN COUNT(projectId) = COUNT(*) AND COUNT(project_name) = COUNT(*)
                        AND COUNT(project_path) = COUNT(*)
@@ -9520,10 +9505,11 @@ def get_terminal_execution_projection(terminal_id: str) -> Dict[str, Any]:
             .first()
         )
         unadmitted_waiting = False
-        active_turn = False
         if active_row is not None:
             if active_row.state == TURN_CLAIMED:
-                active_turn = True
+                # A claim is durable dispatch authority, not proof that a
+                # provider/model process currently owns execution.
+                unadmitted_waiting = True
             else:
                 admitted = (
                     db.query(WorkflowTurnReceiptModel.id)
@@ -9534,10 +9520,12 @@ def get_terminal_execution_projection(terminal_id: str) -> Dict[str, Any]:
                     .first()
                     is not None
                 )
-                active_turn = bool(admitted and active_row.provider_reconnect_requested_at is None)
-                unadmitted_waiting = not active_turn
-        if active_turn:
-            return {"active_turn": True, "wait_reason": None}
+                # A receipted turn may remain OPEN while the provider is Ready
+                # (for example, Result Ready or a suspended child wait). Only
+                # its execution lease is physical Processing authority.
+                unadmitted_waiting = bool(
+                    not admitted or active_row.provider_reconnect_requested_at is not None
+                )
         # A durable cleanup claim protects exact worktree/history authority
         # after provider exit. It is an execution dependency only until the
         # assigned child is durably exited and its runtime-owned leases are
@@ -9980,6 +9968,109 @@ def _mirror_workflow_effect_ledger(
         )
 
 
+def _bind_receipted_provider_execution(
+    db: Any,
+    workflow: WorkflowModel,
+    turn: WorkflowTurnModel,
+    receiver_terminal_id: str,
+    now: datetime,
+) -> Optional[str]:
+    """Bind semantic receipt to the exact physical provider execution.
+
+    A status observer can see the provider's pre-task Ready frame after tmux
+    accepted an envelope but before the model calls the receipt tool.  That
+    observer releases the execution lease and requeues the same turn for an
+    at-least-once transport retry.  The later receipt is stronger evidence:
+    this exact logical turn is executing in the receiver now.
+
+    Restore only a turn proven to have crossed that earlier send boundary.
+    Ordinary queued work remains unreceiptable, and any conflicting execution
+    authority fails closed.  Capacity can temporarily exceed its configured
+    admission limit because the physical execution already exists; recording
+    it prevents further admissions and makes the read model truthful.
+    """
+    if turn.workflow_id != workflow.id or workflow.active_turn_id != turn.id:
+        return "duplicate_or_closed_workflow"
+    settled_before_receipt = (
+        turn.state == TURN_QUEUED and turn.queue_reason == "PROVIDER_SETTLED_BEFORE_RECEIPT"
+    )
+    if turn.state not in {TURN_CLAIMED, TURN_SENT} and not settled_before_receipt:
+        return "workflow_turn_not_dispatched"
+
+    lease = db.get(ProviderExecutionLeaseModel, receiver_terminal_id)
+    if lease is not None and lease.workflow_turn_id != turn.id:
+        return "provider_execution_lease_conflict"
+    conflicting_turn_lease = (
+        db.query(ProviderExecutionLeaseModel)
+        .filter(
+            ProviderExecutionLeaseModel.workflow_turn_id == turn.id,
+            ProviderExecutionLeaseModel.terminal_id != receiver_terminal_id,
+        )
+        .first()
+    )
+    if conflicting_turn_lease is not None:
+        return "provider_execution_lease_conflict"
+    if settled_before_receipt:
+        terminal = db.get(TerminalModel, receiver_terminal_id)
+        if terminal is None or terminal.runtime_lifecycle in {
+            "recovery_required",
+            "exit_pending",
+            "exited",
+            "recovery_fenced",
+        }:
+            return "terminal_runtime_not_executing"
+    if settled_before_receipt and lease is None:
+        db.add(
+            ProviderExecutionLeaseModel(
+                terminal_id=receiver_terminal_id,
+                workflow_turn_id=turn.id,
+                acquired_at=now,
+            )
+        )
+
+    if settled_before_receipt and turn.inbox_message_id is not None:
+        if turn.kind in {"inbox_message", "handoff_recovery"}:
+            message = db.get(InboxModel, turn.inbox_message_id)
+            if (
+                message is None
+                or message.receiver_id != receiver_terminal_id
+                or message.message != turn.payload
+                or message.status != MessageStatus.PENDING.value
+            ):
+                return "workflow_transport_authority_conflict"
+            message.status = MessageStatus.DELIVERED.value
+        else:
+            members = _validated_result_callback_transport(
+                db,
+                workflow,
+                turn,
+                receiver_terminal_id,
+                allow_delivered=True,
+            )
+            if members is None:
+                return "workflow_transport_authority_conflict"
+            for message, assignment in members:
+                message.status = MessageStatus.DELIVERED.value
+                assignment.status = (
+                    ChildAssignmentStatus.HANDOFF_RESULT_DELIVERED.value
+                    if assignment.status == ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value
+                    else ChildAssignmentStatus.RESULT_DELIVERED.value
+                )
+                assignment.updated_at = now
+
+    if settled_before_receipt:
+        # The semantic receipt supersedes the settled-before-receipt retry
+        # envelope. It does not create a successor or alter result authority.
+        turn.state = TURN_SENT
+        turn.queue_reason = None
+        turn.claim_token = None
+        turn.claim_expires_at = None
+        turn.provider_processing_observed_at = now
+        turn.provider_ready_observed_at = None
+        turn.updated_at = now
+    return None
+
+
 def claim_or_resume_workflow_turn_receipt(
     receiver_terminal_id: str,
     logical_turn_id: int,
@@ -10058,9 +10149,9 @@ def claim_or_resume_workflow_turn_receipt(
             db.flush()
 
             # Provider capacity is execution authority for the active logical
-            # turn, not merely a terminal-wide counter.  Transfer an exact
+            # turn, not merely a terminal-wide counter. Transfer an exact
             # interrupted-turn lease under the same BEGIN IMMEDIATE fence as
-            # active_turn_id.  Releasing and reacquiring here would expose a
+            # active_turn_id. Releasing and reacquiring here would expose a
             # capacity race; accepting a lease owned by any other turn would
             # strand the resumed execution with split authority.
             provider_lease = db.get(ProviderExecutionLeaseModel, receiver_terminal_id)
@@ -10088,7 +10179,6 @@ def claim_or_resume_workflow_turn_receipt(
                         "accepted": False,
                         "reason": "provider_execution_lease_conflict",
                     }
-
             # A fresh logical turn fences the interrupted model invocation.
             # Mirror its effect ledger so retrying an already-completed or
             # indeterminate operation cannot acquire a new capability merely
@@ -10150,6 +10240,9 @@ def claim_or_resume_workflow_turn_receipt(
             db.rollback()
             return {"accepted": False, "reason": "duplicate_or_closed_workflow"}
         turn = db.get(WorkflowTurnModel, logical_turn_id)
+        if turn is None:
+            db.rollback()
+            return {"accepted": False, "reason": "duplicate_or_closed_workflow"}
         reconnect_parent_receipt = None
         reconnect_parent_turn_id: Optional[int] = None
         if (
@@ -10179,6 +10272,20 @@ def claim_or_resume_workflow_turn_receipt(
             ):
                 db.rollback()
                 return {"accepted": False, "reason": "duplicate_or_closed_workflow"}
+        workflow = db.get(WorkflowModel, turn.workflow_id)
+        if workflow is None:
+            db.rollback()
+            return {"accepted": False, "reason": "duplicate_or_closed_workflow"}
+        execution_conflict = _bind_receipted_provider_execution(
+            db,
+            workflow,
+            turn,
+            receiver_terminal_id,
+            now,
+        )
+        if execution_conflict is not None:
+            db.rollback()
+            return {"accepted": False, "reason": execution_conflict}
         next_resume_token = secrets.token_urlsafe(32)
         db.add(
             WorkflowTurnReceiptModel(
@@ -13250,7 +13357,7 @@ def requeue_settled_unadmitted_workflow_turn(
     ``terminal_service.get_terminal`` snapshots the durable execution lease,
     observes the provider, and releases only that exact lease when the runtime
     is no longer processing. This follow-up transaction turns the matching
-    active, unreceipted ``sent`` row back into its same queued envelope. The
+    active, unreceipted ``claimed``/``sent`` row back into its same queued envelope. The
     no-lease predicate prevents a stale status observer from requeueing a new
     resident execution, while the receiver receipt remains the semantic
     exactly-once fence.
@@ -13271,7 +13378,7 @@ def requeue_settled_unadmitted_workflow_turn(
         if (
             turn is None
             or turn.workflow_id != workflow.id
-            or turn.state != TURN_SENT
+            or turn.state not in {TURN_CLAIMED, TURN_SENT}
             or db.get(ProviderExecutionLeaseModel, root_terminal_id) is not None
             or db.query(WorkflowTurnReceiptModel)
             .filter_by(

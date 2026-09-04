@@ -194,7 +194,7 @@ describe('StatusBadge', () => {
     expect(screen.getByText((_, element) => element?.tagName === 'P' && element.textContent === reason)).toBeInTheDocument()
   })
 
-  it('uses an active durable turn to override a momentary provider Ready observation', () => {
+  it('uses physical execution state for Processing while keeping workflow Active secondary', () => {
     render(
       <StatusBadge
         status={lifecycleBadgeStatus('open', 'completed', 'running', 'processing')}
@@ -202,6 +202,17 @@ describe('StatusBadge', () => {
     )
     expect(screen.getByText('Processing')).toBeInTheDocument()
     expect(screen.queryByText('Ready')).not.toBeInTheDocument()
+  })
+
+  it('keeps provider Ready primary while a workflow result is independently ready', () => {
+    render(
+      <StatusBadge
+        status={lifecycleBadgeStatus('result_ready', 'processing', 'running', 'ready')}
+      />
+    )
+    expect(screen.getByText('Ready')).toBeInTheDocument()
+    expect(screen.getByText('Result ready')).toBeInTheDocument()
+    expect(screen.queryByText('Processing')).not.toBeInTheDocument()
   })
 
   it.each([
@@ -642,6 +653,92 @@ describe('OutputViewer fullscreen', () => {
       undefined,
       expect.any(AbortSignal),
     )
+  })
+
+  it('opens and explicitly refreshes at the newest rendered content', async () => {
+    const height = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollHeight')
+    const client = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight')
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', { configurable: true, get: () => 900 })
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', { configurable: true, get: () => 200 })
+    vi.mocked(api.getTerminalOutput)
+      .mockResolvedValueOnce({ output: 'latest one', mode: 'last' })
+      .mockResolvedValueOnce({ output: 'latest two', mode: 'last' })
+    try {
+      render(<OutputViewer terminalId="terminal-bottom" onClose={() => {}} />)
+      const initial = await screen.findByTestId('terminal-output-surface')
+      await waitFor(() => expect(initial.scrollTop).toBe(900))
+
+      initial.scrollTop = 120
+      fireEvent.click(screen.getByTitle('Refresh output'))
+      await screen.findByText('latest two')
+      const refreshed = screen.getByTestId('terminal-output-surface')
+      await waitFor(() => expect(refreshed.scrollTop).toBe(900))
+    } finally {
+      if (height) Object.defineProperty(HTMLElement.prototype, 'scrollHeight', height)
+      else delete (HTMLElement.prototype as any).scrollHeight
+      if (client) Object.defineProperty(HTMLElement.prototype, 'clientHeight', client)
+      else delete (HTMLElement.prototype as any).clientHeight
+    }
+  })
+
+  it('keeps Last and Full isolated when delayed responses settle out of order', async () => {
+    const pending: Array<{
+      mode: 'last' | 'full'
+      resolve: (value: any) => void
+    }> = []
+    vi.mocked(api.getTerminalOutput).mockImplementation((_id, mode) => new Promise(resolve => {
+      if (mode !== 'last' && mode !== 'full') throw new Error('mode is required')
+      pending.push({ mode, resolve })
+    }))
+    render(<OutputViewer terminalId="terminal-race" onClose={() => {}} />)
+    await waitFor(() => expect(pending).toHaveLength(1))
+
+    pending[0].resolve({ output: 'initial last', mode: 'last' })
+    await screen.findByText('initial last')
+    fireEvent.click(screen.getByRole('button', { name: 'Full Output' }))
+    await waitFor(() => expect(pending).toHaveLength(2))
+    fireEvent.click(screen.getByRole('button', { name: /Last Response/i }))
+    await waitFor(() => expect(pending).toHaveLength(3))
+
+    pending[1].resolve({ output: 'stale gigantic full buffer', mode: 'full' })
+    pending[2].resolve({ output: 'current last response', mode: 'last' })
+
+    expect(await screen.findByText('current last response')).toBeInTheDocument()
+    expect(screen.queryByText('stale gigantic full buffer')).not.toBeInTheDocument()
+    expect(screen.getByTestId('terminal-output-surface')).toHaveAttribute('data-output-mode', 'last')
+  })
+
+  it('scrolls explicit loads to newest but preserves an upward inspection position', async () => {
+    let resolveOlder: ((value: any) => void) | undefined
+    vi.mocked(api.getTerminalOutput)
+      .mockResolvedValueOnce({ output: 'latest response', mode: 'last' })
+      .mockResolvedValueOnce({
+        output: 'newest page', mode: 'full', cursor: 'older', has_older: true,
+        range_start: 100, range_end: 200, snapshot_size: 200,
+      })
+      .mockImplementationOnce(() => new Promise(resolve => { resolveOlder = resolve }))
+    render(<OutputViewer terminalId="terminal-scroll" onClose={() => {}} />)
+    const initial = await screen.findByTestId('terminal-output-surface')
+    Object.defineProperty(initial, 'scrollHeight', { configurable: true, get: () => 600 })
+    Object.defineProperty(initial, 'clientHeight', { configurable: true, get: () => 200 })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Full Output' }))
+    const surface = await screen.findByTestId('terminal-output-surface')
+    let height = 1000
+    Object.defineProperty(surface, 'scrollHeight', { configurable: true, get: () => height })
+    Object.defineProperty(surface, 'clientHeight', { configurable: true, get: () => 200 })
+    surface.scrollTop = 300
+    fireEvent.scroll(surface)
+    fireEvent.click(screen.getByRole('button', { name: 'Load older output' }))
+    await waitFor(() => expect(resolveOlder).toBeDefined())
+    height = 1400
+    resolveOlder?.({
+      output: 'older page\n', mode: 'full', cursor: null, has_older: false,
+      range_start: 0, range_end: 100, snapshot_size: 200,
+    })
+
+    await waitFor(() => expect(surface).toHaveTextContent('older page newest page'))
+    expect(surface.scrollTop).toBe(700)
   })
 
   it('aborts an in-flight output request before closing', async () => {

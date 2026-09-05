@@ -16639,22 +16639,32 @@ def _assignment_for_child_workflow(
     child_workflow_id: int,
     *,
     parent_terminal_id: Optional[str] = None,
-    child_workflow_turn_id: Optional[int] = None,
+    authority_turn_id: Optional[int] = None,
 ) -> Optional[ChildAssignmentModel]:
-    """Resolve a callback to its exact workflow turn, with a legacy-only fallback."""
+    """Resolve a callback to its exact assignment-authorized workflow lineage."""
     query = db.query(ChildAssignmentModel).filter(
         ChildAssignmentModel.child_terminal_id == child_terminal_id
     )
     if parent_terminal_id is not None:
         query = query.filter(ChildAssignmentModel.parent_terminal_id == parent_terminal_id)
     exact_query = query.filter(ChildAssignmentModel.child_workflow_id == child_workflow_id)
-    if child_workflow_turn_id is not None:
-        exact_query = exact_query.filter(
-            ChildAssignmentModel.child_workflow_turn_id == child_workflow_turn_id
-        )
     exact = exact_query.order_by(ChildAssignmentModel.id.desc()).first()
-    if exact is not None:
+    child_workflow = db.get(WorkflowModel, child_workflow_id)
+    if (
+        exact is not None
+        and exact.child_workflow_turn_id is not None
+        and child_workflow is not None
+        and _child_workflow_authority_descends_from_assignment(
+            db,
+            child_workflow,
+            cast(int, exact.child_workflow_turn_id),
+            child_terminal_id,
+            authority_turn_id=authority_turn_id,
+        )
+    ):
         return cast(ChildAssignmentModel, exact)
+    if exact is not None:
+        return None
     return cast(
         Optional[ChildAssignmentModel],
         query.filter(
@@ -17427,7 +17437,7 @@ def create_child_assignment_result_message(
             sender_id,
             int(effect.workflow_id),
             parent_terminal_id=receiver_id,
-            child_workflow_turn_id=workflow_turn_id,
+            authority_turn_id=workflow_turn_id,
         )
         if assignment is None:
             return None, False
@@ -17506,7 +17516,7 @@ def create_assigned_child_completion_result_message(
             db,
             child_terminal_id,
             int(effect.workflow_id),
-            child_workflow_turn_id=workflow_turn_id,
+            authority_turn_id=workflow_turn_id,
         )
         if assignment is None or assignment.status == ChildAssignmentStatus.CANCELLED.value:
             return None, False
@@ -17693,6 +17703,7 @@ def _review_acknowledgement_reason(
         if result is not None and result.workflow_effect_id is not None
         else None
     )
+    child_workflow = db.get(WorkflowModel, assignment.child_workflow_id)
     expected_subject = hashlib.sha256(
         "\x1f".join(
             (
@@ -17714,11 +17725,19 @@ def _review_acknowledgement_reason(
         or result.parent_workflow_id != parent_workflow.id
         or result.child_terminal_id != assignment.child_terminal_id
         or child_effect is None
+        or child_workflow is None
         or child_effect.workflow_id != assignment.child_workflow_id
-        or child_effect.workflow_turn_id != assignment.child_workflow_turn_id
+        or child_effect.workflow_turn_id is None
         or child_effect.effect_kind
         not in {"send_message", "complete_workflow", "submit_handoff_result_v1"}
         or child_effect.state not in {"claimed", "completed"}
+        or not _child_workflow_authority_descends_from_assignment(
+            db,
+            child_workflow,
+            cast(int, assignment.child_workflow_turn_id),
+            cast(str, assignment.child_terminal_id),
+            authority_turn_id=cast(int, child_effect.workflow_turn_id),
+        )
         or not hmac.compare_digest(expected_subject, assignment.review_subject_id)
     ):
         return "RESULT_REVIEW_AUTHORITY_UNBOUND"

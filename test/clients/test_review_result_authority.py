@@ -536,6 +536,75 @@ def test_block_acknowledge_preserves_same_reviewer_for_exact_correction(
     ] == ["reviewer"]
 
 
+def test_resumed_reviewer_callback_preserves_exact_attempt_authority(authority_db, tmp_path):
+    """A one-use execution resume remains inside the immutable review attempt."""
+    repo, revision = _repository(tmp_path)
+    with database.SessionLocal() as db:
+        db.add(_reviewer("reviewer", repo, revision))
+        db.commit()
+
+    request = _start_review(
+        "parent",
+        "reviewer",
+        "Review exact revision across a safe reconnect",
+        requested_revision=revision,
+    )
+    admitted = database.claim_or_resume_workflow_turn_receipt("reviewer", request["child_turn_id"])
+    assert admitted["accepted"] is True
+    resumed = database.claim_or_resume_workflow_turn_receipt(
+        "reviewer",
+        request["child_turn_id"],
+        resume_token=admitted["resume_token"],
+    )
+    assert resumed["accepted"] is True
+    assert resumed["resumed"] is True
+    resumed_turn = resumed["logical_turn_id"]
+    assert resumed_turn != request["child_turn_id"]
+
+    effect = claim_workflow_effect(
+        "reviewer", resumed_turn, "send_message", "PASS after safe reconnect"
+    )
+    assert effect is not None
+    notice, duplicate = create_child_assignment_result_message(
+        "reviewer",
+        "parent",
+        "PASS after safe reconnect",
+        workflow_effect_id=effect["id"],
+        workflow_turn_id=resumed_turn,
+    )
+    assert notice is not None and duplicate is False and notice.result_id
+    assert finish_workflow_effect("reviewer", effect["id"], effect["claim_token"], "completed")
+    assert mark_child_assignment_result_delivered(notice.id)
+
+    artifact = get_delegation_result(notice.result_id)
+    assert artifact["attempt_id"]
+    assert artifact["review"]["revision"] == revision
+    assert artifact["review"]["revision_source"] == "explicit"
+    assert artifact["review"]["current_authority"] is True
+    with database.SessionLocal() as db:
+        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id="reviewer").one()
+        result = (
+            db.query(database.DelegationResultModel)
+            .filter_by(child_assignment_id=assignment.id)
+            .one()
+        )
+        child_effect = db.get(database.WorkflowEffectModel, result.workflow_effect_id)
+        assert assignment.child_workflow_turn_id == request["child_turn_id"]
+        assert child_effect is not None and child_effect.workflow_turn_id == resumed_turn
+        assert result.workflow_effect_id == effect["id"]
+
+    callback_turn = activate_workflow_turn_for_inbox(notice.id)
+    assert isinstance(callback_turn, int)
+    assert get_delegation_result(notice.result_id)["workflow_turn_id"] == callback_turn
+    assert mark_workflow_turn_sent_for_inbox(notice.id)
+    assert claim_workflow_turn_receipt("parent", callback_turn)
+    accepted = acknowledge_child_assignment_result_outcome("parent", result_id=notice.result_id)
+    assert accepted["accepted"] is True
+    replay = acknowledge_child_assignment_result_outcome("parent", result_id=notice.result_id)
+    assert replay["accepted"] is False
+    assert replay["reason_code"] == "RESULT_ALREADY_ACKNOWLEDGED"
+
+
 def test_replacement_reviewer_binds_explicit_revision_not_its_current_head(
     authority_db, monkeypatch, tmp_path
 ):

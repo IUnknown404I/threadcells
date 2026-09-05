@@ -1,7 +1,9 @@
 """Process-level regression coverage for top-level Session cold starts."""
 
+import re
 import shutil
 import subprocess
+import time
 import uuid
 from contextlib import nullcontext
 from pathlib import Path
@@ -24,6 +26,45 @@ from cli_agent_orchestrator.services import (
     operations_service,
     terminal_service,
 )
+
+
+def _wait_for_authoritative_server_absence(
+    tmux_binary: str, socket_name: str, session_name: str
+) -> None:
+    """Prove the private tmux server is gone before exercising cold bootstrap."""
+    deadline = time.monotonic() + 5
+    result = None
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            [
+                tmux_binary,
+                "-L",
+                socket_name,
+                "-f",
+                "/dev/null",
+                "has-session",
+                "-t",
+                f"={session_name}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        stderr = result.stderr.strip()
+        if result.returncode == 1 and (
+            re.fullmatch(r"no server running on .+", stderr)
+            or re.fullmatch(
+                r"error connecting to .+ \((?:No such file or directory|Connection refused)\)",
+                stderr,
+            )
+        ):
+            return
+        time.sleep(0.01)
+    pytest.fail(
+        "tmux server did not reach authoritative absence: "
+        f"returncode={getattr(result, 'returncode', None)!r} "
+        f"stderr={getattr(result, 'stderr', None)!r}"
+    )
 
 
 @pytest.mark.integration
@@ -157,6 +198,7 @@ def test_last_session_exit_then_privileged_managed_session_coldstart_succeeds(
         monkeypatch.setenv("TMUX", f"{socket_path},0,0")
         assert client.session_exists(previous_session) is True
         assert client.kill_session(previous_session) is True
+        _wait_for_authoritative_server_absence("tmux", socket_name, previous_session)
         assert client.session_exists(f"cao-{next_session}") is False
 
         terminal = terminal_service.create_terminal(

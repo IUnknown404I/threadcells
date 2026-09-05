@@ -1,12 +1,53 @@
 """Real libtmux coverage for exact session/window presence classification."""
 
+import re
 import shutil
 import subprocess
+import time
 import uuid
 
 import pytest
 
 from cli_agent_orchestrator.clients.tmux import TmuxClient, _BoundedTmuxServer
+
+
+def _wait_for_authoritative_server_absence(
+    tmux_binary: str, socket_name: str, session_name: str
+) -> None:
+    """Wait out tmux's shutdown transition before asserting inventory absence."""
+    deadline = time.monotonic() + 5
+    result = None
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            [
+                tmux_binary,
+                "-L",
+                socket_name,
+                "-f",
+                "/dev/null",
+                "has-session",
+                "-t",
+                f"={session_name}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        stderr = result.stderr.strip()
+        if result.returncode == 1 and (
+            re.fullmatch(r"no server running on .+", stderr)
+            or re.fullmatch(
+                r"error connecting to .+ \((?:No such file or directory|Connection refused)\)",
+                stderr,
+            )
+        ):
+            return
+        time.sleep(0.01)
+    pytest.fail(
+        "tmux server did not reach authoritative absence: "
+        f"returncode={getattr(result, 'returncode', None)!r} "
+        f"stderr={getattr(result, 'stderr', None)!r}"
+    )
 
 
 @pytest.mark.integration
@@ -71,6 +112,7 @@ def test_real_libtmux_presence_distinguishes_absence_from_healthy_inventory():
             [tmux_binary, "-L", socket_name, "kill-server"],
             check=True,
         )
+        _wait_for_authoritative_server_absence(tmux_binary, socket_name, session_name)
         assert client.session_exists(session_name) is False
         assert client.window_exists(session_name, window_name) is False
     finally:

@@ -3621,6 +3621,63 @@ def test_f13_settled_unreceipted_ordinary_inbox_restores_same_transport(workflow
         assert turn.state == "queued"
         assert turn.queue_reason == "PROVIDER_SETTLED_BEFORE_RECEIPT"
 
+    # A model can start after the Ready observer released the send lease. Its
+    # exact semantic receipt cancels the retry and restores physical execution
+    # truth without manufacturing a successor or another Inbox row.
+    assert claim_workflow_turn_receipt(root, turn_id)
+    assert not claim_workflow_turn_receipt(root, turn_id)
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, turn_id)
+        assert turn.state == "sent"
+        assert turn.queue_reason is None
+        assert db.get(InboxModel, inbox.id).status == "delivered"
+        lease = db.get(database.ProviderExecutionLeaseModel, root)
+        assert lease is not None and lease.workflow_turn_id == turn_id
+
+
+def test_f13_late_receipt_fences_already_claimed_settled_retry(workflow_db):
+    root = "root-receipt-after-retry-claim"
+    _ensure_running_test_terminal(root)
+    inbox, turn_id = _pending_inbox_turn(root, "one durable transport")
+    assert activate_workflow_turn_for_inbox(inbox.id) == turn_id
+    original = claim_workflow_turn(root, inbox_message_id=inbox.id)
+    assert original is not None
+    assert mark_workflow_turn_sent(turn_id, original["claim_token"], original["claim_generation"])
+    assert database.update_pending_message_status(inbox.id, database.MessageStatus.DELIVERED)
+    assert database.acquire_provider_execution(root, turn_id, 3)
+    assert database.release_provider_execution(root, turn_id)
+    assert database.requeue_settled_unadmitted_workflow_turn(root, turn_id)
+
+    retry = claim_workflow_turn(root, inbox_message_id=inbox.id)
+    assert retry is not None
+    assert retry["id"] == turn_id
+    assert database.acquire_provider_execution(root, turn_id, 3)
+    operation_token = database.acquire_terminal_runtime_transport(root)
+    assert operation_token is not None
+
+    # The original model execution receipts after the dispatcher claimed its
+    # same-turn retry. Receipt admission atomically invalidates that claimant,
+    # so its mandatory renewal and mark-sent fences cannot authorize another
+    # physical transport.
+    assert claim_workflow_turn_receipt(root, turn_id)
+    assert not renew_workflow_turn_claim(turn_id, retry["claim_token"], retry["claim_generation"])
+    assert not mark_workflow_turn_sent(turn_id, retry["claim_token"], retry["claim_generation"])
+    with database.workflow_turn_transport_fence(
+        root,
+        turn_id,
+        retry["claim_token"],
+        retry["claim_generation"],
+        operation_token,
+    ) as permitted:
+        assert permitted is False
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, turn_id)
+        assert turn.state == "sent"
+        assert turn.claim_token is None
+        assert turn.queue_reason is None
+        assert db.get(InboxModel, inbox.id).status == "delivered"
+        assert db.query(WorkflowTurnReceiptModel).count() == 1
+
 
 @pytest.mark.parametrize("exact_authority", (False, True))
 def test_f13_settled_unreceipted_handoff_recovery_restores_same_transport(
@@ -3711,6 +3768,19 @@ def test_f13_settled_unreceipted_handoff_batch_restores_every_sealed_member(work
             for notice in notices
         } == {claim["id"]}
     assert database.get_provider_execution_admission_queue()[0]["source"] == "inbox"
+
+    assert claim_workflow_turn_receipt(parent, claim["id"])
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, claim["id"])
+        assert turn.state == "sent"
+        assert turn.queue_reason is None
+        assert {db.get(InboxModel, notice.id).status for notice in notices} == {"delivered"}
+        assert {
+            db.query(database.ChildAssignmentModel).filter_by(child_terminal_id=child).one().status
+            for child in children
+        } == {"handoff_result_delivered"}
+        lease = db.get(database.ProviderExecutionLeaseModel, parent)
+        assert lease is not None and lease.workflow_turn_id == claim["id"]
 
 
 def test_f13_settled_unreceipted_callback_retry_exhaustion_owner_gates(workflow_db):
@@ -6639,6 +6709,13 @@ def test_f13_concurrent_duplicate_receiver_receipts_admit_one_effect(tmp_path, m
     turn_id, duplicate = queue_workflow_turn(root, "test", "concurrent-receipt")
     assert turn_id is not None and duplicate is False
     assert activate_workflow_turn(root, turn_id)
+    transport = claim_workflow_turn(root)
+    assert transport is not None and transport["id"] == turn_id
+    assert mark_workflow_turn_sent(
+        turn_id,
+        transport["claim_token"],
+        transport["claim_generation"],
+    )
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         admitted = list(
@@ -6660,11 +6737,25 @@ def test_f13_receiver_receipt_restart_suppression_and_distinct_turns(workflow_db
     assert second_id is not None and second_duplicate is False
 
     assert activate_workflow_turn(root, first_id)
+    first_transport = claim_workflow_turn(root)
+    assert first_transport is not None and first_transport["id"] == first_id
+    assert mark_workflow_turn_sent(
+        first_id,
+        first_transport["claim_token"],
+        first_transport["claim_generation"],
+    )
     assert claim_workflow_turn_receipt(root, first_id)
     # Restart/replay of the same envelope does not create a second semantic
     # consume, whereas an independently stable logical turn remains valid.
     assert not claim_workflow_turn_receipt(root, first_id)
     assert activate_workflow_turn(root, second_id)
+    second_transport = claim_workflow_turn(root)
+    assert second_transport is not None and second_transport["id"] == second_id
+    assert mark_workflow_turn_sent(
+        second_id,
+        second_transport["claim_token"],
+        second_transport["claim_generation"],
+    )
     assert claim_workflow_turn_receipt(root, second_id)
 
 
@@ -6994,6 +7085,9 @@ def test_f13_effect_ledger_requires_admitted_logical_turn_and_dedupes_restart(wo
     # receiver admission can.  This is the server-side isolation boundary.
     assert claim_workflow_effect(root, turn_id, "assign", "task-a") is None
     assert activate_workflow_turn(root, turn_id)
+    transport = claim_workflow_turn(root)
+    assert transport is not None and transport["id"] == turn_id
+    assert mark_workflow_turn_sent(turn_id, transport["claim_token"], transport["claim_generation"])
     assert claim_workflow_turn_receipt(root, turn_id)
 
     first = claim_workflow_effect(root, turn_id, "assign", "task-a")
@@ -7179,6 +7273,13 @@ def test_f13_assigned_and_handoff_callbacks_keep_restart_safe_admission_envelope
     assert activate_workflow_turn_for_inbox(assigned.id) == assigned_turn["turn_id"]
     # The next handoff cannot overtake this unadmitted callback. Model the
     # parent's receipt before asking F11 to create its subsequent boundary.
+    assigned_transport = claim_workflow_turn(parent, inbox_message_id=assigned.id)
+    assert assigned_transport is not None
+    assert mark_workflow_turn_sent(
+        assigned_transport["id"],
+        assigned_transport["claim_token"],
+        assigned_transport["claim_generation"],
+    )
     assert claim_workflow_turn_receipt(parent, assigned_turn["turn_id"])
 
     # F11 uses the same Inbox-to-current-turn path after recovery.
@@ -7376,6 +7477,9 @@ def test_f13_effect_ledger_allows_distinct_task_identities_once_each(workflow_db
     turn_id, duplicate = queue_workflow_turn(root, "test", "effect-identities")
     assert turn_id is not None and duplicate is False
     assert activate_workflow_turn(root, turn_id)
+    transport = claim_workflow_turn(root)
+    assert transport is not None and transport["id"] == turn_id
+    assert mark_workflow_turn_sent(turn_id, transport["claim_token"], transport["claim_generation"])
     assert claim_workflow_turn_receipt(root, turn_id)
     assign = claim_workflow_effect(root, turn_id, "assign", "task-a")
     handoff = claim_workflow_effect(root, turn_id, "handoff", "task-b")
@@ -7401,6 +7505,9 @@ def test_f13_effect_ledger_owner_cancel_matrix_fences_unstarted_effects(workflow
     turn_id, duplicate = queue_workflow_turn(root, "test", "effect-closed")
     assert turn_id is not None and duplicate is False
     assert activate_workflow_turn(root, turn_id)
+    transport = claim_workflow_turn(root)
+    assert transport is not None and transport["id"] == turn_id
+    assert mark_workflow_turn_sent(turn_id, transport["claim_token"], transport["claim_generation"])
     assert claim_workflow_turn_receipt(root, turn_id)
     assert close(root)
     assert claim_workflow_effect(root, turn_id, "send_message", "target") is None
@@ -7423,6 +7530,13 @@ def test_f14_old_effect_cannot_cross_closed_workflow_into_new_turn_matrix(workfl
     old_turn, duplicate = queue_workflow_turn(root, "test", "old-effect")
     assert old_turn is not None and duplicate is False
     assert activate_workflow_turn(root, old_turn)
+    old_transport = claim_workflow_turn(root)
+    assert old_transport is not None and old_transport["id"] == old_turn
+    assert mark_workflow_turn_sent(
+        old_turn,
+        old_transport["claim_token"],
+        old_transport["claim_generation"],
+    )
     assert claim_workflow_turn_receipt(root, old_turn)
     assert close(root)
 
@@ -7431,6 +7545,13 @@ def test_f14_old_effect_cannot_cross_closed_workflow_into_new_turn_matrix(workfl
     new_turn, duplicate = queue_workflow_turn(root, "test", "new-effect")
     assert new_turn is not None and duplicate is False
     assert activate_workflow_turn(root, new_turn)
+    new_transport = claim_workflow_turn(root)
+    assert new_transport is not None and new_transport["id"] == new_turn
+    assert mark_workflow_turn_sent(
+        new_turn,
+        new_transport["claim_token"],
+        new_transport["claim_generation"],
+    )
     assert claim_workflow_turn_receipt(root, new_turn)
 
     assert claim_workflow_effect(root, old_turn, "send_message", "old-target") is None
@@ -7470,6 +7591,11 @@ def test_f13_privileged_mcp_operations_cannot_bypass_logical_turn_effect_gate(
         # inbox write. A replay after admission cannot enqueue a second one.
         rejected = asyncio.run(mcp_server.send_message(turn_id, "target", "payload"))
         assert rejected["success"] is False
+        transport = claim_workflow_turn(root)
+        assert transport is not None and transport["id"] == turn_id
+        assert mark_workflow_turn_sent(
+            turn_id, transport["claim_token"], transport["claim_generation"]
+        )
         assert claim_workflow_turn_receipt(root, turn_id)
         accepted = asyncio.run(mcp_server.send_message(turn_id, "target", "payload"))
         replay = asyncio.run(mcp_server.send_message(turn_id, "target", "payload"))

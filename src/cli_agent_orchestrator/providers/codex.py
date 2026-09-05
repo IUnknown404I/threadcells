@@ -104,6 +104,8 @@ STARTUP_ERROR_PATTERN = (
     r"codex: command not found|command not found:)"
 )
 STARTUP_EVIDENCE_LIMIT = 12_000
+CODEX_LAST_RESPONSE_SCAN_MAX_BYTES = 8 * 1024 * 1024
+CODEX_LAST_RESPONSE_CACHE_MAX_BYTES = 256 * 1024
 # Resuming a long conversation can redraw more than the ordinary 200-line
 # status window before the TUI becomes idle. Keep reconnect evidence bounded,
 # but large enough that the shell marker cannot disappear during that redraw.
@@ -545,6 +547,58 @@ def _codex_turn_execution_active(path: Path) -> Optional[bool]:
             os.close(descriptor)
 
 
+def _bounded_response_suffix(value: str) -> str:
+    payload = value.encode("utf-8", errors="replace")
+    if len(payload) <= CODEX_LAST_RESPONSE_CACHE_MAX_BYTES:
+        return value
+    start = len(payload) - max(1, CODEX_LAST_RESPONSE_CACHE_MAX_BYTES - 4)
+    while start > 0 and 0x80 <= payload[start] <= 0xBF:
+        start -= 1
+    return payload[start:].decode("utf-8", errors="replace")
+
+
+def _latest_completed_codex_response(path: Path) -> Optional[tuple[str, int]]:
+    """Read one completed response and its durable line boundary from a bounded suffix."""
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        source = os.fstat(descriptor)
+        if not stat.S_ISREG(source.st_mode):
+            return None
+        start = max(0, source.st_size - CODEX_LAST_RESPONSE_SCAN_MAX_BYTES)
+        raw = os.pread(descriptor, source.st_size - start, start)
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if start:
+        partial, separator, raw = raw.partition(b"\n")
+        if not separator:
+            return None
+        start += len(partial) + len(separator)
+    latest: Optional[tuple[str, int]] = None
+    offset = start
+    for line in raw.splitlines(keepends=True):
+        offset += len(line)
+        if len(line) > 4 * 1024 * 1024:
+            continue
+        try:
+            row = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        payload = row.get("payload") if isinstance(row, dict) else None
+        if (
+            row.get("type") == "event_msg"
+            and isinstance(payload, dict)
+            and payload.get("type") == "task_complete"
+            and isinstance(payload.get("last_agent_message"), str)
+            and payload["last_agent_message"].strip()
+        ):
+            latest = (_bounded_response_suffix(payload["last_agent_message"]), offset)
+    return latest
+
+
 def _latest_structured_codex_outcome(
     path: Path, after_cursor: str
 ) -> Optional[ProviderTurnOutcome]:
@@ -641,7 +695,8 @@ def _durable_reconnect_output_boundary(terminal_id: str) -> Optional[dict[str, A
         get_latest_workflow_provider_reconnect_output_boundary,
     )
 
-    return get_latest_workflow_provider_reconnect_output_boundary(terminal_id)
+    value = get_latest_workflow_provider_reconnect_output_boundary(terminal_id)
+    return value if isinstance(value, dict) else None
 
 
 def _has_runtime_reconnect_signal(output: str, attempt_token: Optional[str]) -> bool:
@@ -885,6 +940,8 @@ class CodexProvider(BaseProvider):
             provider_session_id,
             Path(working_directory_value).resolve(strict=False),
         )
+        if rollout_path is not None:
+            self._cache_latest_completed_response(rollout_path, provider_session_id)
         return (
             _latest_structured_codex_outcome(rollout_path, after_cursor) if rollout_path else None
         )
@@ -1678,6 +1735,14 @@ class CodexProvider(BaseProvider):
             f"command={_toml_scalar(hook_command)},timeout=30}}]}}]"
         )
         command_parts.extend(["-c", hook_config])
+        completion_hook_command = shlex.join(
+            [sys.executable, "-m", "cli_agent_orchestrator.codex_completion_hook"]
+        )
+        completion_hook_config = (
+            'hooks.Stop=[{hooks=[{type="command",'
+            f"command={_toml_scalar(completion_hook_command)},timeout=30}}]}}]"
+        )
+        command_parts.extend(["-c", completion_hook_config])
 
         if resume_session_id is not None:
             command_parts.extend(["resume", resume_session_id])
@@ -2143,6 +2208,63 @@ class CodexProvider(BaseProvider):
             if values["total_tokens"] is not None:
                 values["total_tokens"] += cached_input_tokens
         return values
+
+    def get_durable_last_response(self) -> Optional[str]:
+        """Return the latest exact-session response without reading terminal history."""
+        from cli_agent_orchestrator.clients.database import (
+            get_terminal_metadata,
+            get_terminal_provider_last_response,
+        )
+
+        metadata = get_terminal_metadata(self.terminal_id)
+        if metadata is None:
+            return None
+        identity = metadata.get("provider_resume_identity")
+        working_directory = metadata.get("launch_worktree")
+        if (
+            not isinstance(identity, str)
+            or not isinstance(working_directory, str)
+            or not os.path.isabs(working_directory)
+        ):
+            return None
+        rollout = _rollout_path_for_identity(
+            identity,
+            Path(working_directory).resolve(strict=False),
+        )
+        if rollout is not None:
+            cached = self._cache_latest_completed_response(rollout, identity)
+            if cached is not None:
+                return cached
+        response = get_terminal_provider_last_response(
+            self.terminal_id,
+            provider="codex",
+            provider_session_id=identity,
+        )
+        return response if isinstance(response, str) else None
+
+    def _cache_latest_completed_response(
+        self, rollout: Path, provider_session_id: str
+    ) -> Optional[str]:
+        from cli_agent_orchestrator.clients.database import (
+            persist_terminal_provider_last_response,
+        )
+
+        completion = _latest_completed_codex_response(rollout)
+        if completion is None:
+            return None
+        response, completion_offset = completion
+        persisted = persist_terminal_provider_last_response(
+            self.terminal_id,
+            provider="codex",
+            provider_session_id=provider_session_id,
+            completion_offset=completion_offset,
+            response=response,
+        )
+        return response if persisted else None
+
+    def durable_last_response_is_authoritative(self) -> bool:
+        """Codex completions are provider-native; terminal-tail fallback is unsafe."""
+        return True
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Codex's final response from terminal output.

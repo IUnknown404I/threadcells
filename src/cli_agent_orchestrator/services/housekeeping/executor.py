@@ -20,6 +20,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from cli_agent_orchestrator.services.compressed_output_index import (
+    precompute_compressed_output_index,
+)
+
 from .models import HousekeepingCandidate, HousekeepingPlan, candidate_fingerprint, default_settings
 from .planner import revalidate_runtime_candidate
 from .protected_set import ProtectedSet, resolve_protected_set
@@ -457,7 +461,13 @@ def _compress(
         finally:
             os.close(destination_parent_fd)
         temporary = None
-        return max(0, reclaimed - destination.lstat().st_size)
+        retained_bytes = destination.lstat().st_size
+        if path.parent.name == "terminal" and path.name.endswith(".log"):
+            index_path, data_path = precompute_compressed_output_index(
+                destination, expected_raw_size=source.st_size
+            )
+            retained_bytes += index_path.lstat().st_size + data_path.lstat().st_size
+        return max(0, reclaimed - retained_bytes)
     finally:
         if temporary is not None:
             try:

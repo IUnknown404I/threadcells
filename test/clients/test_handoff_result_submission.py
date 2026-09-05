@@ -36,6 +36,7 @@ from cli_agent_orchestrator.clients.database import (
     get_pending_handoff_child_terminal_ids,
     get_pending_message_receiver_ids,
     mark_child_assignment_result_delivered,
+    mark_workflow_turn_sent_for_inbox,
     purge_expired_delegation_results,
     register_child_assignment,
     register_handoff_child,
@@ -234,6 +235,7 @@ def _admit_managed_continuation(child: str, scheduled: dict) -> int:
     assert f"logical-turn={scheduled['turn_id']}" in _message_for_delivery(
         message, scheduled["turn_id"]
     )
+    assert mark_workflow_turn_sent_for_inbox(message.id)
     assert claim_workflow_turn_receipt(child, scheduled["turn_id"])
     return scheduled["turn_id"]
 

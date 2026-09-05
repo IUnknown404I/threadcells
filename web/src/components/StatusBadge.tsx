@@ -15,14 +15,15 @@ export function lifecycleBadgeStatus(
   if (providerLifecycle === 'exited') {
     return workflowState ? `WORKFLOW_${workflowState.toUpperCase()}::Exited` : 'Exited'
   }
-  if (!workflowState) return providerStatus || 'unknown'
   const provider = executionState === 'processing' ? 'Processing'
     : executionState === 'queued_provider_execution' ? 'WaitingProviderSlot'
     : executionState === 'waiting_child_retirement' ? 'WaitingChildRetirement'
     : executionState === 'waiting_resource_recovery' ? 'WaitingResourceRecovery'
     : executionState === 'waiting_runtime_recovery' ? 'WaitingRuntimeRecovery'
     : executionState === 'waiting_workflow_continuation' ? 'WaitingWorkflowContinuation'
+    : executionState === 'ready' ? 'Ready'
     : providerStatus === 'processing' ? 'Processing' : 'Ready'
+  if (!workflowState) return provider
   return `WORKFLOW_${workflowState.toUpperCase()}::${provider}`
 }
 

@@ -25,9 +25,11 @@ from cli_agent_orchestrator.providers.codex import (
     CodexStartupNoReadyError,
     ProviderError,
 )
+from cli_agent_orchestrator.services.compressed_output_index import (
+    precompute_compressed_output_index,
+)
+from cli_agent_orchestrator.services.terminal_render import ParserState, render_terminal_stream
 from cli_agent_orchestrator.services.terminal_service import (
-    COMPRESSED_OUTPUT_MAX_BYTES,
-    COMPRESSED_OUTPUT_SOURCE_MAX_BYTES,
     LAST_OUTPUT_READ_MAX_BYTES,
     LAST_OUTPUT_RESPONSE_MAX_BYTES,
     OUTPUT_CHUNK_MAX_BYTES,
@@ -39,6 +41,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     _canonical_worktree,
     _create_terminal_after_admission,
     _render_progressive_terminal_output,
+    _render_progressive_terminal_page,
     _resolve_context_role,
     _sanitize_human_terminal_output,
     _write_enabled_lane,
@@ -70,6 +73,140 @@ from cli_agent_orchestrator.services.terminal_service import (
 )
 def test_human_output_sanitizer_fails_closed_on_partial_controls(raw, expected):
     assert _sanitize_human_terminal_output(raw) == expected
+
+
+def test_human_output_collapses_codex_cursor_repaint_without_matching_words():
+    raw = "".join(
+        f"\x1b[4;1H{prefix}\x1b[K"
+        for prefix in ("W", "Wo", "Wor", "Work", "Worki", "Workin", "Working")
+    )
+    raw += "\x1b[4;1HFinal answer\x1b[K"
+
+    assert _sanitize_human_terminal_output(raw) == "Final answer"
+
+
+def test_human_output_collapses_spinner_and_background_counter_frames():
+    raw = (
+        "\x1b[8;1H• Working (1s • esc to interrupt)\x1b[K"
+        "\x1b[9;1H1 background terminal running\x1b[K"
+        "\x1b[8;1H◐ Working (2s • esc to interrupt)\x1b[K"
+        "\x1b[9;1H2 background terminals running\x1b[K"
+        "\x1b[8;1HCompleted\x1b[K\x1b[9;1H\x1b[K"
+    )
+
+    assert _sanitize_human_terminal_output(raw) == "Completed"
+
+
+def test_human_output_preserves_ordinary_working_code_unicode_tabs_and_lines():
+    expected = (
+        "Working is legitimate prose.\n"
+        "print('• Working')\n"
+        r"print('literal \x1b[31m ANSI example')"
+        "\nПривет\t✓\n"
+    )
+
+    assert _sanitize_human_terminal_output(expected) == expected
+
+
+def test_human_output_applies_c1_cursor_and_erase_semantics():
+    raw = "\x9b4;1HWorking\x9bK\x9b4;1HDone\x9bK"
+
+    assert _sanitize_human_terminal_output(raw) == "Done"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("abc\x1b7def\x1b8X", "abcXef"),
+        ("one\x1bEtwo", "one\ntwo"),
+        ("A\tB\rXX", "XX      B"),
+        ("\n\nhello\rX", "\n\nXello"),
+        ("界B\rX", "X B"),
+    ],
+)
+def test_human_output_applies_esc_tab_wide_and_leading_row_semantics(raw, expected):
+    assert _sanitize_human_terminal_output(raw) == expected
+
+
+def test_human_output_semantic_expansion_stays_bounded():
+    raw = "wide" + "\x1b[4096GX\x1b[S" * 20_000
+
+    rendered = _sanitize_human_terminal_output(raw)
+
+    assert len(rendered) <= OUTPUT_CHUNK_MAX_BYTES
+
+
+def test_isolated_older_semantic_page_preserves_residual_viewport_prose():
+    payload = b"draft\rFinal\nline one\nline two\n"
+    rendered = _render_progressive_terminal_page(
+        payload,
+        prefix_context=b"",
+        prefix_truncated=False,
+        expected_end_state=ParserState.NORMAL,
+        line_isolated=True,
+    )
+
+    newer = "newer prose"
+    single_stream = render_terminal_stream(payload.decode() + newer).output
+
+    assert rendered.output == "Final\nline one\nline two\n"
+    assert rendered.output + newer == single_stream
+
+
+@pytest.mark.parametrize("trailing_linefeeds", [0, 1, 2, 4, 30])
+def test_line_local_semantic_page_preserves_exact_trailing_linefeeds(trailing_linefeeds):
+    payload = b"draft\rFinal" + b"\n" * trailing_linefeeds
+    rendered = _render_progressive_terminal_page(
+        payload,
+        prefix_context=b"",
+        prefix_truncated=False,
+        expected_end_state=ParserState.NORMAL,
+        line_isolated=True,
+    )
+
+    newer = "newer prose"
+    assert rendered.output == "Final" + "\n" * trailing_linefeeds
+    assert rendered.output + newer == render_terminal_stream(payload.decode() + newer).output
+
+
+def test_line_local_semantic_page_preserves_visible_whitespace_unicode_and_edits():
+    payload = "draft\rФинал\nA\tB\nAB\bC\n \t\n\n\n".encode()
+    rendered = _render_progressive_terminal_page(
+        payload,
+        prefix_context=b"",
+        prefix_truncated=False,
+        expected_end_state=ParserState.NORMAL,
+        line_isolated=True,
+    )
+
+    newer = "новее ✓"
+    assert rendered.output == "Финал\nA\tB\nAC\n \t\n\n\n"
+    assert rendered.output + newer == render_terminal_stream(payload.decode() + newer).output
+
+
+def test_nonisolated_older_semantic_page_does_not_invent_line_separator():
+    older_payload = b"draft\rFinal"
+    newer_payload = b" suffix"
+    older = _render_progressive_terminal_page(
+        older_payload,
+        prefix_context=b"",
+        prefix_truncated=False,
+        expected_end_state=ParserState.NORMAL,
+        line_isolated=False,
+    )
+    newer = _render_progressive_terminal_page(
+        newer_payload,
+        prefix_context=older_payload,
+        prefix_truncated=False,
+        expected_end_state=None,
+        line_isolated=False,
+    )
+
+    assert older.output == ""
+    assert (
+        older.output + newer.output
+        == render_terminal_stream((older_payload + newer_payload).decode()).output
+    )
 
 
 def test_bind_provider_runtime_session_identity_proves_exact_hook_path(monkeypatch, tmp_path):
@@ -2751,6 +2888,52 @@ class TestSendInput:
         mock_release.assert_called_once_with("test1234", 42)
         wake.assert_called_once_with(None)
 
+    @patch("cli_agent_orchestrator.services.terminal_service.release_provider_execution")
+    @patch("cli_agent_orchestrator.services.operations_service.acquire_provider_execution_slot")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_fences_retry_after_receipt_without_releasing_admitted_execution(
+        self, mock_get_metadata, mock_tmux, mock_pm, mock_acquire, mock_release
+    ):
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "supervisor-window",
+            "runtime_lifecycle": "running",
+        }
+        mock_pm.get_provider.return_value.paste_enter_count = 1
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.acquire_terminal_runtime_transport",
+                return_value="transport-token",
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.workflow_turn_transport_fence",
+                return_value=nullcontext(False),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.has_admitted_workflow_turn",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.release_terminal_runtime_operation",
+                return_value=True,
+            ),
+            pytest.raises(RuntimeError, match="fenced before provider transport"),
+        ):
+            send_input(
+                "test1234",
+                "task",
+                logical_turn_id=42,
+                workflow_turn_claim_token="claim-token",
+                workflow_turn_claim_generation=2,
+            )
+
+        mock_acquire.assert_called_once_with("test1234", 42)
+        mock_tmux.send_keys.assert_not_called()
+        mock_release.assert_not_called()
+
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch(
         "cli_agent_orchestrator.services.terminal_service.bind_workflow_turn_provider_outcome_cursor"
@@ -2974,7 +3157,7 @@ class TestGetOutput:
         self._durable_terminal(monkeypatch, tmp_path)
         path = tmp_path / "test1234.log"
         with path.open("wb") as stream:
-            stream.seek(64 * 1024 * 1024)
+            stream.seek(512 * 1024 * 1024)
             stream.write(b"\nlatest response\n")
         provider = MagicMock()
         provider.extract_last_message_from_script.return_value = "latest response"
@@ -3036,6 +3219,9 @@ class TestGetOutput:
         self._durable_terminal(monkeypatch, tmp_path)
         with gzip.open(tmp_path / "test1234.log.gz", "wb") as stream:
             stream.write(b"latest compressed response")
+        precompute_compressed_output_index(
+            tmp_path / "test1234.log.gz", expected_raw_size=len(b"latest compressed response")
+        )
         provider = MagicMock()
         provider.extract_last_message_from_script.return_value = "latest compressed response"
         monkeypatch.setattr(
@@ -3047,6 +3233,48 @@ class TestGetOutput:
         provider.extract_last_message_from_script.assert_called_once_with(
             "latest compressed response"
         )
+
+    def test_provider_native_last_response_bypasses_huge_terminal_history(
+        self, monkeypatch, tmp_path
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        (tmp_path / "test1234.log.gz").write_bytes(b"large historical gzip is not consulted")
+        provider = MagicMock()
+        provider.get_durable_last_response.return_value = "bounded actual latest response"
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.provider_manager.get_provider",
+            lambda *_: provider,
+        )
+
+        assert get_output("test1234", OutputMode.LAST) == "bounded actual latest response"
+        provider.extract_last_message_from_script.assert_not_called()
+        assert not (tmp_path / "test1234.log.tci").exists()
+
+    def test_authoritative_provider_last_response_never_falls_back_to_active_tail(
+        self, monkeypatch, tmp_path
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.get_terminal_metadata",
+            lambda _terminal_id: {
+                "id": "test1234",
+                "provider": "codex",
+                "provider_resume_identity": "exact-provider-session",
+            },
+        )
+        (tmp_path / "test1234.log").write_text(
+            "newer in-progress provider output", encoding="utf-8"
+        )
+        provider = MagicMock()
+        provider.durable_last_response_is_authoritative.return_value = True
+        provider.get_durable_last_response.return_value = None
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.provider_manager.get_provider",
+            lambda *_: provider,
+        )
+
+        assert get_output("test1234", OutputMode.LAST) == ""
+        provider.extract_last_message_from_script.assert_not_called()
 
     def test_full_output_pages_newest_first_without_gaps_or_overlap(self, monkeypatch, tmp_path):
         self._durable_terminal(monkeypatch, tmp_path)
@@ -3082,6 +3310,96 @@ class TestGetOutput:
         assert ranges[0][0] == 0
         assert ranges[-1][1] == len(expected.encode())
         assert all(older[1] == newer[0] for older, newer in zip(ranges, ranges[1:]))
+
+    def test_full_output_preserves_isolated_semantic_prose_on_an_older_page(
+        self, monkeypatch, tmp_path
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        semantic = b"draft\rFinal\nline one\nline two\n"
+        newer_prefix = b"newer prose"
+        newer = newer_prefix + b"x" * (OUTPUT_CHUNK_MAX_BYTES - 5 - len(newer_prefix)) + b"\n"
+        (tmp_path / "test1234.log").write_bytes(semantic + newer)
+
+        newest = get_output_chunk("test1234")
+        assert newest.cursor is not None
+        older = get_output_chunk("test1234", newest.cursor)
+
+        assert older.output == "Final\nline one\nline two\n"
+        assert older.end_offset == newest.start_offset
+        assert older.output + newest.output == "Final\nline one\nline two\n" + newer.decode()
+
+    def test_forced_pagination_matches_single_stream_terminal_render(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.OUTPUT_CHUNK_MAX_BYTES", 128
+        )
+        raw = "draft\rFinal\nline one\nline two\n" + "".join(
+            f"newer prose {number:02d}\n" for number in range(24)
+        )
+        raw += "newest prose"
+        (tmp_path / "test1234.log").write_text(raw, encoding="utf-8")
+
+        cursor = None
+        chunks = []
+        ranges = []
+        while True:
+            chunk = get_output_chunk("test1234", cursor)
+            chunks.insert(0, chunk.output)
+            ranges.insert(0, (chunk.start_offset, chunk.end_offset))
+            if not chunk.has_older:
+                break
+            assert chunk.cursor is not None
+            cursor = chunk.cursor
+
+        assert len(chunks) >= 3
+        assert "".join(chunks) == render_terminal_stream(raw).output
+        assert all(older[1] == newer[0] for older, newer in zip(ranges, ranges[1:]))
+
+    @pytest.mark.parametrize("chunk_bytes", [64, 97, 128, 191])
+    def test_forced_pagination_preserves_exact_trailing_linefeed_multiplicity(
+        self, monkeypatch, tmp_path, chunk_bytes
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.OUTPUT_CHUNK_MAX_BYTES",
+            chunk_bytes,
+        )
+        semantic = b"draft\rFinal\nline\n\n\n"
+        newer_prefix = b"newer prose"
+        newer = newer_prefix + b"x" * (chunk_bytes - 4 - len(newer_prefix))
+        raw = semantic + newer
+        (tmp_path / "test1234.log").write_bytes(raw)
+
+        newest = get_output_chunk("test1234")
+        assert newest.cursor is not None
+        older = get_output_chunk("test1234", newest.cursor)
+
+        assert (older.start_offset, older.end_offset) == (0, len(semantic))
+        assert older.end_offset == newest.start_offset
+        assert older.output + newest.output == render_terminal_stream(raw.decode()).output
+
+    def test_forced_hard_boundary_without_linefeed_invents_no_separator(
+        self, monkeypatch, tmp_path
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        chunk_bytes = 64
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.OUTPUT_CHUNK_MAX_BYTES",
+            chunk_bytes,
+        )
+        semantic = b"draft\rFinal"
+        newer_prefix = b"newer prose"
+        newer = newer_prefix + b"x" * (chunk_bytes - 4 - len(newer_prefix))
+        raw = semantic + newer
+        (tmp_path / "test1234.log").write_bytes(raw)
+
+        newest = get_output_chunk("test1234")
+        assert newest.cursor is not None
+        older = get_output_chunk("test1234", newest.cursor)
+
+        assert older.end_offset == newest.start_offset
+        assert older.output + newest.output == render_terminal_stream(raw.decode()).output
+        assert "Finalnewer prose" in older.output + newest.output
 
     def test_full_output_preserves_utf8_boundaries_and_replaces_malformed_bytes(
         self, monkeypatch, tmp_path
@@ -3195,6 +3513,42 @@ class TestGetOutput:
         assert "".join(chunks) == "before `code` привет\tafter"
         assert forbidden not in "".join(chunks)
         assert all(older[1] == newer[0] for older, newer in zip(ranges, ranges[1:]))
+
+    def test_codex_repaints_collapse_across_four_progressive_pages(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        frames = []
+        prefixes = ("W", "Wo", "Wor", "Work", "Worki", "Workin", "Working")
+        size = 0
+        while size < OUTPUT_CHUNK_MAX_BYTES * 4:
+            prefix = prefixes[len(frames) % len(prefixes)]
+            frame = (
+                f"\x1b[?2026h\x1b[20;1H• {prefix} (1s • esc to interrupt)"
+                "\x1b[K\x1b[21;1H1 background terminal running\x1b[K\x1b[?2026l"
+            )
+            frames.append(frame)
+            size += len(frame.encode())
+        frames.append(
+            "\x1b[?2026h\x1b[20;1HOrdinary Working prose\x1b[K"
+            "\x1b[21;1Hprint('Working')\t✓\x1b[K\x1b[?2026l"
+        )
+        (tmp_path / "test1234.log").write_text("".join(frames), encoding="utf-8")
+
+        cursor = None
+        chunks = []
+        for _ in range(8):
+            chunk = get_output_chunk("test1234", cursor)
+            chunks.insert(0, chunk.output)
+            if not chunk.has_older:
+                break
+            cursor = chunk.cursor
+
+        rendered = "".join(chunks)
+        assert len(chunks) >= 4
+        assert "Ordinary Working prose" in rendered
+        assert "print('Working')\t✓" in rendered
+        assert "esc to interrupt" not in rendered
+        assert "background terminal running" not in rendered
+        assert "Working•Working" not in rendered
 
     def test_older_hard_pages_strip_production_terminal_fragments_and_bound_reads(
         self, monkeypatch, tmp_path
@@ -3311,32 +3665,122 @@ class TestGetOutput:
         with pytest.raises(TerminalOutputUnavailable):
             get_output_chunk("test1234")
 
-    def test_large_compressed_history_fails_without_an_unbounded_scan(self, monkeypatch, tmp_path):
+    def test_large_compressed_history_is_indexed_for_bounded_pagination(
+        self, monkeypatch, tmp_path
+    ):
         self._durable_terminal(monkeypatch, tmp_path)
+        expected = b"".join(
+            f"{number:07d}:{'x' * 113}\n".encode()
+            for number in range((OUTPUT_CHUNK_MAX_BYTES * 3) // 122)
+        )
         with gzip.open(tmp_path / "test1234.log.gz", "wb") as stream:
-            stream.write(b"x" * (COMPRESSED_OUTPUT_MAX_BYTES + 1))
+            stream.write(expected)
+        precompute_compressed_output_index(
+            tmp_path / "test1234.log.gz", expected_raw_size=len(expected)
+        )
 
-        with pytest.raises(TerminalOutputUnavailable) as error:
-            get_output_chunk("test1234")
+        cursor = None
+        chunks = []
+        ranges = []
+        while True:
+            chunk = get_output_chunk("test1234", cursor)
+            chunks.insert(0, chunk.output)
+            ranges.insert(0, (chunk.start_offset, chunk.end_offset))
+            if not chunk.has_older:
+                break
+            cursor = chunk.cursor
 
-        assert error.value.reason_code == "COMPRESSED_OUTPUT_REQUIRES_INDEX"
+        assert "".join(chunks).encode() == expected
+        assert len(chunks) >= 3
+        assert all(older[1] == newer[0] for older, newer in zip(ranges, ranges[1:]))
+        assert (tmp_path / "test1234.log.tci").is_file()
+        assert (tmp_path / "test1234.log.tcd").is_file()
 
-    def test_concatenated_gzip_members_have_a_compressed_input_ceiling(self, monkeypatch, tmp_path):
+    def test_precomputed_512_mib_compressed_history_opens_with_bounded_page_reads(
+        self, monkeypatch, tmp_path
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        path = tmp_path / "test1234.log.gz"
+        block = b"x" * (1024 * 1024)
+        with gzip.open(path, "wb", compresslevel=1) as stream:
+            for _ in range(512):
+                stream.write(block)
+        precompute_compressed_output_index(path, expected_raw_size=512 * 1024 * 1024)
+
+        original_pread = os.pread
+        reads = []
+
+        def tracked_pread(descriptor, count, offset):
+            reads.append((count, offset))
+            return original_pread(descriptor, count, offset)
+
+        monkeypatch.setattr(os, "pread", tracked_pread)
+        chunk = get_output_chunk("test1234")
+
+        assert chunk.snapshot_size == 512 * 1024 * 1024
+        assert len(chunk.output.encode()) <= OUTPUT_CHUNK_MAX_BYTES
+        assert max(count for count, _offset in reads) <= OUTPUT_CHUNK_MAX_BYTES + 4096
+
+    def test_compressed_cursor_rejects_replaced_history(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        path = tmp_path / "test1234.log.gz"
+        path.write_bytes(gzip.compress(b"older\n" + b"x" * OUTPUT_CHUNK_MAX_BYTES))
+        precompute_compressed_output_index(
+            path, expected_raw_size=len(b"older\n") + OUTPUT_CHUNK_MAX_BYTES
+        )
+        first = get_output_chunk("test1234")
+        assert first.cursor is not None
+
+        replacement = tmp_path / "replacement.gz"
+        replacement.write_bytes(gzip.compress(b"newer\n" + b"y" * OUTPUT_CHUNK_MAX_BYTES))
+        os.replace(replacement, path)
+
+        with pytest.raises(TerminalOutputCursorError) as error:
+            get_output_chunk("test1234", first.cursor)
+        assert error.value.reason_code == "OUTPUT_CURSOR_STALE"
+
+    def test_concatenated_gzip_members_are_indexed_without_visible_artifacts(
+        self, monkeypatch, tmp_path
+    ):
         self._durable_terminal(monkeypatch, tmp_path)
         member = gzip.compress(b"")
-        member_count = (COMPRESSED_OUTPUT_SOURCE_MAX_BYTES // len(member)) + 1
+        member_count = ((256 * 1024) // len(member)) + 1
         source = member * member_count
-        assert len(source) > COMPRESSED_OUTPUT_SOURCE_MAX_BYTES
+        assert len(source) > 256 * 1024
         (tmp_path / "test1234.log.gz").write_bytes(source)
+        precompute_compressed_output_index(tmp_path / "test1234.log.gz", expected_raw_size=0)
 
-        with patch(
-            "cli_agent_orchestrator.services.terminal_service.os.pread", wraps=os.pread
-        ) as bounded_read:
-            with pytest.raises(TerminalOutputUnavailable) as error:
-                get_output_chunk("test1234")
+        chunk = get_output_chunk("test1234")
 
-        assert error.value.reason_code == "COMPRESSED_OUTPUT_REQUIRES_INDEX"
-        bounded_read.assert_not_called()
+        assert chunk.output == ""
+        assert chunk.has_older is False
+        assert chunk.snapshot_size == 0
+
+    def test_compressed_output_request_never_builds_a_missing_high_ratio_index(
+        self, monkeypatch, tmp_path
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        path = tmp_path / "test1234.log.gz"
+        path.write_bytes(gzip.compress(b"x" * (32 * 1024 * 1024)))
+
+        with pytest.raises(TerminalOutputUnavailable, match="bounded pagination index"):
+            get_output_chunk("test1234")
+
+        assert not (tmp_path / "test1234.log.tci").exists()
+        assert not (tmp_path / "test1234.log.tcd").exists()
+
+    def test_precompute_rejects_high_ratio_history_beyond_exact_source_ceiling(
+        self, monkeypatch, tmp_path
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        path = tmp_path / "test1234.log.gz"
+        path.write_bytes(gzip.compress(b"x" * (32 * 1024 * 1024)))
+
+        with pytest.raises(OSError, match="exact source size"):
+            precompute_compressed_output_index(path, expected_raw_size=1024 * 1024)
+
+        assert not (tmp_path / "test1234.log.tci").exists()
+        assert not (tmp_path / "test1234.log.tcd").exists()
 
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
@@ -3376,7 +3820,9 @@ class TestGetOutput:
 
         result = get_output("test1234", OutputMode.FULL)
 
-        assert result == "Привет, мир\nТекст\tданные"
+        # ESC M is reverse-index, not decoration: after LF it returns to the
+        # preceding row, where the later text and tab overwrite the old frame.
+        assert result == "Текст\tданные"
         assert "\x1b" not in result
 
     @patch("cli_agent_orchestrator.services.terminal_service.tmux_client")
@@ -3422,7 +3868,9 @@ class TestGetOutput:
 
         result = get_output("test1234", OutputMode.FULL)
 
-        assert result == "Русский\nтекст\t✓\nprogressOK\nnext\nplain"
+        # A lone carriage return rewrites the current terminal row. Without
+        # an erase-line control the untouched suffix remains visible.
+        assert result == "Русский\nтекст\t✓\nnextressOK\nplain"
         assert "\x1b" not in result
 
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")

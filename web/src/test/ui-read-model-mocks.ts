@@ -159,12 +159,7 @@ export function installUiReadModelSpies() {
       if (resolved.workflowStates?.length && !resolved.workflowStates.includes(item.workflow_state || '')) return false
       if (resolved.profiles?.length && !resolved.profiles.includes(item.agent_profile || '')) return false
       if (resolved.homeFilter === 'active' && ['exited', 'recovery_fenced'].includes(item.lifecycle || '')) return false
-      if (resolved.homeFilter === 'waiting' && (
-        !item.workflow_state
-        || ['owner_gate', 'cancelled', 'completed'].includes(item.workflow_state)
-        || ['exited', 'recovery_fenced'].includes(item.lifecycle || '')
-        || item.activity === 'processing'
-      )) return false
+      if (resolved.homeFilter === 'waiting' && !['ready', 'queued'].includes(item.activity || '')) return false
       if (resolved.homeFilter === 'owner_gate' && item.workflow_state !== 'owner_gate') return false
       if (resolved.homeFilter === 'cancelled' && item.workflow_state !== 'cancelled') return false
       if (resolved.homeFilter === 'completed' && item.workflow_state !== 'completed') return false
@@ -180,12 +175,7 @@ export function installUiReadModelSpies() {
       sessions: useStore.getState().sessions.length,
       agents: agents.length,
       active: agents.filter(item => !item.lifecycle || !['exited', 'recovery_fenced'].includes(item.lifecycle)).length,
-      waiting: agents.filter(item => (
-        Boolean(item.workflow_state)
-        && !['owner_gate', 'cancelled', 'completed'].includes(item.workflow_state || '')
-        && !['exited', 'recovery_fenced'].includes(item.lifecycle || '')
-        && item.activity !== 'processing'
-      )).length,
+      waiting: agents.filter(item => ['ready', 'queued'].includes(item.activity || '')).length,
       owner_gate: agents.filter(item => item.workflow_state === 'owner_gate').length,
       cancelled: agents.filter(item => item.workflow_state === 'cancelled').length,
       completed: agents.filter(item => item.workflow_state === 'completed').length,

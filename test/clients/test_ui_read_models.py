@@ -228,6 +228,11 @@ def test_history_sessions_survive_runtime_retirement(monkeypatch):
     assert agents["total"] == 180
     assert len(agents["items"]) == 40
     assert any(item["status"] == "history" for item in sessions["items"])
+    all_agents = ui_read_model_service.list_agent_summaries(limit=100)["items"]
+    all_agents += ui_read_model_service.list_agent_summaries(limit=100, offset=100)["items"]
+    assert overview["waiting"] == sum(
+        item["activity"] in {"ready", "queued"} for item in all_agents
+    )
 
 
 def test_session_summary_search_uses_aggregated_session_columns(monkeypatch):
@@ -305,11 +310,19 @@ def test_home_lifecycle_counts_and_filters_are_mutually_truthful(monkeypatch):
     completed = ui_read_model_service.list_agent_summaries(limit=20, home_filter="completed")
     session = ui_read_model_service.list_session_summaries(limit=10)["items"][0]
 
-    assert overview["waiting"] == 1
+    assert overview["active"] == 6
+    assert overview["waiting"] == 5
     assert overview["owner_gate"] == 1
     assert overview["cancelled"] == 1
     assert overview["completed"] == 1
-    assert [item["id"] for item in waiting["items"]] == ["queued"]
+    assert waiting["total"] == 5
+    assert {item["id"] for item in waiting["items"]} == {
+        "ready",
+        "queued",
+        "owner",
+        "cancelled",
+        "completed",
+    }
     assert [item["id"] for item in owner["items"]] == ["owner"]
     assert [item["id"] for item in cancelled["items"]] == ["cancelled"]
     assert [item["id"] for item in completed["items"]] == ["completed"]
@@ -319,6 +332,9 @@ def test_home_lifecycle_counts_and_filters_are_mutually_truthful(monkeypatch):
         "queued": 1,
         "ready": 4,
     }
+    assert overview["waiting"] == (
+        session["activity_counts"]["ready"] + session["activity_counts"]["queued"]
+    )
     assert session["workflow_counts"] == {
         "active": 4,
         "cancelled": 1,

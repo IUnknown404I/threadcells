@@ -539,6 +539,30 @@ describe('session creation and canonical ordering', () => {
     expect(onNavigate).toHaveBeenLastCalledWith({ tab: 'agents', intent: 'create-session' })
   })
 
+  it('renders the canonical Ready / waiting aggregate and opens the matching filter', async () => {
+    const onNavigate = vi.fn()
+    render(<DashboardHome
+      onNavigate={onNavigate}
+      overviewState={{
+        overview: {
+          sessions: 2,
+          agents: 4,
+          active: 3,
+          waiting: 2,
+          owner_gate: 0,
+          cancelled: 1,
+          completed: 1,
+        },
+        error: null,
+      }}
+    />)
+
+    const readyWaiting = screen.getByRole('button', { name: 'View Ready / waiting agents' })
+    expect(readyWaiting).toHaveTextContent('2')
+    fireEvent.click(readyWaiting)
+    expect(onNavigate).toHaveBeenCalledWith({ tab: 'agents', filter: 'waiting' })
+  })
+
   it('shows a session project badge only for one complete exact terminal context and keeps Home copy English', async () => {
     const exact = session('cao-project-exact', '300')
     const noProject = session('cao-project-none', '200')
@@ -989,6 +1013,28 @@ describe('session deletion confirmation', () => {
     fireEvent.click(reopenedConfirm)
     await waitFor(() => expect(remove).toHaveBeenCalledTimes(1))
     expect(remove).toHaveBeenCalledWith('lifetime-delete-me', false)
+  })
+
+  it('preserves a Session when canonical preflight reports genuinely queued work', async () => {
+    vi.mocked(api.getSessionDeletionPreflight).mockResolvedValue({
+      eligible: false,
+      already_deleted: false,
+      requires_dirty_confirmation: false,
+      modified_files: 0,
+      untracked_files: 0,
+      reason_code: 'QUEUED_WORK',
+    })
+    const remove = vi.spyOn(useStore.getState(), 'deleteSession').mockResolvedValue()
+    render(<AgentPanel />)
+
+    fireEvent.click(await screen.findByTitle('Delete session'))
+
+    await waitFor(() => expect(useStore.getState().snackbar).toEqual({
+      type: 'error',
+      message: 'QUEUED_WORK',
+    }))
+    expect(screen.queryByRole('heading', { name: 'Delete Session' })).not.toBeInTheDocument()
+    expect(remove).not.toHaveBeenCalled()
   })
 
   it('prevents duplicate delete confirmations while the request is pending', async () => {

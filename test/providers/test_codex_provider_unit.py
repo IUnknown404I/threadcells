@@ -1508,6 +1508,10 @@ class TestCodexBulletFormatStatusDetection:
                 "launch_worktree": str(working_directory),
             },
         )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.persist_terminal_provider_last_response",
+            lambda *_args, **_kwargs: True,
+        )
 
         assert provider.get_durable_last_response() == "latest response — ✓"
 

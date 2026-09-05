@@ -3548,6 +3548,8 @@ _WORKSPACE_RETIREMENT_ACTIVE_ASSIGNMENT_STATES = (
     ChildAssignmentStatus.HANDOFF_RESULT_FAILED.value,
 )
 
+_WORKSPACE_RETIREMENT_TERMINAL_WORKFLOW_STATES = ("terminal", "cancelled")
+
 
 def _session_workspace_snapshot_in_transaction(
     db: Any, context: WritableWorkContextModel
@@ -3598,7 +3600,12 @@ def _session_workspace_snapshot_in_transaction(
             .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
             .filter(
                 WorkflowModel.root_terminal_id.in_(terminal_ids),
+                # Turn rows are immutable delivery history. Once their owning
+                # workflow is terminal they cannot be claimed or transported,
+                # even when an old row still says queued/claimed/sent.
+                WorkflowModel.status.notin_(_WORKSPACE_RETIREMENT_TERMINAL_WORKFLOW_STATES),
                 WorkflowTurnModel.state.in_(("queued", "claimed", "sent")),
+                WorkflowTurnModel.superseded_by_turn_id.is_(None),
             )
             .first()
         )
@@ -4868,6 +4875,9 @@ def _ensure_terminal_ui_projection_schema() -> None:
         _terminal_ui_projection_schema_ready = True
 
 
+_UI_READY_WAITING_ACTIVITY_PREDICATE = "activity IN ('ready', 'queued')"
+
+
 def _ui_projection_filters(
     *,
     session_id: Optional[str] = None,
@@ -4910,7 +4920,7 @@ def _ui_projection_filters(
         if home_filter == "active":
             clauses.append("lifecycle NOT IN ('exited', 'recovery_fenced')")
         elif home_filter == "waiting":
-            clauses.append("activity = 'queued'")
+            clauses.append(_UI_READY_WAITING_ACTIVITY_PREDICATE)
         elif home_filter in {"owner_gate", "cancelled", "completed"}:
             clauses.append("workflow_state = :home_filter")
             parameters["home_filter"] = home_filter
@@ -4988,11 +4998,12 @@ def get_terminal_ui_overview_counts() -> Dict[str, int]:
     """Aggregate Home counters and durable session lifetimes in SQLite."""
     _ensure_terminal_ui_projection_schema()
     projection_cte, parameters = _terminal_ui_projection_cte()
-    sql = projection_cte + """
+    sql = projection_cte + f"""
         SELECT COUNT(DISTINCT session_id) AS sessions, COUNT(*) AS agents,
                SUM(CASE WHEN lifecycle NOT IN ('exited', 'recovery_fenced')
                         THEN 1 ELSE 0 END) AS active,
-               SUM(CASE WHEN activity = 'queued' THEN 1 ELSE 0 END) AS waiting,
+               SUM(CASE WHEN {_UI_READY_WAITING_ACTIVITY_PREDICATE}
+                        THEN 1 ELSE 0 END) AS waiting,
                SUM(CASE WHEN workflow_state = 'owner_gate' THEN 1 ELSE 0 END) AS owner_gate,
                SUM(CASE WHEN workflow_state = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
                SUM(CASE WHEN workflow_state = 'completed' THEN 1 ELSE 0 END) AS completed

@@ -13,9 +13,11 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import (
     Base,
+    ChildAssignmentModel,
     InboxModel,
     ProviderExecutionLeaseModel,
     TerminalModel,
+    WorkflowEffectModel,
     WorkflowModel,
     WorkflowTurnModel,
     WorktreeWriterLeaseModel,
@@ -329,8 +331,8 @@ def test_clean_auto_retirement_never_force_deletes_new_dirty_contents(workspace_
         ("processing", "WORKTREE_ACTIVE"),
         ("owner_gate", "OWNER_GATE"),
         ("open_workflow", "WORKFLOW_OPEN"),
-        ("queued", "QUEUED_WORK"),
-        ("waiting_resource", "QUEUED_WORK"),
+        ("queued", "WORKFLOW_OPEN"),
+        ("waiting_resource", "WORKFLOW_OPEN"),
         ("provider", "PROVIDER_EXECUTION_ACTIVE"),
         ("writer", "WRITER_LEASE_ACTIVE"),
         ("recovery", "RECOVERY_PROTECTED"),
@@ -354,11 +356,7 @@ def test_active_waiting_and_recovery_authority_never_auto_retires(
         elif authority in {"owner_gate", "open_workflow", "queued", "waiting_resource"}:
             workflow = WorkflowModel(
                 root_terminal_id=identity["terminal_id"],
-                status=(
-                    "owner_gate"
-                    if authority == "owner_gate"
-                    else "open" if authority == "open_workflow" else "completed"
-                ),
+                status=("owner_gate" if authority == "owner_gate" else "open"),
             )
             db.add(workflow)
             db.flush()
@@ -395,6 +393,197 @@ def test_active_waiting_and_recovery_authority_never_auto_retires(
     assert candidate.action == "preserve"
     assert candidate.protection_reason == expected
     assert Path(identity["managed"].path).exists()
+
+
+@pytest.mark.parametrize("workflow_status", ["terminal", "cancelled"])
+@pytest.mark.parametrize("turn_state", ["queued", "claimed", "sent", "finished", "cancelled"])
+def test_terminal_workflow_turn_history_does_not_block_retirement(
+    workspace_factory, workflow_status, turn_state
+):
+    identity = workspace_factory()
+    with database.SessionLocal() as db:
+        workflow = WorkflowModel(
+            root_terminal_id=identity["terminal_id"],
+            status=workflow_status,
+        )
+        db.add(workflow)
+        db.flush()
+        db.add(
+            WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="external_input",
+                dedupe_key=f"historical-{workflow_status}-{turn_state}",
+                payload="historical",
+                state=turn_state,
+            )
+        )
+        db.commit()
+
+    candidate = _candidate(identity)
+
+    assert candidate.action == "retire"
+    assert candidate.protection_reason is None
+
+
+def test_superseded_historical_turn_does_not_block_retirement(workspace_factory):
+    identity = workspace_factory()
+    with database.SessionLocal() as db:
+        workflow = WorkflowModel(root_terminal_id=identity["terminal_id"], status="terminal")
+        db.add(workflow)
+        db.flush()
+        successor = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="continuation",
+            dedupe_key="terminal-successor",
+            state="finished",
+        )
+        db.add(successor)
+        db.flush()
+        db.add(
+            WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="external_input",
+                dedupe_key="terminal-superseded",
+                state="cancelled",
+                superseded_by_turn_id=successor.id,
+            )
+        )
+        db.commit()
+
+    assert _candidate(identity).action == "retire"
+
+
+@pytest.mark.parametrize("turn_state", ["queued", "claimed", "sent"])
+def test_open_workflow_work_blocks_until_workflow_terminalizes(workspace_factory, turn_state):
+    identity = workspace_factory()
+    with database.SessionLocal() as db:
+        workflow = WorkflowModel(root_terminal_id=identity["terminal_id"], status="open")
+        db.add(workflow)
+        db.flush()
+        db.add(
+            WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="external_input",
+                dedupe_key=f"live-{turn_state}",
+                payload="live",
+                state=turn_state,
+            )
+        )
+        db.commit()
+
+    blocked = _candidate(identity)
+    assert blocked.action == "preserve"
+    assert blocked.protection_reason == "WORKFLOW_OPEN"
+    if turn_state == "queued":
+        live_projection = database.list_terminal_ui_summary_page(
+            limit=10,
+            session_id=identity["session_id"],
+        )["items"][0]
+        assert live_projection["queued_task_count"] == 1
+        assert live_projection["workflow_state"] == "active"
+
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=identity["terminal_id"]).one()
+        workflow.status = "terminal"
+        db.commit()
+
+    allowed = _candidate(identity)
+    assert allowed.action == "retire"
+    assert allowed.protection_reason is None
+    if turn_state == "queued":
+        historical_projection = database.list_terminal_ui_summary_page(
+            limit=10,
+            session_id=identity["session_id"],
+        )["items"][0]
+        assert historical_projection["queued_task_count"] == 0
+        assert historical_projection["workflow_state"] == "completed"
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("pending", "QUEUED_WORK"),
+        ("delivered", None),
+        ("failed", None),
+        ("superseded", None),
+    ],
+)
+def test_only_pending_inbox_work_blocks_retirement(workspace_factory, status, expected):
+    identity = workspace_factory()
+    with database.SessionLocal() as db:
+        db.add(
+            InboxModel(
+                sender_id=identity["terminal_id"],
+                receiver_id="owner",
+                message=f"{status} message",
+                status=status,
+            )
+        )
+        db.commit()
+
+    candidate = _candidate(identity)
+    assert candidate.action == ("preserve" if expected else "retire")
+    assert candidate.protection_reason == expected
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        ("awaiting_result", "QUEUED_WORK"),
+        ("result_queued", "QUEUED_WORK"),
+        ("result_delivered", "QUEUED_WORK"),
+        ("result_failed", "QUEUED_WORK"),
+        ("handoff_direct_result_claimed", "QUEUED_WORK"),
+        ("result_acknowledged", None),
+        ("result_superseded", None),
+        ("handoff_result_acknowledged", None),
+        ("cancelled", None),
+    ],
+)
+def test_assignment_delivery_authority_matches_retirement_guard(
+    workspace_factory, status, expected
+):
+    identity = workspace_factory()
+    with database.SessionLocal() as db:
+        db.add(
+            ChildAssignmentModel(
+                parent_terminal_id=identity["terminal_id"],
+                child_terminal_id=f"child-{status}",
+                status=status,
+            )
+        )
+        db.commit()
+
+    candidate = _candidate(identity)
+    assert candidate.action == ("preserve" if expected else "retire")
+    assert candidate.protection_reason == expected
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [("claimed", "QUEUED_WORK"), ("indeterminate", "QUEUED_WORK"), ("completed", None)],
+)
+def test_only_live_or_indeterminate_effects_block_retirement(workspace_factory, state, expected):
+    identity = workspace_factory()
+    with database.SessionLocal() as db:
+        workflow = WorkflowModel(root_terminal_id=identity["terminal_id"], status="terminal")
+        db.add(workflow)
+        db.flush()
+        db.add(
+            WorkflowEffectModel(
+                workflow_id=workflow.id,
+                workflow_turn_id=9000,
+                effect_kind="test",
+                effect_key=f"test-{state}",
+                state=state,
+                claim_token=f"claim-{state}",
+            )
+        )
+        db.commit()
+
+    candidate = _candidate(identity)
+    assert candidate.action == ("preserve" if expected else "retire")
+    assert candidate.protection_reason == expected
 
 
 def test_durable_active_blocker_skips_git_inspection(workspace_factory, monkeypatch):
@@ -540,8 +729,8 @@ def test_confirmed_dirty_retirement_resumes_after_contents_change_and_restart(
         ("processing", "WORKTREE_ACTIVE"),
         ("owner_gate", "OWNER_GATE"),
         ("open_workflow", "WORKFLOW_OPEN"),
-        ("queued", "QUEUED_WORK"),
-        ("waiting_resource", "QUEUED_WORK"),
+        ("queued", "WORKFLOW_OPEN"),
+        ("waiting_resource", "WORKFLOW_OPEN"),
         ("provider", "PROVIDER_EXECUTION_ACTIVE"),
         ("writer", "WRITER_LEASE_ACTIVE"),
         ("recovery", "RECOVERY_PROTECTED"),
@@ -565,11 +754,7 @@ def test_authority_appearing_after_dirty_confirmation_aborts_retirement(
         elif authority in {"owner_gate", "open_workflow", "queued", "waiting_resource"}:
             workflow = WorkflowModel(
                 root_terminal_id=identity["terminal_id"],
-                status=(
-                    "owner_gate"
-                    if authority == "owner_gate"
-                    else "open" if authority == "open_workflow" else "completed"
-                ),
+                status=("owner_gate" if authority == "owner_gate" else "open"),
             )
             db.add(workflow)
             db.flush()

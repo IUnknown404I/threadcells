@@ -10,6 +10,7 @@ export interface AgentFilterState {
 }
 
 export interface AgentStatusLike {
+  activity?: string | null
   lifecycle?: string | null
   workflow_state?: string | null
   status?: string | null
@@ -69,14 +70,9 @@ export function matchesHomeAgentFilter(terminal: AgentStatusLike, filter: HomeAg
     case 'all':
       return true
     case 'active':
-      return terminal.lifecycle === 'running' && terminal.workflow_state !== 'completed'
+      return !['exited', 'recovery_fenced'].includes(terminal.lifecycle || '')
     case 'waiting':
-      // This is the former Home `WORKFLOW_*::Ready` badge predicate, expressed
-      // against the same raw values so it can also drive the Agents projection.
-      return Boolean(terminal.workflow_state)
-        && !['owner_gate', 'cancelled', 'completed'].includes(terminal.workflow_state || '')
-        && !['exited', 'recovery_fenced'].includes(terminal.lifecycle || '')
-        && terminal.status !== 'processing'
+      return terminal.activity === 'ready' || terminal.activity === 'queued'
     case 'owner_gate':
     case 'cancelled':
     case 'completed':

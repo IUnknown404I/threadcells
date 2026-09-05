@@ -7,7 +7,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union, cast
 from urllib.parse import quote
 
 import mcp.types as mcp_types
@@ -572,6 +572,7 @@ def _durable_handoff_terminal_result(
 
 
 _LIVE_TERMINAL_LIFECYCLE = "running"
+_EXACT_REVIEW_REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _PROGRESS_ONLY_RESULT_PATTERN = re.compile(
     r"^\s*[•*\-]?\s*(?:codex\s+is\s+)?"
     r"(?:working|thinking|processing|running|starting|analyzing|creating|"
@@ -1837,6 +1838,7 @@ def _assign_impl(
     working_directory: Optional[str] = None,
     *,
     reviewer_terminal_id: Optional[str] = None,
+    review_revision: Optional[str] = None,
     request_effect: Optional[Dict[str, Any]] = None,
     request_workflow_turn_id: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -1847,7 +1849,7 @@ def _assign_impl(
         )
         review_authority: Optional[Dict[str, str]] = None
         if reused_reviewer:
-            terminal_id = reviewer_terminal_id.strip()
+            terminal_id = cast(str, reviewer_terminal_id).strip()
             metadata = get_terminal_metadata(terminal_id)
             actual_profile = metadata.get("agent_profile") if metadata is not None else None
             reviewer_profile = actual_profile == "reviewer" or str(actual_profile or "").startswith(
@@ -1907,6 +1909,7 @@ def _assign_impl(
                     workflow_effect_id=request_effect.get("id"),
                     request_message=message,
                     require_existing_reviewer_attempt=reused_reviewer,
+                    requested_review_revision=review_revision,
                 )
             )
             if not registered and (
@@ -1932,7 +1935,15 @@ def _assign_impl(
                 review_authority = get_child_assignment_request_authority(
                     parent_terminal_id, terminal_id, int(request_effect_id)
                 )
-                if reused_reviewer and review_authority is None:
+                explicit_revision_unbound = bool(
+                    review_revision is not None
+                    and (
+                        review_authority is None
+                        or review_authority.get("revision") != review_revision
+                        or review_authority.get("revision_source") != "explicit"
+                    )
+                )
+                if explicit_revision_unbound or (reused_reviewer and review_authority is None):
                     cancel_child_assignment_attempt(
                         parent_terminal_id,
                         terminal_id,
@@ -1942,10 +1953,18 @@ def _assign_impl(
                     return {
                         "success": False,
                         "terminal_id": terminal_id,
-                        "reviewer_terminal_id": terminal_id,
-                        "reason_code": "REVIEWER_REVIEW_AUTHORITY_UNBOUND",
+                        "reviewer_terminal_id": terminal_id if reused_reviewer else None,
+                        "reason_code": (
+                            "REVIEW_REVISION_UNAVAILABLE"
+                            if explicit_revision_unbound
+                            else "REVIEWER_REVIEW_AUTHORITY_UNBOUND"
+                        ),
                         "message": (
-                            "Existing reviewer could not be bound to an exact immutable revision"
+                            "Reviewer could not be bound to the explicitly requested immutable "
+                            "revision"
+                            if explicit_revision_unbound
+                            else "Existing reviewer could not be bound to an exact immutable "
+                            "revision"
                         ),
                     }
                 if review_authority is not None:
@@ -2034,8 +2053,10 @@ Args:
 
     desc += """
     reviewer_terminal_id: Optional existing assigned reviewer terminal for one bounded rereview.
-        The reviewer profile and parent relation must match, its prior result must be final,
-        and its prior workflow must be terminal. Omit this to create a new child."""
+        The reviewer profile and parent relation must match and its prior result must be final.
+        Omit this to create a new child.
+    review_revision: Optional exact full Git commit ID to bind as immutable review authority.
+        The server must prove this commit in the review repository or assignment fails closed."""
 
     desc += """
 
@@ -2072,15 +2093,32 @@ if ENABLE_WORKING_DIRECTORY:
             default=None,
             description="Existing assigned reviewer terminal to reuse for a bounded rereview",
         ),
+        review_revision: Optional[str] = Field(
+            default=None,
+            description="Exact full Git commit ID for immutable review authority",
+        ),
     ) -> Dict[str, Any]:
         reviewer_terminal_id = (
             reviewer_terminal_id if isinstance(reviewer_terminal_id, str) else None
         )
+        if isinstance(review_revision, str):
+            review_revision = review_revision.strip().lower()
+            if not _EXACT_REVIEW_REVISION_PATTERN.fullmatch(review_revision):
+                return {
+                    "success": False,
+                    "terminal_id": None,
+                    "reason_code": "REVIEW_REVISION_INVALID",
+                    "message": "review_revision must be an exact full Git commit ID",
+                }
+        else:
+            review_revision = None
         effect_identity = (
             (agent_profile, message)
             if reviewer_terminal_id is None
             else (agent_profile, reviewer_terminal_id, message)
         )
+        if review_revision is not None:
+            effect_identity = (*effect_identity, review_revision)
         effect = _claim_privileged_effect(logical_turn_id, "assign", *effect_identity)
         if effect is None:
             return _privileged_effect_rejection(logical_turn_id, "assign", *effect_identity)
@@ -2090,6 +2128,7 @@ if ENABLE_WORKING_DIRECTORY:
                 message,
                 working_directory,
                 reviewer_terminal_id=reviewer_terminal_id,
+                review_revision=review_revision,
                 request_effect=effect,
                 request_workflow_turn_id=logical_turn_id,
             )
@@ -2114,15 +2153,32 @@ else:
             default=None,
             description="Existing assigned reviewer terminal to reuse for a bounded rereview",
         ),
+        review_revision: Optional[str] = Field(
+            default=None,
+            description="Exact full Git commit ID for immutable review authority",
+        ),
     ) -> Dict[str, Any]:
         reviewer_terminal_id = (
             reviewer_terminal_id if isinstance(reviewer_terminal_id, str) else None
         )
+        if isinstance(review_revision, str):
+            review_revision = review_revision.strip().lower()
+            if not _EXACT_REVIEW_REVISION_PATTERN.fullmatch(review_revision):
+                return {
+                    "success": False,
+                    "terminal_id": None,
+                    "reason_code": "REVIEW_REVISION_INVALID",
+                    "message": "review_revision must be an exact full Git commit ID",
+                }
+        else:
+            review_revision = None
         effect_identity = (
             (agent_profile, message)
             if reviewer_terminal_id is None
             else (agent_profile, reviewer_terminal_id, message)
         )
+        if review_revision is not None:
+            effect_identity = (*effect_identity, review_revision)
         effect = _claim_privileged_effect(logical_turn_id, "assign", *effect_identity)
         if effect is None:
             return _privileged_effect_rejection(logical_turn_id, "assign", *effect_identity)
@@ -2132,6 +2188,7 @@ else:
                 message,
                 None,
                 reviewer_terminal_id=reviewer_terminal_id,
+                review_revision=review_revision,
                 request_effect=effect,
                 request_workflow_turn_id=logical_turn_id,
             )

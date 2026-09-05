@@ -1,6 +1,7 @@
 """Issue #81: immutable review-attempt and exact Git-revision authority."""
 
 import asyncio
+import hashlib
 import sqlite3
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -101,7 +102,13 @@ def _reviewer(
     )
 
 
-def _start_review(parent_id: str, child_id: str, request: str) -> dict:
+def _start_review(
+    parent_id: str,
+    child_id: str,
+    request: str,
+    *,
+    requested_revision: str | None = None,
+) -> dict:
     turn_id = start_workflow_input(parent_id)
     assert turn_id is not None
     assert claim_workflow_turn_receipt(parent_id, turn_id)
@@ -113,6 +120,7 @@ def _start_review(parent_id: str, child_id: str, request: str) -> dict:
         workflow_turn_id=turn_id,
         workflow_effect_id=effect["id"],
         request_message=request,
+        requested_review_revision=requested_revision,
     )
     assert finish_workflow_effect(parent_id, effect["id"], effect["claim_token"], "completed")
     binding = issue_workflow_input_binding(child_id)
@@ -414,6 +422,287 @@ def test_mcp_assign_reuses_same_reviewer_with_exact_new_attempt_and_ack(
     assert get_delegation_result(submitted["result_id"])["review"]["current_authority"] is True
 
 
+def test_block_acknowledge_preserves_same_reviewer_for_exact_correction(
+    authority_db, monkeypatch, tmp_path
+):
+    """Issue #130 repro A: acknowledgement must not auto-retire the sole reviewer."""
+    repo, revision_a = _repository(tmp_path)
+    reviewer_worktree = tmp_path / "resident-reviewer"
+    _git(repo, "worktree", "add", "--detach", str(reviewer_worktree), revision_a)
+    with database.SessionLocal() as db:
+        db.add(_reviewer("reviewer", repo, revision_a, launch_worktree=reviewer_worktree))
+        db.commit()
+
+    _start_review("parent", "reviewer", "Review exact revision A")
+    result_a = _submit_result("parent", "reviewer", "BLOCK revision A")
+    parent_turn = activate_workflow_turn_for_inbox(result_a["notice_id"])
+    assert isinstance(parent_turn, int)
+    assert mark_workflow_turn_sent_for_inbox(result_a["notice_id"])
+    assert claim_workflow_turn_receipt("parent", parent_turn)
+    assert acknowledge_child_assignment_result_outcome("parent", result_id=result_a["result_id"])[
+        "accepted"
+    ]
+
+    with database.SessionLocal() as db:
+        first = db.query(ChildAssignmentModel).filter_by(child_terminal_id="reviewer").one()
+        first_workflow = db.get(WorkflowModel, first.child_workflow_id)
+        assert first_workflow is not None and first_workflow.status == "terminal"
+        first_workflow_id = first.child_workflow_id
+        first_turn_id = first.child_workflow_turn_id
+
+    # Before #130 the acknowledgement immediately entered the automatic
+    # retirement queue, exited the reviewer provider, and made the only
+    # policy-eligible same-reviewer rereview fail with
+    # REVIEWER_REUSE_NOT_ELIGIBLE. Preserve that runtime until the parent
+    # review workflow itself reaches a terminal state.
+    assert list_completed_assigned_child_retirement_candidates() == []
+    retirement = database.claim_completed_assigned_child_retirement("parent", "reviewer")
+    assert retirement == {"eligible": False, "error": "reviewer_reuse_window_open"}
+
+    assert set_workflow_terminal_state(
+        "parent", "owner_gate", "owner authorization required for correction"
+    )
+    assert list_completed_assigned_child_retirement_candidates() == []
+    parent_turn = start_workflow_input("parent")
+    assert parent_turn is not None and claim_workflow_turn_receipt("parent", parent_turn)
+
+    revision_b = _advance(repo, "B")
+    monkeypatch.setenv("CAO_TERMINAL_ID", "parent")
+    with (
+        patch.object(mcp_server, "_fence_privileged_runtime"),
+        patch.object(mcp_server, "wait_until_terminal_status", return_value=True),
+        patch.object(mcp_server, "_send_direct_input_assign") as send_input,
+    ):
+        rereview = asyncio.run(
+            mcp_server.assign(
+                parent_turn,
+                "reviewer_sol_high",
+                "Bounded blocker-only rereview",
+                reviewer_terminal_id="reviewer",
+                review_revision=revision_b,
+                **({"working_directory": None} if mcp_server.ENABLE_WORKING_DIRECTORY else {}),
+            )
+        )
+
+    assert rereview["success"] is True, rereview
+    assert rereview["reviewer_reused"] is True
+    assert rereview["review_attempt"]["revision"] == revision_b
+    assert rereview["review_attempt"]["revision_source"] == "explicit"
+    send_input.assert_called_once()
+    assert f"exact_revision={revision_b}" in send_input.call_args.args[1]
+
+    with database.SessionLocal() as db:
+        attempts = (
+            db.query(ChildAssignmentModel)
+            .filter_by(child_terminal_id="reviewer")
+            .order_by(ChildAssignmentModel.id)
+            .all()
+        )
+        assert len(attempts) == 2
+        assert attempts[0].attempt_id != attempts[1].attempt_id
+        assert attempts[0].status == "result_acknowledged"
+        assert attempts[0].review_superseded_at is not None
+        assert attempts[1].review_subject_revision == revision_b
+        assert attempts[1].review_subject_revision_source == "explicit"
+        assert attempts[1].child_workflow_id != first_workflow_id
+        assert attempts[1].child_workflow_turn_id != first_turn_id
+
+    result_b = _submit_result("parent", "reviewer", "PASS revision B")
+    artifact_a = get_delegation_result(result_a["result_id"])
+    artifact_b = get_delegation_result(result_b["result_id"])
+    assert artifact_a["review"]["authority_state"] == "historical"
+    assert artifact_a["review"]["current_authority"] is False
+    assert artifact_b["attempt_id"] != artifact_a["attempt_id"]
+    assert artifact_b["review"]["revision"] == revision_b
+    assert artifact_b["review"]["current_authority"] is True
+
+    acknowledgement_turn = activate_workflow_turn_for_inbox(result_b["notice_id"])
+    assert isinstance(acknowledgement_turn, int)
+    assert mark_workflow_turn_sent_for_inbox(result_b["notice_id"])
+    assert claim_workflow_turn_receipt("parent", acknowledgement_turn)
+    assert acknowledge_child_assignment_result_outcome("parent", result_id=result_b["result_id"])[
+        "accepted"
+    ]
+    assert list_completed_assigned_child_retirement_candidates() == []
+    assert set_workflow_terminal_state(
+        "parent",
+        "terminal",
+        "exact correction review accepted",
+        require_no_active_children=True,
+    )
+    assert [
+        candidate["child_terminal_id"]
+        for candidate in list_completed_assigned_child_retirement_candidates()
+    ] == ["reviewer"]
+
+
+def test_replacement_reviewer_binds_explicit_revision_not_its_current_head(
+    authority_db, monkeypatch, tmp_path
+):
+    """Issue #130 repro B: typed B wins even when the replacement starts at C."""
+    repo, _revision_a = _repository(tmp_path)
+    revision_b = _advance(repo, "B")
+    revision_c = _advance(repo, "C")
+    reviewer_worktree = tmp_path / "replacement-reviewer"
+    _git(repo, "worktree", "add", "--detach", str(reviewer_worktree), revision_c)
+    with database.SessionLocal() as db:
+        db.add(
+            _reviewer(
+                "replacement",
+                repo,
+                revision_c,
+                launch_worktree=reviewer_worktree,
+            )
+        )
+        db.commit()
+    assert _git(repo, "rev-parse", "HEAD") == revision_c
+    assert _git(reviewer_worktree, "rev-parse", "HEAD") == revision_c
+
+    request_message = "Review the owner-authorized correction"
+    with database.SessionLocal() as db:
+        replacement = db.get(TerminalModel, "replacement")
+        assert replacement is not None
+        implicit_binding = database._review_subject_for_child(
+            replacement,
+            hashlib.sha256(request_message.encode("utf-8")).hexdigest(),
+        )
+    # Negative control for the production failure: without typed authority,
+    # a SHA appearing only in prose cannot override the replacement's C HEAD.
+    assert implicit_binding["review_subject_revision"] == revision_c
+
+    parent_turn = start_workflow_input("parent")
+    assert parent_turn is not None and claim_workflow_turn_receipt("parent", parent_turn)
+    monkeypatch.setenv("CAO_TERMINAL_ID", "parent")
+    with (
+        patch.object(mcp_server, "_fence_privileged_runtime"),
+        patch.object(
+            mcp_server, "_create_terminal", return_value=("replacement", "codex")
+        ) as create,
+        patch.object(mcp_server, "wait_until_terminal_status", return_value=True),
+        patch.object(mcp_server, "_send_direct_input_assign") as send_input,
+    ):
+        assigned = asyncio.run(
+            mcp_server.assign(
+                parent_turn,
+                "reviewer_sol_high",
+                request_message,
+                review_revision=revision_b,
+                **({"working_directory": None} if mcp_server.ENABLE_WORKING_DIRECTORY else {}),
+            )
+        )
+        duplicate = asyncio.run(
+            mcp_server.assign(
+                parent_turn,
+                "reviewer_sol_high",
+                request_message,
+                review_revision=revision_b,
+                **({"working_directory": None} if mcp_server.ENABLE_WORKING_DIRECTORY else {}),
+            )
+        )
+
+    assert assigned["success"] is True, assigned
+    assert assigned["review_attempt"]["revision"] == revision_b
+    assert assigned["review_attempt"]["revision_source"] == "explicit"
+    assert duplicate["success"] is False
+    assert duplicate["reason_code"] == "DUPLICATE_EFFECT"
+    create.assert_called_once()
+    send_input.assert_called_once()
+
+    with database.SessionLocal() as db:
+        attempt = db.query(ChildAssignmentModel).filter_by(child_terminal_id="replacement").one()
+        assert attempt.review_subject_revision == revision_b
+        assert attempt.review_subject_revision != revision_c
+        assert attempt.review_subject_revision_source == "explicit"
+
+    result = _submit_result("parent", "replacement", "PASS exact revision B")
+    artifact = get_delegation_result(result["result_id"])
+    assert artifact["review"]["revision"] == revision_b
+    assert artifact["review"]["revision_source"] == "explicit"
+    assert artifact["review"]["current_authority"] is True
+    callback_turn = activate_workflow_turn_for_inbox(result["notice_id"])
+    assert isinstance(callback_turn, int)
+    assert mark_workflow_turn_sent_for_inbox(result["notice_id"])
+    assert claim_workflow_turn_receipt("parent", callback_turn)
+    assert acknowledge_child_assignment_result_outcome("parent", result_id=result["result_id"])[
+        "accepted"
+    ]
+
+
+def test_unavailable_explicit_revision_fails_closed_before_reviewer_input(
+    authority_db, monkeypatch, tmp_path
+):
+    repo, revision = _repository(tmp_path)
+    reviewer_worktree = tmp_path / "unbound-replacement"
+    _git(repo, "worktree", "add", "--detach", str(reviewer_worktree), revision)
+    with database.SessionLocal() as db:
+        db.add(
+            _reviewer(
+                "replacement",
+                repo,
+                revision,
+                launch_worktree=reviewer_worktree,
+            )
+        )
+        db.commit()
+
+    unavailable = "f" * 40
+    parent_turn = start_workflow_input("parent")
+    assert parent_turn is not None and claim_workflow_turn_receipt("parent", parent_turn)
+    monkeypatch.setenv("CAO_TERMINAL_ID", "parent")
+    with (
+        patch.object(mcp_server, "_fence_privileged_runtime"),
+        patch.object(mcp_server, "_create_terminal", return_value=("replacement", "codex")),
+        patch.object(mcp_server, "wait_until_terminal_status", return_value=True),
+        patch.object(mcp_server, "_send_direct_input_assign") as send_input,
+    ):
+        rejected = asyncio.run(
+            mcp_server.assign(
+                parent_turn,
+                "reviewer_sol_high",
+                f"Text mentions {revision}, but typed authority requests an unavailable commit",
+                review_revision=unavailable,
+                **({"working_directory": None} if mcp_server.ENABLE_WORKING_DIRECTORY else {}),
+            )
+        )
+
+    assert rejected["success"] is False
+    assert rejected["reason_code"] == "REVIEW_REVISION_UNAVAILABLE"
+    send_input.assert_not_called()
+    result = database.get_delegation_result_for_assignment("replacement")
+    assert result is not None
+    assert result["status"] == "cancelled"
+    assert result["reason_code"] == "review_authority_unbound"
+    assert result["review"]["authority_state"] == "unbound"
+    assert result["review"]["current_authority"] is False
+
+
+def test_invalid_explicit_revision_is_rejected_before_claim_or_launch(authority_db, monkeypatch):
+    parent_turn = start_workflow_input("parent")
+    assert parent_turn is not None and claim_workflow_turn_receipt("parent", parent_turn)
+    monkeypatch.setenv("CAO_TERMINAL_ID", "parent")
+    with (
+        patch.object(mcp_server, "_fence_privileged_runtime") as runtime_fence,
+        patch.object(mcp_server, "_create_terminal") as create,
+    ):
+        rejected = asyncio.run(
+            mcp_server.assign(
+                parent_turn,
+                "reviewer_sol_high",
+                "Do not admit an abbreviated or symbolic target",
+                review_revision="HEAD",
+                **({"working_directory": None} if mcp_server.ENABLE_WORKING_DIRECTORY else {}),
+            )
+        )
+
+    assert rejected["success"] is False
+    assert rejected["reason_code"] == "REVIEW_REVISION_INVALID"
+    runtime_fence.assert_not_called()
+    create.assert_not_called()
+    with database.SessionLocal() as db:
+        assert db.query(database.WorkflowEffectModel).count() == 0
+        assert db.query(ChildAssignmentModel).count() == 0
+
+
 def test_mcp_assign_cannot_reuse_an_ordinary_child_as_reviewer(authority_db, monkeypatch):
     with database.SessionLocal() as db:
         db.add(
@@ -608,6 +897,7 @@ def test_concurrent_review_requests_create_distinct_attempts_and_one_current(mon
             workflow_turn_id=turn_id,
             workflow_effect_id=effect["id"],
             request_message=f"concurrent-{index}",
+            requested_review_revision=revision,
         )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -616,6 +906,8 @@ def test_concurrent_review_requests_create_distinct_attempts_and_one_current(mon
         attempts = db.query(ChildAssignmentModel).all()
         assert len(attempts) == 2
         assert len({attempt.attempt_id for attempt in attempts}) == 2
+        assert {attempt.review_subject_revision for attempt in attempts} == {revision}
+        assert {attempt.review_subject_revision_source for attempt in attempts} == {"explicit"}
         assert sum(attempt.review_superseded_at is None for attempt in attempts) == 1
 
 
@@ -754,12 +1046,13 @@ def test_legacy_unique_child_schema_migrates_without_fabricating_revision(monkey
     assert database._migrate_child_assignment_columns() is True
     with sqlite3.connect(database_file) as conn:
         migrated = conn.execute(
-            "SELECT attempt_id, review_subject_kind, review_subject_revision "
+            "SELECT attempt_id, review_subject_kind, review_subject_revision, "
+            "review_subject_revision_source "
             "FROM child_assignments"
         ).fetchone()
         assert migrated is not None
         assert migrated[0]
-        assert migrated[1:] == ("legacy_unscoped", None)
+        assert migrated[1:] == ("legacy_unscoped", None, None)
         # A pre-upgrade process does not know about attempt_id.  Its write
         # must remain possible after the new process has rebuilt the shared
         # table; the database supplies identity, while the absent review
@@ -770,13 +1063,14 @@ def test_legacy_unique_child_schema_migrates_without_fabricating_revision(monkey
             ("parent", "legacy-rolling-child", "awaiting_result"),
         )
         rolling_attempt = conn.execute(
-            "SELECT attempt_id, review_subject_kind, review_subject_revision "
+            "SELECT attempt_id, review_subject_kind, review_subject_revision, "
+            "review_subject_revision_source "
             "FROM child_assignments WHERE child_terminal_id = ?",
             ("legacy-rolling-child",),
         ).fetchone()
         assert rolling_attempt is not None
         assert len(rolling_attempt[0]) == 32
-        assert rolling_attempt[1:] == (None, None)
+        assert rolling_attempt[1:] == (None, None, None)
         conn.execute(
             "INSERT INTO child_assignments "
             "(parent_terminal_id, child_terminal_id, status, attempt_id) "
@@ -789,3 +1083,18 @@ def test_legacy_unique_child_schema_migrates_without_fabricating_revision(monkey
             ).fetchone()[0]
             == 2
         )
+
+
+def test_current_child_schema_adds_explicit_revision_provenance(monkeypatch, tmp_path):
+    database_file = tmp_path / "current-without-revision-source.db"
+    engine = create_engine(f"sqlite:///{database_file}")
+    Base.metadata.create_all(bind=engine)
+    engine.dispose()
+    with sqlite3.connect(database_file) as conn:
+        conn.execute("ALTER TABLE child_assignments DROP COLUMN review_subject_revision_source")
+    monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", database_file)
+
+    assert database._migrate_child_assignment_columns() is True
+    with sqlite3.connect(database_file) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(child_assignments)")}
+        assert "review_subject_revision_source" in columns

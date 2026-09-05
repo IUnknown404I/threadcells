@@ -621,6 +621,11 @@ class ChildAssignmentModel(Base):
     review_subject_id = Column(String, nullable=True, index=True)
     review_subject_kind = Column(String, nullable=True)
     review_subject_revision = Column(String, nullable=True)
+    # ``explicit`` means the caller supplied an immutable full commit ID and
+    # the server proved that object before creating the attempt. ``snapshot``
+    # retains the #81 behavior where authority follows the source worktree
+    # HEAD and becomes stale when that HEAD moves. NULL is legacy history.
+    review_subject_revision_source = Column(String, nullable=True)
     review_subject_worktree = Column(String, nullable=True)
     review_superseded_at = Column(DateTime, nullable=True)
     # Recovery must not wake a parent until the completed child has been
@@ -2969,6 +2974,7 @@ def _migrate_child_assignment_columns() -> bool:
                 "review_subject_id VARCHAR, "
                 "review_subject_kind VARCHAR, "
                 "review_subject_revision VARCHAR, "
+                "review_subject_revision_source VARCHAR, "
                 "review_subject_worktree VARCHAR, "
                 "review_superseded_at DATETIME, "
                 "cleanup_acknowledged BOOLEAN NOT NULL DEFAULT 0, "
@@ -3047,6 +3053,7 @@ def _migrate_child_assignment_columns() -> bool:
             "review_subject_id": "VARCHAR",
             "review_subject_kind": "VARCHAR",
             "review_subject_revision": "VARCHAR",
+            "review_subject_revision_source": "VARCHAR",
             "review_subject_worktree": "VARCHAR",
             "review_superseded_at": "DATETIME",
         }
@@ -14533,7 +14540,22 @@ def _review_attempt_projection(
             if assignment.review_subject_worktree
             else None
         )
-        if snapshot is None or not snapshot[1] or snapshot[0] != assignment.review_subject_revision:
+        revision_source = assignment.review_subject_revision_source or "snapshot"
+        revision_matches = bool(
+            revision_source in {"explicit", "snapshot"}
+            and snapshot is not None
+            and snapshot[1]
+            and assignment.review_subject_revision
+            and (
+                _git_review_revision_available(
+                    cast(str, assignment.review_subject_worktree),
+                    cast(str, assignment.review_subject_revision),
+                )
+                if revision_source == "explicit"
+                else snapshot[0] == assignment.review_subject_revision
+            )
+        )
+        if not revision_matches:
             authority_state = "stale_revision"
             current = False
     return {
@@ -14547,6 +14569,11 @@ def _review_attempt_projection(
         "subject_id": assignment.review_subject_id,
         "subject_kind": kind,
         "revision": assignment.review_subject_revision,
+        "revision_source": (
+            assignment.review_subject_revision_source or "snapshot"
+            if kind == "git_commit"
+            else None
+        ),
         "authority_state": authority_state,
         "current_authority": current,
         "superseded_at": assignment.review_superseded_at,
@@ -14771,6 +14798,40 @@ def get_child_retirement_cleanup_intent(
 get_assigned_child_retirement_cleanup_intent = get_child_retirement_cleanup_intent
 
 
+def _reviewer_reuse_window_open(
+    db: Any,
+    assignment: ChildAssignmentModel,
+    terminal: TerminalModel,
+) -> bool:
+    """Keep a current reviewer resident while its parent may request rereview.
+
+    Result acknowledgement closes one immutable attempt, not the parent review
+    policy.  OPEN and OWNER_GATE are the only parent states that can still
+    admit an owner-authorized correction; retiring the reviewer in either
+    state would destroy the sole same-reviewer recovery path.
+    """
+    if assignment.review_superseded_at is not None or not _terminal_is_reviewer(terminal):
+        return False
+    if assignment.review_scope_sha256 is not None:
+        latest_for_scope = (
+            db.query(ChildAssignmentModel.id)
+            .filter(
+                ChildAssignmentModel.parent_terminal_id == assignment.parent_terminal_id,
+                ChildAssignmentModel.review_scope_sha256 == assignment.review_scope_sha256,
+                ChildAssignmentModel.review_superseded_at.is_(None),
+            )
+            .order_by(ChildAssignmentModel.id.desc())
+            .first()
+        )
+        if latest_for_scope is None or int(latest_for_scope[0]) != int(assignment.id):
+            return False
+    parent_workflow = _open_workflow(db, assignment.parent_terminal_id, create=False)
+    return bool(
+        parent_workflow is not None
+        and parent_workflow.status in {WORKFLOW_OPEN, WORKFLOW_OWNER_GATE}
+    )
+
+
 def list_completed_assigned_child_retirement_candidates(
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
@@ -14796,12 +14857,17 @@ def list_completed_assigned_child_retirement_candidates(
         )
         candidates: List[Dict[str, Any]] = []
         for assignment in assignments:
+            latest = _latest_child_assignment(db, assignment.child_terminal_id)
+            if latest is None or latest.id != assignment.id:
+                continue
             terminal = db.query(TerminalModel).filter_by(id=assignment.child_terminal_id).first()
             if terminal is None or terminal.runtime_lifecycle not in {
                 "running",
                 "exit_pending",
                 "exited",
             }:
+                continue
+            if _reviewer_reuse_window_open(db, assignment, terminal):
                 continue
             if _completed_retirement_result(db, assignment, "assign") is None:
                 continue
@@ -15250,6 +15316,8 @@ def claim_completed_child_retirement(
             }
         if assignment.retirement_claim_token is not None:
             return {"eligible": False, "error": "child_retirement_in_progress"}
+        if delegation_kind == "assign" and _reviewer_reuse_window_open(db, assignment, terminal):
+            return {"eligible": False, "error": "reviewer_reuse_window_open"}
 
         result_row = (
             db.query(DelegationResultModel)
@@ -15406,6 +15474,15 @@ def revalidate_completed_assigned_child_retirement(
             )
         )
         if owns_claim != 1:
+            db.rollback()
+            return False
+        assignment = _latest_child_assignment(db, child_terminal_id)
+        terminal = db.query(TerminalModel).filter_by(id=child_terminal_id).first()
+        if (
+            assignment is None
+            or terminal is None
+            or _reviewer_reuse_window_open(db, assignment, terminal)
+        ):
             db.rollback()
             return False
         workflow = _open_workflow(db, child_terminal_id, create=False)
@@ -16562,14 +16639,20 @@ def _assignment_for_child_workflow(
     child_workflow_id: int,
     *,
     parent_terminal_id: Optional[str] = None,
+    child_workflow_turn_id: Optional[int] = None,
 ) -> Optional[ChildAssignmentModel]:
-    """Resolve a callback to its immutable attempt, with a legacy-only fallback."""
+    """Resolve a callback to its exact workflow turn, with a legacy-only fallback."""
     query = db.query(ChildAssignmentModel).filter(
         ChildAssignmentModel.child_terminal_id == child_terminal_id
     )
     if parent_terminal_id is not None:
         query = query.filter(ChildAssignmentModel.parent_terminal_id == parent_terminal_id)
-    exact = query.filter(ChildAssignmentModel.child_workflow_id == child_workflow_id).first()
+    exact_query = query.filter(ChildAssignmentModel.child_workflow_id == child_workflow_id)
+    if child_workflow_turn_id is not None:
+        exact_query = exact_query.filter(
+            ChildAssignmentModel.child_workflow_turn_id == child_workflow_turn_id
+        )
+    exact = exact_query.order_by(ChildAssignmentModel.id.desc()).first()
     if exact is not None:
         return cast(ChildAssignmentModel, exact)
     return cast(
@@ -16630,11 +16713,30 @@ def _git_review_snapshot(worktree: str) -> Optional[tuple[str, bool]]:
         return None
 
 
+def _git_review_revision_available(worktree: str, revision: str) -> bool:
+    """Prove that one full immutable commit exists in the review repository."""
+    if not _REVIEW_REVISION_PATTERN.fullmatch(revision):
+        return False
+    try:
+        root = Path(worktree).resolve(strict=True)
+        available = subprocess.run(
+            ["git", "-C", str(root), "cat-file", "-e", f"{revision}^{{commit}}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return False
+    return available.returncode == 0
+
+
 def _review_subject_for_child(
     child: Optional[TerminalModel],
     request_sha256: str,
     *,
     allow_source_advance: bool = False,
+    requested_revision: Optional[str] = None,
 ) -> Dict[str, Optional[str]]:
     if not _terminal_is_reviewer(child):
         return {}
@@ -16658,50 +16760,61 @@ def _review_subject_for_child(
         and _REVIEW_REVISION_PATTERN.fullmatch(child.managed_worktree_commit.lower())
         else None
     )
+    explicit_revision = (
+        requested_revision.strip().lower() if isinstance(requested_revision, str) else None
+    )
     if snapshot is None or not snapshot[1]:
         return {
             "review_scope_sha256": scope_sha256,
             "review_subject_kind": "unbound",
             "review_subject_worktree": canonical_source,
         }
-    if expected is not None and snapshot[0] != expected and not allow_source_advance:
+    if explicit_revision is not None and not _REVIEW_REVISION_PATTERN.fullmatch(explicit_revision):
         return {
             "review_scope_sha256": scope_sha256,
             "review_subject_kind": "unbound",
             "review_subject_worktree": canonical_source,
         }
-    revision = snapshot[0] if allow_source_advance else expected or snapshot[0]
-    if allow_source_advance:
+    if (
+        explicit_revision is None
+        and expected is not None
+        and snapshot[0] != expected
+        and not allow_source_advance
+    ):
+        return {
+            "review_scope_sha256": scope_sha256,
+            "review_subject_kind": "unbound",
+            "review_subject_worktree": canonical_source,
+        }
+    revision = (
+        explicit_revision
+        if explicit_revision is not None
+        else snapshot[0] if allow_source_advance else expected or snapshot[0]
+    )
+    verify_reviewer_worktree = allow_source_advance or explicit_revision is not None
+    if explicit_revision is not None and not _git_review_revision_available(
+        canonical_source, revision
+    ):
+        return {
+            "review_scope_sha256": scope_sha256,
+            "review_subject_kind": "unbound",
+            "review_subject_worktree": canonical_source,
+        }
+    if verify_reviewer_worktree:
         # A warm reviewer remains in its immutable, clean read-only worktree.
-        # It can inspect a later commit through the shared Git object store;
-        # prove both properties before binding the new request to that commit.
+        # It can inspect an explicitly requested or later commit through the
+        # shared Git object store; prove both properties before binding it.
         reviewer_snapshot = (
             _git_review_snapshot(child.launch_worktree)
             if child is not None and isinstance(child.launch_worktree, str)
             else None
         )
-        try:
-            revision_available = subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    cast(str, child.launch_worktree),
-                    "cat-file",
-                    "-e",
-                    f"{revision}^{{commit}}",
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        except (OSError, RuntimeError, subprocess.SubprocessError):
-            revision_available = None
         if (
             reviewer_snapshot is None
             or not reviewer_snapshot[1]
-            or revision_available is None
-            or revision_available.returncode != 0
+            or child is None
+            or not isinstance(child.launch_worktree, str)
+            or not _git_review_revision_available(child.launch_worktree, revision)
         ):
             return {
                 "review_scope_sha256": scope_sha256,
@@ -16716,6 +16829,9 @@ def _review_subject_for_child(
         "review_subject_id": subject_id,
         "review_subject_kind": "git_commit",
         "review_subject_revision": revision,
+        "review_subject_revision_source": (
+            "explicit" if explicit_revision is not None else "snapshot"
+        ),
         "review_subject_worktree": canonical_source,
     }
 
@@ -16760,6 +16876,7 @@ def _register_child_attempt(
     workflow_effect_id: Optional[int] = None,
     request_message: Optional[str] = None,
     require_existing_reviewer_attempt: bool = False,
+    requested_review_revision: Optional[str] = None,
 ) -> bool:
     """Persist one immutable callback attempt and its exact review subject."""
     _ensure_child_assignment_schema()
@@ -16848,6 +16965,7 @@ def _register_child_attempt(
                 child,
                 cast(str, request_sha256),
                 allow_source_advance=reused_review_child,
+                requested_revision=requested_review_revision,
             )
             if request_sha256 is not None
             else (
@@ -16876,20 +16994,20 @@ def _register_child_attempt(
                 ChildAssignmentModel.review_superseded_at.is_(None),
             )
             if assignment.review_scope_sha256 is not None:
-                superseded_query = superseded_query.filter(
-                    or_(
-                        (
-                            (ChildAssignmentModel.request_workflow_id == workflow.id)
-                            & (
-                                ChildAssignmentModel.review_scope_sha256
-                                == assignment.review_scope_sha256
-                            )
-                        ),
-                        ChildAssignmentModel.review_subject_kind.in_(
-                            ("legacy_unscoped", "unbound")
-                        ),
-                    )
-                )
+                same_scope_current_workflow = (
+                    ChildAssignmentModel.request_workflow_id == workflow.id
+                ) & (ChildAssignmentModel.review_scope_sha256 == assignment.review_scope_sha256)
+                superseded_predicates = [
+                    same_scope_current_workflow,
+                    ChildAssignmentModel.review_subject_kind.in_(("legacy_unscoped", "unbound")),
+                ]
+                if reused_review_child and prior is not None:
+                    # An owner-gate resume creates a successor parent workflow,
+                    # but bounded reuse still replaces the same reviewer's
+                    # previous current attempt. Keep that exact history while
+                    # making its non-current status explicit.
+                    superseded_predicates.append(ChildAssignmentModel.id == prior.id)
+                superseded_query = superseded_query.filter(or_(*superseded_predicates))
             else:
                 # An admitted reviewer request whose source cannot be bound is
                 # itself non-authoritative, but it still proves that an older
@@ -16947,6 +17065,7 @@ def register_child_assignment(
     workflow_effect_id: Optional[int] = None,
     request_message: Optional[str] = None,
     require_existing_reviewer_attempt: bool = False,
+    requested_review_revision: Optional[str] = None,
 ) -> bool:
     """Persist one assigned-child result attempt.
 
@@ -16962,6 +17081,7 @@ def register_child_assignment(
         workflow_effect_id=workflow_effect_id,
         request_message=request_message,
         require_existing_reviewer_attempt=require_existing_reviewer_attempt,
+        requested_review_revision=requested_review_revision,
     )
 
 
@@ -16991,9 +17111,10 @@ def get_child_assignment_request_authority(
         ):
             return None
         return {
-            "attempt_id": assignment.attempt_id,
-            "subject_id": assignment.review_subject_id,
-            "revision": assignment.review_subject_revision,
+            "attempt_id": cast(str, assignment.attempt_id),
+            "subject_id": cast(str, assignment.review_subject_id),
+            "revision": cast(str, assignment.review_subject_revision),
+            "revision_source": cast(str, assignment.review_subject_revision_source or "snapshot"),
         }
 
 
@@ -17302,7 +17423,11 @@ def create_child_assignment_result_message(
                 "assigned result requires the registered child's admitted send_message effect"
             )
         assignment = _assignment_for_child_workflow(
-            db, sender_id, int(effect.workflow_id), parent_terminal_id=receiver_id
+            db,
+            sender_id,
+            int(effect.workflow_id),
+            parent_terminal_id=receiver_id,
+            child_workflow_turn_id=workflow_turn_id,
         )
         if assignment is None:
             return None, False
@@ -17377,7 +17502,12 @@ def create_assigned_child_completion_result_message(
             raise PermissionError(
                 "assigned completion requires the child's admitted complete_workflow effect"
             )
-        assignment = _assignment_for_child_workflow(db, child_terminal_id, int(effect.workflow_id))
+        assignment = _assignment_for_child_workflow(
+            db,
+            child_terminal_id,
+            int(effect.workflow_id),
+            child_workflow_turn_id=workflow_turn_id,
+        )
         if assignment is None or assignment.status == ChildAssignmentStatus.CANCELLED.value:
             return None, False
         parent_workflow = _open_workflow(db, assignment.parent_terminal_id, create=False)
@@ -17595,7 +17725,17 @@ def _review_acknowledgement_reason(
     snapshot = _git_review_snapshot(assignment.review_subject_worktree)
     if snapshot is None:
         return "RESULT_REVIEW_SUBJECT_UNAVAILABLE"
-    if not snapshot[1] or snapshot[0] != assignment.review_subject_revision:
+    if not snapshot[1]:
+        return "RESULT_REVIEW_REVISION_STALE"
+    revision_source = assignment.review_subject_revision_source or "snapshot"
+    if revision_source not in {"explicit", "snapshot"}:
+        return "RESULT_REVIEW_AUTHORITY_UNBOUND"
+    if revision_source == "explicit":
+        if not _git_review_revision_available(
+            assignment.review_subject_worktree, assignment.review_subject_revision
+        ):
+            return "RESULT_REVIEW_SUBJECT_UNAVAILABLE"
+    elif snapshot[0] != assignment.review_subject_revision:
         return "RESULT_REVIEW_REVISION_STALE"
     return None
 

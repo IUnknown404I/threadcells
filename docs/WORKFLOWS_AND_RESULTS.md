@@ -49,6 +49,8 @@ A result normally includes a concise summary, changed files, checks performed, r
 
 Delivery is at-least-once. If the parent restarts before acknowledging a delivered result, ThreadCells can deliver it again. The parent should use the immutable result identity to avoid incorporating the same work twice.
 
+Review results carry narrower authority: the exact attempt, review subject, and Git revision must all match. When an assignment supplies an exact review revision, ThreadCells proves and binds that immutable commit while creating the durable attempt; a parent, session, or reviewer worktree `HEAD` cannot replace it. If the commit cannot be proven, reviewer input is not sent and the attempt remains non-authoritative. Acknowledging one review preserves its history but does not retire the current reviewer while the parent workflow is still open or owner-gated. An authorized rereview creates a fresh attempt for the requested revision, and the earlier result remains historical only.
+
 Inbox delivery is FIFO within a terminal and bound to the exact workflow and logical turn that created it. A pending transport is delivery state, not authority to move a payload or result to another workflow. If its bound workflow is no longer open, ThreadCells terminalizes that stale transport and lets newer open owner work proceed without rebinding the payload, workflow, delivery, receipt, or effect identity. The same reconciliation runs after restart and is idempotent.
 
 ## Provider completion versus workflow completion

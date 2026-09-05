@@ -73,6 +73,7 @@ from cli_agent_orchestrator.clients.database import (
     mark_terminal_runtime_recovery_required_with_workflow_ids,
     mark_terminal_runtime_running,
     mark_workflow_provider_reconnect_launch_dispatched,
+    persist_terminal_provider_last_response,
     persist_terminal_result_snapshot,
     promote_terminal_context_role_to_supervisor,
     reconcile_legacy_terminal_runtime_identity,
@@ -109,6 +110,9 @@ from cli_agent_orchestrator.providers.codex import (
     CodexStartupNoReadyError,
 )
 from cli_agent_orchestrator.providers.codex import ProviderError as CodexProviderError
+from cli_agent_orchestrator.providers.codex import (
+    _bounded_response_suffix,
+)
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.compressed_output_index import (
     CompressedOutputIndex,
@@ -117,6 +121,7 @@ from cli_agent_orchestrator.services.compressed_output_index import (
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.terminal_render import ParserState as _TerminalRenderState
 from cli_agent_orchestrator.services.terminal_render import (
+    has_cross_line_screen_semantics,
     has_screen_semantics,
     render_terminal_stream,
 )
@@ -947,6 +952,7 @@ def _render_progressive_terminal_page(
     prefix_context: bytes,
     prefix_truncated: bool,
     expected_end_state: _TerminalRenderState | None,
+    line_isolated: bool = False,
 ) -> _TerminalRenderResult:
     """Render one bounded page with bounded terminal-parser look-behind.
 
@@ -960,12 +966,22 @@ def _render_progressive_terminal_page(
     value = context_text + payload_text
     emit_from = len(context_text)
     if has_screen_semantics(value):
+        # A newline-isolated older range owns its complete line-local viewport.
+        # Rendering only its payload preserves CR/backspace/horizontal edits
+        # without duplicating a later page's screen. Absolute/vertical screen
+        # controls still use the shared context and newest-page ownership.
+        owns_line_local_screen = (
+            expected_end_state == _TerminalRenderState.NORMAL
+            and line_isolated
+            and has_screen_semantics(payload_text)
+            and not has_cross_line_screen_semantics(payload_text)
+        )
         semantic = render_terminal_stream(
-            value,
-            emit_from=emit_from,
+            payload_text if owns_line_local_screen else value,
+            emit_from=0 if owns_line_local_screen else emit_from,
             # Only the newest page owns the current viewport. Residual screens
-            # from older pages are superseded by the later byte ranges.
-            include_screen=expected_end_state is None,
+            # from cross-line older pages are superseded by later byte ranges.
+            include_screen=expected_end_state is None or owns_line_local_screen,
         )
         return _TerminalRenderResult(
             output=semantic.output,
@@ -2734,6 +2750,108 @@ def bind_provider_runtime_session_identity(
     return verified
 
 
+def persist_provider_completed_response(
+    terminal_id: str,
+    *,
+    provider_session_id: str,
+    transcript_path: str,
+    working_directory: str,
+    runtime_generation: str,
+    response: str,
+) -> int:
+    """Persist one Codex response at its synchronous provider Stop boundary.
+
+    The callback is accepted only from the exact live runtime, provider root,
+    transcript, and managed working directory already bound at SessionStart.
+    Its file size is a monotonic per-session completion boundary; the response
+    itself is bounded before entering durable UI state.
+    """
+    metadata = get_terminal_metadata(terminal_id)
+    if (
+        metadata is None
+        or metadata.get("provider") != ProviderType.CODEX.value
+        or metadata.get("runtime_lifecycle") != "running"
+        or not isinstance(runtime_generation, str)
+        or not hmac.compare_digest(
+            str(metadata.get("runtime_generation") or ""), runtime_generation
+        )
+        or not hmac.compare_digest(
+            str(metadata.get("provider_resume_identity") or ""), provider_session_id
+        )
+        or not hmac.compare_digest(
+            str(metadata.get("provider_resume_runtime_generation") or ""),
+            runtime_generation,
+        )
+        or not isinstance(response, str)
+        or not response.strip()
+        or not os.path.isabs(working_directory)
+        or not os.path.isabs(transcript_path)
+    ):
+        raise RuntimeError("Codex completion callback is stale or malformed")
+    if (
+        not isinstance(metadata.get("launch_worktree"), str)
+        or not os.path.isabs(str(metadata["launch_worktree"]))
+        or Path(str(metadata["launch_worktree"])).resolve(strict=False)
+        != Path(working_directory).resolve(strict=False)
+    ):
+        raise RuntimeError("Codex completion is outside its launch worktree")
+
+    try:
+        resolved_transcript = Path(transcript_path).resolve(strict=True)
+    except (FileNotFoundError, OSError) as exc:
+        raise RuntimeError("Codex completion transcript is unavailable") from exc
+    provider = provider_manager.get_provider(terminal_id)
+    resolver = getattr(provider, "runtime_sidecar_resume_identity", None)
+    if resolver is None:
+        raise RuntimeError(f"Provider for terminal '{terminal_id}' cannot prove completion")
+    try:
+        verified = resolver(
+            expected_identity=provider_session_id,
+            expected_rollout_path=resolved_transcript,
+        )
+    except CodexProviderError as exc:
+        raise RuntimeError("Codex completion does not own the foreground runtime") from exc
+    if not isinstance(verified, str) or not hmac.compare_digest(verified, provider_session_id):
+        raise RuntimeError("Codex completion has stale provider identity")
+
+    pane_working_directory = tmux_client.get_pane_working_directory(
+        str(metadata["tmux_session"]), str(metadata["tmux_window"])
+    )
+    if (
+        not pane_working_directory
+        or not os.path.isabs(pane_working_directory)
+        or Path(pane_working_directory).resolve(strict=False)
+        != Path(working_directory).resolve(strict=False)
+    ):
+        raise RuntimeError("Codex completion working directory is stale")
+
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            resolved_transcript,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        source = os.fstat(descriptor)
+        if not stat.S_ISREG(source.st_mode):
+            raise RuntimeError("Codex completion transcript is not a regular file")
+        completion_offset = source.st_size
+    except OSError as exc:
+        raise RuntimeError("Codex completion transcript is unavailable") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    if not persist_terminal_provider_last_response(
+        terminal_id,
+        provider=ProviderType.CODEX.value,
+        provider_session_id=verified,
+        completion_offset=completion_offset,
+        response=_bounded_response_suffix(response),
+    ):
+        raise RuntimeError("Could not durably persist Codex completion")
+    return completion_offset
+
+
 def verify_provider_runtime_sidecar_resume_identity(terminal_id: str, resume_identity: str) -> None:
     """Prove the persisted identity still belongs to the foreground runtime."""
     provider = provider_manager.get_provider(terminal_id)
@@ -3631,6 +3749,7 @@ def _get_compressed_output_chunk(
                 prefix_context=prefix_context,
                 prefix_truncated=prefix_truncated,
                 expected_end_state=expected_end_state,
+                line_isolated=line_isolated,
             )
             rendered = render_result.output
             start_render_state = render_result.state_at_emit
@@ -3646,6 +3765,7 @@ def _get_compressed_output_chunk(
                 prefix_context=prefix_context,
                 prefix_truncated=prefix_truncated,
                 expected_end_state=expected_end_state,
+                line_isolated=line_isolated,
             )
             rendered = render_result.output
             start_render_state = render_result.state_at_emit
@@ -3728,6 +3848,7 @@ def get_output_chunk(terminal_id: str, cursor: str | None = None) -> TerminalOut
                 prefix_context=prefix_context,
                 prefix_truncated=prefix_truncated,
                 expected_end_state=expected_end_state,
+                line_isolated=line_isolated,
             )
             rendered = render_result.output
             start_render_state = render_result.state_at_emit
@@ -3744,6 +3865,7 @@ def get_output_chunk(terminal_id: str, cursor: str | None = None) -> TerminalOut
                 prefix_context=prefix_context,
                 prefix_truncated=prefix_truncated,
                 expected_end_state=expected_end_state,
+                line_isolated=line_isolated,
             )
             rendered = render_result.output
             start_render_state = render_result.state_at_emit

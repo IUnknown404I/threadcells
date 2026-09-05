@@ -28,6 +28,7 @@ from cli_agent_orchestrator.providers.codex import (
 from cli_agent_orchestrator.services.compressed_output_index import (
     precompute_compressed_output_index,
 )
+from cli_agent_orchestrator.services.terminal_render import ParserState
 from cli_agent_orchestrator.services.terminal_service import (
     LAST_OUTPUT_READ_MAX_BYTES,
     LAST_OUTPUT_RESPONSE_MAX_BYTES,
@@ -40,6 +41,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     _canonical_worktree,
     _create_terminal_after_admission,
     _render_progressive_terminal_output,
+    _render_progressive_terminal_page,
     _resolve_context_role,
     _sanitize_human_terminal_output,
     _write_enabled_lane,
@@ -132,6 +134,18 @@ def test_human_output_semantic_expansion_stays_bounded():
     rendered = _sanitize_human_terminal_output(raw)
 
     assert len(rendered) <= OUTPUT_CHUNK_MAX_BYTES
+
+
+def test_isolated_older_semantic_page_preserves_residual_viewport_prose():
+    rendered = _render_progressive_terminal_page(
+        b"draft\rFinal\nline one\nline two\n",
+        prefix_context=b"",
+        prefix_truncated=False,
+        expected_end_state=ParserState.NORMAL,
+        line_isolated=True,
+    )
+
+    assert rendered.output == "Final\nline one\nline two"
 
 
 def test_bind_provider_runtime_session_identity_proves_exact_hook_path(monkeypatch, tmp_path):
@@ -3235,6 +3249,22 @@ class TestGetOutput:
         assert ranges[0][0] == 0
         assert ranges[-1][1] == len(expected.encode())
         assert all(older[1] == newer[0] for older, newer in zip(ranges, ranges[1:]))
+
+    def test_full_output_preserves_isolated_semantic_prose_on_an_older_page(
+        self, monkeypatch, tmp_path
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        semantic = b"draft\rFinal\nline one\nline two\n"
+        newer = b"x" * (OUTPUT_CHUNK_MAX_BYTES - 5) + b"\n"
+        (tmp_path / "test1234.log").write_bytes(semantic + newer)
+
+        newest = get_output_chunk("test1234")
+        assert newest.cursor is not None
+        older = get_output_chunk("test1234", newest.cursor)
+
+        assert older.output == "Final\nline one\nline two"
+        assert older.end_offset == newest.start_offset
+        assert older.output + newest.output == "Final\nline one\nline two" + newer.decode()
 
     def test_full_output_preserves_utf8_boundaries_and_replaces_malformed_bytes(
         self, monkeypatch, tmp_path

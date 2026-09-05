@@ -1735,6 +1735,14 @@ class CodexProvider(BaseProvider):
             f"command={_toml_scalar(hook_command)},timeout=30}}]}}]"
         )
         command_parts.extend(["-c", hook_config])
+        completion_hook_command = shlex.join(
+            [sys.executable, "-m", "cli_agent_orchestrator.codex_completion_hook"]
+        )
+        completion_hook_config = (
+            'hooks.Stop=[{hooks=[{type="command",'
+            f"command={_toml_scalar(completion_hook_command)},timeout=30}}]}}]"
+        )
+        command_parts.extend(["-c", completion_hook_config])
 
         if resume_session_id is not None:
             command_parts.extend(["resume", resume_session_id])

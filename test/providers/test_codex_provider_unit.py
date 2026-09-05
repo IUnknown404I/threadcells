@@ -19,6 +19,7 @@ from cli_agent_orchestrator.providers.codex import (
     CodexStartupNoReadyError,
     ProviderError,
     _codex_wrapper_preapplies_hook_trust,
+    _latest_completed_codex_response,
 )
 from cli_agent_orchestrator.runtime_generation import (
     ACTIVE_RUNTIME_GENERATION,
@@ -47,6 +48,17 @@ def _assert_managed_session_hook(command: str) -> list[str]:
         in hook_values[0]
     )
     assert "timeout=30" in hook_values[0]
+    completion_hook_values = [
+        parts[index + 1]
+        for index, part in enumerate(parts[:-1])
+        if part == "-c" and parts[index + 1].startswith("hooks.Stop=")
+    ]
+    assert len(completion_hook_values) == 1
+    assert (
+        shlex.join([sys.executable, "-m", "cli_agent_orchestrator.codex_completion_hook"])
+        in completion_hook_values[0]
+    )
+    assert "timeout=30" in completion_hook_values[0]
     assert "CAO_TERMINAL_AUTH_TOKEN" not in command
     return parts
 
@@ -1572,6 +1584,115 @@ class TestCodexBulletFormatStatusDetection:
         with rollout.open("ab") as handle:
             handle.write(b"x" * (9 * 1024 * 1024) + b"\n")
         assert provider.get_durable_last_response() == "authoritative completed response"
+
+    def test_first_last_read_uses_stop_persistence_beyond_eight_megabyte_active_tail(
+        self, tmp_path, monkeypatch
+    ):
+        from cli_agent_orchestrator.services import terminal_service
+
+        provider = CodexProvider("test1234", "test-session", "window-0")
+        working_directory = tmp_path / "project"
+        working_directory.mkdir()
+        codex_home = tmp_path / "codex"
+        identity = "01234567-89ab-cdef-0123-456789abcdef"
+        generation = "11111111-2222-4333-8444-555555555555"
+        rollout = _open_rollout_fixture(
+            tmp_path / "proc",
+            codex_home,
+            process_id=200,
+            descriptor="8",
+            session_id=identity,
+            working_directory=working_directory,
+        )
+        with rollout.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "task_complete",
+                            "last_agent_message": "cold authoritative response — ✓",
+                        },
+                    }
+                )
+                + "\n"
+            )
+
+        cached = {}
+        proof_provider = MagicMock()
+        proof_provider.runtime_sidecar_resume_identity.return_value = identity
+        manager = MagicMock()
+        manager.get_provider.return_value = proof_provider
+        tmux = MagicMock()
+        tmux.get_pane_working_directory.return_value = str(working_directory)
+        monkeypatch.setattr(terminal_service, "provider_manager", manager)
+        monkeypatch.setattr(terminal_service, "tmux_client", tmux)
+        monkeypatch.setattr(
+            terminal_service,
+            "get_terminal_metadata",
+            lambda _terminal_id: {
+                "id": "test1234",
+                "provider": "codex",
+                "runtime_lifecycle": "running",
+                "runtime_generation": generation,
+                "provider_resume_identity": identity,
+                "provider_resume_runtime_generation": generation,
+                "launch_worktree": str(working_directory),
+                "tmux_session": "test-session",
+                "tmux_window": "window-0",
+            },
+        )
+
+        def persist(_terminal_id, **values):
+            cached["response"] = values["response"]
+            cached["completion_offset"] = values["completion_offset"]
+            return True
+
+        monkeypatch.setattr(terminal_service, "persist_terminal_provider_last_response", persist)
+
+        assert (
+            terminal_service.persist_provider_completed_response(
+                "test1234",
+                provider_session_id=identity,
+                transcript_path=str(rollout),
+                working_directory=str(working_directory),
+                runtime_generation=generation,
+                response="cold authoritative response — ✓",
+            )
+            == rollout.stat().st_size
+        )
+        proof_provider.runtime_sidecar_resume_identity.assert_called_once_with(
+            expected_identity=identity,
+            expected_rollout_path=rollout.resolve(),
+        )
+        assert cached == {
+            "response": "cold authoritative response — ✓",
+            "completion_offset": rollout.stat().st_size,
+        }
+        with rollout.open("ab") as handle:
+            handle.write(
+                json.dumps({"type": "event_msg", "payload": {"type": "task_started"}}).encode()
+                + b"\n"
+                + b"x" * (9 * 1024 * 1024)
+                + b"\n"
+            )
+        assert _latest_completed_codex_response(rollout) is None
+
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            lambda _terminal_id: {
+                "id": "test1234",
+                "provider_resume_identity": identity,
+                "launch_worktree": str(working_directory),
+            },
+        )
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.clients.database.get_terminal_provider_last_response",
+            lambda *_args, **_kwargs: cached.get("response"),
+        )
+
+        assert provider.get_durable_last_response() == "cold authoritative response — ✓"
 
     @patch("cli_agent_orchestrator.providers.codex.tmux_client")
     def test_structured_policy_outcome_uses_exact_rollout_without_response_content(

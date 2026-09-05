@@ -25,6 +25,17 @@ def _headers(generation=ACTIVE_RUNTIME_GENERATION):
     }
 
 
+def _completion_payload():
+    return {
+        "session_id": "01234567-89ab-cdef-0123-456789abcdef",
+        "transcript_path": "/tmp/codex/sessions/rollout.jsonl",
+        "cwd": "/tmp/project",
+        "turn_id": "turn-123",
+        "last_assistant_message": "completed response — ✓",
+        "runtime_generation": "11111111-2222-4333-8444-555555555555",
+    }
+
+
 def test_codex_session_identity_requires_exact_terminal_bearer(client):
     with patch("cli_agent_orchestrator.api.main.terminal_auth_token_matches", return_value=False):
         response = client.post(
@@ -181,3 +192,77 @@ def test_codex_session_identity_fails_closed_when_foreground_proof_fails(client)
         )
     assert response.status_code == 409
     assert response.json()["detail"] == "identity_not_proven"
+
+
+def test_codex_turn_complete_requires_exact_terminal_bearer(client):
+    with patch("cli_agent_orchestrator.api.main.terminal_auth_token_matches", return_value=False):
+        response = client.post(
+            "/_internal/terminals/abcdef12/codex-turn-complete",
+            json=_completion_payload(),
+            headers=_headers(),
+        )
+    assert response.status_code == 401
+
+
+def test_codex_turn_complete_requires_current_service_generation(client):
+    with (
+        patch("cli_agent_orchestrator.api.main.terminal_auth_token_matches", return_value=True),
+        patch(
+            "cli_agent_orchestrator.api.main.terminal_service.persist_provider_completed_response"
+        ) as persist,
+    ):
+        response = client.post(
+            "/_internal/terminals/abcdef12/codex-turn-complete",
+            json=_completion_payload(),
+            headers=_headers("b" * 64),
+        )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "stale_runtime_generation"
+    persist.assert_not_called()
+
+
+def test_codex_turn_complete_persists_only_server_proven_completion(client):
+    with (
+        patch(
+            "cli_agent_orchestrator.api.main.terminal_auth_token_matches", return_value=True
+        ) as auth,
+        patch(
+            "cli_agent_orchestrator.api.main.terminal_service.persist_provider_completed_response",
+            return_value=1234,
+        ) as persist,
+    ):
+        response = client.post(
+            "/_internal/terminals/abcdef12/codex-turn-complete",
+            json=_completion_payload(),
+            headers=_headers(),
+        )
+    assert response.status_code == 200
+    assert response.json() == {
+        "session_id": _completion_payload()["session_id"],
+        "completion_offset": 1234,
+    }
+    auth.assert_called_once_with("abcdef12", "terminal-secret")
+    assert persist.call_args.kwargs == {
+        "provider_session_id": _completion_payload()["session_id"],
+        "transcript_path": _completion_payload()["transcript_path"],
+        "working_directory": _completion_payload()["cwd"],
+        "runtime_generation": _completion_payload()["runtime_generation"],
+        "response": _completion_payload()["last_assistant_message"],
+    }
+
+
+def test_codex_turn_complete_fails_closed_when_runtime_proof_fails(client):
+    with (
+        patch("cli_agent_orchestrator.api.main.terminal_auth_token_matches", return_value=True),
+        patch(
+            "cli_agent_orchestrator.api.main.terminal_service.persist_provider_completed_response",
+            side_effect=RuntimeError("wrong rollout"),
+        ),
+    ):
+        response = client.post(
+            "/_internal/terminals/abcdef12/codex-turn-complete",
+            json=_completion_payload(),
+            headers=_headers(),
+        )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "completion_not_proven"

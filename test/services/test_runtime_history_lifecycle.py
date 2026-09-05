@@ -413,6 +413,10 @@ def test_recovery_fenced_terminal_history_remains_available(tmp_path, monkeypatc
 def test_exited_terminal_output_reads_housekeeping_compressed_log(tmp_path, monkeypatch):
     import gzip
 
+    from cli_agent_orchestrator.services.compressed_output_index import (
+        precompute_compressed_output_index,
+    )
+
     metadata = {
         "id": "closed00",
         "tmux_session": "cao-history",
@@ -421,6 +425,10 @@ def test_exited_terminal_output_reads_housekeeping_compressed_log(tmp_path, monk
     }
     with gzip.open(tmp_path / "closed00.log.gz", "wt", encoding="utf-8") as stream:
         stream.write("compressed durable output")
+    precompute_compressed_output_index(
+        tmp_path / "closed00.log.gz",
+        expected_raw_size=len(b"compressed durable output"),
+    )
     monkeypatch.setattr(terminal_service, "TERMINAL_LOG_DIR", tmp_path)
     monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda *_: metadata)
     monkeypatch.setattr(

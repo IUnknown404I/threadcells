@@ -32,6 +32,11 @@ class ParserState(IntEnum):
 _CSI_PATTERN = re.compile(r"(?:\x1b\[|\x9b)([0-9:;<=>?]*)([ -/]*)([@-~])")
 _SCREEN_FINALS = frozenset("@ABCDEFGHJKLMPSTX`abcdefgrsu")
 _ESC_SCREEN_FINALS = frozenset("78DEM")
+# These controls can mutate rows outside the line that contains them. They
+# therefore need the shared bounded viewport context across progressive pages.
+# Horizontal cursor/edit controls remain safe to render independently when a
+# raw page starts and ends at hard newline boundaries.
+_CROSS_LINE_SCREEN_FINALS = frozenset("ABEFHJLMSTdefrsu")
 _TAB_CONTINUATION = "\x00"
 MAX_VIEWPORT_ROWS = 200
 MAX_CURSOR_COLUMN = 4_096
@@ -45,6 +50,15 @@ def has_screen_semantics(value: str) -> bool:
     if any(f"\x1b{final}" in value for final in _ESC_SCREEN_FINALS):
         return True
     return any(match.group(3) in _SCREEN_FINALS for match in _CSI_PATTERN.finditer(value))
+
+
+def has_cross_line_screen_semantics(value: str) -> bool:
+    """Return whether screen mutations can reach beyond one isolated line range."""
+    if any(f"\x1b{final}" in value for final in _ESC_SCREEN_FINALS):
+        return True
+    return any(
+        match.group(3) in _CROSS_LINE_SCREEN_FINALS for match in _CSI_PATTERN.finditer(value)
+    )
 
 
 def infer_viewport_rows(value: str, default: int = 24) -> int:

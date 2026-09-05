@@ -485,6 +485,19 @@ class CodexSessionIdentityRequest(BaseModel):
     runtime_generation: str = Field(pattern=r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 
 
+class CodexTurnCompleteRequest(BaseModel):
+    """Exact provider completion emitted by the managed Codex Stop hook."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    session_id: str = Field(pattern=r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
+    transcript_path: str = Field(min_length=1, max_length=4096)
+    cwd: str = Field(min_length=1, max_length=4096)
+    turn_id: str = Field(min_length=1, max_length=256)
+    last_assistant_message: str = Field(min_length=1, max_length=4 * 1024 * 1024)
+    runtime_generation: str = Field(pattern=r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
+
+
 class CreateFlowRequest(BaseModel):
     """Request model for creating a flow."""
 
@@ -2533,6 +2546,49 @@ async def bind_codex_session_identity_endpoint(
             ),
         ) from exc
     return {"session_id": identity}
+
+
+@app.post(
+    "/_internal/terminals/{terminal_id}/codex-turn-complete",
+    include_in_schema=False,
+)
+async def persist_codex_turn_complete_endpoint(
+    terminal_id: TerminalId,
+    request: Request,
+    body: CodexTurnCompleteRequest,
+) -> Dict[str, Any]:
+    """Persist the bounded exact-session response before Codex settles a turn."""
+    authorization = request.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if (
+        scheme.lower() != "bearer"
+        or not token
+        or not terminal_auth_token_matches(terminal_id, token)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_terminal_auth"
+        )
+    caller_generation = request.headers.get(RUNTIME_GENERATION_HEADER, "")
+    if not hmac.compare_digest(caller_generation, ACTIVE_RUNTIME_GENERATION):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="stale_runtime_generation")
+    try:
+        completion_offset = await run_in_threadpool(
+            partial(
+                terminal_service.persist_provider_completed_response,
+                terminal_id,
+                provider_session_id=body.session_id,
+                transcript_path=body.transcript_path,
+                working_directory=body.cwd,
+                runtime_generation=body.runtime_generation,
+                response=body.last_assistant_message,
+            )
+        )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="completion_not_proven",
+        ) from exc
+    return {"session_id": body.session_id, "completion_offset": completion_offset}
 
 
 @app.post(

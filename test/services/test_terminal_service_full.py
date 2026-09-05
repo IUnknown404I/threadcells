@@ -153,6 +153,37 @@ def test_isolated_older_semantic_page_preserves_residual_viewport_prose():
     assert rendered.output + newer == single_stream
 
 
+@pytest.mark.parametrize("trailing_linefeeds", [0, 1, 2, 4, 30])
+def test_line_local_semantic_page_preserves_exact_trailing_linefeeds(trailing_linefeeds):
+    payload = b"draft\rFinal" + b"\n" * trailing_linefeeds
+    rendered = _render_progressive_terminal_page(
+        payload,
+        prefix_context=b"",
+        prefix_truncated=False,
+        expected_end_state=ParserState.NORMAL,
+        line_isolated=True,
+    )
+
+    newer = "newer prose"
+    assert rendered.output == "Final" + "\n" * trailing_linefeeds
+    assert rendered.output + newer == render_terminal_stream(payload.decode() + newer).output
+
+
+def test_line_local_semantic_page_preserves_visible_whitespace_unicode_and_edits():
+    payload = "draft\rФинал\nA\tB\nAB\bC\n \t\n\n\n".encode()
+    rendered = _render_progressive_terminal_page(
+        payload,
+        prefix_context=b"",
+        prefix_truncated=False,
+        expected_end_state=ParserState.NORMAL,
+        line_isolated=True,
+    )
+
+    newer = "новее ✓"
+    assert rendered.output == "Финал\nA\tB\nAC\n \t\n\n\n"
+    assert rendered.output + newer == render_terminal_stream(payload.decode() + newer).output
+
+
 def test_nonisolated_older_semantic_page_does_not_invent_line_separator():
     older_payload = b"draft\rFinal"
     newer_payload = b" suffix"
@@ -3323,6 +3354,52 @@ class TestGetOutput:
         assert len(chunks) >= 3
         assert "".join(chunks) == render_terminal_stream(raw).output
         assert all(older[1] == newer[0] for older, newer in zip(ranges, ranges[1:]))
+
+    @pytest.mark.parametrize("chunk_bytes", [64, 97, 128, 191])
+    def test_forced_pagination_preserves_exact_trailing_linefeed_multiplicity(
+        self, monkeypatch, tmp_path, chunk_bytes
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.OUTPUT_CHUNK_MAX_BYTES",
+            chunk_bytes,
+        )
+        semantic = b"draft\rFinal\nline\n\n\n"
+        newer_prefix = b"newer prose"
+        newer = newer_prefix + b"x" * (chunk_bytes - 4 - len(newer_prefix))
+        raw = semantic + newer
+        (tmp_path / "test1234.log").write_bytes(raw)
+
+        newest = get_output_chunk("test1234")
+        assert newest.cursor is not None
+        older = get_output_chunk("test1234", newest.cursor)
+
+        assert (older.start_offset, older.end_offset) == (0, len(semantic))
+        assert older.end_offset == newest.start_offset
+        assert older.output + newest.output == render_terminal_stream(raw.decode()).output
+
+    def test_forced_hard_boundary_without_linefeed_invents_no_separator(
+        self, monkeypatch, tmp_path
+    ):
+        self._durable_terminal(monkeypatch, tmp_path)
+        chunk_bytes = 64
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.OUTPUT_CHUNK_MAX_BYTES",
+            chunk_bytes,
+        )
+        semantic = b"draft\rFinal"
+        newer_prefix = b"newer prose"
+        newer = newer_prefix + b"x" * (chunk_bytes - 4 - len(newer_prefix))
+        raw = semantic + newer
+        (tmp_path / "test1234.log").write_bytes(raw)
+
+        newest = get_output_chunk("test1234")
+        assert newest.cursor is not None
+        older = get_output_chunk("test1234", newest.cursor)
+
+        assert older.end_offset == newest.start_offset
+        assert older.output + newest.output == render_terminal_stream(raw.decode()).output
+        assert "Finalnewer prose" in older.output + newest.output
 
     def test_full_output_preserves_utf8_boundaries_and_replaces_malformed_bytes(
         self, monkeypatch, tmp_path

@@ -117,6 +117,11 @@ class _Viewport:
         self.committed: deque[str] = deque()
         self.committed_characters = 0
         self.leading_linefeed_rows = 0
+        # The viewport has a fixed physical height, but only rows at or below
+        # this boundary were reached by the rendered stream. Progressive page
+        # ownership can therefore retain exact trailing logical rows without
+        # exposing the unused remainder of the physical viewport.
+        self.logical_bottom = 0
 
     @staticmethod
     def _text(row: list[str]) -> str:
@@ -160,8 +165,10 @@ class _Viewport:
             self._scroll_up()
         else:
             self.row = min(self.height - 1, self.row + 1)
+        self.logical_bottom = max(self.logical_bottom, self.row)
 
     def write(self, character: str) -> None:
+        self.logical_bottom = max(self.logical_bottom, self.row)
         width = _cell_width(character)
         if width == 0:
             if self.column > 0 and self.rows[self.row]:
@@ -226,6 +233,7 @@ class _Viewport:
 
     def horizontal_tab(self) -> None:
         """Advance to the next conventional eight-column terminal tab stop."""
+        self.logical_bottom = max(self.logical_bottom, self.row)
         target = min(MAX_CURSOR_COLUMN, ((self.column // 8) + 1) * 8)
         row = self.rows[self.row]
         if len(row) < target:
@@ -325,16 +333,23 @@ class _Viewport:
         elif final == "u":
             self.row, self.column = self.saved
 
-    def result(self, include_screen: bool) -> str:
+    def result(self, include_screen: bool, *, preserve_trailing_rows: bool = False) -> str:
         lines = list(self.committed)
         if include_screen:
             screen = [self._text(row) for row in self.rows]
-            leading = 0
-            while leading < len(screen) and not screen[leading]:
-                leading += 1
-            del screen[: max(0, leading - self.leading_linefeed_rows)]
-            while screen and not screen[-1]:
-                screen.pop()
+            if preserve_trailing_rows:
+                # Include exactly the logical rows the stream reached. Empty
+                # rows inside that extent are real terminal line structure;
+                # rows below it are only unused viewport capacity.
+                del screen[self.logical_bottom + 1 :]
+            else:
+                if not self.committed:
+                    leading = 0
+                    while leading < len(screen) and not screen[leading]:
+                        leading += 1
+                    del screen[: max(0, leading - self.leading_linefeed_rows)]
+                while screen and not screen[-1]:
+                    screen.pop()
             lines.extend(screen)
         if not lines:
             return ""
@@ -348,6 +363,7 @@ def render_terminal_stream(
     emit_from: int = 0,
     include_screen: bool = True,
     initial_state: ParserState = ParserState.NORMAL,
+    preserve_trailing_rows: bool = False,
 ) -> RenderedTerminal:
     """Apply bounded terminal semantics and emit only the requested page window."""
     if not 0 <= emit_from <= len(value):
@@ -483,7 +499,10 @@ def render_terminal_stream(
         state_at_emit = state
         viewport.begin_collecting()
     return RenderedTerminal(
-        output=viewport.result(include_screen),
+        output=viewport.result(
+            include_screen,
+            preserve_trailing_rows=preserve_trailing_rows,
+        ),
         state_at_emit=state_at_emit,
         final_state=state,
         orphan_string_terminator=orphan,

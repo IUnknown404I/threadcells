@@ -805,47 +805,84 @@ class TestKillWindow:
 
 class TestSessionExists:
     def test_session_exists_true(self, tmux):
-        tmux.server.sessions.get.return_value = MagicMock()
+        tmux.server.cmd.return_value = MagicMock(returncode=0, stdout=[], stderr=[])
 
         assert tmux.session_exists("ses") is True
 
     def test_session_exists_false(self, tmux):
-        tmux.server.sessions.get.return_value = None
+        tmux.server.cmd.return_value = MagicMock(
+            returncode=1,
+            stdout=["can't find session: ses"],
+            stderr=["can't find session: ses"],
+        )
 
         assert tmux.session_exists("ses") is False
 
-    def test_session_exists_treats_real_libtmux_absence_as_false(self, tmux):
-        """libtmux's authoritative missing-object signal is not an inventory failure."""
-        from libtmux._internal.query_list import ObjectDoesNotExist
-
-        tmux.server.sessions.get.side_effect = ObjectDoesNotExist("ses")
-        tmux.server.cmd.return_value.returncode = 0
-        tmux.server.cmd.return_value.stderr = []
-        tmux.server.cmd.return_value.stdout = []
-
-        assert tmux.session_exists("ses") is False
-
-    def test_session_exists_recovers_present_target_after_suppressed_inventory_failure(self, tmux):
-        from libtmux._internal.query_list import ObjectDoesNotExist
-
-        tmux.server.sessions.get.side_effect = ObjectDoesNotExist("ses")
-        tmux.server.cmd.return_value.returncode = 0
-        tmux.server.cmd.return_value.stderr = []
-        tmux.server.cmd.return_value.stdout = ["ses"]
+    def test_session_exists_uses_exact_target_probe(self, tmux):
+        tmux.server.cmd.return_value = MagicMock(returncode=0, stdout=[], stderr=[])
 
         assert tmux.session_exists("ses") is True
+        tmux.server.cmd.assert_called_once_with("has-session", target="=ses")
 
-    def test_session_exists_treats_missing_server_as_unknown(self, tmux):
-        from libtmux._internal.query_list import ObjectDoesNotExist
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "no server running on /tmp/tmux-1000/default",
+            "error connecting to /tmp/tmux-1000/default (No such file or directory)",
+            "error connecting to /tmp/tmux-1000/default (Connection refused)",
+        ],
+    )
+    def test_session_exists_treats_proven_missing_server_as_false(self, tmux, message):
+        tmux.server.cmd.return_value = MagicMock(
+            returncode=1,
+            stdout=[message],
+            stderr=[message],
+        )
 
-        tmux.server.sessions.get.side_effect = ObjectDoesNotExist("ses")
-        tmux.server.cmd.return_value.returncode = 1
-        tmux.server.cmd.return_value.stderr = ["tmux server unavailable"]
+        assert tmux.session_exists("ses") is False
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "error connecting to /tmp/tmux-1000/default (Permission denied)",
+            "tmux server unavailable",
+            "ambiguous socket selection",
+        ],
+    )
+    def test_session_exists_preserves_inventory_uncertainty(self, tmux, message):
+        tmux.server.cmd.return_value = MagicMock(
+            returncode=1,
+            stdout=[message],
+            stderr=[message],
+        )
+
+        assert tmux.session_exists("ses") is None
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            MagicMock(returncode=0, stdout=["unexpected"], stderr=[]),
+            MagicMock(returncode=0, stdout=[], stderr=["unexpected"]),
+            MagicMock(returncode=2, stdout=[], stderr=[]),
+            MagicMock(returncode=1, stdout=[], stderr=[]),
+            MagicMock(returncode=1, stdout=["other"], stderr=["can't find session: ses"]),
+            MagicMock(returncode=True, stdout=[], stderr=[]),
+            MagicMock(returncode="1", stdout=[], stderr=[]),
+            MagicMock(returncode=0, stdout=None, stderr=[]),
+        ],
+    )
+    def test_session_exists_rejects_malformed_inventory(self, tmux, result):
+        tmux.server.cmd.return_value = result
 
         assert tmux.session_exists("ses") is None
 
     def test_session_exists_error(self, tmux):
-        tmux.server.sessions.get.side_effect = Exception("tmux error")
+        tmux.server.cmd.side_effect = Exception("tmux error")
+
+        assert tmux.session_exists("ses") is None
+
+    def test_session_exists_timeout_is_unknown(self, tmux):
+        tmux.server.cmd.side_effect = TmuxCommandTimeout("inventory timed out")
 
         assert tmux.session_exists("ses") is None
 
@@ -883,7 +920,7 @@ class TestWindowExists:
 
         tmux.server.sessions.get.side_effect = ObjectDoesNotExist("ses")
         tmux.server.cmd.side_effect = [
-            MagicMock(returncode=0, stderr=[], stdout=["ses"]),
+            MagicMock(returncode=0, stderr=[], stdout=[]),
             MagicMock(returncode=0, stderr=[], stdout=["win"]),
         ]
 

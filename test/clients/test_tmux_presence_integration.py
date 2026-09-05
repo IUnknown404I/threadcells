@@ -71,8 +71,8 @@ def test_real_libtmux_presence_distinguishes_absence_from_healthy_inventory():
             [tmux_binary, "-L", socket_name, "kill-server"],
             check=True,
         )
-        assert client.session_exists(session_name) is None
-        assert client.window_exists(session_name, window_name) is None
+        assert client.session_exists(session_name) is False
+        assert client.window_exists(session_name, window_name) is False
     finally:
         subprocess.run(
             [tmux_binary, "-L", socket_name, "kill-server"],

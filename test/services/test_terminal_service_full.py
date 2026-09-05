@@ -28,7 +28,7 @@ from cli_agent_orchestrator.providers.codex import (
 from cli_agent_orchestrator.services.compressed_output_index import (
     precompute_compressed_output_index,
 )
-from cli_agent_orchestrator.services.terminal_render import ParserState
+from cli_agent_orchestrator.services.terminal_render import ParserState, render_terminal_stream
 from cli_agent_orchestrator.services.terminal_service import (
     LAST_OUTPUT_READ_MAX_BYTES,
     LAST_OUTPUT_RESPONSE_MAX_BYTES,
@@ -137,15 +137,45 @@ def test_human_output_semantic_expansion_stays_bounded():
 
 
 def test_isolated_older_semantic_page_preserves_residual_viewport_prose():
+    payload = b"draft\rFinal\nline one\nline two\n"
     rendered = _render_progressive_terminal_page(
-        b"draft\rFinal\nline one\nline two\n",
+        payload,
         prefix_context=b"",
         prefix_truncated=False,
         expected_end_state=ParserState.NORMAL,
         line_isolated=True,
     )
 
-    assert rendered.output == "Final\nline one\nline two"
+    newer = "newer prose"
+    single_stream = render_terminal_stream(payload.decode() + newer).output
+
+    assert rendered.output == "Final\nline one\nline two\n"
+    assert rendered.output + newer == single_stream
+
+
+def test_nonisolated_older_semantic_page_does_not_invent_line_separator():
+    older_payload = b"draft\rFinal"
+    newer_payload = b" suffix"
+    older = _render_progressive_terminal_page(
+        older_payload,
+        prefix_context=b"",
+        prefix_truncated=False,
+        expected_end_state=ParserState.NORMAL,
+        line_isolated=False,
+    )
+    newer = _render_progressive_terminal_page(
+        newer_payload,
+        prefix_context=older_payload,
+        prefix_truncated=False,
+        expected_end_state=None,
+        line_isolated=False,
+    )
+
+    assert older.output == ""
+    assert (
+        older.output + newer.output
+        == render_terminal_stream((older_payload + newer_payload).decode()).output
+    )
 
 
 def test_bind_provider_runtime_session_identity_proves_exact_hook_path(monkeypatch, tmp_path):
@@ -3255,16 +3285,44 @@ class TestGetOutput:
     ):
         self._durable_terminal(monkeypatch, tmp_path)
         semantic = b"draft\rFinal\nline one\nline two\n"
-        newer = b"x" * (OUTPUT_CHUNK_MAX_BYTES - 5) + b"\n"
+        newer_prefix = b"newer prose"
+        newer = newer_prefix + b"x" * (OUTPUT_CHUNK_MAX_BYTES - 5 - len(newer_prefix)) + b"\n"
         (tmp_path / "test1234.log").write_bytes(semantic + newer)
 
         newest = get_output_chunk("test1234")
         assert newest.cursor is not None
         older = get_output_chunk("test1234", newest.cursor)
 
-        assert older.output == "Final\nline one\nline two"
+        assert older.output == "Final\nline one\nline two\n"
         assert older.end_offset == newest.start_offset
-        assert older.output + newest.output == "Final\nline one\nline two" + newer.decode()
+        assert older.output + newest.output == "Final\nline one\nline two\n" + newer.decode()
+
+    def test_forced_pagination_matches_single_stream_terminal_render(self, monkeypatch, tmp_path):
+        self._durable_terminal(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.terminal_service.OUTPUT_CHUNK_MAX_BYTES", 128
+        )
+        raw = "draft\rFinal\nline one\nline two\n" + "".join(
+            f"newer prose {number:02d}\n" for number in range(24)
+        )
+        raw += "newest prose"
+        (tmp_path / "test1234.log").write_text(raw, encoding="utf-8")
+
+        cursor = None
+        chunks = []
+        ranges = []
+        while True:
+            chunk = get_output_chunk("test1234", cursor)
+            chunks.insert(0, chunk.output)
+            ranges.insert(0, (chunk.start_offset, chunk.end_offset))
+            if not chunk.has_older:
+                break
+            assert chunk.cursor is not None
+            cursor = chunk.cursor
+
+        assert len(chunks) >= 3
+        assert "".join(chunks) == render_terminal_stream(raw).output
+        assert all(older[1] == newer[0] for older, newer in zip(ranges, ranges[1:]))
 
     def test_full_output_preserves_utf8_boundaries_and_replaces_malformed_bytes(
         self, monkeypatch, tmp_path

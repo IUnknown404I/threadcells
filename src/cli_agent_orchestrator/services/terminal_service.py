@@ -983,8 +983,16 @@ def _render_progressive_terminal_page(
             # from cross-line older pages are superseded by later byte ranges.
             include_screen=expected_end_state is None or owns_line_local_screen,
         )
+        rendered = semantic.output
+        # The raw LF belongs to this older range: suffix pagination starts the
+        # adjacent newer range after it. Screen rendering trims the final blank
+        # viewport row, so retain that real separator when this page owns its
+        # line-local screen. A hard/non-isolated boundary never enters this
+        # path and therefore cannot gain an invented newline.
+        if owns_line_local_screen and payload.endswith(b"\n") and not rendered.endswith("\n"):
+            rendered += "\n"
         return _TerminalRenderResult(
-            output=semantic.output,
+            output=rendered,
             state_at_emit=_TerminalRenderState(semantic.state_at_emit),
             final_state=_TerminalRenderState(semantic.final_state),
             orphan_string_terminator=semantic.orphan_string_terminator,

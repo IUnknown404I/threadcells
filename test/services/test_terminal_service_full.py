@@ -940,7 +940,20 @@ def test_managed_new_session_inventory_exception_retains_worktree_for_recovery(
     tmux = object.__new__(TmuxClient)
     tmux.server = MagicMock()
     tmux._start_credential_free_bootstrap = MagicMock(return_value="cao-bootstrap-test")
-    tmux.server.sessions.get.side_effect = [None, None, RuntimeError("inventory unavailable")]
+    tmux.server.sessions.get.return_value = None
+    session_inventory_calls = 0
+
+    def command(command, *args, **kwargs):
+        nonlocal session_inventory_calls
+        if command == "has-session":
+            session_inventory_calls += 1
+            if session_inventory_calls == 1:
+                message = "can't find session: cao-new-session"
+                return SimpleNamespace(returncode=1, stdout=[message], stderr=[message])
+            raise RuntimeError("inventory unavailable")
+        return SimpleNamespace(returncode=0, stdout=[], stderr=[])
+
+    tmux.server.cmd.side_effect = command
     tmux.server.new_session.side_effect = RuntimeError("tmux create then raise")
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.operations_service.context_launch_admission",
@@ -982,8 +995,9 @@ def test_managed_new_session_inventory_exception_retains_worktree_for_recovery(
     assert outcome.target_attempted is True
     assert outcome.death_confirmed is False
     tmux._start_credential_free_bootstrap.assert_called_once_with(str(managed_path))
-    tmux.server.cmd.assert_called_once_with("kill-session", "-t", "cao-bootstrap-test")
-    assert tmux.server.sessions.get.call_count == 3
+    assert call("kill-session", "-t", "cao-bootstrap-test") in tmux.server.cmd.call_args_list
+    assert session_inventory_calls == 2
+    tmux.server.sessions.get.assert_called_once_with(session_name="cao-new-session")
     cleanup.assert_not_called()
 
 

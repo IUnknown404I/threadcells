@@ -1041,17 +1041,11 @@ class TmuxClient:
 
     def session_exists(self, session_name: str) -> Optional[bool]:
         """Return exact session existence, preserving inventory uncertainty as ``None``."""
-        try:
-            session = self.server.sessions.get(session_name=session_name)
-            return session is not None
-        except ObjectDoesNotExist:
-            # Server.sessions suppresses its underlying inventory exception and
-            # exposes an empty QueryList.  Confirm the parent inventory before
-            # accepting ObjectDoesNotExist as authoritative target absence.
-            return self._session_inventory_observation(session_name)
-        except Exception as exc:
-            logger.warning("Failed to inventory tmux session %s: %s", session_name, exc)
-            return None
+        # ``libtmux.Server.sessions`` suppresses every inventory exception and
+        # presents an empty QueryList.  Probe tmux directly so a missing server
+        # can be distinguished from permission, transport, and malformed-result
+        # failures without weakening the callers' tri-state contract.
+        return self._session_inventory_observation(session_name)
 
     def window_exists(self, session_name: str, window_name: str) -> Optional[bool]:
         """Return exact window existence, preserving inventory uncertainty as ``None``."""
@@ -1083,14 +1077,48 @@ class TmuxClient:
             return None
 
     def _session_inventory_observation(self, session_name: str) -> Optional[bool]:
-        """Read one exact session from a certain direct tmux inventory."""
+        """Read one exact session from an authoritative direct tmux probe."""
         try:
-            result = self.server.cmd("list-sessions", "-F", "#{session_name}")
-        except Exception:
+            result = self.server.cmd("has-session", target=f"={session_name}")
+        except Exception as exc:
+            logger.warning("Failed to inventory tmux session %s: %s", session_name, exc)
             return None
-        if result.returncode != 0 or result.stderr:
+
+        returncode = getattr(result, "returncode", None)
+        stdout = getattr(result, "stdout", None)
+        stderr = getattr(result, "stderr", None)
+        if (
+            not isinstance(returncode, int)
+            or isinstance(returncode, bool)
+            or not isinstance(stdout, list)
+            or not isinstance(stderr, list)
+            or any(not isinstance(line, str) for line in [*stdout, *stderr])
+        ):
+            logger.warning("Malformed tmux session inventory result for %s", session_name)
             return None
-        return session_name in result.stdout
+        if returncode == 0:
+            if stdout or stderr:
+                logger.warning("Malformed successful tmux session inventory for %s", session_name)
+                return None
+            return True
+        if returncode != 1 or len(stderr) != 1:
+            return None
+
+        message = stderr[0]
+        # _BoundedTmuxServer mirrors has-session's single stderr line into
+        # stdout for libtmux compatibility.  No other stdout is authoritative.
+        if stdout not in ([], [message]):
+            return None
+        if message == f"can't find session: {session_name}":
+            return False
+        if re.fullmatch(r"no server running on .+", message):
+            return False
+        if re.fullmatch(
+            r"error connecting to .+ \((?:No such file or directory|Connection refused)\)",
+            message,
+        ):
+            return False
+        return None
 
     def _window_inventory_observation(self, session_name: str, window_name: str) -> Optional[bool]:
         """Read one exact window from a certain direct tmux inventory."""

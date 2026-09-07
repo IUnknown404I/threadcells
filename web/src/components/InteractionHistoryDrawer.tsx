@@ -48,6 +48,7 @@ const WAIT_KEYS: Record<string, TranslationKey> = {
 }
 
 const DISPOSITION_KEYS: Record<string, TranslationKey> = {
+  processed: 'interactions.disposition.processed',
   completed: 'interactions.disposition.completed',
   delivered: 'interactions.disposition.delivered',
   acknowledged: 'interactions.disposition.acknowledged',
@@ -126,7 +127,7 @@ function itemTone(item: InteractionItem) {
   const state = item.final_disposition || item.queue.state || ''
   if (state.includes('failed') || state === 'cancelled') return 'border-red-800/60 bg-red-950/10'
   if (state === 'owner_gate' || item.queue.wait_reason === 'owner_gate') return 'border-amber-700/60 bg-amber-950/10'
-  if (state === 'acknowledged' || state === 'completed') return 'border-emerald-800/50 bg-emerald-950/10'
+  if (state === 'processed' || state === 'acknowledged' || state === 'completed') return 'border-emerald-800/50 bg-emerald-950/10'
   if (state === 'superseded') return 'border-violet-800/50 bg-violet-950/10'
   return 'border-gray-700/60 bg-gray-900/70'
 }
@@ -135,7 +136,7 @@ function statusTone(item: InteractionItem) {
   const state = item.final_disposition || item.queue.state || ''
   if (state.includes('failed') || state === 'cancelled') return 'bg-red-400/10 text-red-300'
   if (state === 'owner_gate') return 'bg-amber-400/10 text-amber-300'
-  if (state === 'acknowledged' || state === 'completed') return 'bg-emerald-400/10 text-emerald-300'
+  if (state === 'processed' || state === 'acknowledged' || state === 'completed') return 'bg-emerald-400/10 text-emerald-300'
   if (state === 'superseded') return 'bg-violet-400/10 text-violet-300'
   return 'bg-sky-400/10 text-sky-300'
 }

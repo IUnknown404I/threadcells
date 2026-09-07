@@ -1,7 +1,7 @@
 import { lazy, ReactNode, Suspense, useRef, useState } from 'react'
 import { useStore } from '../store'
 import { AgentSummary, Session, SessionDeletionPreflight, SessionSummary, TerminalMeta, UiOverview, api } from '../api'
-import { Bot, ChevronDown, ChevronRight, FileText, LogOut, Mail, MessageSquareWarning, Monitor, Package, Search, Terminal as TermIcon, Trash2, Users, Zap } from 'lucide-react'
+import { Bot, ChevronDown, ChevronRight, FileText, History, LogOut, Mail, MessageSquareWarning, Monitor, Package, Search, Terminal as TermIcon, Trash2, Users, Zap } from 'lucide-react'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
 import { StatusBadge, lifecycleBadgeStatus, sessionStatusTranslationKey } from './StatusBadge'
@@ -16,6 +16,7 @@ import { ProviderOutcomeNotice } from './ProviderOutcomeNotice'
 import { RecoveryTakeoverAction } from './RecoveryTakeoverAction'
 import { WorkflowRecoveryNotice } from './WorkflowRecoveryNotice'
 import { useRecoveryTakeoverCapabilities } from '../recoveryCapabilities'
+import { InteractionHistoryDrawer } from './InteractionHistoryDrawer'
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })))
 
@@ -48,6 +49,7 @@ function ExpandedSessionAgents({
   onTerminal,
   onExit,
   onClose,
+  onHistory,
   onRecoveryCompleted,
   exitingTerminal,
   closingTerminal,
@@ -60,6 +62,7 @@ function ExpandedSessionAgents({
   onTerminal: (agent: AgentSummary) => void
   onExit: (agent: AgentSummary) => void
   onClose: (agent: AgentSummary) => void
+  onHistory: (agent: AgentSummary) => void
   onRecoveryCompleted: () => void
   exitingTerminal: string | null
   closingTerminal: string | null
@@ -79,6 +82,7 @@ function ExpandedSessionAgents({
         <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
           <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1"><TermIcon size={14} className="shrink-0 text-gray-400"/><span className="min-w-0 max-w-full truncate text-sm font-medium text-gray-200" title={agent.agent_profile || 'default'}>{agent.agent_profile || 'default'}</span><span className="min-w-0 max-w-full truncate font-mono text-xs text-gray-400" title={agent.id}>{agent.id}</span><StatusBadge status={badge}/><span className="max-w-full truncate text-[10px] text-gray-400" title={agent.provider}>{agent.provider}</span>{agent.project_name && <span className="max-w-full truncate text-[10px] text-gray-400">{agent.project_name}</span>}</div>
           <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-t border-gray-700/30 pt-2 sm:border-0 sm:pt-0">
+            <button type="button" onClick={() => onHistory(agent)} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-emerald-300" title={t('interactions.action')} aria-label={t('interactions.action')}><History size={14}/></button>
             <button onClick={() => onInbox(agent)} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white" title={t('home.inbox')}><Mail size={14}/></button>
             <button onClick={() => onOutput(agent.id)} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white" title={t('home.output')}><FileText size={14}/></button>
             <button onClick={() => onTerminal(agent)} disabled={workspaceUnavailable} title={workspaceUnavailable ? t('agents.openComposerUnavailable') : undefined} className="flex min-h-11 items-center gap-1.5 rounded-lg bg-emerald-600 px-3 text-xs font-medium text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-40"><Monitor size={12}/>{t('home.terminal')}</button>
@@ -113,6 +117,7 @@ export function DashboardHome({ onNavigate, overviewState }: { onNavigate: (dest
   const [pendingClose, setPendingClose] = useState<TerminalMeta | null>(null)
   const [closingTerminal, setClosingTerminal] = useState<string | null>(null)
   const [inboxTerminal, setInboxTerminal] = useState<{ id: string; readOnly: boolean } | null>(null)
+  const [interactionTarget, setInteractionTarget] = useState<{ sessionId: string; sessionName: string; terminalId?: string } | null>(null)
   const [outputTerminalId, setOutputTerminalId] = useState<string | null>(null)
   const [pendingExit, setPendingExit] = useState<TerminalMeta | null>(null)
   const [exitingTerminal, setExitingTerminal] = useState<string | null>(null)
@@ -203,7 +208,7 @@ export function DashboardHome({ onNavigate, overviewState }: { onNavigate: (dest
       const expanded = expandedSession === session.id
       const displayName = sessionDisplayName(session.name)
       return <div key={session.id} data-testid={`home-session-${session.id}`} className={`overflow-hidden rounded-xl border transition-colors ${expanded ? 'border-emerald-700/50 bg-emerald-900/30' : 'border-gray-700/50 bg-gray-800/60'}`}>
-        <div data-testid={`session-header-${session.id}`} className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1 p-3 sm:grid-cols-[minmax(0,1fr)_auto_auto] sm:gap-x-3 sm:px-4"><div data-testid={`session-title-row-${session.id}`} role="button" tabIndex={0} aria-expanded={expanded} aria-controls={`home-session-detail-${session.id}`} aria-label={t(expanded ? 'home.collapse' : 'home.expand', { name: displayName })} onClick={() => toggleSession(session.id)} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleSession(session.id) } }} className="col-span-2 flex min-w-0 w-full cursor-pointer items-center gap-2 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 sm:col-span-1 sm:gap-3"><Users size={14} className="shrink-0 text-emerald-400"/><span className="min-w-0 flex-1 truncate font-mono text-sm text-gray-200" title={displayName}>{displayName}</span></div><div data-testid={`session-metadata-${session.id}`} className="flex min-w-0 items-center gap-2"><span className="shrink-0 text-xs text-gray-400">{tp('agents', session.agent_count)}</span>{session.project_name && <span className="min-w-0 max-w-[14rem] truncate rounded-full bg-gray-700/50 px-2 py-0.5 text-xs text-gray-300">{t('home.projectPrefix')} {session.project_name}</span>}</div><div data-testid={`session-actions-${session.id}`} className="col-span-2 flex min-w-0 flex-wrap items-center justify-end gap-1 sm:col-span-1 sm:shrink-0 sm:flex-nowrap"><button type="button" onClick={event => { event.stopPropagation(); void openDeleteSession(session) }} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg text-gray-400 hover:bg-gray-800 hover:text-red-400" title={t('home.deleteSession')} aria-label={t('home.deleteNamed', { name: displayName })}><Trash2 size={14}/></button><button type="button" onClick={() => toggleSession(session.id)} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg text-gray-400 hover:bg-gray-800 hover:text-gray-300" aria-expanded={expanded} aria-controls={`home-session-detail-${session.id}`} aria-label={t(expanded ? 'home.collapseChevron' : 'home.expandChevron', { name: displayName })}>{expanded ? <ChevronDown size={14}/> : <ChevronRight size={14}/>}</button></div></div>
+        <div data-testid={`session-header-${session.id}`} className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-1 p-3 sm:grid-cols-[minmax(0,1fr)_auto_auto] sm:gap-x-3 sm:px-4"><div data-testid={`session-title-row-${session.id}`} role="button" tabIndex={0} aria-expanded={expanded} aria-controls={`home-session-detail-${session.id}`} aria-label={t(expanded ? 'home.collapse' : 'home.expand', { name: displayName })} onClick={() => toggleSession(session.id)} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleSession(session.id) } }} className="col-span-2 flex min-w-0 w-full cursor-pointer items-center gap-2 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 sm:col-span-1 sm:gap-3"><Users size={14} className="shrink-0 text-emerald-400"/><span className="min-w-0 flex-1 truncate font-mono text-sm text-gray-200" title={displayName}>{displayName}</span></div><div data-testid={`session-metadata-${session.id}`} className="flex min-w-0 flex-wrap items-center gap-2"><span className="shrink-0 text-xs text-gray-400">{tp('agents', session.agent_count)}</span>{Boolean(session.current_queue_count) && <span data-testid={`session-queue-count-${session.id}`} className="shrink-0 text-[11px] font-medium text-sky-300">{t('interactions.queueCount', { count: session.current_queue_count || 0 })}</span>}{session.project_name && <span className="min-w-0 max-w-[14rem] truncate rounded-full bg-gray-700/50 px-2 py-0.5 text-xs text-gray-300">{t('home.projectPrefix')} {session.project_name}</span>}</div><div data-testid={`session-actions-${session.id}`} className="col-span-2 flex min-w-0 flex-wrap items-center justify-end gap-1 sm:col-span-1 sm:shrink-0 sm:flex-nowrap"><button type="button" onClick={event => { event.stopPropagation(); setInteractionTarget({ sessionId: session.id, sessionName: session.name }) }} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg text-gray-400 hover:bg-gray-800 hover:text-emerald-300" title={t('interactions.action')} aria-label={t('interactions.action')}><History size={14}/></button><button type="button" onClick={event => { event.stopPropagation(); void openDeleteSession(session) }} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg text-gray-400 hover:bg-gray-800 hover:text-red-400" title={t('home.deleteSession')} aria-label={t('home.deleteNamed', { name: displayName })}><Trash2 size={14}/></button><button type="button" onClick={() => toggleSession(session.id)} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg text-gray-400 hover:bg-gray-800 hover:text-gray-300" aria-expanded={expanded} aria-controls={`home-session-detail-${session.id}`} aria-label={t(expanded ? 'home.collapseChevron' : 'home.expandChevron', { name: displayName })}>{expanded ? <ChevronDown size={14}/> : <ChevronRight size={14}/>}</button></div></div>
         <div className="flex min-w-0 items-start gap-2 border-t border-gray-700/30 px-3 py-2 sm:items-center sm:px-4" aria-label={t('home.sessionStatus')}><SessionStatusSummary session={session} trailing={<AgentViewControls value={agentView} onChange={setAgentView}/>} /></div>
         {expanded && (
           <ExpandedSessionAgents
@@ -214,6 +219,7 @@ export function DashboardHome({ onNavigate, overviewState }: { onNavigate: (dest
             onTerminal={openTerminal}
             onExit={agent => setPendingExit(toTerminalMeta(agent))}
             onClose={agent => setPendingClose(toTerminalMeta(agent))}
+            onHistory={agent => setInteractionTarget({ sessionId: session.id, sessionName: session.name, terminalId: agent.id })}
             onRecoveryCompleted={handleRecoveryCompleted}
             exitingTerminal={exitingTerminal}
             closingTerminal={closingTerminal}
@@ -223,6 +229,7 @@ export function DashboardHome({ onNavigate, overviewState }: { onNavigate: (dest
       </div>
     })}{sessionFeed.nextOffset !== null && <div ref={sessionSentinelRef} className="flex justify-center py-3"><button type="button" onClick={sessionFeed.loadMore} disabled={sessionFeed.loading} className="min-h-11 rounded-lg border border-gray-700 px-5 text-xs text-gray-300 hover:border-emerald-700 disabled:opacity-40">{sessionFeed.loading ? t('common.loading') : t('home.loadMoreSessions', { loaded: sessionFeed.items.length, total: sessionFeed.total })}</button></div>}{sessionFeed.limitReached && <p className="py-3 text-center text-xs text-gray-400">{t('home.sessionLimit')}</p>}</div>}
     {inboxTerminal && <InboxPanel terminalId={inboxTerminal.id} readOnly={inboxTerminal.readOnly} onClose={() => setInboxTerminal(null)}/>}
+    {interactionTarget && <InteractionHistoryDrawer {...interactionTarget} onClose={() => setInteractionTarget(null)}/>}
     {liveTerminal && <Suspense fallback={null}><TerminalView terminalId={liveTerminal.id} provider={liveTerminal.provider} agentProfile={liveTerminal.agentProfile} onClose={() => setLiveTerminal(null)} /></Suspense>}
     {outputTerminalId && <OutputViewer terminalId={outputTerminalId} onClose={() => setOutputTerminalId(null)}/>}
     <ConfirmModal open={!!pendingClose} title={t('home.deleteTerminalTitle')} message={t('home.deleteTerminalMessage')} details={pendingClose ? [{ label: t('home.terminalDetail'), value: `${pendingClose.agent_profile || 'default'} (${pendingClose.id})` }, { label: t('home.sessionDetail'), value: sessionDisplayName(pendingClose.tmux_session) }] : []} confirmLabel={t('home.deleteTerminalConfirm')} variant="danger" loading={!!closingTerminal} onConfirm={handleDeleteTerminal} onCancel={() => setPendingClose(null)}/>

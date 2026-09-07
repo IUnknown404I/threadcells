@@ -3627,6 +3627,7 @@ def _session_workspace_snapshot_in_transaction(
                     ChildAssignmentModel.child_terminal_id.in_(terminal_ids),
                 ),
                 ChildAssignmentModel.status.in_(_WORKSPACE_RETIREMENT_ACTIVE_ASSIGNMENT_STATES),
+                ChildAssignmentModel.review_superseded_at.is_(None),
             )
             .first()
         )
@@ -4870,6 +4871,38 @@ def _ensure_terminal_ui_projection_schema() -> None:
             connection.exec_driver_sql(
                 "CREATE INDEX IF NOT EXISTS ix_workflow_turns_workflow_state "
                 "ON workflow_turns (workflow_id, state)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_workflow_turns_workflow_created "
+                "ON workflow_turns (workflow_id, created_at, id)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_inbox_receiver_status_created "
+                "ON inbox (receiver_id, status, created_at, id)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_inbox_sender_status_created "
+                "ON inbox (sender_id, status, created_at, id)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_child_assignments_parent_status_created "
+                "ON child_assignments (parent_terminal_id, status, created_at, id)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_child_assignments_child_status_created "
+                "ON child_assignments (child_terminal_id, status, created_at, id)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_workflow_effects_workflow_turn_state "
+                "ON workflow_effects (workflow_id, workflow_turn_id, state, id)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_recovery_takeovers_old_state_created "
+                "ON recovery_takeovers (old_terminal_id, state, created_at, id)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_recovery_takeovers_new_state_created "
+                "ON recovery_takeovers (new_terminal_id, state, created_at, id)"
             )
         _terminal_ui_projection_schema_engine_identity = engine_identity
         _terminal_ui_projection_schema_ready = True

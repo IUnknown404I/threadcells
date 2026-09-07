@@ -386,9 +386,10 @@ async def test_realistic_home_agents_history_keeps_health_and_database_work_boun
         assert filtered_sessions.json()["total"] == 1
         assert filtered_sessions.json()["items"][0]["name"] == "cao-session-042"
 
-    # Each read-model request is exactly one SQLite statement. No per-session
-    # or per-terminal query can appear as history grows.
-    assert len(query_durations) == 25
+    # Overview and Agents remain one statement each. Sessions deliberately adds
+    # one bounded, page-wide Current Queue count statement, never one per row:
+    # eight refreshes own four statements and the filtered Sessions request two.
+    assert len(query_durations) == 34
     assert len(query_threads) <= api_main.UI_READ_MAX_CONCURRENCY
     assert max(query_durations) < 0.35
     assert max(endpoint_durations) < 0.75

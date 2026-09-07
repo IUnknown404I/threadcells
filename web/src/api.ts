@@ -354,15 +354,18 @@ export interface SessionBoundaryAgent {
 export interface SessionDeletionBlocker {
   category: string
   count: number
-  disposition: 'cancellable' | 'unsafe'
+  disposition: 'cancellable' | 'historical_indeterminate' | 'unsafe'
   reason_codes: string[]
 }
 
 export interface SessionDeletionPreflight {
   eligible: boolean
+  deletion_mode: 'eligible_normal' | 'eligible_with_cancellable_work' | 'eligible_with_historical_indeterminate_retirement' | 'blocked_live_or_unsafe_authority'
   cancellable: boolean
+  can_resolve_and_delete: boolean
   already_deleted: boolean
   requires_cancellation_confirmation: boolean
+  requires_historical_indeterminate_confirmation: boolean
   requires_dirty_confirmation: boolean
   modified_files: number
   untracked_files: number
@@ -371,12 +374,21 @@ export interface SessionDeletionPreflight {
   plan_token: string | null
   current_queue_count: number
   cancellable_count: number
+  historical_indeterminate_count: number
   unsafe_count: number
+  live_unsafe_count: number
+  active_runtime_count: number
+  active_execution_count: number
   plan_limit: number
   blockers: SessionDeletionBlocker[]
   cancellable_blockers: SessionDeletionBlocker[]
+  historical_indeterminate_blockers: SessionDeletionBlocker[]
   unsafe_blockers: SessionDeletionBlocker[]
   cancellation_plan: {
+    count: number
+    categories: SessionDeletionBlocker[]
+  }
+  historical_indeterminate_plan: {
     count: number
     categories: SessionDeletionBlocker[]
   }
@@ -959,10 +971,11 @@ export const api = {
     // runs for genuine caller cancellation (navigation, disconnect, etc.).
     fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}${projectId ? `&projectId=${encodeURIComponent(projectId)}` : ''}${ownerGrant ? `&owner_grant_launch_id=${encodeURIComponent(ownerGrant.launch_id)}` : ''}${workContextRequestId ? `&workContextRequestId=${encodeURIComponent(workContextRequestId)}` : ''}`, { method: 'POST', headers: ownerGrant ? { 'X-ThreadCells-Owner-Grant': ownerGrant.grant } : undefined, timeoutMs: null }),
   getSessionDeletionPreflight: (name: string) => fetchJSON<SessionDeletionPreflight>(`/sessions/${encodeURIComponent(name)}/deletion-preflight`),
-  deleteSession: (name: string, confirmDirtyWorkspace = false, cancelUnresolvedWork = false, cancellationPlanToken?: string | null) => {
+  deleteSession: (name: string, confirmDirtyWorkspace = false, cancelUnresolvedWork = false, cancellationPlanToken?: string | null, retireHistoricalIndeterminate = false) => {
     const search = new URLSearchParams({
       confirm_dirty_workspace: String(confirmDirtyWorkspace),
       cancel_unresolved_work: String(cancelUnresolvedWork),
+      retire_historical_indeterminate: String(retireHistoricalIndeterminate),
     })
     if (cancellationPlanToken) search.set('cancellation_plan_token', cancellationPlanToken)
     return fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${encodeURIComponent(name)}?${search}`, { method: 'DELETE' })

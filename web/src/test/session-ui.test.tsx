@@ -12,9 +12,12 @@ vi.mock('../components/TerminalView', () => ({ TerminalView: () => null }))
 const session = (id: string, created_at: string) => ({ id, name: id, status: 'active', created_at })
 const deletionPreflight = (overrides: Partial<SessionDeletionPreflight> = {}): SessionDeletionPreflight => ({
   eligible: true,
+  deletion_mode: 'eligible_normal',
   cancellable: false,
+  can_resolve_and_delete: false,
   already_deleted: false,
   requires_cancellation_confirmation: false,
+  requires_historical_indeterminate_confirmation: false,
   requires_dirty_confirmation: false,
   modified_files: 0,
   untracked_files: 0,
@@ -23,12 +26,18 @@ const deletionPreflight = (overrides: Partial<SessionDeletionPreflight> = {}): S
   plan_token: null,
   current_queue_count: 0,
   cancellable_count: 0,
+  historical_indeterminate_count: 0,
   unsafe_count: 0,
+  live_unsafe_count: 0,
+  active_runtime_count: 0,
+  active_execution_count: 0,
   plan_limit: 500,
   blockers: [],
   cancellable_blockers: [],
+  historical_indeterminate_blockers: [],
   unsafe_blockers: [],
   cancellation_plan: { count: 0, categories: [] },
+  historical_indeterminate_plan: { count: 0, categories: [] },
   ...overrides,
 })
 
@@ -1033,13 +1042,14 @@ describe('session deletion confirmation', () => {
     const reopenedConfirm = await screen.findByRole('button', { name: 'Delete Session' })
     fireEvent.click(reopenedConfirm)
     await waitFor(() => expect(remove).toHaveBeenCalledTimes(1))
-    expect(remove).toHaveBeenCalledWith('lifetime-delete-me', false, false, null)
+    expect(remove).toHaveBeenCalledWith('lifetime-delete-me', false, false, null, false)
   })
 
   it('explains unsafe queued work without offering force delete', async () => {
     const blocker = { category: 'workflow_effects', count: 1, disposition: 'unsafe' as const, reason_codes: ['INDETERMINATE_EFFECT'] }
     vi.mocked(api.getSessionDeletionPreflight).mockResolvedValue(deletionPreflight({
       eligible: false,
+      deletion_mode: 'blocked_live_or_unsafe_authority',
       reason_code: 'INDETERMINATE_EFFECT',
       reason_codes: ['INDETERMINATE_EFFECT'],
       current_queue_count: 1,
@@ -1060,11 +1070,57 @@ describe('session deletion confirmation', () => {
     expect(remove).not.toHaveBeenCalled()
   })
 
+  it('offers exact operator retirement for historical operations with unknown outcomes', async () => {
+    const blocker = {
+      category: 'historical_indeterminate_effects',
+      count: 4,
+      disposition: 'historical_indeterminate' as const,
+      reason_codes: ['HISTORICAL_EFFECT_OUTCOME_UNKNOWN'],
+    }
+    vi.mocked(api.getSessionDeletionPreflight).mockResolvedValue(deletionPreflight({
+      eligible: false,
+      deletion_mode: 'eligible_with_historical_indeterminate_retirement',
+      can_resolve_and_delete: true,
+      requires_historical_indeterminate_confirmation: true,
+      reason_code: 'HISTORICAL_EFFECT_OUTCOME_UNKNOWN',
+      reason_codes: ['HISTORICAL_EFFECT_OUTCOME_UNKNOWN'],
+      plan_token: 'b'.repeat(64),
+      current_queue_count: 4,
+      historical_indeterminate_count: 4,
+      blockers: [blocker],
+      historical_indeterminate_blockers: [blocker],
+      historical_indeterminate_plan: { count: 4, categories: [blocker] },
+    }))
+    const remove = vi.spyOn(useStore.getState(), 'deleteSession').mockResolvedValue(true)
+    render(<AgentPanel />)
+
+    fireEvent.click(await screen.findByTitle('Delete session'))
+
+    expect(await screen.findByText(
+      'This Session contains historical operations with unknown outcomes.',
+    )).toBeInTheDocument()
+    const warning = screen.getByTestId('session-deletion-historical-indeterminate')
+    expect(warning).toHaveTextContent('ThreadCells can no longer establish the external outcome')
+    expect(warning).toHaveTextContent('History, canonical results, and audit evidence will be preserved.')
+    expect(screen.getByText('Operations with unknown outcomes')).toBeInTheDocument()
+    expect(screen.getByText('Active agents')).toBeInTheDocument()
+    expect(screen.getByText('Active executions')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Preserve unknown outcomes and delete Session',
+    }))
+    await waitFor(() => expect(remove).toHaveBeenCalledWith(
+      'lifetime-delete-me', false, false, 'b'.repeat(64), true,
+    ))
+  })
+
   it('confirms the exact server-authored cancellation plan', async () => {
     const blocker = { category: 'queued_work', count: 1, disposition: 'cancellable' as const, reason_codes: ['UNADMITTED_WORKFLOW_TURN'] }
     vi.mocked(api.getSessionDeletionPreflight).mockResolvedValue(deletionPreflight({
       eligible: false,
+      deletion_mode: 'eligible_with_cancellable_work',
       cancellable: true,
+      can_resolve_and_delete: true,
       requires_cancellation_confirmation: true,
       reason_code: 'QUEUED_WORK',
       reason_codes: ['UNADMITTED_WORKFLOW_TURN'],
@@ -1083,7 +1139,7 @@ describe('session deletion confirmation', () => {
     expect(screen.getByText('Current Queue')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Cancel work and delete Session' }))
     await waitFor(() => expect(remove).toHaveBeenCalledWith(
-      'lifetime-delete-me', false, true, 'a'.repeat(64),
+      'lifetime-delete-me', false, true, 'a'.repeat(64), false,
     ))
   })
 
@@ -1093,7 +1149,9 @@ describe('session deletion confirmation', () => {
     vi.mocked(api.getSessionDeletionPreflight)
       .mockResolvedValueOnce(deletionPreflight({
         eligible: false,
+        deletion_mode: 'eligible_with_cancellable_work',
         cancellable: true,
+        can_resolve_and_delete: true,
         requires_cancellation_confirmation: true,
         plan_token: 'a'.repeat(64),
         current_queue_count: 1,
@@ -1104,6 +1162,7 @@ describe('session deletion confirmation', () => {
       }))
       .mockResolvedValueOnce(deletionPreflight({
         eligible: false,
+        deletion_mode: 'blocked_live_or_unsafe_authority',
         reason_code: 'CLAIMED_EFFECT',
         reason_codes: ['CLAIMED_EFFECT'],
         current_queue_count: 1,
@@ -1158,7 +1217,7 @@ describe('session deletion confirmation', () => {
     )).toBeInTheDocument()
     expect(screen.getByText('Uncommitted workspace changes: 3 modified, 2 untracked.')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Delete Session' }))
-    await waitFor(() => expect(remove).toHaveBeenCalledWith('lifetime-delete-me', true, false, null))
+    await waitFor(() => expect(remove).toHaveBeenCalledWith('lifetime-delete-me', true, false, null, false))
   })
 
   it('opens the terminal deletion confirmation only for an exited terminal', async () => {

@@ -235,12 +235,17 @@ def _session_deletion_preflight(authority: SessionAuthority) -> Dict[str, object
     """Inspect destructive Session deletion without changing durable state."""
     empty_plan: Dict[str, object] = {
         "eligible": True,
+        "deletion_mode": "eligible_normal",
         "cancellable": False,
+        "can_resolve_and_delete": False,
         "requires_cancellation_confirmation": False,
+        "requires_historical_indeterminate_confirmation": False,
         "plan_token": None,
         "blockers": [],
         "cancellable_count": 0,
+        "historical_indeterminate_count": 0,
         "unsafe_count": 0,
+        "live_unsafe_count": 0,
         "plan_limit": 500,
         "reason_codes": [],
     }
@@ -255,8 +260,12 @@ def _session_deletion_preflight(authority: SessionAuthority) -> Dict[str, object
             "reason_code": None,
             "current_queue_count": 0,
             "cancellation_plan": {"count": 0, "categories": []},
+            "historical_indeterminate_plan": {"count": 0, "categories": []},
             "unsafe_blockers": [],
             "cancellable_blockers": [],
+            "historical_indeterminate_blockers": [],
+            "active_runtime_count": 0,
+            "active_execution_count": 0,
         }
 
     plan = get_session_unresolved_work_plan(
@@ -295,6 +304,9 @@ def _session_deletion_preflight(authority: SessionAuthority) -> Dict[str, object
 
     unsafe_blockers = [item for item in blockers if item["disposition"] == "unsafe"]
     cancellable_blockers = [item for item in blockers if item["disposition"] == "cancellable"]
+    retirement_blockers = [
+        item for item in blockers if item["disposition"] == "historical_indeterminate"
+    ]
 
     modified_files = 0
     untracked_files = 0
@@ -317,8 +329,23 @@ def _session_deletion_preflight(authority: SessionAuthority) -> Dict[str, object
             untracked_files += int(worktree.get("untracked_files") or 0)
     unsafe_blockers = [item for item in blockers if item["disposition"] == "unsafe"]
     cancellable_blockers = [item for item in blockers if item["disposition"] == "cancellable"]
-    eligible = not unsafe_blockers and not cancellable_blockers
+    retirement_blockers = [
+        item for item in blockers if item["disposition"] == "historical_indeterminate"
+    ]
+    eligible = not unsafe_blockers and not cancellable_blockers and not retirement_blockers
     cancellable = not unsafe_blockers and bool(cancellable_blockers)
+    retirement_available = not unsafe_blockers and bool(retirement_blockers)
+    can_resolve_and_delete = not unsafe_blockers and bool(
+        cancellable_blockers or retirement_blockers
+    )
+    if unsafe_blockers:
+        deletion_mode = "blocked_live_or_unsafe_authority"
+    elif retirement_blockers:
+        deletion_mode = "eligible_with_historical_indeterminate_retirement"
+    elif cancellable_blockers:
+        deletion_mode = "eligible_with_cancellable_work"
+    else:
+        deletion_mode = "eligible_normal"
     reason_codes = sorted(
         {str(reason) for item in blockers for reason in item.get("reason_codes", [])}
     )
@@ -326,6 +353,8 @@ def _session_deletion_preflight(authority: SessionAuthority) -> Dict[str, object
         reason_code = authority_reason
     elif unsafe_blockers:
         reason_code = str(unsafe_blockers[0]["reason_codes"][0])
+    elif retirement_blockers:
+        reason_code = "HISTORICAL_EFFECT_OUTCOME_UNKNOWN"
     elif cancellable_blockers:
         if "OWNER_GATE" in reason_codes:
             reason_code = "OWNER_GATE"
@@ -344,18 +373,29 @@ def _session_deletion_preflight(authority: SessionAuthority) -> Dict[str, object
         authority.session_id, 0
     )
     dirty = modified_files > 0 or untracked_files > 0
+    active_runtime_count = sum(
+        int(item["count"]) for item in unsafe_blockers if item["category"] == "runtime_authority"
+    )
+    active_execution_count = sum(
+        int(item["count"]) for item in unsafe_blockers if item["category"] == "provider_execution"
+    )
     return {
         "eligible": eligible,
+        "deletion_mode": deletion_mode,
         "cancellable": cancellable,
-        "requires_cancellation_confirmation": cancellable,
-        "plan_token": plan.get("plan_token") if cancellable else None,
+        "can_resolve_and_delete": can_resolve_and_delete,
+        "requires_cancellation_confirmation": (bool(cancellable_blockers) and not unsafe_blockers),
+        "requires_historical_indeterminate_confirmation": retirement_available,
+        "plan_token": plan.get("plan_token") if can_resolve_and_delete else None,
         "blockers": blockers,
         "cancellable_count": sum(int(item["count"]) for item in cancellable_blockers),
+        "historical_indeterminate_count": sum(int(item["count"]) for item in retirement_blockers),
         "unsafe_count": sum(int(item["count"]) for item in unsafe_blockers),
+        "live_unsafe_count": sum(int(item["count"]) for item in unsafe_blockers),
         "plan_limit": int(plan.get("plan_limit") or 500),
         "reason_codes": reason_codes,
         "already_deleted": False,
-        "requires_dirty_confirmation": (eligible or cancellable) and dirty,
+        "requires_dirty_confirmation": (eligible or can_resolve_and_delete) and dirty,
         "modified_files": modified_files,
         "untracked_files": untracked_files,
         "reason_code": reason_code,
@@ -364,8 +404,15 @@ def _session_deletion_preflight(authority: SessionAuthority) -> Dict[str, object
             "count": sum(int(item["count"]) for item in cancellable_blockers),
             "categories": cancellable_blockers,
         },
+        "historical_indeterminate_plan": {
+            "count": sum(int(item["count"]) for item in retirement_blockers),
+            "categories": retirement_blockers,
+        },
         "unsafe_blockers": unsafe_blockers,
         "cancellable_blockers": cancellable_blockers,
+        "historical_indeterminate_blockers": retirement_blockers,
+        "active_runtime_count": active_runtime_count,
+        "active_execution_count": active_execution_count,
     }
 
 
@@ -380,6 +427,7 @@ def delete_session(
     *,
     confirm_dirty_workspace: bool = False,
     cancel_unresolved_work: bool = False,
+    retire_historical_indeterminate: bool = False,
     cancellation_plan_token: str | None = None,
 ) -> Dict:
     """Delete session and cleanup.
@@ -400,9 +448,10 @@ def delete_session(
             terminals = authority.terminals
             preflight = _session_deletion_preflight(authority)
             if not preflight["eligible"]:
-                if cancel_unresolved_work:
+                resolution_requested = cancel_unresolved_work or retire_historical_indeterminate
+                if resolution_requested:
                     if (
-                        not preflight.get("cancellable")
+                        not preflight.get("can_resolve_and_delete")
                         or not cancellation_plan_token
                         or cancellation_plan_token != preflight.get("plan_token")
                     ):
@@ -414,6 +463,8 @@ def delete_session(
                         authority.session_id,
                         expected_plan_token=cancellation_plan_token,
                         expected_terminal_ids=[terminal["id"] for terminal in terminals],
+                        cancel_unresolved_work=cancel_unresolved_work,
+                        retire_historical_indeterminate=retire_historical_indeterminate,
                     )
                     if not cancellation.get("cancelled"):
                         raise SessionLifecycleError(
@@ -421,7 +472,7 @@ def delete_session(
                                 cancellation.get("reason_code")
                                 or "SESSION_DELETE_CANCELLATION_FAILED"
                             ),
-                            "Session-owned work could not be cancelled safely; inspect the current blockers",
+                            "Session-owned work could not be resolved safely; inspect the current blockers",
                         )
                     preflight = _session_deletion_preflight(authority)
                     if not preflight["eligible"]:
@@ -431,6 +482,11 @@ def delete_session(
                         )
                 else:
                     reason = str(preflight["reason_code"])
+                    if preflight.get("requires_historical_indeterminate_confirmation"):
+                        raise SessionLifecycleError(
+                            "SESSION_HISTORICAL_INDETERMINATE_CONFIRMATION_REQUIRED",
+                            "This Session has historical operations with unknown outcomes; explicit operator retirement confirmation is required",
+                        )
                     if preflight.get("cancellable"):
                         raise SessionLifecycleError(
                             "SESSION_CANCELLATION_CONFIRMATION_REQUIRED",

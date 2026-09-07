@@ -45,26 +45,38 @@ const server = http.createServer((request, response) => {
   if (request.method === 'GET' && url.pathname === '/agents/providers') return json(response, [])
   if (request.method === 'GET' && url.pathname === '/agents/profiles') return json(response, [])
   if (request.method === 'GET' && url.pathname === `/sessions/${sessionId}/deletion-preflight`) return json(response, {
-    eligible: true,
+    eligible: false,
+    deletion_mode: 'eligible_with_historical_indeterminate_retirement',
     cancellable: false,
+    can_resolve_and_delete: true,
     already_deleted: false,
     requires_cancellation_confirmation: false,
+    requires_historical_indeterminate_confirmation: true,
     requires_dirty_confirmation: false,
     modified_files: 0,
     untracked_files: 0,
-    reason_code: null,
-    reason_codes: [],
-    plan_token: null,
-    current_queue_count: 0,
+    reason_code: 'HISTORICAL_EFFECT_OUTCOME_UNKNOWN',
+    reason_codes: ['HISTORICAL_EFFECT_OUTCOME_UNKNOWN'],
+    plan_token: 'b'.repeat(64),
+    current_queue_count: 4,
     cancellable_count: 0,
+    historical_indeterminate_count: 4,
     unsafe_count: 0,
+    live_unsafe_count: 0,
+    active_runtime_count: 0,
+    active_execution_count: 0,
     plan_limit: 500,
-    blockers: [],
+    blockers: [{ category: 'historical_indeterminate_effects', count: 4, disposition: 'historical_indeterminate', reason_codes: ['HISTORICAL_EFFECT_OUTCOME_UNKNOWN'] }],
     cancellable_blockers: [],
+    historical_indeterminate_blockers: [{ category: 'historical_indeterminate_effects', count: 4, disposition: 'historical_indeterminate', reason_codes: ['HISTORICAL_EFFECT_OUTCOME_UNKNOWN'] }],
     unsafe_blockers: [],
     cancellation_plan: { count: 0, categories: [] },
+    historical_indeterminate_plan: { count: 4, categories: [{ category: 'historical_indeterminate_effects', count: 4, disposition: 'historical_indeterminate', reason_codes: ['HISTORICAL_EFFECT_OUTCOME_UNKNOWN'] }] },
   })
   if (request.method === 'DELETE' && url.pathname === `/sessions/${sessionId}`) {
+    assert.equal(url.searchParams.get('retire_historical_indeterminate'), 'true')
+    assert.equal(url.searchParams.get('cancel_unresolved_work'), 'false')
+    assert.equal(url.searchParams.get('cancellation_plan_token'), 'b'.repeat(64))
     deleteRequestCount += 1
     releaseDelete = () => {
       sessions.splice(0, sessions.length)
@@ -104,7 +116,7 @@ try {
   }
 
   await page.getByTitle('Delete session').click()
-  const confirm = page.getByRole('button', { name: 'Delete Session', exact: true })
+  const confirm = page.getByRole('button', { name: 'Preserve unknown outcomes and delete Session', exact: true })
   await confirm.click()
   const closing = page.getByRole('button', { name: 'Working…', exact: true })
   await closing.waitFor()

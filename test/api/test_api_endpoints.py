@@ -1538,6 +1538,7 @@ class TestDeleteSession:
             registry=ANY,
             confirm_dirty_workspace=False,
             cancel_unresolved_work=False,
+            retire_historical_indeterminate=False,
             cancellation_plan_token=None,
         )
 
@@ -1555,6 +1556,7 @@ class TestDeleteSession:
             registry=ANY,
             confirm_dirty_workspace=True,
             cancel_unresolved_work=False,
+            retire_historical_indeterminate=False,
             cancellation_plan_token=None,
         )
 
@@ -1577,6 +1579,30 @@ class TestDeleteSession:
             registry=ANY,
             confirm_dirty_workspace=False,
             cancel_unresolved_work=True,
+            retire_historical_indeterminate=False,
+            cancellation_plan_token=token,
+        )
+
+    def test_delete_session_forwards_exact_historical_retirement_intent(self, client):
+        token = "b" * 64
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.delete_session.return_value = {"deleted": ["test-session"], "errors": []}
+
+            response = client.delete(
+                "/sessions/test-session",
+                params={
+                    "retire_historical_indeterminate": True,
+                    "cancellation_plan_token": token,
+                },
+            )
+
+        assert response.status_code == 200
+        mock_svc.delete_session.assert_called_once_with(
+            "test-session",
+            registry=ANY,
+            confirm_dirty_workspace=False,
+            cancel_unresolved_work=False,
+            retire_historical_indeterminate=True,
             cancellation_plan_token=token,
         )
 

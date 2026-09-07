@@ -3570,6 +3570,84 @@ _SESSION_DELETION_PLAN_LIMIT = 500
 _OPERATOR_RETIRED_INDETERMINATE_EFFECT = "operator_retired_indeterminate"
 
 
+def _workflow_effect_retirement_authority(
+    effect: WorkflowEffectModel,
+    workflow: WorkflowModel | None,
+    turn: WorkflowTurnModel | None,
+) -> Dict[str, str]:
+    """Return the exact durable chain that can authorize effect retirement."""
+    link_matches = (
+        workflow is not None
+        and turn is not None
+        and int(turn.workflow_id) == int(effect.workflow_id)
+    )
+    return {
+        "effect_workflow_id": str(effect.workflow_id),
+        "workflow_exists": "1" if workflow is not None else "0",
+        "workflow_status": str(workflow.status) if workflow is not None else "missing",
+        "workflow_active_turn_id": str(workflow.active_turn_id or "") if workflow else "",
+        "workflow_updated_at": str(workflow.updated_at or "") if workflow else "",
+        "turn_exists": "1" if turn is not None else "0",
+        "turn_workflow_id": str(turn.workflow_id) if turn is not None else "",
+        "workflow_link_matches_turn": "1" if link_matches else "0",
+        "turn_state": str(turn.state) if turn is not None else "missing",
+        "turn_updated_at": str(turn.updated_at or "") if turn is not None else "",
+        "turn_provider_processing_observed_at": (
+            str(turn.provider_processing_observed_at or "") if turn is not None else ""
+        ),
+        "turn_provider_ready_observed_at": (
+            str(turn.provider_ready_observed_at or "") if turn is not None else ""
+        ),
+        "turn_provider_reconnect_requested_at": (
+            str(turn.provider_reconnect_requested_at or "") if turn is not None else ""
+        ),
+        "turn_superseded_by_turn_id": (
+            str(turn.superseded_by_turn_id or "") if turn is not None else ""
+        ),
+        "effect_updated_at": str(effect.updated_at or ""),
+    }
+
+
+def _workflow_effect_retirement_classification(
+    effect: WorkflowEffectModel,
+    workflow: WorkflowModel | None,
+    turn: WorkflowTurnModel | None,
+) -> tuple[str, str, str]:
+    """Classify one unknown effect without borrowing authority across links."""
+    if workflow is None:
+        return "unsafe", "workflow_effects", "EFFECT_WORKFLOW_LINK_MISSING"
+    if turn is None:
+        return "unsafe", "workflow_effects", "EFFECT_TURN_LINK_MISSING"
+    if int(turn.workflow_id) != int(effect.workflow_id):
+        return "unsafe", "workflow_effects", "EFFECT_WORKFLOW_LINK_MISMATCH"
+
+    is_active_turn = workflow.active_turn_id == turn.id
+    processing_unsettled = turn.provider_processing_observed_at is not None and (
+        turn.provider_ready_observed_at is None
+        or turn.provider_ready_observed_at < turn.provider_processing_observed_at
+    )
+    if is_active_turn and turn.provider_reconnect_requested_at is not None:
+        return "unsafe", "recovery_authority", "PROVIDER_RECONNECT_ACTIVE"
+    if is_active_turn and processing_unsettled:
+        return "unsafe", "provider_execution", "PROVIDER_EXECUTION_STATE_UNSETTLED"
+
+    historical = (
+        workflow.status in _WORKSPACE_RETIREMENT_TERMINAL_WORKFLOW_STATES
+        or turn.superseded_by_turn_id is not None
+    )
+    if historical:
+        return (
+            "historical_indeterminate",
+            "historical_indeterminate_effects",
+            "HISTORICAL_EFFECT_OUTCOME_UNKNOWN",
+        )
+    return (
+        "unsafe",
+        "workflow_effects",
+        "INDETERMINATE_EFFECT" if effect.state == "indeterminate" else "CLAIMED_EFFECT",
+    )
+
+
 def _session_unresolved_work_plan_in_transaction(
     db: Any,
     *,
@@ -3579,10 +3657,11 @@ def _session_unresolved_work_plan_in_transaction(
     """Classify one bounded, exact Session-owned deletion cancellation plan.
 
     This is the queue/authority half of both workspace retirement and Session
-    deletion.  It deliberately treats claimed/indeterminate effects and every
-    runtime/writer/recovery lease as unsafe even when workflow state is
-    terminal.  Historical received, superseded, completed, and acknowledged
-    rows are absent by construction.
+    deletion. Claimed/indeterminate effects become operator-retirable only
+    when their exact workflow/turn linkage is intact, the workflow or turn is
+    historical, and no resumable provider authority remains. Every live
+    runtime/writer/recovery authority stays unsafe. Historical received,
+    superseded, completed, and acknowledged rows are absent by construction.
     """
     terminal_scope_overflow = len(terminals) > _SESSION_DELETION_PLAN_LIMIT
     terminal_ids = [str(terminal.id) for terminal in terminals]
@@ -3659,7 +3738,7 @@ def _session_unresolved_work_plan_in_transaction(
             )
 
         fingerprint_document = {
-            "version": 2,
+            "version": 3,
             "session_id": session_id,
             "terminal_authority": sorted(
                 (
@@ -3899,67 +3978,41 @@ def _session_unresolved_work_plan_in_transaction(
                 assignment.status,
             )
 
+        effect_workflow = aliased(WorkflowModel)
+        effect_turn = aliased(WorkflowTurnModel)
+        turn_workflow = aliased(WorkflowModel)
         effects = bounded(
-            db.query(WorkflowEffectModel, WorkflowModel, WorkflowTurnModel)
-            .join(WorkflowModel, WorkflowModel.id == WorkflowEffectModel.workflow_id)
+            db.query(WorkflowEffectModel, effect_workflow, effect_turn)
             .outerjoin(
-                WorkflowTurnModel,
-                WorkflowTurnModel.id == WorkflowEffectModel.workflow_turn_id,
+                effect_workflow,
+                effect_workflow.id == WorkflowEffectModel.workflow_id,
             )
+            .outerjoin(
+                effect_turn,
+                effect_turn.id == WorkflowEffectModel.workflow_turn_id,
+            )
+            .outerjoin(turn_workflow, turn_workflow.id == effect_turn.workflow_id)
             .filter(
-                WorkflowModel.root_terminal_id.in_(terminal_ids),
+                or_(
+                    effect_workflow.root_terminal_id.in_(terminal_ids),
+                    turn_workflow.root_terminal_id.in_(terminal_ids),
+                ),
                 WorkflowEffectModel.state.in_(("claimed", "indeterminate")),
             )
             .order_by(WorkflowEffectModel.id.asc())
         )
         for effect, workflow, turn in effects:
-            historical = turn is not None and (
-                workflow.status in _WORKSPACE_RETIREMENT_TERMINAL_WORKFLOW_STATES
-                or turn.superseded_by_turn_id is not None
+            disposition, category, reason_code = _workflow_effect_retirement_classification(
+                effect, workflow, turn
             )
             record(
-                "historical_indeterminate" if historical else "unsafe",
-                ("historical_indeterminate_effects" if historical else "workflow_effects"),
-                (
-                    "HISTORICAL_EFFECT_OUTCOME_UNKNOWN"
-                    if historical
-                    else (
-                        "INDETERMINATE_EFFECT"
-                        if effect.state == "indeterminate"
-                        else "CLAIMED_EFFECT"
-                    )
-                ),
+                disposition,
+                category,
+                reason_code,
                 "workflow_effect",
                 effect.id,
                 effect.state,
-                authority=(
-                    {
-                        "workflow_status": str(workflow.status),
-                        "workflow_active_turn_id": str(workflow.active_turn_id or ""),
-                        "workflow_updated_at": str(workflow.updated_at or ""),
-                        "turn_state": str(turn.state) if turn is not None else "missing",
-                        "turn_updated_at": str(turn.updated_at or "") if turn is not None else "",
-                        "turn_provider_processing_observed_at": str(
-                            turn.provider_processing_observed_at or ""
-                        ),
-                        "turn_provider_ready_observed_at": str(
-                            turn.provider_ready_observed_at or ""
-                        ),
-                        "turn_provider_reconnect_requested_at": str(
-                            turn.provider_reconnect_requested_at or ""
-                        ),
-                        "turn_superseded_by_turn_id": str(turn.superseded_by_turn_id or ""),
-                        "effect_updated_at": str(effect.updated_at or ""),
-                    }
-                    if turn is not None
-                    else {
-                        "workflow_status": str(workflow.status),
-                        "workflow_active_turn_id": str(workflow.active_turn_id or ""),
-                        "workflow_updated_at": str(workflow.updated_at or ""),
-                        "turn_state": "missing",
-                        "effect_updated_at": str(effect.updated_at or ""),
-                    }
-                ),
+                authority=_workflow_effect_retirement_authority(effect, workflow, turn),
             )
 
         live_turns = bounded(
@@ -4328,6 +4381,7 @@ def cancel_session_work_for_deletion(
             if receipt is not None:
                 return {"cancelled": True, "already_deleted": True, "residual": None}
             return {"cancelled": False, "reason_code": "SESSION_HISTORY_MISSING"}
+        terminal_ids = [str(terminal.id) for terminal in terminals]
         plan = _session_unresolved_work_plan_in_transaction(
             db,
             session_id=session_id,
@@ -4382,11 +4436,20 @@ def cancel_session_work_for_deletion(
             if item["item_kind"] == "workflow_effect"
         ]
 
-        effects = (
-            db.query(WorkflowEffectModel)
+        effect_rows = (
+            db.query(WorkflowEffectModel, WorkflowModel, WorkflowTurnModel)
+            .join(WorkflowModel, WorkflowModel.id == WorkflowEffectModel.workflow_id)
+            .join(
+                WorkflowTurnModel,
+                and_(
+                    WorkflowTurnModel.id == WorkflowEffectModel.workflow_turn_id,
+                    WorkflowTurnModel.workflow_id == WorkflowEffectModel.workflow_id,
+                ),
+            )
             .filter(
                 WorkflowEffectModel.id.in_(effect_ids),
                 WorkflowEffectModel.state.in_(("claimed", "indeterminate")),
+                WorkflowModel.root_terminal_id.in_(terminal_ids),
             )
             .all()
             if effect_ids
@@ -4395,12 +4458,20 @@ def cancel_session_work_for_deletion(
         expected_effect_states = {
             int(item["item_id"]): str(item["state"]) for item in retirement_items
         }
-        if {int(effect.id) for effect in effects} != set(effect_ids) or any(
-            str(effect.state) != expected_effect_states[int(effect.id)] for effect in effects
+        expected_effect_authority = {
+            int(item["item_id"]): dict(item.get("authority", {})) for item in retirement_items
+        }
+        if {int(effect.id) for effect, _workflow, _turn in effect_rows} != set(effect_ids) or any(
+            str(effect.state) != expected_effect_states[int(effect.id)]
+            or _workflow_effect_retirement_classification(effect, workflow, turn)[0]
+            != "historical_indeterminate"
+            or _workflow_effect_retirement_authority(effect, workflow, turn)
+            != expected_effect_authority[int(effect.id)]
+            for effect, workflow, turn in effect_rows
         ):
             db.rollback()
             return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
-        for effect in effects:
+        for effect, _workflow, _turn in effect_rows:
             effect.state = _OPERATOR_RETIRED_INDETERMINATE_EFFECT
             effect.updated_at = now
 

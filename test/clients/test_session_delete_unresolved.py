@@ -880,7 +880,179 @@ def test_runtime_operation_and_resumable_reconnect_block_historical_retirement(m
     reconnect_blocked = _plan()
     assert reconnect_blocked["deletion_mode"] == "blocked_live_or_unsafe_authority"
     assert "PROVIDER_RECONNECT_ACTIVE" in reconnect_blocked["reason_codes"]
-    assert reconnect_blocked["historical_indeterminate_count"] == 1
+    assert reconnect_blocked["historical_indeterminate_count"] == 0
+
+
+def test_terminal_workflow_unsettled_provider_processing_blocks_historical_retirement(
+    monkeypatch,
+):
+    _install_database(monkeypatch)
+    processing_at = datetime(2026, 9, 7, 10, 5, 0)
+    with database.SessionLocal() as db:
+        db.add(_terminal())
+        workflow = WorkflowModel(root_terminal_id="owner", status="terminal")
+        db.add(workflow)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="terminal-processing",
+            state="sent",
+            provider_processing_observed_at=processing_at,
+        )
+        db.add(turn)
+        db.flush()
+        workflow.active_turn_id = turn.id
+        db.add(
+            WorkflowEffectModel(
+                workflow_id=workflow.id,
+                workflow_turn_id=turn.id,
+                effect_kind="send_message",
+                effect_key="unknown-processing",
+                state="indeterminate",
+                claim_token="claim",
+            )
+        )
+        db.commit()
+        turn_id = int(turn.id)
+
+    blocked = _plan()
+    assert blocked["deletion_mode"] == "blocked_live_or_unsafe_authority"
+    assert blocked["historical_indeterminate_count"] == 0
+    assert blocked["live_unsafe_count"] == 1
+    assert "PROVIDER_EXECUTION_STATE_UNSETTLED" in blocked["reason_codes"]
+
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, turn_id)
+        turn.provider_ready_observed_at = processing_at
+        db.commit()
+
+    settled = _plan()
+    assert settled["deletion_mode"] == ("eligible_with_historical_indeterminate_retirement")
+    assert settled["historical_indeterminate_count"] == 1
+    assert settled["live_unsafe_count"] == 0
+
+
+def test_effect_retirement_rejects_missing_and_cross_workflow_linkage(monkeypatch):
+    _install_database(monkeypatch)
+    with database.SessionLocal() as db:
+        db.add_all([_terminal(), _terminal("foreign", "other")])
+        session_workflow = WorkflowModel(root_terminal_id="owner", status="terminal")
+        foreign_workflow = WorkflowModel(root_terminal_id="foreign", status="terminal")
+        db.add_all([session_workflow, foreign_workflow])
+        db.flush()
+        session_turn = WorkflowTurnModel(
+            workflow_id=session_workflow.id,
+            kind="external_input",
+            dedupe_key="session-turn",
+            state="sent",
+        )
+        foreign_turn = WorkflowTurnModel(
+            workflow_id=foreign_workflow.id,
+            kind="external_input",
+            dedupe_key="foreign-turn",
+            state="sent",
+            superseded_by_turn_id=999,
+        )
+        db.add_all([session_turn, foreign_turn])
+        db.flush()
+        db.add_all(
+            [
+                WorkflowEffectModel(
+                    workflow_id=session_workflow.id,
+                    workflow_turn_id=foreign_turn.id,
+                    effect_kind="send_message",
+                    effect_key="cross-workflow",
+                    state="indeterminate",
+                    claim_token="cross-claim",
+                ),
+                WorkflowEffectModel(
+                    workflow_id=999,
+                    workflow_turn_id=session_turn.id,
+                    effect_kind="handoff",
+                    effect_key="missing-workflow",
+                    state="claimed",
+                    claim_token="missing-claim",
+                ),
+            ]
+        )
+        db.commit()
+
+    plan = _plan()
+    assert plan["deletion_mode"] == "blocked_live_or_unsafe_authority"
+    assert plan["historical_indeterminate_count"] == 0
+    assert plan["live_unsafe_count"] == 2
+    assert "EFFECT_WORKFLOW_LINK_MISMATCH" in plan["reason_codes"]
+    assert "EFFECT_WORKFLOW_LINK_MISSING" in plan["reason_codes"]
+    assert plan["plan_token"] is None
+    current = interaction_read_model_service.list_interactions("session", mode="current", limit=20)
+    assert current["total"] == plan["live_unsafe_count"] == 2
+    assert {item["diagnostics"]["durable_id"] for item in current["items"]} == {"1", "2"}
+    history = interaction_read_model_service.list_interactions("session", mode="history", limit=20)
+    assert not any(item["interaction_type"] == "effect" for item in history["items"])
+    with database.SessionLocal() as db:
+        assert [
+            effect.state
+            for effect in db.query(WorkflowEffectModel).order_by(WorkflowEffectModel.id)
+        ] == ["indeterminate", "claimed"]
+        assert db.query(SessionDeletionCancellationAuditModel).count() == 0
+
+
+def test_effect_retirement_revalidates_same_workflow_linkage_after_preflight(monkeypatch):
+    _install_database(monkeypatch)
+    with database.SessionLocal() as db:
+        db.add_all([_terminal(), _terminal("foreign", "other")])
+        workflow = WorkflowModel(root_terminal_id="owner", status="terminal")
+        db.add(workflow)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="valid-turn",
+            state="sent",
+        )
+        db.add(turn)
+        db.flush()
+        effect = WorkflowEffectModel(
+            workflow_id=workflow.id,
+            workflow_turn_id=turn.id,
+            effect_kind="send_message",
+            effect_key="link-changes",
+            state="indeterminate",
+            claim_token="claim",
+        )
+        db.add(effect)
+        db.commit()
+        effect_id = int(effect.id)
+
+    preflight = _plan()
+    assert preflight["deletion_mode"] == ("eligible_with_historical_indeterminate_retirement")
+    with database.SessionLocal() as db:
+        foreign_workflow = WorkflowModel(root_terminal_id="foreign", status="terminal")
+        db.add(foreign_workflow)
+        db.flush()
+        foreign_turn = WorkflowTurnModel(
+            workflow_id=foreign_workflow.id,
+            kind="external_input",
+            dedupe_key="foreign-turn",
+            state="sent",
+        )
+        db.add(foreign_turn)
+        db.flush()
+        db.get(WorkflowEffectModel, effect_id).workflow_turn_id = foreign_turn.id
+        db.commit()
+
+    rejected = database.cancel_session_work_for_deletion(
+        "session",
+        expected_plan_token=preflight["plan_token"],
+        cancel_unresolved_work=False,
+        retire_historical_indeterminate=True,
+    )
+    assert rejected["cancelled"] is False
+    assert rejected["reason_code"] == "SESSION_DELETE_PLAN_CHANGED"
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowEffectModel, effect_id).state == "indeterminate"
+        assert db.query(SessionDeletionCancellationAuditModel).count() == 0
 
 
 def test_provider_writer_recovery_and_cross_session_authority_are_unsafe(monkeypatch):

@@ -334,14 +334,17 @@ WITH interaction_terminals AS MATERIALIZED (
            ca.child_terminal_id AS target_terminal_id,
            SUBSTR(COALESCE(child_turn.payload, ''), 1, 1200) AS input_preview,
            ca.created_at, ca.updated_at,
-           CASE WHEN ca.status IN (
-             'awaiting_result', 'result_queued', 'result_delivered', 'result_failed',
-             'handoff_awaiting_result', 'handoff_recovery_awaiting_result',
-             'handoff_direct_result_claimed', 'handoff_result_queued',
-             'handoff_result_delivered', 'handoff_result_failed'
-           ) OR result_notice.status = 'pending' THEN 1 ELSE 0 END AS is_current,
+           CASE WHEN ca.review_superseded_at IS NULL AND (
+             ca.status IN (
+               'awaiting_result', 'result_queued', 'result_delivered', 'result_failed',
+               'handoff_awaiting_result', 'handoff_recovery_awaiting_result',
+               'handoff_direct_result_claimed', 'handoff_result_queued',
+               'handoff_result_delivered', 'handoff_result_failed'
+             ) OR result_notice.status = 'pending'
+           ) THEN 1 ELSE 0 END AS is_current,
            ca.status AS queue_state,
            CASE
+             WHEN ca.review_superseded_at IS NOT NULL THEN NULL
              WHEN ca.status IN ('awaiting_result', 'handoff_awaiting_result') THEN 'child_result'
              WHEN ca.status = 'handoff_recovery_awaiting_result' THEN 'reconnect'
              WHEN result_notice.status = 'pending' THEN 'delivery'
@@ -366,16 +369,17 @@ WITH interaction_terminals AS MATERIALIZED (
            CASE WHEN result.document_json IS NOT NULL AND result.content_purged_at IS NULL
                 THEN 1 ELSE 0 END AS result_available,
            ca.status AS delivery_status,
-           CASE WHEN result_notice.status = 'pending' OR ca.status IN (
-             'result_queued', 'result_delivered', 'result_failed',
-             'handoff_direct_result_claimed', 'handoff_result_queued',
-             'handoff_result_delivered', 'handoff_result_failed'
-           ) THEN 1 ELSE 0 END AS delivery_pending,
+           CASE WHEN ca.review_superseded_at IS NOT NULL THEN 0
+                WHEN result_notice.status = 'pending' OR ca.status IN (
+                  'result_queued', 'result_delivered', 'result_failed',
+                  'handoff_direct_result_claimed', 'handoff_result_queued',
+                  'handoff_result_delivered', 'handoff_result_failed'
+                ) THEN 1 ELSE 0 END AS delivery_pending,
            CASE
+             WHEN ca.review_superseded_at IS NOT NULL OR ca.status = 'result_superseded'
+               THEN 'superseded'
              WHEN ca.status IN ('result_acknowledged', 'handoff_result_acknowledged')
                THEN 'acknowledged'
-             WHEN ca.status = 'result_superseded' OR ca.review_superseded_at IS NOT NULL
-               THEN 'superseded'
              WHEN ca.status = 'cancelled' THEN 'cancelled'
              ELSE NULL
            END AS final_disposition,

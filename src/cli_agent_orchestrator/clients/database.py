@@ -3627,6 +3627,7 @@ def _session_workspace_snapshot_in_transaction(
                     ChildAssignmentModel.child_terminal_id.in_(terminal_ids),
                 ),
                 ChildAssignmentModel.status.in_(_WORKSPACE_RETIREMENT_ACTIVE_ASSIGNMENT_STATES),
+                ChildAssignmentModel.review_superseded_at.is_(None),
             )
             .first()
         )

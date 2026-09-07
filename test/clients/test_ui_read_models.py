@@ -1836,3 +1836,112 @@ def test_current_queue_matches_workspace_retirement_safety_boundary(monkeypatch)
     )
     snapshot = database.get_session_workspace_retirement_snapshot("context-1")
     assert snapshot is not None and snapshot["reason_code"] == "WORKFLOW_OPEN"
+
+
+def test_superseded_review_attempts_are_history_not_current_or_retirement_authority(
+    monkeypatch,
+):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 6, 12, 0, 0)
+    terminal = _interaction_terminal()
+    terminal.runtime_lifecycle = "exited"
+    terminal.launch_worktree = "/tmp/superseded-review-worktree"
+    terminal.writer_authority_generation = "writer-superseded-review"
+    terminal.writable_work_context_id = "superseded-review-context"
+    with database.SessionLocal() as db:
+        db.add(terminal)
+        db.add(
+            WritableWorkContextModel(
+                id="superseded-review-context",
+                request_id="superseded-review-request",
+                project_id="project-1",
+                session_id="interaction-session",
+                terminal_id="owner",
+                canonical_source="/tmp/source",
+                canonical_worktree="/tmp/superseded-review-worktree",
+                branch="feat/superseded-review",
+                base_revision="3" * 40,
+                state="admitted",
+                writer_authority_generation="writer-superseded-review",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        attempts = [
+            ChildAssignmentModel(
+                parent_terminal_id="owner",
+                child_terminal_id="reviewer",
+                status="result_acknowledged",
+                attempt_id="superseded-acknowledged-attempt",
+                review_subject_kind="git_commit",
+                review_subject_revision="a" * 40,
+                review_subject_revision_source="explicit",
+                review_superseded_at=now + timedelta(seconds=2),
+                created_at=now,
+                updated_at=now + timedelta(seconds=2),
+            ),
+            # Bounded rereview supersession can intentionally leave a handoff
+            # attempt's transport-looking status intact. The durable review
+            # authority marker, not that old status, is canonical.
+            ChildAssignmentModel(
+                parent_terminal_id="owner",
+                child_terminal_id="reviewer-handoff",
+                status="handoff_result_delivered",
+                attempt_id="superseded-handoff-attempt",
+                review_subject_kind="git_commit",
+                review_subject_revision="b" * 40,
+                review_subject_revision_source="explicit",
+                review_superseded_at=now + timedelta(seconds=3),
+                created_at=now + timedelta(seconds=1),
+                updated_at=now + timedelta(seconds=3),
+            ),
+        ]
+        db.add_all(attempts)
+        db.flush()
+        for attempt, result_id, kind in (
+            (attempts[0], "superseded-ack-result", "assign"),
+            (attempts[1], "superseded-handoff-result", "handoff"),
+        ):
+            db.add(
+                DelegationResultModel(
+                    id=result_id,
+                    child_assignment_id=attempt.id,
+                    schema_version=1,
+                    delegation_kind=kind,
+                    parent_terminal_id=attempt.parent_terminal_id,
+                    child_terminal_id=attempt.child_terminal_id,
+                    authorship="child_submission",
+                    status="complete",
+                    document_json=json.dumps(
+                        {
+                            "format": "v1",
+                            "summary": f"historical {kind} review",
+                            "body_markdown": "durable historical result",
+                        }
+                    ),
+                    created_at=attempt.created_at,
+                    finalized_at=attempt.updated_at,
+                    updated_at=attempt.updated_at,
+                )
+            )
+        db.commit()
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    history = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="history", limit=20
+    )
+
+    assert current["total"] == 0
+    assert current["items"] == []
+    assert interaction_read_model_service.list_session_current_queue_counts(
+        ["interaction-session"]
+    ) == {"interaction-session": 0}
+    assert len(history["items"]) == 2
+    assert {item["final_disposition"] for item in history["items"]} == {"superseded"}
+    assert all(item["queue"]["wait_reason"] is None for item in history["items"])
+    assert all(item["delivery"]["pending"] is False for item in history["items"])
+    assert database.get_parent_completion_barrier("owner") == (0, 0)
+    snapshot = database.get_session_workspace_retirement_snapshot("superseded-review-context")
+    assert snapshot is not None and snapshot["reason_code"] is None

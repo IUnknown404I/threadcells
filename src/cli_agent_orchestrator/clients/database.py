@@ -1046,6 +1046,8 @@ class WorkflowEffectModel(Base):
     ``indeterminate`` rather than replayed blindly. ``not_admitted`` is
     different: it records a proven pre-effect rejection and is the only state
     that may be claimed again after the transient admission condition changes.
+    Bounded observation operations may also seal a known retryable result such
+    as ``wait_timeout`` without changing the observed child lifecycle.
     """
 
     __tablename__ = "workflow_effects"
@@ -11013,6 +11015,10 @@ def _mirror_workflow_effect_ledger(
                 existing.state = _OPERATOR_RETIRED_INDETERMINATE_EFFECT
             elif "indeterminate" in states or "claimed" in states:
                 existing.state = "indeterminate"
+            elif "wait_retryable" in states:
+                existing.state = "wait_retryable"
+            elif "wait_timeout" in states:
+                existing.state = "wait_timeout"
             elif "rejected" in states:
                 existing.state = "rejected"
             else:
@@ -11537,11 +11543,20 @@ def finish_workflow_effect(
 ) -> bool:
     """Seal a claimed effect without permitting a duplicate future entry.
 
-    ``completed`` and ``indeterminate`` are terminal ledger states.  The
-    latter is used for exceptions after an external boundary has been entered;
-    it preserves truthfulness over an unsafe replay.
+    All accepted outcomes seal the claimed row. ``wait_timeout`` and
+    ``wait_retryable`` describe known bounded-observation results without
+    making any claim about the independently owned child lifecycle.
+    ``indeterminate`` is reserved for exceptions after an external boundary
+    has been entered; it preserves truthfulness over an unsafe replay.
     """
-    if outcome not in {"completed", "indeterminate", "rejected", "not_admitted"}:
+    if outcome not in {
+        "completed",
+        "indeterminate",
+        "rejected",
+        "not_admitted",
+        "wait_timeout",
+        "wait_retryable",
+    }:
         raise ValueError(f"Invalid workflow effect outcome: {outcome}")
     _ensure_workflow_schema()
     now = now or datetime.now()
@@ -11622,6 +11637,7 @@ def describe_workflow_effect_rejection(
             return {
                 "reason_code": "DUPLICATE_EFFECT",
                 "workflow_state": workflow.status,
+                "effect_state": str(existing.state),
                 "explanation": "This logical effect was already claimed.",
             }
         return {
@@ -11629,6 +11645,31 @@ def describe_workflow_effect_rejection(
             "workflow_state": workflow.status,
             "explanation": "The logical turn is not the current admitted turn.",
         }
+
+
+def get_workflow_effect_state(
+    receiver_terminal_id: str,
+    logical_turn_id: int,
+    effect_kind: str,
+    effect_key: str,
+) -> Optional[str]:
+    """Return an exact active-turn effect state for a resumable-operation fence."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        row = (
+            db.query(WorkflowEffectModel.state)
+            .join(WorkflowModel, WorkflowModel.id == WorkflowEffectModel.workflow_id)
+            .filter(
+                WorkflowModel.root_terminal_id == receiver_terminal_id,
+                WorkflowModel.status == WORKFLOW_OPEN,
+                WorkflowModel.active_turn_id == logical_turn_id,
+                WorkflowEffectModel.workflow_turn_id == logical_turn_id,
+                WorkflowEffectModel.effect_kind == effect_kind,
+                WorkflowEffectModel.effect_key == effect_key,
+            )
+            .one_or_none()
+        )
+        return str(row[0]) if row is not None else None
 
 
 def mark_workflow_turn_sent_for_inbox(message_id: int) -> bool:

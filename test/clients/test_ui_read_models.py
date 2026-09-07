@@ -1749,6 +1749,125 @@ def test_open_workflow_projects_consumed_turns_as_history_and_only_unresolved_as
     ) == {"interaction-session": 0}
 
 
+def test_wait_timeout_is_history_while_open_workflow_and_provider_axes_stay_independent(
+    monkeypatch,
+):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 7, 12, 0, 0)
+    with database.SessionLocal() as db:
+        db.add(_interaction_terminal())
+        workflows = [
+            WorkflowModel(root_terminal_id="owner", status=status, created_at=now, updated_at=now)
+            for status in ("open", "terminal")
+        ]
+        db.add_all(workflows)
+        db.flush()
+        turns = []
+        for index, workflow in enumerate(workflows):
+            turn = WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="external_input",
+                dedupe_key=f"await-timeout-{index}",
+                state="sent",
+                provider_processing_observed_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(turn)
+            db.flush()
+            db.add(
+                WorkflowTurnReceiptModel(
+                    workflow_turn_id=turn.id,
+                    receiver_terminal_id="owner",
+                    consumed_at=now,
+                )
+            )
+            db.add(
+                WorkflowEffectModel(
+                    workflow_id=workflow.id,
+                    workflow_turn_id=turn.id,
+                    effect_kind="await_handoff",
+                    effect_key=f"wait-slice-{index}",
+                    state="wait_timeout",
+                    claim_token=f"claim-{index}",
+                    created_at=now,
+                    updated_at=now + timedelta(seconds=30),
+                )
+            )
+            turns.append(turn)
+        db.add(
+            WorkflowEffectModel(
+                workflow_id=workflows[0].id,
+                workflow_turn_id=turns[0].id,
+                effect_kind="await_handoff",
+                effect_key="wait-slice-open-completed",
+                state="completed",
+                claim_token="claim-open-completed",
+                created_at=now + timedelta(seconds=31),
+                updated_at=now + timedelta(seconds=32),
+            )
+        )
+        workflows[0].active_turn_id = turns[0].id
+        open_turn_id, terminal_turn_id = (turn.id for turn in turns)
+        db.commit()
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert current["total"] == 1
+    assert current["items"][0]["interaction_type"] == "workflow"
+    assert current["items"][0]["queue"]["wait_reason"] == "workflow_continuation"
+    assert not any(item["workflow"]["effect_state"] == "wait_timeout" for item in current["items"])
+    assert interaction_read_model_service.list_session_current_queue_counts(
+        ["interaction-session"]
+    ) == {"interaction-session": 1}
+
+    history = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="history", limit=20
+    )
+    history_by_turn = {
+        item["workflow"]["turn_id"]: item
+        for item in history["items"]
+        if item["interaction_type"] == "workflow_turn"
+    }
+    assert history_by_turn[open_turn_id]["final_disposition"] == "processed"
+    assert history_by_turn[terminal_turn_id]["final_disposition"] == "completed"
+    known_waits = [
+        item
+        for item in history["items"]
+        if item["interaction_type"] == "effect"
+        and item["workflow"]["effect_kind"] == "await_handoff"
+    ]
+    assert len(known_waits) == 3
+    assert len({item["id"] for item in known_waits}) == 3
+    assert sorted(item["workflow"]["effect_state"] for item in known_waits) == [
+        "completed",
+        "wait_timeout",
+        "wait_timeout",
+    ]
+    assert sorted(item["final_disposition"] for item in known_waits) == [
+        "completed",
+        "wait_slice_expired",
+        "wait_slice_expired",
+    ]
+
+    with database.SessionLocal() as db:
+        db.add(
+            ProviderExecutionLeaseModel(
+                terminal_id="owner", workflow_turn_id=open_turn_id, acquired_at=now
+            )
+        )
+        db.commit()
+    executing = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert executing["total"] == 1
+    assert executing["items"][0]["queue"]["wait_reason"] == "current_provider_turn"
+    assert not any(
+        item["workflow"]["effect_state"] == "wait_timeout" for item in executing["items"]
+    )
+
+
 def test_open_workflow_unadmitted_transport_states_remain_current(monkeypatch):
     _install_database(monkeypatch)
     now = datetime(2026, 9, 7, 8, 30, 0)

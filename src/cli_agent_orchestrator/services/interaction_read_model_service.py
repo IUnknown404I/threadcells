@@ -116,6 +116,9 @@ WITH interaction_terminals AS MATERIALIZED (
     JOIN workflows ew ON ew.id = effect.workflow_id
     JOIN interaction_terminals et ON et.terminal_id = ew.root_terminal_id
     WHERE 1 = 1
+      AND NOT (effect.effect_kind = 'await_handoff'
+               AND effect.state IN ('completed', 'rejected',
+                                    'wait_timeout', 'wait_retryable'))
 """
         + current_effect_scope
         + """
@@ -360,6 +363,38 @@ WITH interaction_terminals AS MATERIALIZED (
         + audit_retirement_scope
         + audit_terminal_scope
         + """
+), known_wait_effect_item_rows AS NOT MATERIALIZED (
+    SELECT 'effect:' || printf('%020d', effect.id) AS interaction_id,
+           terminals.session_id, 'effect' AS interaction_type,
+           effect.effect_kind AS task_type, 'system' AS source_kind,
+           w.root_terminal_id AS source_terminal_id,
+           w.root_terminal_id AS target_terminal_id, '' AS input_preview,
+           effect.created_at, effect.updated_at, 0 AS is_current,
+           effect.state AS queue_state, NULL AS wait_reason,
+           0 AS admission_pending, effect.workflow_id,
+           effect.workflow_turn_id, w.status AS workflow_status,
+           w.terminal_reason AS workflow_reason, wt.state AS turn_state,
+           wt.kind AS turn_kind, wt.provider_outcome_code,
+           wt.provider_outcome_detail, effect.effect_kind, effect.state AS effect_state,
+           0 AS workflow_turn_count, 0 AS superseded_turn_count,
+           NULL AS assignment_id, NULL AS result_id, NULL AS result_status,
+           NULL AS result_summary, 0 AS result_available, NULL AS delivery_status,
+           0 AS delivery_pending,
+           CASE effect.state
+             WHEN 'wait_timeout' THEN 'wait_slice_expired'
+             WHEN 'wait_retryable' THEN 'wait_retryable'
+             WHEN 'completed' THEN 'completed'
+             ELSE 'failed'
+           END AS final_disposition,
+           CAST(effect.id AS TEXT) AS diagnostic_id
+    FROM interaction_terminals terminals
+    CROSS JOIN workflows w ON w.root_terminal_id = terminals.terminal_id
+    CROSS JOIN workflow_turns wt ON wt.workflow_id = w.id
+    CROSS JOIN workflow_effects effect
+      ON effect.workflow_id = w.id
+     AND effect.workflow_turn_id = wt.id
+    WHERE effect.effect_kind = 'await_handoff'
+      AND effect.state IN ('completed', 'rejected', 'wait_timeout', 'wait_retryable')
 ), provider_authority_item_rows AS NOT MATERIALIZED (
     SELECT 'provider:' || lease.terminal_id || ':' || printf('%020d', wt.id)
              AS interaction_id,
@@ -584,6 +619,7 @@ WITH interaction_terminals AS MATERIALIZED (
                 "workflow_shell_item_rows",
                 "unresolved_authority_item_rows",
                 "retired_effect_item_rows",
+                *(("known_wait_effect_item_rows",) if not current_only else ()),
                 "provider_authority_item_rows",
                 "writer_authority_item_rows",
                 "assignment_item_rows",

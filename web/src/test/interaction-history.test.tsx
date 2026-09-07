@@ -198,6 +198,43 @@ describe('InteractionHistoryDrawer', () => {
     expect(screen.getByText('No canonical result exists for this interaction.')).toBeInTheDocument()
   })
 
+  it('renders a bounded handoff timeout as a known History disposition', async () => {
+    const timeout = interaction({
+      id: 'workflow-turn:00000000000000000011',
+      interaction_type: 'effect',
+      task_type: 'await_handoff',
+      current: false,
+      queue: { state: 'sent', wait_reason: null, admission_pending: false },
+      workflow: {
+        id: 7,
+        turn_id: 11,
+        status: 'open',
+        reason: null,
+        turn_state: 'sent',
+        turn_kind: 'assigned_result',
+        provider_outcome_code: null,
+        provider_outcome_detail: null,
+        effect_kind: 'await_handoff',
+        effect_state: 'wait_timeout',
+        turn_count: 0,
+        superseded_turn_count: 0,
+      },
+      result: { id: null, status: null, summary: null, available: false },
+      final_disposition: 'wait_slice_expired',
+    })
+    vi.spyOn(api, 'listInteractions').mockImplementation(async params => (
+      page(params.mode === 'history' ? [timeout] : [])
+    ))
+
+    render(<I18nProvider><InteractionHistoryDrawer sessionId="session-1" sessionName="cao-session-1" initialMode="history" onClose={() => {}} /></I18nProvider>)
+
+    expect(await screen.findByText('Wait slice expired')).toBeInTheDocument()
+    expect(screen.getByText('Wait for handoff')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Show details' }))
+    expect(screen.getByText('await_handoff · wait_timeout')).toBeInTheDocument()
+    expect(screen.getAllByText('No canonical result exists for this interaction.')).toHaveLength(2)
+  })
+
   it('is a responsive modal drawer with trapped initial focus and Escape close', async () => {
     vi.spyOn(api, 'listInteractions').mockResolvedValue(page([]))
     const onClose = vi.fn()

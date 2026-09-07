@@ -37,6 +37,14 @@ class HandoffResult(BaseModel):
         default=None,
         description="Completed only after validated output; waiting is resumable with terminal_id",
     )
+    wait_slice_id: Optional[int] = Field(
+        default=None,
+        description="Bounded await_handoff slice that produced this observation",
+    )
+    next_wait_slice_id: Optional[int] = Field(
+        default=None,
+        description="Next sequential slice accepted after a known resumable wait outcome",
+    )
 
     @model_validator(mode="after")
     def set_legacy_state(self) -> "HandoffResult":

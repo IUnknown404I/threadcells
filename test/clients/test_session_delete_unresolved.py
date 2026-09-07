@@ -89,6 +89,14 @@ def test_historical_lifecycle_axes_do_not_block_or_enter_current_queue(monkeypat
                     state="completed",
                     claim_token="claim",
                 ),
+                WorkflowEffectModel(
+                    workflow_id=workflow.id,
+                    workflow_turn_id=turn.id,
+                    effect_kind="await_handoff",
+                    effect_key="bounded-wait",
+                    state="wait_timeout",
+                    claim_token="wait-claim",
+                ),
                 ChildAssignmentModel(
                     parent_terminal_id="owner",
                     child_terminal_id="child",
@@ -102,6 +110,8 @@ def test_historical_lifecycle_axes_do_not_block_or_enter_current_queue(monkeypat
     assert interaction_read_model_service.list_session_current_queue_counts(["session"]) == {
         "session": 0
     }
+    history = interaction_read_model_service.list_interactions("session", mode="history", limit=20)
+    assert any(item["final_disposition"] == "wait_slice_expired" for item in history["items"])
 
     with database.SessionLocal() as db:
         workflow = db.query(WorkflowModel).one()

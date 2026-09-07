@@ -348,6 +348,66 @@ def test_session_owned_child_assignment_is_cancelled_with_result_history(monkeyp
         assert result.child_assignment_id == assignment.id
 
 
+def test_cancellation_mutates_and_audits_only_exact_planned_rows(monkeypatch):
+    _install_database(monkeypatch)
+    with database.SessionLocal() as db:
+        db.add_all([_terminal(), _terminal("child")])
+        workflow = WorkflowModel(root_terminal_id="owner", status="open")
+        db.add(workflow)
+        db.flush()
+        superseded_turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="superseded-history",
+            state="queued",
+            superseded_by_turn_id=999,
+            superseded_at=datetime(2026, 9, 7, 9, 0, 0),
+        )
+        superseded_assignment = ChildAssignmentModel(
+            parent_terminal_id="owner",
+            child_terminal_id="child",
+            status=ChildAssignmentStatus.AWAITING_RESULT.value,
+            review_superseded_at=datetime(2026, 9, 7, 9, 0, 0),
+        )
+        db.add_all([superseded_turn, superseded_assignment])
+        db.commit()
+        workflow_id = int(workflow.id)
+        turn_id = int(superseded_turn.id)
+        assignment_id = int(superseded_assignment.id)
+
+    plan = _plan()
+    assert plan["cancellable_count"] == 1
+    assert plan["blockers"] == [
+        {
+            "category": "unfinished_workflows",
+            "count": 1,
+            "disposition": "cancellable",
+            "reason_codes": ["WORKFLOW_OPEN"],
+        }
+    ]
+
+    result = database.cancel_session_work_for_deletion(
+        "session", expected_plan_token=plan["plan_token"]
+    )
+    # The existing terminal-cleanup phase runs after the exact cancellation
+    # transaction during Session deletion and must preserve the same history.
+    database.cancel_workflows_for_terminal("owner")
+
+    assert result["cancelled"] is True
+    assert result["cancelled_count"] == 1
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowModel, workflow_id).status == "cancelled"
+        assert db.get(WorkflowTurnModel, turn_id).state == "queued"
+        assert db.get(ChildAssignmentModel, assignment_id).status == (
+            ChildAssignmentStatus.AWAITING_RESULT.value
+        )
+        assert db.query(DelegationResultModel).count() == 0
+        audits = db.query(SessionDeletionCancellationAuditModel).all()
+        assert [(row.item_kind, row.item_id, row.final_state) for row in audits] == [
+            ("workflow", str(workflow_id), "cancelled")
+        ]
+
+
 def test_unsafe_authority_is_fail_closed_and_safe_rows_are_not_partially_cancelled(monkeypatch):
     _install_database(monkeypatch)
     with database.SessionLocal() as db:

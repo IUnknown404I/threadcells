@@ -4193,7 +4193,7 @@ def cancel_session_work_for_deletion(
         assignment_ids = ids("child_assignment")
 
         if turn_ids:
-            (
+            transitioned_turns = (
                 db.query(WorkflowTurnModel)
                 .filter(
                     WorkflowTurnModel.id.in_(turn_ids),
@@ -4210,8 +4210,11 @@ def cancel_session_work_for_deletion(
                     synchronize_session=False,
                 )
             )
+            if transitioned_turns != len(turn_ids):
+                db.rollback()
+                return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
         if inbox_ids:
-            (
+            transitioned_inbox = (
                 db.query(InboxModel)
                 .filter(
                     InboxModel.id.in_(inbox_ids),
@@ -4225,13 +4228,65 @@ def cancel_session_work_for_deletion(
                     synchronize_session=False,
                 )
             )
+            if transitioned_inbox != len(inbox_ids):
+                db.rollback()
+                return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
 
-        terminal_ids = [str(terminal.id) for terminal in terminals]
-        transitioned_workflows = _cancel_protected_workflows_in_transaction(
-            db,
-            terminal_ids,
-            reason="operator deleted Session",
+        workflows = (
+            db.query(WorkflowModel)
+            .filter(
+                WorkflowModel.id.in_(workflow_ids),
+                WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+            )
+            .all()
+            if workflow_ids
+            else []
         )
+        if {int(workflow.id) for workflow in workflows} != set(workflow_ids):
+            db.rollback()
+            return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
+        for workflow in workflows:
+            workflow.status = WORKFLOW_CANCELLED
+            workflow.terminal_reason = "operator deleted Session"
+            workflow.updated_at = now
+
+        assignments = (
+            db.query(ChildAssignmentModel)
+            .filter(
+                ChildAssignmentModel.id.in_(assignment_ids),
+                ChildAssignmentModel.status.in_(_WORKSPACE_RETIREMENT_ACTIVE_ASSIGNMENT_STATES),
+                ChildAssignmentModel.review_superseded_at.is_(None),
+            )
+            .all()
+            if assignment_ids
+            else []
+        )
+        if {int(assignment.id) for assignment in assignments} != set(assignment_ids):
+            db.rollback()
+            return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
+        for assignment in assignments:
+            kind = "handoff" if assignment.status.startswith("handoff_") else "assign"
+            assignment.status = ChildAssignmentStatus.CANCELLED.value
+            assignment.updated_at = now
+            result = _create_result_for_assignment(
+                db,
+                assignment,
+                kind,
+                _open_workflow(db, assignment.parent_terminal_id, create=False),
+            )
+            if result.status == DelegationResultStatus.AWAITING.value:
+                result.status = DelegationResultStatus.CANCELLED.value
+                result.reason_code = "operator_session_deletion"
+                result.finalized_at = result.updated_at = now
+                _record_result_event(
+                    db,
+                    result.id,
+                    f"result-cancelled:{assignment.id}:session-delete",
+                    "cancelled",
+                    "cao_lifecycle",
+                    assignment.parent_terminal_id,
+                )
+                _purge_staged_handoff_submission(db, result.id)
 
         final_states = {
             "workflow": WORKFLOW_CANCELLED,
@@ -4239,26 +4294,6 @@ def cancel_session_work_for_deletion(
             "inbox": MessageStatus.SUPERSEDED.value,
             "child_assignment": ChildAssignmentStatus.CANCELLED.value,
         }
-        # The cancellation helper is intentionally broader only within the
-        # already-proven Session-owned set.  Assert the exact plan stayed
-        # actionable before recording success.
-        if set(transitioned_workflows) != set(workflow_ids):
-            db.rollback()
-            return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
-        if assignment_ids:
-            final_assignments = {
-                int(row.id): str(row.status)
-                for row in db.query(ChildAssignmentModel)
-                .filter(ChildAssignmentModel.id.in_(assignment_ids))
-                .all()
-            }
-            if any(
-                final_assignments.get(int(assignment_id)) != ChildAssignmentStatus.CANCELLED.value
-                for assignment_id in assignment_ids
-            ):
-                db.rollback()
-                return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
-
         audit_items = [
             (
                 item,
@@ -8885,6 +8920,7 @@ def _cancel_parent_assignments(db, parent_terminal_id: str, now: datetime) -> in
         .filter(
             ChildAssignmentModel.parent_terminal_id == parent_terminal_id,
             ChildAssignmentModel.status.in_(_active_child_assignment_statuses()),
+            ChildAssignmentModel.review_superseded_at.is_(None),
         )
         .all()
     )

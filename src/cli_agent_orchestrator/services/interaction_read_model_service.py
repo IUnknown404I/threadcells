@@ -395,6 +395,16 @@ WITH interaction_terminals AS MATERIALIZED (
      AND effect.workflow_turn_id = wt.id
     WHERE effect.effect_kind = 'await_handoff'
       AND effect.state IN ('completed', 'rejected', 'wait_timeout', 'wait_retryable')
+      AND NOT EXISTS (
+        SELECT 1 FROM workflow_effects earlier_effect
+        WHERE earlier_effect.workflow_id = effect.workflow_id
+          AND earlier_effect.effect_kind = effect.effect_kind
+          AND earlier_effect.effect_key = effect.effect_key
+          AND earlier_effect.state IN (
+            'completed', 'rejected', 'wait_timeout', 'wait_retryable'
+          )
+          AND earlier_effect.id < effect.id
+      )
 ), provider_authority_item_rows AS NOT MATERIALIZED (
     SELECT 'provider:' || lease.terminal_id || ':' || printf('%020d', wt.id)
              AS interaction_id,

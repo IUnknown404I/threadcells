@@ -110,6 +110,75 @@ class TestSeedDefaultSkills:
         assert "User edit" in (existing_dir / "SKILL.md").read_text()
         assert seeded_count == 0
 
+    def test_seed_default_skills_migrates_only_retired_builtin_wait_guidance(
+        self, tmp_path, monkeypatch
+    ):
+        """An installed built-in gets the retry contract without losing local additions."""
+        bundled_root = tmp_path / "bundled"
+        _create_bundled_skill(bundled_root, "cao-session-management", "Bundled session management")
+        _create_bundled_skill(
+            bundled_root, "cao-supervisor-protocols", "Bundled supervisor protocols"
+        )
+        skill_store = tmp_path / "skill-store"
+        existing_dir = skill_store / "cao-session-management"
+        existing_dir.mkdir(parents=True)
+        (existing_dir / "SKILL.md").write_text(
+            "**handoff** (blocking) — conductor sends task and waits for a validated worker\n"
+            "result. A `state: waiting` response means the live worker retained its durable\n"
+            "terminal ID; resume that exact child with `await_handoff(terminal_id, timeout)`.\n"
+            "Do not resend its task or create a duplicate. A tmux pane can outlive the\n"
+            "provider process, so `lifecycle: exited` is not resumable even if the pane still\n"
+            "exists.\n\nOperator-local appendix.\n",
+            encoding="utf-8",
+        )
+        (existing_dir / "custom.txt").write_text("keep me", encoding="utf-8")
+        supervisor_dir = skill_store / "cao-supervisor-protocols"
+        supervisor_dir.mkdir(parents=True)
+        (supervisor_dir / "SKILL.md").write_text(
+            "A handoff wait is a bounded slice, not evidence that its worker stopped. If it\n"
+            "returns `state: waiting`, retain the returned `terminal_id` and later call\n"
+            "`await_handoff(terminal_id, timeout)` for that same child. Do not create a\n"
+            "replacement worker or resend the task. Only `state: completed` is a successful\n"
+            "handoff: CAO validates stable, non-progress final output before it sends `/exit`.\n"
+            "An `exited` provider lifecycle is terminal even if the tmux shell remains.\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("cli_agent_orchestrator.cli.commands.init.SKILLS_DIR", skill_store)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.init.resources.files", lambda _: bundled_root
+        )
+
+        seeded_count = seed_default_skills()
+
+        migrated = (existing_dir / "SKILL.md").read_text(encoding="utf-8")
+        assert "wait_slice_id=next_wait_slice_id" in migrated
+        assert "Operator-local appendix." in migrated
+        assert (existing_dir / "custom.txt").read_text(encoding="utf-8") == "keep me"
+        supervisor = (supervisor_dir / "SKILL.md").read_text(encoding="utf-8")
+        assert "wait_slice_id=next_wait_slice_id" in supervisor
+        assert seeded_count == 2
+
+    def test_seed_default_skills_preserves_unrecognized_builtin_customization(
+        self, tmp_path, monkeypatch
+    ):
+        """A custom built-in without the exact retired fragment remains untouched."""
+        bundled_root = tmp_path / "bundled"
+        _create_bundled_skill(
+            bundled_root, "cao-supervisor-protocols", "Bundled supervisor protocols"
+        )
+        skill_store = tmp_path / "skill-store"
+        existing_dir = skill_store / "cao-supervisor-protocols"
+        existing_dir.mkdir(parents=True)
+        custom = "---\nname: cao-supervisor-protocols\n---\n\nUse a custom wait policy.\n"
+        (existing_dir / "SKILL.md").write_text(custom, encoding="utf-8")
+        monkeypatch.setattr("cli_agent_orchestrator.cli.commands.init.SKILLS_DIR", skill_store)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.cli.commands.init.resources.files", lambda _: bundled_root
+        )
+
+        assert seed_default_skills() == 0
+        assert (existing_dir / "SKILL.md").read_text(encoding="utf-8") == custom
+
     def test_seed_default_skills_seeds_new_bundled_skills_on_rerun(self, tmp_path, monkeypatch):
         """Re-running init should seed newly added bundled skills without replacing old ones."""
         bundled_root = tmp_path / "bundled"

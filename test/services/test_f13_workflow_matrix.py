@@ -91,6 +91,7 @@ from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
 from cli_agent_orchestrator.services import (
     inbox_service,
+    interaction_read_model_service,
     operations_service,
     terminal_service,
     workflow_service,
@@ -7255,6 +7256,20 @@ def test_f13_wait_timeout_survives_provider_reconnect_without_duplicate_contradi
             .count()
             == 1
         )
+
+    history = interaction_read_model_service.list_interactions(
+        f"legacy:cao-{root}", mode="history", limit=20
+    )
+    wait_history = [
+        item
+        for item in history["items"]
+        if item["interaction_type"] == "effect"
+        and item["workflow"]["effect_kind"] == "await_handoff"
+    ]
+    assert len(wait_history) == 2
+    assert {
+        (item["workflow"]["turn_id"], item["workflow"]["effect_state"]) for item in wait_history
+    } == {(turn_id, "wait_timeout"), (resumed_turn, "completed")}
 
 
 def test_f13_effect_ledger_requires_admitted_logical_turn_and_dedupes_restart(workflow_db):

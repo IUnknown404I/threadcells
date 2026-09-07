@@ -5826,6 +5826,10 @@ def _ensure_terminal_ui_projection_schema() -> None:
                 "ON workflow_effects (workflow_id, workflow_turn_id, state, id)"
             )
             connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_workflow_effects_workflow_kind_key_id "
+                "ON workflow_effects (workflow_id, effect_kind, effect_key, id)"
+            )
+            connection.exec_driver_sql(
                 "CREATE INDEX IF NOT EXISTS ix_recovery_takeovers_old_state_created "
                 "ON recovery_takeovers (old_terminal_id, state, created_at, id)"
             )

@@ -2826,6 +2826,7 @@ class TestMainEntryPoint:
         with (
             patch("argparse.ArgumentParser.parse_args") as mock_args,
             patch("uvicorn.run") as mock_uvicorn,
+            patch("cli_agent_orchestrator.api.main.seed_default_skills") as mock_seed,
         ):
             mock_args.return_value = MagicMock(agents_dir=None, host=None, port=None)
 
@@ -2837,12 +2838,14 @@ class TestMainEntryPoint:
             call_kwargs = mock_uvicorn.call_args
             # Should use SERVER_HOST and SERVER_PORT defaults
             assert call_kwargs[0][0] is app
+            mock_seed.assert_called_once_with()
 
     def test_main_custom_host_port(self):
         """main() uses custom host and port from args."""
         with (
             patch("argparse.ArgumentParser.parse_args") as mock_args,
             patch("uvicorn.run") as mock_uvicorn,
+            patch("cli_agent_orchestrator.api.main.seed_default_skills"),
         ):
             mock_args.return_value = MagicMock(agents_dir=None, host="0.0.0.0", port=9999)
 
@@ -2858,6 +2861,7 @@ class TestMainEntryPoint:
             patch("argparse.ArgumentParser.parse_args") as mock_args,
             patch("uvicorn.run"),
             patch("cli_agent_orchestrator.constants.KIRO_AGENTS_DIR") as _,
+            patch("cli_agent_orchestrator.api.main.seed_default_skills"),
         ):
             mock_args.return_value = MagicMock(agents_dir="/custom/agents", host=None, port=None)
 

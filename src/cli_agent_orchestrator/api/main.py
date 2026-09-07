@@ -40,6 +40,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 from watchdog.observers.polling import PollingObserver
 
+from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     HandoffResultSubmissionError,
     acquire_terminal_runtime_transport,
@@ -3362,6 +3363,7 @@ def main():
         constants.KIRO_AGENTS_DIR = Path(args.agents_dir)
         logger.info(f"Using agents directory: {args.agents_dir}")
 
+    seed_default_skills()
     host = args.host or SERVER_HOST
     port = args.port or SERVER_PORT
     uvicorn.run(app, host=host, port=port)

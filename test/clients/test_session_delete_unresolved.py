@@ -23,7 +23,11 @@ from cli_agent_orchestrator.clients.database import (
     WorktreeWriterLeaseModel,
 )
 from cli_agent_orchestrator.models.inbox import ChildAssignmentStatus, MessageStatus
-from cli_agent_orchestrator.services import interaction_read_model_service, session_service
+from cli_agent_orchestrator.services import (
+    interaction_read_model_service,
+    session_service,
+    terminal_service,
+)
 
 
 def _install_database(monkeypatch, url: str = "sqlite:///:memory:"):
@@ -389,8 +393,19 @@ def test_cancellation_mutates_and_audits_only_exact_planned_rows(monkeypatch):
     result = database.cancel_session_work_for_deletion(
         "session", expected_plan_token=plan["plan_token"]
     )
-    # The existing terminal-cleanup phase runs after the exact cancellation
-    # transaction during Session deletion and must preserve the same history.
+    # Session deletion next snapshots terminal results, then runs the existing
+    # workflow cleanup phase. Both must preserve excluded superseded history.
+    monkeypatch.setattr(
+        terminal_service,
+        "get_output",
+        lambda *_args, **_kwargs: "must not become a result snapshot",
+    )
+    terminal_service.prepare_terminal_for_destruction("child")
+    # Persistence is independently filtered as a fail-closed recheck in case
+    # assignment authority changes between eligibility and snapshot writes.
+    assert database.persist_terminal_result_snapshot(
+        "child", "must not become a direct result snapshot"
+    )
     database.cancel_workflows_for_terminal("owner")
 
     assert result["cancelled"] is True

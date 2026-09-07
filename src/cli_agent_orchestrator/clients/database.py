@@ -17411,6 +17411,7 @@ def terminal_requires_result_snapshot(terminal_id: str) -> bool:
             db.query(ChildAssignmentModel)
             .filter(
                 ChildAssignmentModel.child_terminal_id == terminal_id,
+                ChildAssignmentModel.review_superseded_at.is_(None),
                 ChildAssignmentModel.status.in_(
                     (
                         ChildAssignmentStatus.AWAITING_RESULT.value,
@@ -17440,6 +17441,7 @@ def persist_terminal_result_snapshot(terminal_id: str, partial: str) -> bool:
             db.query(ChildAssignmentModel)
             .filter(
                 ChildAssignmentModel.child_terminal_id == terminal_id,
+                ChildAssignmentModel.review_superseded_at.is_(None),
                 ChildAssignmentModel.status.in_(
                     (
                         ChildAssignmentStatus.AWAITING_RESULT.value,

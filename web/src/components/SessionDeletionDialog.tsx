@@ -8,6 +8,7 @@ const CATEGORY_KEYS: Record<string, TranslationKey> = {
   pending_delivery: 'sessionDeletion.category.delivery',
   child_assignments: 'sessionDeletion.category.assignments',
   workflow_effects: 'sessionDeletion.category.effects',
+  historical_indeterminate_effects: 'sessionDeletion.category.historicalUnknown',
   provider_execution: 'sessionDeletion.category.provider',
   writer_authority: 'sessionDeletion.category.writer',
   recovery_authority: 'sessionDeletion.category.recovery',
@@ -31,6 +32,8 @@ const REASON_KEYS: Record<string, TranslationKey> = {
   RECOVERY_RECONCILIATION_REQUIRED: 'sessionDeletion.reason.recoveryRequired',
   INDETERMINATE_EFFECT: 'sessionDeletion.reason.indeterminateEffect',
   CLAIMED_EFFECT: 'sessionDeletion.reason.claimedEffect',
+  PROVIDER_RECONNECT_ACTIVE: 'sessionDeletion.reason.reconnectActive',
+  PROVIDER_EXECUTION_STATE_UNSETTLED: 'sessionDeletion.reason.providerUnsettled',
   DIRECT_RESULT_ALREADY_CLAIMED: 'sessionDeletion.reason.resultClaimed',
   CROSS_SESSION_DELIVERY: 'sessionDeletion.reason.externalDelivery',
   CROSS_SESSION_ASSIGNMENT: 'sessionDeletion.reason.externalAssignment',
@@ -62,15 +65,22 @@ export function SessionDeletionDialog({
 }) {
   const { t } = useI18n()
   if (!preflight) return null
-  const unsafe = !preflight.eligible && !preflight.cancellable
-  const cancellable = preflight.cancellable
+  const retirement = preflight.deletion_mode === 'eligible_with_historical_indeterminate_retirement'
+  const unsafe = preflight.deletion_mode === 'blocked_live_or_unsafe_authority'
+  const cancellable = preflight.deletion_mode === 'eligible_with_cancellable_work'
   const message = unsafe
     ? t('sessionDeletion.unsafeMessage')
+    : retirement
+      ? t('sessionDeletion.historicalUnknownMessage')
     : cancellable
       ? t('sessionDeletion.unfinishedMessage')
       : t(preflight.requires_dirty_confirmation ? 'sessionDeletion.dirtyMessage' : 'sessionDeletion.normalMessage')
   const reasonCodes = [...new Set(preflight.unsafe_blockers.flatMap(blocker => blocker.reason_codes))]
-  const counts = cancellable ? preflight.cancellable_blockers : preflight.unsafe_blockers
+  const counts = unsafe
+    ? preflight.unsafe_blockers
+    : retirement
+      ? [...preflight.historical_indeterminate_blockers, ...preflight.cancellable_blockers]
+      : preflight.cancellable_blockers
 
   return (
     <ConfirmModal
@@ -81,7 +91,7 @@ export function SessionDeletionDialog({
         { label: t('sessionDeletion.session'), value: sessionName },
         { label: t('sessionDeletion.status'), value: statusLabel },
       ]}
-      confirmLabel={t(cancellable ? 'sessionDeletion.cancelAndDelete' : 'sessionDeletion.delete')}
+      confirmLabel={t(retirement ? 'sessionDeletion.retireAndDelete' : cancellable ? 'sessionDeletion.cancelAndDelete' : 'sessionDeletion.delete')}
       cancelLabel={t(unsafe ? 'common.close' : 'common.cancel')}
       variant="danger"
       loading={loading}
@@ -98,6 +108,16 @@ export function SessionDeletionDialog({
                 <span className="font-mono text-gray-200">{preflight.current_queue_count}</span>
               </div>
             )}
+            {retirement && <>
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-gray-400">{t('sessionDeletion.activeAgents')}</span>
+                <span className="font-mono text-gray-200">{preflight.active_runtime_count}</span>
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-gray-400">{t('sessionDeletion.activeExecutions')}</span>
+                <span className="font-mono text-gray-200">{preflight.active_execution_count}</span>
+              </div>
+            </>}
             {counts.map(blocker => (
               <div key={`${blocker.disposition}:${blocker.category}`} className="flex items-center justify-between gap-4">
                 <span className="text-gray-400">{blockerLabel(blocker, t)}</span>
@@ -107,10 +127,16 @@ export function SessionDeletionDialog({
           </div>
         </div>
       )}
-      {cancellable && (
+      {preflight.requires_cancellation_confirmation && (
         <p className="text-sm leading-5 text-gray-300">
           {t('sessionDeletion.cancelCopy')}
         </p>
+      )}
+      {retirement && (
+        <div data-testid="session-deletion-historical-indeterminate" role="status" className="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3">
+          <p className="text-sm leading-5 text-amber-100">{t('sessionDeletion.historicalUnknownWarning')}</p>
+          <p className="mt-2 text-sm leading-5 text-gray-300">{t('sessionDeletion.preserveHistoryCopy')}</p>
+        </div>
       )}
       {unsafe && (
         <div data-testid="session-deletion-unsafe" role="status" className="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3">

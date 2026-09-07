@@ -315,12 +315,19 @@ describe('API wrapper', () => {
   it('deleteSession sends DELETE', async () => {
     mockResponse({ success: true, deleted: [], errors: [] })
     await api.deleteSession('s1')
-    expect(mockFetch).toHaveBeenCalledWith('/sessions/s1?confirm_dirty_workspace=false&cancel_unresolved_work=false', expect.objectContaining({ method: 'DELETE' }))
+    expect(mockFetch).toHaveBeenCalledWith('/sessions/s1?confirm_dirty_workspace=false&cancel_unresolved_work=false&retire_historical_indeterminate=false', expect.objectContaining({ method: 'DELETE' }))
 
     mockResponse({ success: true, deleted: [], errors: [] })
     await api.deleteSession('s1', true, true, 'a'.repeat(64))
     expect(mockFetch).toHaveBeenLastCalledWith(
-      `/sessions/s1?confirm_dirty_workspace=true&cancel_unresolved_work=true&cancellation_plan_token=${'a'.repeat(64)}`,
+      `/sessions/s1?confirm_dirty_workspace=true&cancel_unresolved_work=true&retire_historical_indeterminate=false&cancellation_plan_token=${'a'.repeat(64)}`,
+      expect.objectContaining({ method: 'DELETE' }),
+    )
+
+    mockResponse({ success: true, deleted: [], errors: [] })
+    await api.deleteSession('s1', false, false, 'b'.repeat(64), true)
+    expect(mockFetch).toHaveBeenLastCalledWith(
+      `/sessions/s1?confirm_dirty_workspace=false&cancel_unresolved_work=false&retire_historical_indeterminate=true&cancellation_plan_token=${'b'.repeat(64)}`,
       expect.objectContaining({ method: 'DELETE' }),
     )
   })

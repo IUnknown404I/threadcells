@@ -25,7 +25,7 @@ interface Store {
   fetchSessions: () => Promise<void>
   selectSession: (name: string | null) => Promise<void>
   createSession: (provider: string, agentProfile: string, sessionName?: string, workingDirectory?: string, projectId?: string, ownerGrant?: OwnerLaunchGrant, workContextRequestId?: string) => Promise<void>
-  deleteSession: (name: string, confirmDirtyWorkspace?: boolean, cancelUnresolvedWork?: boolean, cancellationPlanToken?: string | null) => Promise<boolean>
+  deleteSession: (name: string, confirmDirtyWorkspace?: boolean, cancelUnresolvedWork?: boolean, cancellationPlanToken?: string | null, retireHistoricalIndeterminate?: boolean) => Promise<boolean>
   showSnackbar: (snackbar: Snackbar) => void
   hideSnackbar: () => void
   setConnected: (connected: boolean) => void
@@ -87,9 +87,9 @@ export const useStore = create<Store>((set, get) => ({
     }
   },
 
-  deleteSession: async (name, confirmDirtyWorkspace = false, cancelUnresolvedWork = false, cancellationPlanToken = null) => {
+  deleteSession: async (name, confirmDirtyWorkspace = false, cancelUnresolvedWork = false, cancellationPlanToken = null, retireHistoricalIndeterminate = false) => {
     try {
-      await api.deleteSession(name, confirmDirtyWorkspace, cancelUnresolvedWork, cancellationPlanToken)
+      await api.deleteSession(name, confirmDirtyWorkspace, cancelUnresolvedWork, cancellationPlanToken, retireHistoricalIndeterminate)
       get().showSnackbar({ type: 'success', message: appText('store.sessionDeleted', { name }) })
       if (get().activeSession === name) {
         set({ activeSession: null, activeSessionDetail: null })

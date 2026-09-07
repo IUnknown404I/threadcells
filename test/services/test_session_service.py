@@ -355,14 +355,18 @@ class TestDeleteSession:
         contexts = self._patch_common(_durable_session(lifecycle="exited"))
         cancellable = {
             "eligible": False,
+            "deletion_mode": "eligible_with_cancellable_work",
             "cancellable": True,
+            "can_resolve_and_delete": True,
             "plan_token": "a" * 64,
             "requires_dirty_confirmation": False,
             "reason_code": "QUEUED_WORK",
         }
         eligible = {
             "eligible": True,
+            "deletion_mode": "eligible_normal",
             "cancellable": False,
+            "can_resolve_and_delete": False,
             "plan_token": None,
             "requires_dirty_confirmation": False,
             "reason_code": None,
@@ -401,6 +405,74 @@ class TestDeleteSession:
             "session-lifetime-1",
             expected_plan_token="a" * 64,
             expected_terminal_ids=["terminal1", "terminal2"],
+            cancel_unresolved_work=True,
+            retire_historical_indeterminate=False,
+        )
+        delete.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.session_service.retire_exited_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_explicit_historical_unknown_retirement_then_rechecks_and_deletes(
+        self, mock_tmux, retire
+    ):
+        mock_tmux.session_exists.return_value = False
+        retire.return_value = True
+        contexts = self._patch_common(_durable_session(lifecycle="exited"))
+        retirement = {
+            "eligible": False,
+            "deletion_mode": "eligible_with_historical_indeterminate_retirement",
+            "can_resolve_and_delete": True,
+            "cancellable": False,
+            "requires_historical_indeterminate_confirmation": True,
+            "plan_token": "r" * 64,
+            "requires_dirty_confirmation": False,
+            "reason_code": "HISTORICAL_EFFECT_OUTCOME_UNKNOWN",
+        }
+        eligible = {
+            "eligible": True,
+            "deletion_mode": "eligible_normal",
+            "can_resolve_and_delete": False,
+            "cancellable": False,
+            "plan_token": None,
+            "requires_dirty_confirmation": False,
+            "reason_code": None,
+        }
+        with (
+            contexts[0],
+            contexts[1],
+            contexts[2],
+            contexts[3],
+            contexts[4],
+            contexts[5],
+            contexts[6] as delete,
+            contexts[7],
+            patch(
+                "cli_agent_orchestrator.services.session_service._session_deletion_preflight",
+                side_effect=[retirement, eligible],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.cancel_session_work_for_deletion",
+                return_value={
+                    "cancelled": True,
+                    "cancelled_count": 0,
+                    "retired_indeterminate_count": 4,
+                    "residual": {"eligible": True},
+                },
+            ) as resolve_work,
+        ):
+            result = delete_session(
+                "session-lifetime-1",
+                retire_historical_indeterminate=True,
+                cancellation_plan_token="r" * 64,
+            )
+
+        assert result["deleted"] == ["cao-test"]
+        resolve_work.assert_called_once_with(
+            "session-lifetime-1",
+            expected_plan_token="r" * 64,
+            expected_terminal_ids=["terminal1", "terminal2"],
+            cancel_unresolved_work=False,
+            retire_historical_indeterminate=True,
         )
         delete.assert_called_once()
 

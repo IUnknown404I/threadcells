@@ -57,7 +57,14 @@ def _projection_cte(
     current_only: bool = False,
     history_candidate_filter: Optional[str] = None,
 ) -> tuple[str, Dict[str, Any]]:
-    scope, parameters = _scope_sql(session_ids, terminal_id)
+    normalized_session_ids = list(dict.fromkeys(str(value) for value in session_ids if value))
+    scope, parameters = _scope_sql(normalized_session_ids, terminal_id)
+    audit_retirement_scope = (
+        " AND 1 = 0" if current_only else " AND audit.session_id = :interaction_session_0"
+    )
+    audit_terminal_scope = (
+        " AND w.root_terminal_id = :interaction_terminal_id" if terminal_id else ""
+    )
     current_effect_scope = (
         " AND effect.state IN ('claimed', 'indeterminate')" if current_only else ""
     )
@@ -274,12 +281,27 @@ WITH interaction_terminals AS MATERIALIZED (
            )
          )
        ))
+), effect_authority_sessions AS MATERIALIZED (
+    SELECT DISTINCT effect.id AS effect_id, terminals.session_id
+    FROM workflow_effects effect
+    LEFT JOIN workflows declared_workflow
+      ON declared_workflow.id = effect.workflow_id
+    LEFT JOIN workflow_turns linked_turn
+      ON linked_turn.id = effect.workflow_turn_id
+    LEFT JOIN workflows turn_workflow
+      ON turn_workflow.id = linked_turn.workflow_id
+    JOIN interaction_terminals terminals
+      ON terminals.terminal_id = declared_workflow.root_terminal_id
+      OR terminals.terminal_id = turn_workflow.root_terminal_id
+    WHERE effect.state IN ('claimed', 'indeterminate')
 ), unresolved_authority_item_rows AS NOT MATERIALIZED (
     SELECT 'effect:' || printf('%020d', effect.id) AS interaction_id,
-           terminals.session_id, 'effect' AS interaction_type,
+           scoped.session_id, 'effect' AS interaction_type,
            effect.effect_kind AS task_type, 'system' AS source_kind,
-           w.root_terminal_id AS source_terminal_id,
-           w.root_terminal_id AS target_terminal_id, '' AS input_preview,
+           COALESCE(w.root_terminal_id, linked_workflow.root_terminal_id)
+             AS source_terminal_id,
+           COALESCE(w.root_terminal_id, linked_workflow.root_terminal_id)
+             AS target_terminal_id, '' AS input_preview,
            effect.created_at, effect.updated_at, 1 AS is_current,
            effect.state AS queue_state,
            CASE WHEN effect.state = 'indeterminate' THEN 'indeterminate_effect'
@@ -294,13 +316,50 @@ WITH interaction_terminals AS MATERIALIZED (
            NULL AS result_summary, 0 AS result_available, NULL AS delivery_status,
            0 AS delivery_pending, NULL AS final_disposition,
            CAST(effect.id AS TEXT) AS diagnostic_id
-    FROM workflow_effects effect
-    JOIN workflows w ON w.id = effect.workflow_id
-    JOIN interaction_terminals terminals ON terminals.terminal_id = w.root_terminal_id
-    JOIN workflow_turns wt ON wt.id = effect.workflow_turn_id
+    FROM effect_authority_sessions scoped
+    JOIN workflow_effects effect ON effect.id = scoped.effect_id
+    LEFT JOIN workflows w ON w.id = effect.workflow_id
+    LEFT JOIN workflow_turns linked_turn ON linked_turn.id = effect.workflow_turn_id
+    LEFT JOIN workflows linked_workflow ON linked_workflow.id = linked_turn.workflow_id
+    LEFT JOIN workflow_turns wt
+      ON wt.id = effect.workflow_turn_id
+     AND wt.workflow_id = effect.workflow_id
     WHERE effect.state IN ('claimed', 'indeterminate')
-      AND (w.status IN ('terminal', 'cancelled')
+      AND (w.id IS NULL OR wt.id IS NULL
+           OR w.status IN ('terminal', 'cancelled')
            OR wt.superseded_by_turn_id IS NOT NULL)
+), retired_effect_item_rows AS NOT MATERIALIZED (
+    SELECT 'effect:' || printf('%020d', effect.id) AS interaction_id,
+           audit.session_id, 'effect' AS interaction_type,
+           effect.effect_kind AS task_type, 'system' AS source_kind,
+           w.root_terminal_id AS source_terminal_id,
+           w.root_terminal_id AS target_terminal_id, '' AS input_preview,
+           effect.created_at, audit.created_at AS updated_at, 0 AS is_current,
+           effect.state AS queue_state, NULL AS wait_reason,
+           0 AS admission_pending, effect.workflow_id,
+           effect.workflow_turn_id, w.status AS workflow_status,
+           w.terminal_reason AS workflow_reason, wt.state AS turn_state,
+           wt.kind AS turn_kind, wt.provider_outcome_code,
+           wt.provider_outcome_detail, effect.effect_kind, effect.state AS effect_state,
+           0 AS workflow_turn_count, 0 AS superseded_turn_count,
+           NULL AS assignment_id, NULL AS result_id, NULL AS result_status,
+           NULL AS result_summary, 0 AS result_available, NULL AS delivery_status,
+           0 AS delivery_pending,
+           'operator_retired_unknown_outcome' AS final_disposition,
+           CAST(effect.id AS TEXT) AS diagnostic_id
+    FROM session_deletion_cancellation_audit audit
+    JOIN workflow_effects effect ON effect.id = CAST(audit.item_id AS INTEGER)
+    JOIN workflows w ON w.id = effect.workflow_id
+    JOIN workflow_turns wt
+      ON wt.id = effect.workflow_turn_id
+     AND wt.workflow_id = effect.workflow_id
+    WHERE audit.item_kind = 'workflow_effect'
+      AND audit.final_state = 'operator_retired_indeterminate'
+      AND audit.reason_code = 'OPERATOR_RETIRED_UNKNOWN_OUTCOME'
+"""
+        + audit_retirement_scope
+        + audit_terminal_scope
+        + """
 ), provider_authority_item_rows AS NOT MATERIALIZED (
     SELECT 'provider:' || lease.terminal_id || ':' || printf('%020d', wt.id)
              AS interaction_id,
@@ -524,6 +583,7 @@ WITH interaction_terminals AS MATERIALIZED (
                 "workflow_turn_item_rows",
                 "workflow_shell_item_rows",
                 "unresolved_authority_item_rows",
+                "retired_effect_item_rows",
                 "provider_authority_item_rows",
                 "writer_authority_item_rows",
                 "assignment_item_rows",

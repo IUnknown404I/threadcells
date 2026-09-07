@@ -160,6 +160,44 @@ describe('InteractionHistoryDrawer', () => {
     expect(readResult).toHaveBeenCalledOnce()
   })
 
+  it('renders operator-retired effects as unknown outcomes without a fabricated result', async () => {
+    const retired = interaction({
+      id: 'effect:00000000000000000042',
+      interaction_type: 'effect',
+      task_type: 'handoff',
+      current: false,
+      queue: {
+        state: 'operator_retired_indeterminate',
+        wait_reason: null,
+        admission_pending: false,
+      },
+      workflow: {
+        id: 7,
+        turn_id: 11,
+        status: 'cancelled',
+        reason: 'operator retirement fixture',
+        turn_state: 'cancelled',
+        turn_kind: 'external_input',
+        provider_outcome_code: null,
+        provider_outcome_detail: null,
+        effect_kind: 'handoff',
+        effect_state: 'operator_retired_indeterminate',
+        turn_count: 0,
+        superseded_turn_count: 0,
+      },
+      result: { id: null, status: null, summary: null, available: false },
+      final_disposition: 'operator_retired_unknown_outcome',
+    })
+    vi.spyOn(api, 'listInteractions').mockImplementation(async params => (
+      page(params.mode === 'history' ? [retired] : [])
+    ))
+
+    render(<I18nProvider><InteractionHistoryDrawer sessionId="session-1" sessionName="cao-session-1" initialMode="history" onClose={() => {}} /></I18nProvider>)
+
+    expect(await screen.findByText('Outcome unknown · retired by operator')).toBeInTheDocument()
+    expect(screen.getByText('No canonical result exists for this interaction.')).toBeInTheDocument()
+  })
+
   it('is a responsive modal drawer with trapped initial focus and Escape close', async () => {
     vi.spyOn(api, 'listInteractions').mockResolvedValue(page([]))
     const onClose = vi.fn()

@@ -2025,6 +2025,7 @@ async def delete_session(
     session_name: str,
     confirm_dirty_workspace: bool = False,
     cancel_unresolved_work: bool = False,
+    retire_historical_indeterminate: bool = False,
     cancellation_plan_token: Optional[str] = None,
 ) -> Dict:
     try:
@@ -2034,6 +2035,7 @@ async def delete_session(
             registry=get_plugin_registry(request),
             confirm_dirty_workspace=confirm_dirty_workspace,
             cancel_unresolved_work=cancel_unresolved_work,
+            retire_historical_indeterminate=retire_historical_indeterminate,
             cancellation_plan_token=cancellation_plan_token,
         )
         return {"success": True, **result}

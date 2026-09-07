@@ -55,6 +55,7 @@ const DISPOSITION_KEYS: Record<string, TranslationKey> = {
   failed: 'interactions.disposition.failed',
   cancelled: 'interactions.disposition.cancelled',
   superseded: 'interactions.disposition.superseded',
+  operator_retired_unknown_outcome: 'interactions.disposition.operatorRetiredUnknown',
 }
 
 const STATE_KEYS: Record<string, TranslationKey> = {
@@ -89,6 +90,7 @@ const STATE_KEYS: Record<string, TranslationKey> = {
   result_acknowledged: 'interactions.state.resultAcknowledged',
   handoff_result_acknowledged: 'interactions.state.resultAcknowledged',
   result_superseded: 'interactions.state.superseded',
+  operator_retired_indeterminate: 'interactions.state.operatorRetiredIndeterminate',
 }
 
 const TASK_KEYS: Record<string, TranslationKey> = {
@@ -126,7 +128,7 @@ function formatTimestamp(value: string | null, locale: AppLocale) {
 function itemTone(item: InteractionItem) {
   const state = item.final_disposition || item.queue.state || ''
   if (state.includes('failed') || state === 'cancelled') return 'border-red-800/60 bg-red-950/10'
-  if (state === 'owner_gate' || item.queue.wait_reason === 'owner_gate') return 'border-amber-700/60 bg-amber-950/10'
+  if (state === 'owner_gate' || state === 'operator_retired_unknown_outcome' || item.queue.wait_reason === 'owner_gate') return 'border-amber-700/60 bg-amber-950/10'
   if (state === 'processed' || state === 'acknowledged' || state === 'completed') return 'border-emerald-800/50 bg-emerald-950/10'
   if (state === 'superseded') return 'border-violet-800/50 bg-violet-950/10'
   return 'border-gray-700/60 bg-gray-900/70'
@@ -135,7 +137,7 @@ function itemTone(item: InteractionItem) {
 function statusTone(item: InteractionItem) {
   const state = item.final_disposition || item.queue.state || ''
   if (state.includes('failed') || state === 'cancelled') return 'bg-red-400/10 text-red-300'
-  if (state === 'owner_gate') return 'bg-amber-400/10 text-amber-300'
+  if (state === 'owner_gate' || state === 'operator_retired_unknown_outcome') return 'bg-amber-400/10 text-amber-300'
   if (state === 'processed' || state === 'acknowledged' || state === 'completed') return 'bg-emerald-400/10 text-emerald-300'
   if (state === 'superseded') return 'bg-violet-400/10 text-violet-300'
   return 'bg-sky-400/10 text-sky-300'

@@ -239,7 +239,7 @@ export function AgentPanel({
 
   const handleDeleteSession = async () => {
     if (!pendingDeleteSession || !deletePreflight || deletingSessionRef.current) return
-    if (!deletePreflight.eligible && !deletePreflight.cancellable) return
+    if (!deletePreflight.eligible && !deletePreflight.can_resolve_and_delete) return
     deletingSessionRef.current = true
     const id = pendingDeleteSession.id
     setDeletingSession(id)
@@ -247,8 +247,9 @@ export function AgentPanel({
       const deleted = await deleteSession(
         pendingDeleteSession.id,
         deletePreflight.requires_dirty_confirmation,
-        deletePreflight.cancellable,
+        deletePreflight.requires_cancellation_confirmation,
         deletePreflight.plan_token,
+        deletePreflight.requires_historical_indeterminate_confirmation,
       )
       if (!deleted) {
         const refreshed = await api.getSessionDeletionPreflight(pendingDeleteSession.id)

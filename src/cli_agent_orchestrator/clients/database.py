@@ -175,7 +175,7 @@ class SessionDeletionReceiptModel(Base):
 
 
 class SessionDeletionCancellationAuditModel(Base):
-    """Append-only evidence for work cancelled by an operator Session deletion."""
+    """Append-only evidence for work resolved by an operator Session deletion."""
 
     __tablename__ = "session_deletion_cancellation_audit"
     __table_args__ = (UniqueConstraint("event_key", name="uq_session_delete_cancel_event"),)
@@ -3567,6 +3567,85 @@ _WORKSPACE_RETIREMENT_ACTIVE_ASSIGNMENT_STATES = (
 
 _WORKSPACE_RETIREMENT_TERMINAL_WORKFLOW_STATES = ("terminal", "cancelled")
 _SESSION_DELETION_PLAN_LIMIT = 500
+_OPERATOR_RETIRED_INDETERMINATE_EFFECT = "operator_retired_indeterminate"
+
+
+def _workflow_effect_retirement_authority(
+    effect: WorkflowEffectModel,
+    workflow: WorkflowModel | None,
+    turn: WorkflowTurnModel | None,
+) -> Dict[str, str]:
+    """Return the exact durable chain that can authorize effect retirement."""
+    link_matches = (
+        workflow is not None
+        and turn is not None
+        and int(turn.workflow_id) == int(effect.workflow_id)
+    )
+    return {
+        "effect_workflow_id": str(effect.workflow_id),
+        "workflow_exists": "1" if workflow is not None else "0",
+        "workflow_status": str(workflow.status) if workflow is not None else "missing",
+        "workflow_active_turn_id": str(workflow.active_turn_id or "") if workflow else "",
+        "workflow_updated_at": str(workflow.updated_at or "") if workflow else "",
+        "turn_exists": "1" if turn is not None else "0",
+        "turn_workflow_id": str(turn.workflow_id) if turn is not None else "",
+        "workflow_link_matches_turn": "1" if link_matches else "0",
+        "turn_state": str(turn.state) if turn is not None else "missing",
+        "turn_updated_at": str(turn.updated_at or "") if turn is not None else "",
+        "turn_provider_processing_observed_at": (
+            str(turn.provider_processing_observed_at or "") if turn is not None else ""
+        ),
+        "turn_provider_ready_observed_at": (
+            str(turn.provider_ready_observed_at or "") if turn is not None else ""
+        ),
+        "turn_provider_reconnect_requested_at": (
+            str(turn.provider_reconnect_requested_at or "") if turn is not None else ""
+        ),
+        "turn_superseded_by_turn_id": (
+            str(turn.superseded_by_turn_id or "") if turn is not None else ""
+        ),
+        "effect_updated_at": str(effect.updated_at or ""),
+    }
+
+
+def _workflow_effect_retirement_classification(
+    effect: WorkflowEffectModel,
+    workflow: WorkflowModel | None,
+    turn: WorkflowTurnModel | None,
+) -> tuple[str, str, str]:
+    """Classify one unknown effect without borrowing authority across links."""
+    if workflow is None:
+        return "unsafe", "workflow_effects", "EFFECT_WORKFLOW_LINK_MISSING"
+    if turn is None:
+        return "unsafe", "workflow_effects", "EFFECT_TURN_LINK_MISSING"
+    if int(turn.workflow_id) != int(effect.workflow_id):
+        return "unsafe", "workflow_effects", "EFFECT_WORKFLOW_LINK_MISMATCH"
+
+    is_active_turn = workflow.active_turn_id == turn.id
+    processing_unsettled = turn.provider_processing_observed_at is not None and (
+        turn.provider_ready_observed_at is None
+        or turn.provider_ready_observed_at < turn.provider_processing_observed_at
+    )
+    if is_active_turn and turn.provider_reconnect_requested_at is not None:
+        return "unsafe", "recovery_authority", "PROVIDER_RECONNECT_ACTIVE"
+    if is_active_turn and processing_unsettled:
+        return "unsafe", "provider_execution", "PROVIDER_EXECUTION_STATE_UNSETTLED"
+
+    historical = (
+        workflow.status in _WORKSPACE_RETIREMENT_TERMINAL_WORKFLOW_STATES
+        or turn.superseded_by_turn_id is not None
+    )
+    if historical:
+        return (
+            "historical_indeterminate",
+            "historical_indeterminate_effects",
+            "HISTORICAL_EFFECT_OUTCOME_UNKNOWN",
+        )
+    return (
+        "unsafe",
+        "workflow_effects",
+        "INDETERMINATE_EFFECT" if effect.state == "indeterminate" else "CLAIMED_EFFECT",
+    )
 
 
 def _session_unresolved_work_plan_in_transaction(
@@ -3578,16 +3657,18 @@ def _session_unresolved_work_plan_in_transaction(
     """Classify one bounded, exact Session-owned deletion cancellation plan.
 
     This is the queue/authority half of both workspace retirement and Session
-    deletion.  It deliberately treats claimed/indeterminate effects and every
-    runtime/writer/recovery lease as unsafe even when workflow state is
-    terminal.  Historical received, superseded, completed, and acknowledged
-    rows are absent by construction.
+    deletion. Claimed/indeterminate effects become operator-retirable only
+    when their exact workflow/turn linkage is intact, the workflow or turn is
+    historical, and no resumable provider authority remains. Every live
+    runtime/writer/recovery authority stays unsafe. Historical received,
+    superseded, completed, and acknowledged rows are absent by construction.
     """
     terminal_scope_overflow = len(terminals) > _SESSION_DELETION_PLAN_LIMIT
     terminal_ids = [str(terminal.id) for terminal in terminals]
     terminal_id_set = set(terminal_ids)
-    cancellable_items: list[dict[str, str]] = []
-    unsafe_items: list[dict[str, str]] = []
+    cancellable_items: list[dict[str, Any]] = []
+    retirement_items: list[dict[str, Any]] = []
+    unsafe_items: list[dict[str, Any]] = []
     category_counts: dict[tuple[str, str], dict[str, Any]] = {}
     overflow = terminal_scope_overflow
 
@@ -3598,17 +3679,25 @@ def _session_unresolved_work_plan_in_transaction(
         item_kind: str,
         item_id: Any,
         state: Any,
+        *,
+        authority: Mapping[str, Any] | None = None,
     ) -> None:
-        target = cancellable_items if disposition == "cancellable" else unsafe_items
-        target.append(
-            {
-                "item_kind": item_kind,
-                "item_id": str(item_id),
-                "state": str(state),
-                "category": category,
-                "reason_code": reason_code,
-            }
-        )
+        targets = {
+            "cancellable": cancellable_items,
+            "historical_indeterminate": retirement_items,
+            "unsafe": unsafe_items,
+        }
+        target = targets[disposition]
+        item = {
+            "item_kind": item_kind,
+            "item_id": str(item_id),
+            "state": str(state),
+            "category": category,
+            "reason_code": reason_code,
+        }
+        if authority is not None:
+            item["authority"] = dict(authority)
+        target.append(item)
         key = (disposition, category)
         summary = category_counts.setdefault(
             key,
@@ -3633,7 +3722,10 @@ def _session_unresolved_work_plan_in_transaction(
 
     def finish() -> Dict[str, Any]:
         nonlocal overflow
-        if len(cancellable_items) + len(unsafe_items) > _SESSION_DELETION_PLAN_LIMIT:
+        if (
+            len(cancellable_items) + len(retirement_items) + len(unsafe_items)
+            > _SESSION_DELETION_PLAN_LIMIT
+        ):
             overflow = True
         if overflow and not any(item["item_kind"] == "plan" for item in unsafe_items):
             record(
@@ -3646,8 +3738,25 @@ def _session_unresolved_work_plan_in_transaction(
             )
 
         fingerprint_document = {
-            "version": 1,
+            "version": 3,
             "session_id": session_id,
+            "terminal_authority": sorted(
+                (
+                    str(terminal.id),
+                    str(terminal.runtime_lifecycle or "unknown"),
+                    str(terminal.runtime_generation or ""),
+                    str(terminal.writer_authority_generation or ""),
+                    str(terminal.runtime_operation_kind or ""),
+                    str(terminal.runtime_operation_token or ""),
+                    str(terminal.runtime_operation_claimed_at or ""),
+                    str(terminal.runtime_operation_expires_at or ""),
+                    str(terminal.provider_resume_identity or ""),
+                    str(terminal.provider_resume_runtime_generation or ""),
+                    str(terminal.recovery_takeover_id or ""),
+                    str(terminal.replaced_by_terminal_id or ""),
+                )
+                for terminal in terminals
+            ),
             "cancellable": sorted(
                 (
                     item["item_kind"],
@@ -3657,6 +3766,17 @@ def _session_unresolved_work_plan_in_transaction(
                     item["reason_code"],
                 )
                 for item in cancellable_items
+            ),
+            "historical_indeterminate": sorted(
+                (
+                    item["item_kind"],
+                    item["item_id"],
+                    item["state"],
+                    item["category"],
+                    item["reason_code"],
+                    json.dumps(item.get("authority", {}), sort_keys=True, separators=(",", ":")),
+                )
+                for item in retirement_items
             ),
             "unsafe": sorted(
                 (item["item_kind"], item["item_id"], item["state"], item["reason_code"])
@@ -3670,19 +3790,39 @@ def _session_unresolved_work_plan_in_transaction(
             category_counts.values(),
             key=lambda item: (item["disposition"], item["category"]),
         )
+        if unsafe_items:
+            deletion_mode = "blocked_live_or_unsafe_authority"
+        elif retirement_items:
+            deletion_mode = "eligible_with_historical_indeterminate_retirement"
+        elif cancellable_items:
+            deletion_mode = "eligible_with_cancellable_work"
+        else:
+            deletion_mode = "eligible_normal"
+        resolvable = bool(cancellable_items or retirement_items) and not unsafe_items
         return {
-            "eligible": not cancellable_items and not unsafe_items,
+            "eligible": deletion_mode == "eligible_normal",
+            "deletion_mode": deletion_mode,
             "cancellable": bool(cancellable_items) and not unsafe_items,
+            "can_resolve_and_delete": resolvable,
             "requires_cancellation_confirmation": bool(cancellable_items) and not unsafe_items,
-            "plan_token": plan_token if cancellable_items and not unsafe_items else None,
+            "requires_historical_indeterminate_confirmation": (
+                bool(retirement_items) and not unsafe_items
+            ),
+            "plan_token": plan_token if resolvable else None,
             "blockers": summaries,
             "cancellable_count": len(cancellable_items),
+            "historical_indeterminate_count": len(retirement_items),
             "unsafe_count": len(unsafe_items),
+            "live_unsafe_count": len(unsafe_items),
             "plan_limit": _SESSION_DELETION_PLAN_LIMIT,
             "reason_codes": sorted(
-                {item["reason_code"] for item in unsafe_items + cancellable_items}
+                {
+                    item["reason_code"]
+                    for item in unsafe_items + retirement_items + cancellable_items
+                }
             ),
             "_cancellable_items": cancellable_items,
+            "_retirement_items": retirement_items,
             "_unsafe_items": unsafe_items,
         }
 
@@ -3691,7 +3831,16 @@ def _session_unresolved_work_plan_in_transaction(
 
     for terminal in terminals:
         lifecycle = str(terminal.runtime_lifecycle or "unknown")
-        if lifecycle != "exited" or terminal.runtime_operation_kind is not None:
+        runtime_operation_active = any(
+            value is not None
+            for value in (
+                terminal.runtime_operation_kind,
+                terminal.runtime_operation_token,
+                terminal.runtime_operation_claimed_at,
+                terminal.runtime_operation_expires_at,
+            )
+        )
+        if lifecycle != "exited" or runtime_operation_active:
             if lifecycle == "recovery_fenced":
                 category = "recovery_authority"
                 reason = "SESSION_RECOVERY_EVIDENCE_PROTECTED"
@@ -3711,7 +3860,8 @@ def _session_unresolved_work_plan_in_transaction(
                 reason,
                 "terminal",
                 terminal.id,
-                terminal.runtime_operation_kind or lifecycle,
+                terminal.runtime_operation_kind
+                or ("runtime_operation_claim" if runtime_operation_active else lifecycle),
             )
 
     if terminal_ids:
@@ -3828,23 +3978,82 @@ def _session_unresolved_work_plan_in_transaction(
                 assignment.status,
             )
 
+        effect_workflow = aliased(WorkflowModel)
+        effect_turn = aliased(WorkflowTurnModel)
+        turn_workflow = aliased(WorkflowModel)
         effects = bounded(
-            db.query(WorkflowEffectModel)
-            .join(WorkflowModel, WorkflowModel.id == WorkflowEffectModel.workflow_id)
+            db.query(WorkflowEffectModel, effect_workflow, effect_turn)
+            .outerjoin(
+                effect_workflow,
+                effect_workflow.id == WorkflowEffectModel.workflow_id,
+            )
+            .outerjoin(
+                effect_turn,
+                effect_turn.id == WorkflowEffectModel.workflow_turn_id,
+            )
+            .outerjoin(turn_workflow, turn_workflow.id == effect_turn.workflow_id)
             .filter(
-                WorkflowModel.root_terminal_id.in_(terminal_ids),
+                or_(
+                    effect_workflow.root_terminal_id.in_(terminal_ids),
+                    turn_workflow.root_terminal_id.in_(terminal_ids),
+                ),
                 WorkflowEffectModel.state.in_(("claimed", "indeterminate")),
             )
             .order_by(WorkflowEffectModel.id.asc())
         )
-        for effect in effects:
+        for effect, workflow, turn in effects:
+            disposition, category, reason_code = _workflow_effect_retirement_classification(
+                effect, workflow, turn
+            )
             record(
-                "unsafe",
-                "workflow_effects",
-                "INDETERMINATE_EFFECT" if effect.state == "indeterminate" else "CLAIMED_EFFECT",
+                disposition,
+                category,
+                reason_code,
                 "workflow_effect",
                 effect.id,
                 effect.state,
+                authority=_workflow_effect_retirement_authority(effect, workflow, turn),
+            )
+
+        live_turns = bounded(
+            db.query(WorkflowTurnModel, WorkflowModel)
+            .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+            .outerjoin(
+                ProviderExecutionLeaseModel,
+                ProviderExecutionLeaseModel.workflow_turn_id == WorkflowTurnModel.id,
+            )
+            .filter(
+                WorkflowModel.root_terminal_id.in_(terminal_ids),
+                WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+                WorkflowModel.active_turn_id == WorkflowTurnModel.id,
+                ProviderExecutionLeaseModel.workflow_turn_id.is_(None),
+                or_(
+                    WorkflowTurnModel.provider_reconnect_requested_at.is_not(None),
+                    and_(
+                        WorkflowTurnModel.provider_processing_observed_at.is_not(None),
+                        or_(
+                            WorkflowTurnModel.provider_ready_observed_at.is_(None),
+                            WorkflowTurnModel.provider_ready_observed_at
+                            < WorkflowTurnModel.provider_processing_observed_at,
+                        ),
+                    ),
+                ),
+            )
+            .order_by(WorkflowTurnModel.id.asc())
+        )
+        for turn, _workflow in live_turns:
+            reconnecting = turn.provider_reconnect_requested_at is not None
+            record(
+                "unsafe",
+                "recovery_authority" if reconnecting else "provider_execution",
+                (
+                    "PROVIDER_RECONNECT_ACTIVE"
+                    if reconnecting
+                    else "PROVIDER_EXECUTION_STATE_UNSETTLED"
+                ),
+                "workflow_turn_authority",
+                turn.id,
+                "reconnect" if reconnecting else "processing",
             )
 
         for lease in bounded(
@@ -3961,6 +4170,7 @@ def _session_workspace_snapshot_in_transaction(
                 "child_assignments",
                 "external_assignments",
                 "workflow_effects",
+                "historical_indeterminate_effects",
                 "plan_limit",
             )
         ):
@@ -4057,12 +4267,17 @@ def _session_identity_changed_plan() -> Dict[str, Any]:
     }
     return {
         "eligible": False,
+        "deletion_mode": "blocked_live_or_unsafe_authority",
         "cancellable": False,
+        "can_resolve_and_delete": False,
         "requires_cancellation_confirmation": False,
+        "requires_historical_indeterminate_confirmation": False,
         "plan_token": None,
         "blockers": [blocker],
         "cancellable_count": 0,
+        "historical_indeterminate_count": 0,
         "unsafe_count": 1,
+        "live_unsafe_count": 1,
         "plan_limit": _SESSION_DELETION_PLAN_LIMIT,
         "reason_codes": ["SESSION_IDENTITY_CHANGED"],
     }
@@ -4131,8 +4346,15 @@ def cancel_session_work_for_deletion(
     *,
     expected_plan_token: str,
     expected_terminal_ids: Sequence[str] | None = None,
+    cancel_unresolved_work: bool = True,
+    retire_historical_indeterminate: bool = False,
 ) -> Dict[str, Any]:
-    """Apply one exact safe deletion plan and retain append-only audit evidence."""
+    """Apply one exact deletion plan and retain append-only lifecycle evidence.
+
+    Ordinary Session-owned work is cancelled only when ``cancel_unresolved_work``
+    is explicit. Historical effects with an unknowable external outcome require
+    the separate retirement intent and retain that uncertainty permanently.
+    """
     if not isinstance(expected_plan_token, str) or not re.fullmatch(
         r"[0-9a-f]{64}", expected_plan_token
     ):
@@ -4159,6 +4381,7 @@ def cancel_session_work_for_deletion(
             if receipt is not None:
                 return {"cancelled": True, "already_deleted": True, "residual": None}
             return {"cancelled": False, "reason_code": "SESSION_HISTORY_MISSING"}
+        terminal_ids = [str(terminal.id) for terminal in terminals]
         plan = _session_unresolved_work_plan_in_transaction(
             db,
             session_id=session_id,
@@ -4174,12 +4397,28 @@ def cancel_session_work_for_deletion(
         if plan["plan_token"] != expected_plan_token:
             db.rollback()
             return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
-        if not plan["cancellable"] or plan["_unsafe_items"]:
+        if plan["_unsafe_items"]:
+            db.rollback()
+            return {"cancelled": False, "reason_code": "SESSION_DELETE_AUTHORITY_UNSAFE"}
+        if plan["_cancellable_items"] and not cancel_unresolved_work:
+            db.rollback()
+            return {
+                "cancelled": False,
+                "reason_code": "SESSION_CANCELLATION_CONFIRMATION_REQUIRED",
+            }
+        if plan["_retirement_items"] and not retire_historical_indeterminate:
+            db.rollback()
+            return {
+                "cancelled": False,
+                "reason_code": "SESSION_HISTORICAL_INDETERMINATE_CONFIRMATION_REQUIRED",
+            }
+        if not plan["_cancellable_items"] and not plan["_retirement_items"]:
             db.rollback()
             return {"cancelled": False, "reason_code": "SESSION_DELETE_AUTHORITY_UNSAFE"}
 
         now = datetime.now()
         items = list(plan["_cancellable_items"])
+        retirement_items = list(plan["_retirement_items"])
 
         def ids(kind: str) -> list[Any]:
             values = [item["item_id"] for item in items if item["item_kind"] == kind]
@@ -4191,6 +4430,50 @@ def cancel_session_work_for_deletion(
         turn_ids = ids("workflow_turn")
         inbox_ids = ids("inbox")
         assignment_ids = ids("child_assignment")
+        effect_ids = [
+            int(item["item_id"])
+            for item in retirement_items
+            if item["item_kind"] == "workflow_effect"
+        ]
+
+        effect_rows = (
+            db.query(WorkflowEffectModel, WorkflowModel, WorkflowTurnModel)
+            .join(WorkflowModel, WorkflowModel.id == WorkflowEffectModel.workflow_id)
+            .join(
+                WorkflowTurnModel,
+                and_(
+                    WorkflowTurnModel.id == WorkflowEffectModel.workflow_turn_id,
+                    WorkflowTurnModel.workflow_id == WorkflowEffectModel.workflow_id,
+                ),
+            )
+            .filter(
+                WorkflowEffectModel.id.in_(effect_ids),
+                WorkflowEffectModel.state.in_(("claimed", "indeterminate")),
+                WorkflowModel.root_terminal_id.in_(terminal_ids),
+            )
+            .all()
+            if effect_ids
+            else []
+        )
+        expected_effect_states = {
+            int(item["item_id"]): str(item["state"]) for item in retirement_items
+        }
+        expected_effect_authority = {
+            int(item["item_id"]): dict(item.get("authority", {})) for item in retirement_items
+        }
+        if {int(effect.id) for effect, _workflow, _turn in effect_rows} != set(effect_ids) or any(
+            str(effect.state) != expected_effect_states[int(effect.id)]
+            or _workflow_effect_retirement_classification(effect, workflow, turn)[0]
+            != "historical_indeterminate"
+            or _workflow_effect_retirement_authority(effect, workflow, turn)
+            != expected_effect_authority[int(effect.id)]
+            for effect, workflow, turn in effect_rows
+        ):
+            db.rollback()
+            return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
+        for effect, _workflow, _turn in effect_rows:
+            effect.state = _OPERATOR_RETIRED_INDETERMINATE_EFFECT
+            effect.updated_at = now
 
         if turn_ids:
             transitioned_turns = (
@@ -4293,13 +4576,19 @@ def cancel_session_work_for_deletion(
             "workflow_turn": TURN_CANCELLED,
             "inbox": MessageStatus.SUPERSEDED.value,
             "child_assignment": ChildAssignmentStatus.CANCELLED.value,
+            "workflow_effect": _OPERATOR_RETIRED_INDETERMINATE_EFFECT,
         }
         audit_items = [
             (
                 item,
-                f"session-delete-cancel:{session_id}:" f"{item['item_kind']}:{item['item_id']}",
+                (
+                    f"session-delete-retire:{session_id}:"
+                    if item["item_kind"] == "workflow_effect"
+                    else f"session-delete-cancel:{session_id}:"
+                )
+                + f"{item['item_kind']}:{item['item_id']}",
             )
-            for item in items
+            for item in items + retirement_items
         ]
         existing_event_keys = {
             str(row[0])
@@ -4321,7 +4610,11 @@ def cancel_session_work_for_deletion(
                         item_id=item["item_id"],
                         previous_state=item["state"],
                         final_state=final_states[item["item_kind"]],
-                        reason_code="OPERATOR_SESSION_DELETION",
+                        reason_code=(
+                            "OPERATOR_RETIRED_UNKNOWN_OUTCOME"
+                            if item["item_kind"] == "workflow_effect"
+                            else "OPERATOR_SESSION_DELETION"
+                        ),
                         created_at=now,
                     )
                 )
@@ -4343,6 +4636,7 @@ def cancel_session_work_for_deletion(
             "cancelled": True,
             "already_cancelled": False,
             "cancelled_count": len(items),
+            "retired_indeterminate_count": len(retirement_items),
             "residual": _public_session_unresolved_work_plan(residual),
         }
 
@@ -10712,6 +11006,11 @@ def _mirror_workflow_effect_ledger(
             states = {str(existing.state), state}
             if "completed" in states:
                 existing.state = "completed"
+            elif _OPERATOR_RETIRED_INDETERMINATE_EFFECT in states:
+                # An operator-retired unknown outcome is a permanent replay
+                # fence. Recovery may copy that truth, never reopen it as a
+                # safely claimable pre-effect state.
+                existing.state = _OPERATOR_RETIRED_INDETERMINATE_EFFECT
             elif "indeterminate" in states or "claimed" in states:
                 existing.state = "indeterminate"
             elif "rejected" in states:

@@ -10,15 +10,22 @@ from cli_agent_orchestrator.clients.database import (
     CapacitySettingsModel,
     ChildAssignmentModel,
     DelegationResultModel,
+    InboxModel,
     ProviderExecutionLeaseModel,
+    RecoveryTakeoverModel,
     SessionDeletionReceiptModel,
     TerminalModel,
+    WorkflowEffectModel,
     WorkflowModel,
     WorkflowTurnModel,
     WorkflowTurnReceiptModel,
     WorktreeWriterLeaseModel,
+    WritableWorkContextModel,
 )
-from cli_agent_orchestrator.services import ui_read_model_service
+from cli_agent_orchestrator.services import (
+    interaction_read_model_service,
+    ui_read_model_service,
+)
 
 
 def _install_database(monkeypatch, url="sqlite:///:memory:"):
@@ -37,6 +44,21 @@ def _install_database(monkeypatch, url="sqlite:///:memory:"):
     ):
         monkeypatch.setattr(database, name, lambda: None)
     return engine
+
+
+def _interaction_terminal(
+    terminal_id: str = "owner", *, session_id: str = "interaction-session"
+) -> TerminalModel:
+    return TerminalModel(
+        id=terminal_id,
+        tmux_session="cao-interactions",
+        session_id=session_id,
+        tmux_window=terminal_id,
+        provider="codex",
+        runtime_lifecycle="running",
+        creation_order=1,
+        last_active=datetime(2026, 9, 7, 9, 0, 0),
+    )
 
 
 def _seed_retirement_projection(*, parent: str, children: tuple[tuple[str, str], ...]) -> None:
@@ -1221,3 +1243,596 @@ def test_recovery_fenced_supervisor_is_historical_while_successor_is_active(monk
     assert agents["new-owner"]["activity"] == "ready"
     assert sessions["lifetime-old-owner"]["active_agent_count"] == 0
     assert sessions["lifetime-new-owner"]["active_agent_count"] == 1
+
+
+def test_interaction_projection_preserves_current_and_history_axes(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 6, 9, 0, 0)
+    with database.SessionLocal() as db:
+        db.add_all(
+            [
+                _interaction_terminal(),
+                _interaction_terminal("child"),
+            ]
+        )
+        open_workflow = WorkflowModel(
+            root_terminal_id="owner", status="open", created_at=now, updated_at=now
+        )
+        terminal_workflow = WorkflowModel(
+            root_terminal_id="owner",
+            status="terminal",
+            terminal_reason="complete",
+            created_at=now + timedelta(seconds=1),
+            updated_at=now + timedelta(seconds=1),
+        )
+        cancelled_workflow = WorkflowModel(
+            root_terminal_id="owner",
+            status="cancelled",
+            created_at=now + timedelta(seconds=2),
+            updated_at=now + timedelta(seconds=2),
+        )
+        superseded_workflow = WorkflowModel(
+            root_terminal_id="owner",
+            status="open",
+            created_at=now + timedelta(seconds=3),
+            updated_at=now + timedelta(seconds=3),
+        )
+        owner_gate_workflow = WorkflowModel(
+            root_terminal_id="owner",
+            status="owner_gate",
+            terminal_reason="owner decision",
+            created_at=now + timedelta(seconds=4),
+            updated_at=now + timedelta(seconds=4),
+        )
+        effect_workflow = WorkflowModel(
+            root_terminal_id="owner",
+            status="terminal",
+            created_at=now + timedelta(seconds=5),
+            updated_at=now + timedelta(seconds=5),
+        )
+        db.add_all(
+            [
+                open_workflow,
+                terminal_workflow,
+                cancelled_workflow,
+                superseded_workflow,
+                owner_gate_workflow,
+                effect_workflow,
+            ]
+        )
+        db.flush()
+
+        turns = []
+        for index, (workflow, state, superseded) in enumerate(
+            (
+                (open_workflow, "queued", False),
+                (terminal_workflow, "sent", False),
+                (cancelled_workflow, "queued", False),
+                (superseded_workflow, "queued", True),
+                (effect_workflow, "queued", False),
+            )
+        ):
+            turn = WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="external_input",
+                dedupe_key=f"interaction-{index}",
+                payload=f"durable input {index}",
+                state=state,
+                superseded_by_turn_id=999 if superseded else None,
+                superseded_at=now if superseded else None,
+                created_at=now + timedelta(seconds=10 + index),
+                updated_at=now + timedelta(seconds=10 + index),
+            )
+            db.add(turn)
+            db.flush()
+            turns.append(turn)
+        open_workflow.active_turn_id = turns[0].id
+        db.add(
+            WorkflowEffectModel(
+                workflow_id=effect_workflow.id,
+                workflow_turn_id=turns[-1].id,
+                effect_kind="handoff",
+                effect_key="effect-current",
+                state="claimed",
+                claim_token="claim",
+                created_at=now + timedelta(seconds=20),
+                updated_at=now + timedelta(seconds=20),
+            )
+        )
+
+        active_assignment = ChildAssignmentModel(
+            parent_terminal_id="owner",
+            child_terminal_id="child",
+            status="result_delivered",
+            request_workflow_id=open_workflow.id,
+            request_workflow_turn_id=turns[0].id,
+            created_at=now + timedelta(seconds=21),
+            updated_at=now + timedelta(seconds=21),
+        )
+        acknowledged_assignment = ChildAssignmentModel(
+            parent_terminal_id="owner",
+            child_terminal_id="child",
+            status="result_acknowledged",
+            created_at=now + timedelta(seconds=22),
+            updated_at=now + timedelta(seconds=22),
+        )
+        cancelled_assignment = ChildAssignmentModel(
+            parent_terminal_id="owner",
+            child_terminal_id="child",
+            status="cancelled",
+            created_at=now + timedelta(seconds=23),
+            updated_at=now + timedelta(seconds=23),
+        )
+        db.add_all([active_assignment, acknowledged_assignment, cancelled_assignment])
+        db.flush()
+        for assignment, result_id in (
+            (active_assignment, "result-current"),
+            (acknowledged_assignment, "result-history"),
+        ):
+            db.add(
+                DelegationResultModel(
+                    id=result_id,
+                    child_assignment_id=assignment.id,
+                    schema_version=1,
+                    delegation_kind="assign",
+                    parent_terminal_id="owner",
+                    child_terminal_id="child",
+                    authorship="child_submission",
+                    status="complete",
+                    document_json=json.dumps(
+                        {"format": "v1", "summary": result_id, "body_markdown": "done"}
+                    ),
+                    created_at=assignment.created_at,
+                    finalized_at=assignment.created_at,
+                    updated_at=assignment.updated_at,
+                )
+            )
+        db.add_all(
+            [
+                InboxModel(
+                    sender_id="ui",
+                    receiver_id="owner",
+                    message="pending input",
+                    status="pending",
+                    kind="message",
+                    created_at=now + timedelta(seconds=24),
+                ),
+                InboxModel(
+                    sender_id="ui",
+                    receiver_id="owner",
+                    message="delivered input",
+                    status="delivered",
+                    kind="message",
+                    created_at=now + timedelta(seconds=25),
+                ),
+            ]
+        )
+        db.commit()
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    history = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="history", limit=20
+    )
+    current_by_type = {}
+    for item in current["items"]:
+        current_by_type.setdefault(item["interaction_type"], []).append(item)
+
+    assert current["total"] == 6
+    assert len(current_by_type["workflow_turn"]) == 1
+    assert current_by_type["workflow_turn"][0]["queue"]["wait_reason"] == ("workflow_continuation")
+    assert current_by_type["effect"][0]["queue"]["wait_reason"] == "claimed_effect"
+    assert current_by_type["effect"][0]["workflow"]["status"] == "terminal"
+    assert {item["queue"]["wait_reason"] for item in current_by_type["workflow"]} == {
+        "owner_gate",
+        "workflow_continuation",
+    }
+    assert not any(
+        item["final_disposition"] == "superseded" for item in current_by_type["workflow_turn"]
+    )
+    assert current_by_type["delegation"][0]["result"] == {
+        "id": "result-current",
+        "status": "complete",
+        "summary": "result-current",
+        "available": True,
+    }
+    assert current_by_type["delegation"][0]["delivery"]["pending"] is True
+    assert current_by_type["inbox"][0]["queue"]["admission_pending"] is True
+    assert (
+        current["total"]
+        == interaction_read_model_service.list_session_current_queue_counts(
+            ["interaction-session"]
+        )["interaction-session"]
+    )
+
+    history_dispositions = {item["final_disposition"] for item in history["items"]}
+    assert {"completed", "cancelled", "superseded", "acknowledged", "delivered"}.issubset(
+        history_dispositions
+    )
+    assert all(not item["current"] for item in history["items"])
+    assert not any(
+        item["workflow"]["status"] in {"terminal", "cancelled"}
+        and item["workflow"]["effect_state"] not in {"claimed", "indeterminate"}
+        for item in current["items"]
+    )
+
+    session = ui_read_model_service.list_session_summaries(limit=10)["items"][0]
+    owner = ui_read_model_service.list_agent_summaries(limit=10, session_id="interaction-session")[
+        "items"
+    ][0]
+    assert session["current_queue_count"] == current["total"]
+    assert owner["activity"] == "ready"
+
+
+def test_interaction_history_cursor_is_stable_bounded_and_query_constant(monkeypatch):
+    engine = _install_database(monkeypatch)
+    now = datetime(2026, 9, 5, 8, 0, 0)
+    with database.SessionLocal() as db:
+        db.add(_interaction_terminal())
+        for index in range(9):
+            db.add(
+                InboxModel(
+                    sender_id="ui",
+                    receiver_id="owner",
+                    message=f"history {index}",
+                    status="delivered",
+                    kind="message",
+                    created_at=now + timedelta(seconds=index),
+                )
+            )
+        db.commit()
+
+    statements = []
+
+    def record(_connection, _cursor, statement, _parameters, _context, _many):
+        if statement.lstrip().upper().startswith(("SELECT", "WITH")):
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        first = interaction_read_model_service.list_interactions(
+            "interaction-session", mode="history", limit=4
+        )
+        repeated = interaction_read_model_service.list_interactions(
+            "interaction-session", mode="history", limit=4
+        )
+        with database.SessionLocal() as db:
+            db.add(
+                InboxModel(
+                    sender_id="ui",
+                    receiver_id="owner",
+                    message="newer than cursor snapshot",
+                    status="delivered",
+                    kind="message",
+                    # Keep this on the snapshot's date to prove SQLite's
+                    # text ordering cannot leak a post-snapshot insert.
+                    created_at=datetime.fromisoformat(first["snapshot_at"]) + timedelta(seconds=1),
+                )
+            )
+            db.commit()
+        second = interaction_read_model_service.list_interactions(
+            "interaction-session", mode="history", limit=4, cursor=first["next_cursor"]
+        )
+        third = interaction_read_model_service.list_interactions(
+            "interaction-session", mode="history", limit=4, cursor=second["next_cursor"]
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    ids = [item["id"] for page in (first, second, third) for item in page["items"]]
+    assert [item["id"] for item in repeated["items"]] == [item["id"] for item in first["items"]]
+    assert len(ids) == len(set(ids)) == 9
+    assert first["total"] is second["total"] is third["total"] is None
+    assert len(statements) == 4
+    assert all("LIMIT ?" in statement for statement in statements)
+    assert all(statement.count("LIMIT ?") >= 10 for statement in statements)
+    assert all(
+        "COUNT(*) AS total_count FROM base_page" not in statement for statement in statements
+    )
+    assert first["limit"] == 4
+    assert third["next_cursor"] is None
+
+
+def test_terminal_and_superseded_work_stays_history_while_authority_is_current(
+    monkeypatch,
+):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 6, 14, 0, 0)
+    terminal = _interaction_terminal()
+    terminal.runtime_lifecycle = "exited"
+    terminal.launch_worktree = "/tmp/interaction-authority"
+    terminal.writer_authority_generation = "writer-generation"
+    terminal.writable_work_context_id = "authority-context"
+    with database.SessionLocal() as db:
+        db.add(terminal)
+        db.add(
+            WritableWorkContextModel(
+                id="authority-context",
+                request_id="authority-request",
+                project_id="project-1",
+                session_id="interaction-session",
+                terminal_id="owner",
+                canonical_source="/tmp/source",
+                canonical_worktree="/tmp/interaction-authority",
+                branch="feat/authority",
+                base_revision="2" * 40,
+                state="admitted",
+                writer_authority_generation="writer-generation",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        workflow = WorkflowModel(
+            root_terminal_id="owner",
+            status="terminal",
+            terminal_reason="workflow complete",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(workflow)
+        db.flush()
+        linked_inbox = InboxModel(
+            sender_id="ui",
+            receiver_id="owner",
+            message="pending transport after terminal state",
+            status="pending",
+            kind="message",
+            created_at=now + timedelta(seconds=1),
+        )
+        db.add(linked_inbox)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="terminal-authority-turn",
+            state="sent",
+            inbox_message_id=linked_inbox.id,
+            superseded_by_turn_id=999,
+            superseded_at=now,
+            created_at=now + timedelta(seconds=2),
+            updated_at=now + timedelta(seconds=2),
+        )
+        db.add(turn)
+        db.flush()
+        db.add(
+            ProviderExecutionLeaseModel(
+                terminal_id="owner", workflow_turn_id=turn.id, acquired_at=now
+            )
+        )
+        db.commit()
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    history = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="history", limit=20
+    )
+    assert {item["interaction_type"] for item in current["items"]} == {
+        "inbox",
+        "runtime_authority",
+    }
+    provider_item = next(
+        item for item in current["items"] if item["interaction_type"] == "runtime_authority"
+    )
+    assert provider_item["queue"]["wait_reason"] == "current_provider_turn"
+    assert provider_item["workflow"]["status"] == "terminal"
+    historical_turn = next(
+        item for item in history["items"] if item["interaction_type"] == "workflow_turn"
+    )
+    assert historical_turn["final_disposition"] == "superseded"
+    assert not historical_turn["current"]
+
+    with database.SessionLocal() as db:
+        inbox = db.get(InboxModel, 1)
+        inbox.status = "delivered"
+        db.commit()
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert [item["interaction_type"] for item in current["items"]] == ["runtime_authority"]
+    snapshot = database.get_session_workspace_retirement_snapshot("authority-context")
+    assert snapshot is not None and snapshot["reason_code"] == "PROVIDER_EXECUTION_ACTIVE"
+
+    with database.SessionLocal() as db:
+        db.query(ProviderExecutionLeaseModel).delete()
+        db.add(
+            WorktreeWriterLeaseModel(
+                canonical_worktree="/tmp/interaction-authority",
+                terminal_id="owner",
+                authority_generation="writer-generation",
+                created_at=now,
+            )
+        )
+        db.commit()
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert [(item["interaction_type"], item["task_type"]) for item in current["items"]] == [
+        ("runtime_authority", "writer_authority")
+    ]
+    snapshot = database.get_session_workspace_retirement_snapshot("authority-context")
+    assert snapshot is not None and snapshot["reason_code"] == "WRITER_LEASE_ACTIVE"
+
+
+def test_interaction_projection_reconstructs_from_durable_state_after_restart(
+    monkeypatch, tmp_path
+):
+    state_path = tmp_path / "interaction-read-model.db"
+    engine = _install_database(monkeypatch, f"sqlite:///{state_path}")
+    now = datetime(2026, 9, 6, 16, 0, 0)
+    with database.SessionLocal() as db:
+        db.add_all([_interaction_terminal(), _interaction_terminal("child")])
+        workflow = WorkflowModel(
+            root_terminal_id="owner", status="open", created_at=now, updated_at=now
+        )
+        db.add(workflow)
+        db.flush()
+        db.add(
+            WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="external_input",
+                dedupe_key="restart-current",
+                payload="durable restart input",
+                state="queued",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        assignment = ChildAssignmentModel(
+            parent_terminal_id="owner",
+            child_terminal_id="child",
+            status="result_acknowledged",
+            created_at=now + timedelta(seconds=1),
+            updated_at=now + timedelta(seconds=1),
+        )
+        db.add(assignment)
+        db.flush()
+        db.add(
+            DelegationResultModel(
+                id="durable-restart-result",
+                child_assignment_id=assignment.id,
+                schema_version=1,
+                delegation_kind="assign",
+                parent_terminal_id="owner",
+                child_terminal_id="child",
+                authorship="child_submission",
+                status="complete",
+                document_json=json.dumps(
+                    {
+                        "format": "v1",
+                        "summary": "survives restart",
+                        "body_markdown": "durable body",
+                    }
+                ),
+                created_at=assignment.created_at,
+                finalized_at=assignment.created_at,
+                updated_at=assignment.updated_at,
+            )
+        )
+        db.commit()
+
+    before = {
+        mode: interaction_read_model_service.list_interactions(
+            "interaction-session", mode=mode, limit=20
+        )["items"]
+        for mode in ("current", "history")
+    }
+    engine.dispose()
+    restarted_engine = _install_database(monkeypatch, f"sqlite:///{state_path}")
+    try:
+        after = {
+            mode: interaction_read_model_service.list_interactions(
+                "interaction-session", mode=mode, limit=20
+            )["items"]
+            for mode in ("current", "history")
+        }
+        assert after == before
+        assert after["history"][0]["result"]["summary"] == "survives restart"
+    finally:
+        restarted_engine.dispose()
+
+
+def test_session_page_adds_one_bounded_current_only_count_query(monkeypatch):
+    engine = _install_database(monkeypatch)
+    _seed_history(session_count=40, terminal_count=400)
+    ui_read_model_service.list_session_summaries(limit=10)
+    statements = []
+
+    def record(_connection, _cursor, statement, _parameters, _context, _many):
+        if statement.lstrip().upper().startswith(("SELECT", "WITH")):
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        page = ui_read_model_service.list_session_summaries(limit=10)
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert len(page["items"]) == 10
+    assert len(statements) == 2
+    assert "LIMIT ? OFFSET ?" in statements[0]
+    assert "FROM interaction_items WHERE is_current = 1" in statements[1]
+    assert statements[1].count("WHERE is_current = 1") >= 9
+    indexes = {
+        index["name"]
+        for table in ("workflow_turns", "inbox", "child_assignments", "workflow_effects")
+        for index in inspect(engine).get_indexes(table)
+    }
+    assert {
+        "ix_workflow_turns_workflow_created",
+        "ix_inbox_receiver_status_created",
+        "ix_inbox_sender_status_created",
+        "ix_child_assignments_parent_status_created",
+        "ix_child_assignments_child_status_created",
+        "ix_workflow_effects_workflow_turn_state",
+    }.issubset(indexes)
+
+
+def test_current_queue_matches_workspace_retirement_safety_boundary(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 5, 8, 0, 0)
+    terminal = _interaction_terminal()
+    terminal.runtime_lifecycle = "exited"
+    terminal.launch_worktree = "/tmp/interaction-worktree"
+    terminal.writer_authority_generation = "writer-1"
+    terminal.writable_work_context_id = "context-1"
+    with database.SessionLocal() as db:
+        db.add(terminal)
+        db.add(
+            WritableWorkContextModel(
+                id="context-1",
+                request_id="request-1",
+                project_id="project-1",
+                session_id="interaction-session",
+                terminal_id="owner",
+                canonical_source="/tmp/source",
+                canonical_worktree="/tmp/interaction-worktree",
+                branch="feat/interaction-test",
+                base_revision="1" * 40,
+                state="admitted",
+                writer_authority_generation="writer-1",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        workflow = WorkflowModel(
+            root_terminal_id="owner", status="terminal", created_at=now, updated_at=now
+        )
+        db.add(workflow)
+        db.flush()
+        db.add(
+            WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="external_input",
+                dedupe_key="historical-sent",
+                state="sent",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        db.commit()
+
+    assert (
+        interaction_read_model_service.list_session_current_queue_counts(["interaction-session"])[
+            "interaction-session"
+        ]
+        == 0
+    )
+    snapshot = database.get_session_workspace_retirement_snapshot("context-1")
+    assert snapshot is not None and snapshot["reason_code"] is None
+
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).one()
+        workflow.status = "open"
+        db.commit()
+    assert (
+        interaction_read_model_service.list_session_current_queue_counts(["interaction-session"])[
+            "interaction-session"
+        ]
+        == 1
+    )
+    snapshot = database.get_session_workspace_retirement_snapshot("context-1")
+    assert snapshot is not None and snapshot["reason_code"] == "WORKFLOW_OPEN"

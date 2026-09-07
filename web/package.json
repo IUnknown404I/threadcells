@@ -32,7 +32,8 @@
     "test:e2e:primary-navigation": "node e2e/primary-navigation.chromium.mjs",
     "test:e2e:touch-scroll": "node e2e/touch-scroll-regression.chromium.mjs",
     "test:e2e:settings-final": "node e2e/settings-final-acceptance.chromium.mjs",
-    "test:e2e:i18n-p1": "node e2e/i18n-p1.chromium.mjs"
+    "test:e2e:i18n-p1": "node e2e/i18n-p1.chromium.mjs",
+    "test:e2e:interaction-history-p1": "node e2e/interaction-history-p1.chromium.mjs"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.11.0",

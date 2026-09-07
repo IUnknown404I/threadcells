@@ -10,6 +10,9 @@ from cli_agent_orchestrator.clients.database import (
     list_terminal_ui_session_page,
     list_terminal_ui_summary_page,
 )
+from cli_agent_orchestrator.services.interaction_read_model_service import (
+    list_session_current_queue_counts,
+)
 
 DEFAULT_SESSION_PAGE_SIZE = 10
 DEFAULT_AGENT_PAGE_SIZE = 40
@@ -61,6 +64,9 @@ def list_session_summaries(
         item["agent_count"] = int(item.get("agent_count") or 0)
         item["active_agent_count"] = int(item.get("active_agent_count") or 0)
         items.append(item)
+    queue_counts = list_session_current_queue_counts(item["id"] for item in items)
+    for item in items:
+        item["current_queue_count"] = queue_counts.get(str(item["id"]), 0)
     return _page(items, total=int(projection["total"]), limit=limit, offset=offset)
 
 

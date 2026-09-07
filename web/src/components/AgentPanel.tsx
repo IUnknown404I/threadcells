@@ -1,7 +1,7 @@
 import { lazy, Suspense, useState, useEffect, useRef } from 'react'
 import { useStore } from '../store'
 import { AgentSummary, AgentProfileInfo, OwnerLaunchGrant, Project, ProviderInfo, Session, SessionDeletionPreflight, SessionSummary, TerminalMeta, api } from '../api'
-import { Bot, Play, Trash2, ChevronRight, Terminal as TermIcon, Monitor, Package, FolderOpen, Search, Mail, Plus, LogOut, FileText, X, LoaderCircle, ShieldAlert } from 'lucide-react'
+import { Bot, Play, Trash2, ChevronRight, Terminal as TermIcon, Monitor, Package, FolderOpen, Search, Mail, Plus, LogOut, FileText, X, LoaderCircle, ShieldAlert, History } from 'lucide-react'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
 import { CustomSelect, SelectOption } from './CustomSelect'
@@ -19,6 +19,7 @@ import { ProviderOutcomeNotice } from './ProviderOutcomeNotice'
 import { RecoveryTakeoverAction } from './RecoveryTakeoverAction'
 import { WorkflowRecoveryNotice } from './WorkflowRecoveryNotice'
 import { useRecoveryTakeoverCapabilities } from '../recoveryCapabilities'
+import { InteractionHistoryDrawer } from './InteractionHistoryDrawer'
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })))
 
@@ -149,6 +150,7 @@ export function AgentPanel({
   const [profileFilters, setProfileFilters] = useState<string[]>(initialFilters.profiles)
   const [homeFilter, setHomeFilter] = useState(initialFilters.homeFilter)
   const [inboxTerminal, setInboxTerminal] = useState<{ id: string; readOnly: boolean } | null>(null)
+  const [interactionTarget, setInteractionTarget] = useState<{ sessionId: string; sessionName: string; terminalId?: string } | null>(null)
   const [projectId, setProjectId] = useState('')
   const [sessionRootWorkDir, setSessionRootWorkDir] = useState<string | null>(null)
   const [showAddAgent, setShowAddAgent] = useState(false)
@@ -502,6 +504,7 @@ export function AgentPanel({
           {sessionName && <span className="text-xs text-gray-600 truncate max-w-full" title={sessionDisplayName(sessionName)}>{t('agents.sessionLabel', { name: sessionDisplayName(sessionName) })}</span>}
         </div>
         <div className={`grid grid-cols-2 gap-2 w-full ${grid ? '' : 'sm:flex sm:w-auto'}`}>
+          <button type="button" onClick={() => setInteractionTarget({ sessionId: terminal.session_id, sessionName: terminal.session_name, terminalId: terminal.id })} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs font-medium rounded-lg transition-colors" title={t('interactions.action')}><History size={14}/>{t('interactions.history')}</button>
           <button onClick={() => setInboxTerminal({ id: terminal.id, readOnly: workspaceUnavailable })} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs font-medium rounded-lg transition-colors" title={t('agents.viewInbox')}><Mail size={14} />{t('agents.inbox')}</button>
           <button onClick={() => openTerminal(terminal.id, terminal.provider, terminal.agent_profile)} disabled={workspaceUnavailable} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-40 text-white text-xs font-medium rounded-lg transition-colors" title={workspaceUnavailable ? t('agents.openComposerUnavailable') : t('agents.openLiveTerminal')}><Monitor size={14} />{t('agents.openTerminal')}</button>
           <button onClick={() => setOutputTerminalId(terminal.id)} className="min-h-11 justify-center flex items-center gap-2 px-3 py-1.5 bg-gray-700 hover:bg-gray-600 text-white text-xs font-medium rounded-lg transition-colors" title={t('agents.viewOutput')}><FileText size={14} />{t('agents.output')}</button>
@@ -692,6 +695,7 @@ export function AgentPanel({
                       <span data-testid={`agent-session-count-${s.id}`} className="shrink-0 text-xs text-gray-500">
                         {t('agents.count', { count: s.agent_count })}
                       </span>
+                      {Boolean(s.current_queue_count) && <span data-testid={`agent-session-queue-count-${s.id}`} className="shrink-0 text-[11px] font-medium text-sky-300">{t('interactions.queueCount', { count: s.current_queue_count || 0 })}</span>}
                       <span className={`shrink-0 rounded-full px-2 py-0.5 text-xs ${s.status === 'active' ? 'bg-emerald-900/50 text-emerald-400' : 'bg-gray-700 text-gray-400'}`}>
                         {t(sessionStatusTranslationKey(s.status))}
                       </span>
@@ -706,6 +710,7 @@ export function AgentPanel({
                     </div>
                     <div data-testid={`agent-session-actions-${s.id}`} className="flex items-center gap-2 self-end sm:self-auto shrink-0" onClick={event => event.stopPropagation()}>
                       <AgentViewControls value={sessionAgentViews[s.id] || 'list'} onChange={value => setSessionAgentViews(current => ({ ...current, [s.id]: value }))} />
+                      <button type="button" onClick={() => setInteractionTarget({ sessionId: s.id, sessionName: s.name })} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg text-gray-500 transition-colors hover:bg-gray-800 hover:text-emerald-300" title={t('interactions.action')} aria-label={t('interactions.action')}><History size={14}/></button>
                       <button
                         onClick={event => { event.stopPropagation(); void openDeleteSession(s) }}
                         className="min-w-11 min-h-11 inline-flex items-center justify-center text-gray-500 hover:text-red-400 transition-colors rounded-lg hover:bg-gray-800"
@@ -801,6 +806,8 @@ export function AgentPanel({
       {inboxTerminal && (
         <InboxPanel terminalId={inboxTerminal.id} readOnly={inboxTerminal.readOnly} onClose={() => setInboxTerminal(null)} />
       )}
+
+      {interactionTarget && <InteractionHistoryDrawer {...interactionTarget} onClose={() => setInteractionTarget(null)} />}
 
       {/* Live Terminal */}
       {liveTerminal && <Suspense fallback={null}>

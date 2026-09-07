@@ -85,6 +85,7 @@ from cli_agent_orchestrator.services import (
     branding_service,
     flow_service,
     inbox_service,
+    interaction_read_model_service,
     managed_worktree_service,
     project_service,
     recovery_takeover_service,
@@ -1950,6 +1951,28 @@ async def list_ui_agent_summaries(
             workflow_states=_csv_query_values(workflow_state),
             profiles=_csv_query_values(profile),
             home_filter=home_filter,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@app.get("/ui/interactions")
+async def list_ui_interactions(
+    session_id: str = Query(min_length=1, max_length=200),
+    mode: Literal["current", "history"] = Query(default="current"),
+    terminal_id: Optional[str] = Query(default=None, max_length=200),
+    limit: int = Query(default=20, ge=1, le=50),
+    cursor: Optional[str] = Query(default=None, max_length=2000),
+) -> Dict:
+    """Return a bounded product projection of current work or durable history."""
+    try:
+        return await _run_ui_read(
+            interaction_read_model_service.list_interactions,
+            session_id,
+            mode=mode,
+            terminal_id=terminal_id,
+            limit=limit,
+            cursor=cursor,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc

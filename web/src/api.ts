@@ -338,6 +338,7 @@ export interface SessionSummary extends Session {
   last_active: string | null
   first_agent: SessionBoundaryAgent | null
   last_agent: SessionBoundaryAgent | null
+  current_queue_count?: number
   workspace_state?: 'reserved' | 'provisioned' | 'launching' | 'admitted' | 'preserved' | 'retiring' | 'retired' | 'abandoned' | null
 }
 
@@ -407,6 +408,46 @@ export interface PageResult<T> {
 
 export interface AgentSummaryPage extends PageResult<AgentSummary> {
   facets: { activities: string[]; workflow_states: string[]; profiles: string[] }
+}
+
+export type InteractionMode = 'current' | 'history'
+
+export interface InteractionItem {
+  id: string
+  interaction_type: 'workflow_turn' | 'workflow' | 'effect' | 'delegation' | 'inbox' | 'recovery' | 'runtime_authority'
+  task_type: string
+  source: { kind: string; terminal_id: string | null; target_terminal_id: string | null }
+  input_preview: string | null
+  created_at: string | null
+  updated_at: string | null
+  current: boolean
+  queue: { state: string | null; wait_reason: string | null; admission_pending: boolean }
+  workflow: {
+    id: number | null
+    turn_id: number | null
+    status: string | null
+    reason: string | null
+    turn_state: string | null
+    turn_kind: string | null
+    provider_outcome_code: string | null
+    provider_outcome_detail: string | null
+    effect_kind: string | null
+    effect_state: string | null
+    turn_count: number
+    superseded_turn_count: number
+  }
+  result: { id: string | null; status: string | null; summary: string | null; available: boolean }
+  delivery: { status: string | null; pending: boolean; acknowledged: boolean }
+  final_disposition: string | null
+  diagnostics: { interaction_id: string; durable_id: string | null; assignment_id: number | null }
+}
+
+export interface InteractionPage {
+  items: InteractionItem[]
+  total: number | null
+  limit: number
+  next_cursor: string | null
+  snapshot_at: string
 }
 
 export interface Terminal {
@@ -877,6 +918,14 @@ export const api = {
     if (params.profiles?.length) search.set('profile', params.profiles.join(','))
     if (params.homeFilter) search.set('home_filter', params.homeFilter)
     return fetchJSON<AgentSummaryPage>(`/ui/agents${search.size ? `?${search}` : ''}`, { signal })
+  },
+  listInteractions: (params: { sessionId: string; mode?: InteractionMode; terminalId?: string; limit?: number; cursor?: string }, signal?: AbortSignal) => {
+    const search = new URLSearchParams({ session_id: params.sessionId })
+    if (params.mode) search.set('mode', params.mode)
+    if (params.terminalId) search.set('terminal_id', params.terminalId)
+    if (params.limit !== undefined) search.set('limit', String(params.limit))
+    if (params.cursor) search.set('cursor', params.cursor)
+    return fetchJSON<InteractionPage>(`/ui/interactions?${search}`, { signal })
   },
   listSessions: () => fetchJSON<Session[]>('/sessions'),
   getSession: (name: string) => fetchJSON<SessionDetail>(`/sessions/${encodeURIComponent(name)}`),

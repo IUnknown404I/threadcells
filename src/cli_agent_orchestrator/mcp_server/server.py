@@ -1099,6 +1099,7 @@ def _waiting_handoff_result(terminal_id: str, timeout: int, reason: str) -> Hand
         terminal_id=terminal_id,
         reason_code="WAIT_SLICE_EXPIRED",
         state=HandoffState.WAITING,
+        next_wait_slice_id=0,
     )
 
 
@@ -1117,6 +1118,7 @@ def _provider_content_unavailable_handoff_result(terminal_id: str) -> HandoffRes
         reason_code="PROVIDER_CONTENT_UNAVAILABLE",
         workflow_state=get_workflow_status(terminal_id),
         state=HandoffState.WAITING,
+        next_wait_slice_id=0,
     )
 
 
@@ -1626,7 +1628,12 @@ async def _handoff_impl(
             raise
         remaining = max(0, deadline - time.monotonic())
         result = await _await_handoff_impl(terminal_id, timeout=remaining)
-        if result.state == HandoffState.COMPLETED:
+        if result.state == HandoffState.WAITING:
+            # The initial handoff wait is outside the explicit await_handoff
+            # effect sequence. Its known continuation is therefore slice 0.
+            result.wait_slice_id = None
+            result.next_wait_slice_id = 0
+        elif result.state == HandoffState.COMPLETED:
             result.message = (
                 f"Successfully handed off to {agent_profile} ({provider}) in "
                 f"{time.time() - start_time:.2f}s"

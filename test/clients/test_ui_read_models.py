@@ -1868,6 +1868,84 @@ def test_wait_timeout_is_history_while_open_workflow_and_provider_axes_stay_inde
     )
 
 
+def test_wait_history_collapses_only_explicit_reconnect_mirrors(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 7, 12, 30, 0)
+    with database.SessionLocal() as db:
+        db.add(_interaction_terminal())
+        workflow = WorkflowModel(
+            root_terminal_id="owner",
+            status="terminal",
+            terminal_reason="completed",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(workflow)
+        db.flush()
+        turns = []
+        for index in range(3):
+            turn = WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="external_input" if index != 1 else "execution_resume",
+                dedupe_key=f"wait-operation-{index}",
+                state="finished",
+                created_at=now + timedelta(seconds=index),
+                updated_at=now + timedelta(seconds=index),
+            )
+            db.add(turn)
+            db.flush()
+            turns.append(turn)
+        first = WorkflowEffectModel(
+            workflow_id=workflow.id,
+            workflow_turn_id=turns[0].id,
+            effect_kind="await_handoff",
+            effect_key="same-child-slice-zero",
+            state="wait_timeout",
+            claim_token="first",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(first)
+        db.flush()
+        db.add_all(
+            [
+                WorkflowEffectModel(
+                    workflow_id=workflow.id,
+                    workflow_turn_id=turns[1].id,
+                    effect_kind="await_handoff",
+                    effect_key="same-child-slice-zero",
+                    state="wait_timeout",
+                    claim_token="mirror",
+                    mirrored_from_effect_id=first.id,
+                    created_at=now + timedelta(seconds=1),
+                    updated_at=now + timedelta(seconds=1),
+                ),
+                WorkflowEffectModel(
+                    workflow_id=workflow.id,
+                    workflow_turn_id=turns[2].id,
+                    effect_kind="await_handoff",
+                    effect_key="same-child-slice-zero",
+                    state="wait_timeout",
+                    claim_token="independent",
+                    created_at=now + timedelta(seconds=2),
+                    updated_at=now + timedelta(seconds=2),
+                ),
+            ]
+        )
+        turn_ids = [int(turn.id) for turn in turns]
+        db.commit()
+
+    history = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="history", limit=20
+    )
+    wait_turn_ids = {
+        item["workflow"]["turn_id"]
+        for item in history["items"]
+        if item["interaction_type"] == "effect"
+    }
+    assert wait_turn_ids == {turn_ids[0], turn_ids[2]}
+
+
 def test_open_workflow_unadmitted_transport_states_remain_current(monkeypatch):
     _install_database(monkeypatch)
     now = datetime(2026, 9, 7, 8, 30, 0)

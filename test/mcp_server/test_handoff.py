@@ -1167,5 +1167,7 @@ class TestResumableHandoffWait:
         result = asyncio.run(_handoff_impl("developer", "Produce a final marker.", timeout=1))
 
         assert result.state == HandoffState.WAITING
+        assert result.wait_slice_id is None
+        assert result.next_wait_slice_id == 0
         mock_send.assert_called_once()
         mock_await.assert_awaited_once()

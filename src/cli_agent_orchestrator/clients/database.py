@@ -1068,6 +1068,11 @@ class WorkflowEffectModel(Base):
     effect_key = Column(String, nullable=False)
     state = Column(String, nullable=False, default="claimed")
     claim_token = Column(String, nullable=False)
+    # Recovery copies are durable replay fences, not new product operations.
+    # Point every copy at the first physical effect so History can collapse
+    # only proven mirrors while preserving independently admitted same-key
+    # effects from other logical turns.
+    mirrored_from_effect_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.now)
     updated_at = Column(DateTime, nullable=False, default=datetime.now)
 
@@ -2543,6 +2548,53 @@ def _migrate_workflow_turn_columns() -> None:
             conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resumed_by_turn_id INTEGER")
         if "resumed_at" not in receipt_columns:
             conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resumed_at DATETIME")
+        effect_columns = {row[1] for row in conn.execute("PRAGMA table_info(workflow_effects)")}
+        effect_lineage_added = "mirrored_from_effect_id" not in effect_columns
+        if effect_lineage_added:
+            conn.execute("ALTER TABLE workflow_effects ADD COLUMN mirrored_from_effect_id INTEGER")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_workflow_effects_workflow_kind_key_id "
+            "ON workflow_effects(workflow_id, effect_kind, effect_key, id)"
+        )
+        # Releases predating explicit effect lineage still have durable turn
+        # resume/supersession evidence. Backfill only exact same-key effects
+        # copied onto such a successor; unrelated admitted turns remain
+        # independent even when they target the same child and slice number.
+        if effect_lineage_added:
+            conn.execute("""
+                WITH mirror_lineage AS (
+                    SELECT mirror.id AS mirror_id, MIN(source.id) AS source_id
+                    FROM workflow_effects mirror
+                    JOIN workflow_turns mirror_turn
+                      ON mirror_turn.id = mirror.workflow_turn_id
+                     AND mirror_turn.workflow_id = mirror.workflow_id
+                    JOIN workflow_effects source
+                      ON source.workflow_id = mirror.workflow_id
+                     AND source.effect_kind = mirror.effect_kind
+                     AND source.effect_key = mirror.effect_key
+                     AND source.id < mirror.id
+                     AND source.workflow_turn_id != mirror.workflow_turn_id
+                    JOIN workflow_turns source_turn
+                      ON source_turn.id = source.workflow_turn_id
+                     AND source_turn.workflow_id = source.workflow_id
+                    LEFT JOIN workflow_turn_receipts source_receipt
+                      ON source_receipt.workflow_turn_id = source_turn.id
+                    WHERE mirror.mirrored_from_effect_id IS NULL
+                      AND (
+                        mirror_turn.resume_parent_turn_id = source_turn.id
+                        OR source_turn.superseded_by_turn_id = mirror_turn.id
+                        OR source_receipt.resumed_by_turn_id = mirror_turn.id
+                      )
+                    GROUP BY mirror.id
+                )
+                UPDATE workflow_effects
+                SET mirrored_from_effect_id = (
+                    SELECT source_id FROM mirror_lineage
+                    WHERE mirror_id = workflow_effects.id
+                )
+                WHERE mirrored_from_effect_id IS NULL
+                  AND id IN (SELECT mirror_id FROM mirror_lineage)
+                """)
         conn.commit()
         conn.close()
     except Exception as exc:
@@ -5824,10 +5876,6 @@ def _ensure_terminal_ui_projection_schema() -> None:
             connection.exec_driver_sql(
                 "CREATE INDEX IF NOT EXISTS ix_workflow_effects_workflow_turn_state "
                 "ON workflow_effects (workflow_id, workflow_turn_id, state, id)"
-            )
-            connection.exec_driver_sql(
-                "CREATE INDEX IF NOT EXISTS ix_workflow_effects_workflow_kind_key_id "
-                "ON workflow_effects (workflow_id, effect_kind, effect_key, id)"
             )
             connection.exec_driver_sql(
                 "CREATE INDEX IF NOT EXISTS ix_recovery_takeovers_old_state_created "
@@ -11037,6 +11085,11 @@ def _mirror_workflow_effect_ledger(
                 effect_key=prior.effect_key,
                 state=state,
                 claim_token=uuid.uuid4().hex,
+                mirrored_from_effect_id=(
+                    prior.mirrored_from_effect_id
+                    if prior.mirrored_from_effect_id is not None
+                    else prior.id
+                ),
                 created_at=now,
                 updated_at=now,
             )

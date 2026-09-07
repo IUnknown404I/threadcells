@@ -1355,15 +1355,34 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
         connection.execute("CREATE TABLE workflows (id INTEGER PRIMARY KEY)")
         connection.execute(
             "CREATE TABLE workflow_turns ("
-            "id INTEGER PRIMARY KEY, claim_generation INTEGER NOT NULL DEFAULT 0, "
-            "claim_token TEXT, claim_expires_at DATETIME, transport_binding TEXT)"
+            "id INTEGER PRIMARY KEY, workflow_id INTEGER NOT NULL DEFAULT 1, "
+            "claim_generation INTEGER NOT NULL DEFAULT 0, "
+            "claim_token TEXT, claim_expires_at DATETIME, transport_binding TEXT, "
+            "resume_parent_turn_id INTEGER)"
         )
         connection.execute(
             "CREATE TABLE workflow_turn_receipts ("
             "id INTEGER PRIMARY KEY, workflow_turn_id INTEGER NOT NULL, "
             "receiver_terminal_id TEXT NOT NULL, consumed_at DATETIME NOT NULL)"
         )
+        connection.execute(
+            "CREATE TABLE workflow_effects ("
+            "id INTEGER PRIMARY KEY, workflow_id INTEGER NOT NULL, "
+            "workflow_turn_id INTEGER NOT NULL, effect_kind TEXT NOT NULL, "
+            "effect_key TEXT NOT NULL)"
+        )
         connection.execute("CREATE TABLE inbox (id INTEGER PRIMARY KEY)")
+        connection.executemany(
+            "INSERT INTO workflow_turns(id, workflow_id, resume_parent_turn_id) "
+            "VALUES (?, 1, ?)",
+            ((1, None), (2, 1), (3, None)),
+        )
+        connection.executemany(
+            "INSERT INTO workflow_effects("
+            "id, workflow_id, workflow_turn_id, effect_kind, effect_key"
+            ") VALUES (?, 1, ?, 'await_handoff', 'same-slice')",
+            ((1, 1), (2, 2), (3, 3)),
+        )
     monkeypatch.setattr(constants, "DATABASE_FILE", database_file)
 
     database._migrate_workflow_turn_columns()
@@ -1375,7 +1394,15 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
         receipt_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(workflow_turn_receipts)")
         }
+        effect_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(workflow_effects)")
+        }
         inbox_columns = {row[1] for row in connection.execute("PRAGMA table_info(inbox)")}
+        effect_lineage = dict(
+            connection.execute(
+                "SELECT id, mirrored_from_effect_id FROM workflow_effects ORDER BY id"
+            )
+        )
     assert "resumed_from_owner_gate_workflow_id" in workflow_columns
     assert "queue_reason" in columns
     assert "provider_processing_observed_at" in columns
@@ -1393,6 +1420,8 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
     assert "resume_token_sha256" in receipt_columns
     assert "resumed_by_turn_id" in receipt_columns
     assert "resumed_at" in receipt_columns
+    assert "mirrored_from_effect_id" in effect_columns
+    assert effect_lineage == {1: None, 2: 1, 3: None}
     assert "superseded_by_turn_id" in columns
     assert "superseded_at" in columns
     assert "callback_reconciled_at" in inbox_columns
@@ -7141,6 +7170,41 @@ def test_f13_await_handoff_timeout_is_terminal_and_next_slice_is_explicit(workfl
         assert db.query(database.DelegationResultModel).count() == 0
 
 
+def test_f13_initial_handoff_timeout_starts_explicit_await_slice_zero(workflow_db, monkeypatch):
+    root = "root-handoff-first-await-slice"
+    child = "child-handoff-first-await-slice"
+    turn_id = _start_admitted_input(root)
+    monkeypatch.setenv("CAO_TERMINAL_ID", root)
+    initial_wait = mcp_server._waiting_handoff_result(child, 1, "completion not observed")
+    first_await = mcp_server._waiting_handoff_result(child, 1, "still running")
+
+    with (
+        patch.object(mcp_server, "_handoff_impl", AsyncMock(return_value=initial_wait)),
+        patch.object(mcp_server, "_await_handoff_impl", AsyncMock(return_value=first_await)),
+    ):
+        handoff_result = asyncio.run(
+            mcp_server.handoff(turn_id, "developer", "perform bounded work", timeout=1)
+        )
+        assert handoff_result.next_wait_slice_id == 0
+        await_result = asyncio.run(
+            mcp_server.await_handoff(
+                turn_id,
+                child,
+                timeout=1,
+                wait_slice_id=handoff_result.next_wait_slice_id,
+            )
+        )
+
+    assert handoff_result.state == mcp_server.HandoffState.WAITING
+    assert handoff_result.wait_slice_id is None
+    assert await_result.state == mcp_server.HandoffState.WAITING
+    assert await_result.wait_slice_id == 0
+    assert await_result.next_wait_slice_id == 1
+    with database.SessionLocal() as db:
+        wait_effect = db.query(WorkflowEffectModel).filter_by(effect_kind="await_handoff").one()
+        assert wait_effect.state == "wait_timeout"
+
+
 def test_f13_await_handoff_known_child_failure_is_terminal_rejection(workflow_db, monkeypatch):
     root = "root-await-known-failure"
     child = "child-await-known-failure"
@@ -7250,6 +7314,7 @@ def test_f13_wait_timeout_survives_provider_reconnect_without_duplicate_contradi
         )
         assert original.state == "wait_timeout"
         assert mirrored.state == "wait_timeout"
+        assert mirrored.mirrored_from_effect_id == original.id
         assert (
             db.query(WorkflowEffectModel)
             .filter_by(workflow_turn_id=resumed_turn, state="completed")

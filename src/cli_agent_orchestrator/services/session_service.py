@@ -25,9 +25,11 @@ from typing import Dict, List
 
 from cli_agent_orchestrator.clients.database import (
     AmbiguousSessionIdentity,
+    cancel_session_work_for_deletion,
     cancel_workflows_for_terminal,
     claim_session_workspace_retirement,
     delete_terminals_by_session_lifetime,
+    get_session_unresolved_work_plan,
     get_session_workspace_retirement_snapshot,
     get_writable_work_context_by_session,
     resolve_session_lifetime,
@@ -231,30 +233,72 @@ def get_session_root_working_directory(session_name: str) -> str | None:
 
 def _session_deletion_preflight(authority: SessionAuthority) -> Dict[str, object]:
     """Inspect destructive Session deletion without changing durable state."""
+    empty_plan: Dict[str, object] = {
+        "eligible": True,
+        "cancellable": False,
+        "requires_cancellation_confirmation": False,
+        "plan_token": None,
+        "blockers": [],
+        "cancellable_count": 0,
+        "unsafe_count": 0,
+        "plan_limit": 500,
+        "reason_codes": [],
+    }
     if authority.deleted:
         return {
+            **empty_plan,
             "eligible": True,
             "already_deleted": True,
             "requires_dirty_confirmation": False,
             "modified_files": 0,
             "untracked_files": 0,
             "reason_code": None,
+            "current_queue_count": 0,
+            "cancellation_plan": {"count": 0, "categories": []},
+            "unsafe_blockers": [],
+            "cancellable_blockers": [],
         }
-    reason_code: str | None = None
+
+    plan = get_session_unresolved_work_plan(
+        authority.session_id,
+        expected_terminal_ids=[terminal["id"] for terminal in authority.terminals],
+    )
+    blockers = [dict(item) for item in plan.get("blockers", [])]
+
+    def add_unsafe(category: str, reason: str) -> None:
+        blockers.append(
+            {
+                "category": category,
+                "count": 1,
+                "disposition": "unsafe",
+                "reason_codes": [reason],
+            }
+        )
+
+    authority_reason: str | None = None
     if authority.has_recovery_fenced_history:
-        reason_code = "SESSION_RECOVERY_EVIDENCE_PROTECTED"
-    elif authority.has_live_runtime_owner:
-        reason_code = "SESSION_RUNTIME_ACTIVE"
+        authority_reason = "SESSION_RECOVERY_EVIDENCE_PROTECTED"
+    elif authority.runtime_exists is None:
+        authority_reason = "SESSION_RUNTIME_AUTHORITY_UNPROVEN"
+    elif authority.runtime_exists and not authority.has_live_runtime_owner:
+        authority_reason = "SESSION_RUNTIME_AUTHORITY_UNPROVEN"
+    elif authority.runtime_exists or authority.has_live_runtime_owner:
+        authority_reason = "SESSION_RUNTIME_ACTIVE"
+    if authority_reason is not None and not any(
+        authority_reason in item.get("reason_codes", []) for item in blockers
+    ):
+        add_unsafe("runtime_authority", authority_reason)
+
     context = get_writable_work_context_by_session(authority.session_id)
-    if reason_code is None and context is not None:
-        snapshot = get_session_workspace_retirement_snapshot(str(context["id"]))
-        snapshot_reason = snapshot.get("reason_code") if snapshot is not None else None
-        if snapshot_reason not in {None, "WORKSPACE_ALREADY_RETIRED"}:
-            reason_code = str(snapshot_reason)
+    if context is not None and context.get("state") not in {"admitted", "retiring", "retired"}:
+        add_unsafe("workspace_authority", "WORKSPACE_STATE_NOT_RETIRABLE")
+
+    unsafe_blockers = [item for item in blockers if item["disposition"] == "unsafe"]
+    cancellable_blockers = [item for item in blockers if item["disposition"] == "cancellable"]
 
     modified_files = 0
     untracked_files = 0
-    if reason_code is None:
+    if not unsafe_blockers:
         from cli_agent_orchestrator.services.managed_worktree_service import (
             managed_worktree_status,
         )
@@ -264,18 +308,64 @@ def _session_deletion_preflight(authority: SessionAuthority) -> Dict[str, object
                 continue
             worktree = managed_worktree_status(terminal)
             if not worktree.get("safe"):
-                reason_code = str(worktree.get("reason_code") or "MANAGED_WORKTREE_UNVERIFIED")
+                add_unsafe(
+                    "workspace_authority",
+                    str(worktree.get("reason_code") or "MANAGED_WORKTREE_UNVERIFIED"),
+                )
                 break
             modified_files += int(worktree.get("modified_files") or 0)
             untracked_files += int(worktree.get("untracked_files") or 0)
+    unsafe_blockers = [item for item in blockers if item["disposition"] == "unsafe"]
+    cancellable_blockers = [item for item in blockers if item["disposition"] == "cancellable"]
+    eligible = not unsafe_blockers and not cancellable_blockers
+    cancellable = not unsafe_blockers and bool(cancellable_blockers)
+    reason_codes = sorted(
+        {str(reason) for item in blockers for reason in item.get("reason_codes", [])}
+    )
+    if authority_reason is not None:
+        reason_code = authority_reason
+    elif unsafe_blockers:
+        reason_code = str(unsafe_blockers[0]["reason_codes"][0])
+    elif cancellable_blockers:
+        if "OWNER_GATE" in reason_codes:
+            reason_code = "OWNER_GATE"
+        elif "WORKFLOW_OPEN" in reason_codes:
+            reason_code = "WORKFLOW_OPEN"
+        else:
+            reason_code = "QUEUED_WORK"
+    else:
+        reason_code = None
+
+    from cli_agent_orchestrator.services.interaction_read_model_service import (
+        list_session_current_queue_counts,
+    )
+
+    current_queue_count = list_session_current_queue_counts([authority.session_id]).get(
+        authority.session_id, 0
+    )
     dirty = modified_files > 0 or untracked_files > 0
     return {
-        "eligible": reason_code is None,
+        "eligible": eligible,
+        "cancellable": cancellable,
+        "requires_cancellation_confirmation": cancellable,
+        "plan_token": plan.get("plan_token") if cancellable else None,
+        "blockers": blockers,
+        "cancellable_count": sum(int(item["count"]) for item in cancellable_blockers),
+        "unsafe_count": sum(int(item["count"]) for item in unsafe_blockers),
+        "plan_limit": int(plan.get("plan_limit") or 500),
+        "reason_codes": reason_codes,
         "already_deleted": False,
-        "requires_dirty_confirmation": reason_code is None and dirty,
+        "requires_dirty_confirmation": (eligible or cancellable) and dirty,
         "modified_files": modified_files,
         "untracked_files": untracked_files,
         "reason_code": reason_code,
+        "current_queue_count": int(current_queue_count),
+        "cancellation_plan": {
+            "count": sum(int(item["count"]) for item in cancellable_blockers),
+            "categories": cancellable_blockers,
+        },
+        "unsafe_blockers": unsafe_blockers,
+        "cancellable_blockers": cancellable_blockers,
     }
 
 
@@ -289,6 +379,8 @@ def delete_session(
     registry: PluginRegistry | None = None,
     *,
     confirm_dirty_workspace: bool = False,
+    cancel_unresolved_work: bool = False,
+    cancellation_plan_token: str | None = None,
 ) -> Dict:
     """Delete session and cleanup.
 
@@ -308,19 +400,56 @@ def delete_session(
             terminals = authority.terminals
             preflight = _session_deletion_preflight(authority)
             if not preflight["eligible"]:
-                reason = str(preflight["reason_code"])
-                messages = {
-                    "SESSION_RECOVERY_EVIDENCE_PROTECTED": (
-                        "This session contains recovery-takeover evidence and must be retained"
-                    ),
-                    "SESSION_RUNTIME_ACTIVE": (
-                        "Every agent must be durably exited before deleting this session"
-                    ),
-                }
-                raise SessionLifecycleError(
-                    reason,
-                    messages.get(reason, "Session authority is still active; deletion is blocked"),
-                )
+                if cancel_unresolved_work:
+                    if (
+                        not preflight.get("cancellable")
+                        or not cancellation_plan_token
+                        or cancellation_plan_token != preflight.get("plan_token")
+                    ):
+                        raise SessionLifecycleError(
+                            "SESSION_DELETE_PLAN_CHANGED",
+                            "Session deletion authority changed; inspect the current blockers and confirm again",
+                        )
+                    cancellation = cancel_session_work_for_deletion(
+                        authority.session_id,
+                        expected_plan_token=cancellation_plan_token,
+                        expected_terminal_ids=[terminal["id"] for terminal in terminals],
+                    )
+                    if not cancellation.get("cancelled"):
+                        raise SessionLifecycleError(
+                            str(
+                                cancellation.get("reason_code")
+                                or "SESSION_DELETE_CANCELLATION_FAILED"
+                            ),
+                            "Session-owned work could not be cancelled safely; inspect the current blockers",
+                        )
+                    preflight = _session_deletion_preflight(authority)
+                    if not preflight["eligible"]:
+                        raise SessionLifecycleError(
+                            str(preflight.get("reason_code") or "SESSION_DELETE_AUTHORITY_UNSAFE"),
+                            "Cancellation completed only in part; the Session remains protected",
+                        )
+                else:
+                    reason = str(preflight["reason_code"])
+                    if preflight.get("cancellable"):
+                        raise SessionLifecycleError(
+                            "SESSION_CANCELLATION_CONFIRMATION_REQUIRED",
+                            "This Session has cancellable unfinished work; explicit cancellation confirmation is required",
+                        )
+                    messages = {
+                        "SESSION_RECOVERY_EVIDENCE_PROTECTED": (
+                            "This session contains recovery-takeover evidence and must be retained"
+                        ),
+                        "SESSION_RUNTIME_ACTIVE": (
+                            "Every agent must be durably exited before deleting this session"
+                        ),
+                    }
+                    raise SessionLifecycleError(
+                        reason,
+                        messages.get(
+                            reason, "Session authority is still active; deletion is blocked"
+                        ),
+                    )
             if preflight["requires_dirty_confirmation"] and not confirm_dirty_workspace:
                 raise SessionLifecycleError(
                     "SESSION_DIRTY_CONFIRMATION_REQUIRED",

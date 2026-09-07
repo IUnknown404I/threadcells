@@ -174,6 +174,23 @@ class SessionDeletionReceiptModel(Base):
     deleted_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
+class SessionDeletionCancellationAuditModel(Base):
+    """Append-only evidence for work cancelled by an operator Session deletion."""
+
+    __tablename__ = "session_deletion_cancellation_audit"
+    __table_args__ = (UniqueConstraint("event_key", name="uq_session_delete_cancel_event"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_key = Column(String, nullable=False)
+    session_id = Column(String, nullable=False, index=True)
+    item_kind = Column(String, nullable=False)
+    item_id = Column(String, nullable=False)
+    previous_state = Column(String, nullable=False)
+    final_state = Column(String, nullable=False)
+    reason_code = Column(String, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
 class TerminalDeletionReceiptModel(Base):
     """Durable idempotency receipt for one retired terminal identity."""
 
@@ -3549,6 +3566,341 @@ _WORKSPACE_RETIREMENT_ACTIVE_ASSIGNMENT_STATES = (
 )
 
 _WORKSPACE_RETIREMENT_TERMINAL_WORKFLOW_STATES = ("terminal", "cancelled")
+_SESSION_DELETION_PLAN_LIMIT = 500
+
+
+def _session_unresolved_work_plan_in_transaction(
+    db: Any,
+    *,
+    session_id: str,
+    terminals: Sequence[TerminalModel],
+) -> Dict[str, Any]:
+    """Classify one bounded, exact Session-owned deletion cancellation plan.
+
+    This is the queue/authority half of both workspace retirement and Session
+    deletion.  It deliberately treats claimed/indeterminate effects and every
+    runtime/writer/recovery lease as unsafe even when workflow state is
+    terminal.  Historical received, superseded, completed, and acknowledged
+    rows are absent by construction.
+    """
+    terminal_scope_overflow = len(terminals) > _SESSION_DELETION_PLAN_LIMIT
+    terminal_ids = [str(terminal.id) for terminal in terminals]
+    terminal_id_set = set(terminal_ids)
+    cancellable_items: list[dict[str, str]] = []
+    unsafe_items: list[dict[str, str]] = []
+    category_counts: dict[tuple[str, str], dict[str, Any]] = {}
+    overflow = terminal_scope_overflow
+
+    def record(
+        disposition: str,
+        category: str,
+        reason_code: str,
+        item_kind: str,
+        item_id: Any,
+        state: Any,
+    ) -> None:
+        target = cancellable_items if disposition == "cancellable" else unsafe_items
+        target.append(
+            {
+                "item_kind": item_kind,
+                "item_id": str(item_id),
+                "state": str(state),
+                "category": category,
+                "reason_code": reason_code,
+            }
+        )
+        key = (disposition, category)
+        summary = category_counts.setdefault(
+            key,
+            {
+                "category": category,
+                "count": 0,
+                "disposition": disposition,
+                "reason_codes": [],
+            },
+        )
+        summary["count"] += 1
+        if reason_code not in summary["reason_codes"]:
+            summary["reason_codes"].append(reason_code)
+
+    def bounded(query: Any) -> list[Any]:
+        nonlocal overflow
+        rows = cast(list[Any], query.limit(_SESSION_DELETION_PLAN_LIMIT + 1).all())
+        if len(rows) > _SESSION_DELETION_PLAN_LIMIT:
+            overflow = True
+            return rows[:_SESSION_DELETION_PLAN_LIMIT]
+        return rows
+
+    def finish() -> Dict[str, Any]:
+        nonlocal overflow
+        if len(cancellable_items) + len(unsafe_items) > _SESSION_DELETION_PLAN_LIMIT:
+            overflow = True
+        if overflow and not any(item["item_kind"] == "plan" for item in unsafe_items):
+            record(
+                "unsafe",
+                "plan_limit",
+                "CANCELLATION_PLAN_TOO_LARGE",
+                "plan",
+                session_id,
+                "overflow",
+            )
+
+        fingerprint_document = {
+            "version": 1,
+            "session_id": session_id,
+            "cancellable": sorted(
+                (
+                    item["item_kind"],
+                    item["item_id"],
+                    item["state"],
+                    item["category"],
+                    item["reason_code"],
+                )
+                for item in cancellable_items
+            ),
+            "unsafe": sorted(
+                (item["item_kind"], item["item_id"], item["state"], item["reason_code"])
+                for item in unsafe_items
+            ),
+        }
+        plan_token = hashlib.sha256(
+            json.dumps(fingerprint_document, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        summaries = sorted(
+            category_counts.values(),
+            key=lambda item: (item["disposition"], item["category"]),
+        )
+        return {
+            "eligible": not cancellable_items and not unsafe_items,
+            "cancellable": bool(cancellable_items) and not unsafe_items,
+            "requires_cancellation_confirmation": bool(cancellable_items) and not unsafe_items,
+            "plan_token": plan_token if cancellable_items and not unsafe_items else None,
+            "blockers": summaries,
+            "cancellable_count": len(cancellable_items),
+            "unsafe_count": len(unsafe_items),
+            "plan_limit": _SESSION_DELETION_PLAN_LIMIT,
+            "reason_codes": sorted(
+                {item["reason_code"] for item in unsafe_items + cancellable_items}
+            ),
+            "_cancellable_items": cancellable_items,
+            "_unsafe_items": unsafe_items,
+        }
+
+    if terminal_scope_overflow:
+        return finish()
+
+    for terminal in terminals:
+        lifecycle = str(terminal.runtime_lifecycle or "unknown")
+        if lifecycle != "exited" or terminal.runtime_operation_kind is not None:
+            if lifecycle == "recovery_fenced":
+                category = "recovery_authority"
+                reason = "SESSION_RECOVERY_EVIDENCE_PROTECTED"
+            elif lifecycle == "recovery_required":
+                category = "recovery_authority"
+                reason = "RECOVERY_RECONCILIATION_REQUIRED"
+            else:
+                category = "runtime_authority"
+                reason = (
+                    "RUNTIME_DEATH_UNCONFIRMED"
+                    if lifecycle != "exited"
+                    else "RUNTIME_RECOVERY_OPERATION_ACTIVE"
+                )
+            record(
+                "unsafe",
+                category,
+                reason,
+                "terminal",
+                terminal.id,
+                terminal.runtime_operation_kind or lifecycle,
+            )
+
+    if terminal_ids:
+        workflows = bounded(
+            db.query(WorkflowModel)
+            .filter(
+                WorkflowModel.root_terminal_id.in_(terminal_ids),
+                WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+            )
+            .order_by(WorkflowModel.id.asc())
+        )
+        for workflow in workflows:
+            record(
+                "cancellable",
+                "unfinished_workflows",
+                "OWNER_GATE" if workflow.status == WORKFLOW_OWNER_GATE else "WORKFLOW_OPEN",
+                "workflow",
+                workflow.id,
+                workflow.status,
+            )
+
+        receipt = aliased(WorkflowTurnReceiptModel)
+        turns = bounded(
+            db.query(WorkflowTurnModel)
+            .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+            .outerjoin(
+                receipt,
+                and_(
+                    receipt.workflow_turn_id == WorkflowTurnModel.id,
+                    receipt.receiver_terminal_id == WorkflowModel.root_terminal_id,
+                ),
+            )
+            .filter(
+                WorkflowModel.root_terminal_id.in_(terminal_ids),
+                WorkflowModel.status.notin_(_WORKSPACE_RETIREMENT_TERMINAL_WORKFLOW_STATES),
+                WorkflowTurnModel.superseded_by_turn_id.is_(None),
+                or_(
+                    WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+                    and_(WorkflowTurnModel.state == TURN_SENT, receipt.id.is_(None)),
+                ),
+            )
+            .order_by(WorkflowTurnModel.id.asc())
+        )
+        for turn in turns:
+            record(
+                "cancellable",
+                "queued_work",
+                "UNADMITTED_WORKFLOW_TURN",
+                "workflow_turn",
+                turn.id,
+                turn.state,
+            )
+
+        inbox_rows = bounded(
+            db.query(InboxModel)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                or_(
+                    InboxModel.sender_id.in_(terminal_ids),
+                    InboxModel.receiver_id.in_(terminal_ids),
+                ),
+            )
+            .order_by(InboxModel.id.asc())
+        )
+        for inbox in inbox_rows:
+            owned = inbox.receiver_id in terminal_id_set and (
+                inbox.sender_id == "ui" or inbox.sender_id in terminal_id_set
+            )
+            record(
+                "cancellable" if owned else "unsafe",
+                "pending_delivery" if owned else "external_delivery",
+                "PENDING_SESSION_DELIVERY" if owned else "CROSS_SESSION_DELIVERY",
+                "inbox",
+                inbox.id,
+                inbox.status,
+            )
+
+        assignments = bounded(
+            db.query(ChildAssignmentModel)
+            .filter(
+                or_(
+                    ChildAssignmentModel.parent_terminal_id.in_(terminal_ids),
+                    ChildAssignmentModel.child_terminal_id.in_(terminal_ids),
+                ),
+                ChildAssignmentModel.status.in_(_WORKSPACE_RETIREMENT_ACTIVE_ASSIGNMENT_STATES),
+                ChildAssignmentModel.review_superseded_at.is_(None),
+            )
+            .order_by(ChildAssignmentModel.id.asc())
+        )
+        for assignment in assignments:
+            owned = (
+                assignment.parent_terminal_id in terminal_id_set
+                and assignment.child_terminal_id in terminal_id_set
+            )
+            direct_claimed = (
+                assignment.status == ChildAssignmentStatus.HANDOFF_DIRECT_RESULT_CLAIMED.value
+            )
+            safe = owned and not direct_claimed
+            reason = (
+                "PENDING_CHILD_ASSIGNMENT"
+                if safe
+                else (
+                    "DIRECT_RESULT_ALREADY_CLAIMED"
+                    if direct_claimed
+                    else "CROSS_SESSION_ASSIGNMENT"
+                )
+            )
+            record(
+                "cancellable" if safe else "unsafe",
+                "child_assignments" if safe else "external_assignments",
+                reason,
+                "child_assignment",
+                assignment.id,
+                assignment.status,
+            )
+
+        effects = bounded(
+            db.query(WorkflowEffectModel)
+            .join(WorkflowModel, WorkflowModel.id == WorkflowEffectModel.workflow_id)
+            .filter(
+                WorkflowModel.root_terminal_id.in_(terminal_ids),
+                WorkflowEffectModel.state.in_(("claimed", "indeterminate")),
+            )
+            .order_by(WorkflowEffectModel.id.asc())
+        )
+        for effect in effects:
+            record(
+                "unsafe",
+                "workflow_effects",
+                "INDETERMINATE_EFFECT" if effect.state == "indeterminate" else "CLAIMED_EFFECT",
+                "workflow_effect",
+                effect.id,
+                effect.state,
+            )
+
+        for lease in bounded(
+            db.query(ProviderExecutionLeaseModel)
+            .filter(ProviderExecutionLeaseModel.terminal_id.in_(terminal_ids))
+            .order_by(ProviderExecutionLeaseModel.terminal_id.asc())
+        ):
+            record(
+                "unsafe",
+                "provider_execution",
+                "PROVIDER_EXECUTION_ACTIVE",
+                "provider_execution",
+                lease.terminal_id,
+                "active",
+            )
+
+        for lease in bounded(
+            db.query(WorktreeWriterLeaseModel)
+            .filter(WorktreeWriterLeaseModel.terminal_id.in_(terminal_ids))
+            .order_by(WorktreeWriterLeaseModel.terminal_id.asc())
+        ):
+            record(
+                "unsafe",
+                "writer_authority",
+                "WRITER_LEASE_ACTIVE",
+                "writer_lease",
+                lease.terminal_id,
+                "active",
+            )
+
+        recoveries = bounded(
+            db.query(RecoveryTakeoverModel)
+            .filter(
+                or_(
+                    RecoveryTakeoverModel.old_terminal_id.in_(terminal_ids),
+                    RecoveryTakeoverModel.new_terminal_id.in_(terminal_ids),
+                ),
+                RecoveryTakeoverModel.state.in_(("claimed", "fenced", "dispatching", "admitted")),
+            )
+            .order_by(RecoveryTakeoverModel.id.asc())
+        )
+        for recovery in recoveries:
+            record(
+                "unsafe",
+                "recovery_authority",
+                "RECOVERY_TAKEOVER_ACTIVE",
+                "recovery_takeover",
+                recovery.id,
+                recovery.state,
+            )
+
+    return finish()
+
+
+def _public_session_unresolved_work_plan(plan: Mapping[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in plan.items() if not key.startswith("_")}
 
 
 def _session_workspace_snapshot_in_transaction(
@@ -3559,9 +3911,15 @@ def _session_workspace_snapshot_in_transaction(
         db.query(TerminalModel)
         .filter(TerminalModel.session_id == context.session_id)
         .order_by(TerminalModel.creation_order.asc(), TerminalModel.id.asc())
+        .limit(_SESSION_DELETION_PLAN_LIMIT + 1)
         .all()
     )
     terminal_ids = [str(terminal.id) for terminal in terminals]
+    unresolved_plan = _session_unresolved_work_plan_in_transaction(
+        db,
+        session_id=str(context.session_id),
+        terminals=terminals,
+    )
     reason_code: str | None = None
     if context.state == "retired":
         reason_code = "WORKSPACE_ALREADY_RETIRED"
@@ -3579,104 +3937,39 @@ def _session_workspace_snapshot_in_transaction(
     elif any(terminal.runtime_operation_kind is not None for terminal in terminals):
         reason_code = "RECOVERY_PROTECTED"
     elif terminal_ids:
-        owner_gate = (
-            db.query(WorkflowModel.id)
-            .filter(
-                WorkflowModel.root_terminal_id.in_(terminal_ids),
-                WorkflowModel.status == "owner_gate",
-            )
-            .first()
-        )
-        open_workflow = (
-            db.query(WorkflowModel.id)
-            .filter(
-                WorkflowModel.root_terminal_id.in_(terminal_ids),
-                WorkflowModel.status == "open",
-            )
-            .first()
-        )
-        queued_turn = (
-            db.query(WorkflowTurnModel.id)
-            .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
-            .filter(
-                WorkflowModel.root_terminal_id.in_(terminal_ids),
-                # Turn rows are immutable delivery history. Once their owning
-                # workflow is terminal they cannot be claimed or transported,
-                # even when an old row still says queued/claimed/sent.
-                WorkflowModel.status.notin_(_WORKSPACE_RETIREMENT_TERMINAL_WORKFLOW_STATES),
-                WorkflowTurnModel.state.in_(("queued", "claimed", "sent")),
-                WorkflowTurnModel.superseded_by_turn_id.is_(None),
-            )
-            .first()
-        )
-        pending_inbox = (
-            db.query(InboxModel.id)
-            .filter(
-                InboxModel.status == MessageStatus.PENDING.value,
-                or_(
-                    InboxModel.sender_id.in_(terminal_ids), InboxModel.receiver_id.in_(terminal_ids)
-                ),
-            )
-            .first()
-        )
-        active_assignment = (
-            db.query(ChildAssignmentModel.id)
-            .filter(
-                or_(
-                    ChildAssignmentModel.parent_terminal_id.in_(terminal_ids),
-                    ChildAssignmentModel.child_terminal_id.in_(terminal_ids),
-                ),
-                ChildAssignmentModel.status.in_(_WORKSPACE_RETIREMENT_ACTIVE_ASSIGNMENT_STATES),
-                ChildAssignmentModel.review_superseded_at.is_(None),
-            )
-            .first()
-        )
-        active_effect = (
-            db.query(WorkflowEffectModel.id)
-            .join(WorkflowModel, WorkflowModel.id == WorkflowEffectModel.workflow_id)
-            .filter(
-                WorkflowModel.root_terminal_id.in_(terminal_ids),
-                WorkflowEffectModel.state.in_(("claimed", "indeterminate")),
-            )
-            .first()
-        )
-        provider_execution = (
-            db.query(ProviderExecutionLeaseModel.terminal_id)
-            .filter(ProviderExecutionLeaseModel.terminal_id.in_(terminal_ids))
-            .first()
-        )
-        writer_lease = (
-            db.query(WorktreeWriterLeaseModel.terminal_id)
-            .filter(WorktreeWriterLeaseModel.terminal_id.in_(terminal_ids))
-            .first()
-        )
-        recovery = (
-            db.query(RecoveryTakeoverModel.id)
-            .filter(
-                or_(
-                    RecoveryTakeoverModel.old_terminal_id.in_(terminal_ids),
-                    RecoveryTakeoverModel.new_terminal_id.in_(terminal_ids),
-                ),
-                RecoveryTakeoverModel.state.in_(("claimed", "fenced", "dispatching", "admitted")),
-            )
-            .first()
-        )
-        if owner_gate is not None:
+        categories = {
+            str(item["category"]): item
+            for item in unresolved_plan["blockers"]
+            if int(item["count"]) > 0
+        }
+        workflow_reasons = {
+            str(reason)
+            for item in unresolved_plan["blockers"]
+            if item["category"] == "unfinished_workflows"
+            for reason in item["reason_codes"]
+        }
+        if "OWNER_GATE" in workflow_reasons:
             reason_code = "OWNER_GATE"
-        elif open_workflow is not None:
+        elif "WORKFLOW_OPEN" in workflow_reasons:
             reason_code = "WORKFLOW_OPEN"
-        elif (
-            queued_turn is not None
-            or pending_inbox is not None
-            or active_assignment is not None
-            or active_effect is not None
+        elif any(
+            category in categories
+            for category in (
+                "queued_work",
+                "pending_delivery",
+                "external_delivery",
+                "child_assignments",
+                "external_assignments",
+                "workflow_effects",
+                "plan_limit",
+            )
         ):
             reason_code = "QUEUED_WORK"
-        elif provider_execution is not None:
+        elif "provider_execution" in categories:
             reason_code = "PROVIDER_EXECUTION_ACTIVE"
-        elif writer_lease is not None:
+        elif "writer_authority" in categories:
             reason_code = "WRITER_LEASE_ACTIVE"
-        elif recovery is not None:
+        elif "recovery_authority" in categories:
             reason_code = "RECOVERY_PROTECTED"
 
     terminal_documents = [
@@ -3713,12 +4006,14 @@ def _session_workspace_snapshot_in_transaction(
         "base_revision": context.base_revision,
         "writer_authority_generation": context.writer_authority_generation,
         "reason_code": reason_code,
+        "unresolved_plan_token": unresolved_plan["plan_token"],
         "terminals": terminal_documents,
     }
     return {
         "context": _work_context_dict(context),
         "terminals": terminal_documents,
         "reason_code": reason_code,
+        "unresolved_work": _public_session_unresolved_work_plan(unresolved_plan),
         "authority_fingerprint": hashlib.sha256(
             json.dumps(fingerprint_document, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest(),
@@ -3751,6 +4046,300 @@ def get_session_workspace_retirement_snapshot(context_id: str) -> Optional[Dict[
         return (
             _session_workspace_snapshot_in_transaction(db, context) if context is not None else None
         )
+
+
+def _session_identity_changed_plan() -> Dict[str, Any]:
+    blocker = {
+        "category": "session_identity",
+        "count": 1,
+        "disposition": "unsafe",
+        "reason_codes": ["SESSION_IDENTITY_CHANGED"],
+    }
+    return {
+        "eligible": False,
+        "cancellable": False,
+        "requires_cancellation_confirmation": False,
+        "plan_token": None,
+        "blockers": [blocker],
+        "cancellable_count": 0,
+        "unsafe_count": 1,
+        "plan_limit": _SESSION_DELETION_PLAN_LIMIT,
+        "reason_codes": ["SESSION_IDENTITY_CHANGED"],
+    }
+
+
+def _session_plan_terminals(
+    db: Any,
+    session_id: str,
+    expected_terminal_ids: Sequence[str] | None,
+) -> Optional[List[TerminalModel]]:
+    expected = list(dict.fromkeys(str(value) for value in expected_terminal_ids or () if value))
+    terminals = cast(
+        List[TerminalModel],
+        db.query(TerminalModel)
+        .filter(
+            or_(
+                TerminalModel.session_id == session_id,
+                and_(
+                    TerminalModel.session_id.is_(None),
+                    ("legacy:" + TerminalModel.tmux_session) == session_id,
+                ),
+            )
+        )
+        .order_by(TerminalModel.creation_order.asc(), TerminalModel.id.asc())
+        .limit(_SESSION_DELETION_PLAN_LIMIT + 1)
+        .all(),
+    )
+    if (
+        len(terminals) <= _SESSION_DELETION_PLAN_LIMIT
+        and expected
+        and {str(terminal.id) for terminal in terminals} != set(expected)
+    ):
+        return None
+    return terminals
+
+
+def get_session_unresolved_work_plan(
+    session_id: str,
+    *,
+    expected_terminal_ids: Sequence[str] | None = None,
+) -> Dict[str, Any]:
+    """Return a bounded public deletion plan for one stable Session lifetime."""
+    # Reuse the interaction projection's additive indexes so the shared
+    # unresolved-work predicates remain bounded on rolling-upgrade databases.
+    _ensure_terminal_ui_projection_schema()
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_workflow_schema()
+    _ensure_child_assignment_schema()
+    _ensure_provider_execution_schema()
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        terminals = _session_plan_terminals(db, session_id, expected_terminal_ids)
+        if terminals is None:
+            return _session_identity_changed_plan()
+        return _public_session_unresolved_work_plan(
+            _session_unresolved_work_plan_in_transaction(
+                db,
+                session_id=session_id,
+                terminals=terminals,
+            )
+        )
+
+
+def cancel_session_work_for_deletion(
+    session_id: str,
+    *,
+    expected_plan_token: str,
+    expected_terminal_ids: Sequence[str] | None = None,
+) -> Dict[str, Any]:
+    """Apply one exact safe deletion plan and retain append-only audit evidence."""
+    if not isinstance(expected_plan_token, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", expected_plan_token
+    ):
+        return {"cancelled": False, "reason_code": "SESSION_DELETE_INTENT_INVALID"}
+    _ensure_terminal_ui_projection_schema()
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_workflow_schema()
+    _ensure_child_assignment_schema()
+    _ensure_delegation_result_schema()
+    _ensure_provider_execution_schema()
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminals = _session_plan_terminals(db, session_id, expected_terminal_ids)
+        if terminals is None:
+            receipt = db.get(SessionDeletionReceiptModel, session_id)
+            db.rollback()
+            if receipt is not None:
+                return {"cancelled": True, "already_deleted": True, "residual": None}
+            return {"cancelled": False, "reason_code": "SESSION_IDENTITY_CHANGED"}
+        if not terminals:
+            receipt = db.get(SessionDeletionReceiptModel, session_id)
+            db.rollback()
+            if receipt is not None:
+                return {"cancelled": True, "already_deleted": True, "residual": None}
+            return {"cancelled": False, "reason_code": "SESSION_HISTORY_MISSING"}
+        plan = _session_unresolved_work_plan_in_transaction(
+            db,
+            session_id=session_id,
+            terminals=terminals,
+        )
+        if plan["eligible"]:
+            db.rollback()
+            return {
+                "cancelled": True,
+                "already_cancelled": True,
+                "residual": _public_session_unresolved_work_plan(plan),
+            }
+        if plan["plan_token"] != expected_plan_token:
+            db.rollback()
+            return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
+        if not plan["cancellable"] or plan["_unsafe_items"]:
+            db.rollback()
+            return {"cancelled": False, "reason_code": "SESSION_DELETE_AUTHORITY_UNSAFE"}
+
+        now = datetime.now()
+        items = list(plan["_cancellable_items"])
+
+        def ids(kind: str) -> list[Any]:
+            values = [item["item_id"] for item in items if item["item_kind"] == kind]
+            if kind in {"workflow", "workflow_turn", "inbox", "child_assignment"}:
+                return [int(value) for value in values]
+            return values
+
+        workflow_ids = ids("workflow")
+        turn_ids = ids("workflow_turn")
+        inbox_ids = ids("inbox")
+        assignment_ids = ids("child_assignment")
+
+        if turn_ids:
+            (
+                db.query(WorkflowTurnModel)
+                .filter(
+                    WorkflowTurnModel.id.in_(turn_ids),
+                    WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED, TURN_SENT)),
+                    WorkflowTurnModel.superseded_by_turn_id.is_(None),
+                )
+                .update(
+                    {
+                        WorkflowTurnModel.state: TURN_CANCELLED,
+                        WorkflowTurnModel.claim_token: None,
+                        WorkflowTurnModel.claim_expires_at: None,
+                        WorkflowTurnModel.updated_at: now,
+                    },
+                    synchronize_session=False,
+                )
+            )
+        if inbox_ids:
+            (
+                db.query(InboxModel)
+                .filter(
+                    InboxModel.id.in_(inbox_ids),
+                    InboxModel.status == MessageStatus.PENDING.value,
+                )
+                .update(
+                    {
+                        InboxModel.status: MessageStatus.SUPERSEDED.value,
+                        InboxModel.superseded_at: now,
+                    },
+                    synchronize_session=False,
+                )
+            )
+
+        terminal_ids = [str(terminal.id) for terminal in terminals]
+        transitioned_workflows = _cancel_protected_workflows_in_transaction(
+            db,
+            terminal_ids,
+            reason="operator deleted Session",
+        )
+
+        final_states = {
+            "workflow": WORKFLOW_CANCELLED,
+            "workflow_turn": TURN_CANCELLED,
+            "inbox": MessageStatus.SUPERSEDED.value,
+            "child_assignment": ChildAssignmentStatus.CANCELLED.value,
+        }
+        # The cancellation helper is intentionally broader only within the
+        # already-proven Session-owned set.  Assert the exact plan stayed
+        # actionable before recording success.
+        if set(transitioned_workflows) != set(workflow_ids):
+            db.rollback()
+            return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
+        if assignment_ids:
+            final_assignments = {
+                int(row.id): str(row.status)
+                for row in db.query(ChildAssignmentModel)
+                .filter(ChildAssignmentModel.id.in_(assignment_ids))
+                .all()
+            }
+            if any(
+                final_assignments.get(int(assignment_id)) != ChildAssignmentStatus.CANCELLED.value
+                for assignment_id in assignment_ids
+            ):
+                db.rollback()
+                return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
+
+        audit_items = [
+            (
+                item,
+                f"session-delete-cancel:{session_id}:" f"{item['item_kind']}:{item['item_id']}",
+            )
+            for item in items
+        ]
+        existing_event_keys = {
+            str(row[0])
+            for row in db.query(SessionDeletionCancellationAuditModel.event_key)
+            .filter(
+                SessionDeletionCancellationAuditModel.event_key.in_(
+                    [event_key for _item, event_key in audit_items]
+                )
+            )
+            .all()
+        }
+        for item, event_key in audit_items:
+            if event_key not in existing_event_keys:
+                db.add(
+                    SessionDeletionCancellationAuditModel(
+                        event_key=event_key,
+                        session_id=session_id,
+                        item_kind=item["item_kind"],
+                        item_id=item["item_id"],
+                        previous_state=item["state"],
+                        final_state=final_states[item["item_kind"]],
+                        reason_code="OPERATOR_SESSION_DELETION",
+                        created_at=now,
+                    )
+                )
+        db.flush()
+        residual = _session_unresolved_work_plan_in_transaction(
+            db,
+            session_id=session_id,
+            terminals=terminals,
+        )
+        if not residual["eligible"]:
+            db.rollback()
+            return {
+                "cancelled": False,
+                "reason_code": "SESSION_DELETE_CANCELLATION_INCOMPLETE",
+                "residual": _public_session_unresolved_work_plan(residual),
+            }
+        db.commit()
+        return {
+            "cancelled": True,
+            "already_cancelled": False,
+            "cancelled_count": len(items),
+            "residual": _public_session_unresolved_work_plan(residual),
+        }
+
+
+def list_session_deletion_cancellation_audit(
+    session_id: str,
+    *,
+    limit: int = _SESSION_DELETION_PLAN_LIMIT,
+) -> List[Dict[str, Any]]:
+    """Return durable cancellation evidence for diagnostics and regression tests."""
+    if isinstance(limit, bool) or not 1 <= limit <= _SESSION_DELETION_PLAN_LIMIT:
+        raise ValueError(f"limit must be between 1 and {_SESSION_DELETION_PLAN_LIMIT}")
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        rows = (
+            db.query(SessionDeletionCancellationAuditModel)
+            .filter(SessionDeletionCancellationAuditModel.session_id == session_id)
+            .order_by(SessionDeletionCancellationAuditModel.id.asc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "item_kind": row.item_kind,
+                "item_id": row.item_id,
+                "previous_state": row.previous_state,
+                "final_state": row.final_state,
+                "reason_code": row.reason_code,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
 
 
 def claim_session_workspace_retirement(
@@ -4356,6 +4945,7 @@ def _session_terminal_dict(terminal: TerminalModel) -> Dict[str, Any]:
 def _ensure_session_deletion_receipt_schema() -> None:
     with _session_deletion_receipt_schema_lock:
         SessionDeletionReceiptModel.__table__.create(bind=engine, checkfirst=True)
+        SessionDeletionCancellationAuditModel.__table__.create(bind=engine, checkfirst=True)
         with engine.begin() as connection:
             columns = {
                 row[1]
@@ -4869,8 +5459,16 @@ def _ensure_terminal_ui_projection_schema() -> None:
                 "ON workflows (root_terminal_id)"
             )
             connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_workflows_root_status_id "
+                "ON workflows (root_terminal_id, status, id)"
+            )
+            connection.exec_driver_sql(
                 "CREATE INDEX IF NOT EXISTS ix_workflow_turns_workflow_state "
                 "ON workflow_turns (workflow_id, state)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_workflow_turns_workflow_state_superseded "
+                "ON workflow_turns (workflow_id, state, superseded_by_turn_id, id)"
             )
             connection.exec_driver_sql(
                 "CREATE INDEX IF NOT EXISTS ix_workflow_turns_workflow_created "

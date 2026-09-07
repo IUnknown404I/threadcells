@@ -218,6 +218,25 @@ class TestSessionAuthority:
 
 
 class TestDeleteSession:
+    @pytest.fixture(autouse=True)
+    def _stub_empty_unresolved_work_plan(self):
+        """Keep service-unit deletion tests independent from ambient durable state."""
+        with patch(
+            "cli_agent_orchestrator.services.session_service.get_session_unresolved_work_plan",
+            return_value={
+                "eligible": True,
+                "cancellable": False,
+                "requires_cancellation_confirmation": False,
+                "plan_token": None,
+                "blockers": [],
+                "cancellable_count": 0,
+                "unsafe_count": 0,
+                "plan_limit": 500,
+                "reason_codes": [],
+            },
+        ):
+            yield
+
     def _patch_common(self, durable):
         return (
             patch(
@@ -325,6 +344,104 @@ class TestDeleteSession:
             expected_terminal_ids=["terminal1", "terminal2"],
             retained_resources=[],
         )
+
+    @patch("cli_agent_orchestrator.services.session_service.retire_exited_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_explicit_plan_cancels_session_owned_work_then_rechecks_and_deletes(
+        self, mock_tmux, retire
+    ):
+        mock_tmux.session_exists.return_value = False
+        retire.return_value = True
+        contexts = self._patch_common(_durable_session(lifecycle="exited"))
+        cancellable = {
+            "eligible": False,
+            "cancellable": True,
+            "plan_token": "a" * 64,
+            "requires_dirty_confirmation": False,
+            "reason_code": "QUEUED_WORK",
+        }
+        eligible = {
+            "eligible": True,
+            "cancellable": False,
+            "plan_token": None,
+            "requires_dirty_confirmation": False,
+            "reason_code": None,
+        }
+        with (
+            contexts[0],
+            contexts[1],
+            contexts[2],
+            contexts[3],
+            contexts[4],
+            contexts[5],
+            contexts[6] as delete,
+            contexts[7],
+            patch(
+                "cli_agent_orchestrator.services.session_service._session_deletion_preflight",
+                side_effect=[cancellable, eligible],
+            ) as preflight,
+            patch(
+                "cli_agent_orchestrator.services.session_service.cancel_session_work_for_deletion",
+                return_value={
+                    "cancelled": True,
+                    "cancelled_count": 2,
+                    "residual": {"eligible": True},
+                },
+            ) as cancel_work,
+        ):
+            result = delete_session(
+                "session-lifetime-1",
+                cancel_unresolved_work=True,
+                cancellation_plan_token="a" * 64,
+            )
+
+        assert result["deleted"] == ["cao-test"]
+        assert preflight.call_count == 2
+        cancel_work.assert_called_once_with(
+            "session-lifetime-1",
+            expected_plan_token="a" * 64,
+            expected_terminal_ids=["terminal1", "terminal2"],
+        )
+        delete.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_stale_or_unsafe_cancellation_intent_mutates_nothing(self, mock_tmux):
+        mock_tmux.session_exists.return_value = False
+        contexts = self._patch_common(_durable_session(lifecycle="exited"))
+        with (
+            contexts[0],
+            contexts[1] as prepare,
+            contexts[2],
+            contexts[3],
+            contexts[4],
+            contexts[5],
+            contexts[6] as delete,
+            contexts[7],
+            patch(
+                "cli_agent_orchestrator.services.session_service._session_deletion_preflight",
+                return_value={
+                    "eligible": False,
+                    "cancellable": False,
+                    "plan_token": None,
+                    "requires_dirty_confirmation": False,
+                    "reason_code": "INDETERMINATE_EFFECT",
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.cancel_session_work_for_deletion"
+            ) as cancel_work,
+        ):
+            with pytest.raises(SessionLifecycleError) as error:
+                delete_session(
+                    "session-lifetime-1",
+                    cancel_unresolved_work=True,
+                    cancellation_plan_token="b" * 64,
+                )
+
+        assert error.value.reason_code == "SESSION_DELETE_PLAN_CHANGED"
+        cancel_work.assert_not_called()
+        prepare.assert_not_called()
+        delete.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.session_service.retire_exited_terminal_runtime")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")

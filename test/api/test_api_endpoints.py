@@ -1534,7 +1534,11 @@ class TestDeleteSession:
         assert data["success"] is True
         assert data["deleted"] == ["test-session"]
         mock_svc.delete_session.assert_called_once_with(
-            "test-session", registry=ANY, confirm_dirty_workspace=False
+            "test-session",
+            registry=ANY,
+            confirm_dirty_workspace=False,
+            cancel_unresolved_work=False,
+            cancellation_plan_token=None,
         )
 
     def test_delete_session_forwards_explicit_dirty_confirmation(self, client):
@@ -1547,7 +1551,33 @@ class TestDeleteSession:
 
         assert response.status_code == 200
         mock_svc.delete_session.assert_called_once_with(
-            "test-session", registry=ANY, confirm_dirty_workspace=True
+            "test-session",
+            registry=ANY,
+            confirm_dirty_workspace=True,
+            cancel_unresolved_work=False,
+            cancellation_plan_token=None,
+        )
+
+    def test_delete_session_forwards_exact_cancellation_intent(self, client):
+        token = "a" * 64
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.delete_session.return_value = {"deleted": ["test-session"], "errors": []}
+
+            response = client.delete(
+                "/sessions/test-session",
+                params={
+                    "cancel_unresolved_work": True,
+                    "cancellation_plan_token": token,
+                },
+            )
+
+        assert response.status_code == 200
+        mock_svc.delete_session.assert_called_once_with(
+            "test-session",
+            registry=ANY,
+            confirm_dirty_workspace=False,
+            cancel_unresolved_work=True,
+            cancellation_plan_token=token,
         )
 
     def test_delete_session_not_found(self, client):

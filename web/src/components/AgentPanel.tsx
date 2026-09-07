@@ -20,6 +20,7 @@ import { RecoveryTakeoverAction } from './RecoveryTakeoverAction'
 import { WorkflowRecoveryNotice } from './WorkflowRecoveryNotice'
 import { useRecoveryTakeoverCapabilities } from '../recoveryCapabilities'
 import { InteractionHistoryDrawer } from './InteractionHistoryDrawer'
+import { SessionDeletionDialog } from './SessionDeletionDialog'
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })))
 
@@ -237,15 +238,23 @@ export function AgentPanel({
   }
 
   const handleDeleteSession = async () => {
-    if (!pendingDeleteSession || !deletePreflight?.eligible || deletingSessionRef.current) return
+    if (!pendingDeleteSession || !deletePreflight || deletingSessionRef.current) return
+    if (!deletePreflight.eligible && !deletePreflight.cancellable) return
     deletingSessionRef.current = true
     const id = pendingDeleteSession.id
     setDeletingSession(id)
     try {
-      await deleteSession(
+      const deleted = await deleteSession(
         pendingDeleteSession.id,
         deletePreflight.requires_dirty_confirmation,
+        deletePreflight.cancellable,
+        deletePreflight.plan_token,
       )
+      if (!deleted) {
+        const refreshed = await api.getSessionDeletionPreflight(pendingDeleteSession.id)
+        setDeletePreflight(refreshed)
+        return
+      }
       if (activeSession === id) setActiveSession(null)
       sessionFeed.reload()
       filteredAgentFeed.reload()
@@ -260,10 +269,6 @@ export function AgentPanel({
   const openDeleteSession = async (session: Session) => {
     try {
       const preflight = await api.getSessionDeletionPreflight(session.id)
-      if (!preflight.eligible) {
-        showSnackbar({ type: 'error', message: preflight.reason_code || t('store.deleteFailed') })
-        return
-      }
       setDeletePreflight(preflight)
       setPendingDeleteSession(session)
     } catch (reason: any) {
@@ -845,20 +850,11 @@ export function AgentPanel({
         onCancel={() => setPendingClose(null)}
       />
 
-      <ConfirmModal
+      <SessionDeletionDialog
         open={!!pendingDeleteSession}
-        title={t('agents.deleteSessionTitle')}
-        message={t(deletePreflight?.requires_dirty_confirmation ? 'agents.deleteSessionDirty' : 'agents.deleteSessionMessage')}
-        details={pendingDeleteSession ? [
-          { label: t('statistics.session'), value: sessionDisplayName(pendingDeleteSession.name) },
-          { label: t('agents.status'), value: t(sessionStatusTranslationKey(pendingDeleteSession.status)) },
-          ...(deletePreflight?.requires_dirty_confirmation ? [
-            { label: t('agents.modifiedFiles'), value: String(deletePreflight.modified_files) },
-            { label: t('agents.untrackedFiles'), value: String(deletePreflight.untracked_files) },
-          ] : []),
-        ] : []}
-        confirmLabel={t('agents.deleteSessionTitle')}
-        variant="danger"
+        sessionName={pendingDeleteSession ? sessionDisplayName(pendingDeleteSession.name) : ''}
+        statusLabel={pendingDeleteSession ? t(sessionStatusTranslationKey(pendingDeleteSession.status)) : ''}
+        preflight={deletePreflight}
         loading={!!deletingSession}
         onConfirm={handleDeleteSession}
         onCancel={() => { setPendingDeleteSession(null); setDeletePreflight(null) }}

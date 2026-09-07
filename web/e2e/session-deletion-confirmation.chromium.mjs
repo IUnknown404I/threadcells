@@ -44,6 +44,26 @@ const server = http.createServer((request, response) => {
   if (request.method === 'GET' && url.pathname === '/sessions') return json(response, sessions)
   if (request.method === 'GET' && url.pathname === '/agents/providers') return json(response, [])
   if (request.method === 'GET' && url.pathname === '/agents/profiles') return json(response, [])
+  if (request.method === 'GET' && url.pathname === `/sessions/${sessionId}/deletion-preflight`) return json(response, {
+    eligible: true,
+    cancellable: false,
+    already_deleted: false,
+    requires_cancellation_confirmation: false,
+    requires_dirty_confirmation: false,
+    modified_files: 0,
+    untracked_files: 0,
+    reason_code: null,
+    reason_codes: [],
+    plan_token: null,
+    current_queue_count: 0,
+    cancellable_count: 0,
+    unsafe_count: 0,
+    plan_limit: 500,
+    blockers: [],
+    cancellable_blockers: [],
+    unsafe_blockers: [],
+    cancellation_plan: { count: 0, categories: [] },
+  })
   if (request.method === 'DELETE' && url.pathname === `/sessions/${sessionId}`) {
     deleteRequestCount += 1
     releaseDelete = () => {
@@ -67,16 +87,26 @@ try {
   await page.goto(origin)
   await page.getByRole('link', { name: 'Agents' }).click()
 
-  await page.getByTitle('Delete session').click()
-  await page.getByRole('heading', { name: 'Delete Session' }).waitFor({ state: 'visible' })
-  assert.equal(deleteRequestCount, 0, 'opening confirmation must not delete')
-  await page.getByRole('button', { name: 'Cancel' }).click()
-  assert.equal(deleteRequestCount, 0, 'cancelling confirmation must not delete')
+  for (const width of [1440, 834, 390]) {
+    await page.setViewportSize({ width, height: width === 390 ? 844 : 960 })
+    const action = page.getByTitle('Delete session')
+    await action.click()
+    const dialog = page.getByRole('dialog', { name: 'Delete Session?' })
+    await dialog.waitFor({ state: 'visible' })
+    const [dialogBox, viewport] = await Promise.all([dialog.boundingBox(), page.viewportSize()])
+    assert(dialogBox && viewport)
+    assert(dialogBox.x >= 0 && dialogBox.x + dialogBox.width <= viewport.width + 1, `dialog escaped viewport at ${width}px`)
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth), 0, `horizontal overflow at ${width}px`)
+    assert.equal(deleteRequestCount, 0, 'opening confirmation must not delete')
+    await page.getByRole('button', { name: 'Cancel' }).click()
+    assert.equal(await action.evaluate(node => document.activeElement === node), true, 'cancelling must restore focus')
+    assert.equal(deleteRequestCount, 0, 'cancelling confirmation must not delete')
+  }
 
   await page.getByTitle('Delete session').click()
   const confirm = page.getByRole('button', { name: 'Delete Session', exact: true })
   await confirm.click()
-  const closing = page.getByRole('button', { name: 'Closing...', exact: true })
+  const closing = page.getByRole('button', { name: 'Working…', exact: true })
   await closing.waitFor()
   assert.equal(deleteRequestCount, 1, 'confirmation must issue exactly one delete request')
   assert.equal(await closing.isDisabled(), true, 'pending delete must disable duplicate confirmation')

@@ -122,6 +122,10 @@ WITH interaction_terminals AS MATERIALIZED (
            inbox.sender_id AS inbox_sender_id, inbox.kind AS inbox_kind,
            inbox.status AS inbox_status,
            CASE WHEN receipt.id IS NOT NULL THEN 1 ELSE 0 END AS receipt_exists,
+           CASE WHEN wt.state IN ('queued', 'claimed')
+                  OR (wt.state = 'sent' AND receipt.id IS NULL)
+                THEN 1 ELSE 0 END AS transport_unresolved,
+           CASE WHEN w.active_turn_id = wt.id THEN 1 ELSE 0 END AS is_active_turn,
            CASE WHEN lease.workflow_turn_id IS NOT NULL THEN 1 ELSE 0 END
              AS provider_execution_active,
            ranked_effect.effect_kind, ranked_effect.state AS effect_state,
@@ -153,41 +157,52 @@ WITH interaction_terminals AS MATERIALIZED (
            facts.created_at, facts.updated_at,
            CASE
              WHEN facts.workflow_status IN ('open', 'owner_gate')
-              AND facts.state IN ('queued', 'claimed', 'sent')
+              AND facts.transport_unresolved = 1
               AND facts.superseded_by_turn_id IS NULL THEN 1
              WHEN facts.workflow_status IN ('open', 'owner_gate')
               AND facts.superseded_by_turn_id IS NULL
               AND (facts.inbox_status = 'pending'
                    OR facts.unresolved_effect_count > 0
-                   OR facts.provider_execution_active = 1) THEN 1
+                   OR facts.provider_execution_active = 1
+                   OR (facts.is_active_turn = 1
+                       AND facts.provider_reconnect_requested_at IS NOT NULL)) THEN 1
              ELSE 0
            END AS is_current,
            CASE
              WHEN facts.provider_execution_active = 1 THEN 'executing'
-             WHEN facts.workflow_status = 'owner_gate' THEN 'owner_gate'
+             WHEN facts.workflow_status = 'owner_gate'
+              AND facts.transport_unresolved = 1
+               THEN 'owner_gate'
              ELSE facts.state
            END AS queue_state,
            CASE
              WHEN facts.provider_execution_active = 1 THEN 'current_provider_turn'
-             WHEN facts.workflow_status = 'owner_gate' THEN 'owner_gate'
              WHEN facts.inbox_status = 'pending' THEN 'delivery'
              WHEN facts.effect_state = 'indeterminate' THEN 'indeterminate_effect'
              WHEN facts.effect_state = 'claimed' THEN 'claimed_effect'
-             WHEN facts.provider_reconnect_requested_at IS NOT NULL
-               OR facts.queue_reason LIKE '%RECONNECT%' THEN 'reconnect'
-             WHEN facts.queue_reason = 'RESOURCE_HEALTH_REJECTED' THEN 'resource_health'
+             WHEN facts.workflow_status = 'owner_gate'
+              AND facts.transport_unresolved = 1
+               THEN 'owner_gate'
+             WHEN facts.is_active_turn = 1
+              AND facts.provider_reconnect_requested_at IS NOT NULL
+               THEN 'reconnect'
+             WHEN facts.queue_reason LIKE '%RECONNECT%'
+              AND facts.transport_unresolved = 1
+               THEN 'reconnect'
+             WHEN facts.queue_reason = 'RESOURCE_HEALTH_REJECTED'
+              AND facts.transport_unresolved = 1
+               THEN 'resource_health'
              WHEN facts.queue_reason IN ('TERMINAL_RUNTIME_OPERATION_BUSY',
                                          'TERMINAL_RUNTIME_RECONNECT_PENDING')
+              AND facts.transport_unresolved = 1
                THEN 'writer_recovery_authority'
              WHEN facts.state = 'sent' AND facts.receipt_exists = 0 THEN 'admission'
              WHEN facts.state = 'queued'
               AND capacity.active_count >= capacity.execution_limit THEN 'provider_capacity'
-             WHEN facts.state IN ('queued', 'claimed', 'sent') THEN 'workflow_continuation'
+             WHEN facts.state IN ('queued', 'claimed') THEN 'workflow_continuation'
              ELSE NULL
            END AS wait_reason,
-           CASE WHEN facts.inbox_status = 'pending'
-                      OR facts.state IN ('queued', 'claimed')
-                      OR (facts.state = 'sent' AND facts.receipt_exists = 0)
+           CASE WHEN facts.inbox_status = 'pending' OR facts.transport_unresolved = 1
                 THEN 1 ELSE 0 END AS admission_pending,
            facts.workflow_id, facts.id AS workflow_turn_id, facts.workflow_status,
            facts.workflow_reason, facts.state AS turn_state, facts.kind AS turn_kind,
@@ -200,6 +215,13 @@ WITH interaction_terminals AS MATERIALIZED (
              WHEN facts.superseded_by_turn_id IS NOT NULL THEN 'superseded'
              WHEN facts.workflow_status = 'cancelled' THEN 'cancelled'
              WHEN facts.workflow_status = 'terminal' THEN 'completed'
+             WHEN facts.state = 'sent' AND facts.receipt_exists = 1
+              AND facts.inbox_status IS NOT 'pending'
+              AND facts.unresolved_effect_count = 0
+              AND facts.provider_execution_active = 0
+              AND NOT (facts.is_active_turn = 1
+                       AND facts.provider_reconnect_requested_at IS NOT NULL)
+               THEN 'processed'
              ELSE NULL
            END AS final_disposition,
            CAST(facts.id AS TEXT) AS diagnostic_id
@@ -231,13 +253,19 @@ WITH interaction_terminals AS MATERIALIZED (
        OR (w.status IN ('open', 'owner_gate') AND NOT EXISTS (
          SELECT 1 FROM workflow_turns wt
          LEFT JOIN inbox linked_inbox ON linked_inbox.id = wt.inbox_message_id
+         LEFT JOIN workflow_turn_receipts linked_receipt
+           ON linked_receipt.workflow_turn_id = wt.id
+          AND linked_receipt.receiver_terminal_id = w.root_terminal_id
          LEFT JOIN provider_execution_leases linked_lease
            ON linked_lease.workflow_turn_id = wt.id
          WHERE wt.workflow_id = w.id AND (
-           (wt.state IN ('queued', 'claimed', 'sent')
+           ((wt.state IN ('queued', 'claimed')
+             OR (wt.state = 'sent' AND linked_receipt.id IS NULL))
              AND wt.superseded_by_turn_id IS NULL)
            OR linked_inbox.status = 'pending'
            OR linked_lease.workflow_turn_id IS NOT NULL
+           OR (w.active_turn_id = wt.id
+               AND wt.provider_reconnect_requested_at IS NOT NULL)
            OR EXISTS (
              SELECT 1 FROM workflow_effects linked_effect
              WHERE linked_effect.workflow_id = w.id

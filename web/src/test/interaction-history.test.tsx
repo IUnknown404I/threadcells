@@ -80,7 +80,10 @@ describe('InteractionHistoryDrawer', () => {
   it('loads Current Queue immediately and History only after the operator opens it', async () => {
     const list = vi.spyOn(api, 'listInteractions').mockImplementation(async params => (
       params.mode === 'history'
-        ? page([interaction({ id: 'inbox:0002', interaction_type: 'inbox', current: false, final_disposition: 'delivered', queue: { state: 'delivered', wait_reason: null, admission_pending: false } })])
+        ? page([
+          interaction({ id: 'inbox:0002', interaction_type: 'inbox', current: false, final_disposition: 'delivered', queue: { state: 'delivered', wait_reason: null, admission_pending: false } }),
+          interaction({ id: 'workflow-turn:0003', current: false, final_disposition: 'processed', queue: { state: 'sent', wait_reason: null, admission_pending: false } }),
+        ])
         : page([interaction()])
     ))
 
@@ -92,6 +95,7 @@ describe('InteractionHistoryDrawer', () => {
 
     fireEvent.click(screen.getByRole('tab', { name: 'History' }))
     expect(await screen.findByText('Inbox message')).toBeInTheDocument()
+    expect(screen.getByText('Processed')).toBeInTheDocument()
     expect(list).toHaveBeenCalledTimes(2)
     expect(list.mock.calls[1][0]).toMatchObject({ mode: 'history', sessionId: 'session-1' })
   })

@@ -2024,6 +2024,8 @@ async def delete_session(
     request: Request,
     session_name: str,
     confirm_dirty_workspace: bool = False,
+    cancel_unresolved_work: bool = False,
+    cancellation_plan_token: Optional[str] = None,
 ) -> Dict:
     try:
         result = await run_in_threadpool(
@@ -2031,6 +2033,8 @@ async def delete_session(
             session_name,
             registry=get_plugin_registry(request),
             confirm_dirty_workspace=confirm_dirty_workspace,
+            cancel_unresolved_work=cancel_unresolved_work,
+            cancellation_plan_token=cancellation_plan_token,
         )
         return {"success": True, **result}
     except (SessionNotFoundError, ValueError, SessionLifecycleError) as e:

@@ -351,13 +351,35 @@ export interface SessionBoundaryAgent {
   workflow_reason: string | null
 }
 
+export interface SessionDeletionBlocker {
+  category: string
+  count: number
+  disposition: 'cancellable' | 'unsafe'
+  reason_codes: string[]
+}
+
 export interface SessionDeletionPreflight {
   eligible: boolean
+  cancellable: boolean
   already_deleted: boolean
+  requires_cancellation_confirmation: boolean
   requires_dirty_confirmation: boolean
   modified_files: number
   untracked_files: number
   reason_code: string | null
+  reason_codes: string[]
+  plan_token: string | null
+  current_queue_count: number
+  cancellable_count: number
+  unsafe_count: number
+  plan_limit: number
+  blockers: SessionDeletionBlocker[]
+  cancellable_blockers: SessionDeletionBlocker[]
+  unsafe_blockers: SessionDeletionBlocker[]
+  cancellation_plan: {
+    count: number
+    categories: SessionDeletionBlocker[]
+  }
 }
 
 export type TerminalLifecycle = 'starting' | 'running' | 'recovery_required' | 'exit_pending' | 'exited' | 'recovery_fenced'
@@ -937,7 +959,14 @@ export const api = {
     // runs for genuine caller cancellation (navigation, disconnect, etc.).
     fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}${projectId ? `&projectId=${encodeURIComponent(projectId)}` : ''}${ownerGrant ? `&owner_grant_launch_id=${encodeURIComponent(ownerGrant.launch_id)}` : ''}${workContextRequestId ? `&workContextRequestId=${encodeURIComponent(workContextRequestId)}` : ''}`, { method: 'POST', headers: ownerGrant ? { 'X-ThreadCells-Owner-Grant': ownerGrant.grant } : undefined, timeoutMs: null }),
   getSessionDeletionPreflight: (name: string) => fetchJSON<SessionDeletionPreflight>(`/sessions/${encodeURIComponent(name)}/deletion-preflight`),
-  deleteSession: (name: string, confirmDirtyWorkspace = false) => fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${encodeURIComponent(name)}?confirm_dirty_workspace=${confirmDirtyWorkspace}`, { method: 'DELETE' }),
+  deleteSession: (name: string, confirmDirtyWorkspace = false, cancelUnresolvedWork = false, cancellationPlanToken?: string | null) => {
+    const search = new URLSearchParams({
+      confirm_dirty_workspace: String(confirmDirtyWorkspace),
+      cancel_unresolved_work: String(cancelUnresolvedWork),
+    })
+    if (cancellationPlanToken) search.set('cancellation_plan_token', cancellationPlanToken)
+    return fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${encodeURIComponent(name)}?${search}`, { method: 'DELETE' })
+  },
 
   // Terminals
   getTerminalStatus: (id: string) => fetchJSON<Terminal>(`/terminals/${id}`),

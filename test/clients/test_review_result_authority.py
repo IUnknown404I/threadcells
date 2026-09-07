@@ -273,7 +273,9 @@ def test_superseded_review_does_not_block_transactional_terminal_guard(authority
             .all()
         )
         assert assignments[0].review_superseded_at is not None
-        assert assignments[0].status == "cancelled"
+        # Supersession is the final disposition axis. Terminal cleanup must not
+        # rewrite the historical transport state of an earlier review attempt.
+        assert assignments[0].status == "handoff_result_delivered"
         assert assignments[1].review_superseded_at is None
         assert assignments[1].status == "result_acknowledged"
         assert db.query(WorkflowModel).filter_by(root_terminal_id="parent").one().status == (

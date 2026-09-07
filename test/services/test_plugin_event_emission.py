@@ -125,6 +125,7 @@ class TestSessionPluginEvents:
             session_name="cao-demo",
             terminals=[],
             deleted=False,
+            runtime_exists=False,
             has_live_runtime_owner=False,
             has_recovery_fenced_history=False,
         )

@@ -359,6 +359,8 @@ class TestTerminalOperations:
         mock_session.query.return_value.filter.return_value.order_by.return_value.first.return_value = (
             None
         )
+        mock_session.query.return_value.filter.return_value.first.return_value = None
+        mock_session.get.return_value = None
 
         result = create_terminal(
             "test123",
@@ -1077,7 +1079,9 @@ class TestTerminalOperations:
 
         mock_query = MagicMock()
         mock_query.filter.return_value.delete.return_value = 1
+        mock_query.filter.return_value.first.return_value = None
         mock_session.query.return_value = mock_query
+        mock_session.get.return_value = None
         mock_session_class.return_value = mock_session
 
         result = delete_terminal("test123")
@@ -1094,7 +1098,9 @@ class TestTerminalOperations:
 
         mock_query = MagicMock()
         mock_query.filter.return_value.delete.return_value = 0
+        mock_query.filter.return_value.first.return_value = None
         mock_session.query.return_value = mock_query
+        mock_session.get.return_value = None
         mock_session_class.return_value = mock_session
 
         result = delete_terminal("nonexistent")
@@ -1135,6 +1141,7 @@ class TestTerminalOperations:
 
         mock_query = MagicMock()
         mock_query.filter.return_value.delete.return_value = 2
+        mock_query.filter.return_value.first.return_value = None
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
 
@@ -1478,7 +1485,15 @@ class TestFlowOperations:
         mock_session.__enter__ = MagicMock(return_value=mock_session)
         mock_session.__exit__ = MagicMock(return_value=False)
         mock_session_class.return_value = mock_session
-        mock_session.get.return_value = MagicMock(runtime_lifecycle="running")
+        terminal = MagicMock(
+            runtime_lifecycle="running",
+            session_id="session",
+            tmux_session="cao-session",
+        )
+        mock_session.get.side_effect = lambda model, _identity: (
+            terminal if model is TerminalModel else None
+        )
+        mock_session.query.return_value.filter.return_value.first.return_value = None
 
         # Setup mock to update message attributes on refresh
         def mock_refresh(msg):

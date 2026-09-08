@@ -306,3 +306,84 @@ def test_cleanup_never_targets_source_or_paths_outside_managed_root(tmp_path, mo
     assert result["removed"] is False
     assert result["reason_code"] == "MANAGED_WORKTREE_IDENTITY_MISMATCH"
     assert repository.exists()
+
+
+def test_hard_purge_removes_worktree_registration_and_private_branch(tmp_path, monkeypatch):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(
+        str(repository), "terminal-hard-delete", "task"
+    )
+    assert task is not None
+
+    result = managed_worktree_service.purge_managed_worktree(_metadata(task))
+
+    assert result == {
+        "removed": True,
+        "managed": True,
+        "already_removed": False,
+        "path_absent": True,
+        "git_unregistered": True,
+        "branch_absent": True,
+    }
+    assert not Path(task.path).exists()
+    inventory = _git(repository, "worktree", "list", "--porcelain")
+    assert task.path not in inventory
+    assert (
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "show-ref",
+                "--verify",
+                f"refs/heads/{task.branch}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        ).returncode
+        != 0
+    )
+
+
+def test_authoritatively_retired_workspace_must_already_be_physically_absent(tmp_path, monkeypatch):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(
+        str(repository), "terminal-retired-conflict", "task"
+    )
+    assert task is not None
+
+    result = managed_worktree_service.purge_managed_worktree(
+        _metadata(task), require_already_absent=True
+    )
+
+    assert result["removed"] is False
+    assert result["reason_code"] == "WORKSPACE_RETIREMENT_STATE_CONFLICT"
+    assert Path(task.path).exists()
+    assert _git(repository, "show-ref", "--verify", f"refs/heads/{task.branch}")
+
+
+def test_hard_purge_retry_finishes_private_branch_after_worktree_is_already_absent(
+    tmp_path, monkeypatch
+):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(
+        str(repository), "terminal-retry", "task"
+    )
+    assert task is not None
+    metadata = _metadata(task)
+    removed = managed_worktree_service.remove_managed_worktree(metadata)
+    assert removed["removed"] is True
+    assert _git(repository, "show-ref", "--verify", f"refs/heads/{task.branch}")
+
+    first = managed_worktree_service.purge_managed_worktree(metadata, require_already_absent=True)
+    second = managed_worktree_service.purge_managed_worktree(metadata, require_already_absent=True)
+
+    assert first["removed"] is True
+    assert first["already_removed"] is True
+    assert second["removed"] is True
+    assert second["already_removed"] is True
+    assert not Path(task.path).exists()

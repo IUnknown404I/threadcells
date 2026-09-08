@@ -295,30 +295,41 @@ def dispatch_workflow_notification(
     """Attempt one fail-open, idempotent notification for a top-level lifecycle event."""
     if event_kind not in EVENT_KINDS:
         raise ValueError("Invalid Telegram workflow event")
-    context = get_workflow_notification_context(root_terminal_id, workflow_id)
-    if context is None:
-        return {"ok": False, "status": "workflow_missing"}
-    if context["delegated_child"]:
-        return {"ok": False, "status": "child_skipped"}
-    event_key = f"workflow:{context['workflow_id']}:{event_kind}"
-    if not claim_telegram_delivery(
-        event_key=event_key,
-        event_kind=event_kind,
-        workflow_id=context["workflow_id"],
-        root_terminal_id=root_terminal_id,
-    ):
-        return {"ok": True, "status": "duplicate_skipped"}
+    # A claimed delivery crosses an external side-effect boundary. Serialize
+    # the complete claim/send/finalize window with Session deletion so a
+    # durable ``claimed`` row can mean either a currently fenced send or a
+    # crash-left unknown outcome, never an untracked concurrent claimant.
+    # Non-blocking acquisition also keeps notifications fail-open when this is
+    # called from a lifecycle operation that already owns the same fence.
+    from cli_agent_orchestrator.services.operations_service import context_lifecycle_fence
 
-    result = _send_message(_lifecycle_message(event_kind, context), require_enabled=True)
-    if result["ok"]:
-        finish_telegram_delivery(event_key, "sent")
-    elif result["status"] in {"disabled", "not_configured"}:
-        finish_telegram_delivery(event_key, "skipped", result.get("reason_code"))
-    else:
-        finish_telegram_delivery(event_key, "failed", result.get("reason_code"))
-        logger.warning(
-            "Telegram lifecycle delivery failed for event %s (%s)",
-            event_kind,
-            result.get("reason_code", "TELEGRAM_DELIVERY_FAILED"),
-        )
-    return result
+    with context_lifecycle_fence(nonblocking=True) as acquired:
+        if not acquired:
+            return {"ok": False, "status": "lifecycle_busy"}
+        context = get_workflow_notification_context(root_terminal_id, workflow_id)
+        if context is None:
+            return {"ok": False, "status": "workflow_missing"}
+        if context["delegated_child"]:
+            return {"ok": False, "status": "child_skipped"}
+        event_key = f"workflow:{context['workflow_id']}:{event_kind}"
+        if not claim_telegram_delivery(
+            event_key=event_key,
+            event_kind=event_kind,
+            workflow_id=context["workflow_id"],
+            root_terminal_id=root_terminal_id,
+        ):
+            return {"ok": True, "status": "duplicate_skipped"}
+
+        result = _send_message(_lifecycle_message(event_kind, context), require_enabled=True)
+        if result["ok"]:
+            finish_telegram_delivery(event_key, "sent")
+        elif result["status"] in {"disabled", "not_configured"}:
+            finish_telegram_delivery(event_key, "skipped", result.get("reason_code"))
+        else:
+            finish_telegram_delivery(event_key, "failed", result.get("reason_code"))
+            logger.warning(
+                "Telegram lifecycle delivery failed for event %s (%s)",
+                event_kind,
+                result.get("reason_code", "TELEGRAM_DELIVERY_FAILED"),
+            )
+        return result

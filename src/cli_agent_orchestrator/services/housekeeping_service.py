@@ -942,6 +942,16 @@ def _housekeeping_execution_lock(lock_dir: Path):
 
 
 @contextmanager
+def housekeeping_mutation_fence(config: Mapping[str, Any] | None = None):
+    """Serialize an external exact cleanup with every Housekeeping mutation."""
+    cfg = dict(config or load_operations_config())
+    lock_dir = Path(str(cfg["lock_dir"]))
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with _housekeeping_execution_lock(lock_dir):
+        yield
+
+
+@contextmanager
 def _full_cleanup_execution_fence(config: Mapping[str, Any]):
     """Prevent new context, provider-turn, or Heavy admission during Full Cleanup."""
     lock_dir = Path(str(config["lock_dir"]))

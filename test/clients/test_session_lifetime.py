@@ -1,5 +1,6 @@
 """Stable session identity and idempotent retirement persistence tests."""
 
+import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -9,6 +10,7 @@ from cli_agent_orchestrator.clients.database import (
     AmbiguousTerminalIdentity,
     Base,
     ProviderExecutionLeaseModel,
+    SessionDeletionOperationModel,
     SessionDeletionReceiptModel,
     TerminalDeletionReceiptModel,
     TerminalModel,
@@ -143,7 +145,72 @@ def test_existing_receipt_schema_adds_replayable_retained_resources(monkeypatch)
                 "PRAGMA table_info(session_deletion_receipts)"
             ).fetchall()
         }
-    assert "retained_resources_json" in columns
+        operation_tables = connection.exec_driver_sql(
+            "SELECT COUNT(*) FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'session_deletion_operations'"
+        ).scalar_one()
+    assert {
+        "retained_resources_json",
+        "deletion_reason",
+        "authority_fingerprint",
+        "receipt_version",
+    }.issubset(columns)
+    assert operation_tables == 1
+    with database.SessionLocal() as db:
+        receipt = db.get(SessionDeletionReceiptModel, "legacy-receipt")
+        assert receipt.receipt_version == 1
+
+    # A restart after any subset of additive DDL must re-inspect the schema,
+    # not trust process-local completion state.
+    database._ensure_session_deletion_receipt_schema()
+    database._ensure_session_deletion_receipt_schema()
+    with database.SessionLocal() as db:
+        receipt = db.get(SessionDeletionReceiptModel, "legacy-receipt")
+        assert receipt.receipt_version == 1
+
+
+def test_existing_terminal_receipt_schema_adds_digest_only_late_callback_fence(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    TerminalDeletionReceiptModel.__table__.drop(bind=engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE terminal_deletion_receipts ("
+            "terminal_id VARCHAR PRIMARY KEY, session_id VARCHAR, "
+            "session_name VARCHAR NOT NULL, window_name VARCHAR NOT NULL, "
+            "deleted_at DATETIME NOT NULL)"
+        )
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
+
+    database._ensure_terminal_deletion_receipt_schema()
+
+    with engine.connect() as connection:
+        columns = {
+            row[1]
+            for row in connection.exec_driver_sql(
+                "PRAGMA table_info(terminal_deletion_receipts)"
+            ).fetchall()
+        }
+        indexes = {
+            row[1]
+            for row in connection.exec_driver_sql(
+                "PRAGMA index_list(terminal_deletion_receipts)"
+            ).fetchall()
+        }
+    assert "auth_token_sha256" in columns
+    assert "ix_terminal_deletion_receipts_auth_token_sha256" in indexes
+
+    database._ensure_terminal_deletion_receipt_schema()
+    database._ensure_terminal_deletion_receipt_schema()
+    with engine.connect() as connection:
+        assert (
+            connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM pragma_table_info('terminal_deletion_receipts') "
+                "WHERE name = 'auth_token_sha256'"
+            ).scalar_one()
+            == 1
+        )
 
 
 def test_exact_lifetime_delete_preserves_reused_name_and_is_idempotent(monkeypatch):
@@ -347,6 +414,33 @@ def test_exact_exited_terminal_delete_rejects_changed_identity(monkeypatch):
     with database.SessionLocal() as db:
         assert db.get(TerminalModel, "exited") is not None
         assert db.get(TerminalDeletionReceiptModel, "exited") is None
+
+
+def test_exact_terminal_delete_cannot_change_a_fenced_session_identity(monkeypatch):
+    _install_database(monkeypatch)
+    terminal = _terminal("exited", "lifetime", "cao-session", "/work/exited")
+    with database.SessionLocal() as db:
+        db.add(terminal)
+        db.commit()
+        expected = {
+            field: getattr(terminal, field) for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
+        }
+
+    started = database.begin_session_hard_deletion(
+        "lifetime",
+        "cao-session",
+        expected_terminal_ids=["exited"],
+        allow_dirty_workspace=False,
+    )
+    assert started["started"] is True
+
+    with pytest.raises(AmbiguousTerminalIdentity):
+        database.delete_exited_terminal("exited", expected_identity=expected)
+
+    with database.SessionLocal() as db:
+        assert db.get(TerminalModel, "exited") is not None
+        assert db.get(TerminalDeletionReceiptModel, "exited") is None
+        assert db.get(SessionDeletionOperationModel, "lifetime") is not None
 
 
 def test_exited_terminal_reconciliation_transfers_a_legacy_shared_writer_lease(monkeypatch):

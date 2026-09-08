@@ -1249,7 +1249,10 @@ def test_mixed_processed_history_plus_one_unresolved_turn_has_exact_queue_count(
     assert [item["workflow"]["turn_id"] for item in current["items"]] == [2]
     assert preflight["cancellable"] is True
     # Fixed query shape: no per-terminal or per-blocker fetch loop.
-    assert len(statements) == 12
+    # Three additional fixed queries inspect active provider-reconnect attempts,
+    # individually retired terminal identities, and claimed external
+    # notifications. None depends on the number of terminals or blockers.
+    assert len(statements) == 15
 
 
 def test_plan_token_revalidation_fails_closed_after_state_change(monkeypatch):

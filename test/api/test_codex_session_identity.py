@@ -46,6 +46,31 @@ def test_codex_session_identity_requires_exact_terminal_bearer(client):
     assert response.status_code == 401
 
 
+def test_deleted_terminal_callback_is_rejected_without_resurrection(client):
+    with (
+        patch("cli_agent_orchestrator.api.main.terminal_auth_token_matches", return_value=False),
+        patch(
+            "cli_agent_orchestrator.api.main.terminal_deletion_auth_token_matches",
+            return_value=True,
+        ),
+    ):
+        identity = client.post(
+            "/_internal/terminals/abcdef12/codex-session-identity",
+            json=_payload(),
+            headers=_headers(),
+        )
+        completion = client.post(
+            "/_internal/terminals/abcdef12/codex-turn-complete",
+            json=_completion_payload(),
+            headers=_headers(),
+        )
+
+    assert identity.status_code == 409
+    assert identity.json()["detail"] == "session_deleted"
+    assert completion.status_code == 409
+    assert completion.json()["detail"] == "session_deleted"
+
+
 def test_codex_session_identity_allows_stale_api_generation_only_as_exact_rebind(
     client, monkeypatch
 ):

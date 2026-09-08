@@ -244,6 +244,11 @@ class TestDeleteSession:
                 return_value=None,
             ),
             patch(
+                "cli_agent_orchestrator.services.session_service."
+                "list_session_historical_terminal_cleanup_authorities",
+                return_value=[],
+            ),
+            patch(
                 "cli_agent_orchestrator.services.session_service.begin_session_hard_deletion",
                 side_effect=lambda session_id, session_name, expected_terminal_ids, allow_dirty_workspace: {
                     "started": True,
@@ -621,6 +626,34 @@ class TestDeleteSession:
                 "mark_session_hard_deletion_workspace_retired",
                 return_value={"marked": True},
             ) as mark,
+            patch(
+                "cli_agent_orchestrator.services.session_service."
+                "list_session_historical_terminal_cleanup_authorities",
+                return_value=[
+                    {
+                        "id": "retired-child",
+                        "terminal_id": "retired-child",
+                        "managed": True,
+                        "workspace_cleanup_authority_version": 1,
+                        "managed_worktree_kind": "task",
+                        "managed_worktree_source": "/source/project",
+                        "launch_worktree": "/work/retired-child",
+                        "managed_worktree_branch": "cao/task/retired-child",
+                        "managed_worktree_branch_object_id": "a" * 40,
+                        "managed_worktree_identity": "retired-child",
+                    }
+                ],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.purge_managed_worktree",
+                side_effect=lambda metadata, **_kwargs: {
+                    "removed": True,
+                    "managed": metadata.get("terminal_id") == "retired-child",
+                    "path_absent": True,
+                    "git_unregistered": True,
+                    "branch_absent": True,
+                },
+            ) as cleanup,
         ):
             result = delete_session("session-lifetime-1")
 
@@ -629,12 +662,27 @@ class TestDeleteSession:
         assert [item["terminal_id"] for item in evidence] == graph_ids
         assert evidence[-1] == {
             "terminal_id": "retired-child",
-            "managed": False,
+            "managed": True,
             "path_absent": True,
             "git_unregistered": True,
             "branch_absent": True,
             "runtime_artifacts_absent": True,
         }
+        cleanup.assert_any_call(
+            {
+                "id": "retired-child",
+                "terminal_id": "retired-child",
+                "managed": True,
+                "workspace_cleanup_authority_version": 1,
+                "managed_worktree_kind": "task",
+                "managed_worktree_source": "/source/project",
+                "launch_worktree": "/work/retired-child",
+                "managed_worktree_branch": "cao/task/retired-child",
+                "managed_worktree_branch_object_id": "a" * 40,
+                "managed_worktree_identity": "retired-child",
+            },
+            require_already_absent=True,
+        )
         assert result["deleted"] == ["cao-test"]
 
     @patch("cli_agent_orchestrator.services.session_service.retire_exited_terminal_runtime")

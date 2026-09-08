@@ -34,6 +34,7 @@ from cli_agent_orchestrator.clients.database import (
     get_session_unresolved_work_plan,
     get_session_workspace_retirement_snapshot,
     get_writable_work_context_by_session,
+    list_session_historical_terminal_cleanup_authorities,
     mark_session_hard_deletion_workspace_retired,
     resolve_session_lifetime,
     revalidate_session_hard_deletion,
@@ -629,8 +630,12 @@ def delete_session(
                 graph_terminal_ids = [
                     str(value) for value in revalidated.get("graph_terminal_ids", terminal_ids)
                 ]
+                historical_terminal_cleanup = list_session_historical_terminal_cleanup_authorities(
+                    authority.session_id
+                )
             else:
                 graph_terminal_ids = terminal_ids
+                historical_terminal_cleanup = []
 
             for terminal in terminals if operation is not None else ():
                 try:
@@ -710,19 +715,30 @@ def delete_session(
                                 "TERMINAL_ARTIFACT_CLEANUP_UNPROVEN",
                                 "Terminal output or attachment cleanup could not be proven",
                             )
-                        # Individually retired historical terminals no longer
-                        # have live metadata, but their durable deletion
-                        # receipt proves their prior worktree cleanup.  Their
-                        # remaining output/attachments were just removed under
-                        # the same Housekeeping fence above.
-                        for terminal_id in sorted(set(graph_terminal_ids) - set(terminal_ids)):
+                        # Individual terminal retirement removes the worktree
+                        # but deliberately preserves its private task branch.
+                        # Consume the exact receipt-bound Git identity here;
+                        # legacy receipts without that authority remain unsafe
+                        # in preflight rather than receiving fabricated proof.
+                        for historical in historical_terminal_cleanup:
+                            cleanup = purge_managed_worktree(
+                                historical,
+                                require_already_absent=True,
+                            )
+                            if not cleanup.get("removed") and cleanup.get("managed"):
+                                raise SessionLifecycleError(
+                                    str(
+                                        cleanup.get("reason_code") or "MANAGED_WORKTREE_UNVERIFIED"
+                                    ),
+                                    "Historical managed-worktree cleanup could not be proven",
+                                )
                             workspace_evidence.append(
                                 {
-                                    "terminal_id": terminal_id,
-                                    "managed": False,
-                                    "path_absent": True,
-                                    "git_unregistered": True,
-                                    "branch_absent": True,
+                                    "terminal_id": str(historical["terminal_id"]),
+                                    "managed": bool(cleanup.get("managed")),
+                                    "path_absent": bool(cleanup.get("path_absent", True)),
+                                    "git_unregistered": bool(cleanup.get("git_unregistered", True)),
+                                    "branch_absent": bool(cleanup.get("branch_absent", True)),
                                     "runtime_artifacts_absent": True,
                                 }
                             )

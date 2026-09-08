@@ -261,6 +261,7 @@ def managed_worktree_status(metadata: Mapping[str, Any]) -> dict[str, Any]:
                     "safe": False,
                     "reason_code": "TASK_WORKTREE_BRANCH_MISSING",
                 }
+            result["commit"] = branch.stdout.split()[0]
         return result
     resolved_path = path.resolve(strict=True)
     root = _repository_root(path)
@@ -378,7 +379,8 @@ def purge_managed_worktree(
             "branch_absent": True,
         }
     identity = (
-        metadata.get("writable_work_context_id")
+        metadata.get("managed_worktree_identity")
+        or metadata.get("writable_work_context_id")
         or metadata.get("managed_worktree_origin_terminal_id")
         or metadata.get("id")
     )
@@ -446,6 +448,13 @@ def purge_managed_worktree(
         branch = _git("rev-parse", "--verify", ref_name, cwd=source, check=False)
         if branch.returncode == 0:
             old_object = branch.stdout.strip()
+            expected_object = metadata.get("managed_worktree_branch_object_id")
+            if expected_object is not None and old_object != expected_object:
+                return {
+                    "removed": False,
+                    "managed": True,
+                    "reason_code": "MANAGED_WORKTREE_BRANCH_CHANGED",
+                }
             removed_ref = _git("update-ref", "-d", ref_name, old_object, cwd=source, check=False)
             if removed_ref.returncode != 0:
                 return {

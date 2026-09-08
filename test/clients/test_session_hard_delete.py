@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, event
@@ -43,7 +45,7 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.models.inbox import ChildAssignmentStatus, MessageStatus
 from cli_agent_orchestrator.models.result import HandoffResultDocumentV1
 from cli_agent_orchestrator.models.usage import UsageObservation
-from cli_agent_orchestrator.services import interaction_read_model_service
+from cli_agent_orchestrator.services import interaction_read_model_service, managed_worktree_service
 
 
 def _install_database(monkeypatch, url: str = "sqlite:///:memory:"):
@@ -118,6 +120,122 @@ def _fence_and_mark(
     return started
 
 
+def _git(repository: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repository), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_individually_retired_private_branch_is_receipted_then_session_purged(
+    monkeypatch, tmp_path
+):
+    _install_database(monkeypatch)
+    repository = tmp_path / "source"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.name", "ThreadCells Test")
+    _git(repository, "config", "user.email", "threadcells@example.invalid")
+    (repository / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+    _git(repository, "add", "tracked.txt")
+    _git(repository, "commit", "-qm", "baseline")
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    managed = managed_worktree_service.create_managed_worktree(
+        str(repository), "retired-child", "task"
+    )
+    assert managed is not None and managed.branch is not None
+
+    owner = _terminal("owner")
+    child = _terminal("retired-child")
+    child.launch_worktree = managed.path
+    child.managed_worktree_kind = managed.kind
+    child.managed_worktree_source = managed.source
+    child.managed_worktree_branch = managed.branch
+    child.managed_worktree_commit = managed.commit
+    with database.SessionLocal() as db:
+        db.add_all([owner, child])
+        db.commit()
+        expected_identity = {
+            field: getattr(child, field) for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
+        }
+
+    metadata = {
+        "id": "retired-child",
+        "launch_worktree": managed.path,
+        "managed_worktree_kind": managed.kind,
+        "managed_worktree_source": managed.source,
+        "managed_worktree_branch": managed.branch,
+        "managed_worktree_commit": managed.commit,
+    }
+    removed = managed_worktree_service.remove_managed_worktree(metadata)
+    assert removed["removed"] is True
+    deleted = database.delete_exited_terminal(
+        "retired-child",
+        expected_identity=expected_identity,
+        workspace_cleanup_authority={
+            "version": 1,
+            "managed": True,
+            "kind": managed.kind,
+            "source": managed.source,
+            "path": managed.path,
+            "branch": managed.branch,
+            "branch_object_id": removed["commit"],
+            "identity": "retired-child",
+            "path_absent": True,
+            "git_unregistered": True,
+        },
+    )
+    assert deleted["deleted"] == 1
+    assert _git(repository, "rev-parse", f"refs/heads/{managed.branch}") == removed["commit"]
+
+    started = database.begin_session_hard_deletion(
+        "session",
+        "cao-session",
+        expected_terminal_ids=["owner"],
+        allow_dirty_workspace=False,
+    )
+    assert started["started"] is True
+    cleanup_authorities = database.list_session_historical_terminal_cleanup_authorities("session")
+    assert cleanup_authorities[0]["managed_worktree_branch_object_id"] == removed["commit"]
+    cleanup = managed_worktree_service.purge_managed_worktree(
+        cleanup_authorities[0], require_already_absent=True
+    )
+    assert cleanup["removed"] is True
+    assert cleanup["branch_absent"] is True
+    assert not Path(managed.path).exists()
+    assert managed.path not in _git(repository, "worktree", "list", "--porcelain")
+    database.mark_session_hard_deletion_workspace_retired(
+        "session",
+        workspace_evidence=[
+            {
+                "terminal_id": "owner",
+                "managed": False,
+                "path_absent": True,
+                "git_unregistered": True,
+                "branch_absent": True,
+                "runtime_artifacts_absent": True,
+            },
+            {
+                "terminal_id": "retired-child",
+                "managed": True,
+                "path_absent": True,
+                "git_unregistered": True,
+                "branch_absent": True,
+                "runtime_artifacts_absent": True,
+            },
+        ],
+    )
+    completed = database.complete_session_hard_deletion("session", "cao-session")
+    assert completed["completed"] is True
+    with database.SessionLocal() as db:
+        receipt = db.get(TerminalDeletionReceiptModel, "retired-child")
+        assert receipt.workspace_cleanup_authority_version is None
+        assert receipt.managed_worktree_branch is None
+        assert db.get(SessionDeletionReceiptModel, "session").receipt_version == 2
+
+
 def test_individually_retired_terminal_graph_is_planned_projected_and_hard_purged(
     monkeypatch,
 ):
@@ -131,6 +249,7 @@ def test_individually_retired_terminal_graph_is_planned_projected_and_hard_purge
                 session_name="cao-session",
                 window_name="retired-child",
                 auth_token_sha256="c" * 64,
+                workspace_cleanup_authority_version=1,
                 deleted_at=datetime(2026, 9, 8, 9, 30, 0),
             )
         )
@@ -209,9 +328,42 @@ def test_individually_retired_terminal_graph_is_planned_projected_and_hard_purge
     assert all(count == 0 for count in completed["after_counts"].values())
     with database.SessionLocal() as db:
         assert db.query(TerminalDeletionReceiptModel).count() == 2
+        retired_receipt = db.get(TerminalDeletionReceiptModel, "retired-child")
+        assert retired_receipt.workspace_cleanup_authority_version is None
+        assert retired_receipt.managed_worktree_source is None
+        assert retired_receipt.managed_worktree_branch_object_id is None
         assert db.query(WorkflowModel).count() == 0
         assert db.query(WorkflowEffectModel).count() == 0
         assert db.query(DelegationResultModel).count() == 0
+
+
+def test_legacy_terminal_receipt_without_workspace_cleanup_authority_fails_closed(monkeypatch):
+    _install_database(monkeypatch)
+    with database.SessionLocal() as db:
+        db.add(_terminal("owner"))
+        db.add(
+            TerminalDeletionReceiptModel(
+                terminal_id="legacy-retired-child",
+                session_id="session",
+                session_name="cao-session",
+                window_name="legacy-retired-child",
+                deleted_at=datetime(2026, 9, 8, 9, 30, 0),
+            )
+        )
+        db.commit()
+
+    plan = database.get_session_unresolved_work_plan("session", expected_terminal_ids=["owner"])
+    assert plan["deletion_mode"] == "blocked_live_or_unsafe_authority"
+    assert plan["reason_codes"] == ["TERMINAL_WORKSPACE_CLEANUP_AUTHORITY_MISSING"]
+    assert database.begin_session_hard_deletion(
+        "session",
+        "cao-session",
+        expected_terminal_ids=["owner"],
+        allow_dirty_workspace=False,
+    ) == {
+        "started": False,
+        "reason_code": "TERMINAL_WORKSPACE_CLEANUP_AUTHORITY_MISSING",
+    }
 
 
 def test_hard_delete_purges_owned_graph_and_preserves_shared_registry_and_other_session(
@@ -1257,6 +1409,6 @@ def test_hard_purge_sql_shape_is_fixed_and_uses_one_batched_terminal_fence_inser
 
     one = run(1)
     fifty = run(50)
-    assert one[:2] == fifty[:2] == (91, 65)
+    assert one[:2] == fifty[:2] == (92, 65)
     assert one[2] == 0
     assert fifty[2] == 1

@@ -198,7 +198,16 @@ def test_existing_terminal_receipt_schema_adds_digest_only_late_callback_fence(m
                 "PRAGMA index_list(terminal_deletion_receipts)"
             ).fetchall()
         }
-    assert "auth_token_sha256" in columns
+    assert {
+        "auth_token_sha256",
+        "workspace_cleanup_authority_version",
+        "managed_worktree_kind",
+        "managed_worktree_source",
+        "managed_worktree_path",
+        "managed_worktree_branch",
+        "managed_worktree_branch_object_id",
+        "managed_worktree_identity",
+    } <= columns
     assert "ix_terminal_deletion_receipts_auth_token_sha256" in indexes
 
     database._ensure_terminal_deletion_receipt_schema()
@@ -352,6 +361,9 @@ def test_exact_exited_terminal_delete_retires_managed_work_context_atomically(mo
     terminal.writable_work_context_id = "context-a"
     terminal.writer_authority_generation = "generation-a"
     terminal.managed_worktree_kind = "supervisor"
+    terminal.managed_worktree_source = "/source/project-a"
+    terminal.managed_worktree_branch = "cao/session/context-a"
+    terminal.managed_worktree_commit = "b" * 40
     with database.SessionLocal() as db:
         db.add_all(
             [
@@ -381,7 +393,25 @@ def test_exact_exited_terminal_delete_retires_managed_work_context_atomically(mo
             field: getattr(terminal, field) for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
         }
 
-    assert database.delete_exited_terminal("exited", expected_identity=expected)["deleted"] == 1
+    assert (
+        database.delete_exited_terminal(
+            "exited",
+            expected_identity=expected,
+            workspace_cleanup_authority={
+                "version": 1,
+                "managed": True,
+                "kind": "supervisor",
+                "source": "/source/project-a",
+                "path": "/work/exited",
+                "branch": "cao/session/context-a",
+                "branch_object_id": "b" * 40,
+                "identity": "context-a",
+                "path_absent": True,
+                "git_unregistered": True,
+            },
+        )["deleted"]
+        == 1
+    )
 
     with database.SessionLocal() as db:
         assert db.get(TerminalModel, "exited") is None

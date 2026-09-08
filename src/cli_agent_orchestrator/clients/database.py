@@ -229,6 +229,17 @@ class TerminalDeletionReceiptModel(Base):
     # into an explicit SESSION_DELETED rejection.  The bearer secret itself is
     # never persisted here.
     auth_token_sha256 = Column(String, nullable=True, index=True)
+    # Individually retired terminals may have already removed their physical
+    # worktree while deliberately preserving the private task branch. Retain
+    # the exact, bounded cleanup authority until the owning Session is hard
+    # deleted; the final purge clears these transitional fields.
+    workspace_cleanup_authority_version = Column(Integer, nullable=True)
+    managed_worktree_kind = Column(String, nullable=True)
+    managed_worktree_source = Column(String, nullable=True)
+    managed_worktree_path = Column(String, nullable=True)
+    managed_worktree_branch = Column(String, nullable=True)
+    managed_worktree_branch_object_id = Column(String, nullable=True)
+    managed_worktree_identity = Column(String, nullable=True)
     deleted_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
@@ -3944,7 +3955,7 @@ def _session_unresolved_work_plan_in_transaction(
             )
 
         fingerprint_document = {
-            "version": 3,
+            "version": 4,
             "session_id": session_id,
             "terminal_authority": sorted(
                 (
@@ -3970,6 +3981,13 @@ def _session_unresolved_work_plan_in_transaction(
                     str(receipt.session_name),
                     str(receipt.window_name),
                     str(receipt.auth_token_sha256 or ""),
+                    str(receipt.workspace_cleanup_authority_version or ""),
+                    str(receipt.managed_worktree_kind or ""),
+                    str(receipt.managed_worktree_source or ""),
+                    str(receipt.managed_worktree_path or ""),
+                    str(receipt.managed_worktree_branch or ""),
+                    str(receipt.managed_worktree_branch_object_id or ""),
+                    str(receipt.managed_worktree_identity or ""),
                     str(receipt.deleted_at or ""),
                 )
                 for receipt in historical_terminal_receipts
@@ -4079,6 +4097,17 @@ def _session_unresolved_work_plan_in_transaction(
                 terminal.id,
                 terminal.runtime_operation_kind
                 or ("runtime_operation_claim" if runtime_operation_active else lifecycle),
+            )
+
+    for receipt in historical_terminal_receipts:
+        if _terminal_receipt_workspace_cleanup_authority(receipt) is None:
+            record(
+                "unsafe",
+                "workspace_authority",
+                "TERMINAL_WORKSPACE_CLEANUP_AUTHORITY_MISSING",
+                "terminal_deletion_receipt",
+                receipt.terminal_id,
+                "legacy_or_invalid_cleanup_authority",
             )
 
     if terminal_ids:
@@ -5774,6 +5803,62 @@ def _session_historical_terminal_receipts(
     )
 
 
+def _terminal_receipt_workspace_cleanup_authority(
+    receipt: TerminalDeletionReceiptModel,
+) -> Dict[str, Any] | None:
+    if receipt.workspace_cleanup_authority_version != 1:
+        return None
+    managed = receipt.managed_worktree_kind is not None
+    if not managed:
+        return {
+            "terminal_id": str(receipt.terminal_id),
+            "managed": False,
+            "workspace_cleanup_authority_version": 1,
+        }
+    required = (
+        receipt.managed_worktree_source,
+        receipt.managed_worktree_path,
+        receipt.managed_worktree_identity,
+    )
+    if not all(isinstance(value, str) and value for value in required):
+        return None
+    if receipt.managed_worktree_branch is not None and not (
+        isinstance(receipt.managed_worktree_branch_object_id, str)
+        and receipt.managed_worktree_branch_object_id
+    ):
+        return None
+    return {
+        "id": str(receipt.terminal_id),
+        "terminal_id": str(receipt.terminal_id),
+        "managed": True,
+        "workspace_cleanup_authority_version": 1,
+        "managed_worktree_kind": str(receipt.managed_worktree_kind),
+        "managed_worktree_source": str(receipt.managed_worktree_source),
+        "launch_worktree": str(receipt.managed_worktree_path),
+        "managed_worktree_branch": receipt.managed_worktree_branch,
+        "managed_worktree_branch_object_id": receipt.managed_worktree_branch_object_id,
+        "managed_worktree_identity": str(receipt.managed_worktree_identity),
+    }
+
+
+def list_session_historical_terminal_cleanup_authorities(
+    session_id: str,
+) -> List[Dict[str, Any]]:
+    """Return exact bounded physical-cleanup authority for retired terminals."""
+    _ensure_terminal_deletion_receipt_schema()
+    with SessionLocal() as db:
+        receipts = _session_historical_terminal_receipts(db, session_id)
+        if len(receipts) > _SESSION_DELETION_PLAN_LIMIT:
+            raise AmbiguousSessionIdentity(session_id)
+        authorities = []
+        for receipt in receipts:
+            authority = _terminal_receipt_workspace_cleanup_authority(receipt)
+            if authority is None:
+                raise AmbiguousTerminalIdentity(str(receipt.terminal_id))
+            authorities.append(authority)
+        return authorities
+
+
 def _session_graph_terminal_ids(
     db: Any,
     session_id: str,
@@ -5827,6 +5912,26 @@ def _ensure_terminal_deletion_receipt_schema() -> None:
                 connection.exec_driver_sql(
                     "ALTER TABLE terminal_deletion_receipts " "ADD COLUMN auth_token_sha256 VARCHAR"
                 )
+            additions = {
+                "workspace_cleanup_authority_version": "INTEGER",
+                "managed_worktree_kind": "VARCHAR",
+                "managed_worktree_source": "VARCHAR",
+                "managed_worktree_path": "VARCHAR",
+                "managed_worktree_branch": "VARCHAR",
+                "managed_worktree_branch_object_id": "VARCHAR",
+                "managed_worktree_identity": "VARCHAR",
+            }
+            columns = {
+                str(row[1])
+                for row in connection.exec_driver_sql(
+                    "PRAGMA table_info(terminal_deletion_receipts)"
+                ).fetchall()
+            }
+            for name, sql_type in additions.items():
+                if name not in columns:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE terminal_deletion_receipts ADD COLUMN {name} {sql_type}"
+                    )
             connection.exec_driver_sql(
                 "CREATE INDEX IF NOT EXISTS "
                 "ix_terminal_deletion_receipts_auth_token_sha256 "
@@ -6639,6 +6744,7 @@ _TERMINAL_DELETION_IDENTITY_FIELDS = (
     "managed_worktree_source",
     "managed_worktree_branch",
     "managed_worktree_commit",
+    "managed_worktree_origin_terminal_id",
     "writable_work_context_id",
     "writer_authority_generation",
     "runtime_pane_id",
@@ -6649,6 +6755,57 @@ _TERMINAL_DELETION_IDENTITY_FIELDS = (
 )
 
 
+def _terminal_workspace_cleanup_receipt_fields(
+    terminal: TerminalModel,
+    authority: Mapping[str, Any] | None,
+) -> Dict[str, Any]:
+    """Validate physical cleanup evidence before deleting terminal metadata."""
+    if terminal.managed_worktree_kind is None:
+        return {
+            "workspace_cleanup_authority_version": 1,
+            "managed_worktree_kind": None,
+            "managed_worktree_source": None,
+            "managed_worktree_path": None,
+            "managed_worktree_branch": None,
+            "managed_worktree_branch_object_id": None,
+            "managed_worktree_identity": None,
+        }
+    identity = (
+        terminal.writable_work_context_id
+        or terminal.managed_worktree_origin_terminal_id
+        or terminal.id
+    )
+    expected = {
+        "version": 1,
+        "managed": True,
+        "kind": terminal.managed_worktree_kind,
+        "source": terminal.managed_worktree_source,
+        "path": terminal.launch_worktree,
+        "branch": terminal.managed_worktree_branch,
+        "identity": identity,
+        "path_absent": True,
+        "git_unregistered": True,
+    }
+    if authority is None or any(authority.get(key) != value for key, value in expected.items()):
+        raise AmbiguousTerminalIdentity(str(terminal.id))
+    branch_object_id = authority.get("branch_object_id")
+    if expected["branch"] is not None and not (
+        isinstance(branch_object_id, str) and branch_object_id
+    ):
+        raise AmbiguousTerminalIdentity(str(terminal.id))
+    if expected["branch"] is None and branch_object_id is not None:
+        raise AmbiguousTerminalIdentity(str(terminal.id))
+    return {
+        "workspace_cleanup_authority_version": 1,
+        "managed_worktree_kind": str(expected["kind"]),
+        "managed_worktree_source": str(expected["source"]),
+        "managed_worktree_path": str(expected["path"]),
+        "managed_worktree_branch": expected["branch"],
+        "managed_worktree_branch_object_id": branch_object_id,
+        "managed_worktree_identity": str(identity),
+    }
+
+
 def terminal_deletion_receipt_exists(terminal_id: str) -> bool:
     """Return whether one exact terminal was already deleted successfully."""
     _ensure_terminal_deletion_receipt_schema()
@@ -6657,7 +6814,10 @@ def terminal_deletion_receipt_exists(terminal_id: str) -> bool:
 
 
 def delete_exited_terminal(
-    terminal_id: str, *, expected_identity: Mapping[str, Any]
+    terminal_id: str,
+    *,
+    expected_identity: Mapping[str, Any],
+    workspace_cleanup_authority: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Delete one unchanged exited terminal and persist an idempotency receipt.
 
@@ -6708,6 +6868,10 @@ def delete_exited_terminal(
             "session_name": terminal.tmux_session,
             "window_name": terminal.tmux_window,
         }
+        cleanup_receipt_fields = _terminal_workspace_cleanup_receipt_fields(
+            terminal,
+            workspace_cleanup_authority,
+        )
 
         writable_context = None
         if terminal.writable_work_context_id is not None:
@@ -6769,6 +6933,7 @@ def delete_exited_terminal(
                 session_name=receipt_identity["session_name"],
                 window_name=receipt_identity["window_name"],
                 auth_token_sha256=terminal.auth_token_sha256,
+                **cleanup_receipt_fields,
                 deleted_at=datetime.now(),
             )
         )
@@ -7003,7 +7168,7 @@ def _session_hard_delete_authority_fingerprint(
     if len(terminal_receipts) > _SESSION_DELETION_PLAN_LIMIT:
         raise AmbiguousSessionIdentity(session_id)
     document = {
-        "version": 2,
+        "version": 3,
         "session_id": session_id,
         "session_name": session_name,
         "terminals": sorted(
@@ -7056,6 +7221,13 @@ def _session_hard_delete_authority_fingerprint(
                 str(receipt.session_name),
                 str(receipt.window_name),
                 str(receipt.auth_token_sha256 or ""),
+                str(receipt.workspace_cleanup_authority_version or ""),
+                str(receipt.managed_worktree_kind or ""),
+                str(receipt.managed_worktree_source or ""),
+                str(receipt.managed_worktree_path or ""),
+                str(receipt.managed_worktree_branch or ""),
+                str(receipt.managed_worktree_branch_object_id or ""),
+                str(receipt.managed_worktree_identity or ""),
                 receipt.deleted_at.isoformat() if receipt.deleted_at else "",
             )
             for receipt in terminal_receipts
@@ -7567,6 +7739,25 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
                         ("legacy:" + TerminalModel.tmux_session) == session_id,
                     ),
                 )
+            )
+        )
+        # The per-terminal cleanup authority is transitional. Once the whole
+        # Session graph and its physical/Git resources are gone, retain only
+        # the minimal callback/idempotency terminal fences.
+        (
+            db.query(TerminalDeletionReceiptModel)
+            .filter(TerminalDeletionReceiptModel.terminal_id.in_(terminal_values))
+            .update(
+                {
+                    TerminalDeletionReceiptModel.workspace_cleanup_authority_version: None,
+                    TerminalDeletionReceiptModel.managed_worktree_kind: None,
+                    TerminalDeletionReceiptModel.managed_worktree_source: None,
+                    TerminalDeletionReceiptModel.managed_worktree_path: None,
+                    TerminalDeletionReceiptModel.managed_worktree_branch: None,
+                    TerminalDeletionReceiptModel.managed_worktree_branch_object_id: None,
+                    TerminalDeletionReceiptModel.managed_worktree_identity: None,
+                },
+                synchronize_session=False,
             )
         )
 

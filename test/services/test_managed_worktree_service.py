@@ -387,3 +387,40 @@ def test_hard_purge_retry_finishes_private_branch_after_worktree_is_already_abse
     assert second["removed"] is True
     assert second["already_removed"] is True
     assert not Path(task.path).exists()
+
+
+def test_historical_terminal_cleanup_deletes_only_the_receipted_branch_object(
+    tmp_path, monkeypatch
+):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(
+        str(repository), "terminal-history", "task"
+    )
+    assert task is not None
+    metadata = _metadata(task)
+    removed = managed_worktree_service.remove_managed_worktree(metadata)
+    assert removed["removed"] is True
+    receipt_authority = {
+        **metadata,
+        "managed_worktree_identity": "terminal-history",
+        "managed_worktree_branch_object_id": removed["commit"],
+    }
+
+    moved = _git(repository, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "late move")
+    _git(repository, "update-ref", f"refs/heads/{task.branch}", moved)
+    changed = managed_worktree_service.purge_managed_worktree(
+        receipt_authority,
+        require_already_absent=True,
+    )
+    assert changed["removed"] is False
+    assert changed["reason_code"] == "MANAGED_WORKTREE_BRANCH_CHANGED"
+    assert _git(repository, "rev-parse", f"refs/heads/{task.branch}") == moved
+
+    receipt_authority["managed_worktree_branch_object_id"] = moved
+    purged = managed_worktree_service.purge_managed_worktree(
+        receipt_authority,
+        require_already_absent=True,
+    )
+    assert purged["removed"] is True
+    assert purged["branch_absent"] is True

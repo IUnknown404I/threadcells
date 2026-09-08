@@ -40,6 +40,7 @@ const REASON_KEYS: Record<string, TranslationKey> = {
   CROSS_SESSION_ASSIGNMENT: 'sessionDeletion.reason.externalAssignment',
   WORKSPACE_STATE_NOT_RETIRABLE: 'sessionDeletion.reason.workspaceProtected',
   WORKSPACE_RETIREMENT_STATE_CONFLICT: 'sessionDeletion.reason.workspaceProtected',
+  TERMINAL_WORKSPACE_CLEANUP_AUTHORITY_MISSING: 'sessionDeletion.reason.workspaceProtected',
   CANCELLATION_PLAN_TOO_LARGE: 'sessionDeletion.reason.planTooLarge',
   SESSION_IDENTITY_CHANGED: 'sessionDeletion.reason.sessionIdentity',
 }

@@ -65,6 +65,7 @@ from cli_agent_orchestrator.clients.database import (
     get_writable_work_context_by_request,
     has_admitted_workflow_turn,
     list_all_terminals,
+    list_exited_terminal_provider_execution_candidates,
     mark_handoff_child_input_received,
     mark_recovery_takeover_completed,
     mark_recovery_takeover_dispatch_uncertain,
@@ -76,6 +77,7 @@ from cli_agent_orchestrator.clients.database import (
     persist_terminal_provider_last_response,
     persist_terminal_result_snapshot,
     promote_terminal_context_role_to_supervisor,
+    reconcile_exited_terminal_provider_execution_authority,
     reconcile_legacy_terminal_runtime_identity,
     reconcile_terminal_runtime_process_identity,
     record_workflow_provider_reconnect_output_boundary,
@@ -1283,7 +1285,15 @@ def reconcile_terminal_runtime(
     if metadata.get("runtime_lifecycle") in {"exited", "recovery_fenced"}:
         if metadata.get("runtime_lifecycle") == "recovery_fenced":
             return True
-        _retire_exited_terminal_runtime(metadata)
+        retired, _reason = _retire_observed_dead_runtime(metadata, proc_root=proc_root)
+        if retired:
+            observed_authority = {
+                field: metadata.get(field) for field in TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
+            }
+            reconcile_exited_terminal_provider_execution_authority(
+                terminal_id,
+                expected_runtime_authority=observed_authority,
+            )
         return True
     if metadata.get("runtime_lifecycle") == TerminalLifecycle.RECOVERY_REQUIRED.value:
         # This is already a durable non-writable recovery boundary. Runtime
@@ -1489,6 +1499,35 @@ def retire_exited_terminal_runtime(
     if not metadata:
         return None
     return _retire_exited_terminal_runtime(metadata, proc_root=proc_root)
+
+
+def reconcile_exited_terminal_provider_execution_authorities(
+    *, proc_root: Path = Path("/proc"), limit: int = 100
+) -> int:
+    """Settle exited provider turns only after exact physical death proof.
+
+    Runtime lifecycle is necessary but not sufficient here.  The exact pane
+    must also be absent or safely retired before the database CAS rechecks
+    generation, writer, reconnect, recovery, and operation authority.
+    """
+    reconciled = 0
+    for terminal_id in list_exited_terminal_provider_execution_candidates(limit=limit):
+        metadata = get_terminal_metadata(terminal_id)
+        if not metadata or metadata.get("runtime_lifecycle") != "exited":
+            continue
+        retired, _reason = _retire_observed_dead_runtime(metadata, proc_root=proc_root)
+        if not retired:
+            continue
+        observed_authority = {
+            field: metadata.get(field) for field in TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
+        }
+        reconciled += int(
+            reconcile_exited_terminal_provider_execution_authority(
+                terminal_id,
+                expected_runtime_authority=observed_authority,
+            )
+        )
+    return reconciled
 
 
 def _canonical_worktree(working_directory: Optional[str]) -> str:

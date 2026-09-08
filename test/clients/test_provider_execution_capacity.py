@@ -784,6 +784,89 @@ def test_inbox_creation_and_runtime_exit_are_serialized(capacity_db):
     assert database.get_provider_execution_admission_queue() == []
 
 
+def test_runtime_exit_terminalizes_exact_provider_execution_without_inventing_success(
+    capacity_db,
+):
+    processing_at = datetime(2026, 9, 8, 12, 0, 0)
+    with database.SessionLocal() as db:
+        workflow = database.WorkflowModel(root_terminal_id="term-0", status="open")
+        db.add(workflow)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="provider-exit-before-final",
+            state="sent",
+            claim_generation=1,
+            provider_processing_observed_at=processing_at,
+        )
+        db.add(turn)
+        db.flush()
+        workflow.active_turn_id = turn.id
+        effect = database.WorkflowEffectModel(
+            workflow_id=workflow.id,
+            workflow_turn_id=turn.id,
+            effect_kind="await_handoff",
+            effect_key="child",
+            state="claimed",
+            claim_token="effect-claim",
+        )
+        db.add_all(
+            [
+                effect,
+                database.ProviderExecutionLeaseModel(
+                    terminal_id="term-0", workflow_turn_id=turn.id
+                ),
+            ]
+        )
+        other_workflow = database.WorkflowModel(root_terminal_id="term-1", status="open")
+        db.add(other_workflow)
+        db.flush()
+        other_turn = WorkflowTurnModel(
+            workflow_id=other_workflow.id,
+            kind="external_input",
+            dedupe_key="other-live-provider",
+            state="sent",
+            provider_processing_observed_at=processing_at,
+        )
+        db.add(other_turn)
+        db.flush()
+        other_workflow.active_turn_id = other_turn.id
+        db.add(
+            database.ProviderExecutionLeaseModel(
+                terminal_id="term-1", workflow_turn_id=other_turn.id
+            )
+        )
+        db.commit()
+        workflow_id = int(workflow.id)
+        turn_id = int(turn.id)
+        effect_id = int(effect.id)
+        other_workflow_id = int(other_workflow.id)
+
+    assert mark_terminal_runtime_exited("term-0") is True
+
+    with database.SessionLocal() as db:
+        workflow = db.get(database.WorkflowModel, workflow_id)
+        turn = db.get(WorkflowTurnModel, turn_id)
+        effect = db.get(database.WorkflowEffectModel, effect_id)
+        assert workflow.status == "cancelled"
+        assert turn.state == "cancelled"
+        assert turn.provider_processing_observed_at == processing_at
+        assert turn.provider_ready_observed_at is None
+        assert turn.queue_reason == database.PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED
+        assert turn.provider_outcome_code is None
+        assert effect.state == "indeterminate"
+        assert db.get(database.ProviderExecutionLeaseModel, "term-0") is None
+        assert db.get(database.ProviderExecutionLeaseModel, "term-1") is not None
+        assert db.get(database.WorkflowModel, other_workflow_id).status == "open"
+
+    assert mark_terminal_runtime_exited("term-0") is True
+    with database.SessionLocal() as db:
+        repeated = db.get(WorkflowTurnModel, turn_id)
+        assert repeated.provider_ready_observed_at is None
+        assert repeated.provider_outcome_code is None
+
+
 def test_inbox_creation_rejects_missing_receiver_without_orphan_row(capacity_db):
     with pytest.raises(ValueError, match="not found"):
         database.create_inbox_message("owner", "missing-terminal", "must not orphan")
@@ -792,7 +875,7 @@ def test_inbox_creation_rejects_missing_receiver_without_orphan_row(capacity_db)
         assert db.query(InboxModel).count() == 0
 
 
-def test_reconcile_exited_terminal_workflow_authority_repairs_legacy_race(capacity_db):
+def test_reconcile_exited_terminal_workflow_authority_repairs_legacy_race(capacity_db, monkeypatch):
     assert mark_terminal_runtime_exited("term-0") is True
     with database.SessionLocal() as db:
         message = InboxModel(
@@ -819,7 +902,22 @@ def test_reconcile_exited_terminal_workflow_authority_repairs_legacy_race(capaci
         db.commit()
 
     assert database.get_provider_execution_admission_queue()[0]["terminal_id"] == "term-0"
-    assert database.reconcile_exited_terminal_workflow_authorities() == 1
+    monkeypatch.setattr(
+        terminal_service,
+        "_retire_observed_dead_runtime",
+        lambda _metadata, **_kwargs: (False, "RECOVERY_RUNTIME_PROCESS_TREE_ACTIVE"),
+    )
+    assert terminal_service.reconcile_exited_terminal_provider_execution_authorities() == 0
+    with database.SessionLocal() as db:
+        assert db.get(database.WorkflowModel, workflow_id).status == "open"
+
+    monkeypatch.setattr(
+        terminal_service,
+        "_retire_observed_dead_runtime",
+        lambda _metadata, **_kwargs: (True, None),
+    )
+    assert terminal_service.reconcile_exited_terminal_provider_execution_authorities() == 1
+    assert terminal_service.reconcile_exited_terminal_provider_execution_authorities() == 0
 
     with database.SessionLocal() as db:
         assert db.get(database.WorkflowModel, workflow_id).status == "cancelled"
@@ -1206,7 +1304,11 @@ def test_provider_release_wakeup_dispatches_merged_sources_without_starvation(
     capacity_db, monkeypatch
 ):
     order: list[tuple[str, str]] = []
-    monkeypatch.setattr(inbox_service, "reconcile_exited_terminal_workflow_authorities", lambda: 0)
+    monkeypatch.setattr(
+        terminal_service,
+        "reconcile_exited_terminal_provider_execution_authorities",
+        lambda: 0,
+    )
     monkeypatch.setattr(
         inbox_service,
         "get_provider_execution_admission_queue",

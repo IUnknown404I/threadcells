@@ -328,11 +328,25 @@ WITH terminal_lifetimes AS MATERIALIZED (
              AS source_terminal_id,
            COALESCE(w.root_terminal_id, linked_workflow.root_terminal_id)
              AS target_terminal_id, '' AS input_preview,
-           effect.created_at, effect.updated_at, 1 AS is_current,
+           effect.created_at, effect.updated_at,
+           CASE WHEN w.status IN ('terminal', 'cancelled')
+                       AND w.active_turn_id = wt.id
+                       AND wt.state IN ('finished', 'cancelled')
+                       AND wt.queue_reason = 'PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED'
+                THEN 0 ELSE 1 END AS is_current,
            effect.state AS queue_state,
-           CASE WHEN effect.state = 'indeterminate' THEN 'indeterminate_effect'
+           CASE WHEN w.status IN ('terminal', 'cancelled')
+                       AND w.active_turn_id = wt.id
+                       AND wt.state IN ('finished', 'cancelled')
+                       AND wt.queue_reason = 'PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED'
+                  THEN NULL
+                WHEN effect.state = 'indeterminate' THEN 'indeterminate_effect'
                 ELSE 'claimed_effect' END AS wait_reason,
-           1 AS admission_pending, effect.workflow_id,
+           CASE WHEN w.status IN ('terminal', 'cancelled')
+                       AND w.active_turn_id = wt.id
+                       AND wt.state IN ('finished', 'cancelled')
+                       AND wt.queue_reason = 'PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED'
+                THEN 0 ELSE 1 END AS admission_pending, effect.workflow_id,
            effect.workflow_turn_id, w.status AS workflow_status,
            w.terminal_reason AS workflow_reason, wt.state AS turn_state,
            wt.kind AS turn_kind, wt.provider_outcome_code,
@@ -340,7 +354,13 @@ WITH terminal_lifetimes AS MATERIALIZED (
            0 AS workflow_turn_count, 0 AS superseded_turn_count,
            NULL AS assignment_id, NULL AS result_id, NULL AS result_status,
            NULL AS result_summary, 0 AS result_available, NULL AS delivery_status,
-           0 AS delivery_pending, NULL AS final_disposition,
+           0 AS delivery_pending,
+           CASE WHEN w.status IN ('terminal', 'cancelled')
+                       AND w.active_turn_id = wt.id
+                       AND wt.state IN ('finished', 'cancelled')
+                       AND wt.queue_reason = 'PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED'
+                THEN 'provider_runtime_exited_indeterminate' ELSE NULL END
+             AS final_disposition,
            CAST(effect.id AS TEXT) AS diagnostic_id
     FROM effect_authority_sessions scoped
     JOIN workflow_effects effect ON effect.id = scoped.effect_id

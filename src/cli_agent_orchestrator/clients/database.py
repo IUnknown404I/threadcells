@@ -3844,6 +3844,9 @@ _WORKSPACE_RETIREMENT_ACTIVE_ASSIGNMENT_STATES = (
 _WORKSPACE_RETIREMENT_TERMINAL_WORKFLOW_STATES = ("terminal", "cancelled")
 _SESSION_DELETION_PLAN_LIMIT = 500
 _OPERATOR_RETIRED_INDETERMINATE_EFFECT = "operator_retired_indeterminate"
+PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED = "PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED"
+PROVIDER_EXECUTION_RECONCILIATION_OPERATION = "provider_execution_reconciliation"
+PROVIDER_EXECUTION_RECONCILIATION_LEASE_SECONDS = 30
 
 
 def _workflow_effect_retirement_authority(
@@ -3904,7 +3907,13 @@ def _workflow_effect_retirement_classification(
     )
     if is_active_turn and turn.provider_reconnect_requested_at is not None:
         return "unsafe", "recovery_authority", "PROVIDER_RECONNECT_ACTIVE"
-    if is_active_turn and processing_unsettled:
+    runtime_exit_reconciled = (
+        is_active_turn
+        and workflow.status in _WORKSPACE_RETIREMENT_TERMINAL_WORKFLOW_STATES
+        and turn.state in ("finished", "cancelled")
+        and turn.queue_reason == PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED
+    )
+    if is_active_turn and processing_unsettled and not runtime_exit_reconciled:
         return "unsafe", "provider_execution", "PROVIDER_EXECUTION_STATE_UNSETTLED"
 
     historical = (
@@ -9715,8 +9724,13 @@ def mark_terminal_runtime_exited_with_workflow_ids(
                 # never terminalize the newer authority.
                 db.rollback()
                 return False, []
+        now = datetime.now()
+        provider_lease = db.get(ProviderExecutionLeaseModel, terminal_id)
+        provider_lease_turn_ids = (
+            (int(provider_lease.workflow_turn_id),) if provider_lease is not None else ()
+        )
         terminal.runtime_lifecycle = "exited"
-        terminal.runtime_exited_at = terminal.runtime_exited_at or datetime.now()
+        terminal.runtime_exited_at = terminal.runtime_exited_at or now
         terminal.runtime_operation_kind = None
         terminal.runtime_operation_token = None
         terminal.runtime_operation_claimed_at = None
@@ -9727,6 +9741,13 @@ def mark_terminal_runtime_exited_with_workflow_ids(
             reason="root terminal exited or deleted",
         )
         _release_or_transfer_worktree_writer_lease(db, terminal_id)
+        db.flush()
+        _reconcile_exited_provider_execution_in_transaction(
+            db,
+            terminal,
+            now=now,
+            additional_turn_ids=provider_lease_turn_ids,
+        )
         db.commit()
         return True, cancelled_workflow_ids
 
@@ -9903,8 +9924,19 @@ def abandon_terminal_runtime_recovery(terminal_id: str) -> tuple[str, List[int]]
         now = datetime.now()
         terminal.runtime_lifecycle = "exited"
         terminal.runtime_exited_at = terminal.runtime_exited_at or now
+        provider_lease = db.get(ProviderExecutionLeaseModel, terminal_id)
+        provider_lease_turn_ids = (
+            (int(provider_lease.workflow_turn_id),) if provider_lease is not None else ()
+        )
         cancelled_workflow_ids = _cancel_protected_workflows_in_transaction(
             db, [terminal_id], reason="runtime recovery was explicitly abandoned"
+        )
+        db.flush()
+        _reconcile_exited_provider_execution_in_transaction(
+            db,
+            terminal,
+            now=now,
+            additional_turn_ids=provider_lease_turn_ids,
         )
         event_key = f"runtime-recovery-abandoned:{terminal_id}:{terminal.runtime_generation}"
         if (
@@ -17757,6 +17789,542 @@ def _cancel_protected_workflows_in_transaction(
     return workflow_ids
 
 
+def _provider_execution_continuation_authority_exists_in_transaction(
+    db: Any, terminal: TerminalModel
+) -> bool:
+    """Return whether durable recovery may still continue this provider runtime."""
+    if terminal.replaced_by_terminal_id is not None or (
+        terminal.provider_resume_identity is not None
+        and terminal.provider_resume_runtime_generation != terminal.runtime_generation
+    ):
+        return True
+    if (
+        db.query(RecoveryTakeoverModel.id)
+        .filter(
+            or_(
+                RecoveryTakeoverModel.old_terminal_id == terminal.id,
+                RecoveryTakeoverModel.new_terminal_id == terminal.id,
+            ),
+            RecoveryTakeoverModel.state.notin_(("failed", "completed")),
+        )
+        .first()
+        is not None
+    ):
+        return True
+    return (
+        db.query(WorkflowProviderReconnectAttemptModel.id)
+        .filter(
+            WorkflowProviderReconnectAttemptModel.root_terminal_id == terminal.id,
+            WorkflowProviderReconnectAttemptModel.state.in_(
+                (
+                    PROVIDER_RECONNECT_RESERVED,
+                    PROVIDER_RECONNECT_LAUNCHED,
+                    PROVIDER_RECONNECT_READY,
+                )
+            ),
+        )
+        .first()
+        is not None
+    )
+
+
+def _reconcile_exited_provider_execution_in_transaction(
+    db: Any,
+    terminal: TerminalModel,
+    *,
+    now: datetime,
+    additional_turn_ids: Sequence[int] = (),
+) -> bool:
+    """Terminalize provider-turn facts after authoritative runtime exit.
+
+    This does not invent a model/tool outcome.  A claimed external effect is
+    preserved as indeterminate, while the exact provider-execution axis is
+    terminalized because the exited runtime can no longer produce output.
+    """
+    if _provider_execution_continuation_authority_exists_in_transaction(db, terminal):
+        return False
+    target_turn_ids = {int(value) for value in additional_turn_ids}
+    rows = (
+        db.query(WorkflowTurnModel, WorkflowModel)
+        .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+        .filter(
+            WorkflowModel.root_terminal_id == terminal.id,
+            WorkflowModel.status.in_((WORKFLOW_TERMINAL, WORKFLOW_CANCELLED)),
+            WorkflowModel.active_turn_id == WorkflowTurnModel.id,
+            and_(
+                or_(
+                    WorkflowTurnModel.queue_reason.is_(None),
+                    WorkflowTurnModel.queue_reason != PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED,
+                ),
+                or_(
+                    WorkflowTurnModel.provider_reconnect_requested_at.is_not(None),
+                    and_(
+                        WorkflowTurnModel.provider_processing_observed_at.is_not(None),
+                        or_(
+                            WorkflowTurnModel.provider_ready_observed_at.is_(None),
+                            WorkflowTurnModel.provider_ready_observed_at
+                            < WorkflowTurnModel.provider_processing_observed_at,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        .all()
+    )
+    target_turn_ids.update(int(turn.id) for turn, _workflow in rows)
+    if not target_turn_ids:
+        return False
+
+    targets = (
+        db.query(WorkflowTurnModel, WorkflowModel)
+        .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+        .filter(
+            WorkflowTurnModel.id.in_(sorted(target_turn_ids)),
+            WorkflowModel.root_terminal_id == terminal.id,
+            WorkflowModel.status.in_((WORKFLOW_TERMINAL, WORKFLOW_CANCELLED)),
+        )
+        .all()
+    )
+    if {int(turn.id) for turn, _workflow in targets} != target_turn_ids:
+        return False
+    for turn, _workflow in targets:
+        bootstrap_generation = turn.provider_outcome_cursor_bootstrap_generation
+        if bootstrap_generation is not None and bootstrap_generation != terminal.runtime_generation:
+            return False
+
+    changed = False
+    for turn, workflow in targets:
+        turn_changed = False
+        if turn.state in (TURN_CLAIMED, TURN_SENT):
+            turn.state = TURN_FINISHED if workflow.status == WORKFLOW_TERMINAL else TURN_CANCELLED
+            turn.claim_token = None
+            turn.claim_expires_at = None
+            turn_changed = True
+        if turn.provider_reconnect_requested_at is not None:
+            turn.provider_reconnect_requested_at = None
+            turn.provider_reconnect_claim_token = None
+            turn.provider_reconnect_resume_identity = None
+            turn_changed = True
+        if turn.queue_reason != PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED:
+            turn.queue_reason = PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED
+            turn_changed = True
+        if turn_changed:
+            turn.updated_at = now
+            changed = True
+        claimed_effects = (
+            db.query(WorkflowEffectModel)
+            .filter(
+                WorkflowEffectModel.workflow_id == turn.workflow_id,
+                WorkflowEffectModel.workflow_turn_id == turn.id,
+                WorkflowEffectModel.state == "claimed",
+            )
+            .all()
+        )
+        for effect in claimed_effects:
+            effect.state = "indeterminate"
+            effect.updated_at = now
+            changed = True
+    return changed
+
+
+def list_exited_terminal_provider_execution_candidates(
+    limit: int = 100, *, after_terminal_id: Optional[str] = None
+) -> List[str]:
+    """List exited terminals whose provider/workflow authority has not converged."""
+    if isinstance(limit, bool) or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    if after_terminal_id is not None and not after_terminal_id:
+        raise ValueError("after_terminal_id must be a non-empty string")
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_provider_execution_schema()
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        workflow_roots = {
+            str(row[0])
+            for row in (
+                db.query(WorkflowModel.root_terminal_id)
+                .join(TerminalModel, TerminalModel.id == WorkflowModel.root_terminal_id)
+                .outerjoin(
+                    WorkflowTurnModel,
+                    WorkflowTurnModel.id == WorkflowModel.active_turn_id,
+                )
+                .filter(
+                    TerminalModel.runtime_lifecycle == "exited",
+                    *(
+                        (WorkflowModel.root_terminal_id > after_terminal_id,)
+                        if after_terminal_id is not None
+                        else ()
+                    ),
+                    WorkflowModel.status.in_(
+                        (
+                            WORKFLOW_OPEN,
+                            WORKFLOW_OWNER_GATE,
+                            WORKFLOW_TERMINAL,
+                            WORKFLOW_CANCELLED,
+                        )
+                    ),
+                    or_(
+                        WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+                        and_(
+                            or_(
+                                WorkflowTurnModel.queue_reason.is_(None),
+                                WorkflowTurnModel.queue_reason
+                                != PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED,
+                            ),
+                            or_(
+                                WorkflowTurnModel.provider_reconnect_requested_at.is_not(None),
+                                and_(
+                                    WorkflowTurnModel.provider_processing_observed_at.is_not(None),
+                                    or_(
+                                        WorkflowTurnModel.provider_ready_observed_at.is_(None),
+                                        WorkflowTurnModel.provider_ready_observed_at
+                                        < WorkflowTurnModel.provider_processing_observed_at,
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+                .distinct()
+                .order_by(WorkflowModel.root_terminal_id.asc())
+                .limit(limit)
+                .all()
+            )
+        }
+        inbox_roots = {
+            str(row[0])
+            for row in (
+                db.query(InboxModel.receiver_id)
+                .join(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
+                .filter(
+                    TerminalModel.runtime_lifecycle == "exited",
+                    *(
+                        (InboxModel.receiver_id > after_terminal_id,)
+                        if after_terminal_id is not None
+                        else ()
+                    ),
+                    InboxModel.status == MessageStatus.PENDING.value,
+                )
+                .distinct()
+                .order_by(InboxModel.receiver_id.asc())
+                .limit(limit)
+                .all()
+            )
+        }
+        lease_roots = {
+            str(row[0])
+            for row in (
+                db.query(ProviderExecutionLeaseModel.terminal_id)
+                .join(TerminalModel, TerminalModel.id == ProviderExecutionLeaseModel.terminal_id)
+                .filter(
+                    TerminalModel.runtime_lifecycle == "exited",
+                    *(
+                        (ProviderExecutionLeaseModel.terminal_id > after_terminal_id,)
+                        if after_terminal_id is not None
+                        else ()
+                    ),
+                )
+                .order_by(ProviderExecutionLeaseModel.terminal_id.asc())
+                .limit(limit)
+                .all()
+            )
+        }
+        return sorted(workflow_roots | inbox_roots | lease_roots)[:limit]
+
+
+def _exited_provider_execution_reconciliation_targets_in_transaction(
+    db: Any, terminal: TerminalModel
+) -> Optional[tuple[Optional[ProviderExecutionLeaseModel], List[WorkflowTurnModel]]]:
+    """Validate every durable continuation axis and return exact target rows."""
+    reconnect_requested = (
+        db.query(WorkflowTurnModel.id)
+        .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+        .filter(
+            WorkflowModel.root_terminal_id == terminal.id,
+            WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+            WorkflowModel.active_turn_id == WorkflowTurnModel.id,
+            WorkflowTurnModel.provider_reconnect_requested_at.is_not(None),
+        )
+        .first()
+    )
+    if (
+        _provider_execution_continuation_authority_exists_in_transaction(db, terminal)
+        or reconnect_requested
+    ):
+        return None
+
+    lease = db.get(ProviderExecutionLeaseModel, terminal.id)
+    lease_turn_ids: tuple[int, ...] = ()
+    if lease is not None:
+        lease_turn = db.get(WorkflowTurnModel, lease.workflow_turn_id)
+        lease_workflow = (
+            db.get(WorkflowModel, lease_turn.workflow_id) if lease_turn is not None else None
+        )
+        if (
+            lease_turn is None
+            or lease_workflow is None
+            or lease_workflow.root_terminal_id != terminal.id
+            or lease_workflow.status
+            not in (
+                WORKFLOW_OPEN,
+                WORKFLOW_OWNER_GATE,
+                WORKFLOW_TERMINAL,
+                WORKFLOW_CANCELLED,
+            )
+        ):
+            return None
+        lease_turn_ids = (int(lease.workflow_turn_id),)
+
+    provider_turns = (
+        db.query(WorkflowTurnModel)
+        .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+        .filter(
+            WorkflowModel.root_terminal_id == terminal.id,
+            WorkflowModel.status.in_(
+                (
+                    WORKFLOW_OPEN,
+                    WORKFLOW_OWNER_GATE,
+                    WORKFLOW_TERMINAL,
+                    WORKFLOW_CANCELLED,
+                )
+            ),
+            or_(
+                WorkflowTurnModel.id.in_(lease_turn_ids),
+                and_(
+                    WorkflowModel.active_turn_id == WorkflowTurnModel.id,
+                    and_(
+                        or_(
+                            WorkflowTurnModel.queue_reason.is_(None),
+                            WorkflowTurnModel.queue_reason
+                            != PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED,
+                        ),
+                        or_(
+                            WorkflowTurnModel.provider_reconnect_requested_at.is_not(None),
+                            and_(
+                                WorkflowTurnModel.provider_processing_observed_at.is_not(None),
+                                or_(
+                                    WorkflowTurnModel.provider_ready_observed_at.is_(None),
+                                    WorkflowTurnModel.provider_ready_observed_at
+                                    < WorkflowTurnModel.provider_processing_observed_at,
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        .all()
+    )
+    if any(
+        turn.provider_outcome_cursor_bootstrap_generation is not None
+        and turn.provider_outcome_cursor_bootstrap_generation != terminal.runtime_generation
+        for turn in provider_turns
+    ):
+        return None
+
+    had_candidate = bool(
+        lease is not None
+        or db.query(WorkflowModel.id)
+        .filter(
+            WorkflowModel.root_terminal_id == terminal.id,
+            WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+        )
+        .first()
+        is not None
+        or db.query(InboxModel.id)
+        .filter(
+            InboxModel.receiver_id == terminal.id,
+            InboxModel.status == MessageStatus.PENDING.value,
+        )
+        .first()
+        is not None
+        or provider_turns
+    )
+    return (lease, provider_turns) if had_candidate else None
+
+
+def claim_exited_terminal_provider_execution_reconciliation(
+    terminal_id: str,
+    *,
+    expected_runtime_authority: Mapping[str, Any],
+    now: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """Fence continuation claimants before exact physical runtime retirement.
+
+    The short durable operation claim makes pane retirement mutually exclusive
+    with writer, reconnect, recovery, and transport authority. A process crash
+    is recoverable: only this reconciler may replace its own expired claim.
+    """
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_provider_execution_schema()
+    _ensure_child_assignment_schema()
+    _ensure_workflow_schema()
+    now = now or datetime.now()
+    claim_token = uuid.uuid4().hex
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.get(TerminalModel, terminal_id)
+        if terminal is None or any(
+            field not in expected_runtime_authority
+            or getattr(terminal, field) != expected_runtime_authority[field]
+            for field in TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
+        ):
+            db.rollback()
+            return None
+        operation_empty = all(
+            value is None
+            for value in (
+                terminal.runtime_operation_kind,
+                terminal.runtime_operation_token,
+                terminal.runtime_operation_claimed_at,
+                terminal.runtime_operation_expires_at,
+            )
+        )
+        expired_reconciliation = bool(
+            terminal.runtime_operation_kind == PROVIDER_EXECUTION_RECONCILIATION_OPERATION
+            and terminal.runtime_operation_token
+            and terminal.runtime_operation_claimed_at
+            and terminal.runtime_operation_expires_at
+            and terminal.runtime_operation_expires_at <= now
+        )
+        if (
+            terminal.runtime_lifecycle != "exited"
+            or terminal.runtime_exited_at is None
+            or not (operation_empty or expired_reconciliation)
+            or db.query(WorktreeWriterLeaseModel.canonical_worktree)
+            .filter(WorktreeWriterLeaseModel.terminal_id == terminal_id)
+            .first()
+            is not None
+            or _exited_provider_execution_reconciliation_targets_in_transaction(db, terminal)
+            is None
+        ):
+            db.rollback()
+            return None
+        terminal.runtime_operation_kind = PROVIDER_EXECUTION_RECONCILIATION_OPERATION
+        terminal.runtime_operation_token = claim_token
+        terminal.runtime_operation_claimed_at = now
+        terminal.runtime_operation_expires_at = now + timedelta(
+            seconds=PROVIDER_EXECUTION_RECONCILIATION_LEASE_SECONDS
+        )
+        db.commit()
+        return {
+            "claim_token": claim_token,
+            "runtime_authority": {
+                field: getattr(terminal, field) for field in TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
+            },
+        }
+
+
+def release_exited_terminal_provider_execution_reconciliation_claim(
+    terminal_id: str, claim_token: str
+) -> bool:
+    """Release only the exact provider-execution reconciliation claim."""
+    _ensure_terminal_worktree_authority_schema()
+    with SessionLocal() as db:
+        released = (
+            db.query(TerminalModel)
+            .filter(
+                TerminalModel.id == terminal_id,
+                TerminalModel.runtime_operation_kind == PROVIDER_EXECUTION_RECONCILIATION_OPERATION,
+                TerminalModel.runtime_operation_token == claim_token,
+            )
+            .update(
+                {
+                    TerminalModel.runtime_operation_kind: None,
+                    TerminalModel.runtime_operation_token: None,
+                    TerminalModel.runtime_operation_claimed_at: None,
+                    TerminalModel.runtime_operation_expires_at: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return released == 1
+
+
+def reconcile_exited_terminal_provider_execution_authority(
+    terminal_id: str,
+    *,
+    expected_runtime_authority: Mapping[str, Any],
+    claim_token: str,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Converge one positively-dead runtime without crossing recovery authority.
+
+    The external caller must first own the durable reconciliation claim, then
+    prove exact tmux/process death. Every continuation axis and the same claim
+    are rechecked under the SQLite writer fence. Unknown effect outcomes remain
+    indeterminate; only provider execution and transport authority are closed.
+    """
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_provider_execution_schema()
+    _ensure_child_assignment_schema()
+    _ensure_workflow_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.get(TerminalModel, terminal_id)
+        if terminal is None or any(
+            field not in expected_runtime_authority
+            or getattr(terminal, field) != expected_runtime_authority[field]
+            for field in TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
+        ):
+            db.rollback()
+            return False
+        if (
+            terminal.runtime_lifecycle != "exited"
+            or terminal.runtime_exited_at is None
+            or terminal.runtime_operation_kind != PROVIDER_EXECUTION_RECONCILIATION_OPERATION
+            or terminal.runtime_operation_token != claim_token
+            or db.query(WorktreeWriterLeaseModel.canonical_worktree)
+            .filter(WorktreeWriterLeaseModel.terminal_id == terminal_id)
+            .first()
+            is not None
+        ):
+            db.rollback()
+            return False
+        targets = _exited_provider_execution_reconciliation_targets_in_transaction(db, terminal)
+        if targets is None:
+            db.rollback()
+            return False
+        lease, provider_turns = targets
+
+        _cancel_protected_workflows_in_transaction(
+            db,
+            [terminal_id],
+            reason="root terminal exited or deleted",
+        )
+        db.flush()
+        _reconcile_exited_provider_execution_in_transaction(
+            db,
+            terminal,
+            now=now,
+            additional_turn_ids=[int(turn.id) for turn in provider_turns],
+        )
+        if lease is not None:
+            # The cancellation helper normally deleted this exact row. Keep
+            # an explicit exact fallback for historical terminal workflows.
+            db.query(ProviderExecutionLeaseModel).filter(
+                ProviderExecutionLeaseModel.terminal_id == terminal_id,
+                ProviderExecutionLeaseModel.workflow_turn_id == lease.workflow_turn_id,
+            ).delete(synchronize_session=False)
+        terminal.runtime_operation_kind = None
+        terminal.runtime_operation_token = None
+        terminal.runtime_operation_claimed_at = None
+        terminal.runtime_operation_expires_at = None
+        db.commit()
+        return True
+
+
+def reconcile_exited_terminal_workflow_authorities() -> int:
+    """Compatibility entry point using canonical physical-runtime reconciliation."""
+    from cli_agent_orchestrator.services.terminal_service import (
+        reconcile_exited_terminal_provider_execution_authorities,
+    )
+
+    return reconcile_exited_terminal_provider_execution_authorities()
+
+
 def cancel_workflows_for_terminal_with_ids(terminal_id: str) -> List[int]:
     """Cancel resumable workflows and return the exact transition-winning IDs."""
     _ensure_workflow_schema()
@@ -17776,48 +18344,6 @@ def cancel_workflows_for_terminal_with_ids(terminal_id: str) -> List[int]:
 def cancel_workflows_for_terminal(terminal_id: str) -> int:
     """Cancel open workflows while preserving the established count contract."""
     return len(cancel_workflows_for_terminal_with_ids(terminal_id))
-
-
-def reconcile_exited_terminal_workflow_authorities() -> int:
-    """Cancel historical workflow/Inbox authority rooted at exited terminals.
-
-    Runtime exit now performs this transition atomically. This reconciliation
-    is the bounded rolling-upgrade repair for rows created by an older Inbox
-    wake after its separate exit transaction had already committed.
-    """
-    _ensure_terminal_worktree_authority_schema()
-    _ensure_child_assignment_schema()
-    _ensure_workflow_schema()
-    with SessionLocal() as db:
-        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
-        workflow_roots = {
-            str(row[0])
-            for row in db.query(WorkflowModel.root_terminal_id)
-            .join(TerminalModel, TerminalModel.id == WorkflowModel.root_terminal_id)
-            .filter(
-                TerminalModel.runtime_lifecycle == "exited",
-                WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
-            )
-            .all()
-        }
-        inbox_roots = {
-            str(row[0])
-            for row in db.query(InboxModel.receiver_id)
-            .join(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
-            .filter(
-                TerminalModel.runtime_lifecycle == "exited",
-                InboxModel.status == MessageStatus.PENDING.value,
-            )
-            .all()
-        }
-        roots = sorted(workflow_roots | inbox_roots)
-        _cancel_protected_workflows_in_transaction(
-            db,
-            roots,
-            reason="root terminal exited or deleted",
-        )
-        db.commit()
-        return len(roots)
 
 
 def _orphaned_protected_workflow_authority_snapshot(

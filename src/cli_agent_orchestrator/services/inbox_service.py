@@ -67,7 +67,6 @@ from cli_agent_orchestrator.clients.database import (
     mark_workflow_turn_sent_for_inbox,
     materialize_deferred_handoff_result_turn_for_inbox,
     reconcile_closed_workflow_inbox_transports,
-    reconcile_exited_terminal_workflow_authorities,
     reconcile_owner_gated_workflow_successors,
     reconcile_receipted_callback_after_reconnect_promotion,
     reconcile_result_callbacks_superseded_by_resume,
@@ -683,7 +682,14 @@ def _reconcile_provider_execution_queue_with_admission(
         # Rolling-upgrade repair: older runtimes could materialize ordinary
         # Inbox work after the receiver had already crossed to Exited. Retire
         # that false authority before it can occupy the shared FIFO.
-        reconcile_exited_terminal_workflow_authorities()
+        reconciled_exited_executions = (
+            terminal_service.reconcile_exited_terminal_provider_execution_authorities()
+        )
+        if reconciled_exited_executions:
+            logger.info(
+                "Reconciled %s provider executions after authoritative runtime exit",
+                reconciled_exited_executions,
+            )
         # Rolling-upgrade repair for the pre-fix composition where a Ready
         # reconnect promoted Composer before a receipted callback could finish
         # its acknowledgement. It runs only after the promoted execution's

@@ -784,6 +784,89 @@ def test_inbox_creation_and_runtime_exit_are_serialized(capacity_db):
     assert database.get_provider_execution_admission_queue() == []
 
 
+def test_runtime_exit_terminalizes_exact_provider_execution_without_inventing_success(
+    capacity_db,
+):
+    processing_at = datetime(2026, 9, 8, 12, 0, 0)
+    with database.SessionLocal() as db:
+        workflow = database.WorkflowModel(root_terminal_id="term-0", status="open")
+        db.add(workflow)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="provider-exit-before-final",
+            state="sent",
+            claim_generation=1,
+            provider_processing_observed_at=processing_at,
+        )
+        db.add(turn)
+        db.flush()
+        workflow.active_turn_id = turn.id
+        effect = database.WorkflowEffectModel(
+            workflow_id=workflow.id,
+            workflow_turn_id=turn.id,
+            effect_kind="await_handoff",
+            effect_key="child",
+            state="claimed",
+            claim_token="effect-claim",
+        )
+        db.add_all(
+            [
+                effect,
+                database.ProviderExecutionLeaseModel(
+                    terminal_id="term-0", workflow_turn_id=turn.id
+                ),
+            ]
+        )
+        other_workflow = database.WorkflowModel(root_terminal_id="term-1", status="open")
+        db.add(other_workflow)
+        db.flush()
+        other_turn = WorkflowTurnModel(
+            workflow_id=other_workflow.id,
+            kind="external_input",
+            dedupe_key="other-live-provider",
+            state="sent",
+            provider_processing_observed_at=processing_at,
+        )
+        db.add(other_turn)
+        db.flush()
+        other_workflow.active_turn_id = other_turn.id
+        db.add(
+            database.ProviderExecutionLeaseModel(
+                terminal_id="term-1", workflow_turn_id=other_turn.id
+            )
+        )
+        db.commit()
+        workflow_id = int(workflow.id)
+        turn_id = int(turn.id)
+        effect_id = int(effect.id)
+        other_workflow_id = int(other_workflow.id)
+
+    assert mark_terminal_runtime_exited("term-0") is True
+
+    with database.SessionLocal() as db:
+        workflow = db.get(database.WorkflowModel, workflow_id)
+        turn = db.get(WorkflowTurnModel, turn_id)
+        effect = db.get(database.WorkflowEffectModel, effect_id)
+        assert workflow.status == "cancelled"
+        assert turn.state == "cancelled"
+        assert turn.provider_processing_observed_at == processing_at
+        assert turn.provider_ready_observed_at is None
+        assert turn.queue_reason == database.PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED
+        assert turn.provider_outcome_code is None
+        assert effect.state == "indeterminate"
+        assert db.get(database.ProviderExecutionLeaseModel, "term-0") is None
+        assert db.get(database.ProviderExecutionLeaseModel, "term-1") is not None
+        assert db.get(database.WorkflowModel, other_workflow_id).status == "open"
+
+    assert mark_terminal_runtime_exited("term-0") is True
+    with database.SessionLocal() as db:
+        repeated = db.get(WorkflowTurnModel, turn_id)
+        assert repeated.provider_ready_observed_at is None
+        assert repeated.provider_outcome_code is None
+
+
 def test_inbox_creation_rejects_missing_receiver_without_orphan_row(capacity_db):
     with pytest.raises(ValueError, match="not found"):
         database.create_inbox_message("owner", "missing-terminal", "must not orphan")
@@ -792,7 +875,7 @@ def test_inbox_creation_rejects_missing_receiver_without_orphan_row(capacity_db)
         assert db.query(InboxModel).count() == 0
 
 
-def test_reconcile_exited_terminal_workflow_authority_repairs_legacy_race(capacity_db):
+def test_reconcile_exited_terminal_workflow_authority_repairs_legacy_race(capacity_db, monkeypatch):
     assert mark_terminal_runtime_exited("term-0") is True
     with database.SessionLocal() as db:
         message = InboxModel(
@@ -819,13 +902,180 @@ def test_reconcile_exited_terminal_workflow_authority_repairs_legacy_race(capaci
         db.commit()
 
     assert database.get_provider_execution_admission_queue()[0]["terminal_id"] == "term-0"
-    assert database.reconcile_exited_terminal_workflow_authorities() == 1
+    monkeypatch.setattr(
+        terminal_service,
+        "_retire_observed_dead_runtime",
+        lambda _metadata, **_kwargs: (False, "RECOVERY_RUNTIME_PROCESS_TREE_ACTIVE"),
+    )
+    assert terminal_service.reconcile_exited_terminal_provider_execution_authorities() == 0
+    with database.SessionLocal() as db:
+        assert db.get(database.WorkflowModel, workflow_id).status == "open"
+
+    monkeypatch.setattr(
+        terminal_service,
+        "_retire_observed_dead_runtime",
+        lambda _metadata, **_kwargs: (True, None),
+    )
+    assert terminal_service.reconcile_exited_terminal_provider_execution_authorities() == 1
+    assert terminal_service.reconcile_exited_terminal_provider_execution_authorities() == 0
 
     with database.SessionLocal() as db:
         assert db.get(database.WorkflowModel, workflow_id).status == "cancelled"
         assert db.get(InboxModel, message_id).status == "failed"
         assert db.get(WorkflowTurnModel, turn_id).state == "cancelled"
     assert database.get_provider_execution_admission_queue() == []
+
+
+def test_exited_provider_reconciliation_claim_fences_physical_retirement(capacity_db, monkeypatch):
+    observed_at = datetime.now()
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, "term-0")
+        terminal.runtime_lifecycle = "exited"
+        terminal.runtime_exited_at = observed_at
+        terminal.runtime_operation_kind = "reconnect"
+        terminal.runtime_operation_token = "live-reconnect"
+        terminal.runtime_operation_claimed_at = observed_at
+        terminal.runtime_operation_expires_at = observed_at + timedelta(minutes=1)
+        workflow = database.WorkflowModel(root_terminal_id="term-0", status="open")
+        db.add(workflow)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="live-claimant",
+            state="sent",
+            provider_processing_observed_at=observed_at,
+        )
+        db.add(turn)
+        db.flush()
+        workflow.active_turn_id = turn.id
+        db.commit()
+
+    retire = MagicMock(return_value=(True, None))
+    monkeypatch.setattr(terminal_service, "_retire_observed_dead_runtime", retire)
+
+    assert terminal_service.reconcile_exited_terminal_provider_execution_authorities() == 0
+    retire.assert_not_called()
+
+
+def test_exited_provider_reconciliation_keyset_scan_cannot_starve_later_session(
+    capacity_db, monkeypatch
+):
+    observed_at = datetime.now()
+    with database.SessionLocal() as db:
+        for index in range(101):
+            terminal_id = f"blocked-{index:03d}"
+            terminal = TerminalModel(
+                id=terminal_id,
+                tmux_session=f"blocked-session-{index:03d}",
+                session_id=f"blocked-session-{index:03d}",
+                tmux_window=terminal_id,
+                provider="codex",
+                runtime_lifecycle="exited",
+                runtime_exited_at=observed_at,
+                runtime_operation_kind="reconnect",
+                runtime_operation_token=f"reconnect-{index:03d}",
+                runtime_operation_claimed_at=observed_at,
+                runtime_operation_expires_at=observed_at + timedelta(minutes=1),
+            )
+            workflow = database.WorkflowModel(root_terminal_id=terminal_id, status="open")
+            db.add_all([terminal, workflow])
+            db.flush()
+            turn = WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="external_input",
+                dedupe_key=f"blocked-turn-{index:03d}",
+                state="sent",
+                provider_processing_observed_at=observed_at,
+            )
+            db.add(turn)
+            db.flush()
+            workflow.active_turn_id = turn.id
+
+        target = TerminalModel(
+            id="target-zzz",
+            tmux_session="target-session",
+            session_id="target-session",
+            tmux_window="target-zzz",
+            provider="codex",
+            runtime_lifecycle="exited",
+            runtime_exited_at=observed_at,
+        )
+        target_workflow = database.WorkflowModel(root_terminal_id=target.id, status="open")
+        db.add_all([target, target_workflow])
+        db.flush()
+        target_turn = WorkflowTurnModel(
+            workflow_id=target_workflow.id,
+            kind="external_input",
+            dedupe_key="target-turn",
+            state="sent",
+            provider_processing_observed_at=observed_at,
+        )
+        db.add(target_turn)
+        db.flush()
+        target_workflow.active_turn_id = target_turn.id
+        target_workflow_id = int(target_workflow.id)
+        db.commit()
+
+    retired_terminal_ids = []
+
+    def retire(metadata, **_kwargs):
+        retired_terminal_ids.append(metadata["id"])
+        return True, None
+
+    monkeypatch.setattr(terminal_service, "_retire_observed_dead_runtime", retire)
+
+    assert terminal_service.reconcile_exited_terminal_provider_execution_authorities(limit=100) == 1
+    assert retired_terminal_ids == ["target-zzz"]
+    with database.SessionLocal() as db:
+        assert db.get(database.WorkflowModel, target_workflow_id).status == "cancelled"
+        assert (
+            db.query(database.WorkflowModel)
+            .filter(database.WorkflowModel.root_terminal_id.like("blocked-%"))
+            .filter(database.WorkflowModel.status == "open")
+            .count()
+            == 101
+        )
+
+
+def test_exited_provider_reconciliation_reclaims_expired_crash_claim(capacity_db, monkeypatch):
+    observed_at = datetime.now()
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, "term-0")
+        terminal.runtime_lifecycle = "exited"
+        terminal.runtime_exited_at = observed_at
+        terminal.runtime_operation_kind = database.PROVIDER_EXECUTION_RECONCILIATION_OPERATION
+        terminal.runtime_operation_token = "crashed-reconciler"
+        terminal.runtime_operation_claimed_at = observed_at - timedelta(minutes=2)
+        terminal.runtime_operation_expires_at = observed_at - timedelta(minutes=1)
+        workflow = database.WorkflowModel(root_terminal_id="term-0", status="open")
+        db.add(workflow)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="crash-recovery",
+            state="sent",
+            provider_processing_observed_at=observed_at,
+        )
+        db.add(turn)
+        db.flush()
+        workflow.active_turn_id = turn.id
+        workflow_id = int(workflow.id)
+        db.commit()
+
+    monkeypatch.setattr(
+        terminal_service,
+        "_retire_observed_dead_runtime",
+        lambda _metadata, **_kwargs: (True, None),
+    )
+
+    assert terminal_service.reconcile_exited_terminal_provider_execution_authorities() == 1
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, "term-0")
+        assert terminal.runtime_operation_kind is None
+        assert terminal.runtime_operation_token is None
+        assert db.get(database.WorkflowModel, workflow_id).status == "cancelled"
 
 
 def test_composer_request_is_durable_and_idempotent(capacity_db):
@@ -1206,7 +1456,11 @@ def test_provider_release_wakeup_dispatches_merged_sources_without_starvation(
     capacity_db, monkeypatch
 ):
     order: list[tuple[str, str]] = []
-    monkeypatch.setattr(inbox_service, "reconcile_exited_terminal_workflow_authorities", lambda: 0)
+    monkeypatch.setattr(
+        terminal_service,
+        "reconcile_exited_terminal_provider_execution_authorities",
+        lambda: 0,
+    )
     monkeypatch.setattr(
         inbox_service,
         "get_provider_execution_admission_queue",

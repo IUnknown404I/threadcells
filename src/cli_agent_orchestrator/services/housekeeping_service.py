@@ -40,6 +40,7 @@ class HousekeepingSummary:
     browser_revisions_removed: int = 0
     browser_revision_candidates: int = 0
     writer_leases_reconciled: int = 0
+    provider_executions_reconciled: int = 0
     retirement_cleanups_reconciled: int = 0
     terminal_runtimes_retired: int = 0
     legacy_authority_reconciled: int = 0
@@ -544,6 +545,23 @@ def _reconcile_writer_leases(
         elif reconciled is None:
             summary.skipped_unknown += 1
             summary.warnings.append(f"runtime_history_finalization_failed:{terminal_id}")
+
+
+def _reconcile_provider_executions(
+    summary: HousekeepingSummary, *, proc_root: Path = Path("/proc")
+) -> None:
+    """Reuse canonical runtime-exit reconciliation for stale provider turns."""
+    from cli_agent_orchestrator.services.terminal_service import (
+        reconcile_exited_terminal_provider_execution_authorities,
+    )
+
+    try:
+        summary.provider_executions_reconciled += (
+            reconcile_exited_terminal_provider_execution_authorities(proc_root=proc_root)
+        )
+    except Exception:
+        summary.skipped_unknown += 1
+        summary.warnings.append("provider_execution_reconciliation_uncertain")
 
 
 def _reconcile_supervisor_context_roles(summary: HousekeepingSummary) -> None:
@@ -1548,6 +1566,7 @@ def run_housekeeping(
         if not dry_run:
             _reconcile_supervisor_context_roles(summary)
             _reconcile_writer_leases(summary)
+            _reconcile_provider_executions(summary, proc_root=proc_root)
             _reconcile_legacy_terminal_authority(summary)
         _inventory_warnings(root, cfg, summary)
         summary.disk_after = shutil.disk_usage("/").free

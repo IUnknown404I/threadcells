@@ -18,6 +18,7 @@ from cli_agent_orchestrator.clients.database import (
     TerminalModel,
     WorkflowEffectModel,
     WorkflowModel,
+    WorkflowProviderReconnectAttemptModel,
     WorkflowTurnModel,
     WorkflowTurnReceiptModel,
     WorktreeWriterLeaseModel,
@@ -62,6 +63,26 @@ def _terminal(terminal_id: str = "owner", session_id: str = "session") -> Termin
 
 def _plan(session_id: str = "session"):
     return database.get_session_unresolved_work_plan(session_id)
+
+
+def _runtime_authority(terminal_id: str = "owner") -> dict:
+    metadata = database.get_terminal_metadata(terminal_id)
+    assert metadata is not None
+    return {
+        field: metadata.get(field) for field in database.TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
+    }
+
+
+def _claim_provider_reconciliation(
+    terminal_id: str = "owner", *, now: datetime | None = None
+) -> dict:
+    claim = database.claim_exited_terminal_provider_execution_reconciliation(
+        terminal_id,
+        expected_runtime_authority=_runtime_authority(terminal_id),
+        now=now,
+    )
+    assert claim is not None
+    return claim
 
 
 def test_historical_lifecycle_axes_do_not_block_or_enter_current_queue(monkeypatch):
@@ -941,6 +962,232 @@ def test_terminal_workflow_unsettled_provider_processing_blocks_historical_retir
     assert settled["deletion_mode"] == ("eligible_with_historical_indeterminate_retirement")
     assert settled["historical_indeterminate_count"] == 1
     assert settled["live_unsafe_count"] == 0
+
+
+def test_exited_provider_reconciliation_moves_only_exact_unknown_effect_to_history(
+    monkeypatch,
+):
+    _install_database(monkeypatch)
+    processing_at = datetime(2026, 9, 7, 10, 5, 0)
+    with database.SessionLocal() as db:
+        terminal = _terminal()
+        terminal.runtime_exited_at = processing_at
+        terminal.runtime_generation = "runtime-generation"
+        db.add(terminal)
+        workflow = WorkflowModel(
+            root_terminal_id="owner",
+            status="cancelled",
+            terminal_reason="root terminal exited or deleted",
+        )
+        db.add(workflow)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="inbox_message",
+            dedupe_key="production-stale-provider",
+            state="sent",
+            claim_generation=1,
+            provider_processing_observed_at=processing_at,
+        )
+        db.add(turn)
+        db.flush()
+        workflow.active_turn_id = turn.id
+        effect = WorkflowEffectModel(
+            workflow_id=workflow.id,
+            workflow_turn_id=turn.id,
+            effect_kind="await_handoff",
+            effect_key="completed-child",
+            state="indeterminate",
+            claim_token="effect-claim",
+        )
+        db.add(effect)
+        db.commit()
+        turn_id = int(turn.id)
+        effect_id = int(effect.id)
+
+    before = _plan()
+    assert before["live_unsafe_count"] == 1
+    assert before["historical_indeterminate_count"] == 0
+    assert "PROVIDER_EXECUTION_STATE_UNSETTLED" in before["reason_codes"]
+    assert interaction_read_model_service.list_session_current_queue_counts(["session"]) == {
+        "session": 1
+    }
+    assert database.list_provider_execution_leases() == []
+
+    claim = _claim_provider_reconciliation(now=processing_at)
+    assert database.reconcile_exited_terminal_provider_execution_authority(
+        "owner",
+        expected_runtime_authority=claim["runtime_authority"],
+        claim_token=claim["claim_token"],
+        now=processing_at,
+    )
+    assert not database.reconcile_exited_terminal_provider_execution_authority(
+        "owner",
+        expected_runtime_authority=claim["runtime_authority"],
+        claim_token=claim["claim_token"],
+        now=processing_at,
+    )
+
+    after = _plan()
+    assert after["live_unsafe_count"] == 0
+    assert after["historical_indeterminate_count"] == 1
+    assert after["deletion_mode"] == "eligible_with_historical_indeterminate_retirement"
+    assert interaction_read_model_service.list_session_current_queue_counts(["session"]) == {
+        "session": 0
+    }
+    history = interaction_read_model_service.list_interactions("session", mode="history", limit=20)
+    history_effect = next(
+        item for item in history["items"] if item["diagnostics"]["durable_id"] == str(effect_id)
+    )
+    assert history_effect["final_disposition"] == "provider_runtime_exited_indeterminate"
+    assert history_effect["workflow"]["effect_state"] == "indeterminate"
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, turn_id)
+        assert turn.state == "cancelled"
+        assert turn.provider_processing_observed_at == processing_at
+        assert turn.provider_ready_observed_at is None
+        assert turn.provider_outcome_code is None
+
+
+def test_exited_provider_reconciliation_fails_closed_for_continuation_authority(
+    monkeypatch,
+):
+    _install_database(monkeypatch)
+    observed_at = datetime(2026, 9, 7, 10, 5, 0)
+    with database.SessionLocal() as db:
+        terminal = _terminal()
+        terminal.runtime_exited_at = observed_at
+        terminal.runtime_generation = "runtime-generation"
+        terminal.provider_resume_identity = "resume-identity"
+        terminal.provider_resume_runtime_generation = "newer-generation"
+        db.add(terminal)
+        workflow = WorkflowModel(root_terminal_id="owner", status="open")
+        db.add(workflow)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="recoverable-provider",
+            state="sent",
+            provider_processing_observed_at=observed_at,
+            provider_outcome_cursor_bootstrap_generation="runtime-generation",
+        )
+        db.add(turn)
+        db.flush()
+        workflow.active_turn_id = turn.id
+        db.commit()
+        workflow_id = int(workflow.id)
+        turn_id = int(turn.id)
+
+    def assert_preserved() -> None:
+        assert (
+            database.claim_exited_terminal_provider_execution_reconciliation(
+                "owner", expected_runtime_authority=_runtime_authority(), now=observed_at
+            )
+            is None
+        )
+        assert not database.reconcile_exited_terminal_provider_execution_authority(
+            "owner",
+            expected_runtime_authority=_runtime_authority(),
+            claim_token="not-owned",
+            now=observed_at,
+        )
+        with database.SessionLocal() as db:
+            assert db.get(WorkflowModel, workflow_id).status == "open"
+            assert db.get(WorkflowTurnModel, turn_id).state == "sent"
+
+    assert_preserved()
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, "owner")
+        terminal.provider_resume_runtime_generation = terminal.runtime_generation
+        terminal.runtime_operation_kind = "reconnect"
+        terminal.runtime_operation_token = "runtime-operation"
+        db.commit()
+    assert_preserved()
+
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, "owner")
+        terminal.runtime_operation_kind = None
+        terminal.runtime_operation_token = None
+        db.add(
+            WorktreeWriterLeaseModel(
+                canonical_worktree="/managed/session",
+                terminal_id="owner",
+                authority_generation="writer-generation",
+            )
+        )
+        db.commit()
+    assert_preserved()
+
+    with database.SessionLocal() as db:
+        db.query(WorktreeWriterLeaseModel).delete()
+        db.add(
+            RecoveryTakeoverModel(
+                id="takeover",
+                request_id="takeover-request",
+                old_terminal_id="owner",
+                new_terminal_id="replacement",
+                old_session_id="session",
+                expected_authority_generation="writer-generation",
+                expected_runtime_generation="runtime-generation",
+                new_authority_generation="new-writer-generation",
+                canonical_worktree="/managed/session",
+                project_id="project",
+                agent_profile="supervisor",
+                provider="codex",
+                owner_grant_id="owner-grant",
+                new_session_name="cao-replacement",
+                new_session_id="replacement-session",
+                new_window_name="replacement",
+                new_runtime_generation="replacement-runtime",
+                state="claimed",
+            )
+        )
+        db.commit()
+    assert_preserved()
+
+    with database.SessionLocal() as db:
+        takeover = db.get(RecoveryTakeoverModel, "takeover")
+        takeover.state = "failed"
+        db.add(
+            WorkflowProviderReconnectAttemptModel(
+                workflow_id=workflow_id,
+                workflow_turn_id=turn_id,
+                root_terminal_id="owner",
+                attempt_number=1,
+                attempt_token="reconnect-attempt",
+                state=database.PROVIDER_RECONNECT_RESERVED,
+            )
+        )
+        db.commit()
+    assert_preserved()
+
+    with database.SessionLocal() as db:
+        attempt = db.query(WorkflowProviderReconnectAttemptModel).one()
+        attempt.state = database.PROVIDER_RECONNECT_FAILED
+        turn = db.get(WorkflowTurnModel, turn_id)
+        turn.provider_reconnect_requested_at = observed_at
+        db.commit()
+    assert_preserved()
+
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, turn_id)
+        turn.provider_reconnect_requested_at = None
+        turn.provider_outcome_cursor_bootstrap_generation = "different-generation"
+        db.commit()
+    assert_preserved()
+
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, turn_id)
+        turn.provider_outcome_cursor_bootstrap_generation = "runtime-generation"
+        db.commit()
+    claim = _claim_provider_reconciliation(now=observed_at)
+    assert database.reconcile_exited_terminal_provider_execution_authority(
+        "owner",
+        expected_runtime_authority=claim["runtime_authority"],
+        claim_token=claim["claim_token"],
+        now=observed_at,
+    )
 
 
 def test_effect_retirement_rejects_missing_and_cross_workflow_linkage(monkeypatch):

@@ -360,7 +360,8 @@ export interface SessionDeletionBlocker {
 
 export interface SessionDeletionPreflight {
   eligible: boolean
-  deletion_mode: 'eligible_normal' | 'eligible_with_cancellable_work' | 'eligible_with_historical_indeterminate_retirement' | 'blocked_live_or_unsafe_authority'
+  deletion_mode: 'eligible_normal' | 'eligible_with_cancellable_work' | 'eligible_with_historical_indeterminate_retirement' | 'blocked_live_or_unsafe_authority' | 'deletion_in_progress'
+  deletion_in_progress?: boolean
   cancellable: boolean
   can_resolve_and_delete: boolean
   already_deleted: boolean
@@ -978,7 +979,15 @@ export const api = {
       retire_historical_indeterminate: String(retireHistoricalIndeterminate),
     })
     if (cancellationPlanToken) search.set('cancellation_plan_token', cancellationPlanToken)
-    return fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${encodeURIComponent(name)}?${search}`, { method: 'DELETE' })
+    return fetchJSON<{
+      success: boolean
+      deleted: string[]
+      errors: any[]
+      already_deleted?: boolean
+      purged_rows?: Record<string, number>
+      remaining_rows?: Record<string, number>
+      tombstone_count?: number
+    }>(`/sessions/${encodeURIComponent(name)}?${search}`, { method: 'DELETE' })
   },
 
   // Terminals

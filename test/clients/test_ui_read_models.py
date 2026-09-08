@@ -14,6 +14,7 @@ from cli_agent_orchestrator.clients.database import (
     ProviderExecutionLeaseModel,
     RecoveryTakeoverModel,
     SessionDeletionReceiptModel,
+    TerminalDeletionReceiptModel,
     TerminalModel,
     WorkflowEffectModel,
     WorkflowModel,
@@ -43,6 +44,8 @@ def _install_database(monkeypatch, url="sqlite:///:memory:"):
         "_ensure_delegation_result_schema",
     ):
         monkeypatch.setattr(database, name, lambda: None)
+    database._ensure_session_deletion_receipt_schema()
+    database._ensure_terminal_deletion_receipt_schema()
     return engine
 
 
@@ -927,6 +930,8 @@ def test_session_lifetime_filter_never_coalesces_reused_tmux_name(monkeypatch):
 def test_projection_lazily_creates_session_receipt_table_for_older_schema(monkeypatch):
     engine = _install_database(monkeypatch)
     SessionDeletionReceiptModel.__table__.drop(bind=engine)
+    monkeypatch.setattr(database, "_session_deletion_receipt_schema_ready", False)
+    monkeypatch.setattr(database, "_session_deletion_receipt_schema_engine_identity", None)
     with database.SessionLocal() as db:
         db.add(
             TerminalModel(
@@ -2314,6 +2319,52 @@ def test_session_page_adds_one_bounded_current_only_count_query(monkeypatch):
         "ix_child_assignments_child_status_created",
         "ix_workflow_effects_workflow_turn_state",
     }.issubset(indexes)
+
+
+def test_receipt_only_undeleted_session_remains_visible_and_counted(monkeypatch):
+    _install_database(monkeypatch)
+    deleted_at = datetime(2026, 9, 8, 12, 0, 0)
+    with database.SessionLocal() as db:
+        db.add_all(
+            [
+                TerminalDeletionReceiptModel(
+                    terminal_id="former-owner",
+                    session_id="receipt-only-session",
+                    session_name="cao-receipt-only",
+                    window_name="owner",
+                    session_lifetime_authority_version=1,
+                    workspace_cleanup_authority_version=1,
+                    deleted_at=deleted_at,
+                ),
+                TerminalDeletionReceiptModel(
+                    terminal_id="former-child",
+                    session_id="receipt-only-session",
+                    session_name="cao-receipt-only",
+                    window_name="child",
+                    session_lifetime_authority_version=1,
+                    workspace_cleanup_authority_version=1,
+                    deleted_at=deleted_at + timedelta(seconds=1),
+                ),
+            ]
+        )
+        db.commit()
+
+    page = ui_read_model_service.list_session_summaries(limit=10)
+    overview = ui_read_model_service.get_overview()
+
+    assert page["total"] == 1
+    item = page["items"][0]
+    assert item["id"] == "receipt-only-session"
+    assert item["name"] == "cao-receipt-only"
+    assert item["status"] == "history"
+    assert item["created_at"] == deleted_at.isoformat()
+    assert item["last_active"] == (deleted_at + timedelta(seconds=1)).isoformat()
+    assert item["agent_count"] == item["active_agent_count"] == 0
+    assert item["current_queue_count"] == 0
+    assert item["first_agent"] is item["last_agent"] is None
+    assert overview["sessions"] == 1
+    assert overview["agents"] == 0
+    assert overview["active"] == 0
 
 
 def test_current_queue_matches_workspace_retirement_safety_boundary(monkeypatch):

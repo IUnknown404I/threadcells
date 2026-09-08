@@ -1,6 +1,7 @@
 """Native Telegram settings, secret, delivery, and lifecycle regressions."""
 
 import logging
+from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 import pytest
@@ -237,6 +238,30 @@ def test_top_level_transition_notifies_exactly_once(
         assert row is not None
         assert row.state == "sent"
         assert row.attempt_count == 1
+
+
+def test_notification_does_not_claim_external_effect_while_lifecycle_fence_is_busy(
+    telegram_state, monkeypatch
+):
+    _configure()
+    _workflow("busy-root")
+    post = MagicMock(return_value=_response())
+    monkeypatch.setattr(telegram.requests, "post", post)
+
+    @contextmanager
+    def busy_fence(*_args, **_kwargs):
+        yield False
+
+    import cli_agent_orchestrator.services.operations_service as operations_service
+
+    monkeypatch.setattr(operations_service, "context_lifecycle_fence", busy_fence)
+    assert telegram.dispatch_workflow_notification("busy-root", "completed") == {
+        "ok": False,
+        "status": "lifecycle_busy",
+    }
+    post.assert_not_called()
+    with database.SessionLocal() as db:
+        assert db.query(TelegramDeliveryModel).count() == 0
 
 
 def test_child_completion_never_notifies(telegram_state, monkeypatch):

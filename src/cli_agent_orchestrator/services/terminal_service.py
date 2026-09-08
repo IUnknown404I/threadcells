@@ -3377,10 +3377,10 @@ def prepare_terminal_for_destruction(terminal_id: str) -> None:
         raise RuntimeError(f"Could not persist durable result snapshot for {terminal_id}")
 
 
-def cleanup_managed_worktree(metadata: Dict, *, allow_dirty: bool = False) -> None:
+def cleanup_managed_worktree(metadata: Dict, *, allow_dirty: bool = False) -> Dict[str, object]:
     """Remove a clean managed worktree or retain all authority fail-closed."""
     if not metadata.get("managed_worktree_kind"):
-        return
+        return {"removed": False, "managed": False}
     from cli_agent_orchestrator.services.managed_worktree_service import (
         remove_managed_worktree,
     )
@@ -3388,6 +3388,7 @@ def cleanup_managed_worktree(metadata: Dict, *, allow_dirty: bool = False) -> No
     cleanup = remove_managed_worktree(metadata, allow_dirty=allow_dirty)
     if not cleanup.get("removed"):
         raise ManagedWorktreeCleanupError(cleanup.get("reason_code", "MANAGED_WORKTREE_UNVERIFIED"))
+    return cleanup
 
 
 def validate_managed_worktree_cleanup(metadata: Dict) -> None:
@@ -3995,6 +3996,7 @@ _TERMINAL_DELETION_IDENTITY_FIELDS = (
     "managed_worktree_source",
     "managed_worktree_branch",
     "managed_worktree_commit",
+    "managed_worktree_origin_terminal_id",
     "writable_work_context_id",
     "writer_authority_generation",
     "runtime_pane_id",
@@ -4103,7 +4105,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
             except Exception:
                 logger.warning("Provider cleanup failed for exited terminal %s", terminal_id)
             try:
-                cleanup_managed_worktree(metadata)
+                workspace_cleanup = cleanup_managed_worktree(metadata)
             except ManagedWorktreeCleanupError as exc:
                 raise TerminalDeletionError(
                     "TERMINAL_WORKTREE_PROTECTED",
@@ -4114,6 +4116,30 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 deletion = db_delete_exited_terminal(
                     terminal_id,
                     expected_identity=_terminal_deletion_identity(metadata),
+                    workspace_cleanup_authority=(
+                        {
+                            "version": 1,
+                            "managed": True,
+                            "kind": metadata.get("managed_worktree_kind"),
+                            "source": metadata.get("managed_worktree_source"),
+                            "path": metadata.get("launch_worktree"),
+                            "branch": metadata.get("managed_worktree_branch"),
+                            "branch_object_id": (
+                                workspace_cleanup.get("commit")
+                                if metadata.get("managed_worktree_branch") is not None
+                                else None
+                            ),
+                            "identity": (
+                                metadata.get("writable_work_context_id")
+                                or metadata.get("managed_worktree_origin_terminal_id")
+                                or metadata.get("id")
+                            ),
+                            "path_absent": bool(workspace_cleanup.get("removed")),
+                            "git_unregistered": bool(workspace_cleanup.get("removed")),
+                        }
+                        if metadata.get("managed_worktree_kind")
+                        else None
+                    ),
                 )
             except AmbiguousTerminalIdentity as exc:
                 raise TerminalDeletionError(

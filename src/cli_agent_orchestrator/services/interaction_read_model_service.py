@@ -22,6 +22,10 @@ DEFAULT_HISTORY_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 50
 
 
+class SessionInteractionsDeleted(ValueError):
+    """The requested Session was permanently deleted."""
+
+
 def _validate_limit(limit: int) -> None:
     if isinstance(limit, bool) or not 1 <= limit <= MAX_PAGE_SIZE:
         raise ValueError(f"limit must be between 1 and {MAX_PAGE_SIZE}")
@@ -46,7 +50,7 @@ def _scope_sql(
     clause = f" AND {_stable_session_id_sql()} IN ({', '.join(placeholders)})"
     if terminal_id:
         parameters["interaction_terminal_id"] = terminal_id
-        clause += " AND t.id = :interaction_terminal_id"
+        clause += " AND t.terminal_id = :interaction_terminal_id"
     return clause, parameters
 
 
@@ -84,16 +88,35 @@ def _projection_cte(
     # this prevents a raw-table/event contract from leaking into React.
     return (
         """
-WITH interaction_terminals AS MATERIALIZED (
+WITH terminal_lifetimes AS MATERIALIZED (
     SELECT t.id AS terminal_id,
-           COALESCE(t.session_id, 'legacy:' || t.tmux_session) AS session_id,
+           t.session_id, t.tmux_session,
            t.runtime_lifecycle, t.runtime_operation_kind,
            t.writer_authority_generation, t.last_active
     FROM terminals t
+    UNION ALL
+    SELECT receipt.terminal_id,
+           receipt.session_id, receipt.session_name,
+           'exited', NULL, NULL, receipt.deleted_at
+    FROM terminal_deletion_receipts receipt
+    WHERE NOT EXISTS (
+        SELECT 1 FROM terminals current_terminal
+        WHERE current_terminal.id = receipt.terminal_id
+    )
+), interaction_terminals AS MATERIALIZED (
+    SELECT t.terminal_id,
+           COALESCE(t.session_id, 'legacy:' || t.tmux_session) AS session_id,
+           t.runtime_lifecycle, t.runtime_operation_kind,
+           t.writer_authority_generation, t.last_active
+    FROM terminal_lifetimes t
     WHERE NOT EXISTS (
         SELECT 1 FROM session_deletion_receipts receipt
         WHERE receipt.session_id = COALESCE(t.session_id, 'legacy:' || t.tmux_session)
     )
+      AND NOT EXISTS (
+        SELECT 1 FROM session_deletion_operations operation
+        WHERE operation.session_id = COALESCE(t.session_id, 'legacy:' || t.tmux_session)
+      )
 """
         + scope
         + """
@@ -801,10 +824,20 @@ def list_interactions(
     LIMIT :page_limit
 )
 """
+    deletion_meta = """, deletion_meta AS (
+    SELECT CASE WHEN EXISTS (
+      SELECT 1 FROM session_deletion_receipts receipt
+      WHERE receipt.session_id = :interaction_session_0
+        AND COALESCE(receipt.receipt_version, 1) >= 2
+    ) THEN 1 ELSE 0 END AS hard_deleted
+)
+"""
     if mode == "current":
-        sql = cte + base_page + f""", meta AS (SELECT COUNT(*) AS total_count FROM base_page)
-SELECT page.*, meta.total_count
-FROM meta LEFT JOIN page ON 1 = 1
+        sql = cte + base_page + deletion_meta + f""", meta AS (
+    SELECT COUNT(*) AS total_count FROM base_page
+)
+SELECT page.*, meta.total_count, deletion_meta.hard_deleted
+FROM meta CROSS JOIN deletion_meta LEFT JOIN page ON 1 = 1
 ORDER BY page.created_at {direction}, page.interaction_id {direction}
 """
     else:
@@ -813,12 +846,15 @@ ORDER BY page.created_at {direction}, page.interaction_id {direction}
         # has-more through the limit+1 cursor and deliberately leaves total
         # unknown. Current Queue retains its exact total because that value is
         # the canonical session indicator.
-        sql = cte + base_page + f"""
-SELECT page.*, NULL AS total_count FROM page
+        sql = cte + base_page + deletion_meta + f"""
+SELECT page.*, NULL AS total_count, deletion_meta.hard_deleted
+FROM deletion_meta LEFT JOIN page ON 1 = 1
 ORDER BY page.created_at {direction}, page.interaction_id {direction}
 """
     with database.SessionLocal() as db:
         rows = db.execute(text(sql), parameters).mappings().all()
+    if rows and int(rows[0]["hard_deleted"] or 0):
+        raise SessionInteractionsDeleted("SESSION_DELETED")
     total = int(rows[0]["total_count"] or 0) if mode == "current" else None
     fetched_rows = [dict(row) for row in rows if row["interaction_id"] is not None]
     has_more = len(fetched_rows) > resolved_limit

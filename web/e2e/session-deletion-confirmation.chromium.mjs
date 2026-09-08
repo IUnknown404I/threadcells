@@ -96,27 +96,38 @@ let browser
 try {
   browser = await chromium.launch({ headless: true })
   const page = await browser.newPage()
-  await page.goto(origin)
-  await page.getByRole('link', { name: 'Agents' }).click()
-
-  for (const width of [1440, 834, 390]) {
-    await page.setViewportSize({ width, height: width === 390 ? 844 : 960 })
-    const action = page.getByTitle('Delete session')
-    await action.click()
-    const dialog = page.getByRole('dialog', { name: 'Delete Session?' })
-    await dialog.waitFor({ state: 'visible' })
-    const [dialogBox, viewport] = await Promise.all([dialog.boundingBox(), page.viewportSize()])
-    assert(dialogBox && viewport)
-    assert(dialogBox.x >= 0 && dialogBox.x + dialogBox.width <= viewport.width + 1, `dialog escaped viewport at ${width}px`)
-    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth), 0, `horizontal overflow at ${width}px`)
-    assert.equal(deleteRequestCount, 0, 'opening confirmation must not delete')
-    await page.getByRole('button', { name: 'Cancel' }).click()
-    assert.equal(await action.evaluate(node => document.activeElement === node), true, 'cancelling must restore focus')
-    assert.equal(deleteRequestCount, 0, 'cancelling confirmation must not delete')
+  const locales = [
+    { code: 'en', agents: 'Agents', action: 'Delete session', dialog: 'Delete Session?', cancel: 'Cancel' },
+    { code: 'ru', agents: 'Агенты', action: 'Удалить сессию', dialog: 'Удалить Session?', cancel: 'Отмена' },
+  ]
+  for (const locale of locales) {
+    await page.goto(origin)
+    await page.evaluate(code => localStorage.setItem('threadcells.app.locale', code), locale.code)
+    await page.reload()
+    await page.getByRole('link', { name: locale.agents }).click()
+    for (const width of [1440, 834, 390]) {
+      await page.setViewportSize({ width, height: width === 390 ? 844 : 960 })
+      const action = page.getByTitle(locale.action)
+      await action.click()
+      const dialog = page.getByRole('dialog', { name: locale.dialog })
+      await dialog.waitFor({ state: 'visible' })
+      const [dialogBox, viewport] = await Promise.all([dialog.boundingBox(), page.viewportSize()])
+      assert(dialogBox && viewport)
+      assert(dialogBox.x >= 0 && dialogBox.x + dialogBox.width <= viewport.width + 1, `${locale.code} dialog escaped viewport at ${width}px`)
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth), 0, `${locale.code} horizontal overflow at ${width}px`)
+      assert.equal(deleteRequestCount, 0, 'opening confirmation must not delete')
+      await page.getByRole('button', { name: locale.cancel }).click()
+      assert.equal(await action.evaluate(node => document.activeElement === node), true, 'cancelling must restore focus')
+      assert.equal(deleteRequestCount, 0, 'cancelling confirmation must not delete')
+    }
   }
 
+  await page.goto(origin)
+  await page.evaluate(() => localStorage.setItem('threadcells.app.locale', 'en'))
+  await page.reload()
+  await page.getByRole('link', { name: 'Agents' }).click()
   await page.getByTitle('Delete session').click()
-  const confirm = page.getByRole('button', { name: 'Preserve unknown outcomes and delete Session', exact: true })
+  const confirm = page.getByRole('button', { name: 'Delete Session', exact: true })
   await confirm.click()
   const closing = page.getByRole('button', { name: 'Working…', exact: true })
   await closing.waitFor()

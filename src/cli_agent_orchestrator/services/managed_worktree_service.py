@@ -261,6 +261,7 @@ def managed_worktree_status(metadata: Mapping[str, Any]) -> dict[str, Any]:
                     "safe": False,
                     "reason_code": "TASK_WORKTREE_BRANCH_MISSING",
                 }
+            result["commit"] = branch.stdout.split()[0]
         return result
     resolved_path = path.resolve(strict=True)
     root = _repository_root(path)
@@ -352,6 +353,131 @@ def remove_managed_worktree(
             "detail": (completed.stderr or completed.stdout).strip(),
         }
     return {"removed": True, **status}
+
+
+def purge_managed_worktree(
+    metadata: Mapping[str, Any],
+    *,
+    allow_dirty: bool = False,
+    require_already_absent: bool = False,
+) -> dict[str, Any]:
+    """Permanently remove one exact Session-owned worktree and private branch.
+
+    A durable ``retired`` Session context is accepted only when both the path
+    and Git worktree registration are already absent.  A leftover private
+    Session branch is then removed with an exact old-object CAS.  This keeps a
+    contradictory live worktree fail-closed while allowing crash/retry to
+    converge after either filesystem or ref cleanup completed first.
+    """
+    kind = metadata.get("managed_worktree_kind")
+    if kind not in _MANAGED_KINDS:
+        return {
+            "removed": False,
+            "managed": False,
+            "path_absent": True,
+            "git_unregistered": True,
+            "branch_absent": True,
+        }
+    identity = (
+        metadata.get("managed_worktree_identity")
+        or metadata.get("writable_work_context_id")
+        or metadata.get("managed_worktree_origin_terminal_id")
+        or metadata.get("id")
+    )
+    path_value = metadata.get("launch_worktree")
+    source_value = metadata.get("managed_worktree_source")
+    if not all(isinstance(value, str) and value for value in (identity, path_value, source_value)):
+        return {
+            "removed": False,
+            "managed": True,
+            "reason_code": "MANAGED_WORKTREE_METADATA_INVALID",
+        }
+    path = Path(str(path_value))
+    source = Path(str(source_value))
+    if not source.exists():
+        return {"removed": False, "managed": True, "reason_code": "MANAGED_WORKTREE_MISSING"}
+    resolved_source = source.resolve(strict=True)
+    resolved_path = path.resolve(strict=False)
+    if (
+        _repository_root(source) != resolved_source
+        or resolved_path
+        != _managed_path(resolved_source, str(identity), str(kind)).resolve(strict=False)
+        or metadata.get("managed_worktree_branch") != _branch_for(str(kind), str(identity))
+    ):
+        return {
+            "removed": False,
+            "managed": True,
+            "reason_code": "MANAGED_WORKTREE_IDENTITY_MISMATCH",
+        }
+
+    registered = _git("worktree", "list", "--porcelain", cwd=source)
+    registered_paths = {
+        Path(line.removeprefix("worktree ")).resolve(strict=False)
+        for line in registered.stdout.splitlines()
+        if line.startswith("worktree ")
+    }
+    path_present = path.exists() or path.is_symlink()
+    registered_present = resolved_path in registered_paths
+    if require_already_absent and (path_present or registered_present):
+        return {
+            "removed": False,
+            "managed": True,
+            "reason_code": "WORKSPACE_RETIREMENT_STATE_CONFLICT",
+        }
+    if not require_already_absent and (path_present or registered_present):
+        removed = remove_managed_worktree(metadata, allow_dirty=allow_dirty)
+        if not removed.get("removed"):
+            return removed
+
+    registered_after = _git("worktree", "list", "--porcelain", cwd=source)
+    still_registered = any(
+        line.startswith("worktree ")
+        and Path(line.removeprefix("worktree ")).resolve(strict=False) == resolved_path
+        for line in registered_after.stdout.splitlines()
+    )
+    if path.exists() or path.is_symlink() or still_registered:
+        return {
+            "removed": False,
+            "managed": True,
+            "reason_code": "MANAGED_WORKTREE_REMOVE_FAILED",
+        }
+
+    expected_branch = _branch_for(str(kind), str(identity))
+    if expected_branch is not None:
+        ref_name = f"refs/heads/{expected_branch}"
+        branch = _git("rev-parse", "--verify", ref_name, cwd=source, check=False)
+        if branch.returncode == 0:
+            old_object = branch.stdout.strip()
+            expected_object = metadata.get("managed_worktree_branch_object_id")
+            if expected_object is not None and old_object != expected_object:
+                return {
+                    "removed": False,
+                    "managed": True,
+                    "reason_code": "MANAGED_WORKTREE_BRANCH_CHANGED",
+                }
+            removed_ref = _git("update-ref", "-d", ref_name, old_object, cwd=source, check=False)
+            if removed_ref.returncode != 0:
+                return {
+                    "removed": False,
+                    "managed": True,
+                    "reason_code": "MANAGED_WORKTREE_BRANCH_CHANGED",
+                }
+        branch_after = _git("show-ref", "--verify", ref_name, cwd=source, check=False)
+        if branch_after.returncode == 0:
+            return {
+                "removed": False,
+                "managed": True,
+                "reason_code": "MANAGED_WORKTREE_BRANCH_REMOVE_FAILED",
+            }
+
+    return {
+        "removed": True,
+        "managed": True,
+        "already_removed": not path_present and not registered_present,
+        "path_absent": True,
+        "git_unregistered": True,
+        "branch_absent": True,
+    }
 
 
 def reconcile_writable_work_context_provisioning() -> int:

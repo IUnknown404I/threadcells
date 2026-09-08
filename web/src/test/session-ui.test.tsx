@@ -1032,6 +1032,8 @@ describe('session deletion confirmation', () => {
 
     fireEvent.click(await screen.findByTitle('Delete session'))
     expect(await screen.findByRole('heading', { name: 'Delete Session?' })).toBeInTheDocument()
+    expect(screen.getByText(/All processes, tasks, results, history, and managed workspace data/))
+      .toBeInTheDocument()
     expect(remove).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
@@ -1101,13 +1103,15 @@ describe('session deletion confirmation', () => {
     )).toBeInTheDocument()
     const warning = screen.getByTestId('session-deletion-historical-indeterminate')
     expect(warning).toHaveTextContent('ThreadCells can no longer establish the external outcome')
-    expect(warning).toHaveTextContent('History, canonical results, and audit evidence will be preserved.')
+    expect(warning).toHaveTextContent(
+      'All Session data, including history, results, and audit details, will be permanently deleted.',
+    )
     expect(screen.getByText('Operations with unknown outcomes')).toBeInTheDocument()
     expect(screen.getByText('Active agents')).toBeInTheDocument()
     expect(screen.getByText('Active executions')).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', {
-      name: 'Preserve unknown outcomes and delete Session',
+      name: 'Delete Session',
     }))
     await waitFor(() => expect(remove).toHaveBeenCalledWith(
       'lifetime-delete-me', false, false, 'b'.repeat(64), true,

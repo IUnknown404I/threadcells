@@ -33,11 +33,14 @@ const REASON_KEYS: Record<string, TranslationKey> = {
   INDETERMINATE_EFFECT: 'sessionDeletion.reason.indeterminateEffect',
   CLAIMED_EFFECT: 'sessionDeletion.reason.claimedEffect',
   PROVIDER_RECONNECT_ACTIVE: 'sessionDeletion.reason.reconnectActive',
+  PROVIDER_RECONNECT_ATTEMPT_ACTIVE: 'sessionDeletion.reason.reconnectActive',
   PROVIDER_EXECUTION_STATE_UNSETTLED: 'sessionDeletion.reason.providerUnsettled',
   DIRECT_RESULT_ALREADY_CLAIMED: 'sessionDeletion.reason.resultClaimed',
   CROSS_SESSION_DELIVERY: 'sessionDeletion.reason.externalDelivery',
   CROSS_SESSION_ASSIGNMENT: 'sessionDeletion.reason.externalAssignment',
   WORKSPACE_STATE_NOT_RETIRABLE: 'sessionDeletion.reason.workspaceProtected',
+  WORKSPACE_RETIREMENT_STATE_CONFLICT: 'sessionDeletion.reason.workspaceProtected',
+  TERMINAL_WORKSPACE_CLEANUP_AUTHORITY_MISSING: 'sessionDeletion.reason.workspaceProtected',
   CANCELLATION_PLAN_TOO_LARGE: 'sessionDeletion.reason.planTooLarge',
   SESSION_IDENTITY_CHANGED: 'sessionDeletion.reason.sessionIdentity',
 }
@@ -135,7 +138,7 @@ export function SessionDeletionDialog({
       {retirement && (
         <div data-testid="session-deletion-historical-indeterminate" role="status" className="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3">
           <p className="text-sm leading-5 text-amber-100">{t('sessionDeletion.historicalUnknownWarning')}</p>
-          <p className="mt-2 text-sm leading-5 text-gray-300">{t('sessionDeletion.preserveHistoryCopy')}</p>
+          <p className="mt-2 text-sm leading-5 text-gray-300">{t('sessionDeletion.permanentDeleteCopy')}</p>
         </div>
       )}
       {unsafe && (

@@ -47,6 +47,7 @@ from cli_agent_orchestrator.clients.database import (
     cancel_child_assignments_for_terminal,
     create_inbox_message,
     get_inbox_messages,
+    get_session_hard_deletion_operation,
     get_terminal_metadata,
     get_writable_work_context_by_session,
     init_db,
@@ -55,6 +56,8 @@ from cli_agent_orchestrator.clients.database import (
     resolve_workflow_input_binding,
     submit_handoff_result_v1,
     terminal_auth_token_matches,
+    terminal_deletion_auth_token_matches,
+    terminal_deletion_receipt_exists,
 )
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
@@ -102,6 +105,7 @@ from cli_agent_orchestrator.services import (
 from cli_agent_orchestrator.services.inbox_service import LogFileHandler
 from cli_agent_orchestrator.services.operations_service import (
     AdmissionDenied,
+    context_lifecycle_fence,
     get_resource_status,
     load_operations_config,
     set_capacity_settings,
@@ -331,6 +335,31 @@ def _decode_terminal_filename(encoded_filename: str) -> str:
     if not filename or any(ord(character) < 32 or ord(character) == 127 for character in filename):
         raise ValueError("Invalid terminal attachment filename")
     return filename
+
+
+def _store_terminal_attachment(
+    terminal_id: str,
+    store: Any,
+    *args: Any,
+) -> tuple[str | None, str | None]:
+    """Serialize one artifact write against permanent Session deletion."""
+    with context_lifecycle_fence():
+        metadata = get_terminal_metadata(terminal_id)
+        if metadata is None:
+            reason = (
+                "SESSION_DELETED"
+                if terminal_deletion_receipt_exists(terminal_id)
+                else "TERMINAL_NOT_FOUND"
+            )
+            return None, reason
+        session_id = metadata.get("session_id")
+        tmux_session = metadata.get("tmux_session")
+        lifetime = (
+            str(session_id) if session_id else (f"legacy:{tmux_session}" if tmux_session else None)
+        )
+        if lifetime is not None and get_session_hard_deletion_operation(lifetime) is not None:
+            return None, "SESSION_DELETION_IN_PROGRESS"
+        return str(store(terminal_id, *args)), None
 
 
 async def flow_daemon():
@@ -1975,6 +2004,11 @@ async def list_ui_interactions(
             limit=limit,
             cursor=cursor,
         )
+    except interaction_read_model_service.SessionInteractionsDeleted as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "SESSION_DELETED", "message": "Session was permanently deleted"},
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -2542,6 +2576,8 @@ async def bind_codex_session_identity_endpoint(
         or not token
         or not terminal_auth_token_matches(terminal_id, token)
     ):
+        if token and terminal_deletion_auth_token_matches(terminal_id, token):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="session_deleted")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_terminal_auth"
         )
@@ -2595,6 +2631,8 @@ async def persist_codex_turn_complete_endpoint(
         or not token
         or not terminal_auth_token_matches(terminal_id, token)
     ):
+        if token and terminal_deletion_auth_token_matches(terminal_id, token):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="session_deleted")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_terminal_auth"
         )
@@ -2632,6 +2670,8 @@ async def create_terminal_image_attachment(
 ) -> TerminalAttachmentResponse:
     """Store one browser image in a generated, short-lived terminal runtime path."""
     if not get_terminal_metadata(terminal_id):
+        if terminal_deletion_receipt_exists(terminal_id):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="session_deleted")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"Terminal '{terminal_id}' not found"
         )
@@ -2653,9 +2693,25 @@ async def create_terminal_image_attachment(
                 )
             content.extend(chunk)
 
-        path = terminal_attachments.store_terminal_image(
-            terminal_id, normalized_mime, bytes(content)
+        path, denial = await run_in_threadpool(
+            partial(
+                _store_terminal_attachment,
+                terminal_id,
+                terminal_attachments.store_terminal_image,
+                normalized_mime,
+                bytes(content),
+            )
         )
+        if denial is not None:
+            raise HTTPException(
+                status_code=(
+                    status.HTTP_404_NOT_FOUND
+                    if denial == "TERMINAL_NOT_FOUND"
+                    else status.HTTP_409_CONFLICT
+                ),
+                detail=denial.lower(),
+            )
+        assert path is not None
         return TerminalAttachmentResponse(path=str(path))
     except HTTPException:
         raise
@@ -2684,6 +2740,8 @@ async def create_terminal_file_attachment(
 ) -> TerminalAttachmentResponse:
     """Store one validated text or opaque ZIP file in a generated private runtime path."""
     if not get_terminal_metadata(terminal_id):
+        if terminal_deletion_receipt_exists(terminal_id):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="session_deleted")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"Terminal '{terminal_id}' not found"
         )
@@ -2711,7 +2769,25 @@ async def create_terminal_file_attachment(
                     detail=size_error,
                 )
             content.extend(chunk)
-        path = terminal_attachments.store_terminal_file(terminal_id, filename, bytes(content))
+        path, denial = await run_in_threadpool(
+            partial(
+                _store_terminal_attachment,
+                terminal_id,
+                terminal_attachments.store_terminal_file,
+                filename,
+                bytes(content),
+            )
+        )
+        if denial is not None:
+            raise HTTPException(
+                status_code=(
+                    status.HTTP_404_NOT_FOUND
+                    if denial == "TERMINAL_NOT_FOUND"
+                    else status.HTTP_409_CONFLICT
+                ),
+                detail=denial.lower(),
+            )
+        assert path is not None
         return TerminalAttachmentResponse(path=str(path))
     except HTTPException:
         raise

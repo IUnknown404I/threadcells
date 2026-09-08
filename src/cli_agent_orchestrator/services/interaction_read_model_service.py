@@ -393,8 +393,13 @@ WITH interaction_terminals AS MATERIALIZED (
     CROSS JOIN workflow_effects effect
       ON effect.workflow_id = w.id
      AND effect.workflow_turn_id = wt.id
-    WHERE effect.effect_kind = 'await_handoff'
-      AND effect.state IN ('completed', 'rejected', 'wait_timeout', 'wait_retryable')
+    WHERE (
+        (effect.effect_kind = 'await_handoff'
+         AND effect.state IN ('completed', 'rejected', 'wait_timeout', 'wait_retryable'))
+        OR
+        (effect.effect_kind = 'handoff'
+         AND effect.state IN ('wait_timeout', 'wait_retryable'))
+      )
       AND effect.mirrored_from_effect_id IS NULL
 ), provider_authority_item_rows AS NOT MATERIALIZED (
     SELECT 'provider:' || lease.terminal_id || ':' || printf('%020d', wt.id)

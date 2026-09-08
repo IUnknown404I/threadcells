@@ -1807,6 +1807,18 @@ def test_wait_timeout_is_history_while_open_workflow_and_provider_axes_stay_inde
                 updated_at=now + timedelta(seconds=32),
             )
         )
+        db.add(
+            WorkflowEffectModel(
+                workflow_id=workflows[0].id,
+                workflow_turn_id=turns[0].id,
+                effect_kind="handoff",
+                effect_key="initial-handoff-known-timeout",
+                state="wait_timeout",
+                claim_token="claim-initial-handoff",
+                created_at=now + timedelta(seconds=33),
+                updated_at=now + timedelta(seconds=34),
+            )
+        )
         workflows[0].active_turn_id = turns[0].id
         open_turn_id, terminal_turn_id = (turn.id for turn in turns)
         db.commit()
@@ -1831,6 +1843,8 @@ def test_wait_timeout_is_history_while_open_workflow_and_provider_axes_stay_inde
         if item["interaction_type"] == "workflow_turn"
     }
     assert history_by_turn[open_turn_id]["final_disposition"] == "processed"
+    assert history_by_turn[open_turn_id]["workflow"]["effect_kind"] == "handoff"
+    assert history_by_turn[open_turn_id]["workflow"]["effect_state"] == "wait_timeout"
     assert history_by_turn[terminal_turn_id]["final_disposition"] == "completed"
     known_waits = [
         item
@@ -1850,6 +1864,13 @@ def test_wait_timeout_is_history_while_open_workflow_and_provider_axes_stay_inde
         "wait_slice_expired",
         "wait_slice_expired",
     ]
+    initial_handoff_waits = [
+        item
+        for item in history["items"]
+        if item["interaction_type"] == "effect" and item["workflow"]["effect_kind"] == "handoff"
+    ]
+    assert len(initial_handoff_waits) == 1
+    assert initial_handoff_waits[0]["final_disposition"] == "wait_slice_expired"
 
     with database.SessionLocal() as db:
         db.add(

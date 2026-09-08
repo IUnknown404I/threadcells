@@ -461,6 +461,15 @@ def _delegation_effect_outcome(result: Any) -> str:
         reason_code = getattr(result, "reason_code", None)
     if success:
         return "completed"
+    if terminal_id is not None and reason_code == "WAIT_SLICE_EXPIRED":
+        # The child was already created and its input was sent. Only this
+        # bounded observation expired; the independently durable child and
+        # result lifecycles remain live.
+        return "wait_timeout"
+    if terminal_id is not None and reason_code == "PROVIDER_CONTENT_UNAVAILABLE":
+        # Provider content recovery is a known retryable observation outcome,
+        # not evidence that the child launch itself is indeterminate.
+        return "wait_retryable"
     if terminal_id is None and reason_code in _SAFE_PRE_EFFECT_ADMISSION_REASONS:
         # The API rejected admission before creating a child terminal. Keep the
         # attempt visible but safely reclaimable under this same logical turn.

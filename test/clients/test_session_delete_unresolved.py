@@ -1223,6 +1223,9 @@ def test_mixed_processed_history_plus_one_unresolved_turn_has_exact_queue_count(
         )
         db.commit()
 
+    # Production startup completes the exact-only terminal-receipt migration
+    # before request query accounting begins.
+    database._ensure_terminal_deletion_receipt_schema()
     statements: list[str] = []
 
     def record(_connection, _cursor, statement, _parameters, _context, _many):

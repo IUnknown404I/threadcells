@@ -12,16 +12,18 @@ from cli_agent_orchestrator.clients.database import (
     ProviderExecutionLeaseModel,
     SessionDeletionOperationModel,
     SessionDeletionReceiptModel,
+    SessionLifetimeAuthorityError,
     TerminalDeletionReceiptModel,
     TerminalModel,
     WorktreeWriterLeaseModel,
     WritableWorkContextAuditModel,
+    WritableWorkContextConflict,
     WritableWorkContextModel,
 )
 
 
-def _install_database(monkeypatch):
-    engine = create_engine("sqlite:///:memory:")
+def _install_database(monkeypatch, url: str = "sqlite:///:memory:"):
+    engine = create_engine(url)
     Base.metadata.create_all(engine)
     monkeypatch.setattr(database, "engine", engine)
     monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
@@ -30,6 +32,7 @@ def _install_database(monkeypatch):
     monkeypatch.setattr(database, "_ensure_usage_schema", lambda: None)
     monkeypatch.setattr(database, "_ensure_session_deletion_receipt_schema", lambda: None)
     monkeypatch.setattr(database, "_ensure_terminal_deletion_receipt_schema", lambda: None)
+    return engine
 
 
 def _terminal(
@@ -153,6 +156,7 @@ def test_existing_receipt_schema_adds_replayable_retained_resources(monkeypatch)
         "retained_resources_json",
         "deletion_reason",
         "authority_fingerprint",
+        "terminal_fences_json",
         "receipt_version",
     }.issubset(columns)
     assert operation_tables == 1
@@ -180,6 +184,19 @@ def test_existing_terminal_receipt_schema_adds_digest_only_late_callback_fence(m
             "session_name VARCHAR NOT NULL, window_name VARCHAR NOT NULL, "
             "deleted_at DATETIME NOT NULL)"
         )
+        connection.exec_driver_sql(
+            "INSERT INTO terminal_deletion_receipts "
+            "(terminal_id, session_id, session_name, window_name, deleted_at) "
+            "VALUES ('legacy-terminal', 'legacy-session', 'cao-legacy-receipt', "
+            "'legacy-window', CURRENT_TIMESTAMP)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO terminal_deletion_receipts "
+            "(terminal_id, session_id, session_name, window_name, deleted_at) VALUES "
+            "('name-only', NULL, 'cao-name-only', 'name-only', CURRENT_TIMESTAMP), "
+            "('conflict-a', 'conflicting-session', 'cao-conflict-a', 'a', CURRENT_TIMESTAMP), "
+            "('conflict-b', 'conflicting-session', 'cao-conflict-b', 'b', CURRENT_TIMESTAMP)"
+        )
     monkeypatch.setattr(database, "engine", engine)
     monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
 
@@ -200,6 +217,7 @@ def test_existing_terminal_receipt_schema_adds_digest_only_late_callback_fence(m
         }
     assert {
         "auth_token_sha256",
+        "session_lifetime_authority_version",
         "workspace_cleanup_authority_version",
         "managed_worktree_kind",
         "managed_worktree_source",
@@ -209,6 +227,120 @@ def test_existing_terminal_receipt_schema_adds_digest_only_late_callback_fence(m
         "managed_worktree_identity",
     } <= columns
     assert "ix_terminal_deletion_receipts_auth_token_sha256" in indexes
+    with engine.connect() as connection:
+        versions = dict(
+            connection.exec_driver_sql(
+                "SELECT terminal_id, session_lifetime_authority_version "
+                "FROM terminal_deletion_receipts"
+            ).all()
+        )
+        assert versions == {
+            "conflict-a": None,
+            "conflict-b": None,
+            "legacy-terminal": 1,
+            "name-only": None,
+        }
+        assert (
+            connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM migration_receipts WHERE name = ?",
+                (database.SESSION_LIFETIME_RECEIPT_MIGRATION,),
+            ).scalar_one()
+            == 1
+        )
+
+
+def test_terminal_receipt_lifetime_backfill_resumes_after_schema_only_crash(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    TerminalDeletionReceiptModel.__table__.drop(bind=engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE terminal_deletion_receipts ("
+            "terminal_id VARCHAR PRIMARY KEY, session_id VARCHAR, "
+            "session_name VARCHAR NOT NULL, window_name VARCHAR NOT NULL, "
+            "deleted_at DATETIME NOT NULL)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO terminal_deletion_receipts "
+            "(terminal_id, session_id, session_name, window_name, deleted_at) VALUES "
+            "('legacy-terminal', 'legacy-session', 'cao-legacy', 'owner', CURRENT_TIMESTAMP), "
+            "('legacy-child', 'legacy-session', 'cao-legacy', 'child', CURRENT_TIMESTAMP)"
+        )
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
+    original_backfill = database._backfill_terminal_deletion_session_lifetime_authority
+
+    def interrupt_backfill(_connection):
+        raise RuntimeError("simulated lifetime backfill interruption")
+
+    monkeypatch.setattr(
+        database,
+        "_backfill_terminal_deletion_session_lifetime_authority",
+        interrupt_backfill,
+    )
+    with pytest.raises(RuntimeError, match="simulated lifetime backfill interruption"):
+        database._ensure_terminal_deletion_receipt_schema()
+
+    with engine.connect() as connection:
+        assert (
+            connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM pragma_table_info('terminal_deletion_receipts') "
+                "WHERE name = 'session_lifetime_authority_version'"
+            ).scalar_one()
+            == 1
+        )
+        assert (
+            connection.exec_driver_sql(
+                "SELECT session_lifetime_authority_version "
+                "FROM terminal_deletion_receipts WHERE terminal_id = 'legacy-terminal'"
+            ).scalar_one()
+            is None
+        )
+        assert (
+            connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM migration_receipts WHERE name = ?",
+                (database.SESSION_LIFETIME_RECEIPT_MIGRATION,),
+            ).scalar_one()
+            == 0
+        )
+
+    # Model a process that durably repaired one exact row before dying. The
+    # receipt-less retry must preserve it and deterministically repair the
+    # remainder.
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "UPDATE terminal_deletion_receipts "
+            "SET session_lifetime_authority_version = 1 "
+            "WHERE terminal_id = 'legacy-terminal'"
+        )
+
+    monkeypatch.setattr(
+        database,
+        "_backfill_terminal_deletion_session_lifetime_authority",
+        original_backfill,
+    )
+    database._ensure_terminal_deletion_receipt_schema()
+    with engine.connect() as connection:
+        assert set(
+            connection.exec_driver_sql(
+                "SELECT terminal_id FROM terminal_deletion_receipts "
+                "WHERE session_lifetime_authority_version = 1"
+            ).scalars()
+        ) == {"legacy-child", "legacy-terminal"}
+        assert (
+            connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM migration_receipts WHERE name = ?",
+                (database.SESSION_LIFETIME_RECEIPT_MIGRATION,),
+            ).scalar_one()
+            == 1
+        )
+
+    monkeypatch.setattr(
+        database,
+        "_backfill_terminal_deletion_session_lifetime_authority",
+        interrupt_backfill,
+    )
+    database._ensure_terminal_deletion_receipt_schema()
 
     database._ensure_terminal_deletion_receipt_schema()
     database._ensure_terminal_deletion_receipt_schema()
@@ -220,6 +352,286 @@ def test_existing_terminal_receipt_schema_adds_digest_only_late_callback_fence(m
             ).scalar_one()
             == 1
         )
+
+
+def test_last_terminal_deletion_preserves_receipt_only_session_lifetime(monkeypatch):
+    _install_database(monkeypatch)
+    first = _terminal("first", "lifetime", "cao-receipt-only", "/work/first")
+    second = _terminal("second", "lifetime", "cao-receipt-only", "/work/second")
+    with database.SessionLocal() as db:
+        db.add_all([first, second])
+        db.commit()
+        first_identity = {
+            field: getattr(first, field) for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
+        }
+        second_identity = {
+            field: getattr(second, field) for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
+        }
+
+    assert (
+        database.delete_exited_terminal("first", expected_identity=first_identity)["deleted"] == 1
+    )
+    assert (
+        database.delete_exited_terminal("second", expected_identity=second_identity)["deleted"] == 1
+    )
+
+    by_id = database.resolve_session_lifetime("lifetime")
+    by_name = database.resolve_session_lifetime("cao-receipt-only")
+    assert by_id is not None and by_name is not None
+    assert by_id["session_id"] == by_name["session_id"] == "lifetime"
+    assert by_id["session_name"] == by_name["session_name"] == "cao-receipt-only"
+    assert by_id["terminals"] == by_name["terminals"] == []
+    assert by_id["receipt_terminal_ids"] == ["first", "second"]
+    assert by_id["lifetime_authority"] == "terminal_deletion_receipts"
+    with database.SessionLocal() as db:
+        assert {
+            row.session_lifetime_authority_version
+            for row in db.query(TerminalDeletionReceiptModel).all()
+        } == {1}
+
+
+def test_receipt_only_session_lifetime_survives_database_restart(monkeypatch, tmp_path):
+    state_path = tmp_path / "receipt-only.sqlite3"
+    engine = _install_database(monkeypatch, f"sqlite:///{state_path}")
+    terminal = _terminal(
+        "former-owner",
+        "restart-lifetime",
+        "cao-receipt-restart",
+        "/work/former-owner",
+    )
+    with database.SessionLocal() as db:
+        db.add(terminal)
+        db.commit()
+        expected_identity = {
+            field: getattr(terminal, field) for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
+        }
+
+    assert (
+        database.delete_exited_terminal("former-owner", expected_identity=expected_identity)[
+            "deleted"
+        ]
+        == 1
+    )
+    engine.dispose()
+
+    restarted = _install_database(monkeypatch, f"sqlite:///{state_path}")
+    try:
+        resolved = database.resolve_session_lifetime("restart-lifetime")
+        assert resolved is not None
+        assert resolved["session_name"] == "cao-receipt-restart"
+        assert resolved["terminals"] == []
+        assert resolved["receipt_terminal_ids"] == ["former-owner"]
+        assert resolved["lifetime_authority"] == "terminal_deletion_receipts"
+    finally:
+        restarted.dispose()
+
+
+def test_receipt_only_undeleted_session_name_cannot_be_recreated(monkeypatch):
+    _install_database(monkeypatch)
+    terminal = _terminal(
+        "former-owner",
+        "undeleted-lifetime",
+        "cao-receipt-resurrection-fence",
+        "/work/former-owner",
+    )
+    with database.SessionLocal() as db:
+        db.add(terminal)
+        db.commit()
+        expected_identity = {
+            field: getattr(terminal, field) for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
+        }
+    assert (
+        database.delete_exited_terminal("former-owner", expected_identity=expected_identity)[
+            "deleted"
+        ]
+        == 1
+    )
+
+    with pytest.raises(WritableWorkContextConflict, match="SESSION_HISTORY_INELIGIBLE"):
+        database.create_terminal(
+            "replacement-owner",
+            "cao-receipt-resurrection-fence",
+            "owner",
+            "codex",
+            session_lifetime_id="replacement-lifetime",
+        )
+
+    assert (
+        database.resolve_session_lifetime("undeleted-lifetime")["lifetime_authority"]
+        == "terminal_deletion_receipts"
+    )
+
+
+def test_retired_child_receipt_does_not_block_same_live_session_agent_creation(monkeypatch):
+    _install_database(monkeypatch)
+    active = _terminal("active-owner", "live-lifetime", "cao-live", "/work/active")
+    active.runtime_lifecycle = "running"
+    retired = _terminal("retired-child", "live-lifetime", "cao-live", "/work/retired")
+    with database.SessionLocal() as db:
+        db.add_all([active, retired])
+        db.commit()
+        expected_identity = {
+            field: getattr(retired, field) for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
+        }
+    assert (
+        database.delete_exited_terminal("retired-child", expected_identity=expected_identity)[
+            "deleted"
+        ]
+        == 1
+    )
+
+    created = database.create_terminal(
+        "new-child",
+        "cao-live",
+        "new-child",
+        "codex",
+        session_lifetime_id="live-lifetime",
+    )
+
+    assert created["session_id"] == "live-lifetime"
+    resolved = database.resolve_session_lifetime("live-lifetime")
+    assert resolved is not None
+    assert {terminal["id"] for terminal in resolved["terminals"]} == {
+        "active-owner",
+        "new-child",
+    }
+
+
+def test_new_legacy_terminal_receipt_persists_explicit_canonical_lifetime(monkeypatch):
+    _install_database(monkeypatch)
+    terminal = _terminal(
+        "legacy-owner", "placeholder", "cao-legacy-receipt-only", "/work/legacy-owner"
+    )
+    terminal.session_id = None
+    with database.SessionLocal() as db:
+        db.add(terminal)
+        db.commit()
+        expected_identity = {
+            field: getattr(terminal, field) for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
+        }
+
+    assert (
+        database.delete_exited_terminal("legacy-owner", expected_identity=expected_identity)[
+            "deleted"
+        ]
+        == 1
+    )
+    resolved = database.resolve_session_lifetime("legacy:cao-legacy-receipt-only")
+    assert resolved is not None
+    assert resolved["session_id"] == "legacy:cao-legacy-receipt-only"
+    assert resolved["terminals"] == []
+    with database.SessionLocal() as db:
+        receipt = db.get(TerminalDeletionReceiptModel, "legacy-owner")
+        assert receipt.session_id == "legacy:cao-legacy-receipt-only"
+        assert receipt.session_lifetime_authority_version == 1
+
+
+def test_name_only_legacy_receipt_cannot_borrow_current_terminal_authority(monkeypatch):
+    _install_database(monkeypatch)
+    terminal = _terminal(
+        "current-owner", "placeholder", "cao-legacy-conflict", "/work/current-owner"
+    )
+    terminal.session_id = None
+    with database.SessionLocal() as db:
+        db.add(terminal)
+        db.add(
+            TerminalDeletionReceiptModel(
+                terminal_id="unknown-former-owner",
+                session_id=None,
+                session_name="cao-legacy-conflict",
+                window_name="unknown-former-owner",
+                session_lifetime_authority_version=None,
+                workspace_cleanup_authority_version=1,
+            )
+        )
+        db.commit()
+        expected_identity = {
+            field: getattr(terminal, field) for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
+        }
+
+    with pytest.raises(AmbiguousTerminalIdentity):
+        database.delete_exited_terminal("current-owner", expected_identity=expected_identity)
+    with pytest.raises(SessionLifetimeAuthorityError) as error:
+        database.resolve_session_lifetime("cao-legacy-conflict")
+    assert error.value.reason_code == "SESSION_LIFETIME_AUTHORITY_INCOMPLETE"
+    with database.SessionLocal() as db:
+        assert db.get(TerminalModel, "current-owner") is not None
+        receipt = db.get(TerminalDeletionReceiptModel, "unknown-former-owner")
+        assert receipt.session_lifetime_authority_version is None
+
+
+@pytest.mark.parametrize(
+    ("receipts", "reason_code"),
+    [
+        (
+            [
+                {
+                    "terminal_id": "legacy",
+                    "session_id": "lifetime",
+                    "session_name": "cao-receipt-only",
+                    "session_lifetime_authority_version": None,
+                }
+            ],
+            "SESSION_LIFETIME_AUTHORITY_INCOMPLETE",
+        ),
+        (
+            [
+                {
+                    "terminal_id": "one",
+                    "session_id": "lifetime",
+                    "session_name": "cao-one",
+                    "session_lifetime_authority_version": 1,
+                },
+                {
+                    "terminal_id": "two",
+                    "session_id": "lifetime",
+                    "session_name": "cao-two",
+                    "session_lifetime_authority_version": 1,
+                },
+            ],
+            "SESSION_LIFETIME_RECEIPT_CONFLICT",
+        ),
+    ],
+)
+def test_receipt_only_lifetime_missing_or_conflicting_authority_fails_closed(
+    monkeypatch, receipts, reason_code
+):
+    _install_database(monkeypatch)
+    with database.SessionLocal() as db:
+        db.add_all(
+            TerminalDeletionReceiptModel(
+                **receipt,
+                window_name=receipt["terminal_id"],
+                workspace_cleanup_authority_version=1,
+            )
+            for receipt in receipts
+        )
+        db.commit()
+
+    with pytest.raises(SessionLifetimeAuthorityError) as error:
+        database.resolve_session_lifetime("lifetime")
+    assert error.value.reason_code == reason_code
+
+
+def test_current_terminal_and_receipt_ownership_mismatch_fails_closed(monkeypatch):
+    _install_database(monkeypatch)
+    with database.SessionLocal() as db:
+        db.add(_terminal("current", "lifetime", "cao-current", "/work/current"))
+        db.add(
+            TerminalDeletionReceiptModel(
+                terminal_id="retired",
+                session_id="lifetime",
+                session_name="cao-conflicting",
+                window_name="retired",
+                session_lifetime_authority_version=1,
+                workspace_cleanup_authority_version=1,
+            )
+        )
+        db.commit()
+
+    with pytest.raises(SessionLifetimeAuthorityError) as error:
+        database.resolve_session_lifetime("lifetime")
+    assert error.value.reason_code == "SESSION_LIFETIME_RECEIPT_CONFLICT"
 
 
 def test_exact_lifetime_delete_preserves_reused_name_and_is_idempotent(monkeypatch):

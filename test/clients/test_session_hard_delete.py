@@ -148,7 +148,8 @@ def test_individually_retired_private_branch_is_receipted_then_session_purged(
     assert managed is not None and managed.branch is not None
 
     owner = _terminal("owner")
-    child = _terminal("retired-child")
+    child_token = "receipt-only-child-token"
+    child = _terminal("retired-child", token=child_token)
     child.launch_worktree = managed.path
     child.managed_worktree_kind = managed.kind
     child.managed_worktree_source = managed.source
@@ -157,6 +158,9 @@ def test_individually_retired_private_branch_is_receipted_then_session_purged(
     with database.SessionLocal() as db:
         db.add_all([owner, child])
         db.commit()
+        owner_expected_identity = {
+            field: getattr(owner, field) for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
+        }
         expected_identity = {
             field: getattr(child, field) for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
         }
@@ -189,18 +193,35 @@ def test_individually_retired_private_branch_is_receipted_then_session_purged(
     )
     assert deleted["deleted"] == 1
     assert _git(repository, "rev-parse", f"refs/heads/{managed.branch}") == removed["commit"]
+    assert (
+        database.delete_exited_terminal("owner", expected_identity=owner_expected_identity)[
+            "deleted"
+        ]
+        == 1
+    )
+    lifetime = database.resolve_session_lifetime("session")
+    assert lifetime is not None
+    assert lifetime["terminals"] == []
+    assert lifetime["lifetime_authority"] == "terminal_deletion_receipts"
 
     started = database.begin_session_hard_deletion(
         "session",
         "cao-session",
-        expected_terminal_ids=["owner"],
+        expected_terminal_ids=[],
         allow_dirty_workspace=False,
     )
     assert started["started"] is True
+    assert started["terminal_ids"] == []
+    assert started["graph_terminal_ids"] == ["owner", "retired-child"]
     cleanup_authorities = database.list_session_historical_terminal_cleanup_authorities("session")
-    assert cleanup_authorities[0]["managed_worktree_branch_object_id"] == removed["commit"]
+    child_cleanup_authority = next(
+        authority
+        for authority in cleanup_authorities
+        if authority["terminal_id"] == "retired-child"
+    )
+    assert child_cleanup_authority["managed_worktree_branch_object_id"] == removed["commit"]
     cleanup = managed_worktree_service.purge_managed_worktree(
-        cleanup_authorities[0], require_already_absent=True
+        child_cleanup_authority, require_already_absent=True
     )
     assert cleanup["removed"] is True
     assert cleanup["branch_absent"] is True
@@ -230,10 +251,31 @@ def test_individually_retired_private_branch_is_receipted_then_session_purged(
     completed = database.complete_session_hard_deletion("session", "cao-session")
     assert completed["completed"] is True
     with database.SessionLocal() as db:
-        receipt = db.get(TerminalDeletionReceiptModel, "retired-child")
-        assert receipt.workspace_cleanup_authority_version is None
-        assert receipt.managed_worktree_branch is None
-        assert db.get(SessionDeletionReceiptModel, "session").receipt_version == 2
+        assert db.get(TerminalDeletionReceiptModel, "retired-child") is None
+        tombstone = db.get(SessionDeletionReceiptModel, "session")
+        assert tombstone.receipt_version == 3
+        assert {
+            item["terminal_id"] for item in database._session_receipt_terminal_fences(tombstone)
+        } == {
+            "owner",
+            "retired-child",
+        }
+    assert database.terminal_deletion_auth_token_matches("retired-child", child_token) is True
+    with pytest.raises(HandoffResultSubmissionError) as error:
+        database.submit_handoff_result_v1(
+            child_token,
+            1,
+            HandoffResultDocumentV1(
+                format="v1",
+                summary="late receipt-only callback",
+                body_markdown="must not recreate the deleted Session",
+                changed_files=[],
+                checks=[],
+                risks=[],
+                blockers=[],
+            ),
+        )
+    assert (error.value.status_code, error.value.code) == (409, "session_deleted")
 
 
 def test_individually_retired_terminal_graph_is_planned_projected_and_hard_purged(
@@ -327,11 +369,7 @@ def test_individually_retired_terminal_graph_is_planned_projected_and_hard_purge
     assert completed["before_counts"]["delegation_results"] == 1
     assert all(count == 0 for count in completed["after_counts"].values())
     with database.SessionLocal() as db:
-        assert db.query(TerminalDeletionReceiptModel).count() == 2
-        retired_receipt = db.get(TerminalDeletionReceiptModel, "retired-child")
-        assert retired_receipt.workspace_cleanup_authority_version is None
-        assert retired_receipt.managed_worktree_source is None
-        assert retired_receipt.managed_worktree_branch_object_id is None
+        assert db.query(TerminalDeletionReceiptModel).count() == 0
         assert db.query(WorkflowModel).count() == 0
         assert db.query(WorkflowEffectModel).count() == 0
         assert db.query(DelegationResultModel).count() == 0
@@ -662,6 +700,7 @@ def test_hard_delete_purges_owned_graph_and_preserves_shared_registry_and_other_
         "writable_work_contexts": 1,
         "writable_work_context_audit": 1,
         "session_deletion_cancellation_audit": 1,
+        "terminal_deletion_receipts": 0,
     }
     assert all(count == 0 for count in completed["after_counts"].values())
     with database.SessionLocal() as db:
@@ -681,10 +720,10 @@ def test_hard_delete_purges_owned_graph_and_preserves_shared_registry_and_other_
         assert db.query(SessionDeletionOperationModel).count() == 0
         tombstone = db.get(SessionDeletionReceiptModel, "session")
         assert tombstone is not None
-        assert tombstone.receipt_version == 2
+        assert tombstone.receipt_version == 3
         assert tombstone.deletion_reason == "operator_session_hard_delete"
         assert tombstone.retained_resources_json == "[]"
-        assert db.query(TerminalDeletionReceiptModel).count() == 2
+        assert db.query(TerminalDeletionReceiptModel).count() == 0
 
 
 def test_historical_indeterminate_is_fenced_then_purged_without_result_fabrication(monkeypatch):
@@ -994,7 +1033,7 @@ def test_hard_delete_receipts_fence_late_work_and_return_deleted_history_semanti
         assert db.query(TerminalModel).count() == 0
         assert db.query(WorkflowModel).count() == 0
         assert db.query(SessionDeletionReceiptModel).count() == 1
-        assert db.query(TerminalDeletionReceiptModel).count() == 1
+        assert db.query(TerminalDeletionReceiptModel).count() == 0
         assert db.query(UsageRecordModel).count() == 0
         assert db.query(ProviderUsageBindingModel).count() == 0
         assert db.query(TelegramDeliveryModel).count() == 0
@@ -1240,7 +1279,7 @@ def test_crash_retry_and_concurrent_completion_converge_to_one_tombstone(monkeyp
     assert sorted(outcome["already_deleted"] for outcome in outcomes) == [False, True]
     with database.SessionLocal() as db:
         assert db.query(SessionDeletionReceiptModel).count() == 1
-        assert db.query(TerminalDeletionReceiptModel).count() == len(terminal_ids)
+        assert db.query(TerminalDeletionReceiptModel).count() == 0
         assert db.query(SessionDeletionOperationModel).count() == 0
         assert db.query(TerminalModel).count() == 0
 
@@ -1321,7 +1360,7 @@ def test_partial_database_purge_rolls_back_and_retry_converges(monkeypatch):
     assert database.complete_session_hard_deletion("session", "cao-session")["completed"] is True
     with database.SessionLocal() as db:
         assert db.get(SessionDeletionOperationModel, "session") is None
-        assert db.get(SessionDeletionReceiptModel, "session").receipt_version == 2
+        assert db.get(SessionDeletionReceiptModel, "session").receipt_version == 3
         assert db.query(TerminalModel).count() == 0
         assert db.query(WorkflowModel).count() == 0
         assert db.query(WorkflowTurnModel).count() == 0
@@ -1381,7 +1420,7 @@ def test_terminal_creation_and_hard_delete_fence_serialize_without_resurrection(
         assert late is not None
 
 
-def test_hard_purge_sql_shape_is_fixed_and_uses_one_batched_terminal_fence_insert(
+def test_hard_purge_sql_shape_is_fixed_with_one_session_tombstone(
     monkeypatch,
 ):
     def run(size: int) -> tuple[int, int, int]:
@@ -1409,6 +1448,6 @@ def test_hard_purge_sql_shape_is_fixed_and_uses_one_batched_terminal_fence_inser
 
     one = run(1)
     fifty = run(50)
-    assert one[:2] == fifty[:2] == (92, 65)
+    assert one[:2] == fifty[:2] == (94, 68)
     assert one[2] == 0
-    assert fifty[2] == 1
+    assert fifty[2] == 0

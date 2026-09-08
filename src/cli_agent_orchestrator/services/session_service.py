@@ -25,6 +25,7 @@ from typing import Dict, List
 
 from cli_agent_orchestrator.clients.database import (
     AmbiguousSessionIdentity,
+    SessionLifetimeAuthorityError,
     begin_session_hard_deletion,
     cancel_session_work_for_deletion,
     cancel_workflows_for_terminal,
@@ -108,6 +109,12 @@ def resolve_session_authority(identifier: str, *, require_live: bool = False) ->
     """Resolve one stable lifetime and its current tmux authority."""
     try:
         durable = resolve_session_lifetime(identifier)
+    except SessionLifetimeAuthorityError as exc:
+        raise SessionLifecycleError(
+            exc.reason_code,
+            "Session lifetime authority is incomplete or conflicting; reconciliation is required",
+            inventory_uncertain=True,
+        ) from exc
     except AmbiguousSessionIdentity as exc:
         raise SessionLifecycleError(
             "SESSION_IDENTITY_AMBIGUOUS",

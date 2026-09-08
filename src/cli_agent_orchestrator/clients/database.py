@@ -59,6 +59,15 @@ class AmbiguousSessionIdentity(RuntimeError):
     """A reusable session name identifies more than one durable lifetime."""
 
 
+class SessionLifetimeAuthorityError(RuntimeError):
+    """An undeleted Session exists, but its durable lifetime proof is unusable."""
+
+    def __init__(self, reason_code: str, identifier: str):
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+        self.identifier = identifier
+
+
 class AmbiguousTerminalIdentity(RuntimeError):
     """Terminal deletion authority changed after runtime death was proven."""
 
@@ -179,6 +188,10 @@ class SessionDeletionReceiptModel(Base):
         server_default="operator_session_delete",
     )
     authority_fingerprint = Column(String, nullable=True)
+    # The final Session tombstone owns only the bounded identities needed to
+    # reject stale terminal callbacks. Transitional per-terminal receipts and
+    # their workspace/history metadata are purged with the Session graph.
+    terminal_fences_json = Column(Text, nullable=False, default="[]", server_default="[]")
     receipt_version = Column(Integer, nullable=False, default=2, server_default=text("2"))
     deleted_at = Column(DateTime, nullable=False, default=datetime.now)
 
@@ -229,6 +242,10 @@ class TerminalDeletionReceiptModel(Base):
     # into an explicit SESSION_DELETED rejection.  The bearer secret itself is
     # never persisted here.
     auth_token_sha256 = Column(String, nullable=True, index=True)
+    # Version 1 proves that this receipt was written (or explicitly upgraded)
+    # while an exact current Terminal still bound the stable Session lifetime.
+    # Schema presence alone never upgrades legacy receipt authority.
+    session_lifetime_authority_version = Column(Integer, nullable=True)
     # Individually retired terminals may have already removed their physical
     # worktree while deliberately preserving the private task branch. Retain
     # the exact, bounded cleanup authority until the owning Session is hard
@@ -1144,6 +1161,8 @@ _terminal_ui_projection_schema_ready = False
 _terminal_ui_projection_schema_engine_identity: Optional[int] = None
 _session_deletion_receipt_schema_lock = threading.Lock()
 _terminal_deletion_receipt_schema_lock = threading.Lock()
+_terminal_deletion_receipt_schema_ready = False
+_terminal_deletion_receipt_schema_engine_identity: Optional[int] = None
 
 CONTROL_PLANE_SCHEMA_VERSION = 1
 # Durable compatibility identifier: deployed databases already use this key.
@@ -1151,6 +1170,9 @@ CONTROL_PLANE_MIGRATION_RECEIPT = "threadmesh-control-plane-schema-v1"
 WORKFLOW_EFFECT_LINEAGE_SCHEMA_VERSION = 1
 WORKFLOW_EFFECT_LINEAGE_MIGRATION_RECEIPT = "workflow-effect-mirror-lineage-v1"
 WORKFLOW_EFFECT_LINEAGE_BACKFILL_BATCH_SIZE = 500
+SESSION_LIFETIME_RECEIPT_SCHEMA_VERSION = 1
+SESSION_LIFETIME_RECEIPT_MIGRATION = "terminal-deletion-session-lifetime-authority-v1"
+SESSION_LIFETIME_RECEIPT_BACKFILL_BATCH_SIZE = 500
 
 
 def init_db() -> None:
@@ -3981,6 +4003,7 @@ def _session_unresolved_work_plan_in_transaction(
                     str(receipt.session_name),
                     str(receipt.window_name),
                     str(receipt.auth_token_sha256 or ""),
+                    str(receipt.session_lifetime_authority_version or ""),
                     str(receipt.workspace_cleanup_authority_version or ""),
                     str(receipt.managed_worktree_kind or ""),
                     str(receipt.managed_worktree_source or ""),
@@ -4610,7 +4633,7 @@ def _session_plan_terminals(
     )
     if (
         len(terminals) <= _SESSION_DELETION_PLAN_LIMIT
-        and expected
+        and expected_terminal_ids is not None
         and {str(terminal.id) for terminal in terminals} != set(expected)
     ):
         return None
@@ -4626,6 +4649,7 @@ def get_session_unresolved_work_plan(
     # Reuse the interaction projection's additive indexes so the shared
     # unresolved-work predicates remain bounded on rolling-upgrade databases.
     _ensure_terminal_ui_projection_schema()
+    _ensure_terminal_deletion_receipt_schema()
     _ensure_terminal_worktree_authority_schema()
     _ensure_workflow_schema()
     _ensure_child_assignment_schema()
@@ -4635,6 +4659,27 @@ def get_session_unresolved_work_plan(
         terminals = _session_plan_terminals(db, session_id, expected_terminal_ids)
         if terminals is None:
             return _session_identity_changed_plan()
+        if not terminals:
+            receipts = _session_historical_terminal_receipts(db, session_id)
+            names = {str(receipt.session_name) for receipt in receipts}
+            if len(names) != 1:
+                reason_code = (
+                    "SESSION_LIFETIME_AUTHORITY_INCOMPLETE"
+                    if not receipts
+                    else "SESSION_LIFETIME_RECEIPT_CONFLICT"
+                )
+            else:
+                _receipts, reason_code = _validate_session_terminal_receipt_authority(
+                    db,
+                    session_id,
+                    names.pop(),
+                    require_complete=True,
+                )
+            if reason_code is not None:
+                plan = _session_identity_changed_plan()
+                plan["reason_codes"] = [reason_code]
+                plan["blockers"][0]["reason_codes"] = [reason_code]
+                return plan
         return _public_session_unresolved_work_plan(
             _session_unresolved_work_plan_in_transaction(
                 db,
@@ -4663,6 +4708,7 @@ def cancel_session_work_for_deletion(
     ):
         return {"cancelled": False, "reason_code": "SESSION_DELETE_INTENT_INVALID"}
     _ensure_terminal_ui_projection_schema()
+    _ensure_terminal_deletion_receipt_schema()
     _ensure_terminal_worktree_authority_schema()
     _ensure_workflow_schema()
     _ensure_child_assignment_schema()
@@ -4679,11 +4725,27 @@ def cancel_session_work_for_deletion(
                 return {"cancelled": True, "already_deleted": True, "residual": None}
             return {"cancelled": False, "reason_code": "SESSION_IDENTITY_CHANGED"}
         if not terminals:
-            receipt = db.get(SessionDeletionReceiptModel, session_id)
-            db.rollback()
-            if receipt is not None:
-                return {"cancelled": True, "already_deleted": True, "residual": None}
-            return {"cancelled": False, "reason_code": "SESSION_HISTORY_MISSING"}
+            receipts = _session_historical_terminal_receipts(db, session_id)
+            names = {str(receipt.session_name) for receipt in receipts}
+            if len(names) != 1:
+                db.rollback()
+                return {
+                    "cancelled": False,
+                    "reason_code": (
+                        "SESSION_LIFETIME_AUTHORITY_INCOMPLETE"
+                        if not receipts
+                        else "SESSION_LIFETIME_RECEIPT_CONFLICT"
+                    ),
+                }
+            _receipts, authority_error = _validate_session_terminal_receipt_authority(
+                db,
+                session_id,
+                names.pop(),
+                require_complete=True,
+            )
+            if authority_error is not None:
+                db.rollback()
+                return {"cancelled": False, "reason_code": authority_error}
         terminal_ids = _session_graph_terminal_ids(
             db,
             session_id,
@@ -5172,7 +5234,7 @@ def create_terminal(
         )
         deletion_operation = db.get(SessionDeletionOperationModel, session_id)
         deletion_receipt = db.get(SessionDeletionReceiptModel, session_id)
-        deleted_terminal = db.get(TerminalDeletionReceiptModel, terminal_id)
+        deleted_terminal = _terminal_deletion_fence_exists_in_transaction(db, terminal_id)
         operation_for_name = (
             db.query(SessionDeletionOperationModel.session_id)
             .filter(SessionDeletionOperationModel.session_name == tmux_session)
@@ -5183,18 +5245,41 @@ def create_terminal(
             .filter(SessionDeletionReceiptModel.session_name == tmux_session)
             .first()
         )
+        transitional_lifetime_rows_for_name = (
+            db.query(TerminalDeletionReceiptModel.session_id)
+            .filter(
+                TerminalDeletionReceiptModel.session_name == tmux_session,
+                TerminalDeletionReceiptModel.session_lifetime_authority_version == 1,
+            )
+            .distinct()
+            .limit(2)
+            .all()
+        )
+        transitional_lifetime_ids_for_name = {
+            str(row[0]) for row in transitional_lifetime_rows_for_name if row[0] is not None
+        }
+        transitional_lifetime_conflict = bool(transitional_lifetime_rows_for_name) and (
+            any(row[0] is None for row in transitional_lifetime_rows_for_name)
+            or existing_session is None
+            or transitional_lifetime_ids_for_name != {session_id}
+        )
         if (
             deletion_operation is not None
             or deletion_receipt is not None
-            or deleted_terminal is not None
+            or deleted_terminal
             or operation_for_name is not None
             or receipt_for_name is not None
+            or transitional_lifetime_conflict
         ):
             db.rollback()
             raise WritableWorkContextConflict(
                 "SESSION_DELETION_IN_PROGRESS"
                 if deletion_operation is not None or operation_for_name is not None
-                else "SESSION_DELETED"
+                else (
+                    "SESSION_HISTORY_INELIGIBLE"
+                    if transitional_lifetime_conflict and receipt_for_name is None
+                    else "SESSION_DELETED"
+                )
             )
         session_context = (
             db.query(WritableWorkContextModel)
@@ -5625,6 +5710,7 @@ def terminal_deletion_auth_token_matches(terminal_id: str, token: str) -> bool:
     if not isinstance(token, str) or not token:
         return False
     _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     token_digest = hashlib.sha256(token.encode("utf-8", "strict")).hexdigest()
     with SessionLocal() as db:
         receipt = db.get(TerminalDeletionReceiptModel, terminal_id)
@@ -5633,13 +5719,17 @@ def terminal_deletion_auth_token_matches(terminal_id: str, token: str) -> bool:
             if receipt is not None and receipt.session_id
             else None
         )
-        return bool(
+        legacy_match = bool(
             receipt is not None
             and session_receipt is not None
             and int(session_receipt.receipt_version or 1) >= 2
             and receipt.auth_token_sha256
             and hmac.compare_digest(str(receipt.auth_token_sha256), token_digest)
         )
+        if legacy_match:
+            return True
+        fenced, digest = _hard_deleted_terminal_fence_in_transaction(db, terminal_id)
+        return bool(fenced and digest and hmac.compare_digest(digest, token_digest))
 
 
 def _session_terminal_dict(terminal: TerminalModel) -> Dict[str, Any]:
@@ -5709,6 +5799,11 @@ def _ensure_session_deletion_receipt_schema() -> None:
                     "ALTER TABLE session_deletion_receipts "
                     "ADD COLUMN authority_fingerprint VARCHAR"
                 )
+            if "terminal_fences_json" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_receipts "
+                    "ADD COLUMN terminal_fences_json TEXT NOT NULL DEFAULT '[]'"
+                )
             if "receipt_version" not in columns:
                 connection.exec_driver_sql(
                     "ALTER TABLE session_deletion_receipts "
@@ -5751,6 +5846,97 @@ def _session_receipt_retained_resources(
         return _normalize_session_retained_resources(value)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise AmbiguousSessionIdentity(str(receipt.session_id)) from exc
+
+
+def _normalize_session_terminal_fences(value: Any) -> list[dict[str, str | None]]:
+    """Validate the minimal, bounded late-callback fence in a Session tombstone."""
+    if not isinstance(value, list) or len(value) > _SESSION_DELETION_PLAN_LIMIT:
+        raise ValueError("terminal fences must be a bounded list")
+    normalized: list[dict[str, str | None]] = []
+    terminal_ids: set[str] = set()
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != {
+            "terminal_id",
+            "auth_token_sha256",
+        }:
+            raise ValueError("terminal fence identity is invalid")
+        terminal_id = item.get("terminal_id")
+        digest = item.get("auth_token_sha256")
+        if (
+            not isinstance(terminal_id, str)
+            or not terminal_id
+            or terminal_id in terminal_ids
+            or (
+                digest is not None
+                and not (isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest))
+            )
+        ):
+            raise ValueError("terminal fence identity is invalid")
+        terminal_ids.add(terminal_id)
+        normalized.append({"terminal_id": terminal_id, "auth_token_sha256": digest})
+    return sorted(normalized, key=lambda item: str(item["terminal_id"]))
+
+
+def _session_receipt_terminal_fences(
+    receipt: SessionDeletionReceiptModel,
+) -> list[dict[str, str | None]]:
+    if int(receipt.receipt_version or 1) < 3:
+        return []
+    try:
+        return _normalize_session_terminal_fences(
+            json.loads(str(receipt.terminal_fences_json or "[]"))
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AmbiguousSessionIdentity(str(receipt.session_id)) from exc
+
+
+def _hard_deleted_terminal_fence_in_transaction(
+    db: Any, terminal_id: str
+) -> tuple[bool, str | None]:
+    """Resolve one terminal identity from the single final Session tombstone."""
+    rows = db.execute(
+        text("""
+            SELECT receipt.session_id,
+                   json_extract(fence.value, '$.auth_token_sha256') AS auth_token_sha256
+            FROM session_deletion_receipts AS receipt
+            JOIN json_each(receipt.terminal_fences_json) AS fence
+            WHERE COALESCE(receipt.receipt_version, 1) >= 3
+              AND json_extract(fence.value, '$.terminal_id') = :terminal_id
+            LIMIT 2
+            """),
+        {"terminal_id": terminal_id},
+    ).all()
+    if len(rows) > 1:
+        raise AmbiguousTerminalIdentity(terminal_id)
+    if not rows:
+        return False, None
+    digest = rows[0][1]
+    if digest is not None and not (
+        isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
+    ):
+        raise AmbiguousTerminalIdentity(terminal_id)
+    return True, cast(str | None, digest)
+
+
+def _terminal_deletion_fence_exists_in_transaction(db: Any, terminal_id: str) -> bool:
+    return db.get(TerminalDeletionReceiptModel, terminal_id) is not None or (
+        _hard_deleted_terminal_fence_in_transaction(db, terminal_id)[0]
+    )
+
+
+def _hard_deleted_terminal_digest_exists_in_transaction(db: Any, token_digest: str) -> bool:
+    row = db.execute(
+        text("""
+            SELECT 1
+            FROM session_deletion_receipts AS receipt
+            JOIN json_each(receipt.terminal_fences_json) AS fence
+            WHERE COALESCE(receipt.receipt_version, 1) >= 3
+              AND json_extract(fence.value, '$.auth_token_sha256') = :token_digest
+            LIMIT 1
+            """),
+        {"token_digest": token_digest},
+    ).first()
+    return row is not None
 
 
 def _session_deletion_operation_dict(
@@ -5801,6 +5987,38 @@ def _session_historical_terminal_receipts(
         .limit(_SESSION_DELETION_PLAN_LIMIT + 1)
         .all(),
     )
+
+
+def _terminal_receipt_session_identity(receipt: TerminalDeletionReceiptModel) -> str | None:
+    if isinstance(receipt.session_id, str) and receipt.session_id:
+        return str(receipt.session_id)
+    return None
+
+
+def _validate_session_terminal_receipt_authority(
+    db: Any,
+    session_id: str,
+    session_name: str,
+    *,
+    require_complete: bool,
+) -> tuple[List[TerminalDeletionReceiptModel], str | None]:
+    """Validate exact transitional ownership for one undeleted Session lifetime."""
+    receipts = _session_historical_terminal_receipts(db, session_id)
+    if len(receipts) > _SESSION_DELETION_PLAN_LIMIT:
+        return receipts, "SESSION_DELETE_PLAN_TOO_LARGE"
+    if require_complete and not receipts:
+        return receipts, "SESSION_LIFETIME_AUTHORITY_INCOMPLETE"
+    for receipt in receipts:
+        receipt_identity = _terminal_receipt_session_identity(receipt)
+        if str(receipt.session_name) != session_name or (
+            receipt_identity is not None and receipt_identity != session_id
+        ):
+            return receipts, "SESSION_LIFETIME_RECEIPT_CONFLICT"
+        if require_complete and (
+            receipt.session_lifetime_authority_version != 1 or receipt_identity != session_id
+        ):
+            return receipts, "SESSION_LIFETIME_AUTHORITY_INCOMPLETE"
+    return receipts, None
 
 
 def _terminal_receipt_workspace_cleanup_authority(
@@ -5898,9 +6116,72 @@ def get_session_hard_deletion_operation(session_id: str) -> Optional[Dict[str, A
         )
 
 
+def _backfill_terminal_deletion_session_lifetime_authority(connection: Any) -> dict[str, int]:
+    """Upgrade only legacy receipts with explicit, non-conflicting Session IDs."""
+    last_terminal_id = ""
+    inspected = 0
+    upgraded = 0
+    while True:
+        page = connection.exec_driver_sql(
+            "SELECT terminal_id FROM terminal_deletion_receipts "
+            "WHERE terminal_id > ? ORDER BY terminal_id LIMIT ?",
+            (last_terminal_id, SESSION_LIFETIME_RECEIPT_BACKFILL_BATCH_SIZE),
+        ).fetchall()
+        if not page:
+            break
+        terminal_ids = [str(row[0]) for row in page]
+        inspected += len(terminal_ids)
+        placeholders = ",".join("?" for _value in terminal_ids)
+        updated = connection.exec_driver_sql(
+            f"""
+            UPDATE terminal_deletion_receipts
+            SET session_lifetime_authority_version = ?
+            WHERE terminal_id IN ({placeholders})
+              AND session_lifetime_authority_version IS NULL
+              AND session_id IS NOT NULL
+              AND session_id != ''
+              AND session_name != ''
+              AND NOT EXISTS (
+                SELECT 1 FROM terminal_deletion_receipts AS peer
+                WHERE peer.session_id = terminal_deletion_receipts.session_id
+                  AND peer.session_name != terminal_deletion_receipts.session_name
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM terminals AS terminal
+                WHERE COALESCE(
+                        terminal.session_id,
+                        'legacy:' || terminal.tmux_session
+                      ) = terminal_deletion_receipts.session_id
+                  AND terminal.tmux_session != terminal_deletion_receipts.session_name
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM session_deletion_receipts AS deleted
+                WHERE deleted.session_id = terminal_deletion_receipts.session_id
+              )
+            """,
+            (SESSION_LIFETIME_RECEIPT_SCHEMA_VERSION, *terminal_ids),
+        )
+        upgraded += max(int(updated.rowcount or 0), 0)
+        last_terminal_id = terminal_ids[-1]
+    return {"inspected": inspected, "upgraded": upgraded}
+
+
 def _ensure_terminal_deletion_receipt_schema() -> None:
+    global _terminal_deletion_receipt_schema_ready
+    global _terminal_deletion_receipt_schema_engine_identity
+    if (
+        _terminal_deletion_receipt_schema_ready
+        and _terminal_deletion_receipt_schema_engine_identity == id(engine)
+    ):
+        return
     with _terminal_deletion_receipt_schema_lock:
+        if (
+            _terminal_deletion_receipt_schema_ready
+            and _terminal_deletion_receipt_schema_engine_identity == id(engine)
+        ):
+            return
         TerminalDeletionReceiptModel.__table__.create(bind=engine, checkfirst=True)
+        MigrationReceiptModel.__table__.create(bind=engine, checkfirst=True)
         with engine.begin() as connection:
             columns = {
                 str(row[1])
@@ -5913,6 +6194,7 @@ def _ensure_terminal_deletion_receipt_schema() -> None:
                     "ALTER TABLE terminal_deletion_receipts " "ADD COLUMN auth_token_sha256 VARCHAR"
                 )
             additions = {
+                "session_lifetime_authority_version": "INTEGER",
                 "workspace_cleanup_authority_version": "INTEGER",
                 "managed_worktree_kind": "VARCHAR",
                 "managed_worktree_source": "VARCHAR",
@@ -5937,6 +6219,45 @@ def _ensure_terminal_deletion_receipt_schema() -> None:
                 "ix_terminal_deletion_receipts_auth_token_sha256 "
                 "ON terminal_deletion_receipts (auth_token_sha256)"
             )
+        with engine.connect() as connection:
+            receipt = connection.exec_driver_sql(
+                "SELECT 1 FROM migration_receipts WHERE name = ?",
+                (SESSION_LIFETIME_RECEIPT_MIGRATION,),
+            ).first()
+            if receipt is not None:
+                connection.rollback()
+                return
+            connection.rollback()
+            # Column DDL may already be durable after a prior crash. The
+            # completion receipt, not schema presence, is the sole authority
+            # that the exact-only backfill finished.
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            receipt = connection.exec_driver_sql(
+                "SELECT 1 FROM migration_receipts WHERE name = ?",
+                (SESSION_LIFETIME_RECEIPT_MIGRATION,),
+            ).first()
+            if receipt is None:
+                outcome = _backfill_terminal_deletion_session_lifetime_authority(connection)
+                connection.exec_driver_sql(
+                    "INSERT INTO migration_receipts"
+                    "(name, schema_version, detail_json, created_at) VALUES (?, ?, ?, ?)",
+                    (
+                        SESSION_LIFETIME_RECEIPT_MIGRATION,
+                        SESSION_LIFETIME_RECEIPT_SCHEMA_VERSION,
+                        json.dumps(
+                            {
+                                "batch_size": SESSION_LIFETIME_RECEIPT_BACKFILL_BATCH_SIZE,
+                                **outcome,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        datetime.now(),
+                    ),
+                )
+            connection.commit()
+        _terminal_deletion_receipt_schema_ready = True
+        _terminal_deletion_receipt_schema_engine_identity = id(engine)
 
 
 def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
@@ -5949,13 +6270,9 @@ def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
     _ensure_terminal_worktree_authority_schema()
     _ensure_usage_schema()
     _ensure_session_deletion_receipt_schema()
+    _ensure_terminal_deletion_receipt_schema()
     with SessionLocal() as db:
-        deletion_operation = db.get(SessionDeletionOperationModel, identifier)
-        exact_receipt = (
-            db.query(SessionDeletionReceiptModel)
-            .filter(SessionDeletionReceiptModel.session_id == identifier)
-            .first()
-        )
+        exact_receipt = db.get(SessionDeletionReceiptModel, identifier)
         if exact_receipt is not None:
             return {
                 "session_id": str(exact_receipt.session_id),
@@ -5964,6 +6281,7 @@ def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
                 "terminals": [],
                 "retained_resources": _session_receipt_retained_resources(exact_receipt),
             }
+
         terminals = (
             db.query(TerminalModel)
             .filter(TerminalModel.session_id == identifier)
@@ -5981,42 +6299,6 @@ def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
                 .order_by(TerminalModel.creation_order.asc(), TerminalModel.id.asc())
                 .all()
             )
-        if not terminals:
-            tombstone_exists = (
-                db.query(SessionDeletionReceiptModel.session_id)
-                .filter(
-                    SessionDeletionReceiptModel.session_id
-                    == func.coalesce(
-                        TerminalModel.session_id,
-                        "legacy:" + TerminalModel.tmux_session,
-                    )
-                )
-                .exists()
-            )
-            named = (
-                db.query(TerminalModel)
-                .filter(
-                    TerminalModel.tmux_session == identifier,
-                    ~tombstone_exists,
-                )
-                .order_by(TerminalModel.creation_order.asc(), TerminalModel.id.asc())
-                .all()
-            )
-            identities = {
-                str(row.session_id) if row.session_id else f"legacy:{row.tmux_session}"
-                for row in named
-            }
-            if len(identities) > 1:
-                raise AmbiguousSessionIdentity(identifier)
-            if named:
-                prior_lifetime = (
-                    db.query(SessionDeletionReceiptModel.session_id)
-                    .filter(SessionDeletionReceiptModel.session_name == identifier)
-                    .first()
-                )
-                if prior_lifetime is not None:
-                    raise AmbiguousSessionIdentity(identifier)
-            terminals = named
         if terminals:
             names = {str(row.tmux_session) for row in terminals}
             identities = {
@@ -6026,39 +6308,171 @@ def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
             if len(names) != 1 or len(identities) != 1:
                 raise AmbiguousSessionIdentity(identifier)
             resolved_session_id = identities.pop()
+            resolved_session_name = names.pop()
+            _receipts, authority_error = _validate_session_terminal_receipt_authority(
+                db,
+                resolved_session_id,
+                resolved_session_name,
+                require_complete=False,
+            )
+            if authority_error is not None:
+                raise SessionLifetimeAuthorityError(authority_error, identifier)
             deletion_operation = db.get(SessionDeletionOperationModel, resolved_session_id)
             return {
                 "session_id": resolved_session_id,
-                "session_name": names.pop(),
+                "session_name": resolved_session_name,
                 "deleted": False,
                 "terminals": [_session_terminal_dict(row) for row in terminals],
                 "retained_resources": [],
                 "deletion_in_progress": deletion_operation is not None,
+                "lifetime_authority": "current_terminals",
             }
 
-        receipt = (
-            db.query(SessionDeletionReceiptModel)
-            .filter(SessionDeletionReceiptModel.session_id == identifier)
-            .first()
-        )
-        if receipt is None:
-            receipts = (
-                db.query(SessionDeletionReceiptModel)
-                .filter(SessionDeletionReceiptModel.session_name == identifier)
-                .order_by(SessionDeletionReceiptModel.deleted_at.desc())
-                .all()
+        exact_terminal_receipts = _session_historical_terminal_receipts(db, identifier)
+        if exact_terminal_receipts:
+            names = {str(row.session_name) for row in exact_terminal_receipts}
+            if len(names) != 1:
+                raise SessionLifetimeAuthorityError("SESSION_LIFETIME_RECEIPT_CONFLICT", identifier)
+            session_name = names.pop()
+            _receipts, authority_error = _validate_session_terminal_receipt_authority(
+                db,
+                identifier,
+                session_name,
+                require_complete=True,
             )
-            if len(receipts) > 1:
-                raise AmbiguousSessionIdentity(identifier)
-            receipt = receipts[0] if receipts else None
-        if receipt is None:
+            if authority_error is not None:
+                raise SessionLifetimeAuthorityError(authority_error, identifier)
+            return {
+                "session_id": identifier,
+                "session_name": session_name,
+                "deleted": False,
+                "terminals": [],
+                "retained_resources": [],
+                "deletion_in_progress": (
+                    db.get(SessionDeletionOperationModel, identifier) is not None
+                ),
+                "lifetime_authority": "terminal_deletion_receipts",
+                "receipt_terminal_ids": [str(row.terminal_id) for row in exact_terminal_receipts],
+            }
+
+        tombstone_exists = (
+            db.query(SessionDeletionReceiptModel.session_id)
+            .filter(
+                SessionDeletionReceiptModel.session_id
+                == func.coalesce(
+                    TerminalModel.session_id,
+                    "legacy:" + TerminalModel.tmux_session,
+                )
+            )
+            .exists()
+        )
+        named_terminals = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.tmux_session == identifier, ~tombstone_exists)
+            .order_by(TerminalModel.creation_order.asc(), TerminalModel.id.asc())
+            .all()
+        )
+        named_terminal_receipts = cast(
+            List[TerminalDeletionReceiptModel],
+            db.query(TerminalDeletionReceiptModel)
+            .filter(TerminalDeletionReceiptModel.session_name == identifier)
+            .order_by(TerminalDeletionReceiptModel.terminal_id.asc())
+            .limit(_SESSION_DELETION_PLAN_LIMIT + 1)
+            .all(),
+        )
+        if len(named_terminal_receipts) > _SESSION_DELETION_PLAN_LIMIT:
+            raise SessionLifetimeAuthorityError("SESSION_DELETE_PLAN_TOO_LARGE", identifier)
+        identities = {
+            str(row.session_id) if row.session_id else f"legacy:{row.tmux_session}"
+            for row in named_terminals
+        }
+        receipt_identities = {
+            identity
+            for row in named_terminal_receipts
+            if (identity := _terminal_receipt_session_identity(row)) is not None
+        }
+        incomplete_named_receipt = any(
+            row.session_lifetime_authority_version != 1
+            or _terminal_receipt_session_identity(row) is None
+            for row in named_terminal_receipts
+        )
+        candidate_identities = identities | receipt_identities
+        final_receipts = (
+            db.query(SessionDeletionReceiptModel)
+            .filter(SessionDeletionReceiptModel.session_name == identifier)
+            .order_by(SessionDeletionReceiptModel.deleted_at.desc())
+            .all()
+        )
+        if len(candidate_identities) > 1 or (candidate_identities and final_receipts):
+            raise AmbiguousSessionIdentity(identifier)
+        if candidate_identities:
+            resolved_session_id = candidate_identities.pop()
+            current = [
+                row
+                for row in named_terminals
+                if str(row.session_id or f"legacy:{row.tmux_session}") == resolved_session_id
+            ]
+            if current:
+                if incomplete_named_receipt:
+                    raise SessionLifetimeAuthorityError(
+                        "SESSION_LIFETIME_AUTHORITY_INCOMPLETE", identifier
+                    )
+                _receipts, authority_error = _validate_session_terminal_receipt_authority(
+                    db,
+                    resolved_session_id,
+                    identifier,
+                    require_complete=False,
+                )
+                if authority_error is not None:
+                    raise SessionLifetimeAuthorityError(authority_error, identifier)
+                return {
+                    "session_id": resolved_session_id,
+                    "session_name": identifier,
+                    "deleted": False,
+                    "terminals": [_session_terminal_dict(row) for row in current],
+                    "retained_resources": [],
+                    "deletion_in_progress": (
+                        db.get(SessionDeletionOperationModel, resolved_session_id) is not None
+                    ),
+                    "lifetime_authority": "current_terminals",
+                }
+            if incomplete_named_receipt:
+                raise SessionLifetimeAuthorityError(
+                    "SESSION_LIFETIME_AUTHORITY_INCOMPLETE", identifier
+                )
+            _receipts, authority_error = _validate_session_terminal_receipt_authority(
+                db,
+                resolved_session_id,
+                identifier,
+                require_complete=True,
+            )
+            if authority_error is not None:
+                raise SessionLifetimeAuthorityError(authority_error, identifier)
+            return {
+                "session_id": resolved_session_id,
+                "session_name": identifier,
+                "deleted": False,
+                "terminals": [],
+                "retained_resources": [],
+                "deletion_in_progress": (
+                    db.get(SessionDeletionOperationModel, resolved_session_id) is not None
+                ),
+                "lifetime_authority": "terminal_deletion_receipts",
+                "receipt_terminal_ids": [str(row.terminal_id) for row in named_terminal_receipts],
+            }
+        if named_terminal_receipts:
+            raise SessionLifetimeAuthorityError("SESSION_LIFETIME_AUTHORITY_INCOMPLETE", identifier)
+        if len(final_receipts) > 1:
+            raise AmbiguousSessionIdentity(identifier)
+        if not final_receipts:
             return None
+        final_receipt = final_receipts[0]
         return {
-            "session_id": str(receipt.session_id),
-            "session_name": str(receipt.session_name),
+            "session_id": str(final_receipt.session_id),
+            "session_name": str(final_receipt.session_name),
             "deleted": True,
             "terminals": [],
-            "retained_resources": _session_receipt_retained_resources(receipt),
+            "retained_resources": _session_receipt_retained_resources(final_receipt),
         }
 
 
@@ -6570,9 +6984,36 @@ def list_terminal_ui_summary_page(
 def get_terminal_ui_overview_counts() -> Dict[str, int]:
     """Aggregate Home counters and durable session lifetimes in SQLite."""
     _ensure_terminal_ui_projection_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     projection_cte, parameters = _terminal_ui_projection_cte()
-    sql = projection_cte + f"""
-        SELECT COUNT(DISTINCT session_id) AS sessions, COUNT(*) AS agents,
+    sql = projection_cte + f""", receipt_only_sessions AS MATERIALIZED (
+        SELECT COALESCE(receipt.session_id, 'legacy:' || receipt.session_name) AS session_id
+        FROM terminal_deletion_receipts receipt
+        WHERE receipt.session_lifetime_authority_version = 1
+          AND NOT EXISTS (
+            SELECT 1 FROM terminals terminal
+            WHERE COALESCE(terminal.session_id, 'legacy:' || terminal.tmux_session)
+                  = COALESCE(receipt.session_id, 'legacy:' || receipt.session_name)
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM session_deletion_receipts deleted
+            WHERE deleted.session_id = COALESCE(
+              receipt.session_id, 'legacy:' || receipt.session_name
+            )
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM session_deletion_operations operation
+            WHERE operation.session_id = COALESCE(
+              receipt.session_id, 'legacy:' || receipt.session_name
+            )
+          )
+        GROUP BY COALESCE(receipt.session_id, 'legacy:' || receipt.session_name)
+        HAVING COUNT(DISTINCT receipt.session_name) = 1
+    )
+        SELECT COUNT(DISTINCT session_id)
+                 + (SELECT COUNT(*) FROM receipt_only_sessions) AS sessions,
+               COUNT(*) AS agents,
                SUM(CASE WHEN lifecycle NOT IN ('exited', 'recovery_fenced')
                         THEN 1 ELSE 0 END) AS active,
                SUM(CASE WHEN {_UI_READY_WAITING_ACTIVITY_PREDICATE}
@@ -6590,6 +7031,8 @@ def get_terminal_ui_overview_counts() -> Dict[str, int]:
 def list_terminal_ui_session_page(*, limit: int, offset: int, query: str = "") -> Dict[str, Any]:
     """Page stable session lifetimes; runtime retirement cannot erase them."""
     _ensure_terminal_ui_projection_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     projection_cte, parameters = _terminal_ui_projection_cte()
     normalized = query.strip().lower()
     search = ""
@@ -6602,7 +7045,7 @@ def list_terminal_ui_session_page(*, limit: int, offset: int, query: str = "") -
     parameters.update({"limit": limit, "offset": offset})
     sql = (
         projection_cte
-        + """, aggregates AS MATERIALIZED (
+        + """, terminal_aggregates AS MATERIALIZED (
       SELECT session_id AS id, MAX(session_name) AS name,
              CASE WHEN SUM(CASE WHEN lifecycle NOT IN ('exited', 'recovery_fenced')
                                 THEN 1 ELSE 0 END) > 0
@@ -6618,6 +7061,41 @@ def list_terminal_ui_session_page(*, limit: int, offset: int, query: str = "") -
              MAX(last_active) AS last_active
              , MAX(workspace_state) AS workspace_state
       FROM projected GROUP BY session_id
+    ), receipt_only_aggregates AS MATERIALIZED (
+      SELECT COALESCE(receipt.session_id, 'legacy:' || receipt.session_name) AS id,
+             MAX(receipt.session_name) AS name, 'history' AS status,
+             MIN(receipt.deleted_at) AS created_at, 0 AS agent_count,
+             0 AS active_agent_count, NULL AS project_name,
+             MAX(receipt.deleted_at) AS last_active,
+             (SELECT MAX(context.state) FROM writable_work_contexts context
+              WHERE context.session_id = COALESCE(
+                receipt.session_id, 'legacy:' || receipt.session_name
+              )) AS workspace_state
+      FROM terminal_deletion_receipts receipt
+      WHERE receipt.session_lifetime_authority_version = 1
+        AND NOT EXISTS (
+          SELECT 1 FROM terminals terminal
+          WHERE COALESCE(terminal.session_id, 'legacy:' || terminal.tmux_session)
+                = COALESCE(receipt.session_id, 'legacy:' || receipt.session_name)
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM session_deletion_receipts deleted
+          WHERE deleted.session_id = COALESCE(
+            receipt.session_id, 'legacy:' || receipt.session_name
+          )
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM session_deletion_operations operation
+          WHERE operation.session_id = COALESCE(
+            receipt.session_id, 'legacy:' || receipt.session_name
+          )
+        )
+      GROUP BY COALESCE(receipt.session_id, 'legacy:' || receipt.session_name)
+      HAVING COUNT(DISTINCT receipt.session_name) = 1
+    ), aggregates AS MATERIALIZED (
+      SELECT * FROM terminal_aggregates
+      UNION ALL
+      SELECT * FROM receipt_only_aggregates
     ), filtered AS MATERIALIZED (SELECT * FROM aggregates"""
         + search
         + """),
@@ -6809,8 +7287,9 @@ def _terminal_workspace_cleanup_receipt_fields(
 def terminal_deletion_receipt_exists(terminal_id: str) -> bool:
     """Return whether one exact terminal was already deleted successfully."""
     _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     with SessionLocal() as db:
-        return db.get(TerminalDeletionReceiptModel, terminal_id) is not None
+        return _terminal_deletion_fence_exists_in_transaction(db, terminal_id)
 
 
 def delete_exited_terminal(
@@ -6832,13 +7311,16 @@ def delete_exited_terminal(
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         terminal = db.get(TerminalModel, terminal_id)
         receipt = db.get(TerminalDeletionReceiptModel, terminal_id)
-        if terminal is None and receipt is not None:
+        hard_deleted_terminal, _digest = _hard_deleted_terminal_fence_in_transaction(
+            db, terminal_id
+        )
+        if terminal is None and (receipt is not None or hard_deleted_terminal):
             db.rollback()
             return {"deleted": 0, "already_deleted": True, "missing": False}
         if terminal is None:
             db.rollback()
             return {"deleted": 0, "already_deleted": False, "missing": True}
-        if receipt is not None:
+        if receipt is not None or hard_deleted_terminal:
             # Terminal IDs are intended to be durable identities. If an old ID
             # was nevertheless reused, its prior receipt cannot authorize
             # deletion of the replacement row.
@@ -6864,10 +7346,28 @@ def delete_exited_terminal(
             db.rollback()
             raise AmbiguousTerminalIdentity(terminal_id)
         receipt_identity = {
-            "session_id": terminal.session_id,
+            # Persist the canonical lifetime identity even for legacy rows,
+            # whose TerminalModel.session_id was historically nullable. A
+            # receipt with only a reusable tmux name is never sufficient
+            # authority for a future hard delete.
+            "session_id": session_id,
             "session_name": terminal.tmux_session,
             "window_name": terminal.tmux_window,
         }
+        prior_receipts = _session_historical_terminal_receipts(db, session_id)
+        if len(prior_receipts) > _SESSION_DELETION_PLAN_LIMIT or any(
+            str(prior.session_name) != str(terminal.tmux_session)
+            or not isinstance(prior.session_id, str)
+            or str(prior.session_id) != session_id
+            for prior in prior_receipts
+        ):
+            db.rollback()
+            raise AmbiguousTerminalIdentity(terminal_id)
+        # The current Terminal is exact independent proof of the Session
+        # lifetime. Upgrade only its already-owned receipts, inside the same
+        # transaction that may remove the final current Terminal.
+        for prior in prior_receipts:
+            prior.session_lifetime_authority_version = 1
         cleanup_receipt_fields = _terminal_workspace_cleanup_receipt_fields(
             terminal,
             workspace_cleanup_authority,
@@ -6933,6 +7433,7 @@ def delete_exited_terminal(
                 session_name=receipt_identity["session_name"],
                 window_name=receipt_identity["window_name"],
                 auth_token_sha256=terminal.auth_token_sha256,
+                session_lifetime_authority_version=1,
                 **cleanup_receipt_fields,
                 deleted_at=datetime.now(),
             )
@@ -7149,6 +7650,11 @@ def _session_owned_row_counts_in_transaction(
             .filter(SessionDeletionCancellationAuditModel.session_id == session_id)
             .count()
         ),
+        "terminal_deletion_receipts": int(
+            db.query(TerminalDeletionReceiptModel.terminal_id)
+            .filter(TerminalDeletionReceiptModel.terminal_id.in_(terminal_values))
+            .count()
+        ),
     }
 
 
@@ -7168,7 +7674,7 @@ def _session_hard_delete_authority_fingerprint(
     if len(terminal_receipts) > _SESSION_DELETION_PLAN_LIMIT:
         raise AmbiguousSessionIdentity(session_id)
     document = {
-        "version": 3,
+        "version": 4,
         "session_id": session_id,
         "session_name": session_name,
         "terminals": sorted(
@@ -7221,6 +7727,7 @@ def _session_hard_delete_authority_fingerprint(
                 str(receipt.session_name),
                 str(receipt.window_name),
                 str(receipt.auth_token_sha256 or ""),
+                str(receipt.session_lifetime_authority_version or ""),
                 str(receipt.workspace_cleanup_authority_version or ""),
                 str(receipt.managed_worktree_kind or ""),
                 str(receipt.managed_worktree_source or ""),
@@ -7249,6 +7756,14 @@ def _revalidate_session_hard_deletion_in_transaction(
     terminals = _session_plan_terminals(db, parsed["session_id"], parsed["terminal_ids"])
     if terminals is None or {str(row.id) for row in terminals} != set(parsed["terminal_ids"]):
         return None, "SESSION_IDENTITY_CHANGED"
+    _receipts, lifetime_error = _validate_session_terminal_receipt_authority(
+        db,
+        parsed["session_id"],
+        parsed["session_name"],
+        require_complete=not terminals,
+    )
+    if lifetime_error is not None:
+        return None, lifetime_error
     if any(
         str(row.tmux_session) != parsed["session_name"]
         or str(row.runtime_lifecycle or "") != "exited"
@@ -7382,9 +7897,18 @@ def begin_session_hard_deletion(
                 return {"started": False, "reason_code": reason_code}
             return {"started": True, "already_started": True, **operation}
         terminals = _session_plan_terminals(db, session_id, expected_terminal_ids)
-        if not terminals or len(terminals) > _SESSION_DELETION_PLAN_LIMIT:
+        if terminals is None or len(terminals) > _SESSION_DELETION_PLAN_LIMIT:
             db.rollback()
             raise AmbiguousSessionIdentity(session_id)
+        _receipts, lifetime_error = _validate_session_terminal_receipt_authority(
+            db,
+            session_id,
+            session_name,
+            require_complete=not terminals,
+        )
+        if lifetime_error is not None:
+            db.rollback()
+            return {"started": False, "reason_code": lifetime_error}
         if any(
             str(terminal.tmux_session) != session_name
             or str(terminal.runtime_lifecycle or "") != "exited"
@@ -7600,39 +8124,44 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
 
         owned = _session_owned_graph_queries(db, session_id, terminal_ids)
         terminal_values = owned["terminal_ids"]
-        terminal_windows = {str(row.id): str(row.tmux_window) for row in terminals}
-        terminal_auth_digests = {
+        terminal_auth_digests: dict[str, str | None] = {
             str(row.id): (str(row.auth_token_sha256) if row.auth_token_sha256 else None)
             for row in terminals
         }
-        now = datetime.now()
-        existing_terminal_receipts = {
-            str(row.terminal_id): row
-            for row in db.query(TerminalDeletionReceiptModel)
-            .filter(TerminalDeletionReceiptModel.terminal_id.in_(current_terminal_ids))
-            .all()
-        }
-        new_terminal_receipts = []
-        for terminal_id in current_terminal_ids:
-            existing_terminal_receipt = existing_terminal_receipts.get(terminal_id)
-            if existing_terminal_receipt is not None:
-                if existing_terminal_receipt.session_id != session_id:
-                    db.rollback()
-                    raise AmbiguousSessionIdentity(session_id)
-                continue
-            new_terminal_receipts.append(
+        historical_terminal_receipts = _session_historical_terminal_receipts(db, session_id)
+        if len(historical_terminal_receipts) > _SESSION_DELETION_PLAN_LIMIT:
+            db.rollback()
+            return {"completed": False, "reason_code": "SESSION_DELETE_PLAN_TOO_LARGE"}
+        for terminal_receipt in historical_terminal_receipts:
+            terminal_id = str(terminal_receipt.terminal_id)
+            digest = (
+                str(terminal_receipt.auth_token_sha256)
+                if terminal_receipt.auth_token_sha256
+                else None
+            )
+            if (
+                terminal_id in terminal_auth_digests
+                and terminal_auth_digests[terminal_id] != digest
+            ):
+                db.rollback()
+                return {
+                    "completed": False,
+                    "reason_code": "SESSION_LIFETIME_RECEIPT_CONFLICT",
+                }
+            terminal_auth_digests[terminal_id] = digest
+        if set(terminal_auth_digests) != set(terminal_ids):
+            db.rollback()
+            return {"completed": False, "reason_code": "SESSION_IDENTITY_CHANGED"}
+        terminal_fences = _normalize_session_terminal_fences(
+            [
                 {
                     "terminal_id": terminal_id,
-                    "session_id": session_id,
-                    "session_name": session_name,
-                    "window_name": terminal_windows[terminal_id],
                     "auth_token_sha256": terminal_auth_digests[terminal_id],
-                    "deleted_at": now,
                 }
-            )
-        if new_terminal_receipts:
-            db.execute(insert(TerminalDeletionReceiptModel), new_terminal_receipts)
-        db.flush()
+                for terminal_id in terminal_ids
+            ]
+        )
+        now = datetime.now()
 
         _delete_query(
             db.query(DelegationResultEventModel).filter(
@@ -7741,23 +8270,9 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
                 )
             )
         )
-        # The per-terminal cleanup authority is transitional. Once the whole
-        # Session graph and its physical/Git resources are gone, retain only
-        # the minimal callback/idempotency terminal fences.
-        (
-            db.query(TerminalDeletionReceiptModel)
-            .filter(TerminalDeletionReceiptModel.terminal_id.in_(terminal_values))
-            .update(
-                {
-                    TerminalDeletionReceiptModel.workspace_cleanup_authority_version: None,
-                    TerminalDeletionReceiptModel.managed_worktree_kind: None,
-                    TerminalDeletionReceiptModel.managed_worktree_source: None,
-                    TerminalDeletionReceiptModel.managed_worktree_path: None,
-                    TerminalDeletionReceiptModel.managed_worktree_branch: None,
-                    TerminalDeletionReceiptModel.managed_worktree_branch_object_id: None,
-                    TerminalDeletionReceiptModel.managed_worktree_identity: None,
-                },
-                synchronize_session=False,
+        _delete_query(
+            db.query(TerminalDeletionReceiptModel).filter(
+                TerminalDeletionReceiptModel.terminal_id.in_(terminal_values)
             )
         )
 
@@ -7774,7 +8289,10 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
                         + str(operation.workspace_evidence_sha256)
                     ).encode()
                 ).hexdigest(),
-                receipt_version=2,
+                terminal_fences_json=json.dumps(
+                    terminal_fences, sort_keys=True, separators=(",", ":")
+                ),
+                receipt_version=3,
                 deleted_at=now,
             )
         )
@@ -7791,7 +8309,7 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
             "before_counts": before_counts,
             "after_counts": after_counts,
             "tombstone_count": 1,
-            "terminal_fence_count": len(terminal_ids),
+            "terminal_fence_count": len(terminal_fences),
         }
 
 
@@ -10799,7 +11317,7 @@ def _workspace_accepts_new_work(db: Any, terminal_id: str) -> bool:
         # authority before a terminal row is materialized. Retirement is an
         # explicit state on a present Session workspace, never an inference
         # from missing historical metadata.
-        return db.get(TerminalDeletionReceiptModel, terminal_id) is None
+        return not _terminal_deletion_fence_exists_in_transaction(db, terminal_id)
     session_id = terminal.session_id or f"legacy:{terminal.tmux_session}"
     if (
         db.get(SessionDeletionOperationModel, session_id) is not None
@@ -18611,6 +19129,7 @@ def submit_handoff_result_v1(
 ) -> Dict[str, Any]:
     """Atomically finalize one authenticated strict V1 managed handoff."""
     _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     token_digest = hashlib.sha256(auth_token.encode("utf-8", "strict")).hexdigest()
     document_bytes = canonical_handoff_result_v1_bytes(document)
     problem = managed_final_problem(document.body_markdown)
@@ -18680,6 +19199,8 @@ def _terminal_for_handoff_submission(db: Any, token_digest: str) -> TerminalMode
             .all()
         )
         if len(deleted) == 1 and hmac.compare_digest(str(deleted[0][0]), token_digest):
+            raise HandoffResultSubmissionError(409, "session_deleted")
+        if _hard_deleted_terminal_digest_exists_in_transaction(db, token_digest):
             raise HandoffResultSubmissionError(409, "session_deleted")
         raise HandoffResultSubmissionError(401, "invalid_terminal_auth")
     if not hmac.compare_digest(cast(str, terminals[0].auth_token_sha256), token_digest):

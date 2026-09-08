@@ -323,6 +323,64 @@ class TestDeleteSession:
             patch("cli_agent_orchestrator.services.inbox_service.wake_provider_execution_queue"),
         )
 
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_receipt_only_session_uses_former_terminal_authority_and_hard_deletes(self, mock_tmux):
+        mock_tmux.session_exists.return_value = False
+        durable = {
+            "session_id": "session-lifetime-1",
+            "session_name": "cao-test",
+            "deleted": False,
+            "retained_resources": [],
+            "terminals": [],
+            "receipt_terminal_ids": ["former-terminal"],
+            "lifetime_authority": "terminal_deletion_receipts",
+        }
+        contexts = self._patch_common(durable)
+        historical_cleanup = {
+            "terminal_id": "former-terminal",
+            "managed": False,
+            "workspace_cleanup_authority_version": 1,
+        }
+        with (
+            contexts[0],
+            contexts[1] as prepare,
+            contexts[2] as cancel,
+            contexts[3],
+            contexts[4] as cleanup,
+            contexts[5] as providers,
+            contexts[6] as complete,
+            contexts[7],
+            patch(
+                "cli_agent_orchestrator.services.session_service.revalidate_session_hard_deletion",
+                return_value={
+                    "valid": True,
+                    "terminal_ids": [],
+                    "graph_terminal_ids": ["former-terminal"],
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service."
+                "list_session_historical_terminal_cleanup_authorities",
+                return_value=[historical_cleanup],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.purge_session_terminal_artifacts",
+                return_value={
+                    "runtime_artifacts_absent": True,
+                    "terminals": ["former-terminal"],
+                },
+            ) as artifacts,
+        ):
+            result = delete_session("session-lifetime-1")
+
+        assert result["deleted"] == ["cao-test"]
+        prepare.assert_not_called()
+        cancel.assert_not_called()
+        providers.cleanup_provider.assert_not_called()
+        cleanup.assert_called_once_with(historical_cleanup, require_already_absent=True)
+        artifacts.assert_called_once_with(["former-terminal"])
+        complete.assert_called_once_with("session-lifetime-1", "cao-test")
+
     def test_retired_absent_workspace_with_already_removed_branch_is_preflight_eligible(self):
         durable = _durable_session(lifecycle="exited")
         durable["terminals"][0].update(

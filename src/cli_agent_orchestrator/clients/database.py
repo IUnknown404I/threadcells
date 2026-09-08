@@ -1177,6 +1177,8 @@ _terminal_ui_projection_schema_lock = threading.Lock()
 _terminal_ui_projection_schema_ready = False
 _terminal_ui_projection_schema_engine_identity: Optional[int] = None
 _session_deletion_receipt_schema_lock = threading.Lock()
+_session_deletion_receipt_schema_ready = False
+_session_deletion_receipt_schema_engine_identity: Optional[int] = None
 _terminal_deletion_receipt_schema_lock = threading.Lock()
 _terminal_deletion_receipt_schema_ready = False
 _terminal_deletion_receipt_schema_engine_identity: Optional[int] = None
@@ -5814,7 +5816,25 @@ def _session_terminal_dict(terminal: TerminalModel) -> Dict[str, Any]:
 
 
 def _ensure_session_deletion_receipt_schema() -> None:
+    global _session_deletion_receipt_schema_engine_identity
+    global _session_deletion_receipt_schema_ready
+    engine_identity = id(engine)
+    if (
+        _session_deletion_receipt_schema_ready
+        and _session_deletion_receipt_schema_engine_identity == engine_identity
+    ):
+        return
     with _session_deletion_receipt_schema_lock:
+        if (
+            _session_deletion_receipt_schema_ready
+            and _session_deletion_receipt_schema_engine_identity == engine_identity
+        ):
+            return
+        # A cached completion belongs only to the engine that established it.
+        # Keep the new engine unready until its durable migration receipt has
+        # been verified or its crash-resumable backfill has completed.
+        _session_deletion_receipt_schema_ready = False
+        _session_deletion_receipt_schema_engine_identity = None
         SessionDeletionReceiptModel.__table__.create(bind=engine, checkfirst=True)
         SessionDeletedTerminalFenceModel.__table__.create(bind=engine, checkfirst=True)
         SessionDeletionOperationModel.__table__.create(bind=engine, checkfirst=True)
@@ -5864,6 +5884,8 @@ def _ensure_session_deletion_receipt_schema() -> None:
                     "ADD COLUMN receipt_version INTEGER NOT NULL DEFAULT 1"
                 )
         _ensure_session_deleted_terminal_fence_backfill()
+        _session_deletion_receipt_schema_engine_identity = engine_identity
+        _session_deletion_receipt_schema_ready = True
 
 
 def _normalize_session_retained_resources(
@@ -6338,6 +6360,8 @@ def _ensure_terminal_deletion_receipt_schema() -> None:
             and _terminal_deletion_receipt_schema_engine_identity == id(engine)
         ):
             return
+        _terminal_deletion_receipt_schema_ready = False
+        _terminal_deletion_receipt_schema_engine_identity = None
         TerminalDeletionReceiptModel.__table__.create(bind=engine, checkfirst=True)
         MigrationReceiptModel.__table__.create(bind=engine, checkfirst=True)
         with engine.begin() as connection:
@@ -6382,38 +6406,36 @@ def _ensure_terminal_deletion_receipt_schema() -> None:
                 "SELECT 1 FROM migration_receipts WHERE name = ?",
                 (SESSION_LIFETIME_RECEIPT_MIGRATION,),
             ).first()
-            if receipt is not None:
-                connection.rollback()
-                return
             connection.rollback()
-            # Column DDL may already be durable after a prior crash. The
-            # completion receipt, not schema presence, is the sole authority
-            # that the exact-only backfill finished.
-            connection.exec_driver_sql("BEGIN IMMEDIATE")
-            receipt = connection.exec_driver_sql(
-                "SELECT 1 FROM migration_receipts WHERE name = ?",
-                (SESSION_LIFETIME_RECEIPT_MIGRATION,),
-            ).first()
             if receipt is None:
-                outcome = _backfill_terminal_deletion_session_lifetime_authority(connection)
-                connection.exec_driver_sql(
-                    "INSERT INTO migration_receipts"
-                    "(name, schema_version, detail_json, created_at) VALUES (?, ?, ?, ?)",
-                    (
-                        SESSION_LIFETIME_RECEIPT_MIGRATION,
-                        SESSION_LIFETIME_RECEIPT_SCHEMA_VERSION,
-                        json.dumps(
-                            {
-                                "batch_size": SESSION_LIFETIME_RECEIPT_BACKFILL_BATCH_SIZE,
-                                **outcome,
-                            },
-                            sort_keys=True,
-                            separators=(",", ":"),
+                # Column DDL may already be durable after a prior crash. The
+                # completion receipt, not schema presence, is the sole authority
+                # that the exact-only backfill finished.
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                receipt = connection.exec_driver_sql(
+                    "SELECT 1 FROM migration_receipts WHERE name = ?",
+                    (SESSION_LIFETIME_RECEIPT_MIGRATION,),
+                ).first()
+                if receipt is None:
+                    outcome = _backfill_terminal_deletion_session_lifetime_authority(connection)
+                    connection.exec_driver_sql(
+                        "INSERT INTO migration_receipts"
+                        "(name, schema_version, detail_json, created_at) VALUES (?, ?, ?, ?)",
+                        (
+                            SESSION_LIFETIME_RECEIPT_MIGRATION,
+                            SESSION_LIFETIME_RECEIPT_SCHEMA_VERSION,
+                            json.dumps(
+                                {
+                                    "batch_size": SESSION_LIFETIME_RECEIPT_BACKFILL_BATCH_SIZE,
+                                    **outcome,
+                                },
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            datetime.now(),
                         ),
-                        datetime.now(),
-                    ),
-                )
-            connection.commit()
+                    )
+                connection.commit()
         _terminal_deletion_receipt_schema_ready = True
         _terminal_deletion_receipt_schema_engine_identity = id(engine)
 

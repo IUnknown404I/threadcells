@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -1569,6 +1570,8 @@ def test_final_terminal_fence_backfill_is_receipted_crash_resumable_and_indexed(
         )
     monkeypatch.setattr(database, "engine", engine)
     monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
+    monkeypatch.setattr(database, "_session_deletion_receipt_schema_ready", False)
+    monkeypatch.setattr(database, "_session_deletion_receipt_schema_engine_identity", None)
     original_backfill = database._backfill_session_deleted_terminal_fences
 
     def interrupt_backfill(_connection):
@@ -1577,6 +1580,8 @@ def test_final_terminal_fence_backfill_is_receipted_crash_resumable_and_indexed(
     monkeypatch.setattr(database, "_backfill_session_deleted_terminal_fences", interrupt_backfill)
     with pytest.raises(RuntimeError, match="simulated final-fence backfill interruption"):
         database._ensure_session_deletion_receipt_schema()
+    assert database._session_deletion_receipt_schema_ready is False
+    assert database._session_deletion_receipt_schema_engine_identity is None
     with engine.connect() as connection:
         assert (
             connection.exec_driver_sql(
@@ -1608,6 +1613,8 @@ def test_final_terminal_fence_backfill_is_receipted_crash_resumable_and_indexed(
         )
     monkeypatch.setattr(database, "_backfill_session_deleted_terminal_fences", original_backfill)
     database._ensure_session_deletion_receipt_schema()
+    assert database._session_deletion_receipt_schema_ready is True
+    assert database._session_deletion_receipt_schema_engine_identity == id(engine)
     with engine.connect() as connection:
         indexed = connection.exec_driver_sql(
             "SELECT terminal_id, session_id, auth_token_sha256, deleted_at "
@@ -1660,6 +1667,108 @@ def test_final_terminal_fence_backfill_is_receipted_crash_resumable_and_indexed(
         )
     with database.SessionLocal() as db:
         assert db.query(WritableWorkContextModel).count() == 0
+
+
+def test_session_deletion_schema_readiness_is_engine_scoped_and_query_free(monkeypatch, tmp_path):
+    def install(path: Path):
+        installed = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False})
+        Base.metadata.create_all(installed)
+        monkeypatch.setattr(database, "engine", installed)
+        monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=installed))
+        return installed
+
+    monkeypatch.setattr(database, "_session_deletion_receipt_schema_ready", False)
+    monkeypatch.setattr(database, "_session_deletion_receipt_schema_engine_identity", None)
+    first_engine = install(tmp_path / "schema-ready-a.db")
+    first_statements: list[str] = []
+
+    def record_first(_connection, _cursor, statement, _parameters, _context, _many):
+        first_statements.append(statement)
+
+    event.listen(first_engine, "before_cursor_execute", record_first)
+    try:
+        database._ensure_session_deletion_receipt_schema()
+        assert first_statements
+        assert database._session_deletion_receipt_schema_ready is True
+        assert database._session_deletion_receipt_schema_engine_identity == id(first_engine)
+        first_statements.clear()
+        database._ensure_session_deletion_receipt_schema()
+        database._ensure_session_deletion_receipt_schema()
+        assert first_statements == []
+    finally:
+        event.remove(first_engine, "before_cursor_execute", record_first)
+
+    second_engine = install(tmp_path / "schema-ready-b.db")
+    second_statements: list[str] = []
+
+    def record_second(_connection, _cursor, statement, _parameters, _context, _many):
+        second_statements.append(statement)
+
+    event.listen(second_engine, "before_cursor_execute", record_second)
+    try:
+        database._ensure_session_deletion_receipt_schema()
+        assert second_statements
+        assert database._session_deletion_receipt_schema_ready is True
+        assert database._session_deletion_receipt_schema_engine_identity == id(second_engine)
+        second_statements.clear()
+        database._ensure_session_deletion_receipt_schema()
+        assert second_statements == []
+    finally:
+        event.remove(second_engine, "before_cursor_execute", record_second)
+
+    monkeypatch.setattr(database, "_terminal_deletion_receipt_schema_ready", False)
+    monkeypatch.setattr(database, "_terminal_deletion_receipt_schema_engine_identity", None)
+    database._ensure_terminal_deletion_receipt_schema()
+    terminal_receipt_statements: list[str] = []
+
+    def record_terminal_receipt(_connection, _cursor, statement, _parameters, _context, _many):
+        terminal_receipt_statements.append(statement)
+
+    event.listen(second_engine, "before_cursor_execute", record_terminal_receipt)
+    try:
+        database._ensure_terminal_deletion_receipt_schema()
+        assert terminal_receipt_statements == []
+    finally:
+        event.remove(second_engine, "before_cursor_execute", record_terminal_receipt)
+
+
+def test_session_deletion_schema_concurrent_first_access_runs_one_backfill(monkeypatch, tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'schema-ready-concurrent.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
+    monkeypatch.setattr(database, "_session_deletion_receipt_schema_ready", False)
+    monkeypatch.setattr(database, "_session_deletion_receipt_schema_engine_identity", None)
+    original_backfill = database._backfill_session_deleted_terminal_fences
+    backfill_calls: list[int] = []
+
+    def delayed_backfill(connection):
+        backfill_calls.append(1)
+        time.sleep(0.05)
+        return original_backfill(connection)
+
+    monkeypatch.setattr(database, "_backfill_session_deleted_terminal_fences", delayed_backfill)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(database._ensure_session_deletion_receipt_schema) for _index in range(2)
+        ]
+        for future in futures:
+            future.result()
+
+    assert backfill_calls == [1]
+    assert database._session_deletion_receipt_schema_ready is True
+    assert database._session_deletion_receipt_schema_engine_identity == id(engine)
+    with engine.connect() as connection:
+        assert (
+            connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM migration_receipts WHERE name = ?",
+                (database.SESSION_DELETED_TERMINAL_FENCE_MIGRATION,),
+            ).scalar_one()
+            == 1
+        )
 
 
 def test_final_terminal_fence_backfill_fails_closed_on_conflicting_owner(monkeypatch):

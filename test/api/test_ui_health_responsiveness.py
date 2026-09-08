@@ -315,6 +315,8 @@ def _install_large_history(monkeypatch, tmp_path, *, terminal_count: int = 2000)
         monkeypatch.setattr(database, name, lambda: None)
     monkeypatch.setattr(database, "_terminal_ui_projection_schema_ready", True)
     monkeypatch.setattr(database, "_terminal_ui_projection_schema_engine_identity", id(engine))
+    database._ensure_session_deletion_receipt_schema()
+    database._ensure_terminal_deletion_receipt_schema()
     return engine
 
 

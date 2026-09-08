@@ -44,6 +44,8 @@ def _install_database(monkeypatch, url="sqlite:///:memory:"):
         "_ensure_delegation_result_schema",
     ):
         monkeypatch.setattr(database, name, lambda: None)
+    database._ensure_session_deletion_receipt_schema()
+    database._ensure_terminal_deletion_receipt_schema()
     return engine
 
 
@@ -928,6 +930,8 @@ def test_session_lifetime_filter_never_coalesces_reused_tmux_name(monkeypatch):
 def test_projection_lazily_creates_session_receipt_table_for_older_schema(monkeypatch):
     engine = _install_database(monkeypatch)
     SessionDeletionReceiptModel.__table__.drop(bind=engine)
+    monkeypatch.setattr(database, "_session_deletion_receipt_schema_ready", False)
+    monkeypatch.setattr(database, "_session_deletion_receipt_schema_engine_identity", None)
     with database.SessionLocal() as db:
         db.add(
             TerminalModel(

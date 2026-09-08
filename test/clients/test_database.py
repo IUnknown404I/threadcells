@@ -360,6 +360,9 @@ class TestTerminalOperations:
             None
         )
         mock_session.query.return_value.filter.return_value.first.return_value = None
+        (
+            mock_session.query.return_value.filter.return_value.distinct.return_value.limit.return_value.all.return_value
+        ) = []
         mock_session.get.return_value = None
 
         result = create_terminal(

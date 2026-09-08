@@ -25,6 +25,7 @@ from cli_agent_orchestrator.clients.database import (
     ProjectModel,
     ProviderExecutionLeaseModel,
     ProviderUsageBindingModel,
+    SessionDeletedTerminalFenceModel,
     SessionDeletionCancellationAuditModel,
     SessionDeletionOperationModel,
     SessionDeletionReceiptModel,
@@ -203,6 +204,18 @@ def test_individually_retired_private_branch_is_receipted_then_session_purged(
     assert lifetime is not None
     assert lifetime["terminals"] == []
     assert lifetime["lifetime_authority"] == "terminal_deletion_receipts"
+    with pytest.raises(WritableWorkContextConflict, match="SESSION_DELETED"):
+        database.reserve_writable_work_context(
+            context_id="transitional-resurrection",
+            request_id="transitional-resurrection-request",
+            project_id="other-project",
+            session_id="other-session",
+            terminal_id="retired-child",
+            canonical_source="/source/other-project",
+            canonical_worktree="/work/transitional-resurrection",
+            branch="cao/session/transitional-resurrection",
+            base_revision="d" * 40,
+        )
 
     started = database.begin_session_hard_deletion(
         "session",
@@ -257,6 +270,10 @@ def test_individually_retired_private_branch_is_receipted_then_session_purged(
         assert {
             item["terminal_id"] for item in database._session_receipt_terminal_fences(tombstone)
         } == {
+            "owner",
+            "retired-child",
+        }
+        assert {row.terminal_id for row in db.query(SessionDeletedTerminalFenceModel).all()} == {
             "owner",
             "retired-child",
         }
@@ -975,6 +992,47 @@ def test_hard_delete_receipts_fence_late_work_and_return_deleted_history_semanti
             branch="cao/session/late-context",
             base_revision="f" * 40,
         )
+    # Caller-supplied ownership must not bypass the terminal's permanent
+    # identity fence after transitional receipts have been purged.
+    with pytest.raises(WritableWorkContextConflict, match="SESSION_DELETED"):
+        database.reserve_writable_work_context(
+            context_id="late-context-other-session",
+            request_id="late-context-request-other-session",
+            project_id="different-project",
+            session_id="different-session",
+            terminal_id="owner",
+            canonical_source="/source/different-project",
+            canonical_worktree="/work/late-context-other-session",
+            branch="cao/session/late-context-other-session",
+            base_revision="e" * 40,
+        )
+    provider = database.acquire_provider_execution_decision("owner", 999, limit=1)
+    assert provider["acquired"] is False
+    assert provider["reason_code"] == "TERMINAL_DELETED"
+    assert database.recovery_takeover_durable_eligibility("owner") == {
+        "eligible": False,
+        "reason_code": "RECOVERY_TARGET_DELETED",
+        "terminal": None,
+    }
+    with pytest.raises(database.RecoveryTakeoverRejected, match="RECOVERY_TARGET_DELETED"):
+        database.claim_recovery_takeover(
+            request_id="late-recovery",
+            old_terminal_id="owner",
+            expected_authority_generation="old-generation",
+            expected_runtime_generation="old-runtime",
+            agent_profile="developer",
+            provider="codex",
+            profile_revision_id=None,
+            provider_config_revision_id=None,
+            owner_grant_token="late-grant",
+            owner_grant_launch_id="late-launch",
+            owner_grant_scope={},
+            new_terminal_id="replacement",
+            new_session_name="cao-different-session",
+            new_session_id="different-session",
+            new_window_name="replacement",
+            new_runtime_generation="new-runtime",
+        )
     late_usage = UsageObservation(
         source_run_identity="late-usage",
         extractor="fixture",
@@ -1034,6 +1092,13 @@ def test_hard_delete_receipts_fence_late_work_and_return_deleted_history_semanti
         assert db.query(WorkflowModel).count() == 0
         assert db.query(SessionDeletionReceiptModel).count() == 1
         assert db.query(TerminalDeletionReceiptModel).count() == 0
+        fence = db.get(SessionDeletedTerminalFenceModel, "owner")
+        assert fence is not None
+        assert fence.session_id == "session"
+        assert fence.auth_token_sha256 == hashlib.sha256(token.encode()).hexdigest()
+        assert db.query(WritableWorkContextModel).count() == 0
+        assert db.query(ProviderExecutionLeaseModel).count() == 0
+        assert db.query(database.RecoveryTakeoverModel).count() == 0
         assert db.query(UsageRecordModel).count() == 0
         assert db.query(ProviderUsageBindingModel).count() == 0
         assert db.query(TelegramDeliveryModel).count() == 0
@@ -1420,6 +1485,257 @@ def test_terminal_creation_and_hard_delete_fence_serialize_without_resurrection(
         assert late is not None
 
 
+def test_transitional_to_final_terminal_fence_serializes_without_resurrection(
+    monkeypatch, tmp_path
+):
+    _install_database(monkeypatch, f"sqlite:///{tmp_path / 'final-fence-race.db'}")
+    terminal = _terminal("owner")
+    with database.SessionLocal() as db:
+        db.add(terminal)
+        db.commit()
+        expected_identity = {
+            field: getattr(terminal, field) for field in database._TERMINAL_DELETION_IDENTITY_FIELDS
+        }
+    assert (
+        database.delete_exited_terminal("owner", expected_identity=expected_identity)["deleted"]
+        == 1
+    )
+    _fence_and_mark(terminal_ids=())
+
+    def complete_delete():
+        return database.complete_session_hard_deletion("session", "cao-session")
+
+    def reserve_late_authority():
+        try:
+            database.reserve_writable_work_context(
+                context_id="race-context",
+                request_id="race-request",
+                project_id="different-project",
+                session_id="different-session",
+                terminal_id="owner",
+                canonical_source="/source/different-project",
+                canonical_worktree="/work/race-context",
+                branch="cao/session/race-context",
+                base_revision="c" * 40,
+            )
+        except WritableWorkContextConflict as error:
+            return error.reason_code
+        return "accepted"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        deletion_future = executor.submit(complete_delete)
+        reservation_future = executor.submit(reserve_late_authority)
+        deletion = deletion_future.result()
+        reservation = reservation_future.result()
+
+    assert deletion["completed"] is True
+    assert reservation == "SESSION_DELETED"
+    with database.SessionLocal() as db:
+        assert db.get(TerminalDeletionReceiptModel, "owner") is None
+        assert db.get(SessionDeletedTerminalFenceModel, "owner") is not None
+        assert db.query(WritableWorkContextModel).count() == 0
+
+
+def test_final_terminal_fence_backfill_is_receipted_crash_resumable_and_indexed(
+    monkeypatch, tmp_path
+):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'terminal-fence-migration.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(engine)
+    with sessionmaker(bind=engine)() as db:
+        db.add(
+            SessionDeletionReceiptModel(
+                session_id="deleted-session",
+                session_name="cao-deleted-session",
+                retained_resources_json="[]",
+                deletion_reason="operator_session_hard_delete",
+                authority_fingerprint="a" * 64,
+                terminal_fences_json=(
+                    '[{"auth_token_sha256":"' + "b" * 64 + '","terminal_id":"deleted-child"},'
+                    '{"auth_token_sha256":null,"terminal_id":"deleted-owner"}]'
+                ),
+                receipt_version=3,
+                deleted_at=datetime(2026, 9, 8, 8, 0, 0),
+            )
+        )
+        db.commit()
+    SessionDeletedTerminalFenceModel.__table__.drop(bind=engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "DELETE FROM migration_receipts WHERE name = ?",
+            (database.SESSION_DELETED_TERMINAL_FENCE_MIGRATION,),
+        )
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
+    original_backfill = database._backfill_session_deleted_terminal_fences
+
+    def interrupt_backfill(_connection):
+        raise RuntimeError("simulated final-fence backfill interruption")
+
+    monkeypatch.setattr(database, "_backfill_session_deleted_terminal_fences", interrupt_backfill)
+    with pytest.raises(RuntimeError, match="simulated final-fence backfill interruption"):
+        database._ensure_session_deletion_receipt_schema()
+    with engine.connect() as connection:
+        assert (
+            connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM pragma_table_info('session_deleted_terminal_fences')"
+            ).scalar_one()
+            > 0
+        )
+        assert (
+            connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM migration_receipts WHERE name = ?",
+                (database.SESSION_DELETED_TERMINAL_FENCE_MIGRATION,),
+            ).scalar_one()
+            == 0
+        )
+
+    # Model a process that committed one exact row before dying without the
+    # completion receipt. The next startup must preserve and finish it.
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO session_deleted_terminal_fences"
+            "(terminal_id, session_id, auth_token_sha256, deleted_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                "deleted-child",
+                "deleted-session",
+                "b" * 64,
+                datetime(2026, 9, 8, 7, 0, 0),
+            ),
+        )
+    monkeypatch.setattr(database, "_backfill_session_deleted_terminal_fences", original_backfill)
+    database._ensure_session_deletion_receipt_schema()
+    with engine.connect() as connection:
+        indexed = connection.exec_driver_sql(
+            "SELECT terminal_id, session_id, auth_token_sha256, deleted_at "
+            "FROM session_deleted_terminal_fences ORDER BY terminal_id"
+        ).all()
+        assert [(row[0], row[1], row[2]) for row in indexed] == [
+            ("deleted-child", "deleted-session", "b" * 64),
+            ("deleted-owner", "deleted-session", None),
+        ]
+        assert str(indexed[0][3]).startswith("2026-09-08 07:00:00")
+        assert (
+            connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM migration_receipts WHERE name = ?",
+                (database.SESSION_DELETED_TERMINAL_FENCE_MIGRATION,),
+            ).scalar_one()
+            == 1
+        )
+        plan = " ".join(
+            str(row[-1])
+            for row in connection.exec_driver_sql(
+                "EXPLAIN QUERY PLAN SELECT terminal_id "
+                "FROM session_deleted_terminal_fences WHERE terminal_id = ?",
+                ("deleted-owner",),
+            ).all()
+        )
+        assert "sqlite_autoindex_session_deleted_terminal_fences_1" in plan
+        digest_plan = " ".join(
+            str(row[-1])
+            for row in connection.exec_driver_sql(
+                "EXPLAIN QUERY PLAN SELECT terminal_id "
+                "FROM session_deleted_terminal_fences WHERE auth_token_sha256 = ?",
+                ("b" * 64,),
+            ).all()
+        )
+        assert "ix_session_deleted_terminal_fences_auth_token_sha256" in digest_plan
+
+    monkeypatch.setattr(database, "_backfill_session_deleted_terminal_fences", interrupt_backfill)
+    database._ensure_session_deletion_receipt_schema()
+    with pytest.raises(WritableWorkContextConflict, match="SESSION_DELETED"):
+        database.reserve_writable_work_context(
+            context_id="legacy-tombstone-context",
+            request_id="legacy-tombstone-request",
+            project_id="new-project",
+            session_id="new-session",
+            terminal_id="deleted-owner",
+            canonical_source="/source/new-project",
+            canonical_worktree="/work/legacy-tombstone-context",
+            branch="cao/session/legacy-tombstone-context",
+            base_revision="a" * 40,
+        )
+    with database.SessionLocal() as db:
+        assert db.query(WritableWorkContextModel).count() == 0
+
+
+def test_final_terminal_fence_backfill_fails_closed_on_conflicting_owner(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO session_deletion_receipts"
+            "(session_id, session_name, retained_resources_json, deletion_reason, "
+            " authority_fingerprint, terminal_fences_json, receipt_version, deleted_at) "
+            "VALUES (?, ?, '[]', 'operator_session_hard_delete', ?, ?, 3, CURRENT_TIMESTAMP)",
+            (
+                "deleted-session",
+                "cao-deleted-session",
+                "a" * 64,
+                '[{"auth_token_sha256":null,"terminal_id":"deleted-owner"}]',
+            ),
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO session_deleted_terminal_fences"
+            "(terminal_id, session_id, auth_token_sha256, deleted_at) "
+            "VALUES ('deleted-owner', 'different-session', NULL, CURRENT_TIMESTAMP)"
+        )
+        connection.exec_driver_sql(
+            "DELETE FROM migration_receipts WHERE name = ?",
+            (database.SESSION_DELETED_TERMINAL_FENCE_MIGRATION,),
+        )
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
+    with pytest.raises(database.AmbiguousTerminalIdentity, match="deleted-owner"):
+        database._ensure_session_deletion_receipt_schema()
+    with engine.connect() as connection:
+        assert (
+            connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM migration_receipts WHERE name = ?",
+                (database.SESSION_DELETED_TERMINAL_FENCE_MIGRATION,),
+            ).scalar_one()
+            == 0
+        )
+
+
+def test_final_terminal_fence_backfill_fails_closed_on_malformed_tombstone(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO session_deletion_receipts"
+            "(session_id, session_name, retained_resources_json, deletion_reason, "
+            " authority_fingerprint, terminal_fences_json, receipt_version, deleted_at) "
+            "VALUES ('deleted-session', 'cao-deleted-session', '[]', "
+            "'operator_session_hard_delete', NULL, 'not-json', 3, CURRENT_TIMESTAMP)"
+        )
+        connection.exec_driver_sql(
+            "DELETE FROM migration_receipts WHERE name = ?",
+            (database.SESSION_DELETED_TERMINAL_FENCE_MIGRATION,),
+        )
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
+    with pytest.raises(database.AmbiguousSessionIdentity, match="deleted-session"):
+        database._ensure_session_deletion_receipt_schema()
+    with engine.connect() as connection:
+        assert (
+            connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM migration_receipts WHERE name = ?",
+                (database.SESSION_DELETED_TERMINAL_FENCE_MIGRATION,),
+            ).scalar_one()
+            == 0
+        )
+        assert (
+            connection.exec_driver_sql(
+                "SELECT COUNT(*) FROM session_deleted_terminal_fences"
+            ).scalar_one()
+            == 0
+        )
+
+
 def test_hard_purge_sql_shape_is_fixed_with_one_session_tombstone(
     monkeypatch,
 ):
@@ -1448,6 +1764,6 @@ def test_hard_purge_sql_shape_is_fixed_with_one_session_tombstone(
 
     one = run(1)
     fifty = run(50)
-    assert one[:2] == fifty[:2] == (94, 68)
+    assert one[:2] == fifty[:2] == (96, 69)
     assert one[2] == 0
-    assert fifty[2] == 0
+    assert fifty[2] == 1

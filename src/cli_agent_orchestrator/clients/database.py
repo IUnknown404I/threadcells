@@ -196,6 +196,23 @@ class SessionDeletionReceiptModel(Base):
     deleted_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
+class SessionDeletedTerminalFenceModel(Base):
+    """Indexed terminal identity owned by one final Session tombstone.
+
+    This is deliberately a minimal lookup relation, not retained Session
+    history.  The parent Session deletion receipt remains the tombstone; this
+    row makes its permanent terminal fences authoritative without scanning
+    JSON payloads on every authority-creation path.
+    """
+
+    __tablename__ = "session_deleted_terminal_fences"
+
+    terminal_id = Column(String, primary_key=True)
+    session_id = Column(String, nullable=False, index=True)
+    auth_token_sha256 = Column(String, nullable=True, index=True)
+    deleted_at = Column(DateTime, nullable=False)
+
+
 class SessionDeletionOperationModel(Base):
     """Transient crash-resumable fence while hard deletion crosses filesystem I/O."""
 
@@ -1173,6 +1190,9 @@ WORKFLOW_EFFECT_LINEAGE_BACKFILL_BATCH_SIZE = 500
 SESSION_LIFETIME_RECEIPT_SCHEMA_VERSION = 1
 SESSION_LIFETIME_RECEIPT_MIGRATION = "terminal-deletion-session-lifetime-authority-v1"
 SESSION_LIFETIME_RECEIPT_BACKFILL_BATCH_SIZE = 500
+SESSION_DELETED_TERMINAL_FENCE_SCHEMA_VERSION = 1
+SESSION_DELETED_TERMINAL_FENCE_MIGRATION = "session-deleted-terminal-fence-index-v1"
+SESSION_DELETED_TERMINAL_FENCE_BACKFILL_BATCH_SIZE = 100
 
 
 def init_db() -> None:
@@ -3650,9 +3670,31 @@ def reserve_writable_work_context(
     }
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
-        deletion_in_progress = db.get(SessionDeletionOperationModel, session_id) is not None
-        session_deleted = db.get(SessionDeletionReceiptModel, session_id) is not None
-        terminal_deleted = db.get(TerminalDeletionReceiptModel, terminal_id) is not None
+        terminal = db.get(TerminalModel, terminal_id)
+        terminal_session_id = (
+            str(terminal.session_id or f"legacy:{terminal.tmux_session}")
+            if terminal is not None
+            else None
+        )
+        if terminal_session_id is not None and terminal_session_id != session_id:
+            db.rollback()
+            raise WritableWorkContextConflict("WORK_CONTEXT_AUTHORITY_CONFLICT")
+        authority_session_ids = {session_id}
+        if terminal_session_id is not None:
+            authority_session_ids.add(terminal_session_id)
+        deletion_in_progress = (
+            db.query(SessionDeletionOperationModel.session_id)
+            .filter(SessionDeletionOperationModel.session_id.in_(authority_session_ids))
+            .first()
+            is not None
+        )
+        session_deleted = (
+            db.query(SessionDeletionReceiptModel.session_id)
+            .filter(SessionDeletionReceiptModel.session_id.in_(authority_session_ids))
+            .first()
+            is not None
+        )
+        terminal_deleted = _terminal_deletion_fence_exists_in_transaction(db, terminal_id)
         if deletion_in_progress or session_deleted or terminal_deleted:
             db.rollback()
             raise WritableWorkContextConflict(
@@ -5774,9 +5816,21 @@ def _session_terminal_dict(terminal: TerminalModel) -> Dict[str, Any]:
 def _ensure_session_deletion_receipt_schema() -> None:
     with _session_deletion_receipt_schema_lock:
         SessionDeletionReceiptModel.__table__.create(bind=engine, checkfirst=True)
+        SessionDeletedTerminalFenceModel.__table__.create(bind=engine, checkfirst=True)
         SessionDeletionOperationModel.__table__.create(bind=engine, checkfirst=True)
         SessionDeletionCancellationAuditModel.__table__.create(bind=engine, checkfirst=True)
+        MigrationReceiptModel.__table__.create(bind=engine, checkfirst=True)
         with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_session_deleted_terminal_fences_session_id "
+                "ON session_deleted_terminal_fences (session_id)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_session_deleted_terminal_fences_auth_token_sha256 "
+                "ON session_deleted_terminal_fences (auth_token_sha256)"
+            )
             columns = {
                 row[1]
                 for row in connection.exec_driver_sql(
@@ -5809,6 +5863,7 @@ def _ensure_session_deletion_receipt_schema() -> None:
                     "ALTER TABLE session_deletion_receipts "
                     "ADD COLUMN receipt_version INTEGER NOT NULL DEFAULT 1"
                 )
+        _ensure_session_deleted_terminal_fence_backfill()
 
 
 def _normalize_session_retained_resources(
@@ -5890,27 +5945,129 @@ def _session_receipt_terminal_fences(
         raise AmbiguousSessionIdentity(str(receipt.session_id)) from exc
 
 
+def _backfill_session_deleted_terminal_fences(connection: Any) -> dict[str, int]:
+    """Index exact v3 tombstone fences in deterministic bounded pages."""
+    last_session_id = ""
+    inspected_receipts = 0
+    indexed_fences = 0
+    while True:
+        page = connection.exec_driver_sql(
+            "SELECT session_id, terminal_fences_json, deleted_at "
+            "FROM session_deletion_receipts "
+            "WHERE COALESCE(receipt_version, 1) >= 3 AND session_id > ? "
+            "ORDER BY session_id LIMIT ?",
+            (last_session_id, SESSION_DELETED_TERMINAL_FENCE_BACKFILL_BATCH_SIZE),
+        ).fetchall()
+        if not page:
+            break
+        for session_id_value, fences_json, deleted_at in page:
+            session_id = str(session_id_value)
+            try:
+                raw_fences = json.loads(str(fences_json or "[]"))
+                fences = _normalize_session_terminal_fences(raw_fences)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise AmbiguousSessionIdentity(session_id) from exc
+            inspected_receipts += 1
+            if fences:
+                values = [
+                    (
+                        str(fence["terminal_id"]),
+                        session_id,
+                        fence["auth_token_sha256"],
+                        deleted_at,
+                    )
+                    for fence in fences
+                ]
+                connection.exec_driver_sql(
+                    "INSERT OR IGNORE INTO session_deleted_terminal_fences"
+                    "(terminal_id, session_id, auth_token_sha256, deleted_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    values,
+                )
+                terminal_ids = [value[0] for value in values]
+                placeholders = ",".join("?" for _value in terminal_ids)
+                indexed = connection.exec_driver_sql(
+                    "SELECT terminal_id, session_id, auth_token_sha256 "
+                    "FROM session_deleted_terminal_fences "
+                    f"WHERE terminal_id IN ({placeholders})",
+                    tuple(terminal_ids),
+                ).fetchall()
+                actual = {
+                    str(terminal_id): (str(owner_session_id), digest)
+                    for terminal_id, owner_session_id, digest in indexed
+                }
+                expected = {
+                    terminal_id: (session_id, digest)
+                    for terminal_id, _session_id, digest, _deleted_at in values
+                }
+                if actual != expected:
+                    conflict = next(
+                        (
+                            terminal_id
+                            for terminal_id, authority in expected.items()
+                            if actual.get(terminal_id) != authority
+                        ),
+                        session_id,
+                    )
+                    raise AmbiguousTerminalIdentity(conflict)
+                indexed_fences += len(fences)
+            last_session_id = session_id
+    return {
+        "inspected_receipts": inspected_receipts,
+        "indexed_fences": indexed_fences,
+    }
+
+
+def _ensure_session_deleted_terminal_fence_backfill() -> None:
+    """Finish the tombstone index migration before accepting new authority."""
+    with engine.connect() as connection:
+        receipt = connection.exec_driver_sql(
+            "SELECT 1 FROM migration_receipts WHERE name = ?",
+            (SESSION_DELETED_TERMINAL_FENCE_MIGRATION,),
+        ).first()
+        connection.rollback()
+        if receipt is not None:
+            return
+        # The table may already exist after a process crash. Only this durable
+        # receipt proves that every exact v3 tombstone was indexed.
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        receipt = connection.exec_driver_sql(
+            "SELECT 1 FROM migration_receipts WHERE name = ?",
+            (SESSION_DELETED_TERMINAL_FENCE_MIGRATION,),
+        ).first()
+        if receipt is None:
+            outcome = _backfill_session_deleted_terminal_fences(connection)
+            connection.exec_driver_sql(
+                "INSERT INTO migration_receipts"
+                "(name, schema_version, detail_json, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    SESSION_DELETED_TERMINAL_FENCE_MIGRATION,
+                    SESSION_DELETED_TERMINAL_FENCE_SCHEMA_VERSION,
+                    json.dumps(
+                        {
+                            "batch_size": SESSION_DELETED_TERMINAL_FENCE_BACKFILL_BATCH_SIZE,
+                            **outcome,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    datetime.now(),
+                ),
+            )
+        connection.commit()
+
+
 def _hard_deleted_terminal_fence_in_transaction(
     db: Any, terminal_id: str
 ) -> tuple[bool, str | None]:
-    """Resolve one terminal identity from the single final Session tombstone."""
-    rows = db.execute(
-        text("""
-            SELECT receipt.session_id,
-                   json_extract(fence.value, '$.auth_token_sha256') AS auth_token_sha256
-            FROM session_deletion_receipts AS receipt
-            JOIN json_each(receipt.terminal_fences_json) AS fence
-            WHERE COALESCE(receipt.receipt_version, 1) >= 3
-              AND json_extract(fence.value, '$.terminal_id') = :terminal_id
-            LIMIT 2
-            """),
-        {"terminal_id": terminal_id},
-    ).all()
-    if len(rows) > 1:
-        raise AmbiguousTerminalIdentity(terminal_id)
-    if not rows:
+    """Resolve one terminal identity through the indexed final tombstone."""
+    row = db.get(SessionDeletedTerminalFenceModel, terminal_id)
+    if row is None:
         return False, None
-    digest = rows[0][1]
+    receipt = db.get(SessionDeletionReceiptModel, row.session_id)
+    if receipt is None or int(receipt.receipt_version or 1) < 3:
+        raise AmbiguousTerminalIdentity(terminal_id)
+    digest = row.auth_token_sha256
     if digest is not None and not (
         isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
     ):
@@ -5925,17 +6082,18 @@ def _terminal_deletion_fence_exists_in_transaction(db: Any, terminal_id: str) ->
 
 
 def _hard_deleted_terminal_digest_exists_in_transaction(db: Any, token_digest: str) -> bool:
-    row = db.execute(
-        text("""
-            SELECT 1
-            FROM session_deletion_receipts AS receipt
-            JOIN json_each(receipt.terminal_fences_json) AS fence
-            WHERE COALESCE(receipt.receipt_version, 1) >= 3
-              AND json_extract(fence.value, '$.auth_token_sha256') = :token_digest
-            LIMIT 1
-            """),
-        {"token_digest": token_digest},
-    ).first()
+    row = (
+        db.query(SessionDeletedTerminalFenceModel.terminal_id)
+        .join(
+            SessionDeletionReceiptModel,
+            SessionDeletionReceiptModel.session_id == SessionDeletedTerminalFenceModel.session_id,
+        )
+        .filter(
+            SessionDeletedTerminalFenceModel.auth_token_sha256 == token_digest,
+            SessionDeletionReceiptModel.receipt_version >= 3,
+        )
+        .first()
+    )
     return row is not None
 
 
@@ -8162,6 +8320,30 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
             ]
         )
         now = datetime.now()
+        existing_final_fences = (
+            db.query(SessionDeletedTerminalFenceModel)
+            .filter(SessionDeletedTerminalFenceModel.terminal_id.in_(terminal_values))
+            .all()
+        )
+        if existing_final_fences:
+            db.rollback()
+            return {"completed": False, "reason_code": "SESSION_IDENTITY_CHANGED"}
+        for fence in terminal_fences:
+            terminal_id = str(fence["terminal_id"])
+            digest = cast(str | None, fence["auth_token_sha256"])
+            db.add(
+                SessionDeletedTerminalFenceModel(
+                    terminal_id=terminal_id,
+                    session_id=session_id,
+                    auth_token_sha256=digest,
+                    deleted_at=now,
+                )
+            )
+        # Final indexed fences and the tombstone are committed atomically with
+        # transitional-receipt removal. A reservation serialized before this
+        # transaction remains visible to the deletion authority recheck; one
+        # serialized after it observes the permanent fence.
+        db.flush()
 
         _delete_query(
             db.query(DelegationResultEventModel).filter(
@@ -8524,6 +8706,8 @@ def acquire_provider_execution_decision(
     as capacity exhaustion based on an earlier status projection.
     """
     _ensure_provider_execution_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         canonical = db.get(CapacitySettingsModel, 1)
@@ -8544,6 +8728,9 @@ def acquire_provider_execution_decision(
                 "certain": True,
             }
 
+        if _terminal_deletion_fence_exists_in_transaction(db, terminal_id):
+            db.rollback()
+            return decision(False, "TERMINAL_DELETED")
         existing = (
             db.query(ProviderExecutionLeaseModel)
             .filter(ProviderExecutionLeaseModel.terminal_id == terminal_id)
@@ -9841,6 +10028,8 @@ def recovery_takeover_durable_eligibility(
     _ensure_provider_execution_schema()
     _ensure_child_assignment_schema()
     _ensure_workflow_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     with SessionLocal() as db:
         terminal = db.get(TerminalModel, old_terminal_id)
         current_workflow = (
@@ -9850,7 +10039,9 @@ def recovery_takeover_durable_eligibility(
             .first()
         )
         reason = None
-        if terminal is None:
+        if _terminal_deletion_fence_exists_in_transaction(db, old_terminal_id):
+            reason = "RECOVERY_TARGET_DELETED"
+        elif terminal is None:
             reason = "RECOVERY_TARGET_NOT_FOUND"
         elif (
             db.query(RecoveryTakeoverModel.id)
@@ -9995,8 +10186,16 @@ def claim_recovery_takeover(
     _ensure_provider_execution_schema()
     _ensure_child_assignment_schema()
     _ensure_workflow_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        if _terminal_deletion_fence_exists_in_transaction(db, old_terminal_id):
+            db.rollback()
+            raise RecoveryTakeoverRejected("RECOVERY_TARGET_DELETED")
+        if _terminal_deletion_fence_exists_in_transaction(db, new_terminal_id):
+            db.rollback()
+            raise RecoveryTakeoverRejected("RECOVERY_REPLACEMENT_TERMINAL_DELETED")
         duplicate = (
             db.query(RecoveryTakeoverModel)
             .filter(RecoveryTakeoverModel.request_id == request_id)
@@ -10198,6 +10397,8 @@ def fence_claimed_recovery_takeover(takeover_id: str) -> Optional[Dict[str, Any]
     _ensure_provider_execution_schema()
     _ensure_child_assignment_schema()
     _ensure_workflow_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         row = db.get(RecoveryTakeoverModel, takeover_id)
@@ -10209,9 +10410,13 @@ def fence_claimed_recovery_takeover(takeover_id: str) -> Optional[Dict[str, Any]
             return _recovery_takeover_dict(row)
         terminal = db.get(TerminalModel, row.old_terminal_id)
         blockers = []
-        if terminal is None:
+        if _terminal_deletion_fence_exists_in_transaction(db, row.old_terminal_id):
+            blockers.append("RECOVERY_TARGET_DELETED")
+        if _terminal_deletion_fence_exists_in_transaction(db, row.new_terminal_id):
+            blockers.append("RECOVERY_REPLACEMENT_TERMINAL_DELETED")
+        if terminal is None and not blockers:
             blockers.append("RECOVERY_TARGET_NOT_FOUND")
-        else:
+        elif terminal is not None:
             if terminal.context_role != "supervisor" or terminal.project_id != row.project_id:
                 blockers.append("RECOVERY_TARGET_IDENTITY_MISMATCH")
             if (

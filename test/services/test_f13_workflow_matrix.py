@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from threading import Barrier
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -91,6 +91,7 @@ from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
 from cli_agent_orchestrator.services import (
     inbox_service,
+    interaction_read_model_service,
     operations_service,
     terminal_service,
     workflow_service,
@@ -197,6 +198,8 @@ def _create_exact_handoff_result(
     parent_turn: int,
     child: str,
     body: str,
+    *,
+    request_effect_outcome: str = "completed",
 ):
     """Create one callback with exact admitted parent/child authority."""
     request_effect = claim_workflow_effect(parent, parent_turn, "handoff", child)
@@ -221,7 +224,7 @@ def _create_exact_handoff_result(
         parent,
         request_effect["id"],
         request_effect["claim_token"],
-        "completed",
+        request_effect_outcome,
     )
     return notice
 
@@ -1354,15 +1357,34 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
         connection.execute("CREATE TABLE workflows (id INTEGER PRIMARY KEY)")
         connection.execute(
             "CREATE TABLE workflow_turns ("
-            "id INTEGER PRIMARY KEY, claim_generation INTEGER NOT NULL DEFAULT 0, "
-            "claim_token TEXT, claim_expires_at DATETIME, transport_binding TEXT)"
+            "id INTEGER PRIMARY KEY, workflow_id INTEGER NOT NULL DEFAULT 1, "
+            "claim_generation INTEGER NOT NULL DEFAULT 0, "
+            "claim_token TEXT, claim_expires_at DATETIME, transport_binding TEXT, "
+            "resume_parent_turn_id INTEGER)"
         )
         connection.execute(
             "CREATE TABLE workflow_turn_receipts ("
             "id INTEGER PRIMARY KEY, workflow_turn_id INTEGER NOT NULL, "
             "receiver_terminal_id TEXT NOT NULL, consumed_at DATETIME NOT NULL)"
         )
+        connection.execute(
+            "CREATE TABLE workflow_effects ("
+            "id INTEGER PRIMARY KEY, workflow_id INTEGER NOT NULL, "
+            "workflow_turn_id INTEGER NOT NULL, effect_kind TEXT NOT NULL, "
+            "effect_key TEXT NOT NULL)"
+        )
         connection.execute("CREATE TABLE inbox (id INTEGER PRIMARY KEY)")
+        connection.executemany(
+            "INSERT INTO workflow_turns(id, workflow_id, resume_parent_turn_id) "
+            "VALUES (?, 1, ?)",
+            ((1, None), (2, 1), (3, None)),
+        )
+        connection.executemany(
+            "INSERT INTO workflow_effects("
+            "id, workflow_id, workflow_turn_id, effect_kind, effect_key"
+            ") VALUES (?, 1, ?, 'await_handoff', 'same-slice')",
+            ((1, 1), (2, 2), (3, 3)),
+        )
     monkeypatch.setattr(constants, "DATABASE_FILE", database_file)
 
     database._migrate_workflow_turn_columns()
@@ -1374,7 +1396,19 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
         receipt_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(workflow_turn_receipts)")
         }
+        effect_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(workflow_effects)")
+        }
         inbox_columns = {row[1] for row in connection.execute("PRAGMA table_info(inbox)")}
+        effect_lineage = dict(
+            connection.execute(
+                "SELECT id, mirrored_from_effect_id FROM workflow_effects ORDER BY id"
+            )
+        )
+        lineage_receipt = connection.execute(
+            "SELECT schema_version, detail_json FROM migration_receipts WHERE name = ?",
+            (database.WORKFLOW_EFFECT_LINEAGE_MIGRATION_RECEIPT,),
+        ).fetchone()
     assert "resumed_from_owner_gate_workflow_id" in workflow_columns
     assert "queue_reason" in columns
     assert "provider_processing_observed_at" in columns
@@ -1392,10 +1426,107 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
     assert "resume_token_sha256" in receipt_columns
     assert "resumed_by_turn_id" in receipt_columns
     assert "resumed_at" in receipt_columns
+    assert "mirrored_from_effect_id" in effect_columns
+    assert effect_lineage == {1: None, 2: 1, 3: None}
+    assert lineage_receipt is not None
+    assert lineage_receipt[0] == database.WORKFLOW_EFFECT_LINEAGE_SCHEMA_VERSION
+    assert json.loads(lineage_receipt[1]) == {
+        "batch_size": database.WORKFLOW_EFFECT_LINEAGE_BACKFILL_BATCH_SIZE,
+        "schema_version": database.WORKFLOW_EFFECT_LINEAGE_SCHEMA_VERSION,
+    }
     assert "superseded_by_turn_id" in columns
     assert "superseded_at" in columns
     assert "callback_reconciled_at" in inbox_columns
     assert "callback_reconciled_from_turn_id" in inbox_columns
+
+
+def test_f13_effect_lineage_backfill_resumes_after_schema_only_partial_crash(tmp_path, monkeypatch):
+    database_file = tmp_path / "partial-effect-lineage.db"
+    with sqlite3.connect(database_file) as connection:
+        connection.execute("CREATE TABLE workflows (id INTEGER PRIMARY KEY)")
+        connection.execute(
+            "CREATE TABLE workflow_turns ("
+            "id INTEGER PRIMARY KEY, workflow_id INTEGER NOT NULL, "
+            "resume_parent_turn_id INTEGER, superseded_by_turn_id INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE workflow_turn_receipts ("
+            "id INTEGER PRIMARY KEY, workflow_turn_id INTEGER NOT NULL, "
+            "receiver_terminal_id TEXT NOT NULL, consumed_at DATETIME NOT NULL, "
+            "resumed_by_turn_id INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE workflow_effects ("
+            "id INTEGER PRIMARY KEY, workflow_id INTEGER NOT NULL, "
+            "workflow_turn_id INTEGER NOT NULL, effect_kind TEXT NOT NULL, "
+            "effect_key TEXT NOT NULL)"
+        )
+        connection.execute("CREATE TABLE inbox (id INTEGER PRIMARY KEY)")
+        connection.executemany(
+            "INSERT INTO workflow_turns("
+            "id, workflow_id, resume_parent_turn_id, superseded_by_turn_id"
+            ") VALUES (?, 1, ?, NULL)",
+            ((1, None), (2, 1), (3, None), (4, None), (5, 4)),
+        )
+        connection.executemany(
+            "INSERT INTO workflow_effects("
+            "id, workflow_id, workflow_turn_id, effect_kind, effect_key"
+            ") VALUES (?, 1, ?, 'await_handoff', 'same-slice')",
+            ((1, 1), (2, 2), (3, 3), (4, 4), (5, 5)),
+        )
+    monkeypatch.setattr(constants, "DATABASE_FILE", database_file)
+    monkeypatch.setattr(database, "WORKFLOW_EFFECT_LINEAGE_BACKFILL_BATCH_SIZE", 2)
+    real_backfill = database._backfill_workflow_effect_mirror_lineage
+
+    def interrupt_after_schema(_connection):
+        raise RuntimeError("simulated crash before lineage receipt")
+
+    monkeypatch.setattr(
+        database, "_backfill_workflow_effect_mirror_lineage", interrupt_after_schema
+    )
+    database._migrate_workflow_turn_columns()
+    with sqlite3.connect(database_file) as connection:
+        assert "mirrored_from_effect_id" in {
+            row[1] for row in connection.execute("PRAGMA table_info(workflow_effects)")
+        }
+        assert (
+            connection.execute(
+                "SELECT 1 FROM migration_receipts WHERE name = ?",
+                (database.WORKFLOW_EFFECT_LINEAGE_MIGRATION_RECEIPT,),
+            ).fetchone()
+            is None
+        )
+        # Also model a process that committed one safe batch before dying.
+        connection.execute("UPDATE workflow_effects SET mirrored_from_effect_id = 1 WHERE id = 2")
+
+    successful_backfills = []
+
+    def record_backfill(connection):
+        successful_backfills.append(True)
+        real_backfill(connection)
+
+    monkeypatch.setattr(database, "_backfill_workflow_effect_mirror_lineage", record_backfill)
+    database._migrate_workflow_turn_columns()
+    database._migrate_workflow_turn_columns()
+
+    with sqlite3.connect(database_file) as connection:
+        lineage = dict(
+            connection.execute(
+                "SELECT id, mirrored_from_effect_id FROM workflow_effects ORDER BY id"
+            )
+        )
+        receipts = connection.execute(
+            "SELECT schema_version, detail_json FROM migration_receipts WHERE name = ?",
+            (database.WORKFLOW_EFFECT_LINEAGE_MIGRATION_RECEIPT,),
+        ).fetchall()
+    assert lineage == {1: None, 2: 1, 3: None, 4: None, 5: 4}
+    assert successful_backfills == [True]
+    assert len(receipts) == 1
+    assert receipts[0][0] == database.WORKFLOW_EFFECT_LINEAGE_SCHEMA_VERSION
+    assert json.loads(receipts[0][1]) == {
+        "batch_size": 2,
+        "schema_version": database.WORKFLOW_EFFECT_LINEAGE_SCHEMA_VERSION,
+    }
 
 
 def _queue_inbox_workflow_turn(root: str, key: str = "inbox-result") -> tuple[int, int]:
@@ -7074,6 +7205,336 @@ def test_f13_interrupted_owner_input_resume_fences_old_effects_and_concurrent_re
         )
         assert original_receipt.resume_token_sha256 != admitted["resume_token"]
         assert len(original_receipt.resume_token_sha256) == 64
+
+
+def test_f13_await_handoff_timeout_is_terminal_and_next_slice_is_explicit(workflow_db, monkeypatch):
+    root = "root-await-slices"
+    child = "child-await-slices"
+    turn_id = _start_admitted_input(root)
+    _ensure_running_test_terminal(child)
+    monkeypatch.setenv("CAO_TERMINAL_ID", root)
+    with database.SessionLocal() as db:
+        db.add(
+            database.ChildAssignmentModel(
+                parent_terminal_id=root,
+                child_terminal_id=child,
+                status="handoff_awaiting_result",
+            )
+        )
+        db.commit()
+
+    wait = mcp_server.HandoffResult(
+        success=False,
+        message="bounded wait expired",
+        terminal_id=child,
+        reason_code="WAIT_SLICE_EXPIRED",
+        state=mcp_server.HandoffState.WAITING,
+    )
+    completed = mcp_server.HandoffResult(
+        success=True,
+        message="child completion observed",
+        output="canonical output belongs to the child result path",
+        terminal_id=child,
+        state=mcp_server.HandoffState.COMPLETED,
+    )
+    waiter = AsyncMock(side_effect=[wait, completed])
+    with patch.object(mcp_server, "_await_handoff_impl", waiter):
+        first = asyncio.run(mcp_server.await_handoff(turn_id, child, timeout=1))
+        duplicate = asyncio.run(mcp_server.await_handoff(turn_id, child, timeout=1))
+        gap = asyncio.run(mcp_server.await_handoff(turn_id, child, timeout=1, wait_slice_id=2))
+        second = asyncio.run(mcp_server.await_handoff(turn_id, child, timeout=1, wait_slice_id=1))
+        completed_duplicate = asyncio.run(
+            mcp_server.await_handoff(turn_id, child, timeout=1, wait_slice_id=1)
+        )
+
+    assert first.state == mcp_server.HandoffState.WAITING
+    assert first.reason_code == "WAIT_SLICE_EXPIRED"
+    assert (first.wait_slice_id, first.next_wait_slice_id) == (0, 1)
+    assert duplicate.reason_code == "WAIT_SLICE_ALREADY_RECORDED"
+    assert duplicate.state == mcp_server.HandoffState.WAITING
+    assert (duplicate.wait_slice_id, duplicate.next_wait_slice_id) == (0, 1)
+    assert gap.reason_code == "WAIT_SLICE_PREDECESSOR_REQUIRED"
+    assert second.state == mcp_server.HandoffState.COMPLETED
+    assert second.wait_slice_id == 1
+    assert second.next_wait_slice_id is None
+    assert completed_duplicate.reason_code == "DUPLICATE_EFFECT"
+    assert completed_duplicate.wait_slice_id == 1
+    assert waiter.await_count == 2
+
+    with database.SessionLocal() as db:
+        effects = db.query(WorkflowEffectModel).order_by(WorkflowEffectModel.id).all()
+        assert [effect.state for effect in effects] == ["wait_timeout", "completed"]
+        assert len({effect.effect_key for effect in effects}) == 2
+        assignment = db.query(database.ChildAssignmentModel).one()
+        assert assignment.status == "handoff_awaiting_result"
+        assert db.get(TerminalModel, child).runtime_lifecycle == "running"
+        assert db.query(database.DelegationResultModel).count() == 0
+
+
+def test_f13_initial_handoff_timeout_starts_explicit_await_slice_zero(workflow_db, monkeypatch):
+    root = "root-handoff-first-await-slice"
+    child = "child-handoff-first-await-slice"
+    turn_id = _start_admitted_input(root)
+    _ensure_running_test_terminal(child)
+    monkeypatch.setenv("CAO_TERMINAL_ID", root)
+    initial_wait = mcp_server._waiting_handoff_result(child, 1, "completion not observed")
+    first_await = mcp_server._waiting_handoff_result(child, 1, "still running")
+
+    async def launch_then_wait(
+        _agent_profile,
+        message,
+        _timeout,
+        _working_directory,
+        *,
+        runtime_fence,
+        request_effect,
+        request_workflow_turn_id,
+    ):
+        assert runtime_fence is False
+        assert database.register_handoff_child(
+            root,
+            child,
+            workflow_turn_id=request_workflow_turn_id,
+            workflow_effect_id=request_effect["id"],
+            request_message=message,
+        )
+        return initial_wait
+
+    with (
+        patch.object(mcp_server, "_handoff_impl", side_effect=launch_then_wait),
+        patch.object(mcp_server, "_await_handoff_impl", AsyncMock(return_value=first_await)),
+    ):
+        handoff_result = asyncio.run(
+            mcp_server.handoff(turn_id, "developer", "perform bounded work", timeout=1)
+        )
+        assert handoff_result.next_wait_slice_id == 0
+        await_result = asyncio.run(
+            mcp_server.await_handoff(
+                turn_id,
+                child,
+                timeout=1,
+                wait_slice_id=handoff_result.next_wait_slice_id,
+            )
+        )
+
+    assert handoff_result.state == mcp_server.HandoffState.WAITING
+    assert handoff_result.wait_slice_id is None
+    assert await_result.state == mcp_server.HandoffState.WAITING
+    assert await_result.wait_slice_id == 0
+    assert await_result.next_wait_slice_id == 1
+    with database.SessionLocal() as db:
+        effects = {
+            effect.effect_kind: effect.state
+            for effect in db.query(WorkflowEffectModel).order_by(WorkflowEffectModel.id).all()
+        }
+        assignment = db.query(database.ChildAssignmentModel).one()
+        assert effects == {"handoff": "wait_timeout", "await_handoff": "wait_timeout"}
+        assert assignment.status == "handoff_awaiting_result"
+        assert db.get(TerminalModel, child).runtime_lifecycle == "running"
+        result = db.query(database.DelegationResultModel).one()
+        assert result.status == "awaiting"
+        assert result.document_json is None
+        assert result.finalized_at is None
+
+
+def test_f13_initial_handoff_unknown_outcome_remains_indeterminate(workflow_db, monkeypatch):
+    root = "root-handoff-unknown-outcome"
+    child = "child-handoff-unknown-outcome"
+    turn_id = _start_admitted_input(root)
+    monkeypatch.setenv("CAO_TERMINAL_ID", root)
+    unknown = mcp_server.HandoffResult(
+        success=False,
+        message="transport ended before the wait outcome was known",
+        terminal_id=child,
+        reason_code="WAIT_OUTCOME_UNKNOWN",
+        state=mcp_server.HandoffState.FAILED,
+    )
+
+    with patch.object(mcp_server, "_handoff_impl", AsyncMock(return_value=unknown)):
+        result = asyncio.run(
+            mcp_server.handoff(turn_id, "developer", "perform uncertain work", timeout=1)
+        )
+
+    assert result.reason_code == "WAIT_OUTCOME_UNKNOWN"
+    with database.SessionLocal() as db:
+        effect = db.query(WorkflowEffectModel).one()
+        assert effect.effect_kind == "handoff"
+        assert effect.state == "indeterminate"
+
+
+def test_f13_child_result_after_initial_handoff_timeout_is_delivered_once(workflow_db):
+    parent = "root-handoff-timeout-later-result"
+    child = "child-handoff-timeout-later-result"
+    parent_turn = _start_admitted_input(parent)
+    notice = _create_exact_handoff_result(
+        parent,
+        parent_turn,
+        child,
+        "canonical child result after the initial wait expired",
+        request_effect_outcome="wait_timeout",
+    )
+    callback_claim = claim_handoff_result_batch_for_inbox(notice.id)
+    assert isinstance(callback_claim, dict)
+    callback_turn = callback_claim["id"]
+    assert mark_workflow_turn_sent(
+        callback_turn,
+        callback_claim["claim_token"],
+        callback_claim["claim_generation"],
+    )
+    assert database.update_pending_message_status(notice.id, database.MessageStatus.DELIVERED)
+    assert mark_child_assignment_result_delivered(notice.id)
+    assert claim_workflow_turn_receipt(parent, callback_turn)
+
+    acknowledged = acknowledge_child_assignment_result_outcome(
+        parent, child_terminal_id=child, result_id=notice.result_id
+    )
+    duplicate, duplicate_result = create_handoff_child_result_message(
+        child, "duplicate child output must not replace the canonical result"
+    )
+
+    assert acknowledged["accepted"] is True
+    assert duplicate is not None and duplicate.id == notice.id
+    assert duplicate_result is True
+    with database.SessionLocal() as db:
+        request_effect = db.query(WorkflowEffectModel).filter_by(effect_kind="handoff").one()
+        assignment = db.query(database.ChildAssignmentModel).one()
+        result = db.query(database.DelegationResultModel).one()
+        assert request_effect.state == "wait_timeout"
+        assert assignment.status == "handoff_result_acknowledged"
+        assert result.status == "complete"
+        assert result.document_json is not None
+
+
+def test_f13_await_handoff_known_child_failure_is_terminal_rejection(workflow_db, monkeypatch):
+    root = "root-await-known-failure"
+    child = "child-await-known-failure"
+    turn_id = _start_admitted_input(root)
+    monkeypatch.setenv("CAO_TERMINAL_ID", root)
+    known_failure = mcp_server.HandoffResult(
+        success=False,
+        message="child reached an observed error state",
+        terminal_id=child,
+        reason_code="HANDOFF_WORKER_ERROR",
+        state=mcp_server.HandoffState.FAILED,
+    )
+
+    with patch.object(mcp_server, "_await_handoff_impl", AsyncMock(return_value=known_failure)):
+        result = asyncio.run(mcp_server.await_handoff(turn_id, child, timeout=1))
+
+    assert result.reason_code == "HANDOFF_WORKER_ERROR"
+    assert result.wait_slice_id == 0
+    assert result.next_wait_slice_id is None
+    with database.SessionLocal() as db:
+        effect = db.query(WorkflowEffectModel).one()
+        assert effect.effect_kind == "await_handoff"
+        assert effect.state == "rejected"
+
+
+def test_f13_await_handoff_unknown_interruption_remains_indeterminate(workflow_db, monkeypatch):
+    root = "root-await-interrupted"
+    child = "child-await-interrupted"
+    turn_id = _start_admitted_input(root)
+    monkeypatch.setenv("CAO_TERMINAL_ID", root)
+
+    with patch.object(
+        mcp_server,
+        "_await_handoff_impl",
+        AsyncMock(side_effect=RuntimeError("transport boundary lost")),
+    ):
+        with pytest.raises(RuntimeError, match="transport boundary lost"):
+            asyncio.run(mcp_server.await_handoff(turn_id, child, timeout=1))
+        duplicate = asyncio.run(mcp_server.await_handoff(turn_id, child, timeout=1))
+
+    assert duplicate.reason_code == "DUPLICATE_EFFECT"
+    assert duplicate.wait_slice_id == 0
+    with database.SessionLocal() as db:
+        effect = db.query(WorkflowEffectModel).one()
+        assert effect.effect_kind == "await_handoff"
+        assert effect.state == "indeterminate"
+
+
+def test_f13_wait_timeout_survives_provider_reconnect_without_duplicate_contradiction(
+    workflow_db, monkeypatch
+):
+    root = "root-await-reconnect"
+    child = "child-await-reconnect"
+    _ensure_running_test_terminal(root)
+    turn_id = start_workflow_input(root)
+    assert turn_id is not None
+    monkeypatch.setenv("CAO_TERMINAL_ID", root)
+    admitted = asyncio.run(mcp_server.claim_workflow_turn_receipt(turn_id))
+    assert admitted["accepted"] is True
+
+    wait = mcp_server.HandoffResult(
+        success=False,
+        message="bounded wait expired",
+        terminal_id=child,
+        reason_code="WAIT_SLICE_EXPIRED",
+        state=mcp_server.HandoffState.WAITING,
+    )
+    completed = mcp_server.HandoffResult(
+        success=True,
+        message="child completion observed",
+        output="complete",
+        terminal_id=child,
+        state=mcp_server.HandoffState.COMPLETED,
+    )
+    waiter = AsyncMock(side_effect=[wait, completed])
+    with patch.object(mcp_server, "_await_handoff_impl", waiter):
+        first = asyncio.run(mcp_server.await_handoff(turn_id, child, timeout=1))
+        assert first.reason_code == "WAIT_SLICE_EXPIRED"
+        resumed = claim_or_resume_workflow_turn_receipt(
+            root, turn_id, resume_token=admitted["resume_token"]
+        )
+        assert resumed["accepted"] is True
+        resumed_turn = resumed["logical_turn_id"]
+        duplicate = asyncio.run(mcp_server.await_handoff(resumed_turn, child, timeout=1))
+        second = asyncio.run(
+            mcp_server.await_handoff(resumed_turn, child, timeout=1, wait_slice_id=1)
+        )
+
+    assert duplicate.reason_code == "WAIT_SLICE_ALREADY_RECORDED"
+    assert duplicate.next_wait_slice_id == 1
+    assert second.state == mcp_server.HandoffState.COMPLETED
+    assert waiter.await_count == 2
+    with database.SessionLocal() as db:
+        original = (
+            db.query(WorkflowEffectModel)
+            .filter_by(workflow_turn_id=turn_id, effect_kind="await_handoff")
+            .one()
+        )
+        mirrored = (
+            db.query(WorkflowEffectModel)
+            .filter_by(
+                workflow_turn_id=resumed_turn,
+                effect_kind="await_handoff",
+                effect_key=original.effect_key,
+            )
+            .one()
+        )
+        assert original.state == "wait_timeout"
+        assert mirrored.state == "wait_timeout"
+        assert mirrored.mirrored_from_effect_id == original.id
+        assert (
+            db.query(WorkflowEffectModel)
+            .filter_by(workflow_turn_id=resumed_turn, state="completed")
+            .count()
+            == 1
+        )
+
+    history = interaction_read_model_service.list_interactions(
+        f"legacy:cao-{root}", mode="history", limit=20
+    )
+    wait_history = [
+        item
+        for item in history["items"]
+        if item["interaction_type"] == "effect"
+        and item["workflow"]["effect_kind"] == "await_handoff"
+    ]
+    assert len(wait_history) == 2
+    assert {
+        (item["workflow"]["turn_id"], item["workflow"]["effect_state"]) for item in wait_history
+    } == {(turn_id, "wait_timeout"), (resumed_turn, "completed")}
 
 
 def test_f13_effect_ledger_requires_admitted_logical_turn_and_dedupes_restart(workflow_db):

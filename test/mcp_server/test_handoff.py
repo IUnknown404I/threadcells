@@ -250,18 +250,21 @@ class TestInitialHandoffRuntimeGenerationFence:
             success=False,
             message="waiting",
             terminal_id="child-existing",
+            reason_code="WAIT_SLICE_EXPIRED",
             state=HandoffState.WAITING,
         )
 
         result = asyncio.run(await_handoff(763, "child-existing", timeout=3))
 
         assert result.state == HandoffState.WAITING
+        assert result.wait_slice_id == 0
+        assert result.next_wait_slice_id == 1
         # This unit isolates the await orchestration by replacing the central
         # effect-claim helper; focused lifecycle tests exercise the real gate.
         mock_active_generation.assert_not_called()
         mock_claim.assert_called_once_with(763, "await_handoff", "child-existing")
         mock_await.assert_awaited_once_with("child-existing", 3)
-        mock_finish.assert_called_once_with(mock_claim.return_value, "indeterminate")
+        mock_finish.assert_called_once_with(mock_claim.return_value, "wait_timeout")
 
 
 @pytest.mark.integration
@@ -1164,5 +1167,7 @@ class TestResumableHandoffWait:
         result = asyncio.run(_handoff_impl("developer", "Produce a final marker.", timeout=1))
 
         assert result.state == HandoffState.WAITING
+        assert result.wait_slice_id is None
+        assert result.next_wait_slice_id == 0
         mock_send.assert_called_once()
         mock_await.assert_awaited_once()

@@ -55,6 +55,8 @@ const DISPOSITION_KEYS: Record<string, TranslationKey> = {
   failed: 'interactions.disposition.failed',
   cancelled: 'interactions.disposition.cancelled',
   superseded: 'interactions.disposition.superseded',
+  wait_slice_expired: 'interactions.disposition.waitSliceExpired',
+  wait_retryable: 'interactions.disposition.waitRetryable',
   operator_retired_unknown_outcome: 'interactions.disposition.operatorRetiredUnknown',
 }
 
@@ -107,6 +109,7 @@ const TASK_KEYS: Record<string, TranslationKey> = {
   workflow: 'interactions.task.workflow',
   assign: 'interactions.task.assign',
   handoff: 'interactions.task.handoff',
+  await_handoff: 'interactions.task.awaitHandoff',
   recovery_takeover: 'interactions.task.recoveryTakeover',
   runtime_recovery: 'interactions.task.runtimeRecovery',
   provider_execution: 'interactions.task.providerExecution',

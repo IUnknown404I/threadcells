@@ -561,7 +561,13 @@ def test_assignment_delivery_authority_matches_retirement_guard(
 
 @pytest.mark.parametrize(
     ("state", "expected"),
-    [("claimed", "QUEUED_WORK"), ("indeterminate", "QUEUED_WORK"), ("completed", None)],
+    [
+        ("claimed", "QUEUED_WORK"),
+        ("indeterminate", "QUEUED_WORK"),
+        ("completed", None),
+        ("wait_timeout", None),
+        ("wait_retryable", None),
+    ],
 )
 def test_only_live_or_indeterminate_effects_block_retirement(workspace_factory, state, expected):
     identity = workspace_factory()

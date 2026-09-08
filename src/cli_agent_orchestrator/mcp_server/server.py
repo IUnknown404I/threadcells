@@ -7,7 +7,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union, cast
+from typing import Annotated, Any, Dict, Optional, Tuple, Union, cast
 from urllib.parse import quote
 
 import mcp.types as mcp_types
@@ -46,6 +46,7 @@ from cli_agent_orchestrator.clients.database import (
     get_handoff_parent_terminal_id,
     get_parent_completion_barrier,
     get_terminal_metadata,
+    get_workflow_effect_state,
     get_workflow_provider_outcome,
     get_workflow_status,
     has_admitted_workflow_turn,
@@ -373,10 +374,79 @@ def _privileged_effect_rejection(
     return {"success": False, "accepted": False, **detail, "error": detail["explanation"]}
 
 
-def _finish_privileged_effect(effect: Dict[str, Any], outcome: str) -> None:
+def _finish_privileged_effect(effect: Dict[str, Any], outcome: str) -> bool:
     terminal_id = os.environ.get("CAO_TERMINAL_ID")
-    if terminal_id:
-        finish_workflow_effect(terminal_id, effect["id"], effect["claim_token"], outcome)
+    return bool(
+        terminal_id
+        and finish_workflow_effect(terminal_id, effect["id"], effect["claim_token"], outcome)
+    )
+
+
+_AWAIT_HANDOFF_RESUMABLE_EFFECT_STATES = {"wait_timeout", "wait_retryable"}
+
+
+def _await_handoff_effect_identity(terminal_id: str, wait_slice_id: int) -> tuple[object, ...]:
+    """Keep slice zero compatible while giving each resumed wait a durable identity."""
+    if wait_slice_id == 0:
+        return (terminal_id,)
+    return (terminal_id, f"wait-slice:{wait_slice_id}")
+
+
+def _await_handoff_effect_key(terminal_id: str, wait_slice_id: int) -> str:
+    return _workflow_effect_key(
+        "await_handoff", *_await_handoff_effect_identity(terminal_id, wait_slice_id)
+    )
+
+
+def _await_handoff_effect_outcome(result: HandoffResult) -> str:
+    """Separate one bounded wait outcome from the independent child lifecycle."""
+    if result.state == HandoffState.COMPLETED:
+        return "completed"
+    if result.state == HandoffState.WAITING:
+        return "wait_timeout" if result.reason_code == "WAIT_SLICE_EXPIRED" else "wait_retryable"
+    if result.reason_code in {
+        "HANDOFF_NOT_RESUMABLE",
+        "HANDOFF_VALIDATION_FAILED",
+        "HANDOFF_WORKER_ERROR",
+    }:
+        return "rejected"
+    if result.reason_code in {
+        "RUNTIME_IDENTITY_UNAVAILABLE",
+        "RUNTIME_RECONNECT_REQUIRED",
+    }:
+        return "wait_retryable"
+    return "indeterminate"
+
+
+def _annotate_wait_slice(result: HandoffResult, wait_slice_id: int) -> HandoffResult:
+    result.wait_slice_id = wait_slice_id
+    if result.state == HandoffState.WAITING:
+        result.next_wait_slice_id = wait_slice_id + 1
+    return result
+
+
+def _replayed_wait_slice_result(
+    terminal_id: str, wait_slice_id: int, effect_state: str
+) -> HandoffResult:
+    disposition = (
+        "expired without observing completion"
+        if effect_state == "wait_timeout"
+        else "ended with a known retryable outcome"
+    )
+    return HandoffResult(
+        success=False,
+        message=(
+            f"Handoff wait slice {wait_slice_id} already {disposition}. "
+            f"Start wait slice {wait_slice_id + 1} to observe the child's current state; "
+            "the child lifecycle is unchanged by this replay."
+        ),
+        output=None,
+        terminal_id=terminal_id,
+        reason_code="WAIT_SLICE_ALREADY_RECORDED",
+        state=HandoffState.WAITING,
+        wait_slice_id=wait_slice_id,
+        next_wait_slice_id=wait_slice_id + 1,
+    )
 
 
 def _delegation_effect_outcome(result: Any) -> str:
@@ -391,6 +461,15 @@ def _delegation_effect_outcome(result: Any) -> str:
         reason_code = getattr(result, "reason_code", None)
     if success:
         return "completed"
+    if terminal_id is not None and reason_code == "WAIT_SLICE_EXPIRED":
+        # The child was already created and its input was sent. Only this
+        # bounded observation expired; the independently durable child and
+        # result lifecycles remain live.
+        return "wait_timeout"
+    if terminal_id is not None and reason_code == "PROVIDER_CONTENT_UNAVAILABLE":
+        # Provider content recovery is a known retryable observation outcome,
+        # not evidence that the child launch itself is indeterminate.
+        return "wait_retryable"
     if terminal_id is None and reason_code in _SAFE_PRE_EFFECT_ADMISSION_REASONS:
         # The API rejected admission before creating a child terminal. Keep the
         # attempt visible but safely reclaimable under this same logical turn.
@@ -1022,11 +1101,14 @@ def _waiting_handoff_result(terminal_id: str, timeout: int, reason: str) -> Hand
         success=False,
         message=(
             f"Handoff wait slice expired after {timeout} seconds: {reason}. "
-            "Worker remains live; call await_handoff with this terminal_id to resume."
+            "Worker remains live; call await_handoff with this terminal_id and the "
+            "returned next_wait_slice_id to resume."
         ),
         output=None,
         terminal_id=terminal_id,
+        reason_code="WAIT_SLICE_EXPIRED",
         state=HandoffState.WAITING,
+        next_wait_slice_id=0,
     )
 
 
@@ -1037,13 +1119,15 @@ def _provider_content_unavailable_handoff_result(terminal_id: str) -> HandoffRes
         message=(
             "Provider response unavailable; workflow state is preserved. "
             "Continue the child through its normal workflow input where permitted, "
-            "then call await_handoff with this terminal_id to resume."
+            "then call await_handoff with this terminal_id and the returned "
+            "next_wait_slice_id to resume."
         ),
         output=None,
         terminal_id=terminal_id,
         reason_code="PROVIDER_CONTENT_UNAVAILABLE",
         workflow_state=get_workflow_status(terminal_id),
         state=HandoffState.WAITING,
+        next_wait_slice_id=0,
     )
 
 
@@ -1061,6 +1145,7 @@ def _runtime_reconnect_handoff_result(terminal_id: Optional[str]) -> HandoffResu
         ),
         output=None,
         terminal_id=terminal_id,
+        reason_code="RUNTIME_RECONNECT_REQUIRED",
         state=HandoffState.FAILED,
     )
 
@@ -1076,6 +1161,7 @@ def _runtime_identity_unavailable_handoff_result(
         ),
         output=None,
         terminal_id=terminal_id,
+        reason_code="RUNTIME_IDENTITY_UNAVAILABLE",
         state=HandoffState.FAILED,
     )
 
@@ -1293,6 +1379,7 @@ async def _await_handoff_impl(terminal_id: str, timeout: int = 600) -> HandoffRe
                     ),
                     output=None,
                     terminal_id=terminal_id,
+                    reason_code="HANDOFF_NOT_RESUMABLE",
                     state=HandoffState.FAILED,
                 )
             if terminal_status == TerminalStatus.ERROR.value:
@@ -1302,6 +1389,7 @@ async def _await_handoff_impl(terminal_id: str, timeout: int = 600) -> HandoffRe
                     message="Handoff worker reached ERROR; worker was not exited by handoff",
                     output=None,
                     terminal_id=terminal_id,
+                    reason_code="HANDOFF_WORKER_ERROR",
                     state=HandoffState.FAILED,
                 )
 
@@ -1364,6 +1452,7 @@ async def _await_handoff_impl(terminal_id: str, timeout: int = 600) -> HandoffRe
                                     message="Handoff worker exited during final-output validation",
                                     output=None,
                                     terminal_id=terminal_id,
+                                    reason_code="HANDOFF_VALIDATION_FAILED",
                                     state=HandoffState.FAILED,
                                 )
                             if verified_status == TerminalStatus.COMPLETED.value:
@@ -1430,6 +1519,7 @@ async def _await_handoff_impl(terminal_id: str, timeout: int = 600) -> HandoffRe
                     ),
                     output=None,
                     terminal_id=terminal_id,
+                    reason_code="HANDOFF_NOT_RESUMABLE",
                     state=HandoffState.FAILED,
                 )
 
@@ -1443,6 +1533,7 @@ async def _await_handoff_impl(terminal_id: str, timeout: int = 600) -> HandoffRe
             message=f"Handoff wait failed: {str(exc)}",
             output=None,
             terminal_id=terminal_id,
+            reason_code="WAIT_OUTCOME_UNKNOWN",
             state=HandoffState.FAILED,
         )
 
@@ -1546,7 +1637,12 @@ async def _handoff_impl(
             raise
         remaining = max(0, deadline - time.monotonic())
         result = await _await_handoff_impl(terminal_id, timeout=remaining)
-        if result.state == HandoffState.COMPLETED:
+        if result.state == HandoffState.WAITING:
+            # The initial handoff wait is outside the explicit await_handoff
+            # effect sequence. Its known continuation is therefore slice 0.
+            result.wait_slice_id = None
+            result.next_wait_slice_id = 0
+        elif result.state == HandoffState.COMPLETED:
             result.message = (
                 f"Successfully handed off to {agent_profile} ({provider}) in "
                 f"{time.time() - start_time:.2f}s"
@@ -1760,18 +1856,63 @@ async def await_handoff(
         ge=1,
         le=3600,
     ),
+    wait_slice_id: Annotated[
+        int,
+        Field(
+            description=(
+                "Sequential bounded-wait identity within this logical turn. Start at 0; "
+                "after a waiting result, retry with its next_wait_slice_id."
+            ),
+            ge=0,
+        ),
+    ] = 0,
 ) -> HandoffResult:
     """Resume waiting for an existing handoff worker without sending it another task.
 
-    A waiting result retains the same terminal_id. This tool only observes that
-    child, validates its final output, and exits it after a successful result.
+    A waiting result retains the same terminal_id and returns the exact next
+    wait_slice_id. This tool observes the independent child lifecycle, validates
+    its final output, and exits it after a successful result. Replaying an exact
+    slice is idempotent; a later slice must use the returned sequential identity.
     """
+    effect_identity = _await_handoff_effect_identity(terminal_id, wait_slice_id)
+    owner_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    if wait_slice_id > 0:
+        predecessor_state = (
+            get_workflow_effect_state(
+                owner_terminal_id,
+                logical_turn_id,
+                "await_handoff",
+                _await_handoff_effect_key(terminal_id, wait_slice_id - 1),
+            )
+            if owner_terminal_id
+            else None
+        )
+        if predecessor_state not in _AWAIT_HANDOFF_RESUMABLE_EFFECT_STATES:
+            return HandoffResult(
+                success=False,
+                message=(
+                    f"Handoff wait slice {wait_slice_id} was not admitted: "
+                    f"slice {wait_slice_id - 1} has no durable resumable outcome."
+                ),
+                output=None,
+                terminal_id=terminal_id,
+                reason_code="WAIT_SLICE_PREDECESSOR_REQUIRED",
+                state=HandoffState.FAILED,
+                wait_slice_id=wait_slice_id,
+            )
     try:
-        effect = _claim_privileged_effect(logical_turn_id, "await_handoff", terminal_id)
+        effect = _claim_privileged_effect(logical_turn_id, "await_handoff", *effect_identity)
     except SidecarRuntimeRecoveryRequired:
         return _runtime_reconnect_handoff_result(terminal_id)
     if effect is None:
-        rejection = _privileged_effect_rejection(logical_turn_id, "await_handoff", terminal_id)
+        rejection = _privileged_effect_rejection(logical_turn_id, "await_handoff", *effect_identity)
+        if (
+            rejection.get("reason_code") == "DUPLICATE_EFFECT"
+            and rejection.get("effect_state") in _AWAIT_HANDOFF_RESUMABLE_EFFECT_STATES
+        ):
+            return _replayed_wait_slice_result(
+                terminal_id, wait_slice_id, str(rejection["effect_state"])
+            )
         return HandoffResult(
             success=False,
             message=str(rejection["error"]),
@@ -1780,16 +1921,19 @@ async def await_handoff(
             reason_code=rejection["reason_code"],
             workflow_state=rejection["workflow_state"],
             state=HandoffState.FAILED,
+            wait_slice_id=wait_slice_id,
         )
     execution_terminal, execution_suspended = _suspend_provider_execution(logical_turn_id)
     try:
         result = await _await_handoff_impl(terminal_id, timeout)
+        result = _annotate_wait_slice(result, wait_slice_id)
+        if not _finish_privileged_effect(effect, _await_handoff_effect_outcome(result)):
+            raise RuntimeError("await_handoff effect finalization was not confirmed")
     except Exception:
         _finish_privileged_effect(effect, "indeterminate")
         raise
     finally:
         await _resume_provider_execution(execution_terminal, logical_turn_id, execution_suspended)
-    _finish_privileged_effect(effect, "completed" if result.success else "indeterminate")
     return result
 
 

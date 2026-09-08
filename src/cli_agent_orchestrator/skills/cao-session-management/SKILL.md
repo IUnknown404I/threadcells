@@ -74,10 +74,12 @@ worker, and follow-up questions to a persistent async worker (see below).
 
 **handoff** (blocking) — conductor sends task and waits for a validated worker
 result. A `state: waiting` response means the live worker retained its durable
-terminal ID; resume that exact child with `await_handoff(terminal_id, timeout)`.
-Do not resend its task or create a duplicate. A tmux pane can outlive the
-provider process, so `lifecycle: exited` is not resumable even if the pane still
-exists.
+terminal ID. Retain its returned `next_wait_slice_id`, then resume that exact
+child with
+`await_handoff(terminal_id, timeout, wait_slice_id=next_wait_slice_id)`. Reusing
+an old slice only reports its recorded outcome and does not wait again. Do not
+resend its task or create a duplicate. A tmux pane can outlive the provider
+process, so `lifecycle: exited` is not resumable even if the pane still exists.
 
 **assign** (non-blocking) — conductor sends task and returns immediately. The worker
 is expected to call `send_message` back to the conductor's terminal ID when done.

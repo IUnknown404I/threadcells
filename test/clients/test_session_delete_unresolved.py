@@ -73,6 +73,18 @@ def _runtime_authority(terminal_id: str = "owner") -> dict:
     }
 
 
+def _claim_provider_reconciliation(
+    terminal_id: str = "owner", *, now: datetime | None = None
+) -> dict:
+    claim = database.claim_exited_terminal_provider_execution_reconciliation(
+        terminal_id,
+        expected_runtime_authority=_runtime_authority(terminal_id),
+        now=now,
+    )
+    assert claim is not None
+    return claim
+
+
 def test_historical_lifecycle_axes_do_not_block_or_enter_current_queue(monkeypatch):
     _install_database(monkeypatch)
     with database.SessionLocal() as db:
@@ -1002,11 +1014,18 @@ def test_exited_provider_reconciliation_moves_only_exact_unknown_effect_to_histo
     }
     assert database.list_provider_execution_leases() == []
 
+    claim = _claim_provider_reconciliation(now=processing_at)
     assert database.reconcile_exited_terminal_provider_execution_authority(
-        "owner", expected_runtime_authority=_runtime_authority(), now=processing_at
+        "owner",
+        expected_runtime_authority=claim["runtime_authority"],
+        claim_token=claim["claim_token"],
+        now=processing_at,
     )
     assert not database.reconcile_exited_terminal_provider_execution_authority(
-        "owner", expected_runtime_authority=_runtime_authority(), now=processing_at
+        "owner",
+        expected_runtime_authority=claim["runtime_authority"],
+        claim_token=claim["claim_token"],
+        now=processing_at,
     )
 
     after = _plan()
@@ -1061,8 +1080,17 @@ def test_exited_provider_reconciliation_fails_closed_for_continuation_authority(
         turn_id = int(turn.id)
 
     def assert_preserved() -> None:
+        assert (
+            database.claim_exited_terminal_provider_execution_reconciliation(
+                "owner", expected_runtime_authority=_runtime_authority(), now=observed_at
+            )
+            is None
+        )
         assert not database.reconcile_exited_terminal_provider_execution_authority(
-            "owner", expected_runtime_authority=_runtime_authority(), now=observed_at
+            "owner",
+            expected_runtime_authority=_runtime_authority(),
+            claim_token="not-owned",
+            now=observed_at,
         )
         with database.SessionLocal() as db:
             assert db.get(WorkflowModel, workflow_id).status == "open"
@@ -1153,8 +1181,12 @@ def test_exited_provider_reconciliation_fails_closed_for_continuation_authority(
         turn = db.get(WorkflowTurnModel, turn_id)
         turn.provider_outcome_cursor_bootstrap_generation = "runtime-generation"
         db.commit()
+    claim = _claim_provider_reconciliation(now=observed_at)
     assert database.reconcile_exited_terminal_provider_execution_authority(
-        "owner", expected_runtime_authority=_runtime_authority(), now=observed_at
+        "owner",
+        expected_runtime_authority=claim["runtime_authority"],
+        claim_token=claim["claim_token"],
+        now=observed_at,
     )
 
 

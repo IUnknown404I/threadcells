@@ -48,6 +48,7 @@ from cli_agent_orchestrator.clients.database import (
     bind_workflow_turn_provider_outcome_cursor,
     cancel_child_assignments_for_terminal,
     cancel_workflows_for_terminal,
+    claim_exited_terminal_provider_execution_reconciliation,
     claim_terminal_runtime_exit,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
@@ -81,6 +82,7 @@ from cli_agent_orchestrator.clients.database import (
     reconcile_legacy_terminal_runtime_identity,
     reconcile_terminal_runtime_process_identity,
     record_workflow_provider_reconnect_output_boundary,
+    release_exited_terminal_provider_execution_reconciliation_claim,
     release_provider_execution,
     release_terminal_runtime_operation,
     replace_starting_terminal_runtime_identity,
@@ -1285,15 +1287,7 @@ def reconcile_terminal_runtime(
     if metadata.get("runtime_lifecycle") in {"exited", "recovery_fenced"}:
         if metadata.get("runtime_lifecycle") == "recovery_fenced":
             return True
-        retired, _reason = _retire_observed_dead_runtime(metadata, proc_root=proc_root)
-        if retired:
-            observed_authority = {
-                field: metadata.get(field) for field in TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
-            }
-            reconcile_exited_terminal_provider_execution_authority(
-                terminal_id,
-                expected_runtime_authority=observed_authority,
-            )
+        _reconcile_exited_terminal_provider_execution_authority(metadata, proc_root=proc_root)
         return True
     if metadata.get("runtime_lifecycle") == TerminalLifecycle.RECOVERY_REQUIRED.value:
         # This is already a durable non-writable recovery boundary. Runtime
@@ -1501,6 +1495,38 @@ def retire_exited_terminal_runtime(
     return _retire_exited_terminal_runtime(metadata, proc_root=proc_root)
 
 
+def _reconcile_exited_terminal_provider_execution_authority(
+    metadata: Dict[str, Any], *, proc_root: Path = Path("/proc")
+) -> bool:
+    """Fence claimants, prove physical death, and atomically settle one runtime."""
+    terminal_id = str(metadata.get("id") or "")
+    if not terminal_id:
+        return False
+    observed_authority = {
+        field: metadata.get(field) for field in TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
+    }
+    claim = claim_exited_terminal_provider_execution_reconciliation(
+        terminal_id,
+        expected_runtime_authority=observed_authority,
+    )
+    if claim is None:
+        return False
+    claim_token = str(claim["claim_token"])
+    claimed_authority = claim["runtime_authority"]
+    retired, _reason = _retire_observed_dead_runtime(metadata, proc_root=proc_root)
+    if not retired:
+        release_exited_terminal_provider_execution_reconciliation_claim(terminal_id, claim_token)
+        return False
+    reconciled = reconcile_exited_terminal_provider_execution_authority(
+        terminal_id,
+        expected_runtime_authority=claimed_authority,
+        claim_token=claim_token,
+    )
+    if not reconciled:
+        release_exited_terminal_provider_execution_reconciliation_claim(terminal_id, claim_token)
+    return reconciled
+
+
 def reconcile_exited_terminal_provider_execution_authorities(
     *, proc_root: Path = Path("/proc"), limit: int = 100
 ) -> int:
@@ -1511,22 +1537,25 @@ def reconcile_exited_terminal_provider_execution_authorities(
     generation, writer, reconnect, recovery, and operation authority.
     """
     reconciled = 0
-    for terminal_id in list_exited_terminal_provider_execution_candidates(limit=limit):
-        metadata = get_terminal_metadata(terminal_id)
-        if not metadata or metadata.get("runtime_lifecycle") != "exited":
-            continue
-        retired, _reason = _retire_observed_dead_runtime(metadata, proc_root=proc_root)
-        if not retired:
-            continue
-        observed_authority = {
-            field: metadata.get(field) for field in TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
-        }
-        reconciled += int(
-            reconcile_exited_terminal_provider_execution_authority(
-                terminal_id,
-                expected_runtime_authority=observed_authority,
-            )
+    after_terminal_id: str | None = None
+    while True:
+        candidates = list_exited_terminal_provider_execution_candidates(
+            limit=limit, after_terminal_id=after_terminal_id
         )
+        if not candidates:
+            break
+        for terminal_id in candidates:
+            metadata = get_terminal_metadata(terminal_id)
+            if not metadata or metadata.get("runtime_lifecycle") != "exited":
+                continue
+            reconciled += int(
+                _reconcile_exited_terminal_provider_execution_authority(
+                    metadata, proc_root=proc_root
+                )
+            )
+        after_terminal_id = candidates[-1]
+        if len(candidates) < limit:
+            break
     return reconciled
 
 

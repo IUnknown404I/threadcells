@@ -2896,8 +2896,15 @@ async def claim_workflow_turn_receipt(
     if not receiver_terminal_id:
         return {"accepted": False, "error": "CAO_TERMINAL_ID is required"}
     effective_resume_token = resume_token if isinstance(resume_token, str) else None
+    # The separately protected terminal bearer lets the control plane
+    # re-derive this receipt's current resume capability after a proven Codex
+    # compaction. It is never returned or stored by this MCP process.
+    terminal_auth_token = os.environ.get("CAO_TERMINAL_AUTH_TOKEN")
     admission = claim_or_resume_workflow_turn_receipt(
-        receiver_terminal_id, logical_turn_id, resume_token=effective_resume_token
+        receiver_terminal_id,
+        logical_turn_id,
+        resume_token=effective_resume_token,
+        terminal_auth_token=terminal_auth_token,
     )
     return {**admission, "receiver_terminal_id": receiver_terminal_id}
 

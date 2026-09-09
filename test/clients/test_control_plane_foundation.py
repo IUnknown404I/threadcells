@@ -15,6 +15,7 @@ from cli_agent_orchestrator.clients.database import (
     OwnerLaunchGrantModel,
     TerminalModel,
 )
+from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
 
 
 @pytest.fixture
@@ -127,6 +128,7 @@ def test_capacity_update_and_provider_count_share_one_transaction_boundary(contr
                     agent_profile="supervisor",
                     context_role="supervisor",
                     runtime_lifecycle="running",
+                    provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
                 )
             )
         db.commit()

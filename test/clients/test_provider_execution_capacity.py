@@ -21,6 +21,7 @@ from cli_agent_orchestrator.clients.database import (
     release_provider_execution,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
 from cli_agent_orchestrator.services import (
     inbox_service,
     operations_service,
@@ -59,6 +60,7 @@ def capacity_db(tmp_path, monkeypatch):
                     context_role="supervisor",
                     project_id=f"project-{index}",
                     runtime_lifecycle="running",
+                    provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
                 )
             )
         db.commit()

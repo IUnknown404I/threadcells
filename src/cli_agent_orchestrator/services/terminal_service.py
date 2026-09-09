@@ -118,6 +118,7 @@ from cli_agent_orchestrator.providers.codex import (
     _bounded_response_suffix,
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
 from cli_agent_orchestrator.services.compressed_output_index import (
     CompressedOutputIndex,
     open_compressed_output_index,
@@ -1843,6 +1844,9 @@ def _create_terminal_after_admission(
                 runtime_process_start_ticks=runtime_target.process_start_ticks,
                 runtime_process_group_id=runtime_target.process_group_id,
                 runtime_process_session_id=runtime_target.process_session_id,
+                provider_runtime_compatibility_generation=(
+                    ACTIVE_RUNTIME_GENERATION if provider == ProviderType.CODEX.value else None
+                ),
                 recovery_takeover_id=recovery_takeover_id,
             )
             metadata_persisted = True
@@ -2735,16 +2739,16 @@ def bind_provider_runtime_session_identity(
     A fresh Codex TUI has no conversation while idle. The provider-native
     identity first exists at ``SessionStart``, before the first model request;
     this method fences that callback to the managed terminal generation and
-    exact foreground writable transcript. An immutable pre-promotion hook may
-    request only an exact rebind of the already-durable provider identity; it
-    cannot introduce or rotate provider authority under the new service.
+    exact foreground writable transcript. Resume and compaction callbacks may
+    only re-prove an already-durable provider identity; neither may introduce
+    or rotate provider authority.
     """
     metadata = get_terminal_metadata(terminal_id)
     if (
         metadata is None
         or metadata.get("provider") != ProviderType.CODEX.value
         or metadata.get("runtime_lifecycle") not in {"starting", "running"}
-        or source not in {"startup", "resume"}
+        or source not in {"startup", "resume", "compact"}
         or not isinstance(runtime_generation, str)
         or not hmac.compare_digest(
             str(metadata.get("runtime_generation") or ""), runtime_generation
@@ -2753,7 +2757,8 @@ def bind_provider_runtime_session_identity(
         or not os.path.isabs(transcript_path)
     ):
         raise RuntimeError("Codex session identity callback is stale or malformed")
-    if require_existing_binding and (
+    exact_rebind_required = require_existing_binding or source == "compact"
+    if exact_rebind_required and (
         not isinstance(metadata.get("provider_resume_identity"), str)
         or not hmac.compare_digest(str(metadata["provider_resume_identity"]), resume_identity)
         or not isinstance(metadata.get("provider_resume_runtime_generation"), str)
@@ -2799,7 +2804,7 @@ def bind_provider_runtime_session_identity(
         provider=ProviderType.CODEX.value,
         resume_identity=verified,
         runtime_generation=runtime_generation,
-        require_existing_binding=require_existing_binding,
+        require_existing_binding=exact_rebind_required,
     ):
         raise RuntimeError("Could not durably bind Codex session identity")
     bootstrap_turn_id = get_workflow_turn_provider_outcome_cursor_bootstrap(

@@ -53,6 +53,7 @@ from cli_agent_orchestrator.models.result import (
     canonical_handoff_result_v1_bytes,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
 from cli_agent_orchestrator.services import workflow_service
 from cli_agent_orchestrator.services.inbox_service import (
     _message_for_delivery,
@@ -102,13 +103,20 @@ def _setup_handoff(monkeypatch, reset=True, *, autoflush=True):
     with database.SessionLocal() as db:
         db.add_all(
             [
-                TerminalModel(id="parent", tmux_session="s", tmux_window="p", provider="codex"),
+                TerminalModel(
+                    id="parent",
+                    tmux_session="s",
+                    tmux_window="p",
+                    provider="codex",
+                    provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
+                ),
                 TerminalModel(
                     id="child",
                     tmux_session="s",
                     tmux_window="c",
                     provider="codex",
                     auth_token_sha256=hashlib.sha256(token.encode()).hexdigest(),
+                    provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
                 ),
                 TerminalModel(
                     id="sibling",
@@ -116,6 +124,7 @@ def _setup_handoff(monkeypatch, reset=True, *, autoflush=True):
                     tmux_window="x",
                     provider="codex",
                     auth_token_sha256=hashlib.sha256(b"sibling").hexdigest(),
+                    provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
                 ),
             ]
         )
@@ -689,13 +698,20 @@ def test_assignment_child_cannot_submit_handoff_document(monkeypatch):
     with database.SessionLocal() as db:
         db.add_all(
             [
-                TerminalModel(id="parent", tmux_session="s", tmux_window="p", provider="codex"),
+                TerminalModel(
+                    id="parent",
+                    tmux_session="s",
+                    tmux_window="p",
+                    provider="codex",
+                    provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
+                ),
                 TerminalModel(
                     id="child",
                     tmux_session="s",
                     tmux_window="c",
                     provider="codex",
                     auth_token_sha256=hashlib.sha256(token.encode()).hexdigest(),
+                    provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
                 ),
             ]
         )

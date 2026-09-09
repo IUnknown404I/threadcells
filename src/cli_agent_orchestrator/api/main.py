@@ -43,12 +43,14 @@ from watchdog.observers.polling import PollingObserver
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     HandoffResultSubmissionError,
+    WorkflowContinuationAuthorityConflict,
     acquire_terminal_runtime_transport,
     cancel_child_assignments_for_terminal,
     create_inbox_message,
     get_inbox_messages,
     get_session_hard_deletion_operation,
     get_terminal_metadata,
+    get_workflow_compaction_continuation_authority,
     get_writable_work_context_by_session,
     init_db,
     queue_workflow_input_for_provider,
@@ -403,6 +405,12 @@ async def _workflow_reconciliation_tick(
     """Run one isolated recovery tick and return whether startup replay remains due."""
     performed_full_recovery = False
     try:
+        fenced = await _run_workflow_io(workflow_service.fence_stale_provider_runtime_compatibility)
+        if fenced:
+            logger.info("Fenced %s stale Codex runtimes for provider reconnect", fenced)
+    except Exception as exc:
+        logger.warning("Provider runtime compatibility reconciliation failed: %s", exc)
+    try:
         workspaces = await _run_workflow_io(
             managed_worktree_service.reconcile_writable_work_context_provisioning
         )
@@ -512,7 +520,7 @@ class CodexSessionIdentityRequest(BaseModel):
     session_id: str = Field(pattern=r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
     transcript_path: str
     cwd: str
-    source: Literal["startup", "resume"]
+    source: Literal["startup", "resume", "compact"]
     runtime_generation: str = Field(pattern=r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 
 
@@ -578,6 +586,16 @@ async def lifespan(app: FastAPI):
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
     init_db()
+    # This durable barrier precedes API availability and every startup queue
+    # replay. A resident Codex process retains the hook matcher parsed by its
+    # launch release; it must be reconnected before current code can restore
+    # compacted authority or send another workflow continuation.
+    startup_fenced_runtimes = workflow_service.fence_stale_provider_runtime_compatibility()
+    if startup_fenced_runtimes:
+        logger.info(
+            "Fenced %s pre-promotion Codex runtimes before startup replay",
+            startup_fenced_runtimes,
+        )
     from cli_agent_orchestrator.services.control_plane_registry import (
         initialize_control_plane_registries,
     )
@@ -2567,8 +2585,8 @@ async def bind_codex_session_identity_endpoint(
     terminal_id: TerminalId,
     request: Request,
     body: CodexSessionIdentityRequest,
-) -> Dict[str, str]:
-    """Bind the exact foreground Codex root before its first model request."""
+) -> Dict[str, Any]:
+    """Bind the foreground Codex root and restore proven compact authority."""
     authorization = request.headers.get("authorization", "")
     scheme, _, token = authorization.partition(" ")
     if (
@@ -2588,6 +2606,8 @@ async def bind_codex_session_identity_endpoint(
     # terminal authority. It may request only the exact durable rebind below;
     # malformed/missing generations and every fresh identity remain fenced.
     if not caller_generation_is_current and not re.fullmatch(r"[0-9a-f]{64}", caller_generation):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="stale_runtime_generation")
+    if body.source == "compact" and not caller_generation_is_current:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="stale_runtime_generation")
     try:
         identity = await run_in_threadpool(
@@ -2611,7 +2631,26 @@ async def bind_codex_session_identity_endpoint(
                 else "stale_identity_rebind_not_proven"
             ),
         ) from exc
-    return {"session_id": identity}
+    response: Dict[str, Any] = {"session_id": identity}
+    if body.source == "compact":
+        try:
+            continuation_authority = await run_in_threadpool(
+                partial(
+                    get_workflow_compaction_continuation_authority,
+                    terminal_id,
+                    terminal_auth_token=token,
+                    runtime_generation=body.runtime_generation,
+                    provider_resume_identity=identity,
+                )
+            )
+        except WorkflowContinuationAuthorityConflict as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="continuation_authority_not_proven",
+            ) from exc
+        if continuation_authority is not None:
+            response["continuation_authority"] = continuation_authority
+    return response
 
 
 @app.post(

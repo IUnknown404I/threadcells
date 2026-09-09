@@ -1,5 +1,6 @@
 """Minimal database client with only terminal metadata."""
 
+import base64
 import hashlib
 import hmac
 import json
@@ -142,6 +143,12 @@ class TerminalModel(Base):
     # replace it from provider-global state.
     provider_resume_identity = Column(String, nullable=True)
     provider_resume_runtime_generation = Column(String, nullable=True)
+    # Compatibility identity of the code/config that launched the resident
+    # provider process. Unlike ``runtime_generation`` (the physical pane
+    # epoch), this changes when a promoted ThreadCells runtime changes the
+    # Codex hook or MCP protocol. NULL is deliberately legacy/unknown and
+    # therefore requires a provider reconnect before compact continuation.
+    provider_runtime_compatibility_generation = Column(String, nullable=True)
     # Bounded provider-native response cache. It is readable only through an
     # exact provider/session binding and cannot be replaced by terminal-tail
     # inference from a newer in-progress turn.
@@ -1086,6 +1093,17 @@ class WorkflowProviderReconnectAttemptModel(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
+class ProviderRuntimeCompatibilityScanModel(Base):
+    """Singleton cursor for bounded, restart-safe rolling-upgrade sweeps."""
+
+    __tablename__ = "provider_runtime_compatibility_scan"
+
+    id = Column(Integer, primary_key=True)
+    active_runtime_generation = Column(String, nullable=False)
+    after_terminal_id = Column(String, nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
 class WorkflowTurnReceiptModel(Base):
     """One irreversible receiver-side admission for a stable logical turn.
 
@@ -1107,8 +1125,11 @@ class WorkflowTurnReceiptModel(Base):
     receiver_terminal_id = Column(String, nullable=False)
     # Only the model execution that received this opaque capability may
     # transfer an interrupted turn to a fresh admitted continuation. Store
-    # only its digest and consume it exactly once.
+    # only its digest. Managed runtimes additionally retain a random nonce;
+    # the raw capability can then be re-derived only with that terminal's
+    # separately protected bearer after a proven Codex compaction boundary.
     resume_token_sha256 = Column(String, nullable=True)
+    resume_token_nonce = Column(String, nullable=True)
     resumed_by_turn_id = Column(Integer, nullable=True)
     resumed_at = Column(DateTime, nullable=True)
     consumed_at = Column(DateTime, nullable=False, default=datetime.now)
@@ -1194,6 +1215,7 @@ CONTROL_PLANE_MIGRATION_RECEIPT = "threadmesh-control-plane-schema-v1"
 WORKFLOW_EFFECT_LINEAGE_SCHEMA_VERSION = 1
 WORKFLOW_EFFECT_LINEAGE_MIGRATION_RECEIPT = "workflow-effect-mirror-lineage-v1"
 WORKFLOW_EFFECT_LINEAGE_BACKFILL_BATCH_SIZE = 500
+STALE_PROVIDER_RUNTIME_RECONNECT_BATCH_SIZE = 100
 SESSION_LIFETIME_RECEIPT_SCHEMA_VERSION = 1
 SESSION_LIFETIME_RECEIPT_MIGRATION = "terminal-deletion-session-lifetime-authority-v1"
 SESSION_LIFETIME_RECEIPT_BACKFILL_BATCH_SIZE = 500
@@ -2581,6 +2603,7 @@ def _ensure_workflow_schema() -> None:
     WorkflowModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowTurnModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowProviderReconnectAttemptModel.__table__.create(bind=engine, checkfirst=True)
+    ProviderRuntimeCompatibilityScanModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowTurnReceiptModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowEffectModel.__table__.create(bind=engine, checkfirst=True)
     _migrate_workflow_turn_columns()
@@ -2722,11 +2745,18 @@ def _migrate_workflow_turn_columns() -> None:
             "CREATE INDEX IF NOT EXISTS ix_workflow_turns_superseded_by_turn_id "
             "ON workflow_turns(superseded_by_turn_id)"
         )
+        if {"root_terminal_id", "status", "id"}.issubset(workflow_columns):
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_workflows_root_status_id "
+                "ON workflows(root_terminal_id, status, id)"
+            )
         receipt_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(workflow_turn_receipts)")
         }
         if "resume_token_sha256" not in receipt_columns:
             conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resume_token_sha256 TEXT")
+        if "resume_token_nonce" not in receipt_columns:
+            conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resume_token_nonce TEXT")
         if "resumed_by_turn_id" not in receipt_columns:
             conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resumed_by_turn_id INTEGER")
         if "resumed_at" not in receipt_columns:
@@ -3475,6 +3505,7 @@ def _migrate_terminal_worktree_authority_columns() -> bool:
             "runtime_operation_token",
             "provider_resume_identity",
             "provider_resume_runtime_generation",
+            "provider_runtime_compatibility_generation",
             "provider_last_response_identity",
             "recovery_fenced_reason",
             "recovery_takeover_id",
@@ -5249,6 +5280,7 @@ def create_terminal(
     runtime_process_start_ticks: Optional[int] = None,
     runtime_process_group_id: Optional[int] = None,
     runtime_process_session_id: Optional[int] = None,
+    provider_runtime_compatibility_generation: Optional[str] = None,
     recovery_takeover_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create metadata and atomically acquire any required writer lease."""
@@ -5267,6 +5299,11 @@ def create_terminal(
         raise ValueError("terminal context_role must be supervisor or work")
     if managed_worktree_kind not in {None, "supervisor", "task", "reviewer"}:
         raise ValueError("managed_worktree_kind must be supervisor, task, or reviewer")
+    if provider_runtime_compatibility_generation is not None and (
+        provider != "codex"
+        or re.fullmatch(r"[0-9a-f]{64}", provider_runtime_compatibility_generation) is None
+    ):
+        raise ValueError("provider runtime compatibility generation is invalid")
     if workspace_classification not in {None, "managed_isolated", "legacy_shared_root"}:
         raise ValueError("workspace_classification is invalid")
     with SessionLocal() as db:
@@ -5555,6 +5592,7 @@ def create_terminal(
             runtime_process_start_ticks=runtime_process_start_ticks,
             runtime_process_group_id=runtime_process_group_id,
             runtime_process_session_id=runtime_process_session_id,
+            provider_runtime_compatibility_generation=(provider_runtime_compatibility_generation),
             recovery_takeover_id=recovery_takeover_id,
         )
         db.add(terminal)
@@ -5666,6 +5704,9 @@ def create_terminal(
             "runtime_process_start_ticks": terminal.runtime_process_start_ticks,
             "runtime_process_group_id": terminal.runtime_process_group_id,
             "runtime_process_session_id": terminal.runtime_process_session_id,
+            "provider_runtime_compatibility_generation": (
+                terminal.provider_runtime_compatibility_generation
+            ),
             "recovery_fenced_at": terminal.recovery_fenced_at,
             "recovery_fenced_reason": terminal.recovery_fenced_reason,
             "recovery_takeover_id": terminal.recovery_takeover_id,
@@ -5741,6 +5782,9 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "runtime_process_session_id": terminal.runtime_process_session_id,
             "provider_resume_identity": terminal.provider_resume_identity,
             "provider_resume_runtime_generation": terminal.provider_resume_runtime_generation,
+            "provider_runtime_compatibility_generation": (
+                terminal.provider_runtime_compatibility_generation
+            ),
             "runtime_operation_kind": terminal.runtime_operation_kind,
             "runtime_operation_token": terminal.runtime_operation_token,
             "runtime_operation_claimed_at": terminal.runtime_operation_claimed_at,
@@ -9445,6 +9489,30 @@ def acquire_provider_execution_decision(
         if _terminal_deletion_fence_exists_in_transaction(db, terminal_id):
             db.rollback()
             return decision(False, "TERMINAL_DELETED")
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal is None:
+            db.commit()
+            return decision(False, "TERMINAL_NOT_FOUND")
+        if terminal.runtime_lifecycle in (
+            "recovery_required",
+            "exit_pending",
+            "exited",
+            "recovery_fenced",
+        ):
+            db.commit()
+            return decision(False, "TERMINAL_RUNTIME_NOT_WRITABLE")
+        if _terminal_requires_provider_runtime_compatibility_reconnect(terminal):
+            # The same writer transaction which rejects provider admission
+            # installs reconnect authority whenever this exact turn can own
+            # it. Even if another caller prepared an old-style SENT row, no
+            # bytes can reach the incompatible process through this lease.
+            _request_workflow_provider_reconnect_in_transaction(
+                db,
+                terminal_id,
+                datetime.now(),
+            )
+            db.commit()
+            return decision(False, "TERMINAL_RUNTIME_RECONNECT_PENDING")
         existing = (
             db.query(ProviderExecutionLeaseModel)
             .filter(ProviderExecutionLeaseModel.terminal_id == terminal_id)
@@ -9468,18 +9536,6 @@ def acquire_provider_execution_decision(
         if active >= effective_limit:
             db.commit()
             return decision(False, "PROVIDER_EXECUTION_CAPACITY_EXHAUSTED")
-        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
-        if terminal is None:
-            db.commit()
-            return decision(False, "TERMINAL_NOT_FOUND")
-        if terminal.runtime_lifecycle in (
-            "recovery_required",
-            "exit_pending",
-            "exited",
-            "recovery_fenced",
-        ):
-            db.commit()
-            return decision(False, "TERMINAL_RUNTIME_NOT_WRITABLE")
         if _terminal_has_pending_provider_reconnect(db, terminal_id):
             db.commit()
             return decision(False, "TERMINAL_RUNTIME_RECONNECT_PENDING")
@@ -10168,6 +10224,33 @@ def _terminal_has_pending_provider_reconnect(db, terminal_id: str) -> bool:
     )
 
 
+def _terminal_requires_provider_runtime_compatibility_reconnect(
+    terminal: Optional[TerminalModel],
+) -> bool:
+    """Treat every resident Codex runtime not proven current as stale.
+
+    Workflow state is deliberately absent from this authority decision. A
+    terminal can retain the same physical provider process after its prior
+    workflow closes, and NULL is a legacy unknown rather than compatibility
+    proof. Known recovery/exit lifecycles are owned by their canonical sagas;
+    NULL lifecycle remains a legacy unknown because transport still permits it.
+    """
+    from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
+
+    return bool(
+        terminal is not None
+        and terminal.provider == "codex"
+        and terminal.runtime_lifecycle in (None, "running")
+        and (
+            not terminal.provider_runtime_compatibility_generation
+            or not hmac.compare_digest(
+                str(terminal.provider_runtime_compatibility_generation),
+                ACTIVE_RUNTIME_GENERATION,
+            )
+        )
+    )
+
+
 def _terminal_runtime_mutation_blocked(db, terminal_id: str, now: datetime) -> bool:
     terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
     if terminal is None:
@@ -10178,6 +10261,8 @@ def _terminal_runtime_mutation_blocked(db, terminal_id: str, now: datetime) -> b
         "exited",
         "recovery_fenced",
     ):
+        return True
+    if _terminal_requires_provider_runtime_compatibility_reconnect(terminal):
         return True
     if _terminal_has_pending_provider_reconnect(db, terminal_id):
         return True
@@ -10206,6 +10291,9 @@ def acquire_terminal_runtime_transport(
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal is None or terminal.runtime_lifecycle not in (None, "running"):
+            db.commit()
+            return None
+        if _terminal_requires_provider_runtime_compatibility_reconnect(terminal):
             db.commit()
             return None
         if not _workspace_accepts_new_work(db, terminal_id):
@@ -12016,6 +12104,7 @@ TURN_FINISHED = "finished"
 TURN_CANCELLED = "cancelled"
 PROVIDER_CONTENT_UNAVAILABLE = "PROVIDER_CONTENT_UNAVAILABLE"
 WORKFLOW_EXECUTION_RESUME_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{40,64}$")
+WORKFLOW_EXECUTION_RESUME_NONCE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{40,64}$")
 # A provider-final observation for a turn whose receiver never admitted the
 # envelope is not progress.  Keep this distinct from ``None`` (no workflow or
 # no sendable turn) so callers and deterministic tests can prove that the
@@ -12056,6 +12145,68 @@ OPEN_FINAL_CIRCUIT_BREAKER_REASON = (
     "Automatic continuation paused when 65 consecutive provider finals produced no "
     "durable workflow progress. Review the provider/runtime before resuming."
 )
+
+
+class WorkflowContinuationAuthorityConflict(RuntimeError):
+    """The compacting provider cannot prove one current admitted execution."""
+
+
+def _derive_workflow_execution_resume_token(
+    receiver_terminal_id: str,
+    logical_turn_id: int,
+    nonce: str,
+    terminal_auth_token: str,
+) -> str:
+    """Derive one bearer without retaining it in durable control-plane state."""
+    message = (
+        b"threadcells-workflow-execution-resume-v1\0"
+        + receiver_terminal_id.encode("utf-8", "strict")
+        + b"\0"
+        + str(logical_turn_id).encode("ascii", "strict")
+        + b"\0"
+        + nonce.encode("ascii", "strict")
+    )
+    digest = hmac.new(
+        terminal_auth_token.encode("utf-8", "strict"), message, hashlib.sha256
+    ).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _mint_workflow_execution_resume_token(
+    db: Any,
+    receiver_terminal_id: str,
+    logical_turn_id: int,
+    terminal_auth_token: Optional[str],
+) -> tuple[str, Optional[str]]:
+    """Mint restorable authority only for an exact terminal bearer.
+
+    Direct database callers retained for compatibility do not own a terminal
+    bearer. They still receive the established random capability, but it is
+    intentionally not restorable by a provider hook.
+    """
+    terminal = db.get(TerminalModel, receiver_terminal_id)
+    token_digest = (
+        hashlib.sha256(terminal_auth_token.encode("utf-8", "strict")).hexdigest()
+        if terminal_auth_token
+        else None
+    )
+    if (
+        terminal is not None
+        and terminal.auth_token_sha256
+        and token_digest
+        and hmac.compare_digest(str(terminal.auth_token_sha256), token_digest)
+    ):
+        nonce = secrets.token_urlsafe(32)
+        return (
+            _derive_workflow_execution_resume_token(
+                receiver_terminal_id,
+                logical_turn_id,
+                nonce,
+                terminal_auth_token,
+            ),
+            nonce,
+        )
+    return secrets.token_urlsafe(32), None
 
 
 def _dispatch_workflow_notification_fail_open(
@@ -12440,6 +12591,9 @@ def _prepare_workflow_input(
                 "accepted": False,
                 "reason_code": "TERMINAL_RUNTIME_NOT_WRITABLE",
             }
+        runtime_compatibility_recovery = (
+            _terminal_requires_provider_runtime_compatibility_reconnect(terminal)
+        )
         if not _retirement_quiescence_allows_commit(db, root_terminal_id):
             return None
         # Terminal workflow turns can leave their ordinary Inbox transport
@@ -12538,10 +12692,24 @@ def _prepare_workflow_input(
                         "accepted": False,
                         "reason_code": "WORKFLOW_INPUT_NO_LONGER_EXECUTABLE",
                     }
+                if (
+                    runtime_compatibility_recovery
+                    and existing_workflow is not None
+                    and existing_workflow.active_turn_id == effective_turn.id
+                    and effective_turn.state == TURN_QUEUED
+                    and not _request_workflow_provider_reconnect_in_transaction(
+                        db,
+                        root_terminal_id,
+                        datetime.now(),
+                    )
+                ):
+                    db.rollback()
+                    return None
                 runtime_recovery = bool(
                     terminal
                     and (
-                        terminal.runtime_operation_kind in ("reconnect", "retire")
+                        runtime_compatibility_recovery
+                        or terminal.runtime_operation_kind in ("reconnect", "retire")
                         or _terminal_has_pending_provider_reconnect(db, root_terminal_id)
                     )
                 )
@@ -12588,14 +12756,17 @@ def _prepare_workflow_input(
                 )
                 db.add(workflow)
                 db.flush()
-        runtime_owned = False
+        runtime_owned = runtime_compatibility_recovery
         workflow_predecessor = False
         if defer_while_runtime_owned:
             runtime_owned = bool(
-                terminal
-                and (
-                    terminal.runtime_operation_kind in ("reconnect", "retire")
-                    or _terminal_has_pending_provider_reconnect(db, root_terminal_id)
+                runtime_owned
+                or (
+                    terminal
+                    and (
+                        terminal.runtime_operation_kind in ("reconnect", "retire")
+                        or _terminal_has_pending_provider_reconnect(db, root_terminal_id)
+                    )
                 )
             )
             workflow_predecessor = bool(
@@ -12637,8 +12808,16 @@ def _prepare_workflow_input(
         # The direct input about to reach the provider is the only turn whose
         # public MCP calls may be admitted.  A later input replaces this
         # binding, so an old prompt cannot borrow its retained receipt.
-        if not queued:
+        compatibility_head = bool(runtime_compatibility_recovery and not workflow_predecessor)
+        if not queued or compatibility_head:
             workflow.active_turn_id = turn.id
+        if compatibility_head and not _request_workflow_provider_reconnect_in_transaction(
+            db,
+            root_terminal_id,
+            datetime.now(),
+        ):
+            db.rollback()
+            return None
         # A direct owner/user input is genuine progress and re-arms the bounded
         # automatic continuation path for this still-open mission.
         workflow.no_progress_count = 0
@@ -14171,6 +14350,8 @@ def claim_or_resume_workflow_turn_receipt(
     logical_turn_id: int,
     resume_token: Optional[str] = None,
     now: Optional[datetime] = None,
+    *,
+    terminal_auth_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Admit a new turn or transfer an interrupted admitted execution.
 
@@ -14286,7 +14467,12 @@ def claim_or_resume_workflow_turn_receipt(
                 db, int(workflow.id), logical_turn_id, int(resumed.id), now
             )
 
-            next_resume_token = secrets.token_urlsafe(32)
+            next_resume_token, next_resume_nonce = _mint_workflow_execution_resume_token(
+                db,
+                receiver_terminal_id,
+                int(resumed.id),
+                terminal_auth_token,
+            )
             db.add(
                 WorkflowTurnReceiptModel(
                     workflow_turn_id=resumed.id,
@@ -14294,6 +14480,7 @@ def claim_or_resume_workflow_turn_receipt(
                     resume_token_sha256=hashlib.sha256(
                         next_resume_token.encode("utf-8", "strict")
                     ).hexdigest(),
+                    resume_token_nonce=next_resume_nonce,
                     consumed_at=now,
                 )
             )
@@ -14301,6 +14488,7 @@ def claim_or_resume_workflow_turn_receipt(
             interrupted.updated_at = now
             existing.resumed_by_turn_id = resumed.id
             existing.resumed_at = now
+            existing.resume_token_nonce = None
             workflow.active_turn_id = resumed.id
             workflow.updated_at = now
             try:
@@ -14384,7 +14572,12 @@ def claim_or_resume_workflow_turn_receipt(
         if execution_conflict is not None:
             db.rollback()
             return {"accepted": False, "reason": execution_conflict}
-        next_resume_token = secrets.token_urlsafe(32)
+        next_resume_token, next_resume_nonce = _mint_workflow_execution_resume_token(
+            db,
+            receiver_terminal_id,
+            logical_turn_id,
+            terminal_auth_token,
+        )
         db.add(
             WorkflowTurnReceiptModel(
                 workflow_turn_id=logical_turn_id,
@@ -14392,12 +14585,14 @@ def claim_or_resume_workflow_turn_receipt(
                 resume_token_sha256=hashlib.sha256(
                     next_resume_token.encode("utf-8", "strict")
                 ).hexdigest(),
+                resume_token_nonce=next_resume_nonce,
                 consumed_at=now,
             )
         )
         if reconnect_parent_receipt is not None:
             reconnect_parent_receipt.resumed_by_turn_id = logical_turn_id
             reconnect_parent_receipt.resumed_at = now
+            reconnect_parent_receipt.resume_token_nonce = None
         try:
             db.commit()
         except IntegrityError:
@@ -14447,6 +14642,131 @@ def has_admitted_workflow_turn(receiver_terminal_id: str, logical_turn_id: int) 
             .filter_by(workflow_turn_id=logical_turn_id, receiver_terminal_id=receiver_terminal_id)
             .first()
         )
+
+
+def get_workflow_compaction_continuation_authority(
+    receiver_terminal_id: str,
+    *,
+    terminal_auth_token: str,
+    runtime_generation: str,
+    provider_resume_identity: str,
+) -> Optional[Dict[str, Any]]:
+    """Re-derive the exact current admitted pair for a proven Codex compact.
+
+    This is a read-only restoration of existing authority, not a receipt,
+    resume, or privileged effect. A current OPEN turn without a receipt is an
+    ordinary not-yet-admitted input and has nothing to restore. Once a receipt
+    exists, every runtime, provider, lease, recovery, and token axis must agree
+    or compaction fails closed.
+    """
+    from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
+
+    _ensure_workflow_schema()
+    _ensure_provider_execution_schema()
+    if not terminal_auth_token or not runtime_generation or not provider_resume_identity:
+        raise WorkflowContinuationAuthorityConflict("continuation_identity_not_proven")
+    terminal_auth_digest = hashlib.sha256(terminal_auth_token.encode("utf-8", "strict")).hexdigest()
+    with SessionLocal() as db:
+        terminal = db.get(TerminalModel, receiver_terminal_id)
+        if (
+            terminal is None
+            or not _workspace_accepts_new_work(db, receiver_terminal_id)
+            or terminal.provider != "codex"
+            or terminal.runtime_lifecycle != "running"
+            or not terminal.provider_runtime_compatibility_generation
+            or not hmac.compare_digest(
+                str(terminal.provider_runtime_compatibility_generation),
+                ACTIVE_RUNTIME_GENERATION,
+            )
+            or not terminal.auth_token_sha256
+            or not hmac.compare_digest(str(terminal.auth_token_sha256), terminal_auth_digest)
+            or not terminal.runtime_generation
+            or not hmac.compare_digest(str(terminal.runtime_generation), runtime_generation)
+            or not terminal.provider_resume_identity
+            or not hmac.compare_digest(
+                str(terminal.provider_resume_identity), provider_resume_identity
+            )
+            or not terminal.provider_resume_runtime_generation
+            or not hmac.compare_digest(
+                str(terminal.provider_resume_runtime_generation), runtime_generation
+            )
+        ):
+            raise WorkflowContinuationAuthorityConflict("continuation_identity_not_proven")
+        workflow = _open_workflow(db, receiver_terminal_id, create=False)
+        if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
+            return None
+        logical_turn_id = int(workflow.active_turn_id)
+        turn = db.get(WorkflowTurnModel, logical_turn_id)
+        receipt = (
+            db.query(WorkflowTurnReceiptModel)
+            .filter_by(
+                workflow_turn_id=logical_turn_id,
+                receiver_terminal_id=receiver_terminal_id,
+            )
+            .one_or_none()
+        )
+        if receipt is None:
+            return None
+        lease = db.get(ProviderExecutionLeaseModel, receiver_terminal_id)
+        foreign_turn_lease = (
+            db.query(ProviderExecutionLeaseModel.terminal_id)
+            .filter(
+                ProviderExecutionLeaseModel.workflow_turn_id == logical_turn_id,
+                ProviderExecutionLeaseModel.terminal_id != receiver_terminal_id,
+            )
+            .first()
+        )
+        recovery = (
+            db.query(RecoveryTakeoverModel.id)
+            .filter(
+                or_(
+                    RecoveryTakeoverModel.old_terminal_id == receiver_terminal_id,
+                    RecoveryTakeoverModel.new_terminal_id == receiver_terminal_id,
+                ),
+                RecoveryTakeoverModel.state.notin_(("failed", "completed")),
+            )
+            .first()
+        )
+        nonce = str(receipt.resume_token_nonce or "")
+        if (
+            turn is None
+            or turn.workflow_id != workflow.id
+            or turn.state != TURN_SENT
+            or turn.superseded_by_turn_id is not None
+            or turn.superseded_at is not None
+            or turn.provider_ready_observed_at is not None
+            or turn.provider_outcome_code is not None
+            or turn.provider_outcome_observed_at is not None
+            or turn.provider_reconnect_requested_at is not None
+            or receipt.resumed_by_turn_id is not None
+            or receipt.resumed_at is not None
+            or not receipt.resume_token_sha256
+            or WORKFLOW_EXECUTION_RESUME_NONCE_PATTERN.fullmatch(nonce) is None
+            or lease is None
+            or lease.workflow_turn_id != logical_turn_id
+            or foreign_turn_lease is not None
+            or recovery is not None
+            or terminal.runtime_operation_kind is not None
+            or terminal.runtime_operation_token is not None
+        ):
+            raise WorkflowContinuationAuthorityConflict("continuation_authority_not_proven")
+        resume_token = _derive_workflow_execution_resume_token(
+            receiver_terminal_id,
+            logical_turn_id,
+            nonce,
+            terminal_auth_token,
+        )
+        resume_token_digest = hashlib.sha256(resume_token.encode("utf-8", "strict")).hexdigest()
+        if not hmac.compare_digest(str(receipt.resume_token_sha256), resume_token_digest):
+            raise WorkflowContinuationAuthorityConflict("continuation_token_not_proven")
+        return {
+            "authority_version": 1,
+            "workflow_id": int(workflow.id),
+            "logical_turn_id": logical_turn_id,
+            "resume_token": resume_token,
+            "receiver_terminal_id": receiver_terminal_id,
+            "runtime_generation": runtime_generation,
+        }
 
 
 def claim_workflow_effect(
@@ -15327,6 +15647,31 @@ def _provider_reconnect_authority_turn(
         if turn.resume_parent_turn_id is None:
             turn.resume_parent_turn_id = predecessor.id
         candidate = predecessor
+    elif (
+        turn.state == TURN_QUEUED
+        and turn.kind == "external_input"
+        and turn.inbox_message_id is None
+        and workflow.status == WORKFLOW_OPEN
+        and workflow.root_terminal_id == root_terminal_id
+        and workflow.active_turn_id == turn.id
+        and turn.workflow_id == workflow.id
+        and turn.claim_token is None
+        and turn.claim_expires_at is None
+        and turn.superseded_by_turn_id is None
+        and turn.superseded_at is None
+        and db.query(WorkflowTurnReceiptModel.id)
+        .filter_by(
+            workflow_turn_id=turn.id,
+            receiver_terminal_id=root_terminal_id,
+        )
+        .first()
+        is None
+    ):
+        # An accepted external input is durable transport authority even
+        # before provider admission. It may own a compatibility reconnect so
+        # the exact same turn remains queued while the resident process is
+        # replaced, then becomes sendable once the new runtime is proven.
+        return turn
     elif _queued_result_turn_authorizes_provider_reconnect(db, workflow, turn, root_terminal_id):
         return turn
     elif turn.state not in (TURN_SENT, TURN_FINISHED):
@@ -15342,8 +15687,49 @@ def _provider_reconnect_authority_turn(
     return candidate if admitted is not None else None
 
 
+def _request_workflow_provider_reconnect_in_transaction(
+    db: Any,
+    root_terminal_id: str,
+    now: datetime,
+    *,
+    incompatible_with_runtime_generation: Optional[str] = None,
+) -> bool:
+    """Install one reconnect marker while retaining the caller's writer lock."""
+    if not _workspace_accepts_new_work(db, root_terminal_id):
+        return False
+    workflow = _open_workflow(db, root_terminal_id, create=False)
+    if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
+        return False
+    if incompatible_with_runtime_generation is not None:
+        terminal = db.get(TerminalModel, root_terminal_id)
+        if (
+            terminal is None
+            or terminal.provider != "codex"
+            or terminal.runtime_lifecycle != "running"
+            or terminal.provider_runtime_compatibility_generation
+            == incompatible_with_runtime_generation
+        ):
+            return False
+    turn = db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
+    if turn is None or turn.workflow_id != workflow.id:
+        return False
+    if _provider_reconnect_authority_turn(db, workflow, turn, root_terminal_id) is None:
+        return False
+    if turn.provider_reconnect_requested_at is None:
+        turn.provider_reconnect_requested_at = now
+        turn.provider_reconnect_claim_token = None
+        if turn.state == TURN_QUEUED:
+            turn.queue_reason = "TERMINAL_RUNTIME_RECONNECT_PENDING"
+        turn.updated_at = now
+        workflow.updated_at = now
+    return True
+
+
 def request_workflow_provider_reconnect(
-    root_terminal_id: str, now: Optional[datetime] = None
+    root_terminal_id: str,
+    now: Optional[datetime] = None,
+    *,
+    incompatible_with_runtime_generation: Optional[str] = None,
 ) -> bool:
     """Persist a stale-sidecar observation before any replacement transport.
 
@@ -15354,32 +15740,180 @@ def request_workflow_provider_reconnect(
     supplies provenance. No provider launch occurs here.
     """
     _ensure_workflow_schema()
+    if (
+        incompatible_with_runtime_generation is not None
+        and re.fullmatch(r"[0-9a-f]{64}", incompatible_with_runtime_generation) is None
+    ):
+        raise ValueError("incompatible runtime generation is invalid")
     now = now or datetime.now()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
-        if not _workspace_accepts_new_work(db, root_terminal_id):
+        requested = _request_workflow_provider_reconnect_in_transaction(
+            db,
+            root_terminal_id,
+            now,
+            incompatible_with_runtime_generation=incompatible_with_runtime_generation,
+        )
+        if not requested:
             db.rollback()
             return False
-        workflow = _open_workflow(db, root_terminal_id, create=False)
-        if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
-            db.rollback()
-            return False
-        turn = db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
-        if turn is None or turn.workflow_id != workflow.id:
-            db.rollback()
-            return False
-        if _provider_reconnect_authority_turn(db, workflow, turn, root_terminal_id) is None:
-            db.rollback()
-            return False
-        if turn.provider_reconnect_requested_at is None:
-            turn.provider_reconnect_requested_at = now
-            turn.provider_reconnect_claim_token = None
-            if turn.state == TURN_QUEUED:
-                turn.queue_reason = "TERMINAL_RUNTIME_RECONNECT_PENDING"
-            turn.updated_at = now
-            workflow.updated_at = now
         db.commit()
         return True
+
+
+def request_stale_provider_runtime_reconnects(
+    active_runtime_generation: str,
+    *,
+    now: Optional[datetime] = None,
+    limit: int = STALE_PROVIDER_RUNTIME_RECONNECT_BATCH_SIZE,
+) -> int:
+    """Fence admitted Codex executions launched by older control-plane code.
+
+    Codex parses its SessionStart matcher once at launch, so a deployment
+    cannot retrofit the compact hook into a resident process. The terminal's
+    compatibility generation distinguishes that launch authority from the
+    current service. Persisting the ordinary provider-reconnect barrier before
+    queue observation prevents new transport and lets its existing recovery
+    saga resume the exact provider session after the active execution settles.
+
+    Candidate selection includes only turn shapes which can carry reconnect
+    authority. A durable singleton keyset cursor advances across every selected
+    page even when its exact writer transactions all fail, so a deletion fence
+    or concurrently changed claimant cannot make the first page starve another
+    Session. The cursor resets after the end of each finite sweep and when the
+    active release generation changes. Terminal-level transport checks
+    independently fence every stale resident, including terminals with no OPEN
+    workflow.
+    """
+    _ensure_workflow_schema()
+    if re.fullmatch(r"[0-9a-f]{64}", active_runtime_generation) is None:
+        raise ValueError("active runtime generation is invalid")
+    bounded_limit = min(max(int(limit), 1), STALE_PROVIDER_RUNTIME_RECONNECT_BATCH_SIZE)
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        scan = db.get(ProviderRuntimeCompatibilityScanModel, 1)
+        if scan is None:
+            scan = ProviderRuntimeCompatibilityScanModel(
+                id=1,
+                active_runtime_generation=active_runtime_generation,
+            )
+            db.add(scan)
+            db.flush()
+        elif not hmac.compare_digest(
+            str(scan.active_runtime_generation), active_runtime_generation
+        ):
+            scan.active_runtime_generation = active_runtime_generation
+            scan.after_terminal_id = None
+        after_terminal_id = (
+            str(scan.after_terminal_id) if scan.after_terminal_id is not None else None
+        )
+        direct_receipt_exists = (
+            db.query(WorkflowTurnReceiptModel.id)
+            .filter(
+                WorkflowTurnReceiptModel.workflow_turn_id == WorkflowTurnModel.id,
+                WorkflowTurnReceiptModel.receiver_terminal_id == WorkflowModel.root_terminal_id,
+            )
+            .exists()
+        )
+        predecessor_receipt_exists = (
+            db.query(WorkflowTurnReceiptModel.id)
+            .filter(
+                WorkflowTurnReceiptModel.workflow_turn_id
+                == WorkflowTurnModel.resume_parent_turn_id,
+                WorkflowTurnReceiptModel.receiver_terminal_id == WorkflowModel.root_terminal_id,
+            )
+            .exists()
+        )
+        candidates = [
+            str(root_terminal_id)
+            for (root_terminal_id,) in (
+                db.query(WorkflowModel.root_terminal_id)
+                .distinct()
+                .join(TerminalModel, TerminalModel.id == WorkflowModel.root_terminal_id)
+                .join(
+                    WorkflowTurnModel,
+                    WorkflowTurnModel.id == WorkflowModel.active_turn_id,
+                )
+                .filter(
+                    WorkflowModel.status == WORKFLOW_OPEN,
+                    TerminalModel.provider == "codex",
+                    TerminalModel.runtime_lifecycle == "running",
+                    or_(
+                        TerminalModel.provider_runtime_compatibility_generation.is_(None),
+                        TerminalModel.provider_runtime_compatibility_generation
+                        != active_runtime_generation,
+                    ),
+                    WorkflowTurnModel.provider_reconnect_requested_at.is_(None),
+                    *(
+                        (WorkflowModel.root_terminal_id > after_terminal_id,)
+                        if after_terminal_id is not None
+                        else ()
+                    ),
+                    or_(
+                        and_(
+                            WorkflowTurnModel.state.in_((TURN_SENT, TURN_FINISHED)),
+                            direct_receipt_exists,
+                        ),
+                        and_(
+                            WorkflowTurnModel.state == TURN_QUEUED,
+                            WorkflowTurnModel.kind == "open_final",
+                            WorkflowTurnModel.resume_parent_turn_id.is_not(None),
+                            predecessor_receipt_exists,
+                        ),
+                        and_(
+                            WorkflowTurnModel.state == TURN_QUEUED,
+                            WorkflowTurnModel.kind == "external_input",
+                            WorkflowTurnModel.inbox_message_id.is_(None),
+                            WorkflowTurnModel.claim_token.is_(None),
+                            WorkflowTurnModel.claim_expires_at.is_(None),
+                            WorkflowTurnModel.superseded_by_turn_id.is_(None),
+                            WorkflowTurnModel.superseded_at.is_(None),
+                        ),
+                    ),
+                )
+                .order_by(WorkflowModel.root_terminal_id.asc())
+                .limit(bounded_limit)
+                .all()
+            )
+        ]
+        scan.after_terminal_id = candidates[-1] if len(candidates) == bounded_limit else None
+        scan.updated_at = now or datetime.now()
+        db.commit()
+    return sum(
+        int(
+            request_workflow_provider_reconnect(
+                terminal_id,
+                now=now,
+                incompatible_with_runtime_generation=active_runtime_generation,
+            )
+        )
+        for terminal_id in candidates
+    )
+
+
+def count_stale_provider_runtime_compatibilities(active_runtime_generation: str) -> int:
+    """Count every resident Codex runtime not proven compatible with this release."""
+    _ensure_workflow_schema()
+    if re.fullmatch(r"[0-9a-f]{64}", active_runtime_generation) is None:
+        raise ValueError("active runtime generation is invalid")
+    with SessionLocal() as db:
+        return int(
+            db.query(func.count(TerminalModel.id))
+            .filter(
+                TerminalModel.provider == "codex",
+                or_(
+                    TerminalModel.runtime_lifecycle.is_(None),
+                    TerminalModel.runtime_lifecycle == "running",
+                ),
+                or_(
+                    TerminalModel.provider_runtime_compatibility_generation.is_(None),
+                    TerminalModel.provider_runtime_compatibility_generation
+                    != active_runtime_generation,
+                ),
+            )
+            .scalar()
+            or 0
+        )
 
 
 def claim_workflow_provider_reconnect(
@@ -15955,6 +16489,8 @@ def complete_workflow_provider_reconnect(
     attempt_token: str,
 ) -> bool:
     """Close the durable reconnect episode after the resumed TUI is ready."""
+    from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
+
     _ensure_workflow_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
@@ -15985,6 +16521,8 @@ def complete_workflow_provider_reconnect(
             or attempt.output_log_inode is None
             or attempt.output_log_offset is None
             or attempt.output_boundary_at is None
+            or not attempt.runtime_generation
+            or not hmac.compare_digest(str(attempt.runtime_generation), ACTIVE_RUNTIME_GENERATION)
         ):
             db.rollback()
             return False
@@ -16200,6 +16738,11 @@ def complete_workflow_provider_reconnect(
         terminal.runtime_operation_token = None
         terminal.runtime_operation_claimed_at = None
         terminal.runtime_operation_expires_at = None
+        # Readiness was registered by the newly initialized, nonce-bound MCP
+        # sidecar and its output boundary was proven before this transaction.
+        # Publish the resident Codex launch compatibility only at that final
+        # reconnect commit, never merely because a new service was deployed.
+        terminal.provider_runtime_compatibility_generation = attempt.runtime_generation
         attempt.state = PROVIDER_RECONNECT_SUCCEEDED
         attempt.outcome_code = (
             "runtime_ready_authority_gate" if continuation_unsafe else "runtime_ready"

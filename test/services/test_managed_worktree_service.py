@@ -578,20 +578,25 @@ def test_session_purge_rechecks_each_row_immediately_without_another_inventory_s
     ]
     captured = managed_worktree_service.capture_session_worktree_retirement_authority(metadata)
     original_git = managed_worktree_service._git
+    original_inventory = managed_worktree_service._bounded_git_output
     removal_seen = False
     inventory_scans = 0
 
     def mutate_after_first_removal(*args, **kwargs):
-        nonlocal removal_seen, inventory_scans
-        if args[:3] == ("worktree", "list", "--porcelain"):
-            inventory_scans += 1
+        nonlocal removal_seen
         result = original_git(*args, **kwargs)
         if args[:2] == ("worktree", "remove") and not removal_seen:
             removal_seen = True
             _git(Path(second.path), "switch", "-c", "fix/changed-during-cleanup")
         return result
 
+    def count_inventory(*args, **kwargs):
+        nonlocal inventory_scans
+        inventory_scans += 1
+        return original_inventory(*args, **kwargs)
+
     monkeypatch.setattr(managed_worktree_service, "_git", mutate_after_first_removal)
+    monkeypatch.setattr(managed_worktree_service, "_bounded_git_output", count_inventory)
     retired = managed_worktree_service.purge_session_managed_worktrees(
         metadata, captured["authority"]
     )
@@ -602,6 +607,111 @@ def test_session_purge_rechecks_each_row_immediately_without_another_inventory_s
     assert not Path(first.path).exists()
     assert Path(second.path).exists()
     assert inventory_scans == 1
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit_value"),
+    [
+        ("_MAX_WORKTREE_INVENTORY_BYTES", 1),
+        ("_MAX_WORKTREE_INVENTORY_ROWS", 0),
+    ],
+)
+def test_session_capture_fails_closed_when_repository_inventory_exceeds_bound(
+    tmp_path, monkeypatch, limit_name, limit_value
+):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(
+        str(repository), "bounded-inventory", "task"
+    )
+    assert task is not None
+    monkeypatch.setattr(managed_worktree_service, limit_name, limit_value)
+
+    captured = managed_worktree_service.capture_session_worktree_retirement_authority(
+        [{**_metadata(task), "session_id": "session"}]
+    )
+
+    assert captured == {
+        "safe": False,
+        "reason_code": "MANAGED_WORKTREE_INVENTORY_LIMIT",
+    }
+    assert Path(task.path).exists()
+
+
+def test_session_purge_rejects_registration_move_after_cached_inventory(tmp_path, monkeypatch):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(
+        str(repository), "registration-race", "task"
+    )
+    assert task is not None
+    metadata = {**_metadata(task), "session_id": "session"}
+    captured = managed_worktree_service.capture_session_worktree_retirement_authority([metadata])
+    moved_path = tmp_path / "moved-after-inventory"
+    original_git = managed_worktree_service._git
+    moved = False
+
+    def move_during_live_revalidation(*args, **kwargs):
+        nonlocal moved
+        if (
+            not moved
+            and args[:2] == ("rev-parse", "--show-toplevel")
+            and Path(kwargs["cwd"]) == Path(task.path)
+        ):
+            moved = True
+            _git(repository, "worktree", "move", task.path, str(moved_path))
+        return original_git(*args, **kwargs)
+
+    monkeypatch.setattr(managed_worktree_service, "_git", move_during_live_revalidation)
+    retired = managed_worktree_service.purge_session_managed_worktrees(
+        [metadata], captured["authority"]
+    )
+
+    assert retired["removed"] is False
+    assert retired["reason_code"] in {
+        "MANAGED_WORKTREE_IDENTITY_MISMATCH",
+        "MANAGED_WORKTREE_AUTHORITY_CHANGED",
+    }
+    assert moved_path.exists()
+
+
+def test_session_purge_revalidates_repository_identity_before_private_ref_cas(
+    tmp_path, monkeypatch
+):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(
+        str(repository), "repository-race", "task"
+    )
+    assert task is not None and task.branch is not None
+    metadata = {**_metadata(task), "session_id": "session"}
+    captured = managed_worktree_service.capture_session_worktree_retirement_authority([metadata])
+    expected_object = captured["authority"]["worktrees"][0]["owned_ref_object_id"]
+    original_git = managed_worktree_service._git
+    original_repository = tmp_path / "original-source"
+    replaced = False
+
+    def replace_after_worktree_removal(*args, **kwargs):
+        nonlocal replaced
+        result = original_git(*args, **kwargs)
+        if not replaced and args[:2] == ("worktree", "remove"):
+            replaced = True
+            repository.rename(original_repository)
+            subprocess.run(
+                ["git", "clone", "-q", "--no-hardlinks", str(original_repository), str(repository)],
+                check=True,
+            )
+            _git(repository, "update-ref", f"refs/heads/{task.branch}", expected_object)
+        return result
+
+    monkeypatch.setattr(managed_worktree_service, "_git", replace_after_worktree_removal)
+    retired = managed_worktree_service.purge_session_managed_worktrees(
+        [metadata], captured["authority"]
+    )
+
+    assert retired["removed"] is False
+    assert retired["reason_code"] == "MANAGED_WORKTREE_IDENTITY_MISMATCH"
+    assert _git(repository, "rev-parse", f"refs/heads/{task.branch}") == expected_object
 
 
 def test_authoritatively_retired_workspace_must_already_be_physically_absent(tmp_path, monkeypatch):

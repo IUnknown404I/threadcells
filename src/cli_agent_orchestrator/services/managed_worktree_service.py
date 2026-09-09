@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import selectors
 import subprocess
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -76,6 +79,8 @@ def _dirty_content_fingerprint(path: Path, *, status: str, head: str) -> str:
 
 
 _MANAGED_KINDS = frozenset({"supervisor", "task", "reviewer"})
+_MAX_WORKTREE_INVENTORY_BYTES = 2 * 1024 * 1024
+_MAX_WORKTREE_INVENTORY_ROWS = 4096
 
 
 def _branch_for(kind: str, identity: str) -> str | None:
@@ -102,8 +107,62 @@ def _path_identity(path: Path) -> dict[str, int]:
     return {"device": int(metadata.st_dev), "inode": int(metadata.st_ino)}
 
 
-def _load_worktree_inventory(source: Path) -> dict[str, Any]:
-    """Load one exact repository worktree inventory for bounded reuse."""
+def _bounded_git_output(
+    *args: str,
+    cwd: Path,
+    maximum_bytes: int,
+) -> str:
+    """Read one Git result without permitting unbounded captured output."""
+    process = subprocess.Popen(
+        ["git", "-C", str(cwd), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if process.stdout is None:  # pragma: no cover - Popen contract
+        process.kill()
+        process.wait()
+        raise ManagedWorktreeError("MANAGED_WORKTREE_INVENTORY_UNAVAILABLE")
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    output = bytearray()
+    deadline = time.monotonic() + 30
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, 30)
+            events = selector.select(remaining)
+            if not events:
+                raise subprocess.TimeoutExpired(process.args, 30)
+            for key, _mask in events:
+                chunk = os.read(key.fd, min(65536, maximum_bytes + 1 - len(output)))
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                output.extend(chunk)
+                if len(output) > maximum_bytes:
+                    raise ManagedWorktreeError("MANAGED_WORKTREE_INVENTORY_LIMIT")
+        return_code = process.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+    decoded = output.decode("utf-8", "surrogateescape")
+    if return_code != 0:
+        raise subprocess.CalledProcessError(
+            return_code,
+            process.args,
+            output=decoded,
+            stderr=decoded,
+        )
+    return decoded
+
+
+def _repository_authority(source: Path) -> dict[str, Any]:
+    """Read exact live source/common-dir identity without enumerating worktrees."""
     resolved_source = source.resolve(strict=True)
     if _repository_root(resolved_source) != resolved_source:
         raise ManagedWorktreeError("MANAGED_WORKTREE_IDENTITY_MISMATCH")
@@ -115,8 +174,65 @@ def _load_worktree_inventory(source: Path) -> dict[str, Any]:
             cwd=resolved_source,
         ).stdout.strip()
     ).resolve(strict=True)
+    return {
+        "source": str(resolved_source),
+        "source_identity": _path_identity(resolved_source),
+        "git_common_dir": str(common_dir),
+        "git_common_dir_identity": _path_identity(common_dir),
+    }
+
+
+def _repository_authority_matches(
+    expected: Mapping[str, Any],
+    current: Mapping[str, Any],
+) -> bool:
+    return all(
+        expected.get(key) == current.get(key)
+        for key in (
+            "source",
+            "source_identity",
+            "git_common_dir",
+            "git_common_dir_identity",
+        )
+    )
+
+
+def _worktree_registration_link_matches(path: Path, git_dir: Path) -> bool:
+    """Prove the worktree and common-dir administration point at each other."""
+    marker = path / ".git"
+    backlink = git_dir / "gitdir"
+    try:
+        if marker.is_symlink() or backlink.is_symlink():
+            return False
+        marker_stat = marker.stat()
+        backlink_stat = backlink.stat()
+        if marker_stat.st_size > 4096 or backlink_stat.st_size > 4096:
+            return False
+        marker_value = marker.read_text(errors="surrogateescape").strip()
+        backlink_value = backlink.read_text(errors="surrogateescape").strip()
+        prefix = "gitdir: "
+        if not marker_value.startswith(prefix):
+            return False
+        marker_git_dir = Path(marker_value.removeprefix(prefix)).resolve(strict=True)
+        backlink_marker = Path(backlink_value).resolve(strict=False)
+    except OSError:
+        return False
+    return marker_git_dir == git_dir and backlink_marker == marker.resolve(strict=False)
+
+
+def _load_worktree_inventory(source: Path) -> dict[str, Any]:
+    """Load one exact repository worktree inventory for bounded reuse."""
+    authority = _repository_authority(source)
+    resolved_source = Path(str(authority["source"]))
     registrations: dict[str, dict[str, Any]] = {}
-    listing = _git("worktree", "list", "--porcelain", cwd=resolved_source).stdout
+    listing = _bounded_git_output(
+        "worktree",
+        "list",
+        "--porcelain",
+        cwd=resolved_source,
+        maximum_bytes=_MAX_WORKTREE_INVENTORY_BYTES,
+    )
+    row_count = 0
     for block in listing.split("\n\n"):
         fields: dict[str, str | bool] = {}
         for line in block.splitlines():
@@ -128,6 +244,9 @@ def _load_worktree_inventory(source: Path) -> dict[str, Any]:
         path_value = fields.get("worktree")
         if not isinstance(path_value, str) or not path_value:
             continue
+        row_count += 1
+        if row_count > _MAX_WORKTREE_INVENTORY_ROWS:
+            raise ManagedWorktreeError("MANAGED_WORKTREE_INVENTORY_LIMIT")
         path = Path(path_value).resolve(strict=False)
         registrations[str(path)] = {
             "path": str(path),
@@ -138,10 +257,7 @@ def _load_worktree_inventory(source: Path) -> dict[str, Any]:
             "prunable": bool(fields.get("prunable")),
         }
     return {
-        "source": str(resolved_source),
-        "source_identity": _path_identity(resolved_source),
-        "git_common_dir": str(common_dir),
-        "git_common_dir_identity": _path_identity(common_dir),
+        **authority,
         "registrations": registrations,
     }
 
@@ -293,13 +409,20 @@ def managed_worktree_status(
         }
     try:
         current_inventory = dict(inventory or _load_worktree_inventory(resolved_source))
-    except (ManagedWorktreeError, OSError, subprocess.SubprocessError):
+        live_repository = _repository_authority(resolved_source)
+    except ManagedWorktreeError as exc:
+        return {
+            "managed": True,
+            "safe": False,
+            "reason_code": str(exc) or "MANAGED_WORKTREE_IDENTITY_MISMATCH",
+        }
+    except (OSError, subprocess.SubprocessError):
         return {
             "managed": True,
             "safe": False,
             "reason_code": "MANAGED_WORKTREE_IDENTITY_MISMATCH",
         }
-    if current_inventory.get("source") != str(resolved_source):
+    if not _repository_authority_matches(current_inventory, live_repository):
         return {
             "managed": True,
             "safe": False,
@@ -413,11 +536,31 @@ def managed_worktree_status(
             "safe": False,
             "reason_code": "MANAGED_WORKTREE_IDENTITY_MISMATCH",
         }
+    if not _worktree_registration_link_matches(resolved_path, git_dir):
+        return {
+            "managed": True,
+            "safe": False,
+            "reason_code": "MANAGED_WORKTREE_AUTHORITY_CHANGED",
+        }
     content_fingerprint = _dirty_content_fingerprint(
         resolved_path,
         status=status.stdout,
         head=head,
     )
+    try:
+        final_repository = _repository_authority(resolved_source)
+    except (ManagedWorktreeError, OSError, subprocess.SubprocessError):
+        return {
+            "managed": True,
+            "safe": False,
+            "reason_code": "MANAGED_WORKTREE_IDENTITY_MISMATCH",
+        }
+    if not _repository_authority_matches(current_inventory, final_repository):
+        return {
+            "managed": True,
+            "safe": False,
+            "reason_code": "MANAGED_WORKTREE_IDENTITY_MISMATCH",
+        }
     return {
         "managed": True,
         "safe": True,
@@ -434,9 +577,9 @@ def managed_worktree_status(
         "content_fingerprint": content_fingerprint,
         "expected_commit": metadata.get("managed_worktree_commit"),
         "expected_branch": expected_branch,
-        "source_identity": current_inventory.get("source_identity"),
+        "source_identity": final_repository.get("source_identity"),
         "git_common_dir": str(git_common_dir),
-        "git_common_dir_identity": current_inventory.get("git_common_dir_identity"),
+        "git_common_dir_identity": final_repository.get("git_common_dir_identity"),
         "path_identity": _path_identity(resolved_path),
         "git_dir": str(git_dir),
         "git_dir_identity": _path_identity(git_dir),
@@ -492,6 +635,7 @@ def _retirement_authority_document(
         "terminal_id": terminal_id,
         "session_id": bound_session_id,
         "managed": True,
+        "project_id": metadata.get("project_id"),
         "kind": kind,
         "identity": identity,
         "source": str(status["source"]),
@@ -736,15 +880,28 @@ def purge_session_managed_worktrees(
         for row in current.values()
         if row.get("managed") and isinstance(row.get("source"), str)
     }
-    final_inventories = {
-        source: _load_worktree_inventory(Path(source)) for source in sorted(sources)
-    }
+    try:
+        final_inventories = {
+            source: _load_worktree_inventory(Path(source)) for source in sorted(sources)
+        }
+    except (ManagedWorktreeError, OSError, subprocess.SubprocessError) as exc:
+        return {
+            "removed": False,
+            "reason_code": str(exc) or "WRITABLE_WORKTREE_AUTHORITY_CHANGED",
+        }
     for terminal_id in sorted(current):
         row = current[terminal_id]
         if not row.get("managed"):
             continue
         path = Path(str(row["path"]))
-        registrations = final_inventories[str(row["source"])]["registrations"]
+        final_inventory = final_inventories[str(row["source"])]
+        if not _repository_authority_matches(row, final_inventory):
+            return {
+                "removed": False,
+                "terminal_id": terminal_id,
+                "reason_code": "MANAGED_WORKTREE_IDENTITY_MISMATCH",
+            }
+        registrations = final_inventory["registrations"]
         if path.exists() or path.is_symlink() or str(path) in registrations:
             return {
                 "removed": False,
@@ -759,6 +916,32 @@ def purge_session_managed_worktrees(
             continue
         source = Path(str(row["source"]))
         expected_object = row.get("owned_ref_object_id")
+        try:
+            final_inventory = final_inventories[str(row["source"])]
+            live_repository = _repository_authority(source)
+        except (KeyError, ManagedWorktreeError, OSError, subprocess.SubprocessError) as exc:
+            return {
+                "removed": False,
+                "terminal_id": terminal_id,
+                "reason_code": str(exc) or "MANAGED_WORKTREE_IDENTITY_MISMATCH",
+            }
+        if not _repository_authority_matches(row, live_repository) or not (
+            _repository_authority_matches(final_inventory, live_repository)
+        ):
+            return {
+                "removed": False,
+                "terminal_id": terminal_id,
+                "reason_code": "MANAGED_WORKTREE_IDENTITY_MISMATCH",
+            }
+        if any(
+            registration.get("head_ref") == ref_name
+            for registration in final_inventory["registrations"].values()
+        ):
+            return {
+                "removed": False,
+                "terminal_id": terminal_id,
+                "reason_code": "MANAGED_WORKTREE_BRANCH_CHANGED",
+            }
         current_object = _owned_ref_object(source, ref_name)
         if current_object is None:
             if expected_object is None or not Path(str(row["path"])).exists():
@@ -774,8 +957,30 @@ def purge_session_managed_worktrees(
                 "terminal_id": terminal_id,
                 "reason_code": "MANAGED_WORKTREE_BRANCH_CHANGED",
             }
+        try:
+            before_delete_repository = _repository_authority(source)
+        except (ManagedWorktreeError, OSError, subprocess.SubprocessError) as exc:
+            return {
+                "removed": False,
+                "terminal_id": terminal_id,
+                "reason_code": str(exc) or "MANAGED_WORKTREE_IDENTITY_MISMATCH",
+            }
+        if not _repository_authority_matches(row, before_delete_repository):
+            return {
+                "removed": False,
+                "terminal_id": terminal_id,
+                "reason_code": "MANAGED_WORKTREE_IDENTITY_MISMATCH",
+            }
         deleted = _git("update-ref", "-d", ref_name, current_object, cwd=source, check=False)
-        if deleted.returncode != 0 or _owned_ref_object(source, ref_name) is not None:
+        try:
+            after_delete_repository = _repository_authority(source)
+        except (ManagedWorktreeError, OSError, subprocess.SubprocessError):
+            after_delete_repository = {}
+        if (
+            deleted.returncode != 0
+            or not _repository_authority_matches(row, after_delete_repository)
+            or _owned_ref_object(source, ref_name) is not None
+        ):
             return {
                 "removed": False,
                 "terminal_id": terminal_id,

@@ -857,6 +857,20 @@ def delete_session(
             if operation is not None:
                 try:
                     with housekeeping_mutation_fence():
+                        destructive_revalidation = revalidate_session_hard_deletion(
+                            authority.session_id,
+                            authority.session_name,
+                        )
+                        if not destructive_revalidation.get("valid") or set(
+                            destructive_revalidation.get("terminal_ids", ())
+                        ) != set(terminal_ids):
+                            raise SessionLifecycleError(
+                                str(
+                                    destructive_revalidation.get("reason_code")
+                                    or "SESSION_DELETE_PLAN_CHANGED"
+                                ),
+                                "Session workspace authority changed before destructive cleanup",
+                            )
                         context = get_writable_work_context_by_session(authority.session_id)
                         context_already_retired = bool(
                             context and context.get("state") == "retired"

@@ -6171,6 +6171,7 @@ def _normalize_session_workspace_authority(
         raise ValueError("workspace authority is invalid")
     unmanaged_keys = {"version", "terminal_id", "session_id", "managed"}
     managed_keys = unmanaged_keys | {
+        "project_id",
         "kind",
         "identity",
         "source",
@@ -6316,6 +6317,7 @@ def _normalize_session_workspace_authority(
                     or int(row[key]) < 0
                     for key in ("modified_files", "untracked_files")
                 )
+                or not (row.get("project_id") is None or isinstance(row.get("project_id"), str))
                 or not (
                     row.get("writer_authority_generation") is None
                     or isinstance(row.get("writer_authority_generation"), str)
@@ -6397,7 +6399,13 @@ def _session_workspace_context_authority_in_transaction(
         raise ValueError("workspace authority is ambiguous")
     if not contexts:
         return None
-    context = contexts[0]
+    return _workspace_context_authority_document(contexts[0])
+
+
+def _workspace_context_authority_document(
+    context: WritableWorkContextModel,
+) -> Dict[str, Any]:
+    """Serialize one already-selected writable-context authority row."""
     return {
         "id": context.id,
         "session_id": context.session_id,
@@ -6412,6 +6420,264 @@ def _session_workspace_context_authority_in_transaction(
         "retirement_allow_dirty": bool(context.retirement_allow_dirty),
         "retirement_authority_fingerprint": context.retirement_authority_fingerprint,
     }
+
+
+def _session_workspace_context_progress_is_valid(
+    db: Any,
+    expected: Mapping[str, Any] | None,
+    current: WritableWorkContextModel | None,
+    *,
+    allow_dirty_workspace: bool,
+    require_exact: bool,
+) -> bool:
+    current_authority = (
+        _workspace_context_authority_document(current) if current is not None else None
+    )
+    if require_exact:
+        return expected == current_authority
+    if expected is None:
+        return current is None
+    if current is None or current_authority is None:
+        return False
+    immutable_keys = {
+        "id",
+        "session_id",
+        "terminal_id",
+        "project_id",
+        "canonical_source",
+        "canonical_worktree",
+        "branch",
+        "base_revision",
+        "writer_authority_generation",
+    }
+    if any(expected.get(key) != current_authority.get(key) for key in immutable_keys):
+        return False
+    expected_state = str(expected.get("state"))
+    current_state = str(current_authority.get("state"))
+    allowed_progress = {
+        "admitted": {"admitted", "retiring", "retired"},
+        "retiring": {"retiring", "retired"},
+        "retired": {"retired"},
+    }
+    if current_state not in allowed_progress.get(expected_state, set()):
+        return False
+    if current_state == expected_state:
+        return all(
+            expected.get(key) == current_authority.get(key)
+            for key in ("retirement_allow_dirty", "retirement_authority_fingerprint")
+        )
+    if current_state == "retired":
+        return True
+    if current_state != "retiring" or bool(current.retirement_allow_dirty) != bool(
+        allow_dirty_workspace
+    ):
+        return False
+    snapshot = _session_workspace_snapshot_in_transaction(db, current)
+    return bool(
+        snapshot.get("reason_code") is None
+        and isinstance(current.retirement_authority_fingerprint, str)
+        and hmac.compare_digest(
+            current.retirement_authority_fingerprint,
+            str(snapshot.get("authority_fingerprint") or ""),
+        )
+    )
+
+
+def _validate_session_workspace_relational_authority_in_transaction(
+    db: Any,
+    *,
+    session_id: str,
+    terminal_ids: Sequence[str],
+    workspace_authority: Mapping[str, Any],
+    allow_dirty_workspace: bool,
+    require_exact_context: bool,
+) -> str | None:
+    """Prove every destructive target belongs only to this Session."""
+    terminals = _session_plan_terminals(db, session_id, terminal_ids)
+    if terminals is None:
+        return "SESSION_IDENTITY_CHANGED"
+    rows = {
+        str(row["terminal_id"]): row
+        for row in workspace_authority.get("worktrees", ())
+        if isinstance(row, Mapping) and isinstance(row.get("terminal_id"), str)
+    }
+    if set(rows) != {str(terminal.id) for terminal in terminals}:
+        return "WORKSPACE_AUTHORITY_CHANGED"
+    terminal_by_id = {str(terminal.id): terminal for terminal in terminals}
+    managed_rows: list[Mapping[str, Any]] = []
+    for terminal_id, terminal in terminal_by_id.items():
+        row = rows[terminal_id]
+        kind = terminal.managed_worktree_kind
+        if kind not in {"supervisor", "task", "reviewer"}:
+            if row.get("managed") is not False:
+                return "WORKSPACE_AUTHORITY_CHANGED"
+            continue
+        identity = (
+            terminal.writable_work_context_id
+            or terminal.managed_worktree_origin_terminal_id
+            or terminal.id
+        )
+        owned_ref = (
+            None
+            if kind == "reviewer"
+            else f"refs/heads/cao/{'session' if kind == 'supervisor' else 'task'}/{identity}"
+        )
+        if any(
+            (
+                row.get("managed") is not True,
+                row.get("session_id") != session_id,
+                row.get("project_id") != terminal.project_id,
+                row.get("kind") != kind,
+                row.get("identity") != identity,
+                row.get("source") != terminal.managed_worktree_source,
+                row.get("path") != terminal.launch_worktree,
+                row.get("writer_authority_generation") != terminal.writer_authority_generation,
+                row.get("writable_work_context_id") != terminal.writable_work_context_id,
+                row.get("owned_ref") != owned_ref,
+                terminal.managed_worktree_branch
+                != (owned_ref.removeprefix("refs/heads/") if owned_ref else None),
+            )
+        ):
+            return "WORKSPACE_AUTHORITY_CHANGED"
+        managed_rows.append(row)
+
+    contexts = (
+        db.query(WritableWorkContextModel)
+        .filter(WritableWorkContextModel.session_id == session_id)
+        .limit(2)
+        .all()
+    )
+    if len(contexts) > 1:
+        return "WORKSPACE_AUTHORITY_CHANGED"
+    context = contexts[0] if contexts else None
+    expected_context = workspace_authority.get("work_context")
+    if not _session_workspace_context_progress_is_valid(
+        db,
+        expected_context if isinstance(expected_context, Mapping) else None,
+        context,
+        allow_dirty_workspace=allow_dirty_workspace,
+        require_exact=require_exact_context,
+    ):
+        return "WRITABLE_WORKTREE_AUTHORITY_CHANGED"
+    supervisor_rows = [row for row in managed_rows if row.get("kind") == "supervisor"]
+    if context is None:
+        if supervisor_rows or any(row.get("writable_work_context_id") for row in managed_rows):
+            return "WORKSPACE_AUTHORITY_CHANGED"
+    elif not supervisor_rows and context.state == "retired":
+        # Receipt-only legacy Sessions may retain an already-retired context
+        # after its physical supervisor worktree authority was retired.  Other
+        # independent task/reviewer targets still receive their exact checks.
+        if any(row.get("writable_work_context_id") is not None for row in managed_rows):
+            return "WORKSPACE_AUTHORITY_CHANGED"
+    else:
+        current_supervisor = terminal_by_id.get(str(context.terminal_id))
+        if (
+            current_supervisor is None
+            or current_supervisor.managed_worktree_kind != "supervisor"
+            or current_supervisor.writable_work_context_id != context.id
+            or current_supervisor.project_id != context.project_id
+            or current_supervisor.managed_worktree_source != context.canonical_source
+            or current_supervisor.launch_worktree != context.canonical_worktree
+            or current_supervisor.managed_worktree_branch != context.branch
+            or current_supervisor.managed_worktree_commit != context.base_revision
+            or current_supervisor.writer_authority_generation != context.writer_authority_generation
+        ):
+            return "WORKSPACE_AUTHORITY_CHANGED"
+        if any(
+            row.get("writable_work_context_id") != context.id
+            or row.get("project_id") != context.project_id
+            or row.get("source") != context.canonical_source
+            or row.get("path") != context.canonical_worktree
+            or row.get("owned_ref") != f"refs/heads/{context.branch}"
+            for row in supervisor_rows
+        ):
+            return "WORKSPACE_AUTHORITY_CHANGED"
+        if any(
+            row.get("kind") != "supervisor" and row.get("writable_work_context_id") is not None
+            for row in managed_rows
+        ):
+            return "WORKSPACE_AUTHORITY_CHANGED"
+
+    target_paths = tuple(sorted({str(row["path"]) for row in managed_rows}))
+    target_sources = tuple(sorted({str(row["source"]) for row in managed_rows}))
+    target_branches = tuple(
+        sorted(
+            {
+                str(row["owned_ref"]).removeprefix("refs/heads/")
+                for row in managed_rows
+                if isinstance(row.get("owned_ref"), str)
+            }
+        )
+    )
+    if target_paths:
+        foreign_terminal_filters = [TerminalModel.launch_worktree.in_(target_paths)]
+        if target_sources and target_branches:
+            foreign_terminal_filters.append(
+                and_(
+                    TerminalModel.managed_worktree_source.in_(target_sources),
+                    TerminalModel.managed_worktree_branch.in_(target_branches),
+                )
+            )
+        if (
+            db.query(TerminalModel.id)
+            .filter(
+                TerminalModel.id.notin_(tuple(terminal_by_id)),
+                or_(*foreign_terminal_filters),
+            )
+            .first()
+            is not None
+        ):
+            return "WORKSPACE_FOREIGN_OWNER"
+        receipt_filters = [TerminalDeletionReceiptModel.managed_worktree_path.in_(target_paths)]
+        if target_sources and target_branches:
+            receipt_filters.append(
+                and_(
+                    TerminalDeletionReceiptModel.managed_worktree_source.in_(target_sources),
+                    TerminalDeletionReceiptModel.managed_worktree_branch.in_(target_branches),
+                )
+            )
+        if (
+            db.query(TerminalDeletionReceiptModel.terminal_id)
+            .filter(
+                or_(
+                    TerminalDeletionReceiptModel.session_id != session_id,
+                    TerminalDeletionReceiptModel.session_id.is_(None),
+                ),
+                or_(*receipt_filters),
+            )
+            .first()
+            is not None
+        ):
+            return "WORKSPACE_FOREIGN_OWNER"
+        foreign_context_filters = [WritableWorkContextModel.canonical_worktree.in_(target_paths)]
+        if target_sources and target_branches:
+            foreign_context_filters.append(
+                and_(
+                    WritableWorkContextModel.canonical_source.in_(target_sources),
+                    WritableWorkContextModel.branch.in_(target_branches),
+                )
+            )
+        if (
+            db.query(WritableWorkContextModel.id)
+            .filter(
+                or_(
+                    WritableWorkContextModel.session_id != session_id,
+                    WritableWorkContextModel.session_id.is_(None),
+                ),
+                or_(*foreign_context_filters),
+            )
+            .first()
+            is not None
+        ):
+            return "WORKSPACE_FOREIGN_OWNER"
+        if (
+            db.query(WorktreeWriterLeaseModel.terminal_id)
+            .filter(WorktreeWriterLeaseModel.canonical_worktree.in_(target_paths))
+            .first()
+            is not None
+        ):
+            return "WRITER_LEASE_ACTIVE"
+    return None
 
 
 def _session_deletion_operation_dict(
@@ -8308,6 +8574,18 @@ def _revalidate_session_hard_deletion_in_transaction(
     )
     if not hmac.compare_digest(str(operation.authority_fingerprint), current_fingerprint):
         return None, "SESSION_DELETE_PLAN_CHANGED"
+    workspace_authority = parsed.get("workspace_authority")
+    if workspace_authority is not None:
+        relational_error = _validate_session_workspace_relational_authority_in_transaction(
+            db,
+            session_id=parsed["session_id"],
+            terminal_ids=parsed["terminal_ids"],
+            workspace_authority=workspace_authority,
+            allow_dirty_workspace=bool(parsed["allow_dirty_workspace"]),
+            require_exact_context=False,
+        )
+        if relational_error is not None:
+            return None, relational_error
     return terminals, None
 
 
@@ -8518,17 +8796,6 @@ def bind_session_hard_deletion_workspace_authority(
         except ValueError:
             db.rollback()
             return {"bound": False, "reason_code": "WORKSPACE_AUTHORITY_CHANGED"}
-        try:
-            current_context = _session_workspace_context_authority_in_transaction(db, session_id)
-        except ValueError:
-            db.rollback()
-            return {"bound": False, "reason_code": "WORKSPACE_AUTHORITY_CHANGED"}
-        if normalized["work_context"] != current_context:
-            db.rollback()
-            return {
-                "bound": False,
-                "reason_code": "WRITABLE_WORKTREE_AUTHORITY_CHANGED",
-            }
         _terminals, reason_code = _revalidate_session_hard_deletion_in_transaction(
             db,
             operation,
@@ -8537,6 +8804,17 @@ def bind_session_hard_deletion_workspace_authority(
         if reason_code is not None:
             db.rollback()
             return {"bound": False, "reason_code": reason_code}
+        relational_error = _validate_session_workspace_relational_authority_in_transaction(
+            db,
+            session_id=session_id,
+            terminal_ids=parsed["terminal_ids"],
+            workspace_authority=normalized,
+            allow_dirty_workspace=bool(parsed["allow_dirty_workspace"]),
+            require_exact_context=True,
+        )
+        if relational_error is not None:
+            db.rollback()
+            return {"bound": False, "reason_code": relational_error}
         if parsed["workspace_authority"] is not None:
             matched = (
                 hmac.compare_digest(str(parsed["workspace_authority_sha256"]), digest)

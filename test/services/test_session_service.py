@@ -2,7 +2,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import pytest
 
@@ -245,6 +245,14 @@ class TestDeleteSession:
             ),
             patch(
                 "cli_agent_orchestrator.services.session_service."
+                "bind_session_hard_deletion_workspace_authority",
+                return_value={
+                    "bound": True,
+                    "workspace_authority_sha256": "0" * 64,
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service."
                 "list_session_historical_terminal_cleanup_authorities",
                 return_value=[],
             ),
@@ -300,13 +308,21 @@ class TestDeleteSession:
                 create=True,
             ),
             patch(
-                "cli_agent_orchestrator.services.session_service.purge_managed_worktree",
+                "cli_agent_orchestrator.services.session_service."
+                "purge_session_managed_worktrees",
                 return_value={
-                    "removed": False,
-                    "managed": False,
-                    "path_absent": True,
-                    "git_unregistered": True,
-                    "branch_absent": True,
+                    "removed": True,
+                    "evidence": [
+                        {
+                            "terminal_id": str(terminal["id"]),
+                            "managed": False,
+                            "path_absent": True,
+                            "git_unregistered": True,
+                            "branch_absent": True,
+                            "runtime_artifacts_absent": True,
+                        }
+                        for terminal in durable["terminals"]
+                    ],
                 },
             ),
             patch("cli_agent_orchestrator.services.session_service.provider_manager"),
@@ -346,7 +362,7 @@ class TestDeleteSession:
             contexts[1] as prepare,
             contexts[2] as cancel,
             contexts[3],
-            contexts[4] as cleanup,
+            contexts[4] as current_cleanup,
             contexts[5] as providers,
             contexts[6] as complete,
             contexts[7],
@@ -370,6 +386,16 @@ class TestDeleteSession:
                     "terminals": ["former-terminal"],
                 },
             ) as artifacts,
+            patch(
+                "cli_agent_orchestrator.services.session_service.purge_managed_worktree",
+                return_value={
+                    "removed": False,
+                    "managed": False,
+                    "path_absent": True,
+                    "git_unregistered": True,
+                    "branch_absent": True,
+                },
+            ) as cleanup,
         ):
             result = delete_session("session-lifetime-1")
 
@@ -377,6 +403,9 @@ class TestDeleteSession:
         prepare.assert_not_called()
         cancel.assert_not_called()
         providers.cleanup_provider.assert_not_called()
+        current_cleanup.assert_called_once_with(
+            [], ANY, allow_dirty=False, require_already_absent=False
+        )
         cleanup.assert_called_once_with(historical_cleanup, require_already_absent=True)
         artifacts.assert_called_once_with(["former-terminal"])
         complete.assert_called_once_with("session-lifetime-1", "cao-test")
@@ -400,15 +429,24 @@ class TestDeleteSession:
         with (
             patch(
                 "cli_agent_orchestrator.services.session_service.get_writable_work_context_by_session",
-                return_value={"id": "context-1", "state": "retired"},
+                return_value={
+                    "id": "context-1",
+                    "session_id": "session-lifetime-1",
+                    "state": "retired",
+                },
             ),
             patch(
-                "cli_agent_orchestrator.services.managed_worktree_service.managed_worktree_status",
+                "cli_agent_orchestrator.services.session_service."
+                "capture_session_worktree_retirement_authority",
                 return_value={
-                    "managed": True,
-                    "safe": False,
-                    "absent": True,
-                    "reason_code": "TASK_WORKTREE_BRANCH_MISSING",
+                    "safe": True,
+                    "authority": {
+                        "version": 1,
+                        "worktrees": [{"terminal_id": "terminal1", "present": False}],
+                    },
+                    "authority_sha256": "1" * 64,
+                    "modified_files": 0,
+                    "untracked_files": 0,
                 },
             ),
             patch(
@@ -440,14 +478,22 @@ class TestDeleteSession:
         with (
             patch(
                 "cli_agent_orchestrator.services.session_service.get_writable_work_context_by_session",
-                return_value={"id": "context-1", "state": "retired"},
+                return_value={
+                    "id": "context-1",
+                    "session_id": "session-lifetime-1",
+                    "state": "retired",
+                },
             ),
             patch(
-                "cli_agent_orchestrator.services.managed_worktree_service.managed_worktree_status",
+                "cli_agent_orchestrator.services.session_service."
+                "capture_session_worktree_retirement_authority",
                 return_value={
-                    "managed": True,
                     "safe": True,
-                    "absent": False,
+                    "authority": {
+                        "version": 1,
+                        "worktrees": [{"terminal_id": "terminal1", "present": True}],
+                    },
+                    "authority_sha256": "2" * 64,
                     "modified_files": 0,
                     "untracked_files": 0,
                 },
@@ -603,7 +649,11 @@ class TestDeleteSession:
             ),
             patch(
                 "cli_agent_orchestrator.services.session_service.get_writable_work_context_by_session",
-                return_value={"id": "context-1", "state": "retired"},
+                return_value={
+                    "id": "context-1",
+                    "session_id": "session-lifetime-1",
+                    "state": "retired",
+                },
             ),
             patch(
                 "cli_agent_orchestrator.services.session_service.claim_session_workspace_retirement"
@@ -637,13 +687,12 @@ class TestDeleteSession:
         cancel.assert_not_called()
         claim.assert_not_called()
         snapshot.assert_not_called()
-        assert cleanup.call_count == 2
-        for terminal in durable["terminals"]:
-            cleanup.assert_any_call(
-                terminal,
-                allow_dirty=False,
-                require_already_absent=True,
-            )
+        cleanup.assert_called_once_with(
+            durable["terminals"],
+            ANY,
+            allow_dirty=False,
+            require_already_absent=True,
+        )
         artifacts.assert_called_once_with(["terminal1", "terminal2"])
         assert result["terminal_artifacts"]["runtime_artifacts_absent"] is True
         complete.assert_called_once_with("session-lifetime-1", "cao-test")
@@ -757,6 +806,9 @@ class TestDeleteSession:
             "cancellable": True,
             "can_resolve_and_delete": True,
             "plan_token": "a" * 64,
+            "_unresolved_plan_token": "u" * 64,
+            "_workspace_authority": {"version": 1, "worktrees": []},
+            "_workspace_authority_sha256": "4" * 64,
             "requires_dirty_confirmation": False,
             "reason_code": "QUEUED_WORK",
         }
@@ -766,6 +818,8 @@ class TestDeleteSession:
             "cancellable": False,
             "can_resolve_and_delete": False,
             "plan_token": None,
+            "_workspace_authority": {"version": 1, "worktrees": []},
+            "_workspace_authority_sha256": "4" * 64,
             "requires_dirty_confirmation": False,
             "reason_code": None,
         }
@@ -801,7 +855,7 @@ class TestDeleteSession:
         assert preflight.call_count == 2
         cancel_work.assert_called_once_with(
             "session-lifetime-1",
-            expected_plan_token="a" * 64,
+            expected_plan_token="u" * 64,
             expected_terminal_ids=["terminal1", "terminal2"],
             cancel_unresolved_work=True,
             retire_historical_indeterminate=False,
@@ -823,6 +877,9 @@ class TestDeleteSession:
             "cancellable": False,
             "requires_historical_indeterminate_confirmation": True,
             "plan_token": "r" * 64,
+            "_unresolved_plan_token": "v" * 64,
+            "_workspace_authority": {"version": 1, "worktrees": []},
+            "_workspace_authority_sha256": "5" * 64,
             "requires_dirty_confirmation": False,
             "reason_code": "HISTORICAL_EFFECT_OUTCOME_UNKNOWN",
         }
@@ -832,6 +889,8 @@ class TestDeleteSession:
             "can_resolve_and_delete": False,
             "cancellable": False,
             "plan_token": None,
+            "_workspace_authority": {"version": 1, "worktrees": []},
+            "_workspace_authority_sha256": "5" * 64,
             "requires_dirty_confirmation": False,
             "reason_code": None,
         }
@@ -867,7 +926,7 @@ class TestDeleteSession:
         assert result["deleted"] == ["cao-test"]
         resolve_work.assert_called_once_with(
             "session-lifetime-1",
-            expected_plan_token="r" * 64,
+            expected_plan_token="v" * 64,
             expected_terminal_ids=["terminal1", "terminal2"],
             cancel_unresolved_work=False,
             retire_historical_indeterminate=True,
@@ -942,6 +1001,16 @@ class TestDeleteSession:
                     "modified_files": 1,
                     "untracked_files": 1,
                     "reason_code": None,
+                    "_workspace_authority": {
+                        "version": 1,
+                        "work_context": {
+                            "id": "context-1",
+                            "session_id": "session-lifetime-1",
+                            "state": "admitted",
+                        },
+                        "worktrees": [],
+                    },
+                    "_workspace_authority_sha256": "3" * 64,
                 },
             ),
             patch(
@@ -957,7 +1026,11 @@ class TestDeleteSession:
             ) as claim,
             patch(
                 "cli_agent_orchestrator.services.session_service.get_writable_work_context_by_session",
-                return_value={"id": "context-1", "state": "admitted"},
+                return_value={
+                    "id": "context-1",
+                    "session_id": "session-lifetime-1",
+                    "state": "admitted",
+                },
             ),
             patch(
                 "cli_agent_orchestrator.services.session_service.transition_writable_work_context",
@@ -975,13 +1048,20 @@ class TestDeleteSession:
         assert result["deleted"] == ["cao-test"]
         assert result["retained_resources"] == []
         claim.assert_called_once_with("context-1", "exact-session-workspace", allow_dirty=True)
-        assert cleanup.call_count == 2
-        for terminal in durable["terminals"]:
-            cleanup.assert_any_call(
-                terminal,
-                allow_dirty=True,
-                require_already_absent=False,
-            )
+        cleanup.assert_called_once_with(
+            durable["terminals"],
+            {
+                "version": 1,
+                "work_context": {
+                    "id": "context-1",
+                    "session_id": "session-lifetime-1",
+                    "state": "admitted",
+                },
+                "worktrees": [],
+            },
+            allow_dirty=True,
+            require_already_absent=False,
+        )
         delete.assert_called_once_with("session-lifetime-1", "cao-test")
 
     @patch("cli_agent_orchestrator.services.session_service.resolve_session_lifetime")

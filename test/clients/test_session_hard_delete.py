@@ -104,6 +104,15 @@ def _fence_and_mark(
         allow_dirty_workspace=False,
     )
     assert started["started"] is True
+    database.bind_session_hard_deletion_workspace_authority(
+        session_id,
+        session_name,
+        workspace_authority=_unmanaged_workspace_authority(
+            started.get("terminal_ids", terminal_ids),
+            session_id=session_id,
+            work_context=_current_context_authority(session_id),
+        ),
+    )
     marked = database.mark_session_hard_deletion_workspace_retired(
         session_id,
         workspace_evidence=[
@@ -120,6 +129,123 @@ def _fence_and_mark(
     )
     assert marked["marked"] is True
     return started
+
+
+def _unmanaged_workspace_authority(
+    terminal_ids: tuple[str, ...] | list[str],
+    *,
+    session_id: str = "session",
+    work_context=None,
+):
+    return {
+        "version": 1,
+        "work_context": work_context,
+        "worktrees": [
+            {
+                "version": 1,
+                "terminal_id": terminal_id,
+                "session_id": session_id,
+                "managed": False,
+            }
+            for terminal_id in sorted(terminal_ids)
+        ],
+    }
+
+
+def _current_context_authority(session_id: str):
+    context = database.get_writable_work_context_by_session(session_id)
+    if context is None:
+        return None
+    return {
+        key: context.get(key)
+        for key in (
+            "id",
+            "session_id",
+            "terminal_id",
+            "project_id",
+            "canonical_source",
+            "canonical_worktree",
+            "branch",
+            "base_revision",
+            "state",
+            "writer_authority_generation",
+            "retirement_allow_dirty",
+            "retirement_authority_fingerprint",
+        )
+    }
+
+
+def _managed_supervisor_deletion_fixture(monkeypatch, tmp_path):
+    _install_database(monkeypatch)
+    repository = tmp_path / "source"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.name", "ThreadCells Test")
+    _git(repository, "config", "user.email", "threadcells@example.invalid")
+    (repository / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+    _git(repository, "add", "tracked.txt")
+    _git(repository, "commit", "-qm", "baseline")
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    managed = managed_worktree_service.create_managed_worktree(
+        str(repository), "context", "supervisor"
+    )
+    assert managed is not None and managed.branch is not None
+    owner = _terminal("owner")
+    owner.project_id = "project"
+    owner.launch_worktree = managed.path
+    owner.writer_authority_generation = "writer-generation"
+    owner.managed_worktree_kind = managed.kind
+    owner.managed_worktree_source = managed.source
+    owner.managed_worktree_branch = managed.branch
+    owner.managed_worktree_commit = managed.commit
+    owner.writable_work_context_id = "context"
+    with database.SessionLocal() as db:
+        db.add(owner)
+        db.add(
+            ProjectModel(
+                id="project",
+                name="Project",
+                normalized_name="project",
+                path=str(repository),
+                normalized_path=str(repository),
+                is_default=True,
+            )
+        )
+        db.add(
+            WritableWorkContextModel(
+                id="context",
+                request_id="request",
+                project_id="project",
+                session_id="session",
+                terminal_id="owner",
+                canonical_source=managed.source,
+                canonical_worktree=managed.path,
+                branch=managed.branch,
+                base_revision=managed.commit,
+                state="admitted",
+                writer_authority_generation="writer-generation",
+            )
+        )
+        db.commit()
+    metadata = {
+        **managed.as_dict(),
+        "id": "owner",
+        "session_id": "session",
+        "project_id": "project",
+        "launch_worktree": managed.path,
+        "managed_worktree_kind": managed.kind,
+        "managed_worktree_source": managed.source,
+        "managed_worktree_branch": managed.branch,
+        "managed_worktree_commit": managed.commit,
+        "writer_authority_generation": "writer-generation",
+        "writable_work_context_id": "context",
+    }
+    captured = managed_worktree_service.capture_session_worktree_retirement_authority(
+        [metadata], session_id="session"
+    )
+    assert captured["safe"] is True
+    captured["authority"]["work_context"] = _current_context_authority("session")
+    return managed, captured["authority"]
 
 
 def _git(repository: Path, *args: str) -> str:
@@ -227,6 +353,11 @@ def test_individually_retired_private_branch_is_receipted_then_session_purged(
     assert started["started"] is True
     assert started["terminal_ids"] == []
     assert started["graph_terminal_ids"] == ["owner", "retired-child"]
+    assert database.bind_session_hard_deletion_workspace_authority(
+        "session",
+        "cao-session",
+        workspace_authority=_unmanaged_workspace_authority([]),
+    )["bound"]
     cleanup_authorities = database.list_session_historical_terminal_cleanup_authorities("session")
     child_cleanup_authority = next(
         authority
@@ -906,6 +1037,11 @@ def test_inflight_non_authority_history_commits_before_purge_and_is_removed(monk
         expected_terminal_ids=["owner"],
         allow_dirty_workspace=False,
     )
+    assert database.bind_session_hard_deletion_workspace_authority(
+        "session",
+        "cao-session",
+        workspace_authority=_unmanaged_workspace_authority(["owner"]),
+    )["bound"]
     with database.SessionLocal() as db:
         db.add(
             UsageRecordModel(
@@ -1195,6 +1331,11 @@ def test_deleted_or_fenced_lifetime_cannot_register_a_replacement_terminal(monke
         expected_terminal_ids=["owner"],
         allow_dirty_workspace=False,
     )
+    assert database.bind_session_hard_deletion_workspace_authority(
+        "session",
+        "cao-session",
+        workspace_authority=_unmanaged_workspace_authority(["owner"]),
+    )["bound"]
     assert database.queue_workflow_input_for_provider("owner", 1, "late") is False
     assert database.queue_workflow_turn("owner", "external_input", "late") == (None, True)
     assert database.claim_workflow_effect("owner", 1, "send_message", "late") is None
@@ -1312,6 +1453,11 @@ def test_crash_retry_and_concurrent_completion_converge_to_one_tombstone(monkeyp
     )
     assert first["started"] is True
     assert resumed["started"] is True and resumed["already_started"] is True
+    assert database.bind_session_hard_deletion_workspace_authority(
+        "session",
+        "cao-session",
+        workspace_authority=_unmanaged_workspace_authority(list(terminal_ids)),
+    )["bound"]
 
     evidence = [
         {
@@ -1348,6 +1494,185 @@ def test_crash_retry_and_concurrent_completion_converge_to_one_tombstone(monkeyp
         assert db.query(TerminalDeletionReceiptModel).count() == 0
         assert db.query(SessionDeletionOperationModel).count() == 0
         assert db.query(TerminalModel).count() == 0
+
+
+def test_workspace_authority_is_bound_once_and_required_before_cleanup_mark(monkeypatch):
+    _install_database(monkeypatch)
+    with database.SessionLocal() as db:
+        db.add(_terminal("owner"))
+        db.commit()
+    database.begin_session_hard_deletion(
+        "session",
+        "cao-session",
+        expected_terminal_ids=["owner"],
+        allow_dirty_workspace=False,
+    )
+    evidence = [
+        {
+            "terminal_id": "owner",
+            "managed": False,
+            "path_absent": True,
+            "git_unregistered": True,
+            "branch_absent": True,
+            "runtime_artifacts_absent": True,
+        }
+    ]
+    assert database.mark_session_hard_deletion_workspace_retired(
+        "session", workspace_evidence=evidence
+    ) == {"marked": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
+
+    authority = _unmanaged_workspace_authority(["owner"])
+    first = database.bind_session_hard_deletion_workspace_authority(
+        "session", "cao-session", workspace_authority=authority
+    )
+    replay = database.bind_session_hard_deletion_workspace_authority(
+        "session", "cao-session", workspace_authority=authority
+    )
+    changed = _unmanaged_workspace_authority(["owner"])
+    changed["worktrees"][0]["session_id"] = "changed-session"
+    rejected = database.bind_session_hard_deletion_workspace_authority(
+        "session", "cao-session", workspace_authority=changed
+    )
+
+    assert first["bound"] is True
+    assert replay["bound"] is True and replay["already_bound"] is True
+    assert rejected == {
+        "bound": False,
+        "reason_code": "WORKSPACE_AUTHORITY_CHANGED",
+    }
+    operation = database.get_session_hard_deletion_operation("session")
+    assert operation["workspace_authority"] == authority
+    assert len(operation["workspace_authority_sha256"]) == 64
+    assert database.mark_session_hard_deletion_workspace_retired(
+        "session", workspace_evidence=evidence
+    )["marked"]
+
+
+def test_workspace_authority_rejects_terminal_context_relational_mismatch(monkeypatch, tmp_path):
+    _managed, authority = _managed_supervisor_deletion_fixture(monkeypatch, tmp_path)
+    with database.SessionLocal() as db:
+        owner = db.get(TerminalModel, "owner")
+        owner.project_id = "different-project"
+        db.commit()
+    authority["worktrees"][0]["project_id"] = "different-project"
+    assert database.begin_session_hard_deletion(
+        "session",
+        "cao-session",
+        expected_terminal_ids=["owner"],
+        allow_dirty_workspace=False,
+    )["started"]
+
+    assert database.bind_session_hard_deletion_workspace_authority(
+        "session", "cao-session", workspace_authority=authority
+    ) == {
+        "bound": False,
+        "reason_code": "WORKSPACE_AUTHORITY_CHANGED",
+    }
+
+
+def test_workspace_authority_revalidation_rejects_late_foreign_terminal_target_owner(
+    monkeypatch, tmp_path
+):
+    managed, authority = _managed_supervisor_deletion_fixture(monkeypatch, tmp_path)
+    assert database.begin_session_hard_deletion(
+        "session",
+        "cao-session",
+        expected_terminal_ids=["owner"],
+        allow_dirty_workspace=False,
+    )["started"]
+    assert database.bind_session_hard_deletion_workspace_authority(
+        "session", "cao-session", workspace_authority=authority
+    )["bound"]
+    foreign = _terminal(
+        "foreign-owner",
+        session_id="foreign-session",
+        session_name="cao-foreign",
+    )
+    foreign.launch_worktree = managed.path
+    foreign.managed_worktree_kind = "supervisor"
+    foreign.managed_worktree_source = managed.source
+    foreign.managed_worktree_branch = managed.branch
+    foreign.managed_worktree_commit = managed.commit
+    with database.SessionLocal() as db:
+        db.add(foreign)
+        db.commit()
+
+    assert database.revalidate_session_hard_deletion("session", "cao-session") == {
+        "valid": False,
+        "reason_code": "WORKSPACE_FOREIGN_OWNER",
+    }
+
+
+def test_workspace_authority_rejects_foreign_writer_on_target_path(monkeypatch, tmp_path):
+    managed, authority = _managed_supervisor_deletion_fixture(monkeypatch, tmp_path)
+    assert database.begin_session_hard_deletion(
+        "session",
+        "cao-session",
+        expected_terminal_ids=["owner"],
+        allow_dirty_workspace=False,
+    )["started"]
+    with database.SessionLocal() as db:
+        db.add(
+            WorktreeWriterLeaseModel(
+                canonical_worktree=managed.path,
+                terminal_id="foreign-writer",
+                authority_generation="foreign-generation",
+            )
+        )
+        db.commit()
+
+    assert database.bind_session_hard_deletion_workspace_authority(
+        "session", "cao-session", workspace_authority=authority
+    ) == {
+        "bound": False,
+        "reason_code": "WRITER_LEASE_ACTIVE",
+    }
+
+
+def test_workspace_context_change_after_preflight_cannot_be_bound(monkeypatch):
+    _install_database(monkeypatch)
+    with database.SessionLocal() as db:
+        db.add(_terminal("owner"))
+        db.add(
+            WritableWorkContextModel(
+                id="context",
+                request_id="request",
+                project_id="project",
+                session_id="session",
+                terminal_id="owner",
+                canonical_source="/source/project",
+                canonical_worktree="/work/session",
+                branch="cao/session/owner",
+                base_revision="f" * 40,
+                state="admitted",
+                writer_authority_generation="writer-generation",
+            )
+        )
+        db.commit()
+    authority = _unmanaged_workspace_authority(
+        ["owner"],
+        work_context=_current_context_authority("session"),
+    )
+    assert database.begin_session_hard_deletion(
+        "session",
+        "cao-session",
+        expected_terminal_ids=["owner"],
+        allow_dirty_workspace=False,
+    )["started"]
+    with database.SessionLocal() as db:
+        context = db.get(WritableWorkContextModel, "context")
+        context.state = "retiring"
+        context.retirement_authority_fingerprint = "a" * 64
+        db.commit()
+
+    assert database.bind_session_hard_deletion_workspace_authority(
+        "session",
+        "cao-session",
+        workspace_authority=authority,
+    ) == {
+        "bound": False,
+        "reason_code": "WRITABLE_WORKTREE_AUTHORITY_CHANGED",
+    }
 
 
 def test_hard_delete_resumes_the_durable_dirty_workspace_retirement_decision(monkeypatch):
@@ -1873,6 +2198,6 @@ def test_hard_purge_sql_shape_is_fixed_with_one_session_tombstone(
 
     one = run(1)
     fifty = run(50)
-    assert one[:2] == fifty[:2] == (96, 69)
+    assert one[:2] == fifty[:2] == (98, 71)
     assert one[2] == 0
     assert fifty[2] == 1

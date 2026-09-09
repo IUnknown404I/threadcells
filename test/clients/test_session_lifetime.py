@@ -152,6 +152,12 @@ def test_existing_receipt_schema_adds_replayable_retained_resources(monkeypatch)
             "SELECT COUNT(*) FROM sqlite_master "
             "WHERE type = 'table' AND name = 'session_deletion_operations'"
         ).scalar_one()
+        operation_columns = {
+            row[1]
+            for row in connection.exec_driver_sql(
+                "PRAGMA table_info(session_deletion_operations)"
+            ).fetchall()
+        }
     assert {
         "retained_resources_json",
         "deletion_reason",
@@ -160,6 +166,10 @@ def test_existing_receipt_schema_adds_replayable_retained_resources(monkeypatch)
         "receipt_version",
     }.issubset(columns)
     assert operation_tables == 1
+    assert {
+        "workspace_authority_json",
+        "workspace_authority_sha256",
+    }.issubset(operation_columns)
     with database.SessionLocal() as db:
         receipt = db.get(SessionDeletionReceiptModel, "legacy-receipt")
         assert receipt.receipt_version == 1
@@ -171,6 +181,37 @@ def test_existing_receipt_schema_adds_replayable_retained_resources(monkeypatch)
     with database.SessionLocal() as db:
         receipt = db.get(SessionDeletionReceiptModel, "legacy-receipt")
         assert receipt.receipt_version == 1
+
+
+def test_existing_deletion_operation_schema_adds_current_workspace_authority(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    SessionDeletionOperationModel.__table__.drop(bind=engine)
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE session_deletion_operations ("
+            "session_id VARCHAR PRIMARY KEY, session_name VARCHAR NOT NULL, "
+            "state VARCHAR NOT NULL, terminal_ids_json TEXT NOT NULL, "
+            "allow_dirty_workspace BOOLEAN NOT NULL, "
+            "authority_fingerprint VARCHAR NOT NULL, "
+            "workspace_evidence_sha256 VARCHAR, created_at DATETIME NOT NULL, "
+            "updated_at DATETIME NOT NULL)"
+        )
+    monkeypatch.setattr(database, "engine", engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=engine))
+    monkeypatch.setattr(database, "_ensure_terminal_worktree_authority_schema", lambda: None)
+    monkeypatch.setattr(database, "_ensure_usage_schema", lambda: None)
+
+    database._ensure_session_deletion_receipt_schema()
+
+    with engine.connect() as connection:
+        columns = {
+            row[1]
+            for row in connection.exec_driver_sql(
+                "PRAGMA table_info(session_deletion_operations)"
+            ).fetchall()
+        }
+    assert {"workspace_authority_json", "workspace_authority_sha256"}.issubset(columns)
 
 
 def test_existing_terminal_receipt_schema_adds_digest_only_late_callback_fence(monkeypatch):

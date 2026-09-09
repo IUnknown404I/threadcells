@@ -19,14 +19,17 @@ Session Lifecycle:
 3. delete_session() removes the entire session and all contained terminals
 """
 
+import hashlib
+import json
 import logging
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Any, Dict, List
 
 from cli_agent_orchestrator.clients.database import (
     AmbiguousSessionIdentity,
     SessionLifetimeAuthorityError,
     begin_session_hard_deletion,
+    bind_session_hard_deletion_workspace_authority,
     cancel_session_work_for_deletion,
     cancel_workflows_for_terminal,
     claim_session_workspace_retirement,
@@ -51,7 +54,11 @@ from cli_agent_orchestrator.plugins import (
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.housekeeping_service import housekeeping_mutation_fence
-from cli_agent_orchestrator.services.managed_worktree_service import purge_managed_worktree
+from cli_agent_orchestrator.services.managed_worktree_service import (
+    capture_session_worktree_retirement_authority,
+    purge_managed_worktree,
+    purge_session_managed_worktrees,
+)
 from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_event
 from cli_agent_orchestrator.services.terminal_artifact_service import (
     TerminalArtifactCleanupError,
@@ -65,6 +72,7 @@ from cli_agent_orchestrator.services.terminal_service import (
 )
 
 logger = logging.getLogger(__name__)
+_WORKSPACE_CONTEXT_NOT_LOADED = object()
 
 
 class SessionNotFoundError(ValueError):
@@ -255,7 +263,106 @@ def get_session_root_working_directory(session_name: str) -> str | None:
     return tmux_client.get_session_root_working_directory(authority.session_name)
 
 
-def _session_deletion_preflight(authority: SessionAuthority) -> Dict[str, object]:
+def _capture_session_workspace_retirement_authority(
+    authority: SessionAuthority,
+    *,
+    context: Dict[str, Any] | None | object = _WORKSPACE_CONTEXT_NOT_LOADED,
+) -> Dict[str, Any]:
+    """Bind current Git state to the exact durable writable-context state."""
+    captured = capture_session_worktree_retirement_authority(
+        authority.terminals,
+        session_id=authority.session_id,
+    )
+    if not captured.get("safe"):
+        return captured
+    if context is _WORKSPACE_CONTEXT_NOT_LOADED:
+        context = get_writable_work_context_by_session(authority.session_id)
+    context_authority = None
+    if context is not None:
+        if not isinstance(context, dict):
+            return {"safe": False, "reason_code": "WORKSPACE_AUTHORITY_CHANGED"}
+        if context.get("session_id") != authority.session_id:
+            return {"safe": False, "reason_code": "WORKSPACE_AUTHORITY_CHANGED"}
+        context_authority = {
+            key: context.get(key)
+            for key in (
+                "id",
+                "session_id",
+                "terminal_id",
+                "project_id",
+                "canonical_source",
+                "canonical_worktree",
+                "branch",
+                "base_revision",
+                "state",
+                "writer_authority_generation",
+                "retirement_allow_dirty",
+                "retirement_authority_fingerprint",
+            )
+        }
+    current_authority = {
+        **dict(captured["authority"]),
+        "work_context": context_authority,
+    }
+    encoded = json.dumps(current_authority, sort_keys=True, separators=(",", ":"))
+    return {
+        **captured,
+        "authority": current_authority,
+        "authority_sha256": hashlib.sha256(encoded.encode()).hexdigest(),
+    }
+
+
+def _workspace_context_matches_retirement_progress(
+    expected: object,
+    current: Dict[str, Any] | None,
+) -> bool:
+    """Accept only exact context authority or this delete's forward progress."""
+    if expected is None:
+        return current is None
+    if not isinstance(expected, dict) or current is None:
+        return False
+    immutable_keys = {
+        "id",
+        "session_id",
+        "terminal_id",
+        "project_id",
+        "canonical_source",
+        "canonical_worktree",
+        "branch",
+        "base_revision",
+        "writer_authority_generation",
+    }
+    if any(expected.get(key) != current.get(key) for key in immutable_keys):
+        return False
+    expected_state = expected.get("state")
+    current_state = current.get("state")
+    allowed_progress = {
+        "admitted": {"admitted", "retiring", "retired"},
+        "retiring": {"retiring", "retired"},
+        "retired": {"retired"},
+    }
+    if current_state not in allowed_progress.get(str(expected_state), set()):
+        return False
+    if current_state == expected_state:
+        return all(
+            expected.get(key) == current.get(key)
+            for key in ("retirement_allow_dirty", "retirement_authority_fingerprint")
+        )
+    return bool(
+        current_state == "retired"
+        or (
+            current_state == "retiring"
+            and isinstance(current.get("retirement_authority_fingerprint"), str)
+            and current.get("retirement_authority_fingerprint")
+        )
+    )
+
+
+def _session_deletion_preflight(
+    authority: SessionAuthority,
+    *,
+    include_workspace_authority: bool = False,
+) -> Dict[str, object]:
     """Inspect destructive Session deletion without changing durable state."""
     empty_plan: Dict[str, object] = {
         "eligible": True,
@@ -354,39 +461,39 @@ def _session_deletion_preflight(authority: SessionAuthority) -> Dict[str, object
 
     modified_files = 0
     untracked_files = 0
+    workspace_capture: dict[str, Any] | None = None
     if not unsafe_blockers:
-        from cli_agent_orchestrator.services.managed_worktree_service import (
-            managed_worktree_status,
+        captured = _capture_session_workspace_retirement_authority(
+            authority,
+            context=context,
         )
-
-        for terminal in authority.terminals:
-            if not terminal.get("managed_worktree_kind"):
-                continue
-            worktree = managed_worktree_status(terminal)
+        workspace_capture = dict(captured)
+        if not captured.get("safe"):
+            add_unsafe(
+                "workspace_authority",
+                str(captured.get("reason_code") or "MANAGED_WORKTREE_UNVERIFIED"),
+            )
+        else:
             context_retired = bool(context and context.get("state") == "retired")
-            if context_retired and not worktree.get("absent"):
+            worktrees = captured["authority"]["worktrees"]
+            if context_retired and any(item.get("present") for item in worktrees):
                 add_unsafe(
                     "workspace_authority",
                     "WORKSPACE_RETIREMENT_STATE_CONFLICT",
                 )
-                break
-            if (
-                context_retired
-                and worktree.get("absent")
-                and worktree.get("reason_code") == "TASK_WORKTREE_BRANCH_MISSING"
+            elif not context_retired and any(
+                item.get("managed") and not item.get("present") for item in worktrees
             ):
-                # A Session-level retired context plus an absent, unregistered
-                # worktree is authoritative cleanup evidence.  A missing
-                # private branch means that cleanup advanced even further.
-                continue
-            if not worktree.get("safe"):
+                # Before a durable deletion/retirement fence exists, an absent
+                # launch path could be a moved registration or external loss.
+                # Only the retired context (or an already-fenced retry, which
+                # bypasses fresh preflight) makes that absence authoritative.
                 add_unsafe(
                     "workspace_authority",
-                    str(worktree.get("reason_code") or "MANAGED_WORKTREE_UNVERIFIED"),
+                    "WORKSPACE_RETIREMENT_STATE_CONFLICT",
                 )
-                break
-            modified_files += int(worktree.get("modified_files") or 0)
-            untracked_files += int(worktree.get("untracked_files") or 0)
+            modified_files = int(captured.get("modified_files") or 0)
+            untracked_files = int(captured.get("untracked_files") or 0)
     unsafe_blockers = [item for item in blockers if item["disposition"] == "unsafe"]
     cancellable_blockers = [item for item in blockers if item["disposition"] == "cancellable"]
     retirement_blockers = [
@@ -439,14 +546,33 @@ def _session_deletion_preflight(authority: SessionAuthority) -> Dict[str, object
     active_execution_count = sum(
         int(item["count"]) for item in unsafe_blockers if item["category"] == "provider_execution"
     )
-    return {
+    workspace_authority_sha256 = (
+        str(workspace_capture["authority_sha256"])
+        if workspace_capture is not None and workspace_capture.get("safe")
+        else None
+    )
+    deletion_plan_token = None
+    if workspace_authority_sha256 is not None and (eligible or can_resolve_and_delete):
+        deletion_plan_token = hashlib.sha256(
+            json.dumps(
+                {
+                    "version": 1,
+                    "session_id": authority.session_id,
+                    "unresolved_plan_token": plan.get("plan_token"),
+                    "workspace_authority_sha256": workspace_authority_sha256,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+    result = {
         "eligible": eligible,
         "deletion_mode": deletion_mode,
         "cancellable": cancellable,
         "can_resolve_and_delete": can_resolve_and_delete,
         "requires_cancellation_confirmation": (bool(cancellable_blockers) and not unsafe_blockers),
         "requires_historical_indeterminate_confirmation": retirement_available,
-        "plan_token": plan.get("plan_token") if can_resolve_and_delete else None,
+        "plan_token": deletion_plan_token,
         "blockers": blockers,
         "cancellable_count": sum(int(item["count"]) for item in cancellable_blockers),
         "historical_indeterminate_count": sum(int(item["count"]) for item in retirement_blockers),
@@ -474,6 +600,11 @@ def _session_deletion_preflight(authority: SessionAuthority) -> Dict[str, object
         "active_runtime_count": active_runtime_count,
         "active_execution_count": active_execution_count,
     }
+    if include_workspace_authority and workspace_capture is not None:
+        result["_workspace_authority"] = workspace_capture.get("authority")
+        result["_workspace_authority_sha256"] = workspace_authority_sha256
+        result["_unresolved_plan_token"] = plan.get("plan_token")
+    return result
 
 
 def get_session_deletion_preflight(session_name: str) -> Dict[str, object]:
@@ -509,8 +640,17 @@ def delete_session(
             terminal_ids = [str(terminal["id"]) for terminal in terminals]
             operation = get_session_hard_deletion_operation(authority.session_id)
             deletion: Dict | None = None
+            planned_workspace_authority: dict[str, Any] | None = None
             if operation is None:
-                preflight = _session_deletion_preflight(authority)
+                preflight = _session_deletion_preflight(authority, include_workspace_authority=True)
+                if cancellation_plan_token is not None and cancellation_plan_token != (
+                    preflight.get("plan_token")
+                ):
+                    raise SessionLifecycleError(
+                        "SESSION_DELETE_PLAN_CHANGED",
+                        "Session deletion authority changed; inspect and confirm again",
+                    )
+                confirmed_workspace_sha256 = preflight.get("_workspace_authority_sha256")
                 if not preflight["eligible"]:
                     resolution_requested = cancel_unresolved_work or retire_historical_indeterminate
                     if resolution_requested:
@@ -525,7 +665,7 @@ def delete_session(
                             )
                         cancellation = cancel_session_work_for_deletion(
                             authority.session_id,
-                            expected_plan_token=cancellation_plan_token,
+                            expected_plan_token=str(preflight.get("_unresolved_plan_token") or ""),
                             expected_terminal_ids=terminal_ids,
                             cancel_unresolved_work=cancel_unresolved_work,
                             retire_historical_indeterminate=retire_historical_indeterminate,
@@ -538,7 +678,16 @@ def delete_session(
                                 ),
                                 "Session-owned work could not be resolved safely",
                             )
-                        preflight = _session_deletion_preflight(authority)
+                        preflight = _session_deletion_preflight(
+                            authority, include_workspace_authority=True
+                        )
+                        if confirmed_workspace_sha256 != preflight.get(
+                            "_workspace_authority_sha256"
+                        ):
+                            raise SessionLifecycleError(
+                                "WRITABLE_WORKTREE_AUTHORITY_CHANGED",
+                                "Workspace authority changed after deletion confirmation",
+                            )
                         if not preflight["eligible"]:
                             raise SessionLifecycleError(
                                 str(
@@ -563,6 +712,13 @@ def delete_session(
                             reason,
                             "Session authority is still active; deletion is blocked",
                         )
+                workspace_authority = preflight.get("_workspace_authority")
+                if not isinstance(workspace_authority, dict):
+                    raise SessionLifecycleError(
+                        "WORKSPACE_AUTHORITY_CHANGED",
+                        "Current workspace authority could not be captured",
+                    )
+                planned_workspace_authority = workspace_authority
                 if preflight["requires_dirty_confirmation"] and not confirm_dirty_workspace:
                     raise SessionLifecycleError(
                         "SESSION_DIRTY_CONFIRMATION_REQUIRED",
@@ -640,6 +796,50 @@ def delete_session(
                 historical_terminal_cleanup = list_session_historical_terminal_cleanup_authorities(
                     authority.session_id
                 )
+                if operation.get("workspace_authority") is None:
+                    if planned_workspace_authority is None:
+                        captured = _capture_session_workspace_retirement_authority(authority)
+                        if not captured.get("safe"):
+                            raise SessionLifecycleError(
+                                str(
+                                    captured.get("reason_code")
+                                    or "WRITABLE_WORKTREE_AUTHORITY_CHANGED"
+                                ),
+                                "Current workspace authority could not be captured",
+                            )
+                        if (
+                            int(captured.get("modified_files") or 0)
+                            or int(captured.get("untracked_files") or 0)
+                        ) and not bool(operation["allow_dirty_workspace"]):
+                            raise SessionLifecycleError(
+                                "SESSION_DIRTY_CONFIRMATION_REQUIRED",
+                                "Uncommitted workspace changes require explicit confirmation",
+                            )
+                        planned_workspace_authority = captured["authority"]
+                    if planned_workspace_authority is None:
+                        raise SessionLifecycleError(
+                            "WORKSPACE_CLEANUP_UNPROVEN",
+                            "Current workspace authority could not be bound",
+                        )
+                    bound = bind_session_hard_deletion_workspace_authority(
+                        authority.session_id,
+                        authority.session_name,
+                        workspace_authority=planned_workspace_authority,
+                    )
+                    if not bound.get("bound"):
+                        raise SessionLifecycleError(
+                            str(bound.get("reason_code") or "WRITABLE_WORKTREE_AUTHORITY_CHANGED"),
+                            "Current workspace authority changed before cleanup",
+                        )
+                    # The binding transaction has already normalized, hashed,
+                    # and durably committed this exact document.  Carry that
+                    # admitted authority through the current request; later
+                    # retries read the same document from the operation row.
+                    operation = dict(operation)
+                    operation["workspace_authority"] = planned_workspace_authority
+                    operation["workspace_authority_sha256"] = bound.get(
+                        "workspace_authority_sha256"
+                    )
             else:
                 graph_terminal_ids = terminal_ids
                 historical_terminal_cleanup = []
@@ -657,10 +857,32 @@ def delete_session(
             if operation is not None:
                 try:
                     with housekeeping_mutation_fence():
+                        destructive_revalidation = revalidate_session_hard_deletion(
+                            authority.session_id,
+                            authority.session_name,
+                        )
+                        if not destructive_revalidation.get("valid") or set(
+                            destructive_revalidation.get("terminal_ids", ())
+                        ) != set(terminal_ids):
+                            raise SessionLifecycleError(
+                                str(
+                                    destructive_revalidation.get("reason_code")
+                                    or "SESSION_DELETE_PLAN_CHANGED"
+                                ),
+                                "Session workspace authority changed before destructive cleanup",
+                            )
                         context = get_writable_work_context_by_session(authority.session_id)
                         context_already_retired = bool(
                             context and context.get("state") == "retired"
                         )
+                        if not _workspace_context_matches_retirement_progress(
+                            operation["workspace_authority"].get("work_context"),
+                            context,
+                        ):
+                            raise SessionLifecycleError(
+                                "WRITABLE_WORKTREE_AUTHORITY_CHANGED",
+                                "Writable workspace context changed during deletion",
+                            )
                         allow_dirty = bool(operation["allow_dirty_workspace"])
                         if context is not None and not context_already_retired:
                             snapshot = get_session_workspace_retirement_snapshot(str(context["id"]))
@@ -692,30 +914,20 @@ def delete_session(
                                     "Managed workspace authority changed during deletion",
                                 )
 
-                        workspace_evidence: list[dict[str, object]] = []
-                        for terminal in terminals:
-                            cleanup = purge_managed_worktree(
-                                terminal,
-                                allow_dirty=allow_dirty,
-                                require_already_absent=context_already_retired,
+                        cleanup = purge_session_managed_worktrees(
+                            terminals,
+                            operation["workspace_authority"],
+                            allow_dirty=allow_dirty,
+                            require_already_absent=context_already_retired,
+                        )
+                        if not cleanup.get("removed"):
+                            raise SessionLifecycleError(
+                                str(cleanup.get("reason_code") or "MANAGED_WORKTREE_UNVERIFIED"),
+                                "Managed worktree cleanup could not be proven",
                             )
-                            if not cleanup.get("removed") and cleanup.get("managed"):
-                                raise SessionLifecycleError(
-                                    str(
-                                        cleanup.get("reason_code") or "MANAGED_WORKTREE_UNVERIFIED"
-                                    ),
-                                    "Managed worktree cleanup could not be proven",
-                                )
-                            workspace_evidence.append(
-                                {
-                                    "terminal_id": str(terminal["id"]),
-                                    "managed": bool(cleanup.get("managed")),
-                                    "path_absent": bool(cleanup.get("path_absent", True)),
-                                    "git_unregistered": bool(cleanup.get("git_unregistered", True)),
-                                    "branch_absent": bool(cleanup.get("branch_absent", True)),
-                                    "runtime_artifacts_absent": True,
-                                }
-                            )
+                        workspace_evidence: list[dict[str, object]] = list(
+                            cleanup.get("evidence") or []
+                        )
                         artifact_cleanup = purge_session_terminal_artifacts(graph_terminal_ids)
                         if not artifact_cleanup.get("runtime_artifacts_absent"):
                             raise SessionLifecycleError(

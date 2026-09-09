@@ -224,6 +224,11 @@ class SessionDeletionOperationModel(Base):
     terminal_ids_json = Column(Text, nullable=False)
     allow_dirty_workspace = Column(Boolean, nullable=False, default=False, server_default=text("0"))
     authority_fingerprint = Column(String, nullable=False)
+    # Exact current (not launch-time) Git/worktree authority captured before
+    # the first destructive cleanup boundary. Legacy in-progress operations
+    # bind this once on their first safe retry.
+    workspace_authority_json = Column(Text, nullable=True)
+    workspace_authority_sha256 = Column(String, nullable=True)
     workspace_evidence_sha256 = Column(String, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.now)
     updated_at = Column(DateTime, nullable=False, default=datetime.now)
@@ -5892,6 +5897,22 @@ def _ensure_session_deletion_receipt_schema() -> None:
                     "ALTER TABLE session_deletion_receipts "
                     "ADD COLUMN receipt_version INTEGER NOT NULL DEFAULT 1"
                 )
+            operation_columns = {
+                row[1]
+                for row in connection.exec_driver_sql(
+                    "PRAGMA table_info(session_deletion_operations)"
+                ).fetchall()
+            }
+            if "workspace_authority_json" not in operation_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_operations "
+                    "ADD COLUMN workspace_authority_json TEXT"
+                )
+            if "workspace_authority_sha256" not in operation_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_operations "
+                    "ADD COLUMN workspace_authority_sha256 VARCHAR"
+                )
         _ensure_session_deleted_terminal_fence_backfill()
         _session_deletion_receipt_schema_engine_identity = engine_identity
         _session_deletion_receipt_schema_ready = True
@@ -6128,6 +6149,537 @@ def _hard_deleted_terminal_digest_exists_in_transaction(db: Any, token_digest: s
     return row is not None
 
 
+def _normalize_session_workspace_authority(
+    value: Mapping[str, Any],
+    *,
+    expected_session_id: str,
+    expected_terminal_ids: Sequence[str],
+) -> tuple[Dict[str, Any], str, str]:
+    """Validate and canonically encode one bounded current-workspace plan."""
+    if not isinstance(value, Mapping) or set(value) != {
+        "version",
+        "work_context",
+        "worktrees",
+    }:
+        raise ValueError("workspace authority is invalid")
+    worktrees = value.get("worktrees")
+    if (
+        value.get("version") != 1
+        or not isinstance(worktrees, list)
+        or len(worktrees) > (_SESSION_DELETION_PLAN_LIMIT)
+    ):
+        raise ValueError("workspace authority is invalid")
+    unmanaged_keys = {"version", "terminal_id", "session_id", "managed"}
+    managed_keys = unmanaged_keys | {
+        "project_id",
+        "kind",
+        "identity",
+        "source",
+        "source_identity",
+        "git_common_dir",
+        "git_common_dir_identity",
+        "path",
+        "present",
+        "registered",
+        "path_identity",
+        "git_dir",
+        "git_dir_identity",
+        "head",
+        "branch",
+        "head_ref",
+        "detached",
+        "clean",
+        "modified_files",
+        "untracked_files",
+        "content_fingerprint",
+        "writer_authority_generation",
+        "writable_work_context_id",
+        "owned_ref",
+        "owned_ref_object_id",
+    }
+    context_keys = {
+        "id",
+        "session_id",
+        "terminal_id",
+        "project_id",
+        "canonical_source",
+        "canonical_worktree",
+        "branch",
+        "base_revision",
+        "state",
+        "writer_authority_generation",
+        "retirement_allow_dirty",
+        "retirement_authority_fingerprint",
+    }
+    work_context = value.get("work_context")
+    if work_context is not None:
+        if not isinstance(work_context, Mapping) or set(work_context) != context_keys:
+            raise ValueError("workspace authority is invalid")
+        context = dict(work_context)
+        if (
+            context.get("session_id") != expected_session_id
+            or context.get("state") not in {"admitted", "retiring", "retired"}
+            or not isinstance(context.get("retirement_allow_dirty"), bool)
+            or any(
+                not isinstance(context.get(key), str) or not context.get(key)
+                for key in (
+                    "id",
+                    "terminal_id",
+                    "project_id",
+                    "canonical_source",
+                    "canonical_worktree",
+                    "branch",
+                    "base_revision",
+                )
+            )
+            or not Path(str(context["canonical_source"])).is_absolute()
+            or not Path(str(context["canonical_worktree"])).is_absolute()
+            or not (
+                context.get("writer_authority_generation") is None
+                or isinstance(context.get("writer_authority_generation"), str)
+            )
+            or not (
+                context.get("retirement_authority_fingerprint") is None
+                or (
+                    isinstance(context.get("retirement_authority_fingerprint"), str)
+                    and re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        str(context["retirement_authority_fingerprint"]),
+                    )
+                )
+            )
+        ):
+            raise ValueError("workspace authority is invalid")
+
+    def valid_identity(identity: Any) -> bool:
+        return bool(
+            isinstance(identity, Mapping)
+            and set(identity) == {"device", "inode"}
+            and all(
+                isinstance(identity[key], int)
+                and not isinstance(identity[key], bool)
+                and identity[key] >= 0
+                for key in ("device", "inode")
+            )
+        )
+
+    normalized_rows: list[Dict[str, Any]] = []
+    terminal_ids: set[str] = set()
+    for raw in worktrees:
+        if not isinstance(raw, Mapping):
+            raise ValueError("workspace authority is invalid")
+        row = dict(raw)
+        managed = row.get("managed")
+        expected_keys = managed_keys if managed is True else unmanaged_keys
+        terminal_id = row.get("terminal_id")
+        if (
+            set(row) != expected_keys
+            or not isinstance(managed, bool)
+            or not isinstance(terminal_id, str)
+            or not terminal_id
+            or terminal_id in terminal_ids
+            or row.get("version") != 1
+            or row.get("session_id") != expected_session_id
+        ):
+            raise ValueError("workspace authority is invalid")
+        terminal_ids.add(terminal_id)
+        if managed:
+            kind = row.get("kind")
+            identity = row.get("identity")
+            source = row.get("source")
+            common_dir = row.get("git_common_dir")
+            path = row.get("path")
+            present = row.get("present")
+            registered = row.get("registered")
+            head = row.get("head")
+            branch = row.get("branch")
+            head_ref = row.get("head_ref")
+            detached = row.get("detached")
+            owned_ref = row.get("owned_ref")
+            owned_object = row.get("owned_ref_object_id")
+            fingerprint = row.get("content_fingerprint")
+            if (
+                kind not in {"supervisor", "task", "reviewer"}
+                or not isinstance(identity, str)
+                or not identity
+                or not all(
+                    isinstance(item, str) and Path(item).is_absolute()
+                    for item in (source, common_dir, path)
+                )
+                or not valid_identity(row.get("source_identity"))
+                or not valid_identity(row.get("git_common_dir_identity"))
+                or not isinstance(present, bool)
+                or not isinstance(registered, bool)
+                or not isinstance(row.get("clean"), bool)
+                or any(
+                    not isinstance(row.get(key), int)
+                    or isinstance(row.get(key), bool)
+                    or int(row[key]) < 0
+                    for key in ("modified_files", "untracked_files")
+                )
+                or not (row.get("project_id") is None or isinstance(row.get("project_id"), str))
+                or not (
+                    row.get("writer_authority_generation") is None
+                    or isinstance(row.get("writer_authority_generation"), str)
+                )
+                or not (
+                    row.get("writable_work_context_id") is None
+                    or isinstance(row.get("writable_work_context_id"), str)
+                )
+            ):
+                raise ValueError("workspace authority is invalid")
+            expected_ref = (
+                None
+                if kind == "reviewer"
+                else f"refs/heads/cao/{'session' if kind == 'supervisor' else 'task'}/{identity}"
+            )
+            if owned_ref != expected_ref or not (
+                owned_object is None
+                or (
+                    isinstance(owned_object, str) and re.fullmatch(r"[0-9a-f]{40,64}", owned_object)
+                )
+            ):
+                raise ValueError("workspace authority is invalid")
+            if present:
+                if (
+                    not registered
+                    or not valid_identity(row.get("path_identity"))
+                    or not isinstance(row.get("git_dir"), str)
+                    or not Path(str(row["git_dir"])).is_absolute()
+                    or not valid_identity(row.get("git_dir_identity"))
+                    or not isinstance(head, str)
+                    or re.fullmatch(r"[0-9a-f]{40,64}", head) is None
+                    or not isinstance(detached, bool)
+                    or not isinstance(fingerprint, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+                    or not (branch is None or isinstance(branch, str))
+                    or not (head_ref is None or isinstance(head_ref, str))
+                    or bool(branch is None) != detached
+                    or bool(head_ref is None) != detached
+                ):
+                    raise ValueError("workspace authority is invalid")
+            elif (
+                registered
+                or row.get("path_identity") is not None
+                or row.get("git_dir") is not None
+                or row.get("git_dir_identity") is not None
+                or head is not None
+                or branch is not None
+                or head_ref is not None
+                or detached is not None
+                or fingerprint is not None
+                or row.get("clean") is not True
+                or row.get("modified_files") != 0
+                or row.get("untracked_files") != 0
+            ):
+                raise ValueError("workspace authority is invalid")
+        normalized_rows.append(row)
+    if terminal_ids != {str(value) for value in expected_terminal_ids}:
+        raise ValueError("workspace authority terminal identity changed")
+    normalized = {
+        "version": 1,
+        "work_context": dict(work_context) if work_context is not None else None,
+        "worktrees": sorted(normalized_rows, key=lambda item: str(item["terminal_id"])),
+    }
+    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return normalized, encoded, hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _session_workspace_context_authority_in_transaction(
+    db: Any,
+    session_id: str,
+) -> Dict[str, Any] | None:
+    contexts = (
+        db.query(WritableWorkContextModel)
+        .filter(WritableWorkContextModel.session_id == session_id)
+        .limit(2)
+        .all()
+    )
+    if len(contexts) > 1:
+        raise ValueError("workspace authority is ambiguous")
+    if not contexts:
+        return None
+    return _workspace_context_authority_document(contexts[0])
+
+
+def _workspace_context_authority_document(
+    context: WritableWorkContextModel,
+) -> Dict[str, Any]:
+    """Serialize one already-selected writable-context authority row."""
+    return {
+        "id": context.id,
+        "session_id": context.session_id,
+        "terminal_id": context.terminal_id,
+        "project_id": context.project_id,
+        "canonical_source": context.canonical_source,
+        "canonical_worktree": context.canonical_worktree,
+        "branch": context.branch,
+        "base_revision": context.base_revision,
+        "state": context.state,
+        "writer_authority_generation": context.writer_authority_generation,
+        "retirement_allow_dirty": bool(context.retirement_allow_dirty),
+        "retirement_authority_fingerprint": context.retirement_authority_fingerprint,
+    }
+
+
+def _session_workspace_context_progress_is_valid(
+    db: Any,
+    expected: Mapping[str, Any] | None,
+    current: WritableWorkContextModel | None,
+    *,
+    allow_dirty_workspace: bool,
+    require_exact: bool,
+) -> bool:
+    current_authority = (
+        _workspace_context_authority_document(current) if current is not None else None
+    )
+    if require_exact:
+        return expected == current_authority
+    if expected is None:
+        return current is None
+    if current is None or current_authority is None:
+        return False
+    immutable_keys = {
+        "id",
+        "session_id",
+        "terminal_id",
+        "project_id",
+        "canonical_source",
+        "canonical_worktree",
+        "branch",
+        "base_revision",
+        "writer_authority_generation",
+    }
+    if any(expected.get(key) != current_authority.get(key) for key in immutable_keys):
+        return False
+    expected_state = str(expected.get("state"))
+    current_state = str(current_authority.get("state"))
+    allowed_progress = {
+        "admitted": {"admitted", "retiring", "retired"},
+        "retiring": {"retiring", "retired"},
+        "retired": {"retired"},
+    }
+    if current_state not in allowed_progress.get(expected_state, set()):
+        return False
+    if current_state == expected_state:
+        return all(
+            expected.get(key) == current_authority.get(key)
+            for key in ("retirement_allow_dirty", "retirement_authority_fingerprint")
+        )
+    if current_state == "retired":
+        return True
+    if current_state != "retiring" or bool(current.retirement_allow_dirty) != bool(
+        allow_dirty_workspace
+    ):
+        return False
+    snapshot = _session_workspace_snapshot_in_transaction(db, current)
+    return bool(
+        snapshot.get("reason_code") is None
+        and isinstance(current.retirement_authority_fingerprint, str)
+        and hmac.compare_digest(
+            current.retirement_authority_fingerprint,
+            str(snapshot.get("authority_fingerprint") or ""),
+        )
+    )
+
+
+def _validate_session_workspace_relational_authority_in_transaction(
+    db: Any,
+    *,
+    session_id: str,
+    terminal_ids: Sequence[str],
+    workspace_authority: Mapping[str, Any],
+    allow_dirty_workspace: bool,
+    require_exact_context: bool,
+) -> str | None:
+    """Prove every destructive target belongs only to this Session."""
+    terminals = _session_plan_terminals(db, session_id, terminal_ids)
+    if terminals is None:
+        return "SESSION_IDENTITY_CHANGED"
+    rows = {
+        str(row["terminal_id"]): row
+        for row in workspace_authority.get("worktrees", ())
+        if isinstance(row, Mapping) and isinstance(row.get("terminal_id"), str)
+    }
+    if set(rows) != {str(terminal.id) for terminal in terminals}:
+        return "WORKSPACE_AUTHORITY_CHANGED"
+    terminal_by_id = {str(terminal.id): terminal for terminal in terminals}
+    managed_rows: list[Mapping[str, Any]] = []
+    for terminal_id, terminal in terminal_by_id.items():
+        row = rows[terminal_id]
+        kind = terminal.managed_worktree_kind
+        if kind not in {"supervisor", "task", "reviewer"}:
+            if row.get("managed") is not False:
+                return "WORKSPACE_AUTHORITY_CHANGED"
+            continue
+        identity = (
+            terminal.writable_work_context_id
+            or terminal.managed_worktree_origin_terminal_id
+            or terminal.id
+        )
+        owned_ref = (
+            None
+            if kind == "reviewer"
+            else f"refs/heads/cao/{'session' if kind == 'supervisor' else 'task'}/{identity}"
+        )
+        if any(
+            (
+                row.get("managed") is not True,
+                row.get("session_id") != session_id,
+                row.get("project_id") != terminal.project_id,
+                row.get("kind") != kind,
+                row.get("identity") != identity,
+                row.get("source") != terminal.managed_worktree_source,
+                row.get("path") != terminal.launch_worktree,
+                row.get("writer_authority_generation") != terminal.writer_authority_generation,
+                row.get("writable_work_context_id") != terminal.writable_work_context_id,
+                row.get("owned_ref") != owned_ref,
+                terminal.managed_worktree_branch
+                != (owned_ref.removeprefix("refs/heads/") if owned_ref else None),
+            )
+        ):
+            return "WORKSPACE_AUTHORITY_CHANGED"
+        managed_rows.append(row)
+
+    contexts = (
+        db.query(WritableWorkContextModel)
+        .filter(WritableWorkContextModel.session_id == session_id)
+        .limit(2)
+        .all()
+    )
+    if len(contexts) > 1:
+        return "WORKSPACE_AUTHORITY_CHANGED"
+    context = contexts[0] if contexts else None
+    expected_context = workspace_authority.get("work_context")
+    if not _session_workspace_context_progress_is_valid(
+        db,
+        expected_context if isinstance(expected_context, Mapping) else None,
+        context,
+        allow_dirty_workspace=allow_dirty_workspace,
+        require_exact=require_exact_context,
+    ):
+        return "WRITABLE_WORKTREE_AUTHORITY_CHANGED"
+    supervisor_rows = [row for row in managed_rows if row.get("kind") == "supervisor"]
+    if context is None:
+        if supervisor_rows or any(row.get("writable_work_context_id") for row in managed_rows):
+            return "WORKSPACE_AUTHORITY_CHANGED"
+    elif not supervisor_rows and context.state == "retired":
+        # Receipt-only legacy Sessions may retain an already-retired context
+        # after its physical supervisor worktree authority was retired.  Other
+        # independent task/reviewer targets still receive their exact checks.
+        if any(row.get("writable_work_context_id") is not None for row in managed_rows):
+            return "WORKSPACE_AUTHORITY_CHANGED"
+    else:
+        current_supervisor = terminal_by_id.get(str(context.terminal_id))
+        if (
+            current_supervisor is None
+            or current_supervisor.managed_worktree_kind != "supervisor"
+            or current_supervisor.writable_work_context_id != context.id
+            or current_supervisor.project_id != context.project_id
+            or current_supervisor.managed_worktree_source != context.canonical_source
+            or current_supervisor.launch_worktree != context.canonical_worktree
+            or current_supervisor.managed_worktree_branch != context.branch
+            or current_supervisor.managed_worktree_commit != context.base_revision
+            or current_supervisor.writer_authority_generation != context.writer_authority_generation
+        ):
+            return "WORKSPACE_AUTHORITY_CHANGED"
+        if any(
+            row.get("writable_work_context_id") != context.id
+            or row.get("project_id") != context.project_id
+            or row.get("source") != context.canonical_source
+            or row.get("path") != context.canonical_worktree
+            or row.get("owned_ref") != f"refs/heads/{context.branch}"
+            for row in supervisor_rows
+        ):
+            return "WORKSPACE_AUTHORITY_CHANGED"
+        if any(
+            row.get("kind") != "supervisor" and row.get("writable_work_context_id") is not None
+            for row in managed_rows
+        ):
+            return "WORKSPACE_AUTHORITY_CHANGED"
+
+    target_paths = tuple(sorted({str(row["path"]) for row in managed_rows}))
+    target_sources = tuple(sorted({str(row["source"]) for row in managed_rows}))
+    target_branches = tuple(
+        sorted(
+            {
+                str(row["owned_ref"]).removeprefix("refs/heads/")
+                for row in managed_rows
+                if isinstance(row.get("owned_ref"), str)
+            }
+        )
+    )
+    if target_paths:
+        foreign_terminal_filters = [TerminalModel.launch_worktree.in_(target_paths)]
+        if target_sources and target_branches:
+            foreign_terminal_filters.append(
+                and_(
+                    TerminalModel.managed_worktree_source.in_(target_sources),
+                    TerminalModel.managed_worktree_branch.in_(target_branches),
+                )
+            )
+        if (
+            db.query(TerminalModel.id)
+            .filter(
+                TerminalModel.id.notin_(tuple(terminal_by_id)),
+                or_(*foreign_terminal_filters),
+            )
+            .first()
+            is not None
+        ):
+            return "WORKSPACE_FOREIGN_OWNER"
+        receipt_filters = [TerminalDeletionReceiptModel.managed_worktree_path.in_(target_paths)]
+        if target_sources and target_branches:
+            receipt_filters.append(
+                and_(
+                    TerminalDeletionReceiptModel.managed_worktree_source.in_(target_sources),
+                    TerminalDeletionReceiptModel.managed_worktree_branch.in_(target_branches),
+                )
+            )
+        if (
+            db.query(TerminalDeletionReceiptModel.terminal_id)
+            .filter(
+                or_(
+                    TerminalDeletionReceiptModel.session_id != session_id,
+                    TerminalDeletionReceiptModel.session_id.is_(None),
+                ),
+                or_(*receipt_filters),
+            )
+            .first()
+            is not None
+        ):
+            return "WORKSPACE_FOREIGN_OWNER"
+        foreign_context_filters = [WritableWorkContextModel.canonical_worktree.in_(target_paths)]
+        if target_sources and target_branches:
+            foreign_context_filters.append(
+                and_(
+                    WritableWorkContextModel.canonical_source.in_(target_sources),
+                    WritableWorkContextModel.branch.in_(target_branches),
+                )
+            )
+        if (
+            db.query(WritableWorkContextModel.id)
+            .filter(
+                or_(
+                    WritableWorkContextModel.session_id != session_id,
+                    WritableWorkContextModel.session_id.is_(None),
+                ),
+                or_(*foreign_context_filters),
+            )
+            .first()
+            is not None
+        ):
+            return "WORKSPACE_FOREIGN_OWNER"
+        if (
+            db.query(WorktreeWriterLeaseModel.terminal_id)
+            .filter(WorktreeWriterLeaseModel.canonical_worktree.in_(target_paths))
+            .first()
+            is not None
+        ):
+            return "WRITER_LEASE_ACTIVE"
+    return None
+
+
 def _session_deletion_operation_dict(
     operation: SessionDeletionOperationModel,
 ) -> Dict[str, Any]:
@@ -6142,6 +6694,28 @@ def _session_deletion_operation_dict(
         or len(set(terminal_ids)) != len(terminal_ids)
     ):
         raise AmbiguousSessionIdentity(str(operation.session_id))
+    workspace_authority = None
+    workspace_authority_sha256 = operation.workspace_authority_sha256
+    if operation.workspace_authority_json is not None or workspace_authority_sha256 is not None:
+        if not (
+            isinstance(operation.workspace_authority_json, str)
+            and isinstance(workspace_authority_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", workspace_authority_sha256)
+        ):
+            raise AmbiguousSessionIdentity(str(operation.session_id))
+        try:
+            decoded = json.loads(operation.workspace_authority_json)
+            workspace_authority, encoded, digest = _normalize_session_workspace_authority(
+                decoded,
+                expected_session_id=str(operation.session_id),
+                expected_terminal_ids=terminal_ids,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AmbiguousSessionIdentity(str(operation.session_id)) from exc
+        if operation.workspace_authority_json != encoded or not hmac.compare_digest(
+            workspace_authority_sha256, digest
+        ):
+            raise AmbiguousSessionIdentity(str(operation.session_id))
     return {
         "session_id": str(operation.session_id),
         "session_name": str(operation.session_name),
@@ -6149,6 +6723,8 @@ def _session_deletion_operation_dict(
         "terminal_ids": terminal_ids,
         "allow_dirty_workspace": bool(operation.allow_dirty_workspace),
         "authority_fingerprint": str(operation.authority_fingerprint),
+        "workspace_authority": workspace_authority,
+        "workspace_authority_sha256": workspace_authority_sha256,
         "workspace_evidence_sha256": operation.workspace_evidence_sha256,
         "created_at": operation.created_at,
         "updated_at": operation.updated_at,
@@ -7998,6 +8574,18 @@ def _revalidate_session_hard_deletion_in_transaction(
     )
     if not hmac.compare_digest(str(operation.authority_fingerprint), current_fingerprint):
         return None, "SESSION_DELETE_PLAN_CHANGED"
+    workspace_authority = parsed.get("workspace_authority")
+    if workspace_authority is not None:
+        relational_error = _validate_session_workspace_relational_authority_in_transaction(
+            db,
+            session_id=parsed["session_id"],
+            terminal_ids=parsed["terminal_ids"],
+            workspace_authority=workspace_authority,
+            allow_dirty_workspace=bool(parsed["allow_dirty_workspace"]),
+            require_exact_context=False,
+        )
+        if relational_error is not None:
+            return None, relational_error
     return terminals, None
 
 
@@ -8177,6 +8765,80 @@ def begin_session_hard_deletion(
         return {"started": True, **parsed_operation}
 
 
+def bind_session_hard_deletion_workspace_authority(
+    session_id: str,
+    session_name: str,
+    *,
+    workspace_authority: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Bind one exact current Git/worktree plan to a fenced Session delete."""
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        receipt = db.get(SessionDeletionReceiptModel, session_id)
+        if receipt is not None:
+            matched = str(receipt.session_name) == session_name
+            db.rollback()
+            if not matched:
+                raise AmbiguousSessionIdentity(session_id)
+            return {"bound": True, "already_deleted": True}
+        operation = db.get(SessionDeletionOperationModel, session_id)
+        if operation is None or str(operation.session_name) != session_name:
+            db.rollback()
+            return {"bound": False, "reason_code": "SESSION_DELETE_FENCE_MISSING"}
+        parsed = _session_deletion_operation_dict(operation)
+        try:
+            normalized, encoded, digest = _normalize_session_workspace_authority(
+                workspace_authority,
+                expected_session_id=session_id,
+                expected_terminal_ids=parsed["terminal_ids"],
+            )
+        except ValueError:
+            db.rollback()
+            return {"bound": False, "reason_code": "WORKSPACE_AUTHORITY_CHANGED"}
+        _terminals, reason_code = _revalidate_session_hard_deletion_in_transaction(
+            db,
+            operation,
+            require_workspace_retired=False,
+        )
+        if reason_code is not None:
+            db.rollback()
+            return {"bound": False, "reason_code": reason_code}
+        relational_error = _validate_session_workspace_relational_authority_in_transaction(
+            db,
+            session_id=session_id,
+            terminal_ids=parsed["terminal_ids"],
+            workspace_authority=normalized,
+            allow_dirty_workspace=bool(parsed["allow_dirty_workspace"]),
+            require_exact_context=True,
+        )
+        if relational_error is not None:
+            db.rollback()
+            return {"bound": False, "reason_code": relational_error}
+        if parsed["workspace_authority"] is not None:
+            matched = (
+                hmac.compare_digest(str(parsed["workspace_authority_sha256"]), digest)
+                and parsed["workspace_authority"] == normalized
+            )
+            db.rollback()
+            return (
+                {"bound": True, "already_bound": True, "workspace_authority_sha256": digest}
+                if matched
+                else {
+                    "bound": False,
+                    "reason_code": "WRITABLE_WORKTREE_AUTHORITY_CHANGED",
+                }
+            )
+        if operation.state != _SESSION_HARD_DELETE_FENCED:
+            db.rollback()
+            return {"bound": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
+        operation.workspace_authority_json = encoded
+        operation.workspace_authority_sha256 = digest
+        operation.updated_at = datetime.now()
+        db.commit()
+        return {"bound": True, "workspace_authority_sha256": digest}
+
+
 def mark_session_hard_deletion_workspace_retired(
     session_id: str,
     *,
@@ -8230,6 +8892,9 @@ def mark_session_hard_deletion_workspace_retired(
                 else {"marked": False, "reason_code": "SESSION_DELETE_FENCE_MISSING"}
             )
         parsed = _session_deletion_operation_dict(operation)
+        if parsed["workspace_authority"] is None:
+            db.rollback()
+            return {"marked": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
         graph_terminal_ids = _session_graph_terminal_ids(
             db,
             parsed["session_id"],
@@ -8498,6 +9163,8 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
                 authority_fingerprint=hashlib.sha256(
                     (
                         str(operation.authority_fingerprint)
+                        + ":"
+                        + str(operation.workspace_authority_sha256)
                         + ":"
                         + str(operation.workspace_evidence_sha256)
                     ).encode()

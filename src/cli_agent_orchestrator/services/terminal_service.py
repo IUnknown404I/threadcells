@@ -3359,6 +3359,8 @@ def send_input(
                     workflow_turn_claim_token,
                     workflow_turn_claim_generation,
                     runtime_operation_token,
+                    runtime_operation_kind=runtime_operation_claim_kind or "transport",
+                    expected_review_revision=expected_review_revision,
                 ) as permitted:
                     if not permitted:
                         raise RuntimeError("workflow turn was fenced before provider transport")

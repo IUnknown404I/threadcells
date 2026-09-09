@@ -17707,6 +17707,8 @@ def workflow_turn_transport_fence(
     claim_token: str,
     claim_generation: int,
     runtime_operation_token: str,
+    runtime_operation_kind: str = "transport",
+    expected_review_revision: Optional[str] = None,
     now: Optional[datetime] = None,
 ):
     """Serialize the final retry-send boundary against receiver admission.
@@ -17735,6 +17737,45 @@ def workflow_turn_transport_fence(
             .first()
             is not None
         )
+        runtime_operation_matches = bool(
+            terminal is not None
+            and terminal.runtime_operation_kind == runtime_operation_kind
+            and terminal.runtime_operation_token == runtime_operation_token
+        )
+        if (
+            runtime_operation_matches
+            and runtime_operation_kind == REVIEW_WORKTREE_PREPARATION_OPERATION
+        ):
+            try:
+                review_authority = _review_input_authority_in_transaction(
+                    db, root_terminal_id, turn_id
+                )
+            except ValueError:
+                review_authority = None
+            runtime_operation_matches = bool(
+                review_authority is not None
+                and isinstance(expected_review_revision, str)
+                and review_authority[0].review_subject_revision == expected_review_revision
+                and terminal is review_authority[3]
+                and terminal.runtime_lifecycle == "running"
+                and terminal.runtime_operation_expires_at is not None
+                and terminal.runtime_operation_expires_at > now
+                and not _terminal_requires_provider_runtime_compatibility_reconnect(terminal)
+                and not _terminal_has_pending_provider_reconnect(db, root_terminal_id)
+                and db.query(WorktreeWriterLeaseModel.canonical_worktree)
+                .filter(
+                    or_(
+                        WorktreeWriterLeaseModel.terminal_id == root_terminal_id,
+                        WorktreeWriterLeaseModel.canonical_worktree == terminal.launch_worktree,
+                    )
+                )
+                .first()
+                is None
+                and _workspace_accepts_new_work(db, root_terminal_id)
+                and _retirement_quiescence_allows_commit(db, root_terminal_id)
+            )
+        elif runtime_operation_kind != "transport":
+            runtime_operation_matches = False
         permitted = bool(
             turn is not None
             and _claim_matches(turn, claim_token, claim_generation, now)
@@ -17742,9 +17783,7 @@ def workflow_turn_transport_fence(
             and workflow.status == WORKFLOW_OPEN
             and workflow.root_terminal_id == root_terminal_id
             and workflow.active_turn_id == turn_id
-            and terminal is not None
-            and terminal.runtime_operation_kind == "transport"
-            and terminal.runtime_operation_token == runtime_operation_token
+            and runtime_operation_matches
             and lease is not None
             and lease.workflow_turn_id == turn_id
             and not receipted

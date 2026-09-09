@@ -143,6 +143,12 @@ class TerminalModel(Base):
     # replace it from provider-global state.
     provider_resume_identity = Column(String, nullable=True)
     provider_resume_runtime_generation = Column(String, nullable=True)
+    # Compatibility identity of the code/config that launched the resident
+    # provider process. Unlike ``runtime_generation`` (the physical pane
+    # epoch), this changes when a promoted ThreadCells runtime changes the
+    # Codex hook or MCP protocol. NULL is deliberately legacy/unknown and
+    # therefore requires a provider reconnect before compact continuation.
+    provider_runtime_compatibility_generation = Column(String, nullable=True)
     # Bounded provider-native response cache. It is readable only through an
     # exact provider/session binding and cannot be replaced by terminal-tail
     # inference from a newer in-progress turn.
@@ -1198,6 +1204,7 @@ CONTROL_PLANE_MIGRATION_RECEIPT = "threadmesh-control-plane-schema-v1"
 WORKFLOW_EFFECT_LINEAGE_SCHEMA_VERSION = 1
 WORKFLOW_EFFECT_LINEAGE_MIGRATION_RECEIPT = "workflow-effect-mirror-lineage-v1"
 WORKFLOW_EFFECT_LINEAGE_BACKFILL_BATCH_SIZE = 500
+STALE_PROVIDER_RUNTIME_RECONNECT_BATCH_SIZE = 100
 SESSION_LIFETIME_RECEIPT_SCHEMA_VERSION = 1
 SESSION_LIFETIME_RECEIPT_MIGRATION = "terminal-deletion-session-lifetime-authority-v1"
 SESSION_LIFETIME_RECEIPT_BACKFILL_BATCH_SIZE = 500
@@ -3481,6 +3488,7 @@ def _migrate_terminal_worktree_authority_columns() -> bool:
             "runtime_operation_token",
             "provider_resume_identity",
             "provider_resume_runtime_generation",
+            "provider_runtime_compatibility_generation",
             "provider_last_response_identity",
             "recovery_fenced_reason",
             "recovery_takeover_id",
@@ -5255,6 +5263,7 @@ def create_terminal(
     runtime_process_start_ticks: Optional[int] = None,
     runtime_process_group_id: Optional[int] = None,
     runtime_process_session_id: Optional[int] = None,
+    provider_runtime_compatibility_generation: Optional[str] = None,
     recovery_takeover_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create metadata and atomically acquire any required writer lease."""
@@ -5273,6 +5282,11 @@ def create_terminal(
         raise ValueError("terminal context_role must be supervisor or work")
     if managed_worktree_kind not in {None, "supervisor", "task", "reviewer"}:
         raise ValueError("managed_worktree_kind must be supervisor, task, or reviewer")
+    if provider_runtime_compatibility_generation is not None and (
+        provider != "codex"
+        or re.fullmatch(r"[0-9a-f]{64}", provider_runtime_compatibility_generation) is None
+    ):
+        raise ValueError("provider runtime compatibility generation is invalid")
     if workspace_classification not in {None, "managed_isolated", "legacy_shared_root"}:
         raise ValueError("workspace_classification is invalid")
     with SessionLocal() as db:
@@ -5561,6 +5575,7 @@ def create_terminal(
             runtime_process_start_ticks=runtime_process_start_ticks,
             runtime_process_group_id=runtime_process_group_id,
             runtime_process_session_id=runtime_process_session_id,
+            provider_runtime_compatibility_generation=(provider_runtime_compatibility_generation),
             recovery_takeover_id=recovery_takeover_id,
         )
         db.add(terminal)
@@ -5672,6 +5687,9 @@ def create_terminal(
             "runtime_process_start_ticks": terminal.runtime_process_start_ticks,
             "runtime_process_group_id": terminal.runtime_process_group_id,
             "runtime_process_session_id": terminal.runtime_process_session_id,
+            "provider_runtime_compatibility_generation": (
+                terminal.provider_runtime_compatibility_generation
+            ),
             "recovery_fenced_at": terminal.recovery_fenced_at,
             "recovery_fenced_reason": terminal.recovery_fenced_reason,
             "recovery_takeover_id": terminal.recovery_takeover_id,
@@ -5747,6 +5765,9 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "runtime_process_session_id": terminal.runtime_process_session_id,
             "provider_resume_identity": terminal.provider_resume_identity,
             "provider_resume_runtime_generation": terminal.provider_resume_runtime_generation,
+            "provider_runtime_compatibility_generation": (
+                terminal.provider_runtime_compatibility_generation
+            ),
             "runtime_operation_kind": terminal.runtime_operation_kind,
             "runtime_operation_token": terminal.runtime_operation_token,
             "runtime_operation_claimed_at": terminal.runtime_operation_claimed_at,
@@ -14549,6 +14570,8 @@ def get_workflow_compaction_continuation_authority(
     exists, every runtime, provider, lease, recovery, and token axis must agree
     or compaction fails closed.
     """
+    from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
+
     _ensure_workflow_schema()
     _ensure_provider_execution_schema()
     if not terminal_auth_token or not runtime_generation or not provider_resume_identity:
@@ -14561,6 +14584,11 @@ def get_workflow_compaction_continuation_authority(
             or not _workspace_accepts_new_work(db, receiver_terminal_id)
             or terminal.provider != "codex"
             or terminal.runtime_lifecycle != "running"
+            or not terminal.provider_runtime_compatibility_generation
+            or not hmac.compare_digest(
+                str(terminal.provider_runtime_compatibility_generation),
+                ACTIVE_RUNTIME_GENERATION,
+            )
             or not terminal.auth_token_sha256
             or not hmac.compare_digest(str(terminal.auth_token_sha256), terminal_auth_digest)
             or not terminal.runtime_generation
@@ -15546,7 +15574,10 @@ def _provider_reconnect_authority_turn(
 
 
 def request_workflow_provider_reconnect(
-    root_terminal_id: str, now: Optional[datetime] = None
+    root_terminal_id: str,
+    now: Optional[datetime] = None,
+    *,
+    incompatible_with_runtime_generation: Optional[str] = None,
 ) -> bool:
     """Persist a stale-sidecar observation before any replacement transport.
 
@@ -15557,6 +15588,11 @@ def request_workflow_provider_reconnect(
     supplies provenance. No provider launch occurs here.
     """
     _ensure_workflow_schema()
+    if (
+        incompatible_with_runtime_generation is not None
+        and re.fullmatch(r"[0-9a-f]{64}", incompatible_with_runtime_generation) is None
+    ):
+        raise ValueError("incompatible runtime generation is invalid")
     now = now or datetime.now()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
@@ -15567,6 +15603,17 @@ def request_workflow_provider_reconnect(
         if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
             db.rollback()
             return False
+        if incompatible_with_runtime_generation is not None:
+            terminal = db.get(TerminalModel, root_terminal_id)
+            if (
+                terminal is None
+                or terminal.provider != "codex"
+                or terminal.runtime_lifecycle != "running"
+                or terminal.provider_runtime_compatibility_generation
+                == incompatible_with_runtime_generation
+            ):
+                db.rollback()
+                return False
         turn = db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
         if turn is None or turn.workflow_id != workflow.id:
             db.rollback()
@@ -15583,6 +15630,66 @@ def request_workflow_provider_reconnect(
             workflow.updated_at = now
         db.commit()
         return True
+
+
+def request_stale_provider_runtime_reconnects(
+    active_runtime_generation: str,
+    *,
+    now: Optional[datetime] = None,
+    limit: int = STALE_PROVIDER_RUNTIME_RECONNECT_BATCH_SIZE,
+) -> int:
+    """Fence admitted Codex executions launched by older control-plane code.
+
+    Codex parses its SessionStart matcher once at launch, so a deployment
+    cannot retrofit the compact hook into a resident process. The terminal's
+    compatibility generation distinguishes that launch authority from the
+    current service. Persisting the ordinary provider-reconnect barrier before
+    queue observation prevents new transport and lets its existing recovery
+    saga resume the exact provider session after the active execution settles.
+
+    Already-fenced rows are excluded, so bounded repeated daemon ticks make
+    progress beyond this batch without an unbounded startup scan.
+    """
+    _ensure_workflow_schema()
+    if re.fullmatch(r"[0-9a-f]{64}", active_runtime_generation) is None:
+        raise ValueError("active runtime generation is invalid")
+    bounded_limit = min(max(int(limit), 1), STALE_PROVIDER_RUNTIME_RECONNECT_BATCH_SIZE)
+    with SessionLocal() as db:
+        candidates = [
+            str(root_terminal_id)
+            for (root_terminal_id,) in (
+                db.query(WorkflowModel.root_terminal_id)
+                .join(TerminalModel, TerminalModel.id == WorkflowModel.root_terminal_id)
+                .join(
+                    WorkflowTurnModel,
+                    WorkflowTurnModel.id == WorkflowModel.active_turn_id,
+                )
+                .filter(
+                    WorkflowModel.status == WORKFLOW_OPEN,
+                    TerminalModel.provider == "codex",
+                    TerminalModel.runtime_lifecycle == "running",
+                    or_(
+                        TerminalModel.provider_runtime_compatibility_generation.is_(None),
+                        TerminalModel.provider_runtime_compatibility_generation
+                        != active_runtime_generation,
+                    ),
+                    WorkflowTurnModel.provider_reconnect_requested_at.is_(None),
+                )
+                .order_by(WorkflowModel.root_terminal_id.asc())
+                .limit(bounded_limit)
+                .all()
+            )
+        ]
+    return sum(
+        int(
+            request_workflow_provider_reconnect(
+                terminal_id,
+                now=now,
+                incompatible_with_runtime_generation=active_runtime_generation,
+            )
+        )
+        for terminal_id in candidates
+    )
 
 
 def claim_workflow_provider_reconnect(
@@ -16158,6 +16265,8 @@ def complete_workflow_provider_reconnect(
     attempt_token: str,
 ) -> bool:
     """Close the durable reconnect episode after the resumed TUI is ready."""
+    from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
+
     _ensure_workflow_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
@@ -16188,6 +16297,8 @@ def complete_workflow_provider_reconnect(
             or attempt.output_log_inode is None
             or attempt.output_log_offset is None
             or attempt.output_boundary_at is None
+            or not attempt.runtime_generation
+            or not hmac.compare_digest(str(attempt.runtime_generation), ACTIVE_RUNTIME_GENERATION)
         ):
             db.rollback()
             return False
@@ -16403,6 +16514,11 @@ def complete_workflow_provider_reconnect(
         terminal.runtime_operation_token = None
         terminal.runtime_operation_claimed_at = None
         terminal.runtime_operation_expires_at = None
+        # Readiness was registered by the newly initialized, nonce-bound MCP
+        # sidecar and its output boundary was proven before this transaction.
+        # Publish the resident Codex launch compatibility only at that final
+        # reconnect commit, never merely because a new service was deployed.
+        terminal.provider_runtime_compatibility_generation = attempt.runtime_generation
         attempt.state = PROVIDER_RECONNECT_SUCCEEDED
         attempt.outcome_code = (
             "runtime_ready_authority_gate" if continuation_unsafe else "runtime_ready"

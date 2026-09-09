@@ -109,6 +109,7 @@ class TestCapacitySettings:
             "max_work_contexts": 7,
             "max_heavy_execution_slots": 2,
         }
+
         with (
             patch(
                 "cli_agent_orchestrator.api.main._require_operator",
@@ -2747,7 +2748,15 @@ class TestWorkflowDaemon:
             if failed_reconciliation == "assigned":
                 raise RuntimeError("assigned child failure")
 
+        def reconcile_compatibility():
+            calls.append("compatibility")
+
         with (
+            patch(
+                "cli_agent_orchestrator.api.main.workflow_service."
+                "fence_stale_provider_runtime_compatibility",
+                side_effect=reconcile_compatibility,
+            ) as compatibility,
             patch(
                 "cli_agent_orchestrator.api.main.inbox_service.reconcile_handoff_continuations",
                 side_effect=reconcile_handoffs,
@@ -2763,7 +2772,8 @@ class TestWorkflowDaemon:
         ):
             assert await _workflow_reconciliation_tick(None, False) is False
 
-        assert calls == ["handoff", "assigned", "queue"]
+        assert calls == ["compatibility", "handoff", "assigned", "queue"]
+        compatibility.assert_called_once_with()
         handoffs.assert_called_once_with(None)
         assigned.assert_called_once_with()
         queue.assert_called_once_with(None)
@@ -2789,6 +2799,11 @@ class TestLifespan:
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
             patch(
+                "cli_agent_orchestrator.api.main.workflow_service."
+                "fence_stale_provider_runtime_compatibility",
+                return_value=0,
+            ) as compatibility,
+            patch(
                 "cli_agent_orchestrator.api.main.PollingObserver",
                 return_value=mock_observer,
             ),
@@ -2807,6 +2822,7 @@ class TestLifespan:
         ):
             async with lifespan(app):
                 # Inside the lifespan — startup completed
+                compatibility.assert_called_once_with()
                 mock_observer.schedule.assert_called_once()
                 mock_observer.start.assert_called_once()
 

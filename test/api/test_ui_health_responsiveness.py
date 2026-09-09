@@ -220,6 +220,11 @@ async def test_blocked_restart_recovery_begins_only_after_health_is_available(
     monkeypatch.setattr(api_main, "PollingObserver", lambda **_kwargs: observer)
     monkeypatch.setattr(api_main, "flow_daemon", dormant_flow_daemon)
     monkeypatch.setattr(
+        api_main.workflow_service,
+        "fence_stale_provider_runtime_compatibility",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
         control_plane_registry,
         "initialize_control_plane_registries",
         lambda *_args: None,

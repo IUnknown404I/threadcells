@@ -118,6 +118,7 @@ from cli_agent_orchestrator.providers.codex import (
     _bounded_response_suffix,
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
 from cli_agent_orchestrator.services.compressed_output_index import (
     CompressedOutputIndex,
     open_compressed_output_index,
@@ -1843,6 +1844,9 @@ def _create_terminal_after_admission(
                 runtime_process_start_ticks=runtime_target.process_start_ticks,
                 runtime_process_group_id=runtime_target.process_group_id,
                 runtime_process_session_id=runtime_target.process_session_id,
+                provider_runtime_compatibility_generation=(
+                    ACTIVE_RUNTIME_GENERATION if provider == ProviderType.CODEX.value else None
+                ),
                 recovery_takeover_id=recovery_takeover_id,
             )
             metadata_persisted = True

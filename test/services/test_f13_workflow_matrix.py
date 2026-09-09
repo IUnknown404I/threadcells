@@ -179,6 +179,7 @@ def _ensure_running_test_terminal(root: str) -> None:
                     runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
                     provider_resume_identity=TEST_CODEX_RESUME_IDENTITY,
                     provider_resume_runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
+                    provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
                 )
             )
             db.commit()
@@ -758,6 +759,7 @@ def test_composer_successor_waits_for_reconnect_then_delivers_without_second_rec
             .one()
         )
         attempt.state = database.PROVIDER_RECONNECT_READY
+        attempt.runtime_generation = ACTIVE_RUNTIME_GENERATION
         attempt.output_log_device = 1
         attempt.output_log_inode = 2
         attempt.output_log_offset = 3
@@ -832,6 +834,7 @@ def _complete_ready_test_reconnect(root: str, turn_id: int) -> None:
             .one()
         )
         attempt.state = database.PROVIDER_RECONNECT_READY
+        attempt.runtime_generation = ACTIVE_RUNTIME_GENERATION
         attempt.output_log_device = 1
         attempt.output_log_inode = 2
         attempt.output_log_offset = 3
@@ -3516,6 +3519,7 @@ def test_f13_reconnect_callback_successor_fails_closed_on_unproven_result(workfl
             .one()
         )
         attempt.state = database.PROVIDER_RECONNECT_READY
+        attempt.runtime_generation = ACTIVE_RUNTIME_GENERATION
         attempt.output_log_device = 1
         attempt.output_log_inode = 2
         attempt.output_log_offset = 3
@@ -7246,6 +7250,7 @@ def test_f13_codex_compaction_restores_admitted_turn_without_reclaim_or_effect_r
                 runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
                 provider_resume_identity=TEST_CODEX_RESUME_IDENTITY,
                 provider_resume_runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
+                provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
             )
         )
         db.commit()
@@ -7355,6 +7360,7 @@ def test_f13_latest_resumed_pair_supersedes_old_pair_across_repeated_compactions
                 runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
                 provider_resume_identity=TEST_CODEX_RESUME_IDENTITY,
                 provider_resume_runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
+                provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
             )
         )
         db.commit()
@@ -7429,6 +7435,148 @@ def test_f13_latest_resumed_pair_supersedes_old_pair_across_repeated_compactions
     assert second["resume_token"] not in public_projection
 
 
+def test_f13_upgrade_fences_old_codex_runtime_then_restores_compaction_on_reconnect(
+    workflow_db,
+):
+    """A resident old matcher cannot cross promotion as compact authority."""
+    root = "c0dec005"
+    terminal_auth_token = "terminal-upgrade-compaction-authority"
+    old_runtime_generation = "0" * 64 if ACTIVE_RUNTIME_GENERATION != "0" * 64 else "1" * 64
+    with database.SessionLocal() as db:
+        db.add(
+            TerminalModel(
+                id=root,
+                tmux_session=f"cao-{root}",
+                tmux_window="owner-0000",
+                provider="codex",
+                auth_token_sha256=hashlib.sha256(terminal_auth_token.encode()).hexdigest(),
+                runtime_lifecycle="running",
+                runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
+                provider_resume_identity=TEST_CODEX_RESUME_IDENTITY,
+                provider_resume_runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
+                provider_runtime_compatibility_generation=old_runtime_generation,
+            )
+        )
+        db.commit()
+    interrupted_turn = start_workflow_input(root)
+    assert interrupted_turn is not None
+    assert database.acquire_provider_execution(root, interrupted_turn, 1)
+    admitted = claim_or_resume_workflow_turn_receipt(
+        root,
+        interrupted_turn,
+        terminal_auth_token=terminal_auth_token,
+    )
+    assert admitted["accepted"] is True
+
+    # Candidate discovery is only an observation. If another reconnect makes
+    # this resident runtime current before the writer transaction, the stale
+    # observation cannot fence the new process.
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, root)
+        terminal.provider_runtime_compatibility_generation = ACTIVE_RUNTIME_GENERATION
+        db.commit()
+    assert not database.request_workflow_provider_reconnect(
+        root,
+        incompatible_with_runtime_generation=ACTIVE_RUNTIME_GENERATION,
+    )
+    with database.SessionLocal() as db:
+        turn = db.get(WorkflowTurnModel, interrupted_turn)
+        terminal = db.get(TerminalModel, root)
+        assert turn.provider_reconnect_requested_at is None
+        terminal.provider_runtime_compatibility_generation = old_runtime_generation
+        db.commit()
+
+    # Deployment startup persists the existing reconnect saga before queue
+    # replay. The current endpoint refuses to restore the admitted bearer for
+    # the old resident command, and repeated startup ticks do not duplicate it.
+    assert database.request_stale_provider_runtime_reconnects(ACTIVE_RUNTIME_GENERATION) == 1
+    assert database.request_stale_provider_runtime_reconnects(ACTIVE_RUNTIME_GENERATION) == 0
+    with pytest.raises(database.WorkflowContinuationAuthorityConflict):
+        database.get_workflow_compaction_continuation_authority(
+            root,
+            terminal_auth_token=terminal_auth_token,
+            runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
+            provider_resume_identity=TEST_CODEX_RESUME_IDENTITY,
+        )
+    with database.SessionLocal() as db:
+        interrupted = db.get(WorkflowTurnModel, interrupted_turn)
+        assert interrupted.provider_reconnect_requested_at is not None
+        assert db.query(WorkflowTurnReceiptModel).count() == 1
+    assert database.claim_workflow_provider_reconnect(root) is None
+
+    # Once the in-flight provider execution settles, the canonical reconnect
+    # replaces the resident Codex process. Its nonce-bound sidecar readiness
+    # publishes the new compatibility generation only at final commit.
+    assert database.release_provider_execution(root, interrupted_turn)
+    reconnect = database.claim_workflow_provider_reconnect(root)
+    assert reconnect is not None and reconnect.get("exhausted") is not True
+    assert database.mark_workflow_provider_reconnect_launch_dispatched(
+        root,
+        interrupted_turn,
+        reconnect["claim_token"],
+        reconnect["attempt_token"],
+    )
+    assert database.record_workflow_provider_reconnect_runtime_ready(
+        root,
+        reconnect["attempt_token"],
+        ACTIVE_RUNTIME_GENERATION,
+        4321,
+        987654,
+    )
+    with database.SessionLocal() as db:
+        assert (
+            db.get(TerminalModel, root).provider_runtime_compatibility_generation
+            == old_runtime_generation
+        )
+    assert database.record_workflow_provider_reconnect_output_boundary(
+        root,
+        reconnect["attempt_token"],
+        11,
+        22,
+        333,
+    )
+    assert database.complete_workflow_provider_reconnect(
+        root,
+        interrupted_turn,
+        reconnect["claim_token"],
+        reconnect["attempt_token"],
+    )
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, root)
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=root).one()
+        successor = db.get(WorkflowTurnModel, workflow.active_turn_id)
+        assert terminal.provider_runtime_compatibility_generation == ACTIVE_RUNTIME_GENERATION
+        assert successor.kind == "execution_resume"
+        assert successor.resume_parent_turn_id == interrupted_turn
+        successor_turn = successor.id
+
+    transport = claim_workflow_turn(root)
+    assert transport is not None and transport["id"] == successor_turn
+    assert activate_workflow_turn(root, successor_turn)
+    assert database.acquire_provider_execution(root, successor_turn, 1)
+    assert mark_workflow_turn_sent(
+        successor_turn,
+        transport["claim_token"],
+        transport["claim_generation"],
+    )
+    resumed = claim_or_resume_workflow_turn_receipt(
+        root,
+        successor_turn,
+        terminal_auth_token=terminal_auth_token,
+    )
+    assert resumed["accepted"] is True
+    assert resumed["resumed"] is True
+    assert resumed["resume_token"] != admitted["resume_token"]
+    restored = database.get_workflow_compaction_continuation_authority(
+        root,
+        terminal_auth_token=terminal_auth_token,
+        runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
+        provider_resume_identity=TEST_CODEX_RESUME_IDENTITY,
+    )
+    assert restored["logical_turn_id"] == successor_turn
+    assert restored["resume_token"] == resumed["resume_token"]
+
+
 def test_f13_compaction_fails_closed_for_legacy_or_live_conflicting_authority(
     workflow_db,
 ):
@@ -7446,6 +7594,7 @@ def test_f13_compaction_fails_closed_for_legacy_or_live_conflicting_authority(
                 runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
                 provider_resume_identity=TEST_CODEX_RESUME_IDENTITY,
                 provider_resume_runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
+                provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
             )
         )
         db.commit()
@@ -7528,6 +7677,7 @@ def test_f13_compaction_cannot_restore_through_session_deletion_fence(workflow_d
                 runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
                 provider_resume_identity=TEST_CODEX_RESUME_IDENTITY,
                 provider_resume_runtime_generation=TEST_TERMINAL_RUNTIME_GENERATION,
+                provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
             )
         )
         db.commit()

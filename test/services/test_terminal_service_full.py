@@ -25,6 +25,7 @@ from cli_agent_orchestrator.providers.codex import (
     CodexStartupNoReadyError,
     ProviderError,
 )
+from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
 from cli_agent_orchestrator.services.compressed_output_index import (
     precompute_compressed_output_index,
 )
@@ -1989,6 +1990,10 @@ class TestCodexStartupReliability:
         mock_tmux.kill_session.assert_called_once_with("cao-retry")
         assert mock_tmux.kill_window.call_count == 0
         assert mock_provider_manager.create_provider.call_count == 2
+        assert (
+            mock_db_create.call_args.kwargs["provider_runtime_compatibility_generation"]
+            == ACTIVE_RUNTIME_GENERATION
+        )
         bind_identity.assert_not_called()
         mock_log_path.touch.assert_called_once()
 

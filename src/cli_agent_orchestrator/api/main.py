@@ -405,6 +405,12 @@ async def _workflow_reconciliation_tick(
     """Run one isolated recovery tick and return whether startup replay remains due."""
     performed_full_recovery = False
     try:
+        fenced = await _run_workflow_io(workflow_service.fence_stale_provider_runtime_compatibility)
+        if fenced:
+            logger.info("Fenced %s stale Codex runtimes for provider reconnect", fenced)
+    except Exception as exc:
+        logger.warning("Provider runtime compatibility reconciliation failed: %s", exc)
+    try:
         workspaces = await _run_workflow_io(
             managed_worktree_service.reconcile_writable_work_context_provisioning
         )
@@ -580,6 +586,16 @@ async def lifespan(app: FastAPI):
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
     init_db()
+    # This durable barrier precedes API availability and every startup queue
+    # replay. A resident Codex process retains the hook matcher parsed by its
+    # launch release; it must be reconnected before current code can restore
+    # compacted authority or send another workflow continuation.
+    startup_fenced_runtimes = workflow_service.fence_stale_provider_runtime_compatibility()
+    if startup_fenced_runtimes:
+        logger.info(
+            "Fenced %s pre-promotion Codex runtimes before startup replay",
+            startup_fenced_runtimes,
+        )
     from cli_agent_orchestrator.services.control_plane_registry import (
         initialize_control_plane_registries,
     )
@@ -2590,6 +2606,8 @@ async def bind_codex_session_identity_endpoint(
     # terminal authority. It may request only the exact durable rebind below;
     # malformed/missing generations and every fresh identity remain fenced.
     if not caller_generation_is_current and not re.fullmatch(r"[0-9a-f]{64}", caller_generation):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="stale_runtime_generation")
+    if body.source == "compact" and not caller_generation_is_current:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="stale_runtime_generation")
     try:
         identity = await run_in_threadpool(

@@ -131,6 +131,28 @@ def test_codex_session_identity_allows_stale_api_generation_only_as_exact_rebind
     )
 
 
+def test_codex_compaction_rejects_stale_hook_generation_before_identity_rebind(client):
+    payload = {**_payload(), "source": "compact"}
+    stale_generation = "b" * 64
+    if stale_generation == ACTIVE_RUNTIME_GENERATION:
+        stale_generation = "c" * 64
+    with (
+        patch("cli_agent_orchestrator.api.main.terminal_auth_token_matches", return_value=True),
+        patch(
+            "cli_agent_orchestrator.api.main.terminal_service.bind_provider_runtime_session_identity"
+        ) as bind,
+    ):
+        response = client.post(
+            "/_internal/terminals/abcdef12/codex-session-identity",
+            json=payload,
+            headers=_headers(stale_generation),
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "stale_runtime_generation"
+    bind.assert_not_called()
+
+
 def test_codex_session_identity_rejects_malformed_api_generation_before_proof(client):
     with (
         patch("cli_agent_orchestrator.api.main.terminal_auth_token_matches", return_value=True),

@@ -112,6 +112,7 @@ class TestTerminalOperations:
             "runtime_operation_expires_at",
             "provider_resume_identity",
             "provider_resume_runtime_generation",
+            "provider_runtime_compatibility_generation",
             "provider_last_response_identity",
             "provider_last_response",
             "provider_last_response_offset",

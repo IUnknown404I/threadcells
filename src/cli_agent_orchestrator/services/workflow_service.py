@@ -31,6 +31,7 @@ from cli_agent_orchestrator.clients.database import (
     prepare_workflow_input,
     renew_workflow_provider_reconnect,
     renew_workflow_turn_claim,
+    request_stale_provider_runtime_reconnects,
     request_workflow_provider_reconnect,
     requeue_expired_workflow_turn_claims,
     requeue_workflow_turn,
@@ -52,6 +53,13 @@ class ProviderResumeIdentityUnavailable(RuntimeError):
     """Reconnect has no launch-bound identity it can safely resume."""
 
     reconnect_outcome_code = "resume_identity_unavailable_or_unproven"
+
+
+def fence_stale_provider_runtime_compatibility(now: datetime | None = None) -> int:
+    """Persist reconnect barriers for Codex processes from older releases."""
+    from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
+
+    return request_stale_provider_runtime_reconnects(ACTIVE_RUNTIME_GENERATION, now=now)
 
 
 class _WorkflowTurnClaimHeartbeat:

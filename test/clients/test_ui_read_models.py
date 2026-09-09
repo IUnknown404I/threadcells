@@ -1754,6 +1754,279 @@ def test_open_workflow_projects_consumed_turns_as_history_and_only_unresolved_as
     ) == {"interaction-session": 0}
 
 
+def test_resumed_owner_gate_chain_is_history_while_unresolved_gate_remains_current(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 7, 18, 0, 0)
+    with database.SessionLocal() as db:
+        db.add(_interaction_terminal())
+        first_gate = WorkflowModel(
+            root_terminal_id="owner",
+            status="owner_gate",
+            terminal_reason="first owner decision",
+            created_at=now,
+            updated_at=now + timedelta(seconds=1),
+        )
+        second_gate = WorkflowModel(
+            root_terminal_id="owner",
+            status="owner_gate",
+            terminal_reason="second owner decision",
+            created_at=now + timedelta(seconds=2),
+            updated_at=now + timedelta(seconds=3),
+        )
+        completed = WorkflowModel(
+            root_terminal_id="owner",
+            status="terminal",
+            terminal_reason="owner-approved work completed",
+            created_at=now + timedelta(seconds=4),
+            updated_at=now + timedelta(seconds=5),
+        )
+        current_gate = WorkflowModel(
+            root_terminal_id="owner",
+            status="owner_gate",
+            terminal_reason="genuinely waiting for owner",
+            created_at=now + timedelta(seconds=6),
+            updated_at=now + timedelta(seconds=7),
+        )
+        db.add_all([first_gate, second_gate, completed, current_gate])
+        db.flush()
+        second_gate.resumed_from_owner_gate_workflow_id = first_gate.id
+        completed.resumed_from_owner_gate_workflow_id = second_gate.id
+
+        for index, workflow in enumerate((first_gate, second_gate, current_gate)):
+            turn = WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="external_input",
+                dedupe_key=f"owner-gate-currentness-{index}",
+                state="sent",
+                created_at=workflow.created_at,
+                updated_at=workflow.updated_at,
+            )
+            db.add(turn)
+            db.flush()
+            workflow.active_turn_id = turn.id
+            db.add(
+                WorkflowTurnReceiptModel(
+                    workflow_turn_id=turn.id,
+                    receiver_terminal_id="owner",
+                    consumed_at=workflow.updated_at,
+                )
+            )
+            db.add(
+                WorkflowEffectModel(
+                    workflow_id=workflow.id,
+                    workflow_turn_id=turn.id,
+                    effect_kind="owner_gate_workflow",
+                    effect_key=f"owner-gate-currentness-{index}",
+                    state="completed",
+                    claim_token=f"claim-{index}",
+                    created_at=workflow.updated_at,
+                    updated_at=workflow.updated_at,
+                )
+            )
+        first_gate_id = first_gate.id
+        second_gate_id = second_gate.id
+        current_gate_id = current_gate.id
+        db.commit()
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert current["total"] == 1
+    assert current["items"][0]["workflow"]["id"] == current_gate_id
+    assert current["items"][0]["queue"]["wait_reason"] == "owner_gate"
+    assert interaction_read_model_service.list_session_current_queue_counts(
+        ["interaction-session"]
+    ) == {"interaction-session": 1}
+    assert (
+        ui_read_model_service.list_session_summaries(limit=10)["items"][0]["current_queue_count"]
+        == 1
+    )
+
+    history = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="history", limit=20
+    )
+    gate_shells = {
+        item["workflow"]["id"]: item
+        for item in history["items"]
+        if item["interaction_type"] == "workflow" and item["workflow"]["status"] == "owner_gate"
+    }
+    assert set(gate_shells) == {first_gate_id, second_gate_id}
+    assert {item["final_disposition"] for item in gate_shells.values()} == {"superseded"}
+    assert {item["workflow"]["reason"] for item in gate_shells.values()} == {
+        "first owner decision",
+        "second owner decision",
+    }
+
+    with database.SessionLocal() as db:
+        db.add(
+            WorkflowModel(
+                root_terminal_id="owner",
+                status="cancelled",
+                terminal_reason="owner cancelled",
+                resumed_from_owner_gate_workflow_id=current_gate_id,
+                created_at=now + timedelta(seconds=8),
+                updated_at=now + timedelta(seconds=9),
+            )
+        )
+        db.commit()
+
+    # Currentness is reconstructed from durable linkage on every query, so a
+    # browser reload or service restart cannot resurrect the historical gate.
+    for _ in range(2):
+        assert (
+            interaction_read_model_service.list_interactions(
+                "interaction-session", mode="current", limit=20
+            )["total"]
+            == 0
+        )
+        assert interaction_read_model_service.list_session_current_queue_counts(
+            ["interaction-session"]
+        ) == {"interaction-session": 0}
+
+
+def test_resumed_owner_gate_does_not_hide_indeterminate_effect_authority(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 7, 19, 0, 0)
+    with database.SessionLocal() as db:
+        db.add(_interaction_terminal())
+        gate = WorkflowModel(root_terminal_id="owner", status="owner_gate", created_at=now)
+        db.add(gate)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=gate.id,
+            kind="external_input",
+            dedupe_key="owner-gate-indeterminate",
+            state="sent",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(turn)
+        db.flush()
+        gate.active_turn_id = turn.id
+        db.add(
+            WorkflowEffectModel(
+                workflow_id=gate.id,
+                workflow_turn_id=turn.id,
+                effect_kind="send_message",
+                effect_key="owner-gate-indeterminate",
+                state="indeterminate",
+                claim_token="indeterminate-claim",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        db.add(
+            WorkflowModel(
+                root_terminal_id="owner",
+                status="terminal",
+                resumed_from_owner_gate_workflow_id=gate.id,
+                created_at=now + timedelta(seconds=1),
+                updated_at=now + timedelta(seconds=2),
+            )
+        )
+        db.commit()
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert current["total"] == 1
+    assert current["items"][0]["interaction_type"] == "effect"
+    assert current["items"][0]["queue"]["wait_reason"] == "indeterminate_effect"
+
+
+def test_resumed_owner_gate_does_not_hide_provider_execution_authority(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 7, 19, 30, 0)
+    terminal = _interaction_terminal()
+    terminal.runtime_lifecycle = "exited"
+    terminal.runtime_exited_at = now
+    with database.SessionLocal() as db:
+        db.add(terminal)
+        gate = WorkflowModel(
+            root_terminal_id="owner",
+            status="owner_gate",
+            terminal_reason="historical owner decision",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(gate)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=gate.id,
+            kind="external_input",
+            dedupe_key="historical-owner-gate-provider-lease",
+            state="sent",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(turn)
+        db.flush()
+        gate.active_turn_id = turn.id
+        db.add(
+            WorkflowTurnReceiptModel(
+                workflow_turn_id=turn.id,
+                receiver_terminal_id="owner",
+                consumed_at=now,
+            )
+        )
+        db.add(
+            WorkflowModel(
+                root_terminal_id="owner",
+                status="terminal",
+                terminal_reason="owner-approved work completed",
+                resumed_from_owner_gate_workflow_id=gate.id,
+                created_at=now + timedelta(seconds=1),
+                updated_at=now + timedelta(seconds=2),
+            )
+        )
+        db.add(
+            ProviderExecutionLeaseModel(
+                terminal_id="owner",
+                workflow_turn_id=turn.id,
+                acquired_at=now,
+            )
+        )
+        db.commit()
+        gate_id = int(gate.id)
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert current["total"] == 1
+    assert current["items"][0]["interaction_type"] == "runtime_authority"
+    assert current["items"][0]["task_type"] == "provider_execution"
+    assert current["items"][0]["queue"]["wait_reason"] == "current_provider_turn"
+    assert current["items"][0]["workflow"]["id"] == gate_id
+    assert interaction_read_model_service.list_session_current_queue_counts(
+        ["interaction-session"]
+    ) == {"interaction-session": 1}
+    plan = database.get_session_unresolved_work_plan("interaction-session")
+    assert plan["live_unsafe_count"] == 1
+    assert plan["reason_codes"] == ["PROVIDER_EXECUTION_ACTIVE"]
+
+    with database.SessionLocal() as db:
+        db.query(ProviderExecutionLeaseModel).delete()
+        db.commit()
+
+    assert (
+        interaction_read_model_service.list_interactions(
+            "interaction-session", mode="current", limit=20
+        )["total"]
+        == 0
+    )
+    assert database.get_session_unresolved_work_plan("interaction-session")["eligible"] is True
+    history = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="history", limit=20
+    )
+    historical_gate = next(
+        item
+        for item in history["items"]
+        if item["interaction_type"] == "workflow" and item["workflow"]["id"] == gate_id
+    )
+    assert historical_gate["final_disposition"] == "superseded"
+    assert historical_gate["workflow"]["reason"] == "historical owner decision"
+
+
 def test_wait_timeout_is_history_while_open_workflow_and_provider_axes_stay_independent(
     monkeypatch,
 ):

@@ -928,6 +928,69 @@ def test_reconcile_exited_terminal_workflow_authority_repairs_legacy_race(capaci
     assert database.get_provider_execution_admission_queue() == []
 
 
+def test_exited_provider_reconciliation_preserves_resumed_gate_history(capacity_db, monkeypatch):
+    observed_at = datetime.now()
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, "term-0")
+        terminal.runtime_lifecycle = "exited"
+        terminal.runtime_exited_at = observed_at
+        gate = database.WorkflowModel(
+            root_terminal_id="term-0",
+            status="owner_gate",
+            terminal_reason="historical owner decision",
+        )
+        db.add(gate)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=gate.id,
+            kind="external_input",
+            dedupe_key="historical-owner-gate-provider-reconciliation",
+            state="sent",
+        )
+        db.add(turn)
+        db.flush()
+        gate.active_turn_id = turn.id
+        db.add(
+            database.WorkflowModel(
+                root_terminal_id="term-0",
+                status="terminal",
+                terminal_reason="owner-approved work completed",
+                resumed_from_owner_gate_workflow_id=gate.id,
+            )
+        )
+        db.commit()
+        gate_id = int(gate.id)
+        turn_id = int(turn.id)
+
+    assert database.list_exited_terminal_provider_execution_candidates() == []
+    with database.SessionLocal() as db:
+        db.add(
+            database.ProviderExecutionLeaseModel(
+                terminal_id="term-0",
+                workflow_turn_id=turn_id,
+                acquired_at=observed_at,
+            )
+        )
+        db.commit()
+
+    assert database.list_exited_terminal_provider_execution_candidates() == ["term-0"]
+    monkeypatch.setattr(
+        terminal_service,
+        "_retire_observed_dead_runtime",
+        lambda _metadata, **_kwargs: (True, None),
+    )
+    assert terminal_service.reconcile_exited_terminal_provider_execution_authorities() == 1
+    assert terminal_service.reconcile_exited_terminal_provider_execution_authorities() == 0
+    with database.SessionLocal() as db:
+        historical = db.get(database.WorkflowModel, gate_id)
+        turn = db.get(WorkflowTurnModel, turn_id)
+        assert historical.status == "owner_gate"
+        assert historical.terminal_reason == "historical owner decision"
+        assert turn.state == "cancelled"
+        assert turn.queue_reason == database.PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED
+        assert db.get(database.ProviderExecutionLeaseModel, "term-0") is None
+
+
 def test_exited_provider_reconciliation_claim_fences_physical_retirement(capacity_db, monkeypatch):
     observed_at = datetime.now()
     with database.SessionLocal() as db:

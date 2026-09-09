@@ -26,6 +26,7 @@ from sqlalchemy import (
     UniqueConstraint,
     and_,
     create_engine,
+    exists,
     func,
     insert,
     inspect,
@@ -969,7 +970,7 @@ class WorkflowModel(Base):
     # A deliberate owner input may reopen a prior owner gate.  Retain that
     # provenance so the resident recovery turn can be distinguished from
     # autonomous continuation when disk pressure is RED.
-    resumed_from_owner_gate_workflow_id = Column(Integer, nullable=True)
+    resumed_from_owner_gate_workflow_id = Column(Integer, nullable=True, index=True)
     terminal_reason = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now)
@@ -2750,6 +2751,11 @@ def _migrate_workflow_turn_columns() -> None:
                 "CREATE INDEX IF NOT EXISTS ix_workflows_root_status_id "
                 "ON workflows(root_terminal_id, status, id)"
             )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS "
+            "ix_workflows_resumed_from_owner_gate_workflow_id "
+            "ON workflows(resumed_from_owner_gate_workflow_id)"
+        )
         receipt_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(workflow_turn_receipts)")
         }
@@ -4227,7 +4233,7 @@ def _session_unresolved_work_plan_in_transaction(
             db.query(WorkflowModel)
             .filter(
                 WorkflowModel.root_terminal_id.in_(terminal_ids),
-                WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+                workflow_current_execution_authority_predicate(WorkflowModel),
             )
             .order_by(WorkflowModel.id.asc())
         )
@@ -4254,7 +4260,7 @@ def _session_unresolved_work_plan_in_transaction(
             )
             .filter(
                 WorkflowModel.root_terminal_id.in_(terminal_ids),
-                WorkflowModel.status.notin_(_WORKSPACE_RETIREMENT_TERMINAL_WORKFLOW_STATES),
+                workflow_current_execution_authority_predicate(WorkflowModel),
                 WorkflowTurnModel.superseded_by_turn_id.is_(None),
                 or_(
                     WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
@@ -4419,7 +4425,7 @@ def _session_unresolved_work_plan_in_transaction(
             )
             .filter(
                 WorkflowModel.root_terminal_id.in_(terminal_ids),
-                WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+                workflow_current_execution_authority_predicate(WorkflowModel),
                 WorkflowModel.active_turn_id == WorkflowTurnModel.id,
                 ProviderExecutionLeaseModel.workflow_turn_id.is_(None),
                 or_(
@@ -5028,7 +5034,7 @@ def cancel_session_work_for_deletion(
             db.query(WorkflowModel)
             .filter(
                 WorkflowModel.id.in_(workflow_ids),
-                WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+                workflow_current_execution_authority_predicate(WorkflowModel),
             )
             .all()
             if workflow_ids
@@ -10588,6 +10594,7 @@ def mark_terminal_runtime_recovery_required_with_workflow_ids(
             .filter(
                 WorkflowModel.root_terminal_id == terminal_id,
                 WorkflowModel.status == WORKFLOW_OWNER_GATE,
+                workflow_current_execution_authority_predicate(WorkflowModel),
             )
             .first()
             is not None
@@ -10857,12 +10864,6 @@ def recovery_takeover_durable_eligibility(
     _ensure_session_deletion_receipt_schema()
     with SessionLocal() as db:
         terminal = db.get(TerminalModel, old_terminal_id)
-        current_workflow = (
-            db.query(WorkflowModel)
-            .filter(WorkflowModel.root_terminal_id == old_terminal_id)
-            .order_by(WorkflowModel.id.desc())
-            .first()
-        )
         reason = None
         if _terminal_deletion_fence_exists_in_transaction(db, old_terminal_id):
             reason = "RECOVERY_TARGET_DELETED"
@@ -10904,7 +10905,16 @@ def recovery_takeover_durable_eligibility(
             reason = "RECOVERY_RUNTIME_OPERATION_ACTIVE"
         elif db.get(ProviderExecutionLeaseModel, old_terminal_id) is not None:
             reason = "RECOVERY_PROVIDER_EXECUTION_ACTIVE"
-        elif current_workflow is not None and current_workflow.status == WORKFLOW_OWNER_GATE:
+        elif (
+            db.query(WorkflowModel.id)
+            .filter(
+                WorkflowModel.root_terminal_id == old_terminal_id,
+                WorkflowModel.status == WORKFLOW_OWNER_GATE,
+                workflow_current_execution_authority_predicate(WorkflowModel),
+            )
+            .first()
+            is not None
+        ):
             reason = "RECOVERY_GENUINE_OWNER_GATE"
         elif (
             db.query(WorkflowEffectModel.id)
@@ -11073,6 +11083,7 @@ def claim_recovery_takeover(
             .filter(
                 WorkflowModel.root_terminal_id == old_terminal_id,
                 WorkflowModel.status == WORKFLOW_OWNER_GATE,
+                workflow_current_execution_authority_predicate(WorkflowModel),
             )
             .first()
             is not None
@@ -11272,6 +11283,7 @@ def fence_claimed_recovery_takeover(takeover_id: str) -> Optional[Dict[str, Any]
                 .filter(
                     WorkflowModel.root_terminal_id == row.old_terminal_id,
                     WorkflowModel.status == WORKFLOW_OWNER_GATE,
+                    workflow_current_execution_authority_predicate(WorkflowModel),
                 )
                 .first()
                 is not None
@@ -12097,6 +12109,64 @@ WORKFLOW_OPEN = "open"
 WORKFLOW_TERMINAL = "terminal"
 WORKFLOW_OWNER_GATE = "owner_gate"
 WORKFLOW_CANCELLED = "cancelled"
+
+# An OWNER_GATE row is immutable audit of the pause.  The owner's durable
+# decision is represented by a newer same-terminal workflow which points back
+# to that row.  Once that exact edge exists the old gate can no longer advance
+# execution itself, even though its historical status remains ``owner_gate``.
+# Keep the raw-SQL read model and ORM safety plans on this one authority rule.
+WORKFLOW_CURRENT_EXECUTION_AUTHORITY_SQL = """(
+    w.status = 'open'
+    OR (
+      w.status = 'owner_gate'
+      AND NOT EXISTS (
+        SELECT 1 FROM workflows owner_gate_successor
+        WHERE owner_gate_successor.resumed_from_owner_gate_workflow_id = w.id
+          AND owner_gate_successor.root_terminal_id = w.root_terminal_id
+          AND owner_gate_successor.id > w.id
+          AND owner_gate_successor.status IN ('open', 'owner_gate', 'terminal', 'cancelled')
+      )
+    )
+)"""
+
+
+def workflow_current_execution_authority_predicate(workflow_model: Any = WorkflowModel) -> Any:
+    """Return the canonical OPEN/genuinely-owner-gated authority predicate."""
+    successor = aliased(WorkflowModel)
+    resumed = exists().where(
+        and_(
+            successor.resumed_from_owner_gate_workflow_id == workflow_model.id,
+            successor.root_terminal_id == workflow_model.root_terminal_id,
+            successor.id > workflow_model.id,
+            successor.status.in_(
+                (WORKFLOW_OPEN, WORKFLOW_OWNER_GATE, WORKFLOW_TERMINAL, WORKFLOW_CANCELLED)
+            ),
+        )
+    )
+    return or_(
+        workflow_model.status == WORKFLOW_OPEN,
+        and_(workflow_model.status == WORKFLOW_OWNER_GATE, ~resumed),
+    )
+
+
+def workflow_provider_execution_terminalization_predicate(
+    workflow_model: Any = WorkflowModel,
+) -> Any:
+    """Select workflow history whose dead provider turn can be settled.
+
+    A resumed OWNER_GATE stays immutable audit rather than being rewritten to
+    CANCELLED. Its exact provider turn can still be terminalized once physical
+    runtime death proves that no provider outcome can arrive.
+    """
+    return or_(
+        workflow_model.status.in_((WORKFLOW_TERMINAL, WORKFLOW_CANCELLED)),
+        and_(
+            workflow_model.status == WORKFLOW_OWNER_GATE,
+            ~workflow_current_execution_authority_predicate(workflow_model),
+        ),
+    )
+
+
 TURN_QUEUED = "queued"
 TURN_CLAIMED = "claimed"
 TURN_SENT = "sent"
@@ -13278,7 +13348,13 @@ def reconcile_owner_gated_workflow_successors(now: Optional[datetime] = None) ->
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         workflows = (
             db.query(WorkflowModel)
-            .filter(WorkflowModel.status == WORKFLOW_OWNER_GATE)
+            .filter(
+                WorkflowModel.status == WORKFLOW_OWNER_GATE,
+                or_(
+                    workflow_current_execution_authority_predicate(WorkflowModel),
+                    WorkflowModel.terminal_reason == BOUNDED_TRANSPORT_RETRY_GUARD_REASON,
+                ),
+            )
             .order_by(WorkflowModel.id.asc())
             .all()
         )
@@ -13542,7 +13618,8 @@ def get_protected_workflow_root_terminal_ids() -> List[str]:
         return [
             row[0]
             for row in db.query(WorkflowModel.root_terminal_id)
-            .filter(WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)))
+            .filter(workflow_current_execution_authority_predicate(WorkflowModel))
+            .distinct()
             .all()
         ]
 
@@ -18969,7 +19046,7 @@ def _cancel_protected_workflows_in_transaction(
         db.query(WorkflowModel)
         .filter(
             WorkflowModel.root_terminal_id.in_(normalized),
-            WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+            workflow_current_execution_authority_predicate(WorkflowModel),
         )
         .all()
     )
@@ -19075,7 +19152,7 @@ def _reconcile_exited_provider_execution_in_transaction(
         .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
         .filter(
             WorkflowModel.root_terminal_id == terminal.id,
-            WorkflowModel.status.in_((WORKFLOW_TERMINAL, WORKFLOW_CANCELLED)),
+            workflow_provider_execution_terminalization_predicate(WorkflowModel),
             WorkflowModel.active_turn_id == WorkflowTurnModel.id,
             and_(
                 or_(
@@ -19107,7 +19184,7 @@ def _reconcile_exited_provider_execution_in_transaction(
         .filter(
             WorkflowTurnModel.id.in_(sorted(target_turn_ids)),
             WorkflowModel.root_terminal_id == terminal.id,
-            WorkflowModel.status.in_((WORKFLOW_TERMINAL, WORKFLOW_CANCELLED)),
+            workflow_provider_execution_terminalization_predicate(WorkflowModel),
         )
         .all()
     )
@@ -19190,7 +19267,7 @@ def list_exited_terminal_provider_execution_candidates(
                         )
                     ),
                     or_(
-                        WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+                        workflow_current_execution_authority_predicate(WorkflowModel),
                         and_(
                             or_(
                                 WorkflowTurnModel.queue_reason.is_(None),
@@ -19353,7 +19430,7 @@ def _exited_provider_execution_reconciliation_targets_in_transaction(
         or db.query(WorkflowModel.id)
         .filter(
             WorkflowModel.root_terminal_id == terminal.id,
-            WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+            workflow_current_execution_authority_predicate(WorkflowModel),
         )
         .first()
         is not None
@@ -19583,7 +19660,7 @@ def _orphaned_protected_workflow_authority_snapshot(
         db.query(WorkflowModel)
         .filter(
             WorkflowModel.root_terminal_id == root_terminal_id,
-            WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+            workflow_current_execution_authority_predicate(WorkflowModel),
         )
         .order_by(WorkflowModel.id.asc())
         .all()
@@ -19679,7 +19756,7 @@ def list_orphaned_protected_workflow_authorities() -> List[Dict[str, Any]]:
             .outerjoin(TerminalModel, TerminalModel.id == WorkflowModel.root_terminal_id)
             .filter(
                 TerminalModel.id.is_(None),
-                WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+                workflow_current_execution_authority_predicate(WorkflowModel),
             )
             .order_by(WorkflowModel.root_terminal_id.asc(), WorkflowModel.id.asc())
             .all()
@@ -19733,7 +19810,16 @@ def reconcile_orphaned_protected_workflow_authority(
                     "already_reconciled": False,
                     "reason": "identity_changed",
                 }
-            if any(row.status in (WORKFLOW_OPEN, WORKFLOW_OWNER_GATE) for row in rows):
+            if (
+                db.query(WorkflowModel.id)
+                .filter(
+                    WorkflowModel.id.in_(expected),
+                    WorkflowModel.root_terminal_id == root_terminal_id,
+                    workflow_current_execution_authority_predicate(WorkflowModel),
+                )
+                .first()
+                is not None
+            ):
                 db.rollback()
                 return {
                     "reconciled": 0,
@@ -19806,7 +19892,14 @@ def reconcile_orphaned_protected_workflow_authority(
             db.rollback()
             return {"reconciled": 0, "already_reconciled": False, "reason": "identity_changed"}
         protected = sorted(
-            int(row.id) for row in rows if row.status in (WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)
+            int(row[0])
+            for row in db.query(WorkflowModel.id)
+            .filter(
+                WorkflowModel.id.in_(expected),
+                WorkflowModel.root_terminal_id == root_terminal_id,
+                workflow_current_execution_authority_predicate(WorkflowModel),
+            )
+            .all()
         )
         if not protected:
             db.rollback()

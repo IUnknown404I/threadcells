@@ -171,6 +171,153 @@ def test_cancelled_workflow_queued_turn_is_historical_without_supersession(monke
     }
 
 
+def test_resumed_owner_gates_do_not_block_deletion_or_resurrect_unsettled_provider_state(
+    monkeypatch,
+):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 7, 20, 0, 0)
+    with database.SessionLocal() as db:
+        db.add(_terminal())
+        gate_ids = []
+        for index in range(4):
+            gate = WorkflowModel(
+                root_terminal_id="owner",
+                status="owner_gate",
+                terminal_reason=f"historical owner decision {index}",
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(gate)
+            db.flush()
+            turn = WorkflowTurnModel(
+                workflow_id=gate.id,
+                kind="external_input",
+                dedupe_key=f"historical-owner-gate-{index}",
+                state="sent",
+                provider_processing_observed_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(turn)
+            db.flush()
+            gate.active_turn_id = turn.id
+            db.add(
+                WorkflowTurnReceiptModel(
+                    workflow_turn_id=turn.id,
+                    receiver_terminal_id="owner",
+                    consumed_at=now,
+                )
+            )
+            db.add(
+                WorkflowEffectModel(
+                    workflow_id=gate.id,
+                    workflow_turn_id=turn.id,
+                    effect_kind="owner_gate_workflow",
+                    effect_key=f"historical-owner-gate-{index}",
+                    state="completed",
+                    claim_token=f"claim-{index}",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            successor = WorkflowModel(
+                root_terminal_id="owner",
+                status="terminal" if index % 2 == 0 else "cancelled",
+                terminal_reason="owner decision resolved",
+                resumed_from_owner_gate_workflow_id=gate.id,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(successor)
+            db.flush()
+            gate_ids.append(gate.id)
+        db.commit()
+
+    plan = _plan()
+    assert plan["eligible"] is True
+    assert plan["reason_codes"] == []
+    assert interaction_read_model_service.list_session_current_queue_counts(["session"]) == {
+        "session": 0
+    }
+    history = interaction_read_model_service.list_interactions("session", mode="history", limit=20)
+    historical_gates = [
+        item
+        for item in history["items"]
+        if item["interaction_type"] == "workflow" and item["workflow"]["id"] in gate_ids
+    ]
+    assert len(historical_gates) == 4
+    assert {item["final_disposition"] for item in historical_gates} == {"superseded"}
+    assert all(item["workflow"]["reason"] for item in historical_gates)
+
+
+def test_owner_gate_resumed_after_delete_plan_is_preserved_by_idempotent_cancel(monkeypatch):
+    _install_database(monkeypatch)
+    with database.SessionLocal() as db:
+        db.add(_terminal())
+        gate = WorkflowModel(
+            root_terminal_id="owner",
+            status="owner_gate",
+            terminal_reason="owner decision required",
+        )
+        db.add(gate)
+        db.commit()
+        gate_id = int(gate.id)
+
+    stale_plan = _plan()
+    assert stale_plan["cancellable_count"] == 1
+    assert stale_plan["reason_codes"] == ["OWNER_GATE"]
+
+    with database.SessionLocal() as db:
+        db.add(
+            WorkflowModel(
+                root_terminal_id="owner",
+                status="terminal",
+                terminal_reason="owner-approved work completed",
+                resumed_from_owner_gate_workflow_id=gate_id,
+            )
+        )
+        db.commit()
+
+    resolved = database.cancel_session_work_for_deletion(
+        "session",
+        expected_plan_token=stale_plan["plan_token"],
+    )
+    assert resolved["cancelled"] is True
+    assert resolved["already_cancelled"] is True
+    assert resolved["residual"]["eligible"] is True
+    with database.SessionLocal() as db:
+        historical = db.get(WorkflowModel, gate_id)
+        assert historical.status == "owner_gate"
+        assert historical.terminal_reason == "owner decision required"
+        assert db.query(SessionDeletionCancellationAuditModel).count() == 0
+
+
+def test_only_same_terminal_linked_successor_resolves_owner_gate(monkeypatch):
+    _install_database(monkeypatch)
+    with database.SessionLocal() as db:
+        db.add_all([_terminal(), _terminal("foreign", "foreign-session")])
+        gate = WorkflowModel(
+            root_terminal_id="owner", status="owner_gate", terminal_reason="owner decision"
+        )
+        db.add(gate)
+        db.flush()
+        db.add(
+            WorkflowModel(
+                root_terminal_id="foreign",
+                status="terminal",
+                resumed_from_owner_gate_workflow_id=gate.id,
+            )
+        )
+        db.commit()
+
+    plan = _plan()
+    assert plan["cancellable"] is True
+    assert plan["reason_codes"] == ["OWNER_GATE"]
+    current = interaction_read_model_service.list_interactions("session", mode="current", limit=20)
+    assert current["total"] == 1
+    assert current["items"][0]["queue"]["wait_reason"] == "owner_gate"
+
+
 def test_superseded_turn_and_completed_effect_add_no_open_workflow_blocker(monkeypatch):
     _install_database(monkeypatch)
     with database.SessionLocal() as db:

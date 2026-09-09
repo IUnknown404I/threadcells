@@ -47,6 +47,7 @@ from cli_agent_orchestrator.clients.database import (
     get_parent_completion_barrier,
     get_terminal_metadata,
     get_workflow_effect_state,
+    get_workflow_input_binding_delivery,
     get_workflow_provider_outcome,
     get_workflow_status,
     has_admitted_workflow_turn,
@@ -903,7 +904,7 @@ class TerminalAdmissionError(RuntimeError):
 
 def _send_direct_input(
     terminal_id: str, message: str, orchestration_type: OrchestrationType, binding: str
-) -> None:
+) -> Dict[str, Any]:
     """Send input directly to a terminal (bypasses inbox).
 
     Args:
@@ -924,50 +925,66 @@ def _send_direct_input(
         },
     )
     response.raise_for_status()
+    payload = response.json()
+    return payload if isinstance(payload, dict) else {"success": True}
 
 
-def _send_direct_input_handoff(terminal_id: str, provider: str, message: str, binding: str) -> None:
-    """Send handoff payload to an agent, prepending orchestrator instructions if needed."""
+def _direct_handoff_payload(provider: str, message: str) -> str:
+    """Build the exact payload retained by the handoff workflow turn."""
     message = _with_no_tg_notify(message)
-    # For Codex provider: prepend handoff context so the worker agent knows
-    # this is a blocking handoff and should simply output results rather than
-    # attempting to call send_message back to the supervisor.
-    if provider == "codex":
-        supervisor_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
-        handoff_message = (
-            f"[CAO Handoff] Supervisor terminal ID: {supervisor_id}. "
-            "This is a blocking handoff — the orchestrator will automatically "
-            "capture your response when you finish. Complete the task and output "
-            "your results directly. Submit the structured result with "
-            "submit_handoff_result_v1(logical_turn_id=<current logical-turn>, "
-            "document=<V1 object>) immediately before finishing; a successful call "
-            "is the authoritative V1 artifact. Then emit exactly two logical lines "
-            "for compatibility: line 1 must be CAO_RESULT_V1; line 2 must be one "
-            "compact single-line JSON object matching V1, with no Markdown fence, "
-            "bullet, prefix, suffix, extra text, or extra blank line. "
-            "The injected trailing NO_TG_NOTIFY directive is input-only policy context; "
-            "do not echo it in your final response. "
-            "Do NOT use send_message to notify the supervisor "
-            "unless explicitly needed — just do the work and present your deliverables.\n\n"
-            f"{message}"
-        )
-    else:
-        handoff_message = message
-
-    _send_direct_input(terminal_id, handoff_message, OrchestrationType.HANDOFF, binding)
+    if provider != "codex":
+        return message
+    supervisor_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
+    return (
+        f"[CAO Handoff] Supervisor terminal ID: {supervisor_id}. "
+        "This is a blocking handoff — the orchestrator will automatically "
+        "capture your response when you finish. Complete the task and output "
+        "your results directly. Submit the structured result with "
+        "submit_handoff_result_v1(logical_turn_id=<current logical-turn>, "
+        "document=<V1 object>) immediately before finishing; a successful call "
+        "is the authoritative V1 artifact. Then emit exactly two logical lines "
+        "for compatibility: line 1 must be CAO_RESULT_V1; line 2 must be one "
+        "compact single-line JSON object matching V1, with no Markdown fence, "
+        "bullet, prefix, suffix, extra text, or extra blank line. "
+        "The injected trailing NO_TG_NOTIFY directive is input-only policy context; "
+        "do not echo it in your final response. "
+        "Do NOT use send_message to notify the supervisor "
+        "unless explicitly needed — just do the work and present your deliverables.\n\n"
+        f"{message}"
+    )
 
 
-def _send_direct_input_assign(terminal_id: str, message: str, binding: str) -> None:
-    """Send assign payload to a worker agent, appending callback instructions."""
-    # Auto-inject sender terminal ID suffix when enabled
+def _send_direct_input_handoff(
+    terminal_id: str, provider: str, message: str, binding: str
+) -> Dict[str, Any]:
+    """Send handoff payload to an agent, prepending orchestrator instructions if needed."""
+    return _send_direct_input(
+        terminal_id,
+        _direct_handoff_payload(provider, message),
+        OrchestrationType.HANDOFF,
+        binding,
+    )
+
+
+def _direct_assign_payload(message: str) -> str:
+    """Build the exact payload retained by the assigned workflow turn."""
     if ENABLE_SENDER_ID_INJECTION:
         sender_id = os.environ.get("CAO_TERMINAL_ID", "unknown")
         message += (
             f"\n\n[Assigned by terminal {sender_id}. "
             f"When done, send results back to terminal {sender_id} using send_message]"
         )
+    return _with_no_tg_notify(message)
 
-    _send_direct_input(terminal_id, _with_no_tg_notify(message), OrchestrationType.ASSIGN, binding)
+
+def _send_direct_input_assign(terminal_id: str, message: str, binding: str) -> Dict[str, Any]:
+    """Send assign payload to a worker agent, appending callback instructions."""
+    return _send_direct_input(
+        terminal_id,
+        _direct_assign_payload(message),
+        OrchestrationType.ASSIGN,
+        binding,
+    )
 
 
 def _with_no_tg_notify(message: str) -> str:
@@ -1610,6 +1627,8 @@ async def _handoff_impl(
                     terminal_id=terminal_id,
                     state=HandoffState.FAILED,
                 )
+        binding: Optional[str] = None
+        delivery: Dict[str, Any] = {}
         try:
             from cli_agent_orchestrator.services.operations_service import (
                 workflow_execution_admission_fence,
@@ -1625,16 +1644,45 @@ async def _handoff_impl(
                 and not bind_child_assignment_input_turn(terminal_id, binding)
             ):
                 raise RuntimeError("Could not bind handoff child workflow authority")
-            _send_direct_input_handoff(terminal_id, provider, message, binding)
+            delivery = _send_direct_input_handoff(terminal_id, provider, message, binding) or {}
         except Exception:
-            if parent_terminal_id and registered:
+            retained = (
+                get_workflow_input_binding_delivery(
+                    terminal_id,
+                    binding,
+                    expected_payload=_direct_handoff_payload(provider, message),
+                )
+                if binding is not None
+                else None
+            )
+            if retained is not None and retained["accepted"]:
+                delivery = retained
+            elif parent_terminal_id and registered:
                 if request_effect_id is None:
                     cancel_child_assignments_for_terminal(terminal_id)
+                    raise
                 else:
-                    cancel_child_assignment_attempt(
+                    cancelled = cancel_child_assignment_attempt(
                         parent_terminal_id, terminal_id, int(request_effect_id)
                     )
-            raise
+                    if not cancelled and binding is not None:
+                        # Queue/provider admission may win after the first
+                        # observation.  Cancellation is fenced in the same DB
+                        # writer transaction; re-read that winner instead of
+                        # reporting a failure for an input now durably owned.
+                        retained = get_workflow_input_binding_delivery(
+                            terminal_id,
+                            binding,
+                            expected_payload=_direct_handoff_payload(provider, message),
+                        )
+                        if retained is not None and retained["accepted"]:
+                            delivery = retained
+                        else:
+                            raise
+                    else:
+                        raise
+            else:
+                raise
         remaining = max(0, deadline - time.monotonic())
         result = await _await_handoff_impl(terminal_id, timeout=remaining)
         if result.state == HandoffState.WAITING:
@@ -2070,6 +2118,8 @@ def _assign_impl(
                         else "Parent workflow closed before assignment input could be sent"
                     ),
                 }
+        binding: Optional[str] = None
+        delivery: Dict[str, Any] = {}
         try:
             from cli_agent_orchestrator.services.operations_service import (
                 workflow_execution_admission_fence,
@@ -2129,24 +2179,62 @@ def _assign_impl(
                 and not bind_child_assignment_input_turn(terminal_id, binding)
             ):
                 raise RuntimeError("Could not bind assigned child workflow authority")
-            _send_direct_input_assign(terminal_id, message, binding)
+            delivery = _send_direct_input_assign(terminal_id, message, binding) or {}
         except Exception:
-            if parent_terminal_id and registered:
+            retained = (
+                get_workflow_input_binding_delivery(
+                    terminal_id,
+                    binding,
+                    expected_payload=_direct_assign_payload(message),
+                )
+                if binding is not None
+                else None
+            )
+            if retained is not None and retained["accepted"]:
+                delivery = retained
+            elif parent_terminal_id and registered:
                 if request_effect_id is None:
                     cancel_child_assignments_for_terminal(terminal_id)
+                    raise
                 else:
-                    cancel_child_assignment_attempt(
+                    cancelled = cancel_child_assignment_attempt(
                         parent_terminal_id, terminal_id, int(request_effect_id)
                     )
-            raise
+                    if not cancelled and binding is not None:
+                        # Queue/provider admission may win after the first
+                        # observation.  Cancellation is fenced in the same DB
+                        # writer transaction; re-read that winner instead of
+                        # reporting a failure for an input now durably owned.
+                        retained = get_workflow_input_binding_delivery(
+                            terminal_id,
+                            binding,
+                            expected_payload=_direct_assign_payload(message),
+                        )
+                        if retained is not None and retained["accepted"]:
+                            delivery = retained
+                        else:
+                            raise
+                    else:
+                        raise
+            else:
+                raise
 
-        return {
+        result = {
             "success": True,
             "terminal_id": terminal_id,
             "reviewer_reused": reused_reviewer,
             **({"review_attempt": review_authority} if review_authority is not None else {}),
             "message": f"Task assigned to {agent_profile} (terminal: {terminal_id})",
         }
+        if delivery.get("queued"):
+            result.update(
+                {
+                    "queued": True,
+                    "status": delivery.get("status", "queued_provider_execution"),
+                    "reason_code": delivery.get("reason_code") or delivery.get("queue_reason"),
+                }
+            )
+        return result
 
     except TerminalAdmissionError as e:
         return {

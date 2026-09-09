@@ -13023,6 +13023,112 @@ def issue_workflow_input_binding(root_terminal_id: str) -> Optional[str]:
     return binding
 
 
+def get_workflow_input_binding_delivery(
+    root_terminal_id: str,
+    binding: str,
+    *,
+    expected_payload: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Describe accepted delivery authority for one exact internal input.
+
+    A server-bound input can be durably queued before the internal HTTP call
+    reaches provider transport (notably while a resident runtime reconnects
+    across a rolling upgrade).  Callers use this protected control-plane view
+    to preserve that exact turn instead of mistaking the expected queue state
+    for a pre-delivery failure.
+    """
+    _ensure_workflow_schema()
+    _ensure_provider_execution_schema()
+    with SessionLocal() as db:
+        turn = (
+            db.query(WorkflowTurnModel)
+            .join(WorkflowModel, WorkflowTurnModel.workflow_id == WorkflowModel.id)
+            .filter(
+                WorkflowModel.root_terminal_id == root_terminal_id,
+                WorkflowModel.status == WORKFLOW_OPEN,
+                WorkflowModel.active_turn_id == WorkflowTurnModel.id,
+                WorkflowTurnModel.transport_binding == binding,
+            )
+            .first()
+        )
+        if turn is None:
+            return None
+        provider_lease = db.get(ProviderExecutionLeaseModel, root_terminal_id)
+        provider_admitted = bool(
+            provider_lease is not None and provider_lease.workflow_turn_id == turn.id
+        )
+        receipted = (
+            db.query(WorkflowTurnReceiptModel.id)
+            .filter(
+                WorkflowTurnReceiptModel.workflow_turn_id == turn.id,
+                WorkflowTurnReceiptModel.receiver_terminal_id == root_terminal_id,
+            )
+            .first()
+            is not None
+        )
+        payload_matches = expected_payload is None or turn.payload == expected_payload
+        queued = turn.state in (TURN_QUEUED, TURN_CLAIMED) and payload_matches
+        accepted = queued or provider_admitted or receipted
+        return {
+            "turn_id": cast(int, turn.id),
+            "state": cast(str, turn.state),
+            "queue_reason": turn.queue_reason,
+            "reconnect_pending": turn.provider_reconnect_requested_at is not None,
+            "accepted": accepted,
+            "queued": queued and not provider_admitted and not receipted,
+            "provider_admitted": provider_admitted,
+            "receipted": receipted,
+            "payload_matches": payload_matches,
+        }
+
+
+def retain_queued_workflow_input_binding(
+    root_terminal_id: str, binding: str, payload: str
+) -> Optional[Dict[str, Any]]:
+    """Retain payload for an exact binding already fenced behind recovery.
+
+    The binding and payload become one durable input before any provider send.
+    A different payload for the same opaque binding is an authority conflict;
+    a claimed turn is left to its existing queue owner rather than rewritten.
+    """
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        turn = (
+            db.query(WorkflowTurnModel)
+            .join(WorkflowModel, WorkflowTurnModel.workflow_id == WorkflowModel.id)
+            .filter(
+                WorkflowModel.root_terminal_id == root_terminal_id,
+                WorkflowModel.status == WORKFLOW_OPEN,
+                WorkflowModel.active_turn_id == WorkflowTurnModel.id,
+                WorkflowTurnModel.transport_binding == binding,
+                WorkflowTurnModel.state == TURN_QUEUED,
+            )
+            .first()
+        )
+        if turn is None:
+            db.rollback()
+            return None
+        if turn.payload is not None and turn.payload != payload:
+            db.rollback()
+            raise ValueError("input binding payload changed")
+        if turn.payload is None:
+            turn.payload = payload
+            turn.updated_at = datetime.now()
+        result = {
+            "turn_id": cast(int, turn.id),
+            "state": cast(str, turn.state),
+            "queue_reason": turn.queue_reason,
+            "reconnect_pending": turn.provider_reconnect_requested_at is not None,
+            "accepted": True,
+            "queued": True,
+            "provider_admitted": False,
+            "receipted": False,
+        }
+        db.commit()
+        return result
+
+
 def resolve_workflow_input_binding(root_terminal_id: str, binding: str) -> Optional[int]:
     """Resolve a direct binding only while its workflow turn remains current."""
     _ensure_workflow_schema()
@@ -22960,6 +23066,8 @@ def cancel_child_assignment_attempt(
     """
     _ensure_child_assignment_schema()
     _ensure_delegation_result_schema()
+    _ensure_workflow_schema()
+    _ensure_provider_execution_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         assignment = (
@@ -22983,6 +23091,39 @@ def cancel_child_assignment_attempt(
         ):
             db.rollback()
             return False
+        if assignment.child_workflow_turn_id is not None:
+            child_turn = db.get(WorkflowTurnModel, cast(int, assignment.child_workflow_turn_id))
+            provider_lease = db.get(ProviderExecutionLeaseModel, child_terminal_id)
+            provider_admitted = bool(
+                child_turn is not None
+                and provider_lease is not None
+                and provider_lease.workflow_turn_id == child_turn.id
+            )
+            receipted = bool(
+                child_turn is not None
+                and db.query(WorkflowTurnReceiptModel.id)
+                .filter(
+                    WorkflowTurnReceiptModel.workflow_turn_id == child_turn.id,
+                    WorkflowTurnReceiptModel.receiver_terminal_id == child_terminal_id,
+                )
+                .first()
+                is not None
+            )
+            if (
+                (
+                    child_turn is not None
+                    and child_turn.state in (TURN_QUEUED, TURN_CLAIMED)
+                    and child_turn.payload is not None
+                )
+                or provider_admitted
+                or receipted
+            ):
+                # The input has an independent durable delivery owner.  This
+                # writer transaction is the cancellation-vs-queue/provider
+                # fence: never invalidate the assignment that the same turn
+                # will later deliver or has already admitted.
+                db.rollback()
+                return False
         delegation_kind = "handoff" if assignment.status.startswith("handoff_") else "assign"
         now = datetime.now()
         assignment.status = ChildAssignmentStatus.CANCELLED.value

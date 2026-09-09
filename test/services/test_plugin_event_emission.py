@@ -1,5 +1,7 @@
 """Tests for plugin event emission from service-layer operations."""
 
+import hashlib
+import json
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -116,6 +118,14 @@ class TestSessionPluginEvents:
         """Permanent session deletion should emit only after the purge succeeds."""
         registry = _registry_mock()
         call_order: list[str] = []
+        workspace_authority = {
+            "version": 1,
+            "worktrees": [],
+            "work_context": None,
+        }
+        workspace_authority_sha256 = hashlib.sha256(
+            json.dumps(workspace_authority, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
 
         async def record_dispatch(*_args):
             call_order.append("dispatch")
@@ -148,7 +158,12 @@ class TestSessionPluginEvents:
             ),
             patch(
                 "cli_agent_orchestrator.services.session_service._session_deletion_preflight",
-                return_value={"eligible": True, "requires_dirty_confirmation": False},
+                return_value={
+                    "eligible": True,
+                    "requires_dirty_confirmation": False,
+                    "_workspace_authority": workspace_authority,
+                    "_workspace_authority_sha256": workspace_authority_sha256,
+                },
             ),
             patch(
                 "cli_agent_orchestrator.services.session_service.begin_session_hard_deletion",
@@ -161,6 +176,13 @@ class TestSessionPluginEvents:
                     "allow_dirty_workspace": False,
                 },
             ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.bind_session_hard_deletion_workspace_authority",
+                return_value={
+                    "bound": True,
+                    "workspace_authority_sha256": workspace_authority_sha256,
+                },
+            ) as mock_bind_workspace,
             patch(
                 "cli_agent_orchestrator.services.session_service.get_writable_work_context_by_session",
                 return_value=None,
@@ -198,6 +220,11 @@ class TestSessionPluginEvents:
             },
         }
         assert call_order == ["complete_hard_delete", "dispatch"]
+        mock_bind_workspace.assert_called_once_with(
+            "session-lifetime-1",
+            "cao-demo",
+            workspace_authority=workspace_authority,
+        )
         event_type, event = registry.dispatch.await_args.args
         assert event_type == "post_kill_session"
         assert isinstance(event, PostKillSessionEvent)

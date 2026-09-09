@@ -5790,28 +5790,44 @@ def terminal_deletion_auth_token_matches(terminal_id: str, token: str) -> bool:
         return bool(fenced and digest and hmac.compare_digest(digest, token_digest))
 
 
-def _session_terminal_dict(terminal: TerminalModel) -> Dict[str, Any]:
+_SESSION_WORKSPACE_RETIREMENT_TERMINAL_FIELDS = (
+    "id",
+    "session_id",
+    "project_id",
+    "launch_worktree",
+    "managed_worktree_kind",
+    "managed_worktree_source",
+    "managed_worktree_branch",
+    "managed_worktree_commit",
+    "managed_worktree_origin_terminal_id",
+    "writable_work_context_id",
+    "writer_authority_generation",
+)
+
+
+def _session_workspace_retirement_terminal_dict(
+    terminal: TerminalModel,
+) -> Dict[str, Any]:
+    """Project every durable field consumed by managed-worktree retirement."""
     return {
-        "id": terminal.id,
+        field: getattr(terminal, field) for field in _SESSION_WORKSPACE_RETIREMENT_TERMINAL_FIELDS
+    }
+
+
+def _session_terminal_dict(terminal: TerminalModel) -> Dict[str, Any]:
+    workspace_retirement = _session_workspace_retirement_terminal_dict(terminal)
+    return {
+        **workspace_retirement,
         "tmux_session": terminal.tmux_session,
-        "session_id": terminal.session_id,
         "tmux_window": terminal.tmux_window,
         "provider": terminal.provider,
         "agent_profile": terminal.agent_profile,
         "profile_revision_id": terminal.profile_revision_id,
         "provider_config_revision_id": terminal.provider_config_revision_id,
         "launch_snapshot_status": terminal.launch_snapshot_status,
-        "launch_worktree": terminal.launch_worktree,
         "write_enabled": terminal.write_enabled,
         "context_role": terminal.context_role,
-        "managed_worktree_kind": terminal.managed_worktree_kind,
-        "managed_worktree_source": terminal.managed_worktree_source,
-        "managed_worktree_branch": terminal.managed_worktree_branch,
-        "managed_worktree_commit": terminal.managed_worktree_commit,
-        "managed_worktree_origin_terminal_id": terminal.managed_worktree_origin_terminal_id,
-        "writable_work_context_id": terminal.writable_work_context_id,
         "workspace_classification": terminal.workspace_classification,
-        "project_id": terminal.project_id,
         "project_name": terminal.project_name,
         "project_path": terminal.project_path,
         "project_description": terminal.project_description,

@@ -49,6 +49,7 @@ from cli_agent_orchestrator.clients.database import (
     cancel_child_assignments_for_terminal,
     cancel_workflows_for_terminal,
     claim_exited_terminal_provider_execution_reconciliation,
+    claim_review_worktree_preparation,
     claim_terminal_runtime_exit,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
@@ -84,6 +85,7 @@ from cli_agent_orchestrator.clients.database import (
     record_workflow_provider_reconnect_output_boundary,
     release_exited_terminal_provider_execution_reconciliation_claim,
     release_provider_execution,
+    release_review_worktree_preparation,
     release_terminal_runtime_operation,
     replace_starting_terminal_runtime_identity,
     requeue_settled_unadmitted_workflow_turn,
@@ -91,6 +93,7 @@ from cli_agent_orchestrator.clients.database import (
     reserve_writable_work_context,
     reset_recovery_takeover_after_confirmed_prestart_failure,
     resolve_session_lifetime,
+    review_worktree_preparation_owned,
     terminal_deletion_receipt_exists,
     terminal_requires_result_snapshot,
     terminal_runtime_operation_owned,
@@ -2996,6 +2999,7 @@ def request_provider_runtime_sidecar_reconnect(
     reconnect_kwargs: Dict[str, Any] = {}
     if claim_token is not None:
         reconnect_kwargs["runtime_operation_claim_token"] = claim_token
+        reconnect_kwargs["runtime_operation_claim_kind"] = "reconnect"
     send_input(
         terminal_id,
         reconnect_input,
@@ -3211,6 +3215,8 @@ def send_input(
     orchestration_type: OrchestrationType | None = None,
     logical_turn_id: int | None = None,
     runtime_operation_claim_token: str | None = None,
+    runtime_operation_claim_kind: str | None = None,
+    expected_review_revision: str | None = None,
     workflow_turn_claim_token: str | None = None,
     workflow_turn_claim_generation: int | None = None,
 ) -> bool:
@@ -3222,6 +3228,7 @@ def send_input(
     bracketed paste triggers multi-line mode).
     """
     runtime_operation_token: str | None = None
+    review_preparation_claim_acquired = False
     provider_execution_released = False
     try:
         metadata = get_terminal_metadata(terminal_id)
@@ -3241,13 +3248,52 @@ def send_input(
 
         execution_acquired = False
         transport_accepted = False
+        if runtime_operation_claim_token is None and logical_turn_id is not None:
+            preparation = claim_review_worktree_preparation(terminal_id, logical_turn_id)
+            if preparation.get("required"):
+                if not preparation.get("claimed"):
+                    from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+                    raise AdmissionDenied(
+                        str(
+                            preparation.get(
+                                "reason_code", "REVIEW_WORKTREE_PREPARATION_UNAVAILABLE"
+                            )
+                        ),
+                        {},
+                    )
+                runtime_operation_claim_token = str(preparation["claim_token"])
+                runtime_operation_claim_kind = "review_worktree_prepare"
+                expected_review_revision = str(preparation["revision"])
+                review_preparation_claim_acquired = True
+                runtime_operation_token = runtime_operation_claim_token
+                from cli_agent_orchestrator.services.managed_worktree_service import (
+                    prepare_reviewer_worktree_revision,
+                )
+
+                prepare_reviewer_worktree_revision(metadata, expected_review_revision)
         if runtime_operation_claim_token is not None:
-            if not terminal_runtime_operation_owned(
-                terminal_id, runtime_operation_claim_token, "reconnect"
-            ):
-                raise RuntimeError("provider reconnect lost runtime-operation ownership")
+            if runtime_operation_claim_kind == "review_worktree_prepare":
+                if (
+                    logical_turn_id is None
+                    or expected_review_revision is None
+                    or not review_worktree_preparation_owned(
+                        terminal_id,
+                        logical_turn_id,
+                        runtime_operation_claim_token,
+                        expected_review_revision,
+                    )
+                ):
+                    raise RuntimeError("review worktree preparation lost authority")
+            elif runtime_operation_claim_kind == "reconnect":
+                if not terminal_runtime_operation_owned(
+                    terminal_id, runtime_operation_claim_token, "reconnect"
+                ):
+                    raise RuntimeError("provider reconnect lost runtime-operation ownership")
+            else:
+                raise RuntimeError("runtime-operation claim kind is invalid")
             runtime_operation_token = runtime_operation_claim_token
-        elif logical_turn_id is not None:
+        if logical_turn_id is not None and runtime_operation_claim_kind != "reconnect":
             from cli_agent_orchestrator.services.operations_service import (
                 acquire_provider_execution_slot,
             )
@@ -3263,6 +3309,13 @@ def send_input(
                 _wake_queued_provider_execution(registry)
             raise AdmissionDenied("TERMINAL_RUNTIME_OPERATION_BUSY", {})
         try:
+            if expected_review_revision is not None:
+                from cli_agent_orchestrator.services.managed_worktree_service import (
+                    reviewer_worktree_matches_revision,
+                )
+
+                if not reviewer_worktree_matches_revision(metadata, expected_review_revision):
+                    raise RuntimeError("review worktree revision changed before provider transport")
             if logical_turn_id is not None:
                 cursor_requirement = getattr(provider, "turn_outcome_cursor_required", None)
                 cursor_required = bool(cursor_requirement and cursor_requirement() is True)
@@ -3378,7 +3431,10 @@ def send_input(
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
         raise
     finally:
-        if runtime_operation_token is not None and runtime_operation_claim_token is None:
+        if review_preparation_claim_acquired and runtime_operation_claim_token is not None:
+            if release_review_worktree_preparation(terminal_id, runtime_operation_claim_token):
+                _wake_queued_provider_execution(registry)
+        elif runtime_operation_token is not None and runtime_operation_claim_token is None:
             if (
                 release_terminal_runtime_operation(terminal_id, runtime_operation_token)
                 or provider_execution_released

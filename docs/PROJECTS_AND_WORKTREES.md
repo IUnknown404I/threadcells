@@ -38,6 +38,8 @@ Active legacy Sessions that predate this contract remain in their existing works
 
 Only the context holding writer authority should modify a managed worktree. Reviewers can inspect diffs and run safe checks without becoming an untracked second writer.
 
+An exact-revision review binds both the durable review attempt and the reviewer's physical checkout. Before delivering the review task, ThreadCells fences terminal input, verifies a clean Session-owned reviewer worktree, moves it to the requested commit in detached mode, and checks the revision again at provider transport. Reusing a reviewer for a focused correction creates a new attempt and prepares the new revision; the earlier result remains history and cannot approve the correction.
+
 Do not manually edit a managed worktree while its agent is active. If an emergency intervention is necessary, stop or coordinate the writer first and record what changed.
 
 ## Bringing work back

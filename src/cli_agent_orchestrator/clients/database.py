@@ -9551,8 +9551,18 @@ def acquire_provider_execution_decision(
             or terminal.runtime_operation_expires_at > now
         )
         if operation_live:
-            db.commit()
-            return decision(False, "TERMINAL_RUNTIME_OPERATION_BUSY")
+            review_preparation_owns_turn = False
+            if terminal.runtime_operation_kind == REVIEW_WORKTREE_PREPARATION_OPERATION:
+                try:
+                    review_preparation_owns_turn = (
+                        _review_input_authority_in_transaction(db, terminal_id, workflow_turn_id)
+                        is not None
+                    )
+                except ValueError:
+                    review_preparation_owns_turn = False
+            if not review_preparation_owns_turn:
+                db.commit()
+                return decision(False, "TERMINAL_RUNTIME_OPERATION_BUSY")
         workflow_exists = (
             db.query(WorkflowModel.id).filter(WorkflowModel.root_terminal_id == terminal_id).first()
             is not None
@@ -10214,6 +10224,19 @@ def claim_terminal_runtime_exit(terminal_id: str) -> str:
 
 
 RUNTIME_OPERATION_LEASE_SECONDS = 30
+REVIEW_WORKTREE_PREPARATION_OPERATION = "review_worktree_prepare"
+REVIEW_WORKTREE_PREPARATION_LEASE_SECONDS = 60
+
+
+def _terminal_runtime_operation_live(terminal: Optional[TerminalModel], now: datetime) -> bool:
+    return bool(
+        terminal is not None
+        and terminal.runtime_operation_token is not None
+        and (
+            terminal.runtime_operation_expires_at is None
+            or terminal.runtime_operation_expires_at > now
+        )
+    )
 
 
 def _terminal_has_pending_provider_reconnect(db, terminal_id: str) -> bool:
@@ -10308,10 +10331,7 @@ def acquire_terminal_runtime_transport(
         if _terminal_has_pending_provider_reconnect(db, terminal_id):
             db.commit()
             return None
-        operation_live = terminal.runtime_operation_token is not None and (
-            terminal.runtime_operation_expires_at is None
-            or terminal.runtime_operation_expires_at > now
-        )
+        operation_live = _terminal_runtime_operation_live(terminal, now)
         if operation_live:
             db.commit()
             return None
@@ -12779,7 +12799,7 @@ def _prepare_workflow_input(
                     terminal
                     and (
                         runtime_compatibility_recovery
-                        or terminal.runtime_operation_kind in ("reconnect", "retire")
+                        or _terminal_runtime_operation_live(terminal, datetime.now())
                         or _terminal_has_pending_provider_reconnect(db, root_terminal_id)
                     )
                 )
@@ -12834,7 +12854,7 @@ def _prepare_workflow_input(
                 or (
                     terminal
                     and (
-                        terminal.runtime_operation_kind in ("reconnect", "retire")
+                        _terminal_runtime_operation_live(terminal, datetime.now())
                         or _terminal_has_pending_provider_reconnect(db, root_terminal_id)
                     )
                 )
@@ -22684,6 +22704,206 @@ def bind_child_assignment_input_turn(child_terminal_id: str, transport_binding: 
             return False
         db.commit()
         return True
+
+
+def _review_input_authority_in_transaction(
+    db: Any, child_terminal_id: str, workflow_turn_id: int
+) -> tuple[ChildAssignmentModel, WorkflowModel, WorkflowTurnModel, TerminalModel] | None:
+    """Resolve the one exact review attempt authorized for provider transport."""
+    turn = db.get(WorkflowTurnModel, workflow_turn_id)
+    workflow = db.get(WorkflowModel, turn.workflow_id) if turn is not None else None
+    assignment = (
+        db.query(ChildAssignmentModel)
+        .filter(
+            ChildAssignmentModel.child_terminal_id == child_terminal_id,
+            ChildAssignmentModel.child_workflow_id == (workflow.id if workflow else None),
+            ChildAssignmentModel.child_workflow_turn_id == workflow_turn_id,
+        )
+        .first()
+    )
+    if assignment is None or assignment.review_subject_kind is None:
+        return None
+    terminal = db.get(TerminalModel, child_terminal_id)
+    source = terminal.managed_worktree_source if terminal is not None else None
+    revision = assignment.review_subject_revision
+    valid = bool(
+        terminal is not None
+        and _terminal_is_reviewer(terminal)
+        and terminal.managed_worktree_kind == "reviewer"
+        and terminal.managed_worktree_origin_terminal_id == child_terminal_id
+        and terminal.managed_worktree_branch is None
+        and isinstance(terminal.launch_worktree, str)
+        and terminal.launch_worktree.startswith("/")
+        and isinstance(source, str)
+        and source.startswith("/")
+        and assignment.status == ChildAssignmentStatus.AWAITING_RESULT.value
+        and assignment.review_superseded_at is None
+        and assignment.review_subject_kind == "git_commit"
+        and isinstance(assignment.attempt_id, str)
+        and bool(assignment.attempt_id)
+        and isinstance(revision, str)
+        and _REVIEW_REVISION_PATTERN.fullmatch(revision) is not None
+        and assignment.review_subject_worktree == source
+        and assignment.review_scope_sha256
+        == hashlib.sha256(source.encode("utf-8", "strict")).hexdigest()
+        and workflow is not None
+        and workflow.root_terminal_id == child_terminal_id
+        and workflow.status == WORKFLOW_OPEN
+        and workflow.active_turn_id == workflow_turn_id
+        and turn is not None
+        and turn.workflow_id == workflow.id
+        and turn.state in (TURN_SENT, TURN_CLAIMED)
+        and turn.transport_binding is not None
+    )
+    if not valid:
+        raise ValueError("review input authority is not exact")
+    return (
+        cast(ChildAssignmentModel, assignment),
+        cast(WorkflowModel, workflow),
+        cast(WorkflowTurnModel, turn),
+        cast(TerminalModel, terminal),
+    )
+
+
+def claim_review_worktree_preparation(
+    child_terminal_id: str,
+    workflow_turn_id: int,
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Fence one exact reviewer checkout from preparation through transport.
+
+    The review attempt and workflow input are already durable at this point.
+    This claim prevents terminal transport, reconnect, recovery, and retirement
+    from racing the isolated Git checkout before the bound input is pasted.
+    """
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_child_assignment_schema()
+    _ensure_workflow_schema()
+    _ensure_provider_execution_schema()
+    now = now or datetime.now()
+    claim_token = uuid.uuid4().hex
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            authority = _review_input_authority_in_transaction(
+                db, child_terminal_id, workflow_turn_id
+            )
+        except ValueError:
+            db.rollback()
+            return {
+                "required": True,
+                "claimed": False,
+                "reason_code": "REVIEW_WORKTREE_AUTHORITY_CHANGED",
+            }
+        if authority is None:
+            db.rollback()
+            return {"required": False, "claimed": False}
+        assignment, _workflow, _turn, terminal = authority
+        path = cast(str, terminal.launch_worktree)
+        blocked = bool(
+            terminal.runtime_lifecycle != "running"
+            or not terminal.runtime_generation
+            or _terminal_requires_provider_runtime_compatibility_reconnect(terminal)
+            or _terminal_has_pending_provider_reconnect(db, child_terminal_id)
+            or _terminal_runtime_operation_live(terminal, now)
+            or db.get(ProviderExecutionLeaseModel, child_terminal_id) is not None
+            or db.query(WorktreeWriterLeaseModel.canonical_worktree)
+            .filter(
+                or_(
+                    WorktreeWriterLeaseModel.terminal_id == child_terminal_id,
+                    WorktreeWriterLeaseModel.canonical_worktree == path,
+                )
+            )
+            .first()
+            is not None
+            or not _workspace_accepts_new_work(db, child_terminal_id)
+            or not _retirement_quiescence_allows_commit(db, child_terminal_id)
+        )
+        if blocked:
+            db.rollback()
+            return {
+                "required": True,
+                "claimed": False,
+                "reason_code": "REVIEW_WORKTREE_PREPARATION_BUSY",
+            }
+        terminal.runtime_operation_kind = REVIEW_WORKTREE_PREPARATION_OPERATION
+        terminal.runtime_operation_token = claim_token
+        terminal.runtime_operation_claimed_at = now
+        terminal.runtime_operation_expires_at = now + timedelta(
+            seconds=REVIEW_WORKTREE_PREPARATION_LEASE_SECONDS
+        )
+        db.commit()
+        return {
+            "required": True,
+            "claimed": True,
+            "claim_token": claim_token,
+            "attempt_id": cast(str, assignment.attempt_id),
+            "revision": cast(str, assignment.review_subject_revision),
+            "worktree": path,
+            "source": cast(str, terminal.managed_worktree_source),
+            "runtime_generation": cast(str, terminal.runtime_generation),
+        }
+
+
+def review_worktree_preparation_owned(
+    child_terminal_id: str,
+    workflow_turn_id: int,
+    claim_token: str,
+    revision: str,
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Revalidate the exact live preparation capability before provider send."""
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_child_assignment_schema()
+    _ensure_workflow_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        try:
+            authority = _review_input_authority_in_transaction(
+                db, child_terminal_id, workflow_turn_id
+            )
+        except ValueError:
+            return False
+        if authority is None:
+            return False
+        assignment, _workflow, _turn, terminal = authority
+        return bool(
+            terminal.runtime_lifecycle == "running"
+            and terminal.runtime_operation_kind == REVIEW_WORKTREE_PREPARATION_OPERATION
+            and terminal.runtime_operation_token == claim_token
+            and terminal.runtime_operation_expires_at is not None
+            and terminal.runtime_operation_expires_at > now
+            and assignment.review_subject_revision == revision
+            and not _terminal_requires_provider_runtime_compatibility_reconnect(terminal)
+            and not _terminal_has_pending_provider_reconnect(db, child_terminal_id)
+        )
+
+
+def release_review_worktree_preparation(child_terminal_id: str, claim_token: str) -> bool:
+    """Release only the exact review-checkout claim, including failed preparation."""
+    _ensure_terminal_worktree_authority_schema()
+    with SessionLocal() as db:
+        released = (
+            db.query(TerminalModel)
+            .filter(
+                TerminalModel.id == child_terminal_id,
+                TerminalModel.runtime_operation_kind == REVIEW_WORKTREE_PREPARATION_OPERATION,
+                TerminalModel.runtime_operation_token == claim_token,
+            )
+            .update(
+                {
+                    TerminalModel.runtime_operation_kind: None,
+                    TerminalModel.runtime_operation_token: None,
+                    TerminalModel.runtime_operation_claimed_at: None,
+                    TerminalModel.runtime_operation_expires_at: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return released == 1
 
 
 def cancel_child_assignment_attempt(

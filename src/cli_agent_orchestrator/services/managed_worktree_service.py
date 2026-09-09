@@ -79,6 +79,7 @@ def _dirty_content_fingerprint(path: Path, *, status: str, head: str) -> str:
 
 
 _MANAGED_KINDS = frozenset({"supervisor", "task", "reviewer"})
+_EXACT_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _MAX_WORKTREE_INVENTORY_BYTES = 2 * 1024 * 1024
 _MAX_WORKTREE_INVENTORY_ROWS = 4096
 
@@ -585,6 +586,91 @@ def managed_worktree_status(
         "git_dir_identity": _path_identity(git_dir),
         "registered": True,
     }
+
+
+def prepare_reviewer_worktree_revision(
+    metadata: Mapping[str, Any], revision: str
+) -> dict[str, Any]:
+    """Move one clean, owned reviewer worktree to an exact detached commit.
+
+    The caller must hold the terminal's durable review-preparation runtime
+    operation while this function runs. This layer independently proves Git
+    source, registration, path, cleanliness, and detached-state authority
+    before and after the only mutation. Launch metadata remains provenance;
+    the exact review attempt is the current checkout authority.
+    """
+    exact_revision = revision.strip().lower()
+    terminal_id = metadata.get("id")
+    if (
+        not isinstance(terminal_id, str)
+        or metadata.get("managed_worktree_kind") != "reviewer"
+        or metadata.get("managed_worktree_origin_terminal_id") != terminal_id
+        or metadata.get("managed_worktree_branch") is not None
+        or _EXACT_COMMIT_PATTERN.fullmatch(exact_revision) is None
+    ):
+        raise ManagedWorktreeError("REVIEW_WORKTREE_AUTHORITY_CHANGED")
+    before = managed_worktree_status(metadata)
+    if (
+        not before.get("managed")
+        or not before.get("safe")
+        or before.get("absent")
+        or before.get("kind") != "reviewer"
+        or not before.get("clean")
+        or before.get("branch") is not None
+        or not before.get("detached")
+    ):
+        raise ManagedWorktreeError(
+            str(before.get("reason_code") or "REVIEW_WORKTREE_AUTHORITY_CHANGED")
+        )
+    path = Path(str(before["path"]))
+    available = _git("cat-file", "-e", f"{exact_revision}^{{commit}}", cwd=path, check=False)
+    if available.returncode != 0:
+        raise ManagedWorktreeError("REVIEW_REVISION_UNAVAILABLE")
+    if before.get("commit") != exact_revision:
+        switched = _git("switch", "--detach", exact_revision, cwd=path, check=False)
+        if switched.returncode != 0:
+            raise ManagedWorktreeError("REVIEW_WORKTREE_PREPARATION_FAILED")
+    after = managed_worktree_status(metadata)
+    stable_identity_fields = (
+        "source",
+        "source_identity",
+        "git_common_dir",
+        "git_common_dir_identity",
+        "path",
+        "path_identity",
+        "git_dir",
+        "git_dir_identity",
+    )
+    if (
+        not after.get("safe")
+        or after.get("absent")
+        or after.get("kind") != "reviewer"
+        or not after.get("clean")
+        or after.get("branch") is not None
+        or not after.get("detached")
+        or after.get("commit") != exact_revision
+        or any(before.get(field) != after.get(field) for field in stable_identity_fields)
+    ):
+        raise ManagedWorktreeError("REVIEW_WORKTREE_AUTHORITY_CHANGED")
+    return after
+
+
+def reviewer_worktree_matches_revision(metadata: Mapping[str, Any], revision: str) -> bool:
+    """Prove exact detached reviewer state immediately before task transport."""
+    exact_revision = revision.strip().lower()
+    if _EXACT_COMMIT_PATTERN.fullmatch(exact_revision) is None:
+        return False
+    status = managed_worktree_status(metadata)
+    return bool(
+        status.get("managed")
+        and status.get("safe")
+        and not status.get("absent")
+        and status.get("kind") == "reviewer"
+        and status.get("clean")
+        and status.get("branch") is None
+        and status.get("detached")
+        and status.get("commit") == exact_revision
+    )
 
 
 def _retirement_authority_document(

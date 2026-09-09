@@ -1,5 +1,6 @@
 """Minimal database client with only terminal metadata."""
 
+import base64
 import hashlib
 import hmac
 import json
@@ -1107,8 +1108,11 @@ class WorkflowTurnReceiptModel(Base):
     receiver_terminal_id = Column(String, nullable=False)
     # Only the model execution that received this opaque capability may
     # transfer an interrupted turn to a fresh admitted continuation. Store
-    # only its digest and consume it exactly once.
+    # only its digest. Managed runtimes additionally retain a random nonce;
+    # the raw capability can then be re-derived only with that terminal's
+    # separately protected bearer after a proven Codex compaction boundary.
     resume_token_sha256 = Column(String, nullable=True)
+    resume_token_nonce = Column(String, nullable=True)
     resumed_by_turn_id = Column(Integer, nullable=True)
     resumed_at = Column(DateTime, nullable=True)
     consumed_at = Column(DateTime, nullable=False, default=datetime.now)
@@ -2727,6 +2731,8 @@ def _migrate_workflow_turn_columns() -> None:
         }
         if "resume_token_sha256" not in receipt_columns:
             conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resume_token_sha256 TEXT")
+        if "resume_token_nonce" not in receipt_columns:
+            conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resume_token_nonce TEXT")
         if "resumed_by_turn_id" not in receipt_columns:
             conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resumed_by_turn_id INTEGER")
         if "resumed_at" not in receipt_columns:
@@ -12016,6 +12022,7 @@ TURN_FINISHED = "finished"
 TURN_CANCELLED = "cancelled"
 PROVIDER_CONTENT_UNAVAILABLE = "PROVIDER_CONTENT_UNAVAILABLE"
 WORKFLOW_EXECUTION_RESUME_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{40,64}$")
+WORKFLOW_EXECUTION_RESUME_NONCE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{40,64}$")
 # A provider-final observation for a turn whose receiver never admitted the
 # envelope is not progress.  Keep this distinct from ``None`` (no workflow or
 # no sendable turn) so callers and deterministic tests can prove that the
@@ -12056,6 +12063,68 @@ OPEN_FINAL_CIRCUIT_BREAKER_REASON = (
     "Automatic continuation paused when 65 consecutive provider finals produced no "
     "durable workflow progress. Review the provider/runtime before resuming."
 )
+
+
+class WorkflowContinuationAuthorityConflict(RuntimeError):
+    """The compacting provider cannot prove one current admitted execution."""
+
+
+def _derive_workflow_execution_resume_token(
+    receiver_terminal_id: str,
+    logical_turn_id: int,
+    nonce: str,
+    terminal_auth_token: str,
+) -> str:
+    """Derive one bearer without retaining it in durable control-plane state."""
+    message = (
+        b"threadcells-workflow-execution-resume-v1\0"
+        + receiver_terminal_id.encode("utf-8", "strict")
+        + b"\0"
+        + str(logical_turn_id).encode("ascii", "strict")
+        + b"\0"
+        + nonce.encode("ascii", "strict")
+    )
+    digest = hmac.new(
+        terminal_auth_token.encode("utf-8", "strict"), message, hashlib.sha256
+    ).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _mint_workflow_execution_resume_token(
+    db: Any,
+    receiver_terminal_id: str,
+    logical_turn_id: int,
+    terminal_auth_token: Optional[str],
+) -> tuple[str, Optional[str]]:
+    """Mint restorable authority only for an exact terminal bearer.
+
+    Direct database callers retained for compatibility do not own a terminal
+    bearer. They still receive the established random capability, but it is
+    intentionally not restorable by a provider hook.
+    """
+    terminal = db.get(TerminalModel, receiver_terminal_id)
+    token_digest = (
+        hashlib.sha256(terminal_auth_token.encode("utf-8", "strict")).hexdigest()
+        if terminal_auth_token
+        else None
+    )
+    if (
+        terminal is not None
+        and terminal.auth_token_sha256
+        and token_digest
+        and hmac.compare_digest(str(terminal.auth_token_sha256), token_digest)
+    ):
+        nonce = secrets.token_urlsafe(32)
+        return (
+            _derive_workflow_execution_resume_token(
+                receiver_terminal_id,
+                logical_turn_id,
+                nonce,
+                terminal_auth_token,
+            ),
+            nonce,
+        )
+    return secrets.token_urlsafe(32), None
 
 
 def _dispatch_workflow_notification_fail_open(
@@ -14171,6 +14240,8 @@ def claim_or_resume_workflow_turn_receipt(
     logical_turn_id: int,
     resume_token: Optional[str] = None,
     now: Optional[datetime] = None,
+    *,
+    terminal_auth_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Admit a new turn or transfer an interrupted admitted execution.
 
@@ -14286,7 +14357,12 @@ def claim_or_resume_workflow_turn_receipt(
                 db, int(workflow.id), logical_turn_id, int(resumed.id), now
             )
 
-            next_resume_token = secrets.token_urlsafe(32)
+            next_resume_token, next_resume_nonce = _mint_workflow_execution_resume_token(
+                db,
+                receiver_terminal_id,
+                int(resumed.id),
+                terminal_auth_token,
+            )
             db.add(
                 WorkflowTurnReceiptModel(
                     workflow_turn_id=resumed.id,
@@ -14294,6 +14370,7 @@ def claim_or_resume_workflow_turn_receipt(
                     resume_token_sha256=hashlib.sha256(
                         next_resume_token.encode("utf-8", "strict")
                     ).hexdigest(),
+                    resume_token_nonce=next_resume_nonce,
                     consumed_at=now,
                 )
             )
@@ -14301,6 +14378,7 @@ def claim_or_resume_workflow_turn_receipt(
             interrupted.updated_at = now
             existing.resumed_by_turn_id = resumed.id
             existing.resumed_at = now
+            existing.resume_token_nonce = None
             workflow.active_turn_id = resumed.id
             workflow.updated_at = now
             try:
@@ -14384,7 +14462,12 @@ def claim_or_resume_workflow_turn_receipt(
         if execution_conflict is not None:
             db.rollback()
             return {"accepted": False, "reason": execution_conflict}
-        next_resume_token = secrets.token_urlsafe(32)
+        next_resume_token, next_resume_nonce = _mint_workflow_execution_resume_token(
+            db,
+            receiver_terminal_id,
+            logical_turn_id,
+            terminal_auth_token,
+        )
         db.add(
             WorkflowTurnReceiptModel(
                 workflow_turn_id=logical_turn_id,
@@ -14392,12 +14475,14 @@ def claim_or_resume_workflow_turn_receipt(
                 resume_token_sha256=hashlib.sha256(
                     next_resume_token.encode("utf-8", "strict")
                 ).hexdigest(),
+                resume_token_nonce=next_resume_nonce,
                 consumed_at=now,
             )
         )
         if reconnect_parent_receipt is not None:
             reconnect_parent_receipt.resumed_by_turn_id = logical_turn_id
             reconnect_parent_receipt.resumed_at = now
+            reconnect_parent_receipt.resume_token_nonce = None
         try:
             db.commit()
         except IntegrityError:
@@ -14447,6 +14532,124 @@ def has_admitted_workflow_turn(receiver_terminal_id: str, logical_turn_id: int) 
             .filter_by(workflow_turn_id=logical_turn_id, receiver_terminal_id=receiver_terminal_id)
             .first()
         )
+
+
+def get_workflow_compaction_continuation_authority(
+    receiver_terminal_id: str,
+    *,
+    terminal_auth_token: str,
+    runtime_generation: str,
+    provider_resume_identity: str,
+) -> Optional[Dict[str, Any]]:
+    """Re-derive the exact current admitted pair for a proven Codex compact.
+
+    This is a read-only restoration of existing authority, not a receipt,
+    resume, or privileged effect. A current OPEN turn without a receipt is an
+    ordinary not-yet-admitted input and has nothing to restore. Once a receipt
+    exists, every runtime, provider, lease, recovery, and token axis must agree
+    or compaction fails closed.
+    """
+    _ensure_workflow_schema()
+    _ensure_provider_execution_schema()
+    if not terminal_auth_token or not runtime_generation or not provider_resume_identity:
+        raise WorkflowContinuationAuthorityConflict("continuation_identity_not_proven")
+    terminal_auth_digest = hashlib.sha256(terminal_auth_token.encode("utf-8", "strict")).hexdigest()
+    with SessionLocal() as db:
+        terminal = db.get(TerminalModel, receiver_terminal_id)
+        if (
+            terminal is None
+            or not _workspace_accepts_new_work(db, receiver_terminal_id)
+            or terminal.provider != "codex"
+            or terminal.runtime_lifecycle != "running"
+            or not terminal.auth_token_sha256
+            or not hmac.compare_digest(str(terminal.auth_token_sha256), terminal_auth_digest)
+            or not terminal.runtime_generation
+            or not hmac.compare_digest(str(terminal.runtime_generation), runtime_generation)
+            or not terminal.provider_resume_identity
+            or not hmac.compare_digest(
+                str(terminal.provider_resume_identity), provider_resume_identity
+            )
+            or not terminal.provider_resume_runtime_generation
+            or not hmac.compare_digest(
+                str(terminal.provider_resume_runtime_generation), runtime_generation
+            )
+        ):
+            raise WorkflowContinuationAuthorityConflict("continuation_identity_not_proven")
+        workflow = _open_workflow(db, receiver_terminal_id, create=False)
+        if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
+            return None
+        logical_turn_id = int(workflow.active_turn_id)
+        turn = db.get(WorkflowTurnModel, logical_turn_id)
+        receipt = (
+            db.query(WorkflowTurnReceiptModel)
+            .filter_by(
+                workflow_turn_id=logical_turn_id,
+                receiver_terminal_id=receiver_terminal_id,
+            )
+            .one_or_none()
+        )
+        if receipt is None:
+            return None
+        lease = db.get(ProviderExecutionLeaseModel, receiver_terminal_id)
+        foreign_turn_lease = (
+            db.query(ProviderExecutionLeaseModel.terminal_id)
+            .filter(
+                ProviderExecutionLeaseModel.workflow_turn_id == logical_turn_id,
+                ProviderExecutionLeaseModel.terminal_id != receiver_terminal_id,
+            )
+            .first()
+        )
+        recovery = (
+            db.query(RecoveryTakeoverModel.id)
+            .filter(
+                or_(
+                    RecoveryTakeoverModel.old_terminal_id == receiver_terminal_id,
+                    RecoveryTakeoverModel.new_terminal_id == receiver_terminal_id,
+                ),
+                RecoveryTakeoverModel.state.notin_(("failed", "completed")),
+            )
+            .first()
+        )
+        nonce = str(receipt.resume_token_nonce or "")
+        if (
+            turn is None
+            or turn.workflow_id != workflow.id
+            or turn.state != TURN_SENT
+            or turn.superseded_by_turn_id is not None
+            or turn.superseded_at is not None
+            or turn.provider_ready_observed_at is not None
+            or turn.provider_outcome_code is not None
+            or turn.provider_outcome_observed_at is not None
+            or turn.provider_reconnect_requested_at is not None
+            or receipt.resumed_by_turn_id is not None
+            or receipt.resumed_at is not None
+            or not receipt.resume_token_sha256
+            or WORKFLOW_EXECUTION_RESUME_NONCE_PATTERN.fullmatch(nonce) is None
+            or lease is None
+            or lease.workflow_turn_id != logical_turn_id
+            or foreign_turn_lease is not None
+            or recovery is not None
+            or terminal.runtime_operation_kind is not None
+            or terminal.runtime_operation_token is not None
+        ):
+            raise WorkflowContinuationAuthorityConflict("continuation_authority_not_proven")
+        resume_token = _derive_workflow_execution_resume_token(
+            receiver_terminal_id,
+            logical_turn_id,
+            nonce,
+            terminal_auth_token,
+        )
+        resume_token_digest = hashlib.sha256(resume_token.encode("utf-8", "strict")).hexdigest()
+        if not hmac.compare_digest(str(receipt.resume_token_sha256), resume_token_digest):
+            raise WorkflowContinuationAuthorityConflict("continuation_token_not_proven")
+        return {
+            "authority_version": 1,
+            "workflow_id": int(workflow.id),
+            "logical_turn_id": logical_turn_id,
+            "resume_token": resume_token,
+            "receiver_terminal_id": receiver_terminal_id,
+            "runtime_generation": runtime_generation,
+        }
 
 
 def claim_workflow_effect(

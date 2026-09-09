@@ -43,12 +43,14 @@ from watchdog.observers.polling import PollingObserver
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     HandoffResultSubmissionError,
+    WorkflowContinuationAuthorityConflict,
     acquire_terminal_runtime_transport,
     cancel_child_assignments_for_terminal,
     create_inbox_message,
     get_inbox_messages,
     get_session_hard_deletion_operation,
     get_terminal_metadata,
+    get_workflow_compaction_continuation_authority,
     get_writable_work_context_by_session,
     init_db,
     queue_workflow_input_for_provider,
@@ -512,7 +514,7 @@ class CodexSessionIdentityRequest(BaseModel):
     session_id: str = Field(pattern=r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
     transcript_path: str
     cwd: str
-    source: Literal["startup", "resume"]
+    source: Literal["startup", "resume", "compact"]
     runtime_generation: str = Field(pattern=r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 
 
@@ -2567,8 +2569,8 @@ async def bind_codex_session_identity_endpoint(
     terminal_id: TerminalId,
     request: Request,
     body: CodexSessionIdentityRequest,
-) -> Dict[str, str]:
-    """Bind the exact foreground Codex root before its first model request."""
+) -> Dict[str, Any]:
+    """Bind the foreground Codex root and restore proven compact authority."""
     authorization = request.headers.get("authorization", "")
     scheme, _, token = authorization.partition(" ")
     if (
@@ -2611,7 +2613,26 @@ async def bind_codex_session_identity_endpoint(
                 else "stale_identity_rebind_not_proven"
             ),
         ) from exc
-    return {"session_id": identity}
+    response: Dict[str, Any] = {"session_id": identity}
+    if body.source == "compact":
+        try:
+            continuation_authority = await run_in_threadpool(
+                partial(
+                    get_workflow_compaction_continuation_authority,
+                    terminal_id,
+                    terminal_auth_token=token,
+                    runtime_generation=body.runtime_generation,
+                    provider_resume_identity=identity,
+                )
+            )
+        except WorkflowContinuationAuthorityConflict as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="continuation_authority_not_proven",
+            ) from exc
+        if continuation_authority is not None:
+            response["continuation_authority"] = continuation_authority
+    return response
 
 
 @app.post(

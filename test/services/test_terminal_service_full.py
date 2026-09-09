@@ -269,8 +269,12 @@ def test_bind_provider_runtime_session_identity_proves_exact_hook_path(monkeypat
     )
 
 
+@pytest.mark.parametrize(
+    ("source", "require_existing_binding"),
+    (("resume", True), ("compact", False)),
+)
 def test_bind_provider_runtime_session_identity_rebinds_exact_durable_identity(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, source, require_existing_binding
 ):
     identity = "01234567-89ab-cdef-0123-456789abcdef"
     generation = "a" * 64
@@ -317,9 +321,9 @@ def test_bind_provider_runtime_session_identity_rebinds_exact_durable_identity(
             resume_identity=identity,
             transcript_path=str(transcript),
             working_directory=str(working_directory),
-            source="resume",
+            source=source,
             runtime_generation=generation,
-            require_existing_binding=True,
+            require_existing_binding=require_existing_binding,
         )
         == identity
     )

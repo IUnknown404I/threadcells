@@ -1,7 +1,7 @@
 ---
 slug: projects-and-worktrees
 source: docs/PROJECTS_AND_WORKTREES.md
-source_sha256: sha256:c296e8fec6654451a29dbef47bde79d19fda28f7bbfdf926c857e2cc8508ad3a
+source_sha256: sha256:b59a766757b888181ab6f564f9f3994953943a50ff2d15a820edd33e02d7ae6e
 ---
 # 项目与管理的 worktree
 
@@ -42,6 +42,8 @@ ThreadCells 会记录这种关系，而不是将临时目录当作匿名目录�
 ## 写入者权限
 
 只有持有写入者权限的上下文才应修改管理的 worktree。审查者可以检查 diff 并运行安全检查，而不会成为未跟踪的第二个写入者。
+
+精确修订版审查同时绑定持久化的审查尝试和审查者的物理检出。ThreadCells 在交付审查任务前会阻止终端输入，验证属于该会话且干净的审查者 worktree，以 detached 模式切换到请求的提交，并在传输给提供程序时再次核对修订版。为聚焦修正复用审查者时会创建新的尝试并准备新的修订版；较早的结果仅保留为历史，不能批准该修正。
 
 智能体活跃时，请勿手动编辑其管理的 worktree。若必须紧急介入，请先停止或协调写入者，并记录发生的变更。
 

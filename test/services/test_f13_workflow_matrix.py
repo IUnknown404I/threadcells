@@ -1416,6 +1416,7 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
 
     with sqlite3.connect(database_file) as connection:
         workflow_columns = {row[1] for row in connection.execute("PRAGMA table_info(workflows)")}
+        workflow_indexes = {row[1] for row in connection.execute("PRAGMA index_list(workflows)")}
         columns = {row[1] for row in connection.execute("PRAGMA table_info(workflow_turns)")}
         receipt_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(workflow_turn_receipts)")
@@ -1434,6 +1435,7 @@ def test_f13_ready_observation_columns_migrate_additively(tmp_path, monkeypatch)
             (database.WORKFLOW_EFFECT_LINEAGE_MIGRATION_RECEIPT,),
         ).fetchone()
     assert "resumed_from_owner_gate_workflow_id" in workflow_columns
+    assert "ix_workflows_resumed_from_owner_gate_workflow_id" in workflow_indexes
     assert "queue_reason" in columns
     assert "provider_processing_observed_at" in columns
     assert "provider_ready_observed_at" in columns

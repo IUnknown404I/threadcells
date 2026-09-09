@@ -26,6 +26,7 @@ from sqlalchemy import (
     UniqueConstraint,
     and_,
     create_engine,
+    exists,
     func,
     insert,
     inspect,
@@ -969,7 +970,7 @@ class WorkflowModel(Base):
     # A deliberate owner input may reopen a prior owner gate.  Retain that
     # provenance so the resident recovery turn can be distinguished from
     # autonomous continuation when disk pressure is RED.
-    resumed_from_owner_gate_workflow_id = Column(Integer, nullable=True)
+    resumed_from_owner_gate_workflow_id = Column(Integer, nullable=True, index=True)
     terminal_reason = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now)
@@ -2750,6 +2751,11 @@ def _migrate_workflow_turn_columns() -> None:
                 "CREATE INDEX IF NOT EXISTS ix_workflows_root_status_id "
                 "ON workflows(root_terminal_id, status, id)"
             )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS "
+            "ix_workflows_resumed_from_owner_gate_workflow_id "
+            "ON workflows(resumed_from_owner_gate_workflow_id)"
+        )
         receipt_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(workflow_turn_receipts)")
         }
@@ -4227,7 +4233,7 @@ def _session_unresolved_work_plan_in_transaction(
             db.query(WorkflowModel)
             .filter(
                 WorkflowModel.root_terminal_id.in_(terminal_ids),
-                WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+                workflow_current_execution_authority_predicate(WorkflowModel),
             )
             .order_by(WorkflowModel.id.asc())
         )
@@ -4254,7 +4260,7 @@ def _session_unresolved_work_plan_in_transaction(
             )
             .filter(
                 WorkflowModel.root_terminal_id.in_(terminal_ids),
-                WorkflowModel.status.notin_(_WORKSPACE_RETIREMENT_TERMINAL_WORKFLOW_STATES),
+                workflow_current_execution_authority_predicate(WorkflowModel),
                 WorkflowTurnModel.superseded_by_turn_id.is_(None),
                 or_(
                     WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
@@ -4419,7 +4425,7 @@ def _session_unresolved_work_plan_in_transaction(
             )
             .filter(
                 WorkflowModel.root_terminal_id.in_(terminal_ids),
-                WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+                workflow_current_execution_authority_predicate(WorkflowModel),
                 WorkflowModel.active_turn_id == WorkflowTurnModel.id,
                 ProviderExecutionLeaseModel.workflow_turn_id.is_(None),
                 or_(
@@ -12097,6 +12103,46 @@ WORKFLOW_OPEN = "open"
 WORKFLOW_TERMINAL = "terminal"
 WORKFLOW_OWNER_GATE = "owner_gate"
 WORKFLOW_CANCELLED = "cancelled"
+
+# An OWNER_GATE row is immutable audit of the pause.  The owner's durable
+# decision is represented by a newer same-terminal workflow which points back
+# to that row.  Once that exact edge exists the old gate can no longer advance
+# execution itself, even though its historical status remains ``owner_gate``.
+# Keep the raw-SQL read model and ORM safety plans on this one authority rule.
+WORKFLOW_CURRENT_EXECUTION_AUTHORITY_SQL = """(
+    w.status = 'open'
+    OR (
+      w.status = 'owner_gate'
+      AND NOT EXISTS (
+        SELECT 1 FROM workflows owner_gate_successor
+        WHERE owner_gate_successor.resumed_from_owner_gate_workflow_id = w.id
+          AND owner_gate_successor.root_terminal_id = w.root_terminal_id
+          AND owner_gate_successor.id > w.id
+          AND owner_gate_successor.status IN ('open', 'owner_gate', 'terminal', 'cancelled')
+      )
+    )
+)"""
+
+
+def workflow_current_execution_authority_predicate(workflow_model: Any = WorkflowModel) -> Any:
+    """Return the canonical OPEN/genuinely-owner-gated authority predicate."""
+    successor = aliased(WorkflowModel)
+    resumed = exists().where(
+        and_(
+            successor.resumed_from_owner_gate_workflow_id == workflow_model.id,
+            successor.root_terminal_id == workflow_model.root_terminal_id,
+            successor.id > workflow_model.id,
+            successor.status.in_(
+                (WORKFLOW_OPEN, WORKFLOW_OWNER_GATE, WORKFLOW_TERMINAL, WORKFLOW_CANCELLED)
+            ),
+        )
+    )
+    return or_(
+        workflow_model.status == WORKFLOW_OPEN,
+        and_(workflow_model.status == WORKFLOW_OWNER_GATE, ~resumed),
+    )
+
+
 TURN_QUEUED = "queued"
 TURN_CLAIMED = "claimed"
 TURN_SENT = "sent"

@@ -16,6 +16,7 @@ from cli_agent_orchestrator.clients.database import (
     TerminalModel,
     WorkflowModel,
 )
+from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
 from cli_agent_orchestrator.services import telegram_notification_service as telegram
 from cli_agent_orchestrator.services import terminal_service
 
@@ -50,6 +51,7 @@ def _workflow(root: str, *, project: str | None = "Release Project") -> None:
                 agent_profile="supervisor_terra_medium",
                 project_name=project,
                 runtime_lifecycle="running",
+                provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
             )
         )
         db.add(WorkflowModel(root_terminal_id=root, status="open"))

@@ -15,6 +15,7 @@ from cli_agent_orchestrator.clients.database import (
     claim_workflow_provider_reconnect,
     claim_workflow_turn,
     complete_workflow_provider_reconnect,
+    count_stale_provider_runtime_compatibilities,
     fail_workflow_provider_reconnect_attempt,
     get_handoff_child_status,
     get_open_workflow_root_terminal_ids,
@@ -56,9 +57,15 @@ class ProviderResumeIdentityUnavailable(RuntimeError):
 
 
 def fence_stale_provider_runtime_compatibility(now: datetime | None = None) -> int:
-    """Persist reconnect barriers for Codex processes from older releases."""
+    """Audit all stale residents and eagerly reconnect eligible executions."""
     from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
 
+    stale = count_stale_provider_runtime_compatibilities(ACTIVE_RUNTIME_GENERATION)
+    if stale:
+        logger.debug(
+            "Observed %s resident Codex runtimes behind the active compatibility generation",
+            stale,
+        )
     return request_stale_provider_runtime_reconnects(ACTIVE_RUNTIME_GENERATION, now=now)
 
 

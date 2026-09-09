@@ -1093,6 +1093,17 @@ class WorkflowProviderReconnectAttemptModel(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
+class ProviderRuntimeCompatibilityScanModel(Base):
+    """Singleton cursor for bounded, restart-safe rolling-upgrade sweeps."""
+
+    __tablename__ = "provider_runtime_compatibility_scan"
+
+    id = Column(Integer, primary_key=True)
+    active_runtime_generation = Column(String, nullable=False)
+    after_terminal_id = Column(String, nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
 class WorkflowTurnReceiptModel(Base):
     """One irreversible receiver-side admission for a stable logical turn.
 
@@ -2592,6 +2603,7 @@ def _ensure_workflow_schema() -> None:
     WorkflowModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowTurnModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowProviderReconnectAttemptModel.__table__.create(bind=engine, checkfirst=True)
+    ProviderRuntimeCompatibilityScanModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowTurnReceiptModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowEffectModel.__table__.create(bind=engine, checkfirst=True)
     _migrate_workflow_turn_columns()
@@ -2733,6 +2745,11 @@ def _migrate_workflow_turn_columns() -> None:
             "CREATE INDEX IF NOT EXISTS ix_workflow_turns_superseded_by_turn_id "
             "ON workflow_turns(superseded_by_turn_id)"
         )
+        if {"root_terminal_id", "status", "id"}.issubset(workflow_columns):
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_workflows_root_status_id "
+                "ON workflows(root_terminal_id, status, id)"
+            )
         receipt_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(workflow_turn_receipts)")
         }
@@ -9472,6 +9489,30 @@ def acquire_provider_execution_decision(
         if _terminal_deletion_fence_exists_in_transaction(db, terminal_id):
             db.rollback()
             return decision(False, "TERMINAL_DELETED")
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal is None:
+            db.commit()
+            return decision(False, "TERMINAL_NOT_FOUND")
+        if terminal.runtime_lifecycle in (
+            "recovery_required",
+            "exit_pending",
+            "exited",
+            "recovery_fenced",
+        ):
+            db.commit()
+            return decision(False, "TERMINAL_RUNTIME_NOT_WRITABLE")
+        if _terminal_requires_provider_runtime_compatibility_reconnect(terminal):
+            # The same writer transaction which rejects provider admission
+            # installs reconnect authority whenever this exact turn can own
+            # it. Even if another caller prepared an old-style SENT row, no
+            # bytes can reach the incompatible process through this lease.
+            _request_workflow_provider_reconnect_in_transaction(
+                db,
+                terminal_id,
+                datetime.now(),
+            )
+            db.commit()
+            return decision(False, "TERMINAL_RUNTIME_RECONNECT_PENDING")
         existing = (
             db.query(ProviderExecutionLeaseModel)
             .filter(ProviderExecutionLeaseModel.terminal_id == terminal_id)
@@ -9495,18 +9536,6 @@ def acquire_provider_execution_decision(
         if active >= effective_limit:
             db.commit()
             return decision(False, "PROVIDER_EXECUTION_CAPACITY_EXHAUSTED")
-        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
-        if terminal is None:
-            db.commit()
-            return decision(False, "TERMINAL_NOT_FOUND")
-        if terminal.runtime_lifecycle in (
-            "recovery_required",
-            "exit_pending",
-            "exited",
-            "recovery_fenced",
-        ):
-            db.commit()
-            return decision(False, "TERMINAL_RUNTIME_NOT_WRITABLE")
         if _terminal_has_pending_provider_reconnect(db, terminal_id):
             db.commit()
             return decision(False, "TERMINAL_RUNTIME_RECONNECT_PENDING")
@@ -10195,6 +10224,33 @@ def _terminal_has_pending_provider_reconnect(db, terminal_id: str) -> bool:
     )
 
 
+def _terminal_requires_provider_runtime_compatibility_reconnect(
+    terminal: Optional[TerminalModel],
+) -> bool:
+    """Treat every resident Codex runtime not proven current as stale.
+
+    Workflow state is deliberately absent from this authority decision. A
+    terminal can retain the same physical provider process after its prior
+    workflow closes, and NULL is a legacy unknown rather than compatibility
+    proof. Known recovery/exit lifecycles are owned by their canonical sagas;
+    NULL lifecycle remains a legacy unknown because transport still permits it.
+    """
+    from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
+
+    return bool(
+        terminal is not None
+        and terminal.provider == "codex"
+        and terminal.runtime_lifecycle in (None, "running")
+        and (
+            not terminal.provider_runtime_compatibility_generation
+            or not hmac.compare_digest(
+                str(terminal.provider_runtime_compatibility_generation),
+                ACTIVE_RUNTIME_GENERATION,
+            )
+        )
+    )
+
+
 def _terminal_runtime_mutation_blocked(db, terminal_id: str, now: datetime) -> bool:
     terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
     if terminal is None:
@@ -10205,6 +10261,8 @@ def _terminal_runtime_mutation_blocked(db, terminal_id: str, now: datetime) -> b
         "exited",
         "recovery_fenced",
     ):
+        return True
+    if _terminal_requires_provider_runtime_compatibility_reconnect(terminal):
         return True
     if _terminal_has_pending_provider_reconnect(db, terminal_id):
         return True
@@ -10233,6 +10291,9 @@ def acquire_terminal_runtime_transport(
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal is None or terminal.runtime_lifecycle not in (None, "running"):
+            db.commit()
+            return None
+        if _terminal_requires_provider_runtime_compatibility_reconnect(terminal):
             db.commit()
             return None
         if not _workspace_accepts_new_work(db, terminal_id):
@@ -12530,6 +12591,9 @@ def _prepare_workflow_input(
                 "accepted": False,
                 "reason_code": "TERMINAL_RUNTIME_NOT_WRITABLE",
             }
+        runtime_compatibility_recovery = (
+            _terminal_requires_provider_runtime_compatibility_reconnect(terminal)
+        )
         if not _retirement_quiescence_allows_commit(db, root_terminal_id):
             return None
         # Terminal workflow turns can leave their ordinary Inbox transport
@@ -12628,10 +12692,24 @@ def _prepare_workflow_input(
                         "accepted": False,
                         "reason_code": "WORKFLOW_INPUT_NO_LONGER_EXECUTABLE",
                     }
+                if (
+                    runtime_compatibility_recovery
+                    and existing_workflow is not None
+                    and existing_workflow.active_turn_id == effective_turn.id
+                    and effective_turn.state == TURN_QUEUED
+                    and not _request_workflow_provider_reconnect_in_transaction(
+                        db,
+                        root_terminal_id,
+                        datetime.now(),
+                    )
+                ):
+                    db.rollback()
+                    return None
                 runtime_recovery = bool(
                     terminal
                     and (
-                        terminal.runtime_operation_kind in ("reconnect", "retire")
+                        runtime_compatibility_recovery
+                        or terminal.runtime_operation_kind in ("reconnect", "retire")
                         or _terminal_has_pending_provider_reconnect(db, root_terminal_id)
                     )
                 )
@@ -12678,14 +12756,17 @@ def _prepare_workflow_input(
                 )
                 db.add(workflow)
                 db.flush()
-        runtime_owned = False
+        runtime_owned = runtime_compatibility_recovery
         workflow_predecessor = False
         if defer_while_runtime_owned:
             runtime_owned = bool(
-                terminal
-                and (
-                    terminal.runtime_operation_kind in ("reconnect", "retire")
-                    or _terminal_has_pending_provider_reconnect(db, root_terminal_id)
+                runtime_owned
+                or (
+                    terminal
+                    and (
+                        terminal.runtime_operation_kind in ("reconnect", "retire")
+                        or _terminal_has_pending_provider_reconnect(db, root_terminal_id)
+                    )
                 )
             )
             workflow_predecessor = bool(
@@ -12727,8 +12808,16 @@ def _prepare_workflow_input(
         # The direct input about to reach the provider is the only turn whose
         # public MCP calls may be admitted.  A later input replaces this
         # binding, so an old prompt cannot borrow its retained receipt.
-        if not queued:
+        compatibility_head = bool(runtime_compatibility_recovery and not workflow_predecessor)
+        if not queued or compatibility_head:
             workflow.active_turn_id = turn.id
+        if compatibility_head and not _request_workflow_provider_reconnect_in_transaction(
+            db,
+            root_terminal_id,
+            datetime.now(),
+        ):
+            db.rollback()
+            return None
         # A direct owner/user input is genuine progress and re-arms the bounded
         # automatic continuation path for this still-open mission.
         workflow.no_progress_count = 0
@@ -15558,6 +15647,31 @@ def _provider_reconnect_authority_turn(
         if turn.resume_parent_turn_id is None:
             turn.resume_parent_turn_id = predecessor.id
         candidate = predecessor
+    elif (
+        turn.state == TURN_QUEUED
+        and turn.kind == "external_input"
+        and turn.inbox_message_id is None
+        and workflow.status == WORKFLOW_OPEN
+        and workflow.root_terminal_id == root_terminal_id
+        and workflow.active_turn_id == turn.id
+        and turn.workflow_id == workflow.id
+        and turn.claim_token is None
+        and turn.claim_expires_at is None
+        and turn.superseded_by_turn_id is None
+        and turn.superseded_at is None
+        and db.query(WorkflowTurnReceiptModel.id)
+        .filter_by(
+            workflow_turn_id=turn.id,
+            receiver_terminal_id=root_terminal_id,
+        )
+        .first()
+        is None
+    ):
+        # An accepted external input is durable transport authority even
+        # before provider admission. It may own a compatibility reconnect so
+        # the exact same turn remains queued while the resident process is
+        # replaced, then becomes sendable once the new runtime is proven.
+        return turn
     elif _queued_result_turn_authorizes_provider_reconnect(db, workflow, turn, root_terminal_id):
         return turn
     elif turn.state not in (TURN_SENT, TURN_FINISHED):
@@ -15571,6 +15685,44 @@ def _provider_reconnect_authority_turn(
         .first()
     )
     return candidate if admitted is not None else None
+
+
+def _request_workflow_provider_reconnect_in_transaction(
+    db: Any,
+    root_terminal_id: str,
+    now: datetime,
+    *,
+    incompatible_with_runtime_generation: Optional[str] = None,
+) -> bool:
+    """Install one reconnect marker while retaining the caller's writer lock."""
+    if not _workspace_accepts_new_work(db, root_terminal_id):
+        return False
+    workflow = _open_workflow(db, root_terminal_id, create=False)
+    if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
+        return False
+    if incompatible_with_runtime_generation is not None:
+        terminal = db.get(TerminalModel, root_terminal_id)
+        if (
+            terminal is None
+            or terminal.provider != "codex"
+            or terminal.runtime_lifecycle != "running"
+            or terminal.provider_runtime_compatibility_generation
+            == incompatible_with_runtime_generation
+        ):
+            return False
+    turn = db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
+    if turn is None or turn.workflow_id != workflow.id:
+        return False
+    if _provider_reconnect_authority_turn(db, workflow, turn, root_terminal_id) is None:
+        return False
+    if turn.provider_reconnect_requested_at is None:
+        turn.provider_reconnect_requested_at = now
+        turn.provider_reconnect_claim_token = None
+        if turn.state == TURN_QUEUED:
+            turn.queue_reason = "TERMINAL_RUNTIME_RECONNECT_PENDING"
+        turn.updated_at = now
+        workflow.updated_at = now
+    return True
 
 
 def request_workflow_provider_reconnect(
@@ -15596,38 +15748,15 @@ def request_workflow_provider_reconnect(
     now = now or datetime.now()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
-        if not _workspace_accepts_new_work(db, root_terminal_id):
+        requested = _request_workflow_provider_reconnect_in_transaction(
+            db,
+            root_terminal_id,
+            now,
+            incompatible_with_runtime_generation=incompatible_with_runtime_generation,
+        )
+        if not requested:
             db.rollback()
             return False
-        workflow = _open_workflow(db, root_terminal_id, create=False)
-        if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
-            db.rollback()
-            return False
-        if incompatible_with_runtime_generation is not None:
-            terminal = db.get(TerminalModel, root_terminal_id)
-            if (
-                terminal is None
-                or terminal.provider != "codex"
-                or terminal.runtime_lifecycle != "running"
-                or terminal.provider_runtime_compatibility_generation
-                == incompatible_with_runtime_generation
-            ):
-                db.rollback()
-                return False
-        turn = db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
-        if turn is None or turn.workflow_id != workflow.id:
-            db.rollback()
-            return False
-        if _provider_reconnect_authority_turn(db, workflow, turn, root_terminal_id) is None:
-            db.rollback()
-            return False
-        if turn.provider_reconnect_requested_at is None:
-            turn.provider_reconnect_requested_at = now
-            turn.provider_reconnect_claim_token = None
-            if turn.state == TURN_QUEUED:
-                turn.queue_reason = "TERMINAL_RUNTIME_RECONNECT_PENDING"
-            turn.updated_at = now
-            workflow.updated_at = now
         db.commit()
         return True
 
@@ -15647,18 +15776,59 @@ def request_stale_provider_runtime_reconnects(
     queue observation prevents new transport and lets its existing recovery
     saga resume the exact provider session after the active execution settles.
 
-    Already-fenced rows are excluded, so bounded repeated daemon ticks make
-    progress beyond this batch without an unbounded startup scan.
+    Candidate selection includes only turn shapes which can carry reconnect
+    authority. A durable singleton keyset cursor advances across every selected
+    page even when its exact writer transactions all fail, so a deletion fence
+    or concurrently changed claimant cannot make the first page starve another
+    Session. The cursor resets after the end of each finite sweep and when the
+    active release generation changes. Terminal-level transport checks
+    independently fence every stale resident, including terminals with no OPEN
+    workflow.
     """
     _ensure_workflow_schema()
     if re.fullmatch(r"[0-9a-f]{64}", active_runtime_generation) is None:
         raise ValueError("active runtime generation is invalid")
     bounded_limit = min(max(int(limit), 1), STALE_PROVIDER_RUNTIME_RECONNECT_BATCH_SIZE)
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        scan = db.get(ProviderRuntimeCompatibilityScanModel, 1)
+        if scan is None:
+            scan = ProviderRuntimeCompatibilityScanModel(
+                id=1,
+                active_runtime_generation=active_runtime_generation,
+            )
+            db.add(scan)
+            db.flush()
+        elif not hmac.compare_digest(
+            str(scan.active_runtime_generation), active_runtime_generation
+        ):
+            scan.active_runtime_generation = active_runtime_generation
+            scan.after_terminal_id = None
+        after_terminal_id = (
+            str(scan.after_terminal_id) if scan.after_terminal_id is not None else None
+        )
+        direct_receipt_exists = (
+            db.query(WorkflowTurnReceiptModel.id)
+            .filter(
+                WorkflowTurnReceiptModel.workflow_turn_id == WorkflowTurnModel.id,
+                WorkflowTurnReceiptModel.receiver_terminal_id == WorkflowModel.root_terminal_id,
+            )
+            .exists()
+        )
+        predecessor_receipt_exists = (
+            db.query(WorkflowTurnReceiptModel.id)
+            .filter(
+                WorkflowTurnReceiptModel.workflow_turn_id
+                == WorkflowTurnModel.resume_parent_turn_id,
+                WorkflowTurnReceiptModel.receiver_terminal_id == WorkflowModel.root_terminal_id,
+            )
+            .exists()
+        )
         candidates = [
             str(root_terminal_id)
             for (root_terminal_id,) in (
                 db.query(WorkflowModel.root_terminal_id)
+                .distinct()
                 .join(TerminalModel, TerminalModel.id == WorkflowModel.root_terminal_id)
                 .join(
                     WorkflowTurnModel,
@@ -15674,12 +15844,41 @@ def request_stale_provider_runtime_reconnects(
                         != active_runtime_generation,
                     ),
                     WorkflowTurnModel.provider_reconnect_requested_at.is_(None),
+                    *(
+                        (WorkflowModel.root_terminal_id > after_terminal_id,)
+                        if after_terminal_id is not None
+                        else ()
+                    ),
+                    or_(
+                        and_(
+                            WorkflowTurnModel.state.in_((TURN_SENT, TURN_FINISHED)),
+                            direct_receipt_exists,
+                        ),
+                        and_(
+                            WorkflowTurnModel.state == TURN_QUEUED,
+                            WorkflowTurnModel.kind == "open_final",
+                            WorkflowTurnModel.resume_parent_turn_id.is_not(None),
+                            predecessor_receipt_exists,
+                        ),
+                        and_(
+                            WorkflowTurnModel.state == TURN_QUEUED,
+                            WorkflowTurnModel.kind == "external_input",
+                            WorkflowTurnModel.inbox_message_id.is_(None),
+                            WorkflowTurnModel.claim_token.is_(None),
+                            WorkflowTurnModel.claim_expires_at.is_(None),
+                            WorkflowTurnModel.superseded_by_turn_id.is_(None),
+                            WorkflowTurnModel.superseded_at.is_(None),
+                        ),
+                    ),
                 )
                 .order_by(WorkflowModel.root_terminal_id.asc())
                 .limit(bounded_limit)
                 .all()
             )
         ]
+        scan.after_terminal_id = candidates[-1] if len(candidates) == bounded_limit else None
+        scan.updated_at = now or datetime.now()
+        db.commit()
     return sum(
         int(
             request_workflow_provider_reconnect(
@@ -15690,6 +15889,31 @@ def request_stale_provider_runtime_reconnects(
         )
         for terminal_id in candidates
     )
+
+
+def count_stale_provider_runtime_compatibilities(active_runtime_generation: str) -> int:
+    """Count every resident Codex runtime not proven compatible with this release."""
+    _ensure_workflow_schema()
+    if re.fullmatch(r"[0-9a-f]{64}", active_runtime_generation) is None:
+        raise ValueError("active runtime generation is invalid")
+    with SessionLocal() as db:
+        return int(
+            db.query(func.count(TerminalModel.id))
+            .filter(
+                TerminalModel.provider == "codex",
+                or_(
+                    TerminalModel.runtime_lifecycle.is_(None),
+                    TerminalModel.runtime_lifecycle == "running",
+                ),
+                or_(
+                    TerminalModel.provider_runtime_compatibility_generation.is_(None),
+                    TerminalModel.provider_runtime_compatibility_generation
+                    != active_runtime_generation,
+                ),
+            )
+            .scalar()
+            or 0
+        )
 
 
 def claim_workflow_provider_reconnect(

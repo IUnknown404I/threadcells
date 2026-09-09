@@ -41,6 +41,7 @@ from cli_agent_orchestrator.clients.database import (
     set_workflow_terminal_state,
     start_workflow_input,
 )
+from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
 
 
 @pytest.fixture
@@ -99,6 +100,7 @@ def _reviewer(
         managed_worktree_source=str(repo),
         managed_worktree_commit=revision,
         runtime_lifecycle="running",
+        provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
     )
 
 
@@ -784,6 +786,7 @@ def test_mcp_assign_cannot_reuse_an_ordinary_child_as_reviewer(authority_db, mon
                 provider="codex",
                 agent_profile="developer",
                 runtime_lifecycle="running",
+                provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
             )
         )
         db.commit()

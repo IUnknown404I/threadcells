@@ -250,6 +250,48 @@ def test_resumed_owner_gates_do_not_block_deletion_or_resurrect_unsettled_provid
     assert all(item["workflow"]["reason"] for item in historical_gates)
 
 
+def test_owner_gate_resumed_after_delete_plan_is_preserved_by_idempotent_cancel(monkeypatch):
+    _install_database(monkeypatch)
+    with database.SessionLocal() as db:
+        db.add(_terminal())
+        gate = WorkflowModel(
+            root_terminal_id="owner",
+            status="owner_gate",
+            terminal_reason="owner decision required",
+        )
+        db.add(gate)
+        db.commit()
+        gate_id = int(gate.id)
+
+    stale_plan = _plan()
+    assert stale_plan["cancellable_count"] == 1
+    assert stale_plan["reason_codes"] == ["OWNER_GATE"]
+
+    with database.SessionLocal() as db:
+        db.add(
+            WorkflowModel(
+                root_terminal_id="owner",
+                status="terminal",
+                terminal_reason="owner-approved work completed",
+                resumed_from_owner_gate_workflow_id=gate_id,
+            )
+        )
+        db.commit()
+
+    resolved = database.cancel_session_work_for_deletion(
+        "session",
+        expected_plan_token=stale_plan["plan_token"],
+    )
+    assert resolved["cancelled"] is True
+    assert resolved["already_cancelled"] is True
+    assert resolved["residual"]["eligible"] is True
+    with database.SessionLocal() as db:
+        historical = db.get(WorkflowModel, gate_id)
+        assert historical.status == "owner_gate"
+        assert historical.terminal_reason == "owner decision required"
+        assert db.query(SessionDeletionCancellationAuditModel).count() == 0
+
+
 def test_only_same_terminal_linked_successor_resolves_owner_gate(monkeypatch):
     _install_database(monkeypatch)
     with database.SessionLocal() as db:

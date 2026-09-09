@@ -491,9 +491,12 @@ WITH terminal_lifetimes AS MATERIALIZED (
     FROM provider_execution_leases lease
     JOIN workflow_turns wt ON wt.id = lease.workflow_turn_id
     JOIN workflows w ON w.id = wt.workflow_id
+    JOIN workflow_execution_authority workflow_authority
+      ON workflow_authority.workflow_id = w.id
     JOIN interaction_terminals terminals ON terminals.terminal_id = lease.terminal_id
     WHERE w.status IN ('terminal', 'cancelled')
        OR wt.superseded_by_turn_id IS NOT NULL
+       OR workflow_authority.is_current = 0
 ), writer_authority_item_rows AS NOT MATERIALIZED (
     SELECT 'writer:' || terminals.terminal_id AS interaction_id,
            terminals.session_id, 'runtime_authority' AS interaction_type,

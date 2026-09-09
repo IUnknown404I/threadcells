@@ -77,6 +77,46 @@ def test_stable_identity_separates_reused_session_names(monkeypatch):
         raise AssertionError("a reused raw session name must remain ambiguous")
 
 
+def test_current_lifetime_preserves_exact_workspace_retirement_projection(monkeypatch):
+    _install_database(monkeypatch)
+    terminals = [
+        _terminal("supervisor", "lifetime", "cao-session", "/work/supervisor"),
+        _terminal("reviewer", "lifetime", "cao-session", "/work/reviewer"),
+        _terminal("legacy-null", "lifetime", "cao-session", "/work/legacy-null"),
+    ]
+    generations = {
+        "supervisor": "writer-generation-supervisor",
+        "reviewer": "writer-generation-reviewer",
+        "legacy-null": None,
+    }
+    for terminal in terminals:
+        terminal.managed_worktree_kind = "reviewer" if terminal.id == "reviewer" else "supervisor"
+        terminal.managed_worktree_source = "/source/project"
+        terminal.managed_worktree_branch = (
+            None if terminal.id == "reviewer" else f"cao/session/{terminal.id}"
+        )
+        terminal.managed_worktree_commit = terminal.id.ljust(40, "0")
+        terminal.managed_worktree_origin_terminal_id = terminal.id
+        terminal.writable_work_context_id = terminal.id if terminal.id != "reviewer" else None
+        terminal.writer_authority_generation = generations[terminal.id]
+    with database.SessionLocal() as db:
+        db.add_all(terminals)
+        db.commit()
+
+    resolved = database.resolve_session_lifetime("lifetime")
+
+    assert resolved is not None
+    by_id = {row["id"]: row for row in resolved["terminals"]}
+    assert set(by_id) == set(generations)
+    assert all(
+        set(database._SESSION_WORKSPACE_RETIREMENT_TERMINAL_FIELDS) <= set(row)
+        for row in by_id.values()
+    )
+    assert {
+        terminal_id: row["writer_authority_generation"] for terminal_id, row in by_id.items()
+    } == generations
+
+
 def test_undeleted_legacy_session_resolves_by_raw_name(monkeypatch):
     _install_database(monkeypatch)
     legacy = _terminal("legacy", "placeholder", "cao-legacy", "/work/legacy")

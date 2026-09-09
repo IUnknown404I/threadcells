@@ -47,7 +47,11 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.models.inbox import ChildAssignmentStatus, MessageStatus
 from cli_agent_orchestrator.models.result import HandoffResultDocumentV1
 from cli_agent_orchestrator.models.usage import UsageObservation
-from cli_agent_orchestrator.services import interaction_read_model_service, managed_worktree_service
+from cli_agent_orchestrator.services import (
+    interaction_read_model_service,
+    managed_worktree_service,
+    session_service,
+)
 
 
 def _install_database(monkeypatch, url: str = "sqlite:///:memory:"):
@@ -246,6 +250,158 @@ def _managed_supervisor_deletion_fixture(monkeypatch, tmp_path):
     assert captured["safe"] is True
     captured["authority"]["work_context"] = _current_context_authority("session")
     return managed, captured["authority"]
+
+
+def test_production_shaped_fenced_session_binds_exact_projected_writer_generations(
+    monkeypatch, tmp_path
+):
+    _install_database(monkeypatch)
+    repository = tmp_path / "source"
+    repository.mkdir()
+    _git(repository, "init", "-q")
+    _git(repository, "config", "user.name", "ThreadCells Test")
+    _git(repository, "config", "user.email", "threadcells@example.invalid")
+    (repository / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+    _git(repository, "add", "tracked.txt")
+    _git(repository, "commit", "-qm", "baseline")
+    baseline = _git(repository, "rev-parse", "HEAD")
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+
+    supervisor = managed_worktree_service.create_managed_worktree(
+        str(repository), "supervisor", "supervisor", expected_commit=baseline
+    )
+    assert supervisor is not None
+    supervisor_path = Path(supervisor.path)
+    _git(supervisor_path, "switch", "-c", "fix/production-shaped-mission")
+    (supervisor_path / "tracked.txt").write_text("mission\n", encoding="utf-8")
+    _git(supervisor_path, "commit", "-qam", "mission")
+    mission_head = _git(supervisor_path, "rev-parse", "HEAD")
+
+    present_task = managed_worktree_service.create_managed_worktree(
+        str(repository), "task-present", "task", expected_commit=baseline
+    )
+    retired_task = managed_worktree_service.create_managed_worktree(
+        str(repository), "task-retired", "task", expected_commit=baseline
+    )
+    assert present_task is not None and retired_task is not None
+    _git(repository, "worktree", "remove", retired_task.path)
+
+    reviewers = []
+    for index in range(9):
+        reviewer = managed_worktree_service.create_managed_worktree(
+            str(repository),
+            f"reviewer-{index:02d}",
+            "reviewer",
+            expected_commit=baseline,
+        )
+        assert reviewer is not None
+        _git(Path(reviewer.path), "switch", "--detach", mission_head)
+        reviewers.append((f"reviewer-{index:02d}", reviewer))
+
+    managed_rows = [
+        ("supervisor", supervisor),
+        ("task-present", present_task),
+        ("task-retired", retired_task),
+        *reviewers,
+    ]
+    generations = {
+        terminal_id: f"writer-generation-{index:02d}"
+        for index, (terminal_id, _managed) in enumerate(managed_rows)
+    }
+    terminals = []
+    for terminal_id, managed in managed_rows:
+        terminal = _terminal(terminal_id)
+        terminal.project_id = "project"
+        terminal.launch_worktree = managed.path
+        terminal.write_enabled = managed.kind != "reviewer"
+        terminal.managed_worktree_kind = managed.kind
+        terminal.managed_worktree_source = managed.source
+        terminal.managed_worktree_branch = managed.branch
+        terminal.managed_worktree_commit = managed.commit
+        terminal.managed_worktree_origin_terminal_id = terminal_id
+        terminal.writable_work_context_id = "supervisor" if terminal_id == "supervisor" else None
+        terminal.writer_authority_generation = generations[terminal_id]
+        terminal.workspace_classification = "managed_isolated"
+        terminals.append(terminal)
+    with database.SessionLocal() as db:
+        db.add_all(
+            [
+                ProjectModel(
+                    id="project",
+                    name="Project",
+                    normalized_name="project",
+                    path=str(repository),
+                    normalized_path=str(repository),
+                    is_default=True,
+                ),
+                WritableWorkContextModel(
+                    id="supervisor",
+                    request_id="request",
+                    project_id="project",
+                    session_id="session",
+                    terminal_id="supervisor",
+                    canonical_source=supervisor.source,
+                    canonical_worktree=supervisor.path,
+                    branch=str(supervisor.branch),
+                    base_revision=baseline,
+                    state="retiring",
+                    writer_authority_generation=generations["supervisor"],
+                ),
+                *terminals,
+            ]
+        )
+        db.commit()
+
+    terminal_ids = [terminal_id for terminal_id, _managed in managed_rows]
+    started = database.begin_session_hard_deletion(
+        "session",
+        "cao-session",
+        expected_terminal_ids=terminal_ids,
+        allow_dirty_workspace=False,
+    )
+    assert started["started"] is True
+    resolved = database.resolve_session_lifetime("session")
+    assert resolved is not None
+    assert resolved["deletion_in_progress"] is True
+    resolved_generations = {
+        row["id"]: row["writer_authority_generation"] for row in resolved["terminals"]
+    }
+    assert resolved_generations == generations
+
+    authority = session_service.SessionAuthority(
+        session_id="session",
+        session_name="cao-session",
+        terminals=resolved["terminals"],
+        retained_resources=[],
+        deleted=False,
+        runtime_exists=False,
+        deletion_in_progress=True,
+    )
+    captured = session_service._capture_session_workspace_retirement_authority(authority)
+
+    assert captured["safe"] is True
+    captured_rows = {row["terminal_id"]: row for row in captured["authority"]["worktrees"]}
+    assert len(captured_rows) == 12
+    assert sum(bool(row["present"]) for row in captured_rows.values()) == 11
+    assert {
+        terminal_id: row["writer_authority_generation"]
+        for terminal_id, row in captured_rows.items()
+    } == generations
+    assert captured_rows["supervisor"]["branch"] == "fix/production-shaped-mission"
+    assert captured_rows["supervisor"]["head"] == mission_head
+    assert all(
+        captured_rows[terminal_id]["detached"] is True
+        and captured_rows[terminal_id]["head"] == mission_head
+        for terminal_id, _reviewer in reviewers
+    )
+    assert (
+        database.bind_session_hard_deletion_workspace_authority(
+            "session",
+            "cao-session",
+            workspace_authority=captured["authority"],
+        )["bound"]
+        is True
+    )
 
 
 def _git(repository: Path, *args: str) -> str:
@@ -1555,6 +1711,27 @@ def test_workspace_authority_rejects_terminal_context_relational_mismatch(monkey
         owner.project_id = "different-project"
         db.commit()
     authority["worktrees"][0]["project_id"] = "different-project"
+    assert database.begin_session_hard_deletion(
+        "session",
+        "cao-session",
+        expected_terminal_ids=["owner"],
+        allow_dirty_workspace=False,
+    )["started"]
+
+    assert database.bind_session_hard_deletion_workspace_authority(
+        "session", "cao-session", workspace_authority=authority
+    ) == {
+        "bound": False,
+        "reason_code": "WORKSPACE_AUTHORITY_CHANGED",
+    }
+
+
+def test_workspace_authority_rejects_writer_generation_changed_after_capture(monkeypatch, tmp_path):
+    _managed, authority = _managed_supervisor_deletion_fixture(monkeypatch, tmp_path)
+    with database.SessionLocal() as db:
+        owner = db.get(TerminalModel, "owner")
+        owner.writer_authority_generation = "writer-generation-changed"
+        db.commit()
     assert database.begin_session_hard_deletion(
         "session",
         "cao-session",

@@ -4,9 +4,11 @@ import asyncio
 import hashlib
 import sqlite3
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -42,6 +44,7 @@ from cli_agent_orchestrator.clients.database import (
     start_workflow_input,
 )
 from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
+from cli_agent_orchestrator.services import managed_worktree_service, terminal_service
 
 
 @pytest.fixture
@@ -98,8 +101,10 @@ def _reviewer(
         launch_worktree=str(launch_worktree or repo),
         managed_worktree_kind="reviewer",
         managed_worktree_source=str(repo),
+        managed_worktree_origin_terminal_id=child_id,
         managed_worktree_commit=revision,
         runtime_lifecycle="running",
+        runtime_generation=f"runtime-{child_id}",
         provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
     )
 
@@ -224,6 +229,125 @@ def test_correction_and_rereview_preserve_history_but_only_b_is_current(authorit
     assert get_parent_completion_barrier("parent") == (0, 0)
 
 
+def test_exact_review_preparation_claim_admits_only_its_bound_provider_turn(authority_db, tmp_path):
+    repo, revision = _repository(tmp_path)
+    with database.SessionLocal() as db:
+        db.add(_reviewer("reviewer", repo, revision))
+        db.commit()
+    request = _start_review(
+        "parent",
+        "reviewer",
+        "Review exact revision",
+        requested_revision=revision,
+    )
+
+    preparation = database.claim_review_worktree_preparation("reviewer", request["child_turn_id"])
+    assert preparation["required"] is True
+    assert preparation["claimed"] is True
+    assert preparation["revision"] == revision
+    assert database.review_worktree_preparation_owned(
+        "reviewer",
+        request["child_turn_id"],
+        preparation["claim_token"],
+        revision,
+    )
+    admitted = database.acquire_provider_execution_decision(
+        "reviewer", request["child_turn_id"], limit=1
+    )
+    assert admitted["acquired"] is True
+    assert (
+        database.acquire_provider_execution_decision("reviewer", 999999, limit=1)["acquired"]
+        is False
+    )
+    assert database.release_provider_execution("reviewer", request["child_turn_id"])
+    assert database.release_review_worktree_preparation("reviewer", preparation["claim_token"])
+
+
+def test_queued_exact_review_retry_prepares_and_sends_once(authority_db, monkeypatch, tmp_path):
+    """A capacity-deferred review keeps one turn and reaches only exact revision B."""
+    repo, revision_a = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    reviewer = managed_worktree_service.create_managed_worktree(
+        str(repo), "reviewer", "reviewer", expected_commit=revision_a
+    )
+    assert reviewer is not None
+    reviewer_worktree = Path(reviewer.path)
+    revision_b = _advance(repo, "B")
+    with database.SessionLocal() as db:
+        db.add(
+            _reviewer(
+                "reviewer",
+                repo,
+                revision_a,
+                launch_worktree=reviewer_worktree,
+            )
+        )
+        db.commit()
+    request = _start_review(
+        "parent",
+        "reviewer",
+        "Review exact revision B after capacity recovery",
+        requested_revision=revision_b,
+    )
+    child_turn_id = request["child_turn_id"]
+    assert database.queue_workflow_input_for_provider(
+        "reviewer",
+        child_turn_id,
+        "review exact B",
+        "PROVIDER_EXECUTION_CAPACITY_EXHAUSTED",
+    )
+    retry = database.claim_workflow_turn("reviewer")
+    assert retry is not None and retry["id"] == child_turn_id
+
+    provider = SimpleNamespace(
+        paste_enter_count=1,
+        turn_outcome_cursor_required=lambda: False,
+        mark_input_received=lambda: None,
+    )
+    sends: list[str] = []
+
+    def acquire_exact_provider_slot(terminal_id: str, workflow_turn_id: int) -> None:
+        decision = database.acquire_provider_execution_decision(
+            terminal_id, workflow_turn_id, limit=1
+        )
+        assert decision["acquired"] is True
+
+    with (
+        patch.object(terminal_service.provider_manager, "get_provider", return_value=provider),
+        patch.object(
+            terminal_service.tmux_client,
+            "send_keys",
+            side_effect=lambda *_args, **_kwargs: sends.append(
+                _git(reviewer_worktree, "rev-parse", "HEAD")
+            ),
+        ),
+        patch.object(terminal_service, "_wake_queued_provider_execution"),
+        patch(
+            "cli_agent_orchestrator.services.operations_service.acquire_provider_execution_slot",
+            side_effect=acquire_exact_provider_slot,
+        ),
+    ):
+        assert terminal_service.send_input(
+            "reviewer",
+            "review exact B",
+            logical_turn_id=child_turn_id,
+            workflow_turn_claim_token=retry["claim_token"],
+            workflow_turn_claim_generation=retry["claim_generation"],
+        )
+
+    assert sends == [revision_b]
+    assert _git(reviewer_worktree, "rev-parse", "HEAD") == revision_b
+    assert database.mark_workflow_turn_sent(
+        child_turn_id, retry["claim_token"], retry["claim_generation"]
+    )
+    assert database.claim_workflow_turn("reviewer") is None
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, "reviewer")
+        lease = db.get(database.ProviderExecutionLeaseModel, "reviewer")
+        assert terminal is not None and terminal.runtime_operation_kind is None
+        assert lease is not None and lease.workflow_turn_id == child_turn_id
+
+
 def test_superseded_review_does_not_block_transactional_terminal_guard(authority_db, tmp_path):
     repo, revision_a = _repository(tmp_path)
     with database.SessionLocal() as db:
@@ -312,10 +436,14 @@ def test_same_reviewer_terminal_two_attempts_do_not_collapse_delivery(authority_
 def test_mcp_assign_reuses_same_reviewer_with_exact_new_attempt_and_ack(
     authority_db, monkeypatch, tmp_path
 ):
-    """Public admitted assign owns a bounded rereview on a warm reviewer."""
+    """Revision A -> correction B prepares and executes in exact reviewer B."""
     repo, revision_a = _repository(tmp_path)
-    reviewer_worktree = tmp_path / "reviewer-worktree"
-    _git(repo, "worktree", "add", "--detach", str(reviewer_worktree), revision_a)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    reviewer = managed_worktree_service.create_managed_worktree(
+        str(repo), "reviewer", "reviewer", expected_commit=revision_a
+    )
+    assert reviewer is not None
+    reviewer_worktree = Path(reviewer.path)
     with database.SessionLocal() as db:
         db.add(
             _reviewer(
@@ -345,15 +473,61 @@ def test_mcp_assign_reuses_same_reviewer_with_exact_new_attempt_and_ack(
     assert activate_workflow_turn_for_inbox(result_a["notice_id"]) == parent_turn_id
     assert mark_workflow_turn_sent_for_inbox(result_a["notice_id"])
 
-    revision_b = _advance(repo, "B")
+    (repo / "exact_revision_test.py").write_text(
+        "from pathlib import Path\n\n"
+        "def test_reviewer_runs_from_revision_b():\n"
+        "    assert Path('subject.txt').read_text() == 'revision B\\n'\n",
+        encoding="utf-8",
+    )
+    (repo / "subject.txt").write_text("revision B\n", encoding="utf-8")
+    _git(repo, "add", "subject.txt", "exact_revision_test.py")
+    _git(repo, "commit", "-qm", "revision B with exact test")
+    revision_b = _git(repo, "rev-parse", "HEAD")
     assert _git(reviewer_worktree, "rev-parse", "HEAD") == revision_a
 
     assert database.claim_workflow_turn_receipt("parent", parent_turn_id)
     monkeypatch.setenv("CAO_TERMINAL_ID", "parent")
+    provider = SimpleNamespace(
+        paste_enter_count=1,
+        turn_outcome_cursor_required=lambda: False,
+        mark_input_received=lambda: None,
+    )
+    exact_test_runs = []
+
+    def deliver_exact(_terminal_id, _message, binding):
+        child_turn_id = resolve_workflow_input_binding("reviewer", binding)
+        assert child_turn_id is not None
+
+        def observe_send(*_args, **_kwargs):
+            assert _git(reviewer_worktree, "rev-parse", "HEAD") == revision_b
+            completed = subprocess.run(
+                [sys.executable, "-m", "pytest", "-q", "exact_revision_test.py"],
+                cwd=reviewer_worktree,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            exact_test_runs.append((completed.returncode, completed.stdout, completed.stderr))
+            assert completed.returncode == 0, completed.stdout + completed.stderr
+
+        with (
+            patch.object(terminal_service.provider_manager, "get_provider", return_value=provider),
+            patch.object(terminal_service.tmux_client, "send_keys", side_effect=observe_send),
+            patch.object(terminal_service, "_wake_queued_provider_execution"),
+            patch(
+                "cli_agent_orchestrator.services.operations_service.acquire_provider_execution_slot"
+            ),
+        ):
+            assert terminal_service.send_input(
+                "reviewer", "review exact B", logical_turn_id=child_turn_id
+            )
+
     with (
         patch.object(mcp_server, "_fence_privileged_runtime"),
         patch.object(mcp_server, "wait_until_terminal_status", return_value=True),
-        patch.object(mcp_server, "_send_direct_input_assign") as send_input,
+        patch.object(
+            mcp_server, "_send_direct_input_assign", side_effect=deliver_exact
+        ) as send_input,
     ):
         rereview = asyncio.run(
             mcp_server.assign(
@@ -372,6 +546,8 @@ def test_mcp_assign_reuses_same_reviewer_with_exact_new_attempt_and_ack(
     delivered_review_request = send_input.call_args.args[1]
     assert "CAO immutable review authority" in delivered_review_request
     assert f"exact_revision={revision_b}" in delivered_review_request
+    assert _git(reviewer_worktree, "rev-parse", "HEAD") == revision_b
+    assert exact_test_runs and exact_test_runs[0][0] == 0
 
     with database.SessionLocal() as db:
         attempts = (

@@ -29,13 +29,15 @@ def _repository(tmp_path: Path) -> Path:
 
 
 def _metadata(worktree):
+    identity = Path(worktree.path).name.removeprefix(f"{worktree.kind}-")
     return {
-        "id": Path(worktree.path).name.removeprefix(f"{worktree.kind}-"),
+        "id": identity,
         "launch_worktree": worktree.path,
         "managed_worktree_kind": worktree.kind,
         "managed_worktree_source": worktree.source,
         "managed_worktree_branch": worktree.branch,
         "managed_worktree_commit": worktree.commit,
+        "managed_worktree_origin_terminal_id": identity,
     }
 
 
@@ -93,6 +95,65 @@ def test_reviewer_is_detached_at_exact_commit_and_dirty_cleanup_is_fail_closed(
     assert repeated["removed"] is True
     assert repeated["already_removed"] is True
     assert repeated["commit"] == reviewer.commit
+
+
+def test_reviewer_preparation_moves_clean_detached_worktree_to_exact_later_revision(
+    tmp_path, monkeypatch
+):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    reviewer = managed_worktree_service.create_managed_worktree(
+        str(repository), "reviewer-b", "reviewer"
+    )
+    assert reviewer is not None
+    launch_revision = reviewer.commit
+    (repository / "tracked.txt").write_text("correction B\n", encoding="utf-8")
+    _git(repository, "add", "tracked.txt")
+    _git(repository, "commit", "-qm", "correction B")
+    correction_revision = _git(repository, "rev-parse", "HEAD")
+
+    prepared = managed_worktree_service.prepare_reviewer_worktree_revision(
+        _metadata(reviewer), correction_revision
+    )
+
+    assert launch_revision != correction_revision
+    assert reviewer.commit == launch_revision
+    assert prepared["commit"] == correction_revision
+    assert prepared["detached"] is True
+    assert prepared["clean"] is True
+    assert managed_worktree_service.reviewer_worktree_matches_revision(
+        _metadata(reviewer), correction_revision
+    )
+
+
+def test_reviewer_preparation_refuses_dirty_or_foreign_managed_identity(tmp_path, monkeypatch):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    reviewer = managed_worktree_service.create_managed_worktree(
+        str(repository), "reviewer-c", "reviewer"
+    )
+    assert reviewer is not None
+    (repository / "tracked.txt").write_text("correction C\n", encoding="utf-8")
+    _git(repository, "add", "tracked.txt")
+    _git(repository, "commit", "-qm", "correction C")
+    correction_revision = _git(repository, "rev-parse", "HEAD")
+    (Path(reviewer.path) / "notes.txt").write_text("local evidence\n", encoding="utf-8")
+
+    with pytest.raises(
+        managed_worktree_service.ManagedWorktreeError,
+        match="REVIEW_WORKTREE_AUTHORITY_CHANGED",
+    ):
+        managed_worktree_service.prepare_reviewer_worktree_revision(
+            _metadata(reviewer), correction_revision
+        )
+
+    (Path(reviewer.path) / "notes.txt").unlink()
+    foreign = {**_metadata(reviewer), "managed_worktree_origin_terminal_id": "another-terminal"}
+    with pytest.raises(
+        managed_worktree_service.ManagedWorktreeError,
+        match="REVIEW_WORKTREE_AUTHORITY_CHANGED",
+    ):
+        managed_worktree_service.prepare_reviewer_worktree_revision(foreign, correction_revision)
 
 
 def test_supervisor_worktrees_are_isolated_unique_branches_and_idempotent(tmp_path, monkeypatch):

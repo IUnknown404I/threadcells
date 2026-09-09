@@ -2546,18 +2546,32 @@ async def send_orchestrated_terminal_input(
     Its opaque binding is issued by CAO and resolves only while that durable
     turn remains current; it never accepts a caller-selected logical turn.
     """
-    turn_id = resolve_workflow_input_binding(terminal_id, binding)
-    if turn_id is None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="input binding is stale")
-    return await run_in_threadpool(
-        _send_server_bound_input,
-        request,
-        terminal_id,
-        message,
-        turn_id,
-        sender_id=sender_id,
-        orchestration_type=orchestration_type,
-    )
+
+    def deliver_bound_input() -> Dict:
+        from cli_agent_orchestrator.services.operations_service import (
+            workflow_execution_admission_fence,
+        )
+
+        # Re-resolve the opaque binding only after taking the global admission
+        # fence. A newer workflow input that wins first invalidates this send;
+        # once this fence wins, no competing direct/public input can replace
+        # the review turn between checkout preparation and tmux transport.
+        with workflow_execution_admission_fence():
+            turn_id = resolve_workflow_input_binding(terminal_id, binding)
+            if turn_id is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT, detail="input binding is stale"
+                )
+            return _send_server_bound_input(
+                request,
+                terminal_id,
+                message,
+                turn_id,
+                sender_id=sender_id,
+                orchestration_type=orchestration_type,
+            )
+
+    return await run_in_threadpool(deliver_bound_input)
 
 
 @app.post("/_internal/delegation-results/handoff-v1", include_in_schema=False)

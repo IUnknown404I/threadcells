@@ -1629,13 +1629,20 @@ async def _handoff_impl(
                 )
         binding: Optional[str] = None
         delivery: Dict[str, Any] = {}
+        direct_payload = _direct_handoff_payload(provider, message)
         try:
             from cli_agent_orchestrator.services.operations_service import (
                 workflow_execution_admission_fence,
             )
 
             with workflow_execution_admission_fence():
-                binding = issue_workflow_input_binding(terminal_id)
+                binding = issue_workflow_input_binding(
+                    terminal_id,
+                    direct_payload,
+                    child_assignment_workflow_effect_id=(
+                        int(request_effect_id) if request_effect_id is not None else None
+                    ),
+                )
             if binding is None:
                 raise RuntimeError("Could not create handoff child workflow binding")
             if (
@@ -1650,7 +1657,7 @@ async def _handoff_impl(
                 get_workflow_input_binding_delivery(
                     terminal_id,
                     binding,
-                    expected_payload=_direct_handoff_payload(provider, message),
+                    expected_payload=direct_payload,
                 )
                 if binding is not None
                 else None
@@ -1673,7 +1680,7 @@ async def _handoff_impl(
                         retained = get_workflow_input_binding_delivery(
                             terminal_id,
                             binding,
-                            expected_payload=_direct_handoff_payload(provider, message),
+                            expected_payload=direct_payload,
                         )
                         if retained is not None and retained["accepted"]:
                             delivery = retained
@@ -2120,6 +2127,7 @@ def _assign_impl(
                 }
         binding: Optional[str] = None
         delivery: Dict[str, Any] = {}
+        direct_payload: Optional[str] = None
         try:
             from cli_agent_orchestrator.services.operations_service import (
                 workflow_execution_admission_fence,
@@ -2169,8 +2177,15 @@ def _assign_impl(
                         f"subject_id={review_authority['subject_id']} "
                         f"exact_revision={review_authority['revision']}]"
                     )
+            direct_payload = _direct_assign_payload(message)
             with workflow_execution_admission_fence():
-                binding = issue_workflow_input_binding(terminal_id)
+                binding = issue_workflow_input_binding(
+                    terminal_id,
+                    direct_payload,
+                    child_assignment_workflow_effect_id=(
+                        int(request_effect_id) if request_effect_id is not None else None
+                    ),
+                )
             if binding is None:
                 raise RuntimeError("Could not create assigned child workflow binding")
             if (
@@ -2185,7 +2200,7 @@ def _assign_impl(
                 get_workflow_input_binding_delivery(
                     terminal_id,
                     binding,
-                    expected_payload=_direct_assign_payload(message),
+                    expected_payload=direct_payload,
                 )
                 if binding is not None
                 else None
@@ -2208,7 +2223,7 @@ def _assign_impl(
                         retained = get_workflow_input_binding_delivery(
                             terminal_id,
                             binding,
-                            expected_payload=_direct_assign_payload(message),
+                            expected_payload=direct_payload,
                         )
                         if retained is not None and retained["accepted"]:
                             delivery = retained

@@ -4,6 +4,7 @@ import { api, TelegramSettings as TelegramSettingsState } from '../api'
 import { ConfirmModal } from './ConfirmModal'
 import { OperatorAccessCard, useOperatorAccess } from './OperatorAccess'
 import { useI18n, type TranslationKey } from '../i18n'
+import { formatAbsoluteTimestamp, useTimeZone } from '../timeZone'
 
 const RESULT_LABELS: Record<string, TranslationKey> = {
   connection_ok: 'telegram.connectionOk',
@@ -15,6 +16,7 @@ const RESULT_LABELS: Record<string, TranslationKey> = {
 
 export function TelegramSettings() {
   const { locale, t } = useI18n()
+  const { timeZone } = useTimeZone()
   const access = useOperatorAccess()
   const [settings, setSettings] = useState<TelegramSettingsState | null>(null)
   const [enabled, setEnabled] = useState(false)
@@ -118,7 +120,7 @@ export function TelegramSettings() {
       </div>
     </div>
     <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-2 rounded-xl border border-gray-800 bg-gray-900/40 p-4 text-xs text-gray-400">
-      <CheckCircle2 size={15} className="shrink-0 text-emerald-400"/><span className="shrink-0 text-gray-400">{t('telegram.lastResult')}</span><span className="min-w-0 break-words">{settings.last_result && RESULT_LABELS[settings.last_result] ? t(RESULT_LABELS[settings.last_result]) : t('telegram.noResult')}{settings.last_result_at ? ` · ${new Date(settings.last_result_at).toLocaleString(locale)}` : ''}</span>
+      <CheckCircle2 size={15} className="shrink-0 text-emerald-400"/><span className="shrink-0 text-gray-400">{t('telegram.lastResult')}</span><span className="min-w-0 break-words">{settings.last_result && RESULT_LABELS[settings.last_result] ? t(RESULT_LABELS[settings.last_result]) : t('telegram.noResult')}{settings.last_result_at ? ` · ${formatAbsoluteTimestamp(settings.last_result_at, locale, timeZone)}` : ''}</span>
     </div>
     {notice && <p role="status" className="rounded-lg border border-emerald-800/40 bg-emerald-950/20 p-3 text-sm text-emerald-200">{notice}</p>}
     {error && <p role="alert" className="break-words rounded-lg border border-red-700/50 bg-red-950/30 p-3 text-sm text-red-300">{error}</p>}

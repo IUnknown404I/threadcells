@@ -86,6 +86,9 @@ const server = http.createServer((request, response) => {
   if (request.method === 'GET' && url.pathname === '/api/v1/housekeeping') return json(response, housekeeping)
   if (request.method === 'GET' && url.pathname === '/api/v1/housekeeping/report') return json(response, {})
   if (request.method === 'GET' && url.pathname === '/settings/orchestration-capacity') return json(response, capacity)
+  delete request.headers['if-none-match']
+  delete request.headers['if-modified-since']
+  response.setHeader('cache-control', 'no-store')
   vite.middlewares(request, response)
 })
 
@@ -100,13 +103,15 @@ const labels = {
     lang: 'Language', home: 'Home', agents: 'Agents', settings: 'Settings', docs: 'Docs', sessions: 'Sessions',
     create: 'Create Session & Spawn Agent', sessionName: 'Session name', cancel: 'Cancel', inbox: 'Inbox',
     inboxTitle: 'Agent Inbox', housekeeping: 'Housekeeping', full: 'Delete all system files — Full Cleanup',
-    docsTitle: 'Start here: What is ThreadCells?', targetLocale: 'English',
+    docsTitle: 'Start here: What is ThreadCells?', targetLocale: 'English', graceful: 'Graceful Exit',
+    deleteDisabled: 'Gracefully exit this terminal before deleting it',
   },
   ru: {
     lang: 'Язык', home: 'Главная', agents: 'Агенты', settings: 'Настройки', docs: 'Документация', sessions: 'Сессии',
-    create: 'Создать сессию и запустить агента', sessionName: 'Название сессии', cancel: 'Отмена', inbox: 'Входящие',
-    inboxTitle: 'Входящие агента', housekeeping: 'Обслуживание', full: 'Удалить все системные файлы — полная очистка',
-    docsTitle: 'Начните здесь: что такое ThreadCells?', targetLocale: 'Русский',
+    create: 'Создать сессию и запустить агента', sessionName: 'Название сессии', cancel: 'Отмена', inbox: 'Почта',
+    inboxTitle: 'Почта агента', housekeeping: 'Обслуживание', full: 'Удалить все системные файлы — полная очистка',
+    docsTitle: 'Начните здесь: что такое ThreadCells?', targetLocale: 'Русский', graceful: 'Корректно завершить',
+    deleteDisabled: 'Корректно завершите терминал перед удалением',
   },
 }
 
@@ -131,12 +136,27 @@ async function assertSurfaceSet(page, locale, viewport) {
   await page.getByRole('link', { name: copy.home, exact: true }).waitFor()
   assert.equal(await page.locator('html').getAttribute('lang'), locale)
   await page.getByText(copy.sessions, { exact: true }).first().waitFor()
+  const homeSession = page.getByTestId(`home-session-${session.id}`)
+  await homeSession.waitFor()
+  await homeSession.locator('[role="button"]').first().click()
+  const homeCard = page.getByTestId(`agent-detail-card-${agent.id}`)
+  const homeExit = homeCard.getByTitle(copy.graceful)
+  const homeDelete = homeCard.getByTitle(copy.deleteDisabled)
+  assert((await homeExit.getAttribute('class')).includes('bg-amber-600'), `Home graceful exit warning tone in ${locale}`)
+  assert((await homeDelete.getAttribute('class')).includes('bg-red-600'), `Home delete danger tone in ${locale}`)
+  assert.equal(await homeExit.isEnabled(), true)
+  assert.equal(await homeDelete.isDisabled(), true)
+  assert.notEqual(await homeExit.evaluate(node => getComputedStyle(node).backgroundColor), await homeDelete.evaluate(node => getComputedStyle(node).backgroundColor), `disabled danger state stays distinguishable in ${locale}`)
   await overflow(page, 'home', locale, viewport.width)
   await page.screenshot({ path: `${evidenceDir}/${locale}-home-${viewport.width}.png`, fullPage: true })
 
   await page.getByRole('link', { name: new RegExp(`^${copy.agents}`) }).click()
   await page.getByText(`${copy.sessions} (1)`, { exact: true }).waitFor()
   await page.getByRole('button', { name: new RegExp(`^(Expand|Развернуть) ${session.name}$`) }).click()
+  const actionLabels = (await page.getByTestId(`agent-detail-card-${agent.id}`).getByRole('button').allTextContents()).map(value => value.trim()).filter(Boolean)
+  assert.deepEqual(actionLabels.slice(0, 6), locale === 'ru'
+    ? ['История', 'Почта', 'Вывод', 'Открыть терминал', 'Корректно завершить', 'Удалить']
+    : ['History', 'Inbox', 'Output', 'Open Terminal', 'Graceful Exit', 'Delete'], `agent action order in ${locale}`)
   await page.getByRole('button', { name: copy.inbox, exact: true }).click()
   await page.getByRole('heading', { name: copy.inboxTitle, exact: true }).waitFor()
   assert.equal(await page.getByText(rawMessage, { exact: true }).count(), 1, 'Inbox content must remain byte-equivalent')
@@ -198,7 +218,7 @@ try {
     evidenceDir,
     viewports: viewports.map(({ width }) => width),
     locales: ['en', 'ru'],
-    assertions: ['English default despite ru-RU browser', 'immediate EN/RU switch', 'preference reload', 'Home', 'Agents', 'Inbox raw content', 'dialog', 'Housekeeping and Full Cleanup', 'same-slug Docs', 'no horizontal overflow'],
+    assertions: ['English default despite ru-RU browser', 'immediate EN/RU switch', 'preference reload', 'Home warning/error tones and disabled distinction', 'Agents action order', 'Mail/Inbox raw content', 'dialog', 'Housekeeping and Full Cleanup', 'same-slug Docs', 'no horizontal overflow'],
   }))
 } finally {
   await browser?.close()

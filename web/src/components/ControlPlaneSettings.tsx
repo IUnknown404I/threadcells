@@ -9,6 +9,7 @@ import { SettingsPanel } from './SettingsPanel'
 import { TelegramSettings } from './TelegramSettings'
 import { useI18n, type TranslationKey } from '../i18n'
 import { resourceStateTranslationKey } from './StatusBadge'
+import { formatAbsoluteTimestamp, useTimeZone } from '../timeZone'
 
 export type SettingsSection = 'general' | 'profiles' | 'providers' | 'housekeeping' | 'telegram' | 'about'
 
@@ -258,6 +259,7 @@ function HousekeepingWarnings({ warnings, className = '' }: { warnings: string[]
 
 function HousekeepingReport({ report, diskState }: { report: Record<string, any> | null; diskState: string }) {
   const { t, tp, locale } = useI18n()
+  const { timeZone } = useTimeZone()
   if (!report || report.status === 'never_run') return <div className="rounded-xl border border-dashed border-gray-700 p-6 text-center">
 <Clock3 className="mx-auto text-gray-400"/>
 <p className="mt-2 text-sm text-gray-300">{t('housekeeping.noReport')}</p>
@@ -266,8 +268,8 @@ function HousekeepingReport({ report, diskState }: { report: Record<string, any>
   const protectedResources = Array.isArray(report.protected_resources) ? report.protected_resources : []
   const executionSkips = Array.isArray(report.execution_skips) ? report.execution_skips : []
   const skipped = protectedResources.length + executionSkips.length
-  const started = report.started_at ? new Date(report.started_at).toLocaleString(locale) : t('housekeeping.notRecorded')
-  const completed = report.completed_at ? new Date(report.completed_at).toLocaleString(locale) : t('housekeeping.recordedServer')
+  const started = report.started_at ? formatAbsoluteTimestamp(report.started_at, locale, timeZone) : t('housekeeping.notRecorded')
+  const completed = report.completed_at ? formatAbsoluteTimestamp(report.completed_at, locale, timeZone) : t('housekeeping.recordedServer')
   const duration = report.duration_seconds === undefined ? t('housekeeping.notRecorded') : t('housekeeping.seconds', { count: Number(report.duration_seconds).toFixed(1) })
   const classes = Object.entries(report.reclaimed_bytes_by_class || {})
   const completedWithIssues = report.ok === false || report.completed_with_issues === true

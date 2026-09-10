@@ -5610,6 +5610,73 @@ def test_f14_restart_recovery_terminalizes_exited_child_without_valid_final(
         assert db.query(InboxModel).count() == 0
 
 
+@pytest.mark.parametrize(
+    "terminal_status",
+    [TerminalStatus.PROCESSING.value, TerminalStatus.ERROR.value, TerminalStatus.IDLE.value],
+)
+@patch("cli_agent_orchestrator.services.inbox_service.workflow_service.reconcile_root_workflow")
+@patch("cli_agent_orchestrator.services.inbox_service.check_and_send_pending_messages")
+@patch("cli_agent_orchestrator.services.inbox_service.terminal_service")
+def test_f14_restart_recovery_terminalizes_exited_managed_child_with_stale_status(
+    mock_terminal, mock_deliver, _workflow_reconcile, workflow_db, terminal_status
+):
+    """Authoritative runtime exit must outlive a stale rendered provider status."""
+    parent, child = "parent-exited-stale-status", "child-exited-stale-status"
+    with database.SessionLocal() as db:
+        db.add(
+            TerminalModel(
+                id=child,
+                tmux_session="session",
+                tmux_window="child",
+                provider="codex",
+                auth_token_sha256=hashlib.sha256(b"managed-child-token").hexdigest(),
+                provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
+            )
+        )
+        db.commit()
+    start_workflow_input(parent)
+    assert register_handoff_child(parent, child)
+    assert arm_handoff_continuations_for_restart() == 1
+    mock_terminal.get_terminal.return_value = {
+        "status": terminal_status,
+        "lifecycle": "exited",
+    }
+
+    assert reconcile_handoff_continuations() == 0
+    assert reconcile_handoff_continuations() == 0
+    assert reconcile_handoff_continuations() == 0
+
+    result = get_delegation_result_for_assignment(child)
+    assert result is not None
+    assert result["status"] == "incomplete"
+    assert result["reason_code"] == "handoff_recovery_exhausted"
+    assert get_pending_handoff_child_terminal_ids() == [child]
+    assert get_parent_completion_barrier(parent) == (1, 0)
+
+    # The next restart tick records cleanup before attempting the one durable
+    # parent callback.  Model its successful transport and prove that the
+    # exact lifecycle result can be incorporated and acknowledged once.
+    assert reconcile_handoff_continuations() == 0
+    mock_deliver.assert_called_once_with(parent, registry=None)
+    with database.SessionLocal() as db:
+        assignment = (
+            db.query(database.ChildAssignmentModel).filter_by(child_terminal_id=child).one()
+        )
+        assert assignment.result_message_id is not None
+        result_message_id = assignment.result_message_id
+    assert mark_child_assignment_result_delivered(result_message_id)
+    acknowledged = acknowledge_child_assignment_result_outcome(
+        parent, child, result_id=result["id"]
+    )
+    assert acknowledged["accepted"] is True
+    replay = acknowledge_child_assignment_result_outcome(parent, child, result_id=result["id"])
+    assert replay["reason_code"] == "RESULT_ALREADY_ACKNOWLEDGED"
+    assert get_parent_completion_barrier(parent) == (0, 0)
+    assert get_pending_handoff_child_terminal_ids() == []
+    mock_terminal.get_output.assert_not_called()
+    mock_terminal.exit_terminal.assert_not_called()
+
+
 def test_f13_restart_rehydrates_open_handoff_without_a_second_effect(workflow_db):
     start_workflow_input("parent-restart")
     register_handoff_child("parent-restart", "child-restart")

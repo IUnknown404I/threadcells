@@ -856,6 +856,22 @@ def _reconcile_handoff_continuations_with_admission(
                         TerminalStatus.COMPLETED.value,
                     ):
                         continue
+                # Runtime lifecycle is the authoritative physical boundary.
+                # A provider may exit before its rendered status advances to
+                # COMPLETED, leaving PROCESSING/ERROR/IDLE stale forever.  In
+                # that case advance the existing managed-handoff recovery
+                # budget (or terminalize an unmanaged handoff) instead of
+                # requiring a provider observation that can no longer occur.
+                # ``cancel_child_assignments_for_terminal`` preserves the
+                # exact assignment/result identity and never fabricates a
+                # successful outcome.
+                if (
+                    terminal.get("lifecycle") == "exited"
+                    and terminal.get("status") != TerminalStatus.COMPLETED.value
+                    and state is not None
+                ):
+                    cancel_child_assignments_for_terminal(child_id)
+                    continue
                 # Recovery must see the same completed terminal and the same
                 # valid final extraction twice before it creates a durable
                 # Inbox effect. A child can be cleanly exited after reporting

@@ -173,21 +173,62 @@ def test_exited_structured_handoff_exhausts_to_terminal_incomplete(monkeypatch):
     assert result is not None
     assert result["status"] == "incomplete"
     assert result["reason_code"] == "handoff_recovery_exhausted"
-    assert "child" not in get_pending_handoff_child_terminal_ids()
+    assert "child" in get_pending_handoff_child_terminal_ids()
     with database.SessionLocal() as db:
         assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id="child").one()
-        assert assignment.status == ChildAssignmentStatus.HANDOFF_RESULT_FAILED.value
+        assert assignment.status == ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value
         before_events = (
             db.query(DelegationResultEventModel).filter_by(result_id=result["id"]).count()
         )
         before_results = db.query(DelegationResultModel).count()
-    assert reconcile_handoff_continuations(child_terminal_id="child") == 0
+        before_notices = db.query(database.InboxModel).count()
+    assert cancel_child_assignments_for_terminal("child") == 0
     with database.SessionLocal() as db:
         assert (
             db.query(DelegationResultEventModel).filter_by(result_id=result["id"]).count()
             == before_events
         )
         assert db.query(DelegationResultModel).count() == before_results
+        assert db.query(database.InboxModel).count() == before_notices
+
+
+def test_exhausted_handoff_notifies_open_parent_and_fences_late_submission(monkeypatch):
+    token, child_turn = _setup_handoff(monkeypatch)
+    parent_turn = start_workflow_input("parent")
+    assert parent_turn is not None and claim_workflow_turn_receipt("parent", parent_turn)
+
+    assert cancel_child_assignments_for_terminal("child") == 1
+    assert cancel_child_assignments_for_terminal("child") == 1
+    assert cancel_child_assignments_for_terminal("child") == 1
+
+    result = get_delegation_result_for_assignment("child")
+    assert result is not None
+    assert result["status"] == "incomplete"
+    assert result["reason_code"] == "handoff_recovery_exhausted"
+    with database.SessionLocal() as db:
+        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id="child").one()
+        assert assignment.status == ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value
+        assert assignment.result_message_id is not None
+        result_message_id = assignment.result_message_id
+        assert db.query(WorkflowTurnModel).filter_by(kind="handoff_result").count() == 1
+
+    with pytest.raises(HandoffResultSubmissionError) as late:
+        submit_handoff_result_v1(token, child_turn, _document(summary="late"))
+    assert late.value.code == "handoff_not_awaiting"
+
+    assert mark_child_assignment_result_delivered(result_message_id)
+    acknowledged = acknowledge_child_assignment_result_outcome(
+        "parent", "child", result_id=result["id"]
+    )
+    assert acknowledged["accepted"] is True
+    replay = acknowledge_child_assignment_result_outcome("parent", "child", result_id=result["id"])
+    assert replay["reason_code"] == "RESULT_ALREADY_ACKNOWLEDGED"
+    assert get_parent_completion_barrier("parent") == (0, 0)
+
+    # The terminal attempt remains immutable history but no longer prevents
+    # the parent from commissioning one distinct replacement relation.
+    assert register_handoff_child("parent", "replacement-child") is True
+    assert get_parent_completion_barrier("parent") == (1, 0)
 
 
 def test_authenticated_submission_is_idempotent_and_structured_first(monkeypatch):
@@ -545,7 +586,9 @@ def test_managed_continuation_exhaustion_stops_before_a_third_successor(monkeypa
     assert result["status"] == "incomplete"
     assert result["reason_code"] == "handoff_recovery_exhausted"
     with database.SessionLocal() as db:
-        assert db.query(WorkflowTurnModel).count() == 3
+        assert db.query(WorkflowTurnModel).count() == 4
+        assert db.query(WorkflowTurnModel).filter_by(kind="handoff_recovery").count() == 2
+        assert db.query(WorkflowTurnModel).filter_by(kind="handoff_result").count() == 1
 
 
 def test_delegated_handoff_owner_gate_is_rejected_and_v1_remains_submitable(monkeypatch):

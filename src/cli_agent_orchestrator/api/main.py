@@ -56,6 +56,7 @@ from cli_agent_orchestrator.clients.database import (
     queue_workflow_input_for_provider,
     release_terminal_runtime_operation,
     resolve_workflow_input_binding,
+    retain_queued_workflow_input_binding,
     submit_handoff_result_v1,
     terminal_auth_token_matches,
     terminal_deletion_auth_token_matches,
@@ -2562,6 +2563,24 @@ async def send_orchestrated_terminal_input(
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT, detail="input binding is stale"
                 )
+            queued_delivery = retain_queued_workflow_input_binding(terminal_id, binding, message)
+            if queued_delivery is not None:
+                # Rolling-upgrade/runtime recovery already owns this exact
+                # server-bound turn.  Persist its payload, wake the canonical
+                # queue, and acknowledge durable acceptance without touching
+                # the incompatible resident provider process.
+                inbox_service.wake_provider_execution_queue(get_plugin_registry(request))
+                return {
+                    "success": True,
+                    "queued": True,
+                    "status": (
+                        "queued_runtime_recovery"
+                        if queued_delivery["reconnect_pending"]
+                        else "queued_provider_execution"
+                    ),
+                    "reason_code": queued_delivery["queue_reason"],
+                    "turn_id": queued_delivery["turn_id"],
+                }
             return _send_server_bound_input(
                 request,
                 terminal_id,

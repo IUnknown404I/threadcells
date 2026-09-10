@@ -213,7 +213,11 @@ def _create_exact_handoff_result(
         workflow_effect_id=request_effect["id"],
         request_message=f"handoff request for {child}",
     )
-    child_binding = issue_workflow_input_binding(child)
+    child_binding = issue_workflow_input_binding(
+        child,
+        f"handoff request for {child}",
+        child_assignment_workflow_effect_id=request_effect["id"],
+    )
     assert child_binding is not None
     child_turn = resolve_workflow_input_binding(child, child_binding)
     assert child_turn is not None
@@ -874,7 +878,11 @@ def _queued_authoritative_handoff_result(
         workflow_effect_id=request_effect["id"],
         request_message=f"review {child}",
     )
-    child_binding = issue_workflow_input_binding(child)
+    child_binding = issue_workflow_input_binding(
+        child,
+        f"review {child}",
+        child_assignment_workflow_effect_id=request_effect["id"],
+    )
     assert child_binding is not None
     child_turn = resolve_workflow_input_binding(child, child_binding)
     assert child_turn is not None
@@ -2754,7 +2762,11 @@ def test_f13_ready_reconnect_wakes_receipted_result_then_preserves_composer_fifo
         workflow_effect_id=request_effect["id"],
         request_message="review the exact restart composition",
     )
-    child_binding = issue_workflow_input_binding(child)
+    child_binding = issue_workflow_input_binding(
+        child,
+        "review the exact restart composition",
+        child_assignment_workflow_effect_id=request_effect["id"],
+    )
     assert child_binding is not None
     child_turn = resolve_workflow_input_binding(child, child_binding)
     assert child_turn is not None
@@ -3063,7 +3075,11 @@ def test_f13_receipted_callback_reconnect_continues_once_before_composer(workflo
         workflow_effect_id=request_effect["id"],
         request_message="produce one immutable callback",
     )
-    child_binding = issue_workflow_input_binding(child)
+    child_binding = issue_workflow_input_binding(
+        child,
+        "produce one immutable callback",
+        child_assignment_workflow_effect_id=request_effect["id"],
+    )
     assert child_binding is not None
     child_turn = resolve_workflow_input_binding(child, child_binding)
     assert child_turn is not None
@@ -3258,7 +3274,11 @@ def test_f13_reconnect_preserves_exact_git_review_authority(
         workflow_effect_id=request_effect["id"],
         request_message="review this exact revision",
     )
-    binding = issue_workflow_input_binding(child)
+    binding = issue_workflow_input_binding(
+        child,
+        "review this exact revision",
+        child_assignment_workflow_effect_id=request_effect["id"],
+    )
     assert binding is not None
     child_turn = resolve_workflow_input_binding(child, binding)
     assert child_turn is not None
@@ -3416,7 +3436,11 @@ def test_f13_reconnect_resumes_after_acknowledged_review_is_superseded(workflow_
         workflow_effect_id=old_request["id"],
         request_message="review the exact revision",
     )
-    old_binding = issue_workflow_input_binding(old_child)
+    old_binding = issue_workflow_input_binding(
+        old_child,
+        "review the exact revision",
+        child_assignment_workflow_effect_id=old_request["id"],
+    )
     assert old_binding is not None
     old_child_turn = resolve_workflow_input_binding(old_child, old_binding)
     assert old_child_turn is not None
@@ -3859,7 +3883,11 @@ def test_f13_settled_unreceipted_handoff_recovery_restores_same_transport(
             request_message="continue the managed handoff",
         )
         _ensure_running_test_terminal(child)
-        child_binding = issue_workflow_input_binding(child)
+        child_binding = issue_workflow_input_binding(
+            child,
+            "continue the managed handoff",
+            child_assignment_workflow_effect_id=request_effect["id"],
+        )
         assert child_binding is not None
         child_turn = resolve_workflow_input_binding(child, child_binding)
         assert child_turn is not None
@@ -8798,7 +8826,7 @@ def test_f13_public_assign_metadata_cannot_borrow_the_prior_admission(workflow_d
 def test_f13_direct_transport_binding_is_opaque_and_fenced_by_a_new_input(workflow_db):
     """Only CAO's issued direct binding can resolve, and only while current."""
     root = "f13a0013"
-    binding = issue_workflow_input_binding(root)
+    binding = issue_workflow_input_binding(root, "direct transport binding")
     assert binding is not None and len(binding) > 32
     assert resolve_workflow_input_binding(root, "forged-binding") is None
     assert resolve_workflow_input_binding(root, binding) is not None

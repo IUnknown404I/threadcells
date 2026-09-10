@@ -2375,6 +2375,54 @@ class TestSendTerminalInput:
         assert call.kwargs["sender_id"] == "supervisor-1"
         assert call.kwargs["orchestration_type"] == "assign"
 
+    def test_internal_orchestration_accepts_exact_turn_already_queued_for_reconnect(self, client):
+        """A server-bound task remains durable without reaching the stale process."""
+        queued = {
+            "turn_id": 76,
+            "state": "queued",
+            "queue_reason": "TERMINAL_RUNTIME_OPERATION_BUSY",
+            "reconnect_pending": True,
+            "accepted": True,
+            "queued": True,
+            "provider_admitted": False,
+            "receipted": False,
+        }
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_workflow_input_binding",
+                return_value=76,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.retain_queued_workflow_input_binding",
+                return_value=queued,
+            ) as retain,
+            patch(
+                "cli_agent_orchestrator.api.main.inbox_service.wake_provider_execution_queue"
+            ) as wake,
+        ):
+            response = client.post(
+                "/_internal/terminals/abcd1234/input",
+                params={
+                    "message": "review exact correction",
+                    "binding": "exact-binding",
+                    "sender_id": "owner",
+                    "orchestration_type": "assign",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": True,
+            "queued": True,
+            "status": "queued_runtime_recovery",
+            "reason_code": "TERMINAL_RUNTIME_OPERATION_BUSY",
+            "turn_id": 76,
+        }
+        retain.assert_called_once_with("abcd1234", "exact-binding", "review exact correction")
+        wake.assert_called_once()
+        mock_svc.send_input.assert_not_called()
+
     def test_send_input_terminal_not_found(self, client):
         """POST /terminals/{id}/input returns 404 for nonexistent terminal."""
         with patch(

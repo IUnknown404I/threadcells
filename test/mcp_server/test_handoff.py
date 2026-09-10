@@ -81,7 +81,7 @@ class TestHandoffMessageContext:
         )
         monkeypatch.setattr(
             "cli_agent_orchestrator.mcp_server.server.issue_workflow_input_binding",
-            lambda *_: "binding",
+            lambda *_, **__: "binding",
         )
 
     @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
@@ -226,7 +226,9 @@ class TestInitialHandoffRuntimeGenerationFence:
         assert result.state == HandoffState.WAITING
         mock_claim.assert_not_called()
         mock_register.assert_called_once()
-        mock_binding.assert_called_once_with("child-processing")
+        assert mock_binding.call_count == 1
+        assert mock_binding.call_args.args[0] == "child-processing"
+        assert "still processing" in mock_binding.call_args.args[1]
         mock_send.assert_called_once()
         mock_await.assert_awaited_once()
         mock_active_generation.assert_called_once()

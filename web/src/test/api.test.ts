@@ -34,7 +34,7 @@ describe('API wrapper', () => {
     localStorage.setItem(APP_LOCALE_STORAGE_KEY, 'ru')
     mockResponse({ reason_code: 'FULL_CLEANUP_NOT_IDLE' }, 409)
 
-    await expect(api.runFullCleanup('a'.repeat(64))).rejects.toMatchObject({
+    await expect(api.runFullCleanup('b'.repeat(32), 'a'.repeat(64))).rejects.toMatchObject({
       title: 'Агенты ещё работают',
       description: 'Полная очистка доступна, только когда каждый агент готов или завершён, а выполнения провайдера и тяжёлые операции простаивают.',
       reasonCode: 'FULL_CLEANUP_NOT_IDLE',
@@ -278,12 +278,13 @@ describe('API wrapper', () => {
     expect(mockFetch).toHaveBeenCalledWith('/api/v1/housekeeping/full-cleanup/plan?retire_dirty_worktrees=false', expect.objectContaining({ signal: expect.any(AbortSignal) }))
 
     mockResponse({ ok: true })
-    await api.runFullCleanup(planId)
+    const operationId = 'b'.repeat(32)
+    await api.runFullCleanup(operationId, planId)
     expect(mockFetch).toHaveBeenCalledWith(
       '/api/v1/housekeeping/full-cleanup/run',
       expect.objectContaining({
         method: 'POST',
-        body: JSON.stringify({ expected_plan_id: planId, confirmed: true, retire_dirty_worktrees: false }),
+        body: JSON.stringify({ operation_id: operationId, expected_plan_id: planId, confirmed: true, retire_dirty_worktrees: false }),
       })
     )
     expect(JSON.stringify(mockFetch.mock.calls[mockFetch.mock.calls.length - 1])).not.toMatch(/secret|password/i)
@@ -293,11 +294,11 @@ describe('API wrapper', () => {
     expect(mockFetch).toHaveBeenCalledWith('/api/v1/housekeeping/full-cleanup/plan?retire_dirty_worktrees=true', expect.any(Object))
 
     mockResponse({ ok: true })
-    await api.runFullCleanup(planId, true)
+    await api.runFullCleanup(operationId, planId, true)
     expect(mockFetch).toHaveBeenCalledWith(
       '/api/v1/housekeeping/full-cleanup/run',
       expect.objectContaining({
-        body: JSON.stringify({ expected_plan_id: planId, confirmed: true, retire_dirty_worktrees: true }),
+        body: JSON.stringify({ operation_id: operationId, expected_plan_id: planId, confirmed: true, retire_dirty_worktrees: true }),
       })
     )
   })

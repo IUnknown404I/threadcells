@@ -303,6 +303,7 @@ class HousekeepingRunRequest(BaseModel):
 class FullCleanupRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
+    operation_id: str = Field(min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$")
     expected_plan_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     confirmed: Literal[True]
     retire_dirty_worktrees: bool = False
@@ -587,6 +588,16 @@ async def lifespan(app: FastAPI):
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
     init_db()
+    from cli_agent_orchestrator.services.full_cleanup_operation_service import (
+        reconcile_interrupted_full_cleanup_operations,
+    )
+
+    cleanup_recovery = reconcile_interrupted_full_cleanup_operations(include_admitted=True)
+    if cleanup_recovery["terminalized"]:
+        logger.warning(
+            "Terminalized %s interrupted Full Cleanup operations at startup",
+            cleanup_recovery["terminalized"],
+        )
     # This durable barrier precedes API availability and every startup queue
     # replay. A resident Codex process retains the hook matcher parsed by its
     # launch release; it must be reconnected before current code can restore
@@ -1447,10 +1458,10 @@ async def get_housekeeping_plan_endpoint(
         plan = await run_in_threadpool(lambda: plan_housekeeping_serialized(mode=mode))
         return plan.as_dict()
     except RuntimeError as exc:
-        if str(exc) == "HOUSEKEEPING_BUSY":
+        if str(exc) in {"HOUSEKEEPING_BUSY", "FULL_CLEANUP_OPERATION_ACTIVE"}:
             raise HTTPException(
                 status_code=status.HTTP_423_LOCKED,
-                detail={"reason_code": "HOUSEKEEPING_BUSY"},
+                detail={"reason_code": str(exc)},
             ) from exc
         raise
 
@@ -1481,10 +1492,10 @@ async def run_housekeeping_endpoint(
         )
         return summary.as_dict()
     except RuntimeError as exc:
-        if str(exc) == "HOUSEKEEPING_BUSY":
+        if str(exc) in {"HOUSEKEEPING_BUSY", "FULL_CLEANUP_OPERATION_ACTIVE"}:
             raise HTTPException(
                 status_code=status.HTTP_423_LOCKED,
-                detail={"reason_code": "HOUSEKEEPING_BUSY"},
+                detail={"reason_code": str(exc)},
             ) from exc
         if str(exc) == "HOUSEKEEPING_PLAN_CHANGED":
             raise HTTPException(
@@ -1503,10 +1514,11 @@ async def get_full_cleanup_plan_endpoint(retire_dirty_worktrees: bool = False) -
     )
 
     try:
-        return await run_in_threadpool(
+        result = await run_in_threadpool(
             plan_full_cleanup_serialized,
             retire_dirty_worktrees=retire_dirty_worktrees,
         )
+        return {**result, "operation_id": uuid4().hex}
     except RuntimeError as exc:
         if str(exc) == "HOUSEKEEPING_BUSY":
             raise HTTPException(
@@ -1531,18 +1543,31 @@ async def run_full_cleanup_endpoint(
     from cli_agent_orchestrator.services.housekeeping_service import run_full_cleanup
 
     actor = _require_operator(request, authorization)
-    session_token = (
-        request.cookies.get(OPERATOR_SESSION_COOKIE)
-        if actor.startswith("operator_session:")
-        else None
+    actor_kind = "operator_session" if actor.startswith("operator_session:") else "operator_bearer"
+    from cli_agent_orchestrator.clients.database import get_full_cleanup_operation
+    from cli_agent_orchestrator.services.full_cleanup_operation_service import (
+        public_operation,
+        report_from_operation,
     )
-    bearer_secret = (
-        authorization[len("Bearer ") :]
-        if actor == "operator_bearer"
-        and authorization is not None
-        and authorization.startswith("Bearer ")
-        else None
-    )
+
+    existing = get_full_cleanup_operation(body.operation_id)
+    if existing is not None:
+        if (
+            existing["plan_id"] != body.expected_plan_id
+            or existing["retire_dirty_worktrees"] != body.retire_dirty_worktrees
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"reason_code": "FULL_CLEANUP_OPERATION_AUTHORITY_CHANGED"},
+            )
+        recovered = report_from_operation(existing)
+        if recovered is not None:
+            return {
+                **recovered.as_dict(),
+                "operation_id": body.operation_id,
+                "operation_state": existing["state"],
+            }
+        return public_operation(existing)
     try:
         summary = await run_in_threadpool(
             lambda: run_full_cleanup(
@@ -1550,15 +1575,20 @@ async def run_full_cleanup_endpoint(
                 confirmed=body.confirmed,
                 retire_dirty_worktrees=body.retire_dirty_worktrees,
                 privileged_cleanup_executor=lambda **_kwargs: execute_via_privileged_helper(
+                    operation_id=body.operation_id,
                     expected_plan_id=body.expected_plan_id,
                     confirmed=True,
-                    session_token=session_token,
-                    bearer_secret=bearer_secret,
+                    actor_kind=actor_kind,
                     retire_dirty_worktrees=body.retire_dirty_worktrees,
                 ),
             )
         )
-        return summary.as_dict()
+        operation = get_full_cleanup_operation(body.operation_id)
+        return {
+            **summary.as_dict(),
+            "operation_id": body.operation_id,
+            "operation_state": (operation or {}).get("state"),
+        }
     except (FullCleanupHelperError, RuntimeError) as exc:
         reason = str(exc)
         diagnostic_id = (
@@ -1574,7 +1604,11 @@ async def run_full_cleanup_endpoint(
         if not re.fullmatch(r"[A-Z0-9_]{3,96}", reason):
             reason = "FULL_CLEANUP_EXECUTION_FAILED"
             detail["reason_code"] = reason
-        if reason in {"HOUSEKEEPING_BUSY", "FULL_CLEANUP_ADMISSION_BUSY"}:
+        if reason in {
+            "HOUSEKEEPING_BUSY",
+            "FULL_CLEANUP_ADMISSION_BUSY",
+            "FULL_CLEANUP_OPERATION_ACTIVE",
+        }:
             raise HTTPException(
                 status_code=status.HTTP_423_LOCKED,
                 detail=detail,
@@ -1583,6 +1617,7 @@ async def run_full_cleanup_endpoint(
             "HOUSEKEEPING_PLAN_CHANGED",
             "FULL_CLEANUP_NOT_IDLE",
             "FULL_CLEANUP_IDLE_INVENTORY_UNKNOWN",
+            "FULL_CLEANUP_OPERATION_AUTHORITY_CHANGED",
         }:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -1602,6 +1637,41 @@ async def run_full_cleanup_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=detail,
         ) from exc
+
+
+@app.get("/api/v1/housekeeping/full-cleanup/operations/latest")
+async def get_latest_full_cleanup_operation_endpoint() -> Dict:
+    from cli_agent_orchestrator.clients.database import get_latest_full_cleanup_operation
+    from cli_agent_orchestrator.services.full_cleanup_operation_service import (
+        public_operation,
+        reconcile_interrupted_full_cleanup_operations,
+    )
+
+    reconcile_interrupted_full_cleanup_operations(include_admitted=False)
+    return public_operation(get_latest_full_cleanup_operation())
+
+
+@app.get("/api/v1/housekeeping/full-cleanup/operations/{operation_id}")
+async def get_full_cleanup_operation_endpoint(operation_id: str) -> Dict:
+    from cli_agent_orchestrator.clients.database import get_full_cleanup_operation
+    from cli_agent_orchestrator.services.full_cleanup_operation_service import (
+        public_operation,
+        reconcile_interrupted_full_cleanup_operations,
+    )
+
+    if not re.fullmatch(r"[0-9a-f]{32}", operation_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"reason_code": "FULL_CLEANUP_OPERATION_NOT_FOUND"},
+        )
+    reconcile_interrupted_full_cleanup_operations(include_admitted=False)
+    operation = get_full_cleanup_operation(operation_id)
+    if operation is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"reason_code": "FULL_CLEANUP_OPERATION_NOT_FOUND"},
+        )
+    return public_operation(operation)
 
 
 @app.get("/api/v1/housekeeping/report")

@@ -899,6 +899,7 @@ def execute_plan(
     reconcile_releases: bool = True,
     protection_resolver: Callable[[], ProtectedSet] | None = None,
     privileged_path_deletion: bool = False,
+    progress_callback: Callable[[ExecutionReport, str, str], None] | None = None,
 ) -> ExecutionReport:
     """Execute planned actions while rechecking identity and protection per candidate."""
     report = ExecutionReport(plan_id=plan.plan_id)
@@ -1012,7 +1013,14 @@ def execute_plan(
                         "reason_code": release_authority_reason,
                     }
                 )
+                if progress_callback is not None:
+                    progress_callback(report, candidate.canonical_identity, "skipped")
                 continue
+            progress_before = (
+                len(report.executed),
+                len(report.skipped),
+                len(report.failures),
+            )
             try:
                 if candidate.resource_kind == "workflow_authority":
                     from cli_agent_orchestrator.services.operations_service import (
@@ -1327,6 +1335,17 @@ def execute_plan(
                         "reason_code": type(error).__name__,
                     }
                 )
+            finally:
+                if progress_callback is not None:
+                    if len(report.failures) > progress_before[2]:
+                        outcome = "failed"
+                    elif len(report.skipped) > progress_before[1]:
+                        outcome = "skipped"
+                    elif len(report.executed) > progress_before[0]:
+                        outcome = "executed"
+                    else:
+                        outcome = "observed"
+                    progress_callback(report, candidate.canonical_identity, outcome)
         if full_cleanup and reconcile_releases and release_lock_acquired:
             active_release, rollback_available, reason = _reconcile_full_cleanup_release_metadata(
                 root,
@@ -1337,7 +1356,7 @@ def execute_plan(
             report.active_release = active_release
             report.rollback_available = rollback_available
             if reason:
-                outcome = {"candidate": "release-metadata", "reason_code": reason}
+                release_outcome = {"candidate": "release-metadata", "reason_code": reason}
                 if reason in {
                     "ACTIVE_RELEASE_AUTHORITY_CHANGED",
                     "ACTIVE_RELEASE_IDENTITY_CHANGED",
@@ -1345,9 +1364,13 @@ def execute_plan(
                     "RELEASE_METADATA_RECONCILE_FAILED",
                 }:
                     report.ok = False
-                    report.failures.append(outcome)
+                    report.failures.append(release_outcome)
                 else:
-                    report.skipped.append(outcome)
+                    report.skipped.append(release_outcome)
+                if progress_callback is not None:
+                    progress_callback(
+                        report, "release-metadata", "failed" if not report.ok else "skipped"
+                    )
         return report
     finally:
         if release_handle is not None:

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { BookOpen, Boxes, CheckCircle2, Clock3, Database, HardDrive, HeartHandshake, Info, Loader2, Search, ShieldCheck, Sparkles, Trash2 } from 'lucide-react'
-import { api, CaoApiError, FullCleanupPlan, HousekeepingPlan, HousekeepingSettings, OrchestrationCapacity, ProviderSettings, RegistryRecord } from '../api'
+import { api, CaoApiError, FullCleanupOperation, FullCleanupPlan, HousekeepingPlan, HousekeepingSettings, OrchestrationCapacity, ProviderSettings, RegistryRecord } from '../api'
 import { BUILD_IDENTITY } from '../buildIdentity'
 import { providerRuntimeLabel } from '../providerAvailability'
 import { OperatorAccessCard, useOperatorAccess } from './OperatorAccess'
@@ -326,6 +326,7 @@ function HousekeepingSettingsPage() {
   const [executionBlock, setExecutionBlock] = useState<'changed' | 'busy' | null>(null)
   const [fullPlan, setFullPlan] = useState<FullCleanupPlan | null>(null)
   const [fullReport, setFullReport] = useState<Record<string, any> | null>(null)
+  const [fullOperation, setFullOperation] = useState<FullCleanupOperation | null>(null)
   const [fullRunning, setFullRunning] = useState(false)
   const [fullConfirm, setFullConfirm] = useState(false)
   const [fullError, setFullError] = useState('')
@@ -346,6 +347,32 @@ function HousekeepingSettingsPage() {
       planningRef.current = null
     }
   }, [])
+  useEffect(() => {
+    let stopped = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const observe = async () => {
+      try {
+        const operation = await api.getLatestFullCleanupOperation()
+        if (stopped) return
+        setFullOperation(operation.status === 'never_run' ? null : operation)
+        const active = operation.state === 'admitted' || operation.state === 'running'
+        setFullRunning(active)
+        if (operation.report) {
+          setFullReport(operation.report)
+          setReport(operation.report)
+        }
+        if (active) timer = setTimeout(() => void observe(), 1500)
+      } catch {
+        // The ordinary Housekeeping report remains available if operation
+        // observation is temporarily unavailable.
+      }
+    }
+    void observe()
+    return () => {
+      stopped = true
+      if (timer) clearTimeout(timer)
+    }
+  }, [fullOperation?.operation_id])
   const save = async () => { if (!settings || !access.status?.authenticated) return; setError(''); try { setSettings(await api.updateHousekeepingSettings(settings)) } catch (reason: any) { setError(reason.message || t('housekeeping.saveFailed')); await access.refresh() } }
   const startPlanning = (kind: 'normal' | 'full') => {
     if (planningRef.current) return null
@@ -431,9 +458,12 @@ function HousekeepingSettingsPage() {
     setFullRunning(true)
     setFullError('')
     try {
-      const result = await api.runFullCleanup(fullPlan.plan_id, retireDirtyWorktrees)
-      setFullReport(result)
-      setReport(result)
+      const result = await api.runFullCleanup(fullPlan.operation_id, fullPlan.plan_id, retireDirtyWorktrees)
+      const operation = await api.getFullCleanupOperation(fullPlan.operation_id)
+      setFullOperation(operation)
+      const report = operation.report || result
+      setFullReport(report)
+      setReport(report)
       setFullPlan(null)
       await load()
     } catch (reason: any) {
@@ -546,6 +576,12 @@ function HousekeepingSettingsPage() {
         {planning === 'full' && <p role="status" className="text-xs leading-5 text-gray-300">{t('housekeeping.full.scanning')}</p>}
         {fullDisabledReason && <p id="full-cleanup-disabled-reason" className="text-xs leading-5 text-amber-200">{fullDisabledReason}</p>}
         {fullError && <p role="alert" className="rounded-lg border border-red-700/50 bg-red-950/40 p-3 text-sm text-red-200">{fullError}</p>}
+        {fullOperation && <div role="status" className="rounded-lg border border-gray-700 bg-gray-950/50 p-3 text-xs text-gray-300">
+          <p>{t('housekeeping.full.operationId')} <span className="font-mono">{fullOperation.operation_id}</span></p>
+          <p>{t('housekeeping.full.operationState')} <span className="font-medium">{fullOperation.state}</span></p>
+          {fullOperation.progress?.processed_candidates !== undefined && <p>{t('housekeeping.full.operationProgress', { count: fullOperation.progress.processed_candidates })}</p>}
+          {fullOperation.reason_code && <p className="text-amber-200">{fullOperation.reason_code}</p>}
+        </div>}
         {fullPlan && <div className="space-y-4 rounded-xl border border-red-900/60 bg-gray-950/40 p-4">
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <Summary label={t('housekeeping.full.estimated')} value={bytes(fullPlan.reclaimable_bytes)} />

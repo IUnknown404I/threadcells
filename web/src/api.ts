@@ -759,6 +759,7 @@ export interface FullCleanupIdleGate {
 
 export interface FullCleanupPlan extends Omit<HousekeepingPlan, 'mode'> {
   mode: 'full'
+  operation_id: string
   idle_gate: FullCleanupIdleGate
   release_state: {
     metadata_certain: boolean
@@ -770,6 +771,32 @@ export interface FullCleanupPlan extends Omit<HousekeepingPlan, 'mode'> {
     rollback_releases_to_delete: number
     rollback_available: boolean
   }
+}
+
+export interface FullCleanupOperation {
+  status?: 'never_run'
+  operation_id?: string
+  plan_id?: string
+  retire_dirty_worktrees?: boolean
+  state?: 'admitted' | 'running' | 'completed' | 'completed_with_issues' | 'failed' | 'indeterminate'
+  progress?: {
+    sequence?: number
+    phase?: string
+    processed_candidates?: number
+    executed_candidates?: number
+    skipped_candidates?: number
+    failed_candidates?: number
+    freed_bytes?: number
+    last_candidate_sha256?: string
+    last_outcome?: string
+  }
+  report?: Record<string, any> | null
+  reason_code?: string | null
+  diagnostic_id?: string | null
+  created_at?: string | null
+  started_at?: string | null
+  updated_at?: string | null
+  completed_at?: string | null
 }
 
 export interface OwnerLaunchGrant {
@@ -921,7 +948,9 @@ export const api = {
       planningNetworkError(reason, true)
     }
   },
-  runFullCleanup: (expectedPlanId: string, retireDirtyWorktrees = false) => fetchJSON<Record<string, any>>('/api/v1/housekeeping/full-cleanup/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_plan_id: expectedPlanId, confirmed: true, retire_dirty_worktrees: retireDirtyWorktrees }), timeoutMs: null }),
+  runFullCleanup: (operationId: string, expectedPlanId: string, retireDirtyWorktrees = false) => fetchJSON<Record<string, any>>('/api/v1/housekeeping/full-cleanup/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ operation_id: operationId, expected_plan_id: expectedPlanId, confirmed: true, retire_dirty_worktrees: retireDirtyWorktrees }), timeoutMs: null }),
+  getLatestFullCleanupOperation: () => fetchJSON<FullCleanupOperation>('/api/v1/housekeeping/full-cleanup/operations/latest'),
+  getFullCleanupOperation: (operationId: string) => fetchJSON<FullCleanupOperation>(`/api/v1/housekeeping/full-cleanup/operations/${encodeURIComponent(operationId)}`),
   getHousekeepingReport: () => fetchJSON<Record<string, any>>('/api/v1/housekeeping/report'),
   getUsageStatistics: () => fetchJSON<UsageStatistics>('/usage/statistics'),
   getBranding: () => fetchJSON<RuntimeBranding>('/settings/branding'),

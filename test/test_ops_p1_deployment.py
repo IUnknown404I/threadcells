@@ -38,9 +38,9 @@ def _stage_module():
     return module
 
 
-def test_live_staging_activates_and_verifies_full_cleanup_socket(tmp_path):
+def test_live_staging_activates_and_verifies_full_cleanup_socket(short_unix_socket_path):
     stage = _stage_module()
-    socket_path = tmp_path / "full-cleanup.sock"
+    socket_path = short_unix_socket_path
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
         listener.bind(str(socket_path))
         socket_path.chmod(0o600)

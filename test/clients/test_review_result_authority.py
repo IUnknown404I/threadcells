@@ -269,6 +269,53 @@ def test_exact_review_preparation_claim_admits_only_its_bound_provider_turn(auth
     assert database.release_review_worktree_preparation("reviewer", preparation["claim_token"])
 
 
+@pytest.mark.parametrize(
+    "lease_terminal,lease_path_kind,lease_generation",
+    [
+        ("reviewer", "target", "stale-writer-generation"),
+        ("foreign-reviewer", "target", "writer-generation"),
+        ("reviewer", "foreign", "writer-generation"),
+    ],
+)
+def test_exact_review_preparation_rejects_foreign_writer_authority(
+    authority_db,
+    tmp_path,
+    lease_terminal,
+    lease_path_kind,
+    lease_generation,
+):
+    repo, revision = _repository(tmp_path)
+    reviewer = _reviewer("reviewer", repo, revision)
+    reviewer.write_enabled = True
+    reviewer.writer_authority_generation = "writer-generation"
+    with database.SessionLocal() as db:
+        db.add(reviewer)
+        db.add(
+            database.WorktreeWriterLeaseModel(
+                canonical_worktree=(
+                    str(repo) if lease_path_kind == "target" else str(tmp_path / "foreign")
+                ),
+                terminal_id=lease_terminal,
+                authority_generation=lease_generation,
+            )
+        )
+        db.commit()
+    request = _start_review(
+        "parent",
+        "reviewer",
+        "Review exact revision",
+        requested_revision=revision,
+    )
+
+    preparation = database.claim_review_worktree_preparation("reviewer", request["child_turn_id"])
+
+    assert preparation == {
+        "required": True,
+        "claimed": False,
+        "reason_code": "REVIEW_WORKTREE_PREPARATION_BUSY",
+    }
+
+
 def test_queued_exact_review_retry_prepares_and_sends_once(authority_db, monkeypatch, tmp_path):
     """A capacity-deferred review keeps one turn and reaches only exact revision B."""
     repo, revision_a = _repository(tmp_path)
@@ -362,6 +409,7 @@ def test_reconnect_queued_exact_review_is_retained_instead_of_cancelled(
     reviewer_worktree = tmp_path / "reconnect-reviewer"
     _git(repo, "worktree", "add", "--detach", str(reviewer_worktree), revision)
     stale_generation = "0" * 64 if ACTIVE_RUNTIME_GENERATION != "0" * 64 else "1" * 64
+    writer_generation = "writer-reviewer-generation"
     with database.SessionLocal() as db:
         reviewer = _reviewer(
             "reviewer",
@@ -369,10 +417,19 @@ def test_reconnect_queued_exact_review_is_retained_instead_of_cancelled(
             revision,
             launch_worktree=reviewer_worktree,
         )
+        reviewer.write_enabled = True
+        reviewer.writer_authority_generation = writer_generation
         reviewer.provider_runtime_compatibility_generation = stale_generation
         reviewer.provider_resume_identity = "reviewer-resume-identity"
         reviewer.provider_resume_runtime_generation = reviewer.runtime_generation
         db.add(reviewer)
+        db.add(
+            database.WorktreeWriterLeaseModel(
+                canonical_worktree=str(reviewer_worktree),
+                terminal_id="reviewer",
+                authority_generation=writer_generation,
+            )
+        )
         db.commit()
 
     parent_turn = start_workflow_input("parent")

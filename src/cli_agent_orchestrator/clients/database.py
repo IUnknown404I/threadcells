@@ -17868,15 +17868,12 @@ def workflow_turn_transport_fence(
                 and terminal.runtime_operation_expires_at > now
                 and not _terminal_requires_provider_runtime_compatibility_reconnect(terminal)
                 and not _terminal_has_pending_provider_reconnect(db, root_terminal_id)
-                and db.query(WorktreeWriterLeaseModel.canonical_worktree)
-                .filter(
-                    or_(
-                        WorktreeWriterLeaseModel.terminal_id == root_terminal_id,
-                        WorktreeWriterLeaseModel.canonical_worktree == terminal.launch_worktree,
-                    )
+                and not _review_worktree_writer_authority_conflicts(
+                    db,
+                    terminal,
+                    root_terminal_id,
+                    cast(str, terminal.launch_worktree),
                 )
-                .first()
-                is None
                 and _workspace_accepts_new_work(db, root_terminal_id)
                 and _retirement_quiescence_allows_commit(db, root_terminal_id)
             )
@@ -22910,6 +22907,41 @@ def _review_input_authority_in_transaction(
     )
 
 
+def _review_worktree_writer_authority_conflicts(
+    db,
+    terminal: TerminalModel,
+    child_terminal_id: str,
+    path: str,
+) -> bool:
+    """Return whether a writer lease is foreign to this exact reviewer.
+
+    A managed reviewer is itself the durable writer owner of its isolated
+    worktree. That lifetime lease is not concurrent provider work while the
+    runtime-operation and provider-execution axes are otherwise clear. Any
+    different terminal, path, or generation remains ambiguous and blocks.
+    """
+    leases = (
+        db.query(WorktreeWriterLeaseModel)
+        .filter(
+            or_(
+                WorktreeWriterLeaseModel.terminal_id == child_terminal_id,
+                WorktreeWriterLeaseModel.canonical_worktree == path,
+            )
+        )
+        .limit(2)
+        .all()
+    )
+    expected_generation = terminal.writer_authority_generation
+    return any(
+        lease.terminal_id != child_terminal_id
+        or lease.canonical_worktree != path
+        or not isinstance(expected_generation, str)
+        or not expected_generation
+        or lease.authority_generation != expected_generation
+        for lease in leases
+    )
+
+
 def claim_review_worktree_preparation(
     child_terminal_id: str,
     workflow_turn_id: int,
@@ -22953,15 +22985,12 @@ def claim_review_worktree_preparation(
             or _terminal_has_pending_provider_reconnect(db, child_terminal_id)
             or _terminal_runtime_operation_live(terminal, now)
             or db.get(ProviderExecutionLeaseModel, child_terminal_id) is not None
-            or db.query(WorktreeWriterLeaseModel.canonical_worktree)
-            .filter(
-                or_(
-                    WorktreeWriterLeaseModel.terminal_id == child_terminal_id,
-                    WorktreeWriterLeaseModel.canonical_worktree == path,
-                )
+            or _review_worktree_writer_authority_conflicts(
+                db,
+                terminal,
+                child_terminal_id,
+                path,
             )
-            .first()
-            is not None
             or not _workspace_accepts_new_work(db, child_terminal_id)
             or not _retirement_quiescence_allows_commit(db, child_terminal_id)
         )

@@ -22323,7 +22323,6 @@ def _terminalize_handoff_recovery_exhausted(
     terminal_id: str,
 ) -> None:
     """Terminalize one exhausted managed handoff without changing its identity."""
-    assignment.status = ChildAssignmentStatus.HANDOFF_RESULT_FAILED.value
     assignment.updated_at = datetime.now()
     if result.status != DelegationResultStatus.AWAITING.value:
         return
@@ -22347,6 +22346,18 @@ def _terminalize_handoff_recovery_exhausted(
         terminal_id,
         detail={"reason_code": "handoff_recovery_exhausted"},
     )
+    _purge_staged_handoff_submission(db, result.id)
+    notice = _queue_delegation_result_notice(
+        db,
+        assignment,
+        result,
+        blocker,
+        delegation_kind="handoff",
+    )
+    if notice is None:
+        # A terminal parent cannot consume a callback.  Retain the exact
+        # lifecycle result as history without creating resurrection authority.
+        assignment.status = ChildAssignmentStatus.HANDOFF_RESULT_FAILED.value
 
 
 def managed_final_problem(body: object) -> Optional[str]:
@@ -22372,6 +22383,90 @@ def managed_final_problem(body: object) -> Optional[str]:
     if normalized.endswith(("...", "…")):
         return "INTERRUPTED_FINAL"
     return None
+
+
+def _queue_delegation_result_notice(
+    db: Any,
+    assignment: ChildAssignmentModel,
+    result: DelegationResultModel,
+    body: str,
+    *,
+    delegation_kind: str,
+) -> Optional[InboxModel]:
+    """Queue one exact terminal result for its still-open parent.
+
+    Both authoritative child submissions and lifecycle-generated INCOMPLETE
+    outcomes use the same parent callback boundary.  The result status and
+    authorship remain independent: this helper only makes an already durable
+    outcome observable and acknowledgeable by its owning parent.
+    """
+    if assignment.result_message_id is not None:
+        return db.query(InboxModel).filter_by(id=assignment.result_message_id).first()
+    parent_workflow = _open_workflow(db, assignment.parent_terminal_id, create=False)
+    if parent_workflow is None or parent_workflow.status != WORKFLOW_OPEN:
+        return None
+
+    now = datetime.now()
+    inbox = InboxModel(
+        sender_id=assignment.child_terminal_id,
+        receiver_id=assignment.parent_terminal_id,
+        message=body,
+        status=MessageStatus.PENDING.value,
+        result_id=result.id,
+        kind="delegation_result_notice",
+        superseded_at=now,
+    )
+    db.add(inbox)
+    db.flush()
+    assignment.result_message_id = inbox.id
+    assignment.status = (
+        ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value
+        if delegation_kind == "handoff"
+        else ChildAssignmentStatus.RESULT_QUEUED.value
+    )
+    assignment.updated_at = now
+
+    # Results that become ready during one parent turn share its one safe
+    # boundary callback.  A result that arrives while another callback is
+    # unadmitted remains turn-less until the ordinary materializer can bind
+    # it without rolling the workflow authority backwards.
+    turn = None
+    boundary_key: Optional[str] = None
+    defer_handoff_turn = delegation_kind == "handoff" and (
+        _workflow_has_unadmitted_active_continuation(db, parent_workflow)
+    )
+    if delegation_kind == "handoff" and not defer_handoff_turn:
+        boundary_key = f"handoff-result-boundary:{parent_workflow.active_turn_id}"
+        turn = (
+            db.query(WorkflowTurnModel)
+            .filter(
+                WorkflowTurnModel.workflow_id == parent_workflow.id,
+                WorkflowTurnModel.kind == "handoff_result",
+                WorkflowTurnModel.dedupe_key == boundary_key,
+                WorkflowTurnModel.state == TURN_QUEUED,
+            )
+            .order_by(WorkflowTurnModel.id.asc())
+            .first()
+        )
+    if turn is None and not defer_handoff_turn:
+        turn = WorkflowTurnModel(
+            workflow_id=parent_workflow.id,
+            kind="handoff_result" if delegation_kind == "handoff" else "assigned_result",
+            dedupe_key=(
+                cast(str, boundary_key)
+                if delegation_kind == "handoff"
+                else f"assigned-result:{assignment.attempt_id}"
+            ),
+            payload=body,
+            inbox_message_id=inbox.id,
+            state=TURN_QUEUED,
+        )
+        db.add(turn)
+        db.flush()
+    result.workflow_turn_id = turn.id if turn is not None else None
+    parent_workflow.no_progress_count = 0
+    parent_workflow.updated_at = now
+    return inbox
 
 
 def _finalize_managed_delegation_result(
@@ -22434,70 +22529,15 @@ def _finalize_managed_delegation_result(
         # resurrect a parent that an owner/cancellation transition fenced.
         return None, False, "PARENT_NOT_ELIGIBLE"
 
-    inbox = InboxModel(
-        sender_id=assignment.child_terminal_id,
-        receiver_id=assignment.parent_terminal_id,
-        message=result_body,
-        status=MessageStatus.PENDING.value,
-        result_id=result.id,
-        kind="delegation_result_notice",
-        superseded_at=datetime.now(),
+    inbox = _queue_delegation_result_notice(
+        db,
+        assignment,
+        result,
+        result_body,
+        delegation_kind=kind,
     )
-    db.add(inbox)
-    db.flush()
-    assignment.result_message_id = inbox.id
-    assignment.status = (
-        ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value
-        if kind == "handoff"
-        else ChildAssignmentStatus.RESULT_QUEUED.value
-    )
-    assignment.updated_at = datetime.now()
-    # Results that become ready during one parent turn share its one safe
-    # boundary callback. A result that arrives while another callback is
-    # unadmitted must not mint a successor yet: retain its immutable Inbox
-    # notice unbound until the active receiver admission clears that fence.
-    turn = None
-    boundary_key: Optional[str] = None
-    defer_handoff_turn = kind == "handoff" and _workflow_has_unadmitted_active_continuation(
-        db, parent_workflow
-    )
-    if kind == "handoff" and not defer_handoff_turn:
-        boundary_key = f"handoff-result-boundary:{parent_workflow.active_turn_id}"
-        turn = (
-            db.query(WorkflowTurnModel)
-            .filter(
-                WorkflowTurnModel.workflow_id == parent_workflow.id,
-                WorkflowTurnModel.kind == "handoff_result",
-                WorkflowTurnModel.dedupe_key == boundary_key,
-                WorkflowTurnModel.state == TURN_QUEUED,
-            )
-            .order_by(WorkflowTurnModel.id.asc())
-            .first()
-        )
-    if turn is None and not defer_handoff_turn:
-        turn = WorkflowTurnModel(
-            workflow_id=parent_workflow.id,
-            kind="handoff_result" if kind == "handoff" else "assigned_result",
-            dedupe_key=(
-                cast(str, boundary_key)
-                if kind == "handoff"
-                else f"assigned-result:{assignment.attempt_id}"
-            ),
-            payload=result_body,
-            inbox_message_id=inbox.id,
-            state=TURN_QUEUED,
-        )
-        db.add(turn)
-        db.flush()
-    if turn is not None:
-        result.workflow_turn_id = turn.id
-    elif defer_handoff_turn:
-        # _finalize_result records the parent active turn for provenance by
-        # default. A deferred callback must not retain that value as delivery
-        # membership: it is intentionally turn-less until materialization.
-        result.workflow_turn_id = None
-    parent_workflow.no_progress_count = 0
-    parent_workflow.updated_at = datetime.now()
+    if inbox is None:
+        return None, False, "PARENT_NOT_ELIGIBLE"
     return _inbox_model_to_message(inbox), False, "ACCEPTED"
 
 

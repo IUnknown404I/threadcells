@@ -242,6 +242,35 @@ class SessionDeletionOperationModel(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
+class FullCleanupOperationModel(Base):
+    """One operator-admitted Full Cleanup crossing HTTP and helper lifetimes."""
+
+    __tablename__ = "full_cleanup_operations"
+
+    operation_id = Column(String, primary_key=True)
+    plan_id = Column(String, nullable=False, index=True)
+    retire_dirty_worktrees = Column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    actor_kind = Column(String, nullable=False)
+    state = Column(String, nullable=False, default="admitted", index=True)
+    # Exactly one admitted/running operation may own the destructive boundary.
+    # NULL terminal rows do not conflict under SQLite UNIQUE semantics.
+    active_key = Column(Integer, nullable=True, unique=True)
+    operation_token_sha256 = Column(String, nullable=True)
+    token_consumed_at = Column(DateTime, nullable=True)
+    helper_pid = Column(Integer, nullable=True)
+    helper_process_start_ticks = Column(Integer, nullable=True)
+    progress_json = Column(Text, nullable=False, default="{}", server_default="{}")
+    report_json = Column(Text, nullable=True)
+    reason_code = Column(String, nullable=True)
+    diagnostic_id = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    started_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now)
+    completed_at = Column(DateTime, nullable=True)
+
+
 class SessionDeletionCancellationAuditModel(Base):
     """Append-only evidence for work resolved by an operator Session deletion."""
 
@@ -1247,6 +1276,343 @@ def init_db() -> None:
     from cli_agent_orchestrator.services.operations_service import _load_legacy_operations_config
 
     ensure_capacity_settings(_load_legacy_operations_config())
+
+
+_FULL_CLEANUP_OPERATION_ID = re.compile(r"[0-9a-f]{32}")
+_FULL_CLEANUP_PLAN_ID = re.compile(r"[0-9a-f]{64}")
+_FULL_CLEANUP_REASON = re.compile(r"[A-Z0-9_]{3,96}")
+_FULL_CLEANUP_REPORT_LIMIT = 8 * 1024 * 1024
+_FULL_CLEANUP_PROGRESS_LIMIT = 64 * 1024
+
+
+def _full_cleanup_json(value: Mapping[str, Any], *, limit: int) -> str:
+    encoded = json.dumps(dict(value), sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > limit:
+        raise ValueError("full cleanup operation document is too large")
+    return encoded
+
+
+def _full_cleanup_operation_dict(operation: FullCleanupOperationModel) -> Dict[str, Any]:
+    try:
+        progress = json.loads(str(operation.progress_json))
+        report = json.loads(operation.report_json) if operation.report_json is not None else None
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("FULL_CLEANUP_OPERATION_CORRUPT") from exc
+    if not isinstance(progress, dict) or (report is not None and not isinstance(report, dict)):
+        raise RuntimeError("FULL_CLEANUP_OPERATION_CORRUPT")
+    return {
+        "operation_id": str(operation.operation_id),
+        "plan_id": str(operation.plan_id),
+        "retire_dirty_worktrees": bool(operation.retire_dirty_worktrees),
+        "actor_kind": str(operation.actor_kind),
+        "state": str(operation.state),
+        "helper_pid": operation.helper_pid,
+        "helper_process_start_ticks": operation.helper_process_start_ticks,
+        "progress": progress,
+        "report": report,
+        "reason_code": operation.reason_code,
+        "diagnostic_id": operation.diagnostic_id,
+        "created_at": operation.created_at,
+        "started_at": operation.started_at,
+        "updated_at": operation.updated_at,
+        "completed_at": operation.completed_at,
+    }
+
+
+def get_full_cleanup_operation(operation_id: str) -> Optional[Dict[str, Any]]:
+    """Return one non-secret operation projection without consuming authority."""
+    if not isinstance(operation_id, str) or not _FULL_CLEANUP_OPERATION_ID.fullmatch(operation_id):
+        return None
+    with SessionLocal() as db:
+        operation = db.get(FullCleanupOperationModel, operation_id)
+        return _full_cleanup_operation_dict(operation) if operation is not None else None
+
+
+def get_latest_full_cleanup_operation() -> Optional[Dict[str, Any]]:
+    """Return the newest durable Full Cleanup observation."""
+    with SessionLocal() as db:
+        operation = (
+            db.query(FullCleanupOperationModel)
+            .order_by(
+                FullCleanupOperationModel.created_at.desc(),
+                FullCleanupOperationModel.operation_id.desc(),
+            )
+            .first()
+        )
+        return _full_cleanup_operation_dict(operation) if operation is not None else None
+
+
+def list_active_full_cleanup_operations() -> List[Dict[str, Any]]:
+    """Return the bounded singleton destructive authority, if present."""
+    with SessionLocal() as db:
+        operations = (
+            db.query(FullCleanupOperationModel)
+            .filter(FullCleanupOperationModel.active_key == 1)
+            .limit(2)
+            .all()
+        )
+        if len(operations) > 1:
+            raise RuntimeError("FULL_CLEANUP_OPERATION_AUTHORITY_AMBIGUOUS")
+        return [_full_cleanup_operation_dict(operation) for operation in operations]
+
+
+def admit_full_cleanup_operation(
+    operation_id: str,
+    plan_id: str,
+    *,
+    retire_dirty_worktrees: bool,
+    actor_kind: str,
+    operation_token: str,
+) -> Dict[str, Any]:
+    """Atomically bind one authenticated request before the helper can mutate."""
+    if (
+        not isinstance(operation_id, str)
+        or not _FULL_CLEANUP_OPERATION_ID.fullmatch(operation_id)
+        or not isinstance(plan_id, str)
+        or not _FULL_CLEANUP_PLAN_ID.fullmatch(plan_id)
+        or type(retire_dirty_worktrees) is not bool
+        or actor_kind not in {"operator_session", "operator_bearer"}
+        or not isinstance(operation_token, str)
+        or not 32 <= len(operation_token) <= 128
+    ):
+        raise ValueError("invalid Full Cleanup operation authority")
+    digest = hashlib.sha256(operation_token.encode("utf-8")).hexdigest()
+    now = datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        existing = db.get(FullCleanupOperationModel, operation_id)
+        if existing is not None:
+            if (
+                str(existing.plan_id) != plan_id
+                or bool(existing.retire_dirty_worktrees) != retire_dirty_worktrees
+            ):
+                db.rollback()
+                raise RuntimeError("FULL_CLEANUP_OPERATION_AUTHORITY_CHANGED")
+            result = _full_cleanup_operation_dict(existing)
+            result["created"] = False
+            db.rollback()
+            return result
+        active = (
+            db.query(FullCleanupOperationModel.operation_id)
+            .filter(FullCleanupOperationModel.active_key == 1)
+            .first()
+        )
+        if active is not None:
+            db.rollback()
+            raise RuntimeError("FULL_CLEANUP_OPERATION_ACTIVE")
+        operation = FullCleanupOperationModel(
+            operation_id=operation_id,
+            plan_id=plan_id,
+            retire_dirty_worktrees=retire_dirty_worktrees,
+            actor_kind=actor_kind,
+            state="admitted",
+            active_key=1,
+            operation_token_sha256=digest,
+            progress_json="{}",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(operation)
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise RuntimeError("FULL_CLEANUP_OPERATION_ACTIVE") from exc
+        result = _full_cleanup_operation_dict(operation)
+        result["created"] = True
+        return result
+
+
+def claim_full_cleanup_operation(
+    operation_id: str,
+    operation_token: str,
+    *,
+    helper_pid: int,
+    helper_process_start_ticks: int,
+) -> bool:
+    """Consume the helper token once and install exact physical run authority."""
+    if not isinstance(operation_token, str) or helper_pid <= 1 or helper_process_start_ticks <= 0:
+        return False
+    digest = hashlib.sha256(operation_token.encode("utf-8")).hexdigest()
+    now = datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        operation = db.get(FullCleanupOperationModel, operation_id)
+        if (
+            operation is None
+            or operation.state != "admitted"
+            or operation.active_key != 1
+            or not isinstance(operation.operation_token_sha256, str)
+            or not hmac.compare_digest(operation.operation_token_sha256, digest)
+        ):
+            db.rollback()
+            return False
+        operation.state = "running"
+        operation.operation_token_sha256 = None
+        operation.token_consumed_at = now
+        operation.helper_pid = helper_pid
+        operation.helper_process_start_ticks = helper_process_start_ticks
+        operation.started_at = now
+        operation.updated_at = now
+        db.commit()
+        return True
+
+
+def update_full_cleanup_operation_progress(
+    operation_id: str,
+    *,
+    helper_pid: int,
+    helper_process_start_ticks: int,
+    progress: Mapping[str, Any],
+) -> bool:
+    """Persist one bounded monotonic observation from the exact running helper."""
+    required_integer_fields = {
+        "schema_version",
+        "sequence",
+        "processed_candidates",
+        "executed_candidates",
+        "skipped_candidates",
+        "failed_candidates",
+        "freed_bytes",
+    }
+    if (
+        set(progress)
+        != required_integer_fields | {"phase", "last_candidate_sha256", "last_outcome"}
+        or type(progress.get("schema_version")) is not int
+        or progress.get("schema_version") != 1
+        or progress.get("phase") not in {"privileged", "runtime"}
+        or not isinstance(progress.get("last_candidate_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", str(progress["last_candidate_sha256"]))
+        or progress.get("last_outcome") not in {"executed", "skipped", "failed", "observed"}
+        or any(
+            isinstance(progress.get(field), bool)
+            or not isinstance(progress.get(field), int)
+            or int(progress[field]) < (1 if field == "sequence" else 0)
+            for field in required_integer_fields - {"schema_version"}
+        )
+    ):
+        raise ValueError("invalid Full Cleanup operation progress")
+    if int(progress["processed_candidates"]) != sum(
+        int(progress[field])
+        for field in ("executed_candidates", "skipped_candidates", "failed_candidates")
+    ):
+        raise ValueError("invalid Full Cleanup operation progress")
+    encoded = _full_cleanup_json(progress, limit=_FULL_CLEANUP_PROGRESS_LIMIT)
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        operation = db.get(FullCleanupOperationModel, operation_id)
+        if (
+            operation is None
+            or operation.state != "running"
+            or operation.active_key != 1
+            or operation.helper_pid != helper_pid
+            or operation.helper_process_start_ticks != helper_process_start_ticks
+        ):
+            db.rollback()
+            return False
+        try:
+            current_progress = json.loads(str(operation.progress_json))
+            current_sequence = int(current_progress.get("sequence", 0))
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            db.rollback()
+            raise RuntimeError("FULL_CLEANUP_OPERATION_CORRUPT")
+        if int(progress["sequence"]) <= current_sequence:
+            db.rollback()
+            return False
+        for field in (
+            "processed_candidates",
+            "executed_candidates",
+            "skipped_candidates",
+            "failed_candidates",
+            "freed_bytes",
+        ):
+            previous = current_progress.get(field, 0)
+            if isinstance(previous, bool) or not isinstance(previous, int):
+                db.rollback()
+                raise RuntimeError("FULL_CLEANUP_OPERATION_CORRUPT")
+            if int(progress[field]) < previous:
+                db.rollback()
+                return False
+        operation.progress_json = encoded
+        operation.updated_at = datetime.now()
+        db.commit()
+        return True
+
+
+def complete_full_cleanup_operation(
+    operation_id: str,
+    *,
+    helper_pid: int,
+    helper_process_start_ticks: int,
+    report: Mapping[str, Any],
+) -> bool:
+    """Publish the exact terminal report before the helper answers its socket."""
+    encoded = _full_cleanup_json(report, limit=_FULL_CLEANUP_REPORT_LIMIT)
+    completed_with_issues = bool(report.get("completed_with_issues")) or not bool(report.get("ok"))
+    now = datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        operation = db.get(FullCleanupOperationModel, operation_id)
+        if (
+            operation is None
+            or operation.state != "running"
+            or operation.active_key != 1
+            or operation.helper_pid != helper_pid
+            or operation.helper_process_start_ticks != helper_process_start_ticks
+        ):
+            db.rollback()
+            return False
+        operation.state = "completed_with_issues" if completed_with_issues else "completed"
+        operation.active_key = None
+        operation.report_json = encoded
+        operation.reason_code = None
+        operation.updated_at = now
+        operation.completed_at = now
+        db.commit()
+        return True
+
+
+def terminalize_full_cleanup_operation(
+    operation_id: str,
+    *,
+    reason_code: str,
+    indeterminate: bool,
+    helper_pid: Optional[int] = None,
+    helper_process_start_ticks: Optional[int] = None,
+    diagnostic_id: Optional[str] = None,
+) -> bool:
+    """End one exact active authority without fabricating a cleanup outcome."""
+    if not _FULL_CLEANUP_REASON.fullmatch(reason_code):
+        reason_code = "FULL_CLEANUP_EXECUTION_FAILED"
+    if diagnostic_id is not None and not re.fullmatch(r"[0-9a-f]{32}", diagnostic_id):
+        diagnostic_id = None
+    now = datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        operation = db.get(FullCleanupOperationModel, operation_id)
+        if operation is None or operation.active_key != 1:
+            db.rollback()
+            return False
+        if helper_pid is None:
+            if operation.state != "admitted":
+                db.rollback()
+                return False
+        elif (
+            operation.state != "running"
+            or operation.helper_pid != helper_pid
+            or operation.helper_process_start_ticks != helper_process_start_ticks
+        ):
+            db.rollback()
+            return False
+        operation.state = "indeterminate" if indeterminate else "failed"
+        operation.active_key = None
+        operation.operation_token_sha256 = None
+        operation.reason_code = reason_code
+        operation.diagnostic_id = diagnostic_id
+        operation.updated_at = now
+        operation.completed_at = now
+        db.commit()
+        return True
 
 
 def _ensure_control_plane_schema() -> None:

@@ -1299,6 +1299,142 @@ def run_pressure_recovery(
     )
 
 
+def _prepare_housekeeping_summary(summary: HousekeepingSummary, plan: Any) -> list[Any]:
+    """Project one exact immutable plan into its execution summary."""
+    summary.plan_id = plan.plan_id
+    summary.planned_candidates = len(plan.candidates)
+    summary.reclaimable_bytes = plan.reclaimable_bytes
+    class_summaries = getattr(plan, "class_summaries", {})
+    summary.reclaimable_bytes_by_class = {
+        category: int(values["reclaimable_bytes"])
+        for category, values in class_summaries.items()
+        if values["reclaimable_bytes"]
+    }
+    summary.preserved_bytes_by_class = {
+        category: int(values["preserved_bytes"])
+        for category, values in class_summaries.items()
+        if values["preserved_bytes"]
+    }
+    summary.protected_resources = [
+        {
+            "canonical_identity": candidate.canonical_identity,
+            "category": candidate.category,
+            "bytes": candidate.bytes,
+            "reason": candidate.protection_reason or candidate.retention_reason,
+        }
+        for candidate in plan.candidates
+        if candidate.action == "preserve"
+    ]
+    summary.warnings.extend(plan.warnings)
+    return [candidate for candidate in plan.candidates if candidate.action != "preserve"]
+
+
+def _apply_execution_report_to_summary(
+    summary: HousekeepingSummary, report: Any, actionable: Sequence[Any]
+) -> None:
+    """Apply a helper/local execution report using the canonical public counters."""
+    summary.ok = summary.ok and report.ok
+    summary.freed_bytes += report.freed_bytes
+    summary.reclaimed_bytes_by_class = dict(getattr(report, "reclaimed_bytes_by_class", {}))
+    summary.execution_skips.extend(getattr(report, "skipped", []))
+    summary.execution_failures.extend(report.failures)
+    summary.completed_with_issues = bool(getattr(report, "skipped", []) or report.failures)
+    summary.active_release = getattr(report, "active_release", None)
+    summary.rollback_available = getattr(report, "rollback_available", None)
+    summary.warnings.extend(
+        f"{item['reason_code']}:{item['candidate']}" for item in report.failures
+    )
+    executed = set(report.executed)
+    summary.logs_compressed += sum(
+        candidate.canonical_identity in executed
+        and candidate.category == "logs"
+        and candidate.action == "compress"
+        for candidate in actionable
+    )
+    summary.logs_deleted += sum(
+        candidate.canonical_identity in executed
+        and candidate.category == "logs"
+        and candidate.action == "delete"
+        for candidate in actionable
+    )
+    summary.attachments_deleted += sum(
+        candidate.canonical_identity in executed and candidate.category == "attachments"
+        for candidate in actionable
+    )
+    summary.orphan_processes_closed += sum(
+        candidate.canonical_identity in executed
+        and candidate.resource_kind == "browser_process_group"
+        for candidate in actionable
+    )
+    summary.terminal_runtimes_retired += sum(
+        candidate.canonical_identity in executed and candidate.resource_kind == "terminal_runtime"
+        for candidate in actionable
+    )
+    summary.retirement_cleanups_reconciled += sum(
+        candidate.canonical_identity in executed
+        and candidate.resource_kind in {"retirement_cleanup", "workflow_authority"}
+        for candidate in actionable
+    )
+    summary.ephemeral_resources_removed += sum(
+        candidate.canonical_identity in executed
+        and candidate.category == "ephemeral"
+        and candidate.resource_kind != "browser_process_group"
+        for candidate in actionable
+    )
+    summary.browser_revision_candidates += sum(
+        candidate.category == "browser_cache" for candidate in actionable
+    )
+    summary.browser_revisions_removed += sum(
+        candidate.canonical_identity in executed and candidate.category == "browser_cache"
+        for candidate in actionable
+    )
+    summary.releases_removed += sum(
+        candidate.canonical_identity in executed and candidate.category == "releases"
+        for candidate in actionable
+    )
+    summary.cache_pruned += sum(
+        candidate.canonical_identity in executed and candidate.category == "package_cache"
+        for candidate in actionable
+    )
+    summary.worktrees_retired += sum(
+        candidate.canonical_identity in executed
+        and candidate.resource_kind in {"git_worktree", "session_workspace"}
+        for candidate in actionable
+    )
+    summary.reproducible_caches_removed += sum(
+        candidate.canonical_identity in executed and candidate.resource_kind == "reproducible_cache"
+        for candidate in actionable
+    )
+    summary.build_artifacts_removed += sum(
+        candidate.canonical_identity in executed and candidate.category == "build_artifact"
+        for candidate in actionable
+    )
+
+
+def _finalize_housekeeping_summary(
+    summary: HousekeepingSummary,
+    *,
+    root: Path,
+    config: Mapping[str, Any],
+    proc_root: Path,
+    completed_at: float,
+    write_status: bool = True,
+) -> HousekeepingSummary:
+    """Finish reconciliation and publish the ordinary bounded status document."""
+    _reconcile_supervisor_context_roles(summary)
+    _reconcile_writer_leases(summary)
+    _reconcile_provider_executions(summary, proc_root=proc_root)
+    _reconcile_legacy_terminal_authority(summary)
+    _inventory_warnings(root, config, summary)
+    summary.disk_after = shutil.disk_usage("/").free
+    summary.observed_disk_free_delta = summary.disk_after - summary.disk_before
+    if summary.ok and summary.mode in {"frequent", "weekly"}:
+        _write_schedule_receipt(root, summary.mode, completed_at)
+    if write_status:
+        _write_status(root, summary)
+    return summary
+
+
 def run_housekeeping(
     *,
     config: Mapping[str, Any] | None = None,
@@ -1343,6 +1479,11 @@ def run_housekeeping(
         _housekeeping_execution_lock(lock_dir),
         _full_cleanup_execution_fence(cfg) if mode == "full" else nullcontext(),
     ):
+        from cli_agent_orchestrator.services.full_cleanup_operation_service import (
+            require_no_active_full_cleanup_operation,
+        )
+
+        require_no_active_full_cleanup_operation()
         if mode == "full":
             summary.idle_gate = full_cleanup_idle_gate(cfg)
             if not summary.idle_gate["eligible"]:
@@ -1360,38 +1501,12 @@ def run_housekeeping(
         summary.disk_before = shutil.disk_usage("/").free
         from cli_agent_orchestrator.services.housekeeping.executor import (
             execute_plan,
-            merge_execution_reports,
         )
 
         plan = plan_housekeeping(config=cfg, mode=mode, now=current, proc_root=proc_root)
         if expected_plan_id is not None and plan.plan_id != expected_plan_id:
             raise RuntimeError("HOUSEKEEPING_PLAN_CHANGED")
-        summary.plan_id = plan.plan_id
-        summary.planned_candidates = len(plan.candidates)
-        summary.reclaimable_bytes = plan.reclaimable_bytes
-        class_summaries = getattr(plan, "class_summaries", {})
-        summary.reclaimable_bytes_by_class = {
-            category: int(values["reclaimable_bytes"])
-            for category, values in class_summaries.items()
-            if values["reclaimable_bytes"]
-        }
-        summary.preserved_bytes_by_class = {
-            category: int(values["preserved_bytes"])
-            for category, values in class_summaries.items()
-            if values["preserved_bytes"]
-        }
-        summary.protected_resources = [
-            {
-                "canonical_identity": candidate.canonical_identity,
-                "category": candidate.category,
-                "bytes": candidate.bytes,
-                "reason": candidate.protection_reason or candidate.retention_reason,
-            }
-            for candidate in plan.candidates
-            if candidate.action == "preserve"
-        ]
-        summary.warnings.extend(plan.warnings)
-        actionable = [candidate for candidate in plan.candidates if candidate.action != "preserve"]
+        actionable = _prepare_housekeeping_summary(summary, plan)
         if dry_run:
             summary.freed_bytes += plan.reclaimable_bytes
             summary.logs_compressed += sum(
@@ -1441,40 +1556,17 @@ def run_housekeeping(
             )
         else:
             if mode == "full" and privileged_cleanup_executor is not None:
-                privileged_report = privileged_cleanup_executor(
+                durable_summary = privileged_cleanup_executor(
                     plan=plan,
                     config=cfg,
                     settings=settings,
                     proc_root=proc_root,
                 )
-                if privileged_report.plan_id != plan.plan_id:
+                if not isinstance(durable_summary, HousekeepingSummary):
+                    raise RuntimeError("FULL_CLEANUP_HELPER_RESPONSE_INVALID")
+                if durable_summary.plan_id != plan.plan_id:
                     raise RuntimeError("HOUSEKEEPING_REPORT_PLAN_MISMATCH")
-                if privileged_report.ok:
-                    from cli_agent_orchestrator.services.housekeeping.executor import (
-                        privileged_full_cleanup_candidate,
-                    )
-
-                    local_plan = replace(
-                        plan,
-                        candidates=tuple(
-                            candidate
-                            for candidate in plan.candidates
-                            if not privileged_full_cleanup_candidate(candidate)
-                        ),
-                    )
-                    local_report = execute_plan(
-                        local_plan,
-                        config=cfg,
-                        open_inventory=lambda: _runtime_open_paths_inventory(cfg, proc_root),
-                        settings=settings,
-                        proc_root=proc_root,
-                        full_cleanup=True,
-                        lifecycle_fence_held=True,
-                        reconcile_releases=False,
-                    )
-                    report = merge_execution_reports(privileged_report, local_report)
-                else:
-                    report = privileged_report
+                return durable_summary
             else:
                 report = execute_plan(
                     plan,
@@ -1485,96 +1577,18 @@ def run_housekeeping(
                     full_cleanup=mode == "full",
                     lifecycle_fence_held=mode == "full",
                 )
-            summary.ok = summary.ok and report.ok
-            summary.freed_bytes += report.freed_bytes
-            summary.reclaimed_bytes_by_class = dict(getattr(report, "reclaimed_bytes_by_class", {}))
-            summary.execution_skips.extend(getattr(report, "skipped", []))
-            summary.execution_failures.extend(report.failures)
-            summary.completed_with_issues = bool(getattr(report, "skipped", []) or report.failures)
-            summary.active_release = getattr(report, "active_release", None)
-            summary.rollback_available = getattr(report, "rollback_available", None)
-            summary.warnings.extend(
-                f"{item['reason_code']}:{item['candidate']}" for item in report.failures
-            )
-            executed = set(report.executed)
-            summary.logs_compressed += sum(
-                candidate.canonical_identity in executed
-                and candidate.category == "logs"
-                and candidate.action == "compress"
-                for candidate in actionable
-            )
-            summary.logs_deleted += sum(
-                candidate.canonical_identity in executed
-                and candidate.category == "logs"
-                and candidate.action == "delete"
-                for candidate in actionable
-            )
-            summary.attachments_deleted += sum(
-                candidate.canonical_identity in executed and candidate.category == "attachments"
-                for candidate in actionable
-            )
-            summary.orphan_processes_closed += sum(
-                candidate.canonical_identity in executed
-                and candidate.resource_kind == "browser_process_group"
-                for candidate in actionable
-            )
-            summary.terminal_runtimes_retired += sum(
-                candidate.canonical_identity in executed
-                and candidate.resource_kind == "terminal_runtime"
-                for candidate in actionable
-            )
-            summary.retirement_cleanups_reconciled += sum(
-                candidate.canonical_identity in executed
-                and candidate.resource_kind in {"retirement_cleanup", "workflow_authority"}
-                for candidate in actionable
-            )
-            summary.ephemeral_resources_removed += sum(
-                candidate.canonical_identity in executed
-                and candidate.category == "ephemeral"
-                and candidate.resource_kind != "browser_process_group"
-                for candidate in actionable
-            )
-            summary.browser_revision_candidates += sum(
-                candidate.category == "browser_cache" for candidate in actionable
-            )
-            summary.browser_revisions_removed += sum(
-                candidate.canonical_identity in executed and candidate.category == "browser_cache"
-                for candidate in actionable
-            )
-            summary.releases_removed += sum(
-                candidate.canonical_identity in executed and candidate.category == "releases"
-                for candidate in actionable
-            )
-            summary.cache_pruned += sum(
-                candidate.canonical_identity in executed and candidate.category == "package_cache"
-                for candidate in actionable
-            )
-            summary.worktrees_retired += sum(
-                candidate.canonical_identity in executed
-                and candidate.resource_kind in {"git_worktree", "session_workspace"}
-                for candidate in actionable
-            )
-            summary.reproducible_caches_removed += sum(
-                candidate.canonical_identity in executed
-                and candidate.resource_kind == "reproducible_cache"
-                for candidate in actionable
-            )
-            summary.build_artifacts_removed += sum(
-                candidate.canonical_identity in executed and candidate.category == "build_artifact"
-                for candidate in actionable
-            )
+            _apply_execution_report_to_summary(summary, report, actionable)
         if not dry_run:
-            _reconcile_supervisor_context_roles(summary)
-            _reconcile_writer_leases(summary)
-            _reconcile_provider_executions(summary, proc_root=proc_root)
-            _reconcile_legacy_terminal_authority(summary)
+            return _finalize_housekeeping_summary(
+                summary,
+                root=root,
+                config=cfg,
+                proc_root=proc_root,
+                completed_at=current,
+            )
         _inventory_warnings(root, cfg, summary)
         summary.disk_after = shutil.disk_usage("/").free
         summary.observed_disk_free_delta = summary.disk_after - summary.disk_before
-        if not dry_run:
-            if summary.ok and mode in {"frequent", "weekly"}:
-                _write_schedule_receipt(root, mode, current)
-            _write_status(root, summary)
         return summary
 
 

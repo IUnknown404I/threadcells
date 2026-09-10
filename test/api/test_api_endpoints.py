@@ -7,6 +7,7 @@ flow_daemon, lifespan, and the main() entry point.
 
 import asyncio
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -586,7 +587,10 @@ class TestPublicControlPlaneApi:
             )
 
         assert response.status_code == 200
-        assert response.json() == preview
+        assert {
+            key: value for key, value in response.json().items() if key != "operation_id"
+        } == preview
+        assert re.fullmatch(r"[0-9a-f]{32}", response.json()["operation_id"])
         service.assert_called_once_with(retire_dirty_worktrees=retire_dirty_worktrees)
 
     @pytest.mark.parametrize(
@@ -616,6 +620,7 @@ class TestPublicControlPlaneApi:
         self, client, retire_dirty_worktrees
     ):
         plan_id = "b" * 64
+        operation_id = "c" * 32
         summary = MagicMock()
         summary.as_dict.return_value = {"ok": True, "full_cleanup": True}
 
@@ -640,6 +645,7 @@ class TestPublicControlPlaneApi:
             response = client.post(
                 "/api/v1/housekeeping/full-cleanup/run",
                 json={
+                    "operation_id": operation_id,
                     "expected_plan_id": plan_id,
                     "confirmed": True,
                     "retire_dirty_worktrees": retire_dirty_worktrees,
@@ -650,11 +656,11 @@ class TestPublicControlPlaneApi:
         assert response.status_code == 200
         authorize.assert_called_once()
         helper.assert_called_once_with(
+            operation_id=operation_id,
             expected_plan_id=plan_id,
             confirmed=True,
             retire_dirty_worktrees=retire_dirty_worktrees,
-            session_token=None,
-            bearer_secret="existing-secret",
+            actor_kind="operator_bearer",
         )
         service.assert_called_once_with(
             expected_plan_id=plan_id,
@@ -675,7 +681,7 @@ class TestPublicControlPlaneApi:
         ):
             response = client.post(
                 "/api/v1/housekeeping/full-cleanup/run",
-                json={"expected_plan_id": "a" * 64, "confirmed": True},
+                json={"operation_id": "a" * 32, "expected_plan_id": "a" * 64, "confirmed": True},
             )
 
         assert response.status_code == 401
@@ -693,7 +699,7 @@ class TestPublicControlPlaneApi:
         ):
             response = client.post(
                 "/api/v1/housekeeping/full-cleanup/run",
-                json={"expected_plan_id": "a" * 64},
+                json={"operation_id": "a" * 32, "expected_plan_id": "a" * 64},
             )
 
         assert response.status_code == 422
@@ -719,7 +725,7 @@ class TestPublicControlPlaneApi:
         ):
             response = client.post(
                 "/api/v1/housekeeping/full-cleanup/run",
-                json={"expected_plan_id": "a" * 64, "confirmed": True},
+                json={"operation_id": "d" * 32, "expected_plan_id": "a" * 64, "confirmed": True},
                 headers={"Authorization": "Bearer existing-secret"},
             )
 
@@ -748,7 +754,7 @@ class TestPublicControlPlaneApi:
         ):
             response = client.post(
                 "/api/v1/housekeeping/full-cleanup/run",
-                json={"expected_plan_id": "a" * 64, "confirmed": True},
+                json={"operation_id": "e" * 32, "expected_plan_id": "a" * 64, "confirmed": True},
                 headers={"Authorization": "Bearer existing-secret"},
             )
 
@@ -757,6 +763,76 @@ class TestPublicControlPlaneApi:
             "reason_code": "FULL_CLEANUP_HELPER_FAILED",
             "diagnostic_id": "e" * 32,
         }
+
+    def test_full_cleanup_duplicate_operation_observes_without_reexecution(self, client):
+        operation_id = "9" * 32
+        plan_id = "8" * 64
+        operation = {
+            "operation_id": operation_id,
+            "plan_id": plan_id,
+            "retire_dirty_worktrees": False,
+            "state": "running",
+            "progress": {"sequence": 2, "processed_candidates": 2},
+            "report": None,
+            "reason_code": None,
+            "diagnostic_id": None,
+        }
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main._require_operator",
+                return_value="operator_session:test",
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.get_full_cleanup_operation",
+                return_value=operation,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.housekeeping_service.run_full_cleanup",
+            ) as service,
+        ):
+            response = client.post(
+                "/api/v1/housekeeping/full-cleanup/run",
+                json={
+                    "operation_id": operation_id,
+                    "expected_plan_id": plan_id,
+                    "confirmed": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json()["operation_id"] == operation_id
+        assert response.json()["state"] == "running"
+        assert response.json()["progress"]["processed_candidates"] == 2
+        service.assert_not_called()
+
+    def test_full_cleanup_operation_poll_reconciles_dead_helper(self, client):
+        operation_id = "7" * 32
+        operation = {
+            "operation_id": operation_id,
+            "plan_id": "6" * 64,
+            "retire_dirty_worktrees": False,
+            "state": "indeterminate",
+            "progress": {"sequence": 1},
+            "report": None,
+            "reason_code": "FULL_CLEANUP_HELPER_EXITED_WITHOUT_RECEIPT",
+            "diagnostic_id": None,
+        }
+        with (
+            patch(
+                "cli_agent_orchestrator.services.full_cleanup_operation_service.reconcile_interrupted_full_cleanup_operations",
+                return_value={"inspected": 1, "active": 0, "terminalized": 1},
+            ) as reconcile,
+            patch(
+                "cli_agent_orchestrator.clients.database.get_full_cleanup_operation",
+                return_value=operation,
+            ),
+        ):
+            response = client.get(f"/api/v1/housekeeping/full-cleanup/operations/{operation_id}")
+
+        assert response.status_code == 200
+        assert response.json()["state"] == "indeterminate"
+        assert response.json()["reason_code"] == ("FULL_CLEANUP_HELPER_EXITED_WITHOUT_RECEIPT")
+        reconcile.assert_called_once_with(include_admitted=False)
 
     def test_housekeeping_report_is_available_before_the_first_run(self, client, tmp_path):
         with patch(

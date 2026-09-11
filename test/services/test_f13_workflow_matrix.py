@@ -2435,6 +2435,127 @@ def test_f13_resume_reconciles_older_result_callbacks_before_composer_once(
         assert db.query(database.DelegationResultModel).count() == 3
 
 
+def test_f13_reconnect_resume_reconciles_older_inbox_before_later_result_and_composer(
+    workflow_db, monkeypatch
+):
+    """A settled reconnect cannot leave an older ordinary Inbox head behind it."""
+    parent = "parent-reconnect-older-inbox-fifo"
+    child = "child-reconnect-later-result"
+    interrupted_turn = _start_admitted_input(parent)
+
+    ordinary_inbox, ordinary_turn = _pending_inbox_turn(parent, "older owner-approved Inbox work")
+    assert database.request_workflow_provider_reconnect(parent)
+    _complete_ready_test_reconnect(parent, interrupted_turn)
+
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).filter_by(root_terminal_id=parent).one()
+        resume_turn = workflow.active_turn_id
+        resumed = db.get(WorkflowTurnModel, resume_turn)
+        assert resumed.kind == "execution_resume"
+        assert resumed.resume_parent_turn_id == interrupted_turn
+        assert ordinary_turn < resume_turn
+
+    resume_claim = claim_workflow_turn(parent)
+    assert resume_claim is not None and resume_claim["id"] == resume_turn
+    assert activate_workflow_turn(parent, resume_turn)
+    assert mark_workflow_turn_sent(
+        resume_turn,
+        resume_claim["claim_token"],
+        resume_claim["claim_generation"],
+    )
+    assert database.acquire_provider_execution(parent, resume_turn, 3)
+    resume_receipt = claim_or_resume_workflow_turn_receipt(parent, resume_turn)
+    assert resume_receipt["accepted"] is True and resume_receipt["resumed"] is True
+    assert observe_workflow_processing(parent)
+
+    assert register_child_assignment(parent, child)
+    notice, duplicate = create_child_assignment_result_message(
+        child,
+        parent,
+        "immutable UI review result",
+        **_authorized_callback(child),
+    )
+    assert notice is not None and notice.result_id is not None and duplicate is False
+    result_turn = get_workflow_turn_for_inbox(notice.id)["turn_id"]
+    composer_payload = "finish the prepared UI block"
+    composer = database.prepare_workflow_input(
+        parent,
+        composer_payload,
+        request_id="reconnect-older-inbox-composer",
+        require_live_terminal=True,
+    )
+    assert composer is not None and composer["queued"] is True
+    composer_turn = composer["turn_id"]
+    assert ordinary_turn < resume_turn < result_turn < composer_turn
+
+    # The queued suffix remains untouched while the resumed provider still
+    # owns execution capacity. Reconciliation is only safe after that lease
+    # has settled and no recovery mutation is in flight.
+    assert database.reconcile_result_callbacks_superseded_by_resume() == 0
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowTurnModel, ordinary_turn).state == "queued"
+        assert db.get(InboxModel, ordinary_inbox.id).status == "pending"
+
+    # The provider execution settled before the daemon's next ordinary queue
+    # tick. The tick itself must rebuild the stale FIFO generation and deliver
+    # its first item; no manual Inbox wake or workflow-row edit is permitted.
+    assert database.release_provider_execution(parent, resume_turn)
+    provider = MagicMock()
+    provider.get_status.return_value = TerminalStatus.IDLE
+    provider.is_process_alive.return_value = True
+    provider.runtime_sidecar_reconnect_required.return_value = False
+
+    def admit_provider_execution(terminal_id, _payload, **kwargs):
+        logical_turn_id = kwargs.get("logical_turn_id")
+        assert isinstance(logical_turn_id, int)
+        assert database.acquire_provider_execution(terminal_id, logical_turn_id, 3)
+        return True
+
+    send = MagicMock(side_effect=admit_provider_execution)
+    monkeypatch.setattr(inbox_service.provider_manager, "get_provider", lambda *_: provider)
+    monkeypatch.setattr(inbox_service.terminal_service, "send_input", send)
+    monkeypatch.setattr(
+        workflow_service.terminal_service,
+        "get_terminal",
+        lambda *_: {"lifecycle": "running", "status": TerminalStatus.COMPLETED.value},
+    )
+    monkeypatch.setattr(workflow_service.terminal_service, "send_input", send)
+
+    assert inbox_service.reconcile_provider_execution_queue(observe_open_workflows=False) == 1
+    assert send.call_count == 1
+    assert send.call_args.args[1].endswith("older owner-approved Inbox work")
+
+    with database.SessionLocal() as db:
+        old_turns = [
+            db.get(WorkflowTurnModel, turn_id)
+            for turn_id in (ordinary_turn, result_turn, composer_turn)
+        ]
+        successor_ids = [turn.superseded_by_turn_id for turn in old_turns]
+        assert all(turn.state == "cancelled" for turn in old_turns)
+        assert all(isinstance(turn_id, int) for turn_id in successor_ids)
+        assert resume_turn < successor_ids[0] < successor_ids[1] < successor_ids[2]
+        ordinary_successor, result_successor, composer_successor = successor_ids
+        assert db.get(WorkflowTurnModel, ordinary_successor).state == "sent"
+        assert db.get(InboxModel, ordinary_inbox.id).status == "delivered"
+        result = db.get(database.DelegationResultModel, notice.result_id)
+        assert result.workflow_turn_id == result_successor
+        assert db.get(InboxModel, notice.id).status == "pending"
+        assert db.get(WorkflowTurnModel, composer_successor).payload == composer_payload
+
+    assert claim_workflow_turn_receipt(parent, ordinary_successor)
+    assert database.release_provider_execution(parent, ordinary_successor)
+    assert inbox_service.reconcile_provider_execution_queue(observe_open_workflows=False) == 1
+    assert send.call_count == 2
+    assert f"result_id={notice.result_id}" in send.call_args.args[1]
+    assert claim_workflow_turn_receipt(parent, result_successor)
+    assert acknowledge_child_assignment_result(parent, child)
+    assert database.release_provider_execution(parent, result_successor)
+    assert inbox_service.reconcile_provider_execution_queue(observe_open_workflows=False) == 1
+    assert send.call_count == 3
+    assert f"logical-turn={composer_successor}" in send.call_args.args[1]
+    assert send.call_args.args[1].endswith(composer_payload)
+
+
 def test_f13_resume_callback_reconciliation_is_atomic_across_restart(
     workflow_db,
 ):

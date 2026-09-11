@@ -19005,12 +19005,12 @@ def reconcile_receipted_callback_after_reconnect_promotion(
 def reconcile_result_callbacks_superseded_by_resume(
     now: Optional[datetime] = None,
 ) -> int:
-    """Replace stale callback transports with one current FIFO generation.
+    """Replace stale Inbox transports with one current FIFO generation.
 
     An interrupted admitted execution can resume under a fresh logical turn
-    after result callbacks were already queued.  The newer resume capability
-    must never move backward to those old turn IDs.  This transaction makes
-    each old envelope historical and materializes a fresh generation for all
+    after Inbox work was already queued.  The newer resume capability must
+    never move backward to those old turn IDs.  This transaction makes each
+    old envelope historical and materializes a fresh generation for all
     still-executable queued work in that workflow.
 
     Rebuilding the complete suffix is essential: a Composer turn which was
@@ -19050,6 +19050,61 @@ def reconcile_result_callbacks_superseded_by_resume(
             )
             if active is None or resume_turn is None or int(active.id) < int(resume_turn.id):
                 continue
+
+            active_receipt = (
+                db.query(WorkflowTurnReceiptModel)
+                .filter_by(
+                    workflow_turn_id=active.id,
+                    receiver_terminal_id=workflow.root_terminal_id,
+                )
+                .one_or_none()
+            )
+            settled_reconnect_attempt = (
+                db.query(WorkflowProviderReconnectAttemptModel.id)
+                .filter(
+                    WorkflowProviderReconnectAttemptModel.workflow_id == workflow.id,
+                    WorkflowProviderReconnectAttemptModel.root_terminal_id
+                    == workflow.root_terminal_id,
+                    WorkflowProviderReconnectAttemptModel.workflow_turn_id
+                    == active.resume_parent_turn_id,
+                    WorkflowProviderReconnectAttemptModel.state == PROVIDER_RECONNECT_SUCCEEDED,
+                    WorkflowProviderReconnectAttemptModel.outcome_code == "runtime_ready",
+                    WorkflowProviderReconnectAttemptModel.finished_at.is_not(None),
+                )
+                .first()
+            )
+            active_recovery = (
+                db.query(RecoveryTakeoverModel.id)
+                .filter(
+                    or_(
+                        RecoveryTakeoverModel.old_terminal_id == workflow.root_terminal_id,
+                        RecoveryTakeoverModel.new_terminal_id == workflow.root_terminal_id,
+                    ),
+                    RecoveryTakeoverModel.state.notin_(("failed", "completed")),
+                )
+                .first()
+            )
+            settled_reconnect_resume = bool(
+                int(active.id) == int(resume_turn.id)
+                and active.kind == "execution_resume"
+                and active.state == TURN_SENT
+                and active.dedupe_key.startswith("provider-reconnect-execution:")
+                and active.resume_parent_turn_id is not None
+                and active.provider_processing_observed_at is not None
+                and active.provider_ready_observed_at is None
+                and active.provider_outcome_code is None
+                and active.provider_outcome_observed_at is None
+                and active.provider_reconnect_requested_at is None
+                and active_receipt is not None
+                and active_receipt.resumed_by_turn_id is None
+                and active_receipt.resumed_at is None
+                and settled_reconnect_attempt is not None
+                and db.get(ProviderExecutionLeaseModel, workflow.root_terminal_id) is None
+                and active_recovery is None
+                and not _terminal_runtime_mutation_blocked(
+                    db, cast(str, workflow.root_terminal_id), now
+                )
+            )
 
             resume_ancestry = {int(resume_turn.id)}
             ancestor = resume_turn
@@ -19124,10 +19179,32 @@ def reconcile_result_callbacks_superseded_by_resume(
             )
             stale_indexes = []
             for index, turn in enumerate(queued):
-                if turn.id >= resume_turn.id or turn.kind not in {
-                    "assigned_result",
-                    "handoff_result",
-                }:
+                if turn.id >= resume_turn.id:
+                    continue
+                if (
+                    settled_reconnect_resume
+                    and turn.kind == "inbox_message"
+                    and turn.state == TURN_QUEUED
+                    and turn.inbox_message_id is not None
+                    and db.query(InboxModel.id)
+                    .filter(
+                        InboxModel.id == turn.inbox_message_id,
+                        InboxModel.receiver_id == workflow.root_terminal_id,
+                        InboxModel.kind == "message",
+                        InboxModel.status == MessageStatus.PENDING.value,
+                    )
+                    .one_or_none()
+                    is not None
+                ):
+                    # A reconnect-resume receipt intentionally moved active
+                    # authority past this ordinary FIFO item. Once that exact
+                    # resumed provider execution has settled, the old turn ID
+                    # can never activate again. Rebuild the same pending Inbox
+                    # transport with the complete suffix instead of looping on
+                    # a permanently stale FIFO head.
+                    stale_indexes.append(index)
+                    continue
+                if turn.kind not in {"assigned_result", "handoff_result"}:
                     continue
                 # Handoff batching can attach several durable results to one
                 # transport.  Detect any pending member, not only the anchor,

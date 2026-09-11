@@ -267,14 +267,14 @@ export function SettingsPanel() {
       <OperatorAccessCard access={operatorAccess} />
       {/* Effective policy and live operational utilization are read-only. */}
       <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl p-5">
-        <div className="flex items-center justify-between gap-3 mb-4">
-          <div className="flex items-center gap-2">
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-2">
             <Activity size={16} className="text-emerald-400" />
             <h3 className="text-sm font-semibold text-gray-300 uppercase tracking-wide">
               {t('settings.capacity.title')}
             </h3>
           </div>
-          <div className="flex items-center gap-2">{capacity && (
+          <div className="ml-auto flex flex-wrap items-center justify-end gap-2">{capacity && (
             <span
               aria-label={t('settings.capacity.health', { state: t(resourceStateTranslationKey(capacity.resource_state)) })}
               className={`text-xs font-semibold px-2.5 py-1 rounded-full ${

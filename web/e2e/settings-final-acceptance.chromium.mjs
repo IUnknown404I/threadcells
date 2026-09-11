@@ -47,7 +47,7 @@ const spawnProfiles = registryProfiles.map(profile => ({
   owner_authorization_required: profile.owner_authorization_required,
 }))
 const capacity = {
-  resource_state: 'GREEN', reasons: [],
+  resource_state: 'YELLOW', reasons: [],
   resident_supervisors: { active: 1, limit: 5, available: 4, certain: true },
   provider_executions: { active: 0, limit: 3, available: 3, certain: true },
   work_contexts: { active: 0, limit: 2, available: 2, certain: true },

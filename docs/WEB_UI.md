@@ -17,6 +17,8 @@ The Web UI is the operator's live view of ThreadCells. It is designed for a loop
 
 Direct URLs are supported. Browser history should preserve the selected Settings and Docs page.
 
+Settings → General lets each browser display absolute server timestamps in its detected time zone or a manually selected IANA zone. The preference stays in browser storage; it is not a server setting. Only timestamps with an explicit UTC or numeric offset are converted. Durations, calendar date-only values, and ambiguous timestamps remain unchanged.
+
 ## A normal operating loop
 
 1. Check Home for current session/workflow activity and Settings for host health, disk pressure, and available capacity.

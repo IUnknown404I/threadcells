@@ -1,17 +1,70 @@
 import { useState, useEffect } from 'react'
 import { api, AgentDirsSettings, OrchestrationCapacity, AgentProfileInfo, Project, RuntimeBranding } from '../api'
 import { useStore } from '../store'
-import { Activity, FolderOpen, Save, Plus, X, RefreshCw, CheckCircle, Maximize2, Minimize2, Upload, RotateCcw, Pencil, Star, Trash2 } from 'lucide-react'
+import { Activity, Clock3, FolderOpen, Save, Plus, X, RefreshCw, CheckCircle, Maximize2, Minimize2, Upload, RotateCcw, Pencil, Star, Trash2 } from 'lucide-react'
 import { ConfirmModal } from './ConfirmModal'
 import { OperatorAccessCard, useOperatorAccess } from './OperatorAccess'
 import { useI18n, type TranslationKey } from '../i18n'
 import { resourceStateTranslationKey } from './StatusBadge'
+import { AUTO_TIME_ZONE, formatAbsoluteTimestamp, isValidTimeZone, useTimeZone } from '../timeZone'
 
 const CAPACITY_FIELD_KEYS: Record<string, TranslationKey> = {
   max_resident_supervisors: 'settings.capacity.maxResident',
   max_provider_executions: 'settings.capacity.maxProvider',
   max_work_contexts: 'settings.capacity.maxContexts',
   max_heavy_execution_slots: 'settings.capacity.maxHeavy',
+}
+
+export function TimeZoneSettingsCard() {
+  const { locale, t } = useI18n()
+  const { preference, timeZone, browserZone, setPreference } = useTimeZone()
+  const [mode, setMode] = useState<'auto' | 'manual'>(preference === AUTO_TIME_ZONE ? 'auto' : 'manual')
+  const [draft, setDraft] = useState(preference === AUTO_TIME_ZONE ? browserZone : preference)
+  const [saved, setSaved] = useState(false)
+
+  useEffect(() => {
+    setMode(preference === AUTO_TIME_ZONE ? 'auto' : 'manual')
+    setDraft(preference === AUTO_TIME_ZONE ? browserZone : preference)
+  }, [browserZone, preference])
+
+  const manualZone = draft.trim()
+  const manualValid = isValidTimeZone(manualZone)
+  const previewZone = mode === 'auto' ? browserZone : manualValid ? manualZone : timeZone
+  const save = () => {
+    if (mode === 'manual' && !manualValid) return
+    setSaved(setPreference(mode === 'auto' ? AUTO_TIME_ZONE : manualZone))
+  }
+
+  return <section className="rounded-xl border border-gray-700/50 bg-gray-800/60 p-4 sm:p-5" aria-labelledby="time-zone-heading">
+    <div className="flex items-start gap-3">
+      <Clock3 size={17} className="mt-0.5 shrink-0 text-emerald-400" aria-hidden="true" />
+      <div className="min-w-0">
+        <h3 id="time-zone-heading" className="text-sm font-semibold uppercase tracking-wide text-gray-300">{t('settings.timeZone.title')}</h3>
+        <p className="mt-1 text-xs leading-5 text-gray-400">{t('settings.timeZone.help')}</p>
+      </div>
+    </div>
+    <div className="mt-4 grid min-w-0 gap-3 md:grid-cols-2">
+      <label className="min-w-0 text-xs text-gray-400">{t('settings.timeZone.mode')}
+        <select aria-label={t('settings.timeZone.mode')} value={mode} onChange={event => { setMode(event.target.value as 'auto' | 'manual'); setSaved(false) }} className="mt-1 min-h-11 w-full min-w-0 rounded-lg border border-gray-700 bg-gray-950 px-3 text-sm text-gray-200 focus:border-emerald-500 focus:outline-none">
+          <option value="auto">{t('settings.timeZone.auto')}</option>
+          <option value="manual">{t('settings.timeZone.manual')}</option>
+        </select>
+      </label>
+      <label className="min-w-0 text-xs text-gray-400">{t('settings.timeZone.zone')}
+        <input aria-label={t('settings.timeZone.zone')} aria-describedby="time-zone-validation" disabled={mode === 'auto'} value={draft} onChange={event => { setDraft(event.target.value); setSaved(false) }} placeholder={t('settings.timeZone.placeholder')} autoComplete="off" spellCheck={false} className="mt-1 min-h-11 w-full min-w-0 rounded-lg border border-gray-700 bg-gray-950 px-3 font-mono text-sm text-gray-200 focus:border-emerald-500 focus:outline-none disabled:cursor-not-allowed disabled:bg-gray-900 disabled:text-gray-500" />
+      </label>
+    </div>
+    <p className="mt-2 text-xs text-gray-400">{t('settings.timeZone.browser', { zone: browserZone })}</p>
+    {mode === 'manual' && !manualValid && <p id="time-zone-validation" role="alert" className="mt-2 text-xs text-red-300">{t('settings.timeZone.invalid')}</p>}
+    <div className="mt-3 rounded-lg border border-gray-700/50 bg-gray-900/60 px-3 py-2 text-xs text-gray-300">
+      <span className="text-gray-400">{t('settings.timeZone.preview')} · </span>
+      {t('settings.timeZone.previewValue', { time: formatAbsoluteTimestamp('2026-01-15T12:00:00Z', locale, previewZone), zone: previewZone })}
+    </div>
+    <div className="mt-4 flex flex-wrap items-center gap-3">
+      <button type="button" onClick={save} disabled={mode === 'manual' && !manualValid} className="inline-flex min-h-11 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-medium text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:bg-gray-700 disabled:text-gray-400"><Save size={15} aria-hidden="true" />{t('settings.timeZone.apply')}</button>
+      {saved && <span role="status" className="text-xs text-emerald-300">{t('settings.timeZone.applied')}</span>}
+    </div>
+  </section>
 }
 
 export function SettingsPanel() {
@@ -210,6 +263,7 @@ export function SettingsPanel() {
 
   return (
     <div className="space-y-6">
+      <TimeZoneSettingsCard />
       <OperatorAccessCard access={operatorAccess} />
       {/* Effective policy and live operational utilization are read-only. */}
       <div className="bg-gray-800/60 border border-gray-700/50 rounded-xl p-5">

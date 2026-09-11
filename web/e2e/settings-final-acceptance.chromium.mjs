@@ -139,6 +139,20 @@ try {
       await page.goto(`${origin}${surface.path}`)
       await page.getByRole('heading', { name: surface.heading, exact: true }).last().waitFor()
       await page.getByRole('link', { name: 'Telegram', exact: true }).waitFor()
+      if (surface.name === 'capacity') {
+        await page.getByRole('heading', { name: 'Time zone', exact: true }).waitFor()
+        assert.equal(await page.getByLabel('Time zone mode').inputValue(), 'auto')
+        await page.getByLabel('Time zone mode').selectOption('manual')
+        await page.getByLabel('IANA time zone').fill('Asia/Tokyo')
+        await page.getByRole('button', { name: 'Apply time zone' }).click()
+        await page.getByRole('status').filter({ hasText: 'Saved in this browser.' }).waitFor()
+        assert.equal(await page.evaluate(() => localStorage.getItem('threadcells.app.timeZone')), 'Asia/Tokyo')
+        assert.match(await page.getByText(/Asia\/Tokyo/).textContent(), /9:00\sPM/i)
+        await page.reload()
+        await page.getByRole('heading', { name: 'Time zone', exact: true }).waitFor()
+        assert.equal(await page.getByLabel('Time zone mode').inputValue(), 'manual')
+        assert.equal(await page.getByLabel('IANA time zone').inputValue(), 'Asia/Tokyo')
+      }
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)
       assert(overflow <= 0, `${surface.name} horizontal overflow at ${viewport.width}px: ${overflow}`)
       assert.equal(await page.getByRole('link', { name: 'Telegram', exact: true }).count(), 1)
@@ -192,7 +206,7 @@ try {
     assert.equal(await page.getByText('OWNER ONLY — exceptional direct critical architecture and implementation.', { exact: true }).count(), 1)
     await context.close()
   }
-  console.log(JSON.stringify({ evidenceDir, profileCount: profileIds.length, viewports, evidence, assertions: ['current Capacity and Telegram navigation', 'registry and Spawn inventory', 'operator-owned XHigh copy', 'Profiles keyboard access', 'Housekeeping human labels and structured report', 'Housekeeping disabled reason and safe retirement warning', 'About identity', 'touch navigation', 'WCAG-AA operational helper colors', 'no horizontal overflow'] }))
+  console.log(JSON.stringify({ evidenceDir, profileCount: profileIds.length, viewports, evidence, assertions: ['current Capacity and Telegram navigation', 'browser-local time zone Auto/manual preference and reload', 'registry and Spawn inventory', 'operator-owned XHigh copy', 'Profiles keyboard access', 'Housekeeping human labels and structured report', 'Housekeeping disabled reason and safe retirement warning', 'About identity', 'touch navigation', 'WCAG-AA operational helper colors', 'no horizontal overflow'] }))
 } finally {
   await browser?.close()
   await new Promise(resolve => server.close(resolve))

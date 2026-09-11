@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { AlertTriangle, ArrowRight, ChevronDown, ChevronUp, CircleCheck, History as HistoryIcon, ListTodo, Loader2, RefreshCw, X } from 'lucide-react'
 import { api, type DelegationResult, type InteractionItem, type InteractionMode } from '../api'
-import { useI18n, type AppLocale, type TranslationKey } from '../i18n'
+import { useI18n, type TranslationKey } from '../i18n'
 import { sessionDisplayName } from '../sessionDisplayName'
+import { formatAbsoluteTimestamp, useTimeZone } from '../timeZone'
 
 type InteractionHistoryDrawerProps = {
   sessionId: string
@@ -121,13 +122,6 @@ function translatedValue(value: string | null, keys: Record<string, TranslationK
   return keys[value] ? t(keys[value]) : value.replace(/_/g, ' ')
 }
 
-function formatTimestamp(value: string | null, locale: AppLocale) {
-  if (!value) return '—'
-  const parsed = new Date(value)
-  if (Number.isNaN(parsed.getTime())) return value
-  return new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeStyle: 'short' }).format(parsed)
-}
-
 function itemTone(item: InteractionItem) {
   const state = item.final_disposition || item.queue.state || ''
   if (state.includes('failed') || state === 'cancelled') return 'border-red-800/60 bg-red-950/10'
@@ -162,6 +156,7 @@ function InteractionCard({
   onToggle: () => void
 }) {
   const { locale, t } = useI18n()
+  const { timeZone } = useTimeZone()
   const state = item.current
     ? translatedValue(item.queue.state, STATE_KEYS, t)
     : translatedValue(item.final_disposition, DISPOSITION_KEYS, t)
@@ -181,7 +176,7 @@ function InteractionCard({
           <span className="text-xs font-semibold text-gray-100">{t(TYPE_KEYS[item.interaction_type])}</span>
           <span className="max-w-full truncate text-[11px] text-gray-400">{translatedValue(item.task_type, TASK_KEYS, t)}</span>
         </div>
-        <p className="mt-1 text-[11px] text-gray-500">{formatTimestamp(item.created_at, locale)}</p>
+        <p className="mt-1 text-[11px] text-gray-500">{formatAbsoluteTimestamp(item.created_at, locale, timeZone)}</p>
       </div>
       {state && <span className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-medium ${statusTone(item)}`}>{state}</span>}
     </div>

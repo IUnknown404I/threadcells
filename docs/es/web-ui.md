@@ -1,7 +1,7 @@
 ---
 slug: web-ui
 source: docs/WEB_UI.md
-source_sha256: sha256:dc45952406ae34d9be16d78c4e5b4a6f73d8862fe8b5fe6a557528cecaf45928
+source_sha256: sha256:44f2268614b3be15c7e01062819795ffcd7f44e5793dbd28a4739f4c876c17da
 ---
 
 # Uso de la Web UI
@@ -22,6 +22,8 @@ La Web UI es la vista en vivo del operador sobre ThreadCells. Está diseñada pa
 - **Add Agent** inicia otro terminal dentro de la vida útil exacta de la sesión seleccionada; no se une a otra sesión histórica que por casualidad tenga el mismo nombre.
 
 Se admiten URL directas. El historial del navegador debe conservar la página seleccionada de Settings y Docs.
+
+Settings → General permite que cada navegador muestre las marcas de tiempo absolutas del servidor en la zona horaria detectada o en una zona IANA seleccionada manualmente. La preferencia permanece en el almacenamiento del navegador; no es una configuración del servidor. Solo se convierten las marcas con UTC o desplazamiento numérico explícito. Las duraciones, las fechas de calendario sin hora y las marcas de tiempo ambiguas no cambian.
 
 ## Un ciclo operativo normal
 

@@ -19059,20 +19059,75 @@ def reconcile_result_callbacks_superseded_by_resume(
                 )
                 .one_or_none()
             )
-            settled_reconnect_attempt = (
-                db.query(WorkflowProviderReconnectAttemptModel.id)
-                .filter(
-                    WorkflowProviderReconnectAttemptModel.workflow_id == workflow.id,
-                    WorkflowProviderReconnectAttemptModel.root_terminal_id
-                    == workflow.root_terminal_id,
-                    WorkflowProviderReconnectAttemptModel.workflow_turn_id
-                    == active.resume_parent_turn_id,
-                    WorkflowProviderReconnectAttemptModel.state == PROVIDER_RECONNECT_SUCCEEDED,
-                    WorkflowProviderReconnectAttemptModel.outcome_code == "runtime_ready",
-                    WorkflowProviderReconnectAttemptModel.finished_at.is_not(None),
+            # A reconnect-authored resume can itself be resumed one or more
+            # times after compaction. Prove that ancestry through the exact
+            # receipt transfer chain instead of trusting a generic
+            # ``execution-resume:*`` row to assert reconnect provenance.
+            reconnect_resume_ancestor = None
+            lineage = active
+            lineage_receipt = active_receipt
+            lineage_seen: set[int] = set()
+            while lineage is not None and lineage_receipt is not None:
+                lineage_id = int(lineage.id)
+                if lineage_id in lineage_seen or lineage.workflow_id != workflow.id:
+                    break
+                lineage_seen.add(lineage_id)
+                if (
+                    lineage.kind == "execution_resume"
+                    and lineage.resume_parent_turn_id is not None
+                    and lineage.dedupe_key
+                    == f"provider-reconnect-execution:{int(lineage.resume_parent_turn_id)}"
+                ):
+                    reconnect_resume_ancestor = lineage
+                    break
+                parent_id = lineage.resume_parent_turn_id
+                if (
+                    lineage.kind != "execution_resume"
+                    or parent_id is None
+                    or int(parent_id) >= lineage_id
+                    or lineage.dedupe_key != f"execution-resume:{int(parent_id)}"
+                ):
+                    break
+                parent = db.get(WorkflowTurnModel, int(parent_id))
+                parent_receipt = (
+                    db.query(WorkflowTurnReceiptModel)
+                    .filter_by(
+                        workflow_turn_id=parent_id,
+                        receiver_terminal_id=workflow.root_terminal_id,
+                    )
+                    .one_or_none()
                 )
-                .first()
-            )
+                if (
+                    parent is None
+                    or parent.workflow_id != workflow.id
+                    or parent.state != TURN_FINISHED
+                    or parent_receipt is None
+                    or parent_receipt.resumed_by_turn_id != lineage_id
+                    or parent_receipt.resumed_at is None
+                ):
+                    break
+                lineage = parent
+                lineage_receipt = parent_receipt
+
+            settled_reconnect_attempt = None
+            if (
+                reconnect_resume_ancestor is not None
+                and reconnect_resume_ancestor.resume_parent_turn_id is not None
+            ):
+                settled_reconnect_attempt = (
+                    db.query(WorkflowProviderReconnectAttemptModel.id)
+                    .filter(
+                        WorkflowProviderReconnectAttemptModel.workflow_id == workflow.id,
+                        WorkflowProviderReconnectAttemptModel.root_terminal_id
+                        == workflow.root_terminal_id,
+                        WorkflowProviderReconnectAttemptModel.workflow_turn_id
+                        == reconnect_resume_ancestor.resume_parent_turn_id,
+                        WorkflowProviderReconnectAttemptModel.state == PROVIDER_RECONNECT_SUCCEEDED,
+                        WorkflowProviderReconnectAttemptModel.outcome_code == "runtime_ready",
+                        WorkflowProviderReconnectAttemptModel.finished_at.is_not(None),
+                    )
+                    .first()
+                )
             active_recovery = (
                 db.query(RecoveryTakeoverModel.id)
                 .filter(
@@ -19088,7 +19143,6 @@ def reconcile_result_callbacks_superseded_by_resume(
                 int(active.id) == int(resume_turn.id)
                 and active.kind == "execution_resume"
                 and active.state == TURN_SENT
-                and active.dedupe_key.startswith("provider-reconnect-execution:")
                 and active.resume_parent_turn_id is not None
                 and active.provider_processing_observed_at is not None
                 and active.provider_ready_observed_at is None

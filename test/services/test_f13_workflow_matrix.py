@@ -2435,10 +2435,11 @@ def test_f13_resume_reconciles_older_result_callbacks_before_composer_once(
         assert db.query(database.DelegationResultModel).count() == 3
 
 
-def test_f13_reconnect_resume_reconciles_older_inbox_before_later_result_and_composer(
-    workflow_db, monkeypatch
+@pytest.mark.parametrize("additional_resumes", (0, 1))
+def test_f13_reconnect_resume_chain_reconciles_older_inbox_before_later_fifo(
+    workflow_db, monkeypatch, additional_resumes
 ):
-    """A settled reconnect cannot leave an older ordinary Inbox head behind it."""
+    """A reconnect-derived resume chain cannot strand an older Inbox head."""
     parent = "parent-reconnect-older-inbox-fifo"
     child = "child-reconnect-later-result"
     interrupted_turn = _start_admitted_input(parent)
@@ -2449,24 +2450,34 @@ def test_f13_reconnect_resume_reconciles_older_inbox_before_later_result_and_com
 
     with database.SessionLocal() as db:
         workflow = db.query(WorkflowModel).filter_by(root_terminal_id=parent).one()
-        resume_turn = workflow.active_turn_id
-        resumed = db.get(WorkflowTurnModel, resume_turn)
+        reconnect_turn = workflow.active_turn_id
+        resumed = db.get(WorkflowTurnModel, reconnect_turn)
         assert resumed.kind == "execution_resume"
         assert resumed.resume_parent_turn_id == interrupted_turn
-        assert ordinary_turn < resume_turn
+        assert ordinary_turn < reconnect_turn
 
     resume_claim = claim_workflow_turn(parent)
-    assert resume_claim is not None and resume_claim["id"] == resume_turn
-    assert activate_workflow_turn(parent, resume_turn)
+    assert resume_claim is not None and resume_claim["id"] == reconnect_turn
+    assert activate_workflow_turn(parent, reconnect_turn)
     assert mark_workflow_turn_sent(
-        resume_turn,
+        reconnect_turn,
         resume_claim["claim_token"],
         resume_claim["claim_generation"],
     )
-    assert database.acquire_provider_execution(parent, resume_turn, 3)
-    resume_receipt = claim_or_resume_workflow_turn_receipt(parent, resume_turn)
+    assert database.acquire_provider_execution(parent, reconnect_turn, 3)
+    resume_receipt = claim_or_resume_workflow_turn_receipt(parent, reconnect_turn)
     assert resume_receipt["accepted"] is True and resume_receipt["resumed"] is True
     assert observe_workflow_processing(parent)
+    resume_turn = reconnect_turn
+    for _ in range(additional_resumes):
+        resume_receipt = claim_or_resume_workflow_turn_receipt(
+            parent,
+            resume_turn,
+            resume_token=resume_receipt["resume_token"],
+        )
+        assert resume_receipt["accepted"] is True and resume_receipt["resumed"] is True
+        resume_turn = resume_receipt["logical_turn_id"]
+    assert reconnect_turn <= resume_turn
 
     assert register_child_assignment(parent, child)
     notice, duplicate = create_child_assignment_result_message(

@@ -94,7 +94,31 @@ try {
   assert.equal(await reducedPage.locator('.mesh-stage').getAttribute('data-phase'), initialPhase, 'reduced motion keeps a stable mesh frame')
   assert.equal(await reducedPage.evaluate(() => getComputedStyle(document.documentElement).scrollBehavior), 'auto', 'reduced motion disables smooth scroll')
   await reduced.close()
-  console.log(JSON.stringify({ basePath, evidenceDir, results, lightbox: true, docs: true, reducedMotion: true }))
+
+  const consentContext = await browser.newContext({ viewport: { width: 1440, height: 960 } })
+  const consentPage = await consentContext.newPage()
+  let analyticsRequests = 0
+  await consentPage.route('https://www.googletagmanager.com/gtag/js?id=G-WWBZSZ4N7T', async route => {
+    analyticsRequests += 1
+    await route.fulfill({ status: 200, contentType: 'application/javascript', body: '' })
+  })
+  await consentPage.goto(server.origin, { waitUntil: 'networkidle' })
+  assert.equal(analyticsRequests, 0, 'analytics is not requested before consent')
+  assert.equal(await consentPage.locator('script[data-threadcells-analytics]').count(), 0, 'no GA script exists before consent')
+  await consentPage.getByRole('button', { name: 'Decline' }).click()
+  await consentPage.reload({ waitUntil: 'networkidle' })
+  assert.equal(analyticsRequests, 0, 'declined analytics remains unloaded after reload')
+  await consentPage.getByRole('button', { name: 'Privacy & analytics settings' }).click()
+  const privacyDialog = consentPage.getByRole('dialog', { name: 'Your analytics choice' })
+  await privacyDialog.waitFor({ state: 'visible' })
+  await privacyDialog.getByRole('button', { name: 'Allow analytics' }).click()
+  await consentPage.waitForFunction(() => document.querySelectorAll('script[data-threadcells-analytics="G-WWBZSZ4N7T"]').length === 1)
+  assert.equal(analyticsRequests, 1, 'allowing analytics loads the exact GA4 tag once')
+  await consentPage.getByRole('button', { name: 'Privacy & analytics settings' }).click()
+  await privacyDialog.getByRole('button', { name: 'Allow analytics' }).click()
+  assert.equal(await consentPage.locator('script[data-threadcells-analytics="G-WWBZSZ4N7T"]').count(), 1, 'settings cannot duplicate the GA4 page view tag')
+  await consentContext.close()
+  console.log(JSON.stringify({ basePath, evidenceDir, results, lightbox: true, docs: true, reducedMotion: true, analyticsConsent: true }))
 } finally {
   await browser?.close()
   await server.close()

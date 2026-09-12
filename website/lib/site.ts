@@ -16,6 +16,10 @@ const optionalUrl = (name: 'SITE_URL') => {
 const configuredBasePath = process.env.NEXT_PUBLIC_BASE_PATH?.trim() || ''
 export const basePath = configuredBasePath === '/' ? '' : trimTrailingSlash(configuredBasePath)
 
+// This is a public Search Console token, not a credential. It remains unset
+// until the site owner supplies the verification value for this property.
+export const googleSiteVerification = process.env.GOOGLE_SITE_VERIFICATION?.trim() || null
+
 export const assetPath = (path: string) => `${basePath}${path.startsWith('/') ? path : `/${path}`}`
 
 export const publicRepositoryUrl = 'https://github.com/IUnknown404I/threadcells'

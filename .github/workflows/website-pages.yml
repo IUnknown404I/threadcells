@@ -42,8 +42,6 @@ jobs:
         env:
           SITE_URL: ${{ steps.pages.outputs.base_url }}
           NEXT_PUBLIC_BASE_PATH: ${{ steps.pages.outputs.base_path }}
-          GOOGLE_SITE_VERIFICATION: ${{ vars.GOOGLE_SITE_VERIFICATION }}
-          GOOGLE_SITE_VERIFICATION_FILE: ${{ vars.GOOGLE_SITE_VERIFICATION_FILE }}
         run: npm run check
 
       - name: Upload static Pages artifact

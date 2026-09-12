@@ -16,9 +16,8 @@ const optionalUrl = (name: 'SITE_URL') => {
 const configuredBasePath = process.env.NEXT_PUBLIC_BASE_PATH?.trim() || ''
 export const basePath = configuredBasePath === '/' ? '' : trimTrailingSlash(configuredBasePath)
 
-// This is a public Search Console token, not a credential. It remains unset
-// until the site owner supplies the verification value for this property.
-export const googleSiteVerification = process.env.GOOGLE_SITE_VERIFICATION?.trim() || null
+// Public Search Console verification for the canonical Pages property.
+export const googleSiteVerification = 'AWUVlfzo2OLGNrlvn0Ji59Lsn5bqA0Moh6lrtiS6zkc'
 
 export const assetPath = (path: string) => `${basePath}${path.startsWith('/') ? path : `/${path}`}`
 

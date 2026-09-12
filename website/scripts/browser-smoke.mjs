@@ -6,6 +6,9 @@ import { startStaticServer } from './static-server.mjs'
 
 const basePath = process.env.BASE_PATH ?? process.env.NEXT_PUBLIC_BASE_PATH ?? ''
 const evidenceDir = process.env.WEBSITE_EVIDENCE_DIR || '/tmp/threadcells-website-evidence'
+const verificationFile = 'googlee9d638a5abf39da9.html'
+const verificationBody = `google-site-verification: ${verificationFile}`
+const verificationToken = 'AWUVlfzo2OLGNrlvn0Ji59Lsn5bqA0Moh6lrtiS6zkc'
 await mkdir(evidenceDir, { recursive: true })
 const server = await startStaticServer({ basePath })
 let browser
@@ -21,7 +24,35 @@ async function assertPage(page, route, viewportName) {
 }
 
 try {
-  browser = await chromium.launch({ headless: true })
+  browser = await chromium.launch({ headless: true, args: ['--host-resolver-rules=MAP threadcells.test 127.0.0.1'] })
+  const verificationUrl = `${server.origin}/${verificationFile}`
+  const verificationResponse = await fetch(verificationUrl, { redirect: 'manual' })
+  assert.equal(verificationResponse.status, 200, 'Google verification file returns 200')
+  assert.equal(verificationResponse.redirected, false, 'Google verification file does not redirect')
+  assert.equal(verificationResponse.url, verificationUrl, 'Google verification file keeps the exact URL')
+  assert.equal(await verificationResponse.text(), verificationBody, 'Google verification file has the exact issued body')
+
+  const discoveryContext = await browser.newContext({ viewport: { width: 1440, height: 960 } })
+  const discoveryPage = await discoveryContext.newPage()
+  const landingResponse = await discoveryPage.goto(server.origin, { waitUntil: 'networkidle' })
+  assert.equal(landingResponse?.status(), 200, 'landing page returns 200')
+  assert.equal(await discoveryPage.locator(`meta[name="google-site-verification"][content="${verificationToken}"]`).count(), 1, 'landing head has the exact Google verification meta tag')
+  assert.equal(await discoveryPage.locator('meta[name="robots"][content*="noindex" i]').count(), 0, 'landing page is not marked noindex')
+  assert.equal(await discoveryPage.locator('link[rel="canonical"]').count(), 1, 'landing page has one canonical URL')
+  const canonical = await discoveryPage.locator('link[rel="canonical"]').getAttribute('href')
+  assert.equal(new URL(canonical).href, 'https://iunknown404i.github.io/threadcells/', 'landing canonical is the public Pages URL')
+  const sitemapResponse = await fetch(`${server.origin}/sitemap.xml`)
+  assert.equal(sitemapResponse.status, 200, 'sitemap returns 200')
+  const sitemap = await sitemapResponse.text()
+  const sitemapUrls = [...sitemap.matchAll(/<loc>([^<]+)<\/loc>/g)].map(match => match[1])
+  assert(sitemapUrls.length > 1, 'sitemap contains public routes')
+  for (const value of sitemapUrls) {
+    const url = new URL(value)
+    assert.equal(url.origin, 'https://iunknown404i.github.io', `sitemap URL uses public origin: ${value}`)
+    assert(url.pathname.startsWith('/threadcells'), `sitemap URL uses Pages base path: ${value}`)
+  }
+  await discoveryContext.close()
+
   const results = []
   for (const viewport of [
     { name: 'mobile', width: 390, height: 844 },
@@ -95,6 +126,7 @@ try {
   assert.equal(await reducedPage.evaluate(() => getComputedStyle(document.documentElement).scrollBehavior), 'auto', 'reduced motion disables smooth scroll')
   await reduced.close()
 
+  const analyticsOrigin = server.origin.replace('127.0.0.1', 'threadcells.test')
   const consentContext = await browser.newContext({ viewport: { width: 1440, height: 960 } })
   const consentPage = await consentContext.newPage()
   let analyticsRequests = 0
@@ -102,7 +134,7 @@ try {
     analyticsRequests += 1
     await route.fulfill({ status: 200, contentType: 'application/javascript', body: '' })
   })
-  await consentPage.goto(server.origin, { waitUntil: 'networkidle' })
+  await consentPage.goto(analyticsOrigin, { waitUntil: 'networkidle' })
   assert.equal(analyticsRequests, 0, 'analytics is not requested before consent')
   assert.equal(await consentPage.locator('script[data-threadcells-analytics]').count(), 0, 'no GA script exists before consent')
   await consentPage.getByRole('button', { name: 'Decline' }).click()
@@ -118,8 +150,30 @@ try {
   await privacyDialog.getByRole('button', { name: 'Allow analytics' }).click()
   assert.equal(await consentPage.locator('script[data-threadcells-analytics="G-WWBZSZ4N7T"]').count(), 1, 'settings cannot duplicate the GA4 page view tag')
   assert.equal(await consentPage.evaluate(() => window.dataLayer?.filter(event => Array.isArray(event) && event[0] === 'config' && event[1] === 'G-WWBZSZ4N7T').length), 1, 'the local guard permits one GA4 config/page_view per page')
+  assert.equal(await consentPage.evaluate(() => localStorage.getItem('threadcells.analytics-consent.v1')), 'accepted', 'accepted analytics choice persists')
+  await consentPage.reload({ waitUntil: 'networkidle' })
+  assert.equal(analyticsRequests, 2, 'persisted allow loads GA4 once on the next page view')
+  assert.equal(await consentPage.evaluate(() => window.dataLayer?.filter(event => Array.isArray(event) && event[0] === 'config' && event[1] === 'G-WWBZSZ4N7T').length), 1, 'each page lifecycle emits exactly one GA4 config/page_view')
+  await consentPage.getByRole('button', { name: 'Privacy & analytics settings' }).click()
+  await privacyDialog.waitFor({ state: 'visible' })
+  await privacyDialog.getByRole('button', { name: 'Decline analytics' }).click()
+  await consentPage.reload({ waitUntil: 'networkidle' })
+  assert.equal(analyticsRequests, 2, 'persisted decline prevents GA4 on the next page view')
   await consentContext.close()
-  console.log(JSON.stringify({ basePath, evidenceDir, results, lightbox: true, docs: true, reducedMotion: true, analyticsConsent: true }))
+
+  const localhostContext = await browser.newContext({ viewport: { width: 1440, height: 960 } })
+  const localhostPage = await localhostContext.newPage()
+  let localhostAnalyticsRequests = 0
+  await localhostPage.route('https://www.googletagmanager.com/**', async route => {
+    localhostAnalyticsRequests += 1
+    await route.abort()
+  })
+  await localhostPage.goto(server.origin, { waitUntil: 'networkidle' })
+  await localhostPage.getByRole('button', { name: 'Allow analytics' }).click()
+  assert.equal(localhostAnalyticsRequests, 0, 'localhost guard prevents Google Analytics requests after allow')
+  assert.equal(await localhostPage.locator('script[data-threadcells-analytics]').count(), 0, 'localhost guard prevents GA script injection')
+  await localhostContext.close()
+  console.log(JSON.stringify({ basePath, evidenceDir, results, lightbox: true, docs: true, reducedMotion: true, discovery: true, analyticsConsent: true, localhostGuard: true }))
 } finally {
   await browser?.close()
   await server.close()

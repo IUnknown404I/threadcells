@@ -32,7 +32,9 @@ function subscribeToConsent(onChange: () => void) {
 }
 
 function startAnalytics() {
-  if (!isProduction() || window.__threadcellsAnalyticsStarted) return
+  const hostname = window.location.hostname
+  const isLoopback = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1'
+  if (!isProduction() || isLoopback || window.__threadcellsAnalyticsStarted) return
   window.__threadcellsAnalyticsStarted = true
   window.dataLayer = window.dataLayer || []
   window.gtag = (...args: unknown[]) => { window.dataLayer?.push(args) }

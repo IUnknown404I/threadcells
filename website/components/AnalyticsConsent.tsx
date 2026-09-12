@@ -50,6 +50,10 @@ function subscribeToConsent(onChange: () => void) {
   return () => window.removeEventListener('storage', onChange)
 }
 
+function subscribeToLocation() {
+  return () => undefined
+}
+
 function startAnalytics(consent: Consent) {
   if (!analyticsIsAllowedHere() || window.__threadcellsAnalyticsStarted) return
   window.__threadcellsAnalyticsStarted = true
@@ -88,13 +92,28 @@ export function AnalyticsConsent() {
     return readConsent()
   }, [consentVersion])
   const consent = useSyncExternalStore(subscribeToConsent, currentConsent, () => null)
-  const copy = analyticsCopy[localeForPathname(typeof window === 'undefined' ? '/' : window.location.pathname)]
+  const locale = useSyncExternalStore(
+    subscribeToLocation,
+    () => localeForPathname(window.location.pathname),
+    () => 'en' as Locale,
+  )
+  const copy = analyticsCopy[locale]
 
   useEffect(() => {
-    startAnalytics(consent)
+    // Static localized HTML is post-processed after export. Keep React's root
+    // document authority aligned after hydration as well.
+    document.documentElement.lang = locale
+  }, [locale])
+
+  useEffect(() => {
+    // The server snapshot is deliberately null. Re-read the client authority
+    // before the one guarded config call so a saved Allow is granted before
+    // config instead of being downgraded to the hydration default.
+    const effectiveConsent = readConsent()
+    startAnalytics(effectiveConsent)
     if (window.gtag) {
       window.gtag('consent', 'update', {
-        analytics_storage: consent === 'accepted' ? 'granted' : 'denied',
+        analytics_storage: effectiveConsent === 'accepted' ? 'granted' : 'denied',
         ad_storage: 'denied',
         ad_user_data: 'denied',
         ad_personalization: 'denied',

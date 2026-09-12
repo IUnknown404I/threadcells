@@ -861,7 +861,7 @@ export function AgentPanel({
         onCancel={() => { setPendingDeleteSession(null); setDeletePreflight(null) }}
       />
 
-      {/* Graceful Exit Confirmation Modal */}
+      {/* Finish confirmation modal */}
       <ConfirmModal
         open={!!pendingExit}
         title={t('agents.gracefulExit')}

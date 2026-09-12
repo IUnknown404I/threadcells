@@ -716,7 +716,7 @@ describe('session creation and canonical ordering', () => {
       expect(within(card).getByTitle('Inbox')).toBeInTheDocument()
       expect(within(card).getByTitle('Output')).toBeInTheDocument()
       expect(within(card).getByRole('button', { name: 'Terminal' })).toBeInTheDocument()
-      expect(within(card).getByTitle('Graceful Exit')).toBeInTheDocument()
+      expect(within(card).getByTitle('Finish')).toBeInTheDocument()
       expect(within(card).getByTitle('Gracefully exit this terminal before deleting it')).toBeDisabled()
     }
 
@@ -997,7 +997,7 @@ describe('session creation and canonical ordering', () => {
     expect(addAgent).toBeDisabled()
     expect(addAgent).toHaveAttribute('title', 'A retired workspace cannot accept agents, tasks, or terminal input')
     const agent = await screen.findByTestId(`agent-detail-card-${terminal.id}`)
-    expect(within(agent).getByRole('button', { name: 'Open Terminal' })).toBeDisabled()
+    expect(within(agent).getByRole('button', { name: 'Terminal' })).toBeDisabled()
     const inbox = within(agent).getByRole('button', { name: 'Inbox' })
     expect(inbox).not.toBeDisabled()
     expect(within(agent).getByRole('button', { name: 'Output' })).not.toBeDisabled()
@@ -1280,11 +1280,11 @@ describe('graceful exit authority feedback', () => {
     render(<AgentPanel />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand exit' }))
-    fireEvent.click(await screen.findByTitle('Graceful exit'))
+    fireEvent.click(await screen.findByTitle('Finish terminal'))
     fireEvent.click(screen.getByRole('button', { name: 'Send Exit' }))
 
     await waitFor(() => expect(useStore.getState().snackbar?.message).toBe(pending.message))
-    expect(screen.getByRole('heading', { name: 'Graceful Exit' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Finish' })).toBeInTheDocument()
   })
 
   it('keeps DashboardHome confirmation open when exit is not confirmed', async () => {
@@ -1292,11 +1292,11 @@ describe('graceful exit authority feedback', () => {
     render(<DashboardHome onNavigate={() => {}} />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand exit' }))
-    fireEvent.click(await screen.findByTitle('Graceful Exit'))
+    fireEvent.click(await screen.findByTitle('Finish'))
     fireEvent.click(screen.getByRole('button', { name: 'Send Exit' }))
 
     await waitFor(() => expect(useStore.getState().snackbar?.message).toBe(pending.message))
-    expect(screen.getByRole('heading', { name: 'Graceful Exit' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Finish' })).toBeInTheDocument()
   })
 
   it('does not offer another exit for recovery-fenced takeover history on Home', async () => {
@@ -1309,7 +1309,7 @@ describe('graceful exit authority feedback', () => {
     render(<DashboardHome onNavigate={() => {}} />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand exit' }))
-    const exitAction = await screen.findByTitle('Graceful Exit')
+    const exitAction = await screen.findByTitle('Finish')
 
     expect(exitAction).toBeDisabled()
     expect(screen.getAllByText('Replaced during recovery').length).toBeGreaterThan(0)

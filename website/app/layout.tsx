@@ -1,7 +1,8 @@
 import type { Metadata, Viewport } from 'next'
 import { GeistMono } from 'geist/font/mono'
 import { GeistSans } from 'geist/font/sans'
-import { absoluteAssetUrl, assetPath, site } from '@/lib/site'
+import { absoluteAssetUrl, assetPath, googleSiteVerification, site } from '@/lib/site'
+import { AnalyticsConsent } from '@/components/AnalyticsConsent'
 import './globals.css'
 
 const socialImage = absoluteAssetUrl('/media/threadcells-social.png')
@@ -51,6 +52,7 @@ export const metadata: Metadata = {
   },
   manifest: assetPath('/site.webmanifest'),
   robots: { index: true, follow: true },
+  ...(googleSiteVerification ? { verification: { google: googleSiteVerification } } : {}),
 }
 
 export const viewport: Viewport = {
@@ -63,7 +65,7 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en" className={`${GeistSans.variable} ${GeistMono.variable}`}>
-      <body>{children}</body>
+      <body>{children}<AnalyticsConsent /></body>
     </html>
   )
 }

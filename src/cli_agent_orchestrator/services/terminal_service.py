@@ -69,6 +69,7 @@ from cli_agent_orchestrator.clients.database import (
     list_all_terminals,
     list_exited_terminal_provider_execution_candidates,
     mark_handoff_child_input_received,
+    mark_managed_attempt_prompt_delivered,
     mark_recovery_takeover_completed,
     mark_recovery_takeover_dispatch_uncertain,
     mark_terminal_runtime_exited,
@@ -3368,6 +3369,12 @@ def send_input(
             else:
                 transport()
             transport_accepted = True
+            if logical_turn_id is not None:
+                # This relation-level receipt is deliberately adjacent to the
+                # irreversible paste. Workflow ``sent`` remains the generic
+                # transport receipt; managed attempts additionally expose the
+                # delivery/admission distinction required by recovery.
+                mark_managed_attempt_prompt_delivered(terminal_id, logical_turn_id)
         finally:
             receipted_execution = bool(
                 logical_turn_id is not None

@@ -36,6 +36,7 @@ const WAIT_KEYS: Record<string, TranslationKey> = {
   current_provider_turn: 'interactions.wait.providerTurn',
   provider_capacity: 'interactions.wait.providerCapacity',
   reconnect: 'interactions.wait.reconnect',
+  recovery: 'interactions.wait.reconnect',
   child_result: 'interactions.wait.childResult',
   owner_gate: 'interactions.wait.ownerGate',
   delivery: 'interactions.wait.delivery',
@@ -74,6 +75,15 @@ const STATE_KEYS: Record<string, TranslationKey> = {
   admitted: 'interactions.state.admitted',
   dispatching: 'interactions.state.dispatching',
   fenced: 'interactions.state.fenced',
+  assignment_created: 'interactions.state.assignmentCreated',
+  prompt_delivery_scheduled: 'interactions.state.promptDeliveryScheduled',
+  prompt_delivery_acknowledged: 'interactions.state.promptDeliveryAcknowledged',
+  provider_admitted: 'interactions.state.providerAdmitted',
+  provider_running: 'interactions.state.providerRunning',
+  waiting_for_result: 'interactions.state.waitingForResult',
+  recovery_scheduled: 'interactions.state.recoveryScheduled',
+  fence_pending: 'interactions.state.fencePending',
+  fence_claimed: 'interactions.state.fenceClaimed',
   recovery_required: 'interactions.state.recoveryRequired',
   awaiting_result: 'interactions.state.awaitingResult',
   handoff_awaiting_result: 'interactions.state.awaitingResult',
@@ -163,8 +173,18 @@ function InteractionCard({
       || translatedValue(item.queue.state, STATE_KEYS, t)
   const source = translatedValue(item.source.kind, SOURCE_KEYS, t)
   const wait = translatedValue(item.queue.wait_reason, WAIT_KEYS, t)
+  const attempt = item.attempt || {
+    state: null,
+    reason_code: null,
+    delivery_attempt_count: 0,
+    recovery_attempt_count: 0,
+    next_retry_at: null,
+    deadline_at: null,
+    prompt_delivery_acknowledged: false,
+    provider_admitted: false,
+  }
   const hasDetails = Boolean(
-    item.input_preview || item.workflow.id || item.result.id || item.delivery.status || item.diagnostics.durable_id,
+    item.input_preview || item.workflow.id || item.result.id || item.delivery.status || attempt.state || item.diagnostics.durable_id,
   )
   const resultState = translatedValue(item.result.status, STATE_KEYS, t) || item.result.status
   const deliveryState = translatedValue(item.delivery.status, STATE_KEYS, t) || item.delivery.status
@@ -204,6 +224,14 @@ function InteractionCard({
         </div>
         {item.workflow.reason && <p className="mt-1 text-amber-200">{item.workflow.reason}</p>}
         {item.workflow.provider_outcome_code && <p className="mt-1 text-gray-400">{t('interactions.providerOutcome')} · {item.workflow.provider_outcome_code}</p>}
+      </div>}
+      {attempt.state && <div>
+        <p className="mb-1 text-[10px] uppercase tracking-wide text-gray-500">{t('interactions.attemptLifecycle')}</p>
+        <p className="text-gray-300">{translatedValue(attempt.state, STATE_KEYS, t)}</p>
+        {attempt.recovery_attempt_count > 0 && <p className="mt-1 text-amber-200">{t('interactions.recoveryAttempt', { count: attempt.recovery_attempt_count })}</p>}
+        {attempt.next_retry_at && <p className="mt-1 text-gray-400">{t('interactions.nextRetry')} · {formatAbsoluteTimestamp(attempt.next_retry_at, locale, timeZone)}</p>}
+        {attempt.deadline_at && <p className="mt-1 text-gray-400">{t('interactions.deadline')} · {formatAbsoluteTimestamp(attempt.deadline_at, locale, timeZone)}</p>}
+        {attempt.reason_code && <p className="mt-1 break-words font-mono text-amber-200">{attempt.reason_code}</p>}
       </div>}
       <div>
         <p className="mb-1 text-[10px] uppercase tracking-wide text-gray-500">{t('interactions.canonicalResult')}</p>

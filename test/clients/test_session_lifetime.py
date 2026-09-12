@@ -181,6 +181,8 @@ def test_existing_receipt_schema_adds_replayable_retained_resources(monkeypatch)
     assert resolved is not None
     assert resolved["deleted"] is True
     assert resolved["retained_resources"] == []
+    assert resolved["workspace_disposition"] == "retired"
+    assert len(resolved["workspace_evidence_sha256"]) == 64
     with engine.connect() as connection:
         columns = {
             row[1]
@@ -203,12 +205,17 @@ def test_existing_receipt_schema_adds_replayable_retained_resources(monkeypatch)
         "deletion_reason",
         "authority_fingerprint",
         "terminal_fences_json",
+        "workspace_disposition",
+        "workspace_evidence_json",
         "receipt_version",
     }.issubset(columns)
     assert operation_tables == 1
     assert {
         "workspace_authority_json",
         "workspace_authority_sha256",
+        "workspace_disposition",
+        "workspace_evidence_json",
+        "workspace_evidence_sha256",
     }.issubset(operation_columns)
     with database.SessionLocal() as db:
         receipt = db.get(SessionDeletionReceiptModel, "legacy-receipt")

@@ -2,6 +2,7 @@
 
 import asyncio
 import fcntl
+import hashlib
 import hmac
 import json
 import logging
@@ -43,17 +44,22 @@ from watchdog.observers.polling import PollingObserver
 from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     HandoffResultSubmissionError,
+    ManagedAttemptFenceError,
     WorkflowContinuationAuthorityConflict,
     acquire_terminal_runtime_transport,
     cancel_child_assignments_for_terminal,
+    claim_workflow_effect,
     create_inbox_message,
+    finish_workflow_effect,
     get_inbox_messages,
+    get_managed_attempt_lifecycle,
     get_session_hard_deletion_operation,
     get_terminal_metadata,
     get_workflow_compaction_continuation_authority,
     get_writable_work_context_by_session,
     init_db,
     queue_workflow_input_for_provider,
+    reconcile_managed_attempt_timeouts,
     release_terminal_runtime_operation,
     resolve_workflow_input_binding,
     retain_queued_workflow_input_binding,
@@ -61,6 +67,7 @@ from cli_agent_orchestrator.clients.database import (
     terminal_auth_token_matches,
     terminal_deletion_auth_token_matches,
     terminal_deletion_receipt_exists,
+    terminal_has_critical_owner_authority,
 )
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
@@ -93,6 +100,7 @@ from cli_agent_orchestrator.services import (
     flow_service,
     inbox_service,
     interaction_read_model_service,
+    managed_attempt_service,
     managed_worktree_service,
     project_service,
     recovery_takeover_service,
@@ -269,6 +277,23 @@ class RecoveryTakeoverCapabilitiesRequest(BaseModel):
         return value
 
 
+class ManagedAttemptFenceRequest(BaseModel):
+    """Exact owner authority required to fence one orphaned child attempt."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    logical_turn_id: int = Field(ge=1)
+    caller_terminal_id: TerminalId
+    assignment_id: int = Field(ge=1)
+    attempt_id: str = Field(min_length=16, max_length=128)
+    parent_terminal_id: TerminalId
+    request_workflow_effect_id: int = Field(ge=1)
+    child_workflow_turn_id: int = Field(ge=1)
+    reason_code: str = Field(pattern=r"^[A-Z0-9_]{3,128}$")
+    expected_runtime_generation: str
+    expected_writer_authority_generation: str
+
+
 class RegistryImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -406,6 +431,17 @@ async def _workflow_reconciliation_tick(
 ) -> bool:
     """Run one isolated recovery tick and return whether startup replay remains due."""
     performed_full_recovery = False
+    try:
+        attempt_recovery = await _run_workflow_io(reconcile_managed_attempt_timeouts)
+        if any(attempt_recovery.values()):
+            logger.info("Reconciled managed-attempt admission deadlines: %s", attempt_recovery)
+        fenced_attempts = await _run_workflow_io(
+            managed_attempt_service.reconcile_managed_attempt_fences
+        )
+        if fenced_attempts:
+            logger.info("Completed %s managed-attempt fences", fenced_attempts)
+    except Exception as exc:
+        logger.warning("Managed-attempt lifecycle reconciliation failed: %s", exc)
     try:
         fenced = await _run_workflow_io(workflow_service.fence_stale_provider_runtime_compatibility)
         if fenced:
@@ -2678,6 +2714,110 @@ async def submit_handoff_result_v1_endpoint(
         return submit_handoff_result_v1(token, body.logical_turn_id, body.document)
     except HandoffResultSubmissionError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+
+
+@app.post(
+    "/_internal/managed-attempts/{child_terminal_id}/fence",
+    include_in_schema=False,
+)
+async def fence_managed_attempt_endpoint(
+    child_terminal_id: TerminalId,
+    request: Request,
+    body: ManagedAttemptFenceRequest,
+) -> Dict[str, Any]:
+    """Owner-only exact fence used by MCP and rolling-upgrade recovery."""
+    authorization = request.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if (
+        scheme.lower() != "bearer"
+        or not token
+        or not terminal_auth_token_matches(str(body.caller_terminal_id), token)
+        or not terminal_has_critical_owner_authority(str(body.caller_terminal_id))
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="managed_attempt_fence_owner_authority_required",
+        )
+    identity = (
+        body.assignment_id,
+        body.attempt_id,
+        str(body.parent_terminal_id),
+        str(child_terminal_id),
+        body.request_workflow_effect_id,
+        body.child_workflow_turn_id,
+        body.reason_code,
+        body.expected_runtime_generation,
+        body.expected_writer_authority_generation,
+    )
+    effect_key = (
+        "fence_managed_attempt:"
+        + hashlib.sha256("\x1f".join(map(str, identity)).encode()).hexdigest()
+    )
+    effect = claim_workflow_effect(
+        str(body.caller_terminal_id),
+        body.logical_turn_id,
+        "fence_managed_attempt",
+        effect_key,
+    )
+    if effect is None:
+        lifecycle = get_managed_attempt_lifecycle(assignment_id=body.assignment_id)
+        if lifecycle is not None and lifecycle.get("state") == "fenced":
+            return {**lifecycle, "accepted": True, "duplicate": True}
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="managed_attempt_fence_effect_not_admitted",
+        )
+    try:
+        result = await _run_operational_io(
+            managed_attempt_service.fence_managed_attempt,
+            assignment_id=body.assignment_id,
+            attempt_id=body.attempt_id,
+            parent_terminal_id=str(body.parent_terminal_id),
+            child_terminal_id=str(child_terminal_id),
+            request_workflow_effect_id=body.request_workflow_effect_id,
+            child_workflow_turn_id=body.child_workflow_turn_id,
+            reason_code=body.reason_code,
+            expected_runtime_generation=body.expected_runtime_generation,
+            expected_writer_authority_generation=body.expected_writer_authority_generation,
+        )
+    except ManagedAttemptFenceError as exc:
+        finish_workflow_effect(
+            str(body.caller_terminal_id), effect["id"], effect["claim_token"], "rejected"
+        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.reason_code) from exc
+    outcome = "completed" if result.get("state") == "fenced" else "indeterminate"
+    finish_workflow_effect(
+        str(body.caller_terminal_id), effect["id"], effect["claim_token"], outcome
+    )
+    return cast(Dict[str, Any], result)
+
+
+@app.get(
+    "/_internal/managed-attempts/{assignment_id}",
+    include_in_schema=False,
+)
+async def get_managed_attempt_endpoint(
+    assignment_id: int,
+    request: Request,
+    caller_terminal_id: TerminalId,
+) -> Dict[str, Any]:
+    """Read one non-secret attempt lifecycle under a terminal bearer."""
+    authorization = request.headers.get("authorization", "")
+    scheme, _, token = authorization.partition(" ")
+    if (
+        scheme.lower() != "bearer"
+        or not token
+        or not terminal_auth_token_matches(str(caller_terminal_id), token)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_terminal_auth"
+        )
+    lifecycle = get_managed_attempt_lifecycle(assignment_id=assignment_id)
+    if lifecycle is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="managed_attempt_not_found"
+        )
+    return lifecycle
 
 
 @app.post(

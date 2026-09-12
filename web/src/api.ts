@@ -473,6 +473,16 @@ export interface InteractionItem {
   }
   result: { id: string | null; status: string | null; summary: string | null; available: boolean }
   delivery: { status: string | null; pending: boolean; acknowledged: boolean }
+  attempt?: {
+    state: string | null
+    reason_code: string | null
+    delivery_attempt_count: number
+    recovery_attempt_count: number
+    next_retry_at: string | null
+    deadline_at: string | null
+    prompt_delivery_acknowledged: boolean
+    provider_admitted: boolean
+  }
   final_disposition: string | null
   diagnostics: { interaction_id: string; durable_id: string | null; assignment_id: number | null }
 }

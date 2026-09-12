@@ -541,9 +541,14 @@ WITH terminal_lifetimes AS MATERIALIZED (
                'handoff_result_delivered', 'handoff_result_failed'
              ) OR result_notice.status = 'pending'
            ) THEN 1 ELSE 0 END AS is_current,
-           ca.status AS queue_state,
+           COALESCE(attempt.state, ca.status) AS queue_state,
            CASE
              WHEN ca.review_superseded_at IS NOT NULL THEN NULL
+             WHEN attempt.state = 'recovery_scheduled' THEN 'recovery'
+             WHEN attempt.state IN ('prompt_delivery_scheduled',
+                                    'prompt_delivery_acknowledged') THEN 'admission'
+             WHEN attempt.state IN ('fence_pending', 'fence_claimed')
+               THEN 'writer_recovery_authority'
              WHEN ca.status IN ('awaiting_result', 'handoff_awaiting_result') THEN 'child_result'
              WHEN ca.status = 'handoff_recovery_awaiting_result' THEN 'reconnect'
              WHEN result_notice.status = 'pending' THEN 'delivery'
@@ -554,10 +559,14 @@ WITH terminal_lifetimes AS MATERIALIZED (
                THEN 'acknowledgement'
              ELSE NULL
            END AS wait_reason,
-           0 AS admission_pending, ca.request_workflow_id AS workflow_id,
+           CASE WHEN attempt.state IN (
+             'prompt_delivery_scheduled', 'prompt_delivery_acknowledged',
+             'recovery_scheduled', 'fence_pending', 'fence_claimed'
+           ) THEN 1 ELSE 0 END AS admission_pending,
+           ca.request_workflow_id AS workflow_id,
            ca.request_workflow_turn_id AS workflow_turn_id,
            request_workflow.status AS workflow_status,
-           request_workflow.terminal_reason AS workflow_reason,
+           COALESCE(attempt.reason_code, request_workflow.terminal_reason) AS workflow_reason,
            NULL AS turn_state, NULL AS turn_kind, NULL AS provider_outcome_code,
            NULL AS provider_outcome_detail, NULL AS effect_kind, NULL AS effect_state,
            0 AS workflow_turn_count, 0 AS superseded_turn_count, ca.id AS assignment_id,
@@ -579,6 +588,7 @@ WITH terminal_lifetimes AS MATERIALIZED (
                THEN 'superseded'
              WHEN ca.status IN ('result_acknowledged', 'handoff_result_acknowledged')
                THEN 'acknowledged'
+             WHEN ca.status = 'fenced' THEN 'failed'
              WHEN ca.status = 'cancelled' THEN 'cancelled'
              ELSE NULL
            END AS final_disposition,
@@ -586,6 +596,7 @@ WITH terminal_lifetimes AS MATERIALIZED (
     FROM assignment_sessions scoped
     JOIN child_assignments ca ON ca.id = scoped.assignment_id
     LEFT JOIN delegation_results result ON result.child_assignment_id = ca.id
+    LEFT JOIN managed_attempt_lifecycle attempt ON attempt.assignment_id = ca.id
     LEFT JOIN inbox result_notice ON result_notice.id = ca.result_message_id
     LEFT JOIN workflows request_workflow ON request_workflow.id = ca.request_workflow_id
     LEFT JOIN workflow_turns child_turn ON child_turn.id = ca.child_workflow_turn_id
@@ -797,6 +808,16 @@ def _interaction_dto(row: Dict[str, Any]) -> Dict[str, Any]:
                 delivery_status and str(delivery_status).endswith("result_acknowledged")
             ),
         },
+        "attempt": {
+            "state": row.get("attempt_state"),
+            "reason_code": row.get("attempt_reason_code"),
+            "delivery_attempt_count": int(row.get("attempt_delivery_count") or 0),
+            "recovery_attempt_count": int(row.get("attempt_recovery_count") or 0),
+            "next_retry_at": _iso(row.get("attempt_next_retry_at")),
+            "deadline_at": _iso(row.get("attempt_deadline_at")),
+            "prompt_delivery_acknowledged": bool(row.get("attempt_delivery_acknowledged")),
+            "provider_admitted": bool(row.get("attempt_provider_admitted")),
+        },
         "final_disposition": final_disposition,
         "diagnostics": {
             "interaction_id": row["interaction_id"],
@@ -910,6 +931,36 @@ ORDER BY page.created_at {direction}, page.interaction_id {direction}
     fetched_rows = [dict(row) for row in rows if row["interaction_id"] is not None]
     has_more = len(fetched_rows) > resolved_limit
     page_rows = fetched_rows[:resolved_limit]
+    assignment_ids = [
+        int(row["assignment_id"]) for row in page_rows if row.get("assignment_id") is not None
+    ]
+    if assignment_ids:
+        with database.SessionLocal() as db:
+            attempts = (
+                db.query(database.ManagedAttemptLifecycleModel)
+                .filter(database.ManagedAttemptLifecycleModel.assignment_id.in_(assignment_ids))
+                .all()
+            )
+        attempts_by_id = {int(attempt.assignment_id): attempt for attempt in attempts}
+        for row in page_rows:
+            assignment_id = row.get("assignment_id")
+            attempt = attempts_by_id.get(int(assignment_id)) if assignment_id is not None else None
+            if attempt is None:
+                continue
+            row.update(
+                {
+                    "attempt_state": attempt.state,
+                    "attempt_reason_code": attempt.reason_code,
+                    "attempt_delivery_count": attempt.delivery_attempt_count,
+                    "attempt_recovery_count": attempt.recovery_attempt_count,
+                    "attempt_next_retry_at": attempt.recovery_next_retry_at,
+                    "attempt_deadline_at": attempt.recovery_deadline_at,
+                    "attempt_delivery_acknowledged": (
+                        attempt.prompt_delivery_acknowledged_at is not None
+                    ),
+                    "attempt_provider_admitted": attempt.provider_admitted_at is not None,
+                }
+            )
     items = [_interaction_dto(row) for row in page_rows]
     next_cursor = None
     if has_more:

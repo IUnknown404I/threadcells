@@ -110,7 +110,7 @@ const labels = {
     lang: 'Язык', home: 'Главная', agents: 'Агенты', settings: 'Настройки', docs: 'Документация', sessions: 'Сессии',
     create: 'Создать сессию и запустить агента', sessionName: 'Название сессии', cancel: 'Отмена', inbox: 'Почта',
     inboxTitle: 'Почта агента', housekeeping: 'Обслуживание', full: 'Удалить все системные файлы — полная очистка',
-    docsTitle: 'Начните здесь: что такое ThreadCells?', targetLocale: 'Русский', graceful: 'Корректно завершить',
+    docsTitle: 'Начните здесь: что такое ThreadCells?', targetLocale: 'Русский', graceful: 'Завершить',
     deleteDisabled: 'Корректно завершите терминал перед удалением',
   },
 }
@@ -155,7 +155,7 @@ async function assertSurfaceSet(page, locale, viewport) {
   await page.getByRole('button', { name: new RegExp(`^(Expand|Развернуть) ${session.name}$`) }).click()
   const actionLabels = (await page.getByTestId(`agent-detail-card-${agent.id}`).getByRole('button').allTextContents()).map(value => value.trim()).filter(Boolean)
   assert.deepEqual(actionLabels.slice(0, 6), locale === 'ru'
-    ? ['История', 'Почта', 'Вывод', 'Открыть терминал', 'Корректно завершить', 'Удалить']
+    ? ['История', 'Почта', 'Вывод', 'Терминал', 'Завершить', 'Удалить']
     : ['History', 'Inbox', 'Output', 'Open Terminal', 'Graceful Exit', 'Delete'], `agent action order in ${locale}`)
   await page.getByRole('button', { name: copy.inbox, exact: true }).click()
   await page.getByRole('heading', { name: copy.inboxTitle, exact: true }).waitFor()

@@ -4,9 +4,12 @@ import asyncio
 import hashlib
 import sqlite3
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Barrier
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -22,7 +25,6 @@ from cli_agent_orchestrator.clients.database import (
     WorkflowModel,
     acknowledge_child_assignment_result_outcome,
     activate_workflow_turn_for_inbox,
-    bind_child_assignment_input_turn,
     cancel_child_assignment_attempt,
     claim_workflow_effect,
     claim_workflow_turn_receipt,
@@ -40,6 +42,13 @@ from cli_agent_orchestrator.clients.database import (
     resolve_workflow_input_binding,
     set_workflow_terminal_state,
     start_workflow_input,
+)
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
+from cli_agent_orchestrator.services import (
+    managed_worktree_service,
+    terminal_service,
+    workflow_service,
 )
 
 
@@ -97,8 +106,11 @@ def _reviewer(
         launch_worktree=str(launch_worktree or repo),
         managed_worktree_kind="reviewer",
         managed_worktree_source=str(repo),
+        managed_worktree_origin_terminal_id=child_id,
         managed_worktree_commit=revision,
         runtime_lifecycle="running",
+        runtime_generation=f"runtime-{child_id}",
+        provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
     )
 
 
@@ -123,9 +135,12 @@ def _start_review(
         requested_review_revision=requested_revision,
     )
     assert finish_workflow_effect(parent_id, effect["id"], effect["claim_token"], "completed")
-    binding = issue_workflow_input_binding(child_id)
+    binding = issue_workflow_input_binding(
+        child_id,
+        request,
+        child_assignment_workflow_effect_id=effect["id"],
+    )
     assert binding is not None
-    assert bind_child_assignment_input_turn(child_id, binding)
     child_turn_id = resolve_workflow_input_binding(child_id, binding)
     assert child_turn_id is not None
     return {
@@ -222,6 +237,513 @@ def test_correction_and_rereview_preserve_history_but_only_b_is_current(authorit
     assert get_parent_completion_barrier("parent") == (0, 0)
 
 
+def test_exact_review_preparation_claim_admits_only_its_bound_provider_turn(authority_db, tmp_path):
+    repo, revision = _repository(tmp_path)
+    reviewer = _reviewer("reviewer", repo, revision)
+    reviewer.write_enabled = True
+    reviewer.writer_authority_generation = "writer-generation"
+    with database.SessionLocal() as db:
+        db.add(reviewer)
+        db.add(
+            database.WorktreeWriterLeaseModel(
+                canonical_worktree=str(repo),
+                terminal_id="reviewer",
+                authority_generation="writer-generation",
+            )
+        )
+        db.commit()
+    request = _start_review(
+        "parent",
+        "reviewer",
+        "Review exact revision",
+        requested_revision=revision,
+    )
+
+    preparation = database.claim_review_worktree_preparation("reviewer", request["child_turn_id"])
+    assert preparation["required"] is True
+    assert preparation["claimed"] is True
+    assert preparation["revision"] == revision
+    assert database.review_worktree_preparation_owned(
+        "reviewer",
+        request["child_turn_id"],
+        preparation["claim_token"],
+        revision,
+    )
+    admitted = database.acquire_provider_execution_decision(
+        "reviewer", request["child_turn_id"], limit=1
+    )
+    assert admitted["acquired"] is True
+    assert (
+        database.acquire_provider_execution_decision("reviewer", 999999, limit=1)["acquired"]
+        is False
+    )
+    assert database.release_provider_execution("reviewer", request["child_turn_id"])
+    assert database.release_review_worktree_preparation("reviewer", preparation["claim_token"])
+
+
+@pytest.mark.parametrize(
+    "lease_terminal,lease_path_kind,lease_generation",
+    [
+        (None, "target", "writer-generation"),
+        ("reviewer", "target", "stale-writer-generation"),
+        ("foreign-reviewer", "target", "writer-generation"),
+        ("reviewer", "foreign", "writer-generation"),
+    ],
+)
+def test_exact_review_preparation_rejects_foreign_writer_authority(
+    authority_db,
+    tmp_path,
+    lease_terminal,
+    lease_path_kind,
+    lease_generation,
+):
+    repo, revision = _repository(tmp_path)
+    reviewer = _reviewer("reviewer", repo, revision)
+    reviewer.write_enabled = True
+    reviewer.writer_authority_generation = "writer-generation"
+    with database.SessionLocal() as db:
+        db.add(reviewer)
+        if lease_terminal is not None:
+            db.add(
+                database.WorktreeWriterLeaseModel(
+                    canonical_worktree=(
+                        str(repo) if lease_path_kind == "target" else str(tmp_path / "foreign")
+                    ),
+                    terminal_id=lease_terminal,
+                    authority_generation=lease_generation,
+                )
+            )
+        db.commit()
+    request = _start_review(
+        "parent",
+        "reviewer",
+        "Review exact revision",
+        requested_revision=revision,
+    )
+
+    preparation = database.claim_review_worktree_preparation("reviewer", request["child_turn_id"])
+
+    assert preparation == {
+        "required": True,
+        "claimed": False,
+        "reason_code": "REVIEW_WORKTREE_PREPARATION_BUSY",
+    }
+
+
+def test_queued_exact_review_retry_prepares_and_sends_once(authority_db, monkeypatch, tmp_path):
+    """A capacity-deferred review keeps one turn and reaches only exact revision B."""
+    repo, revision_a = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    reviewer = managed_worktree_service.create_managed_worktree(
+        str(repo), "reviewer", "reviewer", expected_commit=revision_a
+    )
+    assert reviewer is not None
+    reviewer_worktree = Path(reviewer.path)
+    revision_b = _advance(repo, "B")
+    writer_generation = "writer-reviewer-generation"
+    with database.SessionLocal() as db:
+        reviewer_terminal = _reviewer(
+            "reviewer",
+            repo,
+            revision_a,
+            launch_worktree=reviewer_worktree,
+        )
+        reviewer_terminal.write_enabled = True
+        reviewer_terminal.writer_authority_generation = writer_generation
+        db.add(reviewer_terminal)
+        db.add(
+            database.WorktreeWriterLeaseModel(
+                canonical_worktree=str(reviewer_worktree),
+                terminal_id="reviewer",
+                authority_generation=writer_generation,
+            )
+        )
+        db.commit()
+    request = _start_review(
+        "parent",
+        "reviewer",
+        "Review exact revision B after capacity recovery",
+        requested_revision=revision_b,
+    )
+    child_turn_id = request["child_turn_id"]
+    assert database.queue_workflow_input_for_provider(
+        "reviewer",
+        child_turn_id,
+        "review exact B",
+        "PROVIDER_EXECUTION_CAPACITY_EXHAUSTED",
+    )
+    retry = database.claim_workflow_turn("reviewer")
+    assert retry is not None and retry["id"] == child_turn_id
+
+    provider = SimpleNamespace(
+        paste_enter_count=1,
+        turn_outcome_cursor_required=lambda: False,
+        mark_input_received=lambda: None,
+    )
+    sends: list[str] = []
+
+    def acquire_exact_provider_slot(terminal_id: str, workflow_turn_id: int) -> None:
+        decision = database.acquire_provider_execution_decision(
+            terminal_id, workflow_turn_id, limit=1
+        )
+        assert decision["acquired"] is True
+
+    with (
+        patch.object(terminal_service.provider_manager, "get_provider", return_value=provider),
+        patch.object(
+            terminal_service.tmux_client,
+            "send_keys",
+            side_effect=lambda *_args, **_kwargs: sends.append(
+                _git(reviewer_worktree, "rev-parse", "HEAD")
+            ),
+        ),
+        patch.object(terminal_service, "_wake_queued_provider_execution"),
+        patch(
+            "cli_agent_orchestrator.services.operations_service.acquire_provider_execution_slot",
+            side_effect=acquire_exact_provider_slot,
+        ),
+    ):
+        assert terminal_service.send_input(
+            "reviewer",
+            "review exact B",
+            logical_turn_id=child_turn_id,
+            workflow_turn_claim_token=retry["claim_token"],
+            workflow_turn_claim_generation=retry["claim_generation"],
+        )
+
+    assert sends == [revision_b]
+    assert _git(reviewer_worktree, "rev-parse", "HEAD") == revision_b
+    assert database.mark_workflow_turn_sent(
+        child_turn_id, retry["claim_token"], retry["claim_generation"]
+    )
+    assert database.claim_workflow_turn("reviewer") is None
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, "reviewer")
+        lease = db.get(database.ProviderExecutionLeaseModel, "reviewer")
+        assert terminal is not None and terminal.runtime_operation_kind is None
+        assert lease is not None and lease.workflow_turn_id == child_turn_id
+
+
+def test_reconnect_queued_exact_review_is_retained_instead_of_cancelled(
+    authority_db, monkeypatch, tmp_path
+):
+    """Production repro: durable reconnect queue survives an uncertain HTTP result."""
+    repo, revision = _repository(tmp_path)
+    reviewer_worktree = tmp_path / "reconnect-reviewer"
+    _git(repo, "worktree", "add", "--detach", str(reviewer_worktree), revision)
+    stale_generation = "0" * 64 if ACTIVE_RUNTIME_GENERATION != "0" * 64 else "1" * 64
+    writer_generation = "writer-reviewer-generation"
+    with database.SessionLocal() as db:
+        reviewer = _reviewer(
+            "reviewer",
+            repo,
+            revision,
+            launch_worktree=reviewer_worktree,
+        )
+        reviewer.write_enabled = True
+        reviewer.writer_authority_generation = writer_generation
+        reviewer.provider_runtime_compatibility_generation = stale_generation
+        reviewer.provider_resume_identity = "reviewer-resume-identity"
+        reviewer.provider_resume_runtime_generation = reviewer.runtime_generation
+        db.add(reviewer)
+        db.add(
+            database.WorktreeWriterLeaseModel(
+                canonical_worktree=str(reviewer_worktree),
+                terminal_id="reviewer",
+                authority_generation=writer_generation,
+            )
+        )
+        db.commit()
+
+    parent_turn = start_workflow_input("parent")
+    assert parent_turn is not None and claim_workflow_turn_receipt("parent", parent_turn)
+    request = "Review exact revision after runtime reconnect"
+    effect = claim_workflow_effect("parent", parent_turn, "assign", request)
+    assert effect is not None
+    monkeypatch.setenv("CAO_TERMINAL_ID", "parent")
+
+    def lose_http_response(_terminal_id, message, binding):
+        payload = mcp_server._direct_assign_payload(message)
+        with database.SessionLocal() as db:
+            attempt = db.query(ChildAssignmentModel).filter_by(child_terminal_id="reviewer").one()
+            turn = db.get(database.WorkflowTurnModel, attempt.child_workflow_turn_id)
+            assert turn is not None
+            assert turn.transport_binding == binding
+            assert turn.payload == payload
+        retained = database.retain_queued_workflow_input_binding("reviewer", binding, payload)
+        assert retained is not None and retained["reconnect_pending"]
+        raise ConnectionError("response lost after durable queue commit")
+
+    delivery_probes = 0
+
+    def observe_delivery_after_cancel_fence(terminal_id, binding, *, expected_payload=None):
+        nonlocal delivery_probes
+        delivery_probes += 1
+        if delivery_probes == 1:
+            # Model a queue commit racing just after the caller's first
+            # observation.  The cancellation transaction must lose, then the
+            # accepted delivery becomes the authoritative call result.
+            return None
+        return database.get_workflow_input_binding_delivery(
+            terminal_id, binding, expected_payload=expected_payload
+        )
+
+    cancellation_attempts = 0
+
+    def fenced_cancel(parent_terminal_id, child_terminal_id, workflow_effect_id):
+        nonlocal cancellation_attempts
+        cancellation_attempts += 1
+        return database.cancel_child_assignment_attempt(
+            parent_terminal_id, child_terminal_id, workflow_effect_id
+        )
+
+    with (
+        patch.object(mcp_server, "wait_until_terminal_status", return_value=True),
+        patch.object(mcp_server, "_create_terminal", return_value=("reviewer", "codex")),
+        patch.object(
+            mcp_server,
+            "_send_direct_input_assign",
+            side_effect=lose_http_response,
+        ),
+        patch.object(
+            mcp_server,
+            "get_workflow_input_binding_delivery",
+            side_effect=observe_delivery_after_cancel_fence,
+        ),
+        patch.object(
+            mcp_server,
+            "cancel_child_assignment_attempt",
+            side_effect=fenced_cancel,
+        ),
+    ):
+        assigned = mcp_server._assign_impl(
+            "reviewer_sol_high",
+            request,
+            review_revision=revision,
+            request_effect=effect,
+            request_workflow_turn_id=parent_turn,
+        )
+
+    assert assigned["success"] is True, assigned
+    assert assigned["queued"] is True
+    assert assigned["reason_code"] == "TERMINAL_RUNTIME_RECONNECT_PENDING"
+    assert delivery_probes == 2
+    assert cancellation_attempts == 1
+    with database.SessionLocal() as db:
+        attempt = db.query(ChildAssignmentModel).filter_by(child_terminal_id="reviewer").one()
+        child_turn = db.get(database.WorkflowTurnModel, attempt.child_workflow_turn_id)
+        child_workflow = db.get(WorkflowModel, attempt.child_workflow_id)
+        assert attempt.status == "awaiting_result"
+        assert attempt.review_subject_revision == revision
+        assert child_workflow is not None and child_workflow.active_turn_id == child_turn.id
+        assert child_turn is not None and child_turn.state == "queued"
+        assert child_turn.payload == mcp_server._direct_assign_payload(
+            f"{request}\n\n"
+            "[CAO immutable review authority: "
+            f"attempt_id={attempt.attempt_id} "
+            f"subject_id={attempt.review_subject_id} "
+            f"exact_revision={revision}]"
+        )
+        assert child_turn.provider_reconnect_requested_at is not None
+        child_turn_id = child_turn.id
+        effect_id = attempt.request_workflow_effect_id
+
+    assert effect_id is not None
+    assert not cancel_child_assignment_attempt("parent", "reviewer", effect_id)
+    with database.SessionLocal() as db:
+        assert (
+            db.query(ChildAssignmentModel).filter_by(child_terminal_id="reviewer").one().status
+            == "awaiting_result"
+        )
+
+    now = datetime(2026, 9, 9, 23, 0, 0)
+    with patch.object(workflow_service, "terminal_service") as reconnecting_terminal:
+        reconnecting_terminal.get_terminal.return_value = {
+            "status": TerminalStatus.IDLE.value,
+            "lifecycle": "running",
+        }
+        reconnecting_terminal.provider_runtime_sidecar_reconnect_required.return_value = False
+        reconnecting_terminal.provider_turn_execution_active.return_value = False
+
+        def reconnect_request(
+            terminal_id,
+            logical_turn_id,
+            resume_identity,
+            *,
+            registry,
+            claim_token,
+            attempt_token,
+            attempt_state,
+            side_effect_guard,
+        ):
+            assert terminal_id == "reviewer"
+            assert resume_identity == "reviewer-resume-identity"
+            assert registry is None
+            assert attempt_state == "reserved"
+            assert side_effect_guard()
+            assert database.mark_workflow_provider_reconnect_launch_dispatched(
+                terminal_id,
+                logical_turn_id,
+                claim_token,
+                attempt_token,
+                now=now,
+            )
+            assert database.record_workflow_provider_reconnect_runtime_ready(
+                terminal_id,
+                attempt_token,
+                ACTIVE_RUNTIME_GENERATION,
+                4321,
+                987654,
+                now=now,
+            )
+            assert database.record_workflow_provider_reconnect_output_boundary(
+                terminal_id,
+                attempt_token,
+                11,
+                22,
+                333,
+                now=now,
+            )
+
+        reconnecting_terminal.request_provider_runtime_sidecar_reconnect.side_effect = (
+            reconnect_request
+        )
+
+        # The first tick upgrades only; no byte reaches the stale runtime.
+        assert workflow_service.reconcile_root_workflow("reviewer", now=now) is False
+        reconnecting_terminal.send_input.assert_not_called()
+        # The next tick delivers the same durable child turn exactly once.
+        assert workflow_service.reconcile_root_workflow("reviewer", now=now + timedelta(seconds=1))
+        assert not workflow_service.reconcile_root_workflow(
+            "reviewer", now=now + timedelta(seconds=2)
+        )
+        reconnecting_terminal.send_input.assert_called_once()
+        sent_args = reconnecting_terminal.send_input.call_args.args
+        sent_kwargs = reconnecting_terminal.send_input.call_args.kwargs
+        assert sent_args[0] == "reviewer"
+        assert request in sent_args[1]
+        assert f"exact_revision={revision}" in sent_args[1]
+        assert sent_kwargs["logical_turn_id"] == child_turn_id
+
+    with database.SessionLocal() as db:
+        attempt = db.query(ChildAssignmentModel).filter_by(child_terminal_id="reviewer").one()
+        delivered_turn = db.get(database.WorkflowTurnModel, attempt.child_workflow_turn_id)
+        assert attempt.status == "awaiting_result"
+        assert delivered_turn is not None and delivered_turn.state == "sent"
+
+
+def test_queued_binding_rejects_payload_replacement(authority_db):
+    stale_generation = "0" * 64 if ACTIVE_RUNTIME_GENERATION != "0" * 64 else "1" * 64
+    with database.SessionLocal() as db:
+        reviewer = TerminalModel(
+            id="reviewer",
+            tmux_session="review-session",
+            tmux_window="reviewer",
+            provider="codex",
+            runtime_lifecycle="running",
+            runtime_generation="runtime-reviewer",
+            provider_runtime_compatibility_generation=stale_generation,
+        )
+        db.add(reviewer)
+        db.commit()
+    binding = issue_workflow_input_binding("reviewer", "exact payload")
+    assert binding is not None
+    retained = database.retain_queued_workflow_input_binding("reviewer", binding, "exact payload")
+    assert retained is not None and retained["accepted"]
+    with pytest.raises(ValueError, match="payload changed"):
+        database.retain_queued_workflow_input_binding("reviewer", binding, "different payload")
+
+
+def test_review_binding_commits_payload_and_attempt_before_reconnect_can_claim(
+    authority_db, tmp_path
+):
+    repo, revision = _repository(tmp_path)
+    reviewer = _reviewer("reviewer", repo, revision)
+    reviewer.provider_runtime_compatibility_generation = "legacy-runtime-generation"
+    with database.SessionLocal() as db:
+        db.add(reviewer)
+        db.commit()
+    parent_turn = start_workflow_input("parent")
+    assert parent_turn is not None and claim_workflow_turn_receipt("parent", parent_turn)
+    effect = claim_workflow_effect("parent", parent_turn, "assign", "exact review")
+    assert effect is not None
+    assert register_child_assignment(
+        "parent",
+        "reviewer",
+        workflow_turn_id=parent_turn,
+        workflow_effect_id=effect["id"],
+        request_message="exact review",
+        requested_review_revision=revision,
+    )
+    payload = f"review exact revision {revision}"
+
+    binding = issue_workflow_input_binding(
+        "reviewer",
+        payload,
+        child_assignment_workflow_effect_id=effect["id"],
+    )
+
+    assert binding is not None
+    with database.SessionLocal() as db:
+        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id="reviewer").one()
+        turn = db.get(database.WorkflowTurnModel, assignment.child_workflow_turn_id)
+        workflow = db.get(WorkflowModel, assignment.child_workflow_id)
+        assert turn is not None and workflow is not None
+        assert workflow.active_turn_id == turn.id
+        assert turn.transport_binding == binding
+        assert turn.payload == payload
+        assert turn.state == "queued"
+        assert turn.provider_reconnect_requested_at is not None
+    assert database.claim_workflow_turn("reviewer") is None
+
+
+def test_provider_lease_never_substitutes_for_missing_bound_payload(authority_db):
+    with database.SessionLocal() as db:
+        db.add(
+            TerminalModel(
+                id="reviewer",
+                tmux_session="review-session",
+                tmux_window="reviewer",
+                provider="codex",
+                runtime_lifecycle="running",
+                runtime_generation="runtime-reviewer",
+                provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
+            )
+        )
+        db.commit()
+    binding = issue_workflow_input_binding("reviewer", "exact payload")
+    assert binding is not None
+    turn_id = resolve_workflow_input_binding("reviewer", binding)
+    assert turn_id is not None
+    with database.SessionLocal() as db:
+        turn = db.get(database.WorkflowTurnModel, turn_id)
+        assert turn is not None
+        turn.payload = None
+        db.add(
+            database.ProviderExecutionLeaseModel(
+                terminal_id="reviewer",
+                workflow_turn_id=turn_id,
+            )
+        )
+        db.commit()
+
+    observed = database.get_workflow_input_binding_delivery(
+        "reviewer", binding, expected_payload="exact payload"
+    )
+    assert observed is not None
+    assert observed["provider_admitted"] is True
+    assert observed["payload_matches"] is False
+    assert observed["accepted"] is False
+
+    with database.SessionLocal() as db:
+        db.query(database.ProviderExecutionLeaseModel).delete()
+        turn = db.get(database.WorkflowTurnModel, turn_id)
+        assert turn is not None
+        turn.state = "queued"
+        db.commit()
+    assert database.claim_workflow_turn("reviewer") is None
+
+
 def test_superseded_review_does_not_block_transactional_terminal_guard(authority_db, tmp_path):
     repo, revision_a = _repository(tmp_path)
     with database.SessionLocal() as db:
@@ -273,7 +795,9 @@ def test_superseded_review_does_not_block_transactional_terminal_guard(authority
             .all()
         )
         assert assignments[0].review_superseded_at is not None
-        assert assignments[0].status == "cancelled"
+        # Supersession is the final disposition axis. Terminal cleanup must not
+        # rewrite the historical transport state of an earlier review attempt.
+        assert assignments[0].status == "handoff_result_delivered"
         assert assignments[1].review_superseded_at is None
         assert assignments[1].status == "result_acknowledged"
         assert db.query(WorkflowModel).filter_by(root_terminal_id="parent").one().status == (
@@ -308,17 +832,30 @@ def test_same_reviewer_terminal_two_attempts_do_not_collapse_delivery(authority_
 def test_mcp_assign_reuses_same_reviewer_with_exact_new_attempt_and_ack(
     authority_db, monkeypatch, tmp_path
 ):
-    """Public admitted assign owns a bounded rereview on a warm reviewer."""
+    """Revision A -> correction B prepares and executes in exact reviewer B."""
     repo, revision_a = _repository(tmp_path)
-    reviewer_worktree = tmp_path / "reviewer-worktree"
-    _git(repo, "worktree", "add", "--detach", str(reviewer_worktree), revision_a)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    reviewer = managed_worktree_service.create_managed_worktree(
+        str(repo), "reviewer", "reviewer", expected_commit=revision_a
+    )
+    assert reviewer is not None
+    reviewer_worktree = Path(reviewer.path)
+    writer_generation = "writer-reviewer-generation"
     with database.SessionLocal() as db:
+        reviewer_terminal = _reviewer(
+            "reviewer",
+            repo,
+            revision_a,
+            launch_worktree=reviewer_worktree,
+        )
+        reviewer_terminal.write_enabled = True
+        reviewer_terminal.writer_authority_generation = writer_generation
+        db.add(reviewer_terminal)
         db.add(
-            _reviewer(
-                "reviewer",
-                repo,
-                revision_a,
-                launch_worktree=reviewer_worktree,
+            database.WorktreeWriterLeaseModel(
+                canonical_worktree=str(reviewer_worktree),
+                terminal_id="reviewer",
+                authority_generation=writer_generation,
             )
         )
         db.commit()
@@ -341,15 +878,61 @@ def test_mcp_assign_reuses_same_reviewer_with_exact_new_attempt_and_ack(
     assert activate_workflow_turn_for_inbox(result_a["notice_id"]) == parent_turn_id
     assert mark_workflow_turn_sent_for_inbox(result_a["notice_id"])
 
-    revision_b = _advance(repo, "B")
+    (repo / "exact_revision_test.py").write_text(
+        "from pathlib import Path\n\n"
+        "def test_reviewer_runs_from_revision_b():\n"
+        "    assert Path('subject.txt').read_text() == 'revision B\\n'\n",
+        encoding="utf-8",
+    )
+    (repo / "subject.txt").write_text("revision B\n", encoding="utf-8")
+    _git(repo, "add", "subject.txt", "exact_revision_test.py")
+    _git(repo, "commit", "-qm", "revision B with exact test")
+    revision_b = _git(repo, "rev-parse", "HEAD")
     assert _git(reviewer_worktree, "rev-parse", "HEAD") == revision_a
 
     assert database.claim_workflow_turn_receipt("parent", parent_turn_id)
     monkeypatch.setenv("CAO_TERMINAL_ID", "parent")
+    provider = SimpleNamespace(
+        paste_enter_count=1,
+        turn_outcome_cursor_required=lambda: False,
+        mark_input_received=lambda: None,
+    )
+    exact_test_runs = []
+
+    def deliver_exact(_terminal_id, _message, binding):
+        child_turn_id = resolve_workflow_input_binding("reviewer", binding)
+        assert child_turn_id is not None
+
+        def observe_send(*_args, **_kwargs):
+            assert _git(reviewer_worktree, "rev-parse", "HEAD") == revision_b
+            completed = subprocess.run(
+                [sys.executable, "-m", "pytest", "-q", "exact_revision_test.py"],
+                cwd=reviewer_worktree,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            exact_test_runs.append((completed.returncode, completed.stdout, completed.stderr))
+            assert completed.returncode == 0, completed.stdout + completed.stderr
+
+        with (
+            patch.object(terminal_service.provider_manager, "get_provider", return_value=provider),
+            patch.object(terminal_service.tmux_client, "send_keys", side_effect=observe_send),
+            patch.object(terminal_service, "_wake_queued_provider_execution"),
+            patch(
+                "cli_agent_orchestrator.services.operations_service.acquire_provider_execution_slot"
+            ),
+        ):
+            assert terminal_service.send_input(
+                "reviewer", "review exact B", logical_turn_id=child_turn_id
+            )
+
     with (
         patch.object(mcp_server, "_fence_privileged_runtime"),
         patch.object(mcp_server, "wait_until_terminal_status", return_value=True),
-        patch.object(mcp_server, "_send_direct_input_assign") as send_input,
+        patch.object(
+            mcp_server, "_send_direct_input_assign", side_effect=deliver_exact
+        ) as send_input,
     ):
         rereview = asyncio.run(
             mcp_server.assign(
@@ -368,6 +951,8 @@ def test_mcp_assign_reuses_same_reviewer_with_exact_new_attempt_and_ack(
     delivered_review_request = send_input.call_args.args[1]
     assert "CAO immutable review authority" in delivered_review_request
     assert f"exact_revision={revision_b}" in delivered_review_request
+    assert _git(reviewer_worktree, "rev-parse", "HEAD") == revision_b
+    assert exact_test_runs and exact_test_runs[0][0] == 0
 
     with database.SessionLocal() as db:
         attempts = (
@@ -782,6 +1367,7 @@ def test_mcp_assign_cannot_reuse_an_ordinary_child_as_reviewer(authority_db, mon
                 provider="codex",
                 agent_profile="developer",
                 runtime_lifecycle="running",
+                provider_runtime_compatibility_generation=ACTIVE_RUNTIME_GENERATION,
             )
         )
         db.commit()

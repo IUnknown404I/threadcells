@@ -1,7 +1,7 @@
 ---
 slug: workflows-and-results
 source: docs/WORKFLOWS_AND_RESULTS.md
-source_sha256: sha256:2075858d138b70bafe8c6605e1d77b69a0aafee4faaa8042ef3437e6ebae71ff
+source_sha256: sha256:96ac4e69b487f09d35f8aaa05ea5c343a7a6010be84f2f1bc7b8592994c441c0
 ---
 # 工作流和持久结果
 
@@ -80,6 +80,8 @@ Workflow Composer 中的新消息就是恢复符合条件的驻留工作流的�
 ## 恢复
 
 重启时，ThreadCells 从持久状态重建工作流所有权。已送达但未确认的结果仍可用。等待中的 handoff 可针对同一子项恢复，而不是启动重复项。一旦为打开的工作流准入较新的逻辑回合，较旧的待延续会被持久地取代，之后不能在压缩或中断后作为独立工作重放。
+
+如果托管子项已经权威地退出但未提交结果，即使提供商最后显示的状态已经过期，ThreadCells 也会推进同一个有界恢复预算。预算耗尽后，系统会记录一个 `incomplete` 生命周期结果，只将它排队一次供仍打开的父项读取并确认，同时拒绝迟到的提交；绝不会捏造成功结果。
 
 如果最新所有者关卡工作流中已取消的传输队首已有较晚的明确 Composer 后继回合，重启协调也会重新打开该工作流。它会提升这个现有后继回合而不创建替代回合，并且绝不会借此恢复 Inbox 回调或 Exited 终端。
 

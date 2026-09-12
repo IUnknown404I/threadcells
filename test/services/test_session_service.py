@@ -1,12 +1,15 @@
 """Tests for the session service."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import pytest
 
 from cli_agent_orchestrator.services.session_service import (
+    SessionAuthority,
     SessionLifecycleError,
+    _session_deletion_preflight,
     delete_session,
     get_session,
     get_session_root_working_directory,
@@ -218,6 +221,78 @@ class TestSessionAuthority:
 
 
 class TestDeleteSession:
+    @pytest.fixture(autouse=True)
+    def _stub_empty_unresolved_work_plan(self):
+        """Keep service-unit deletion tests independent from ambient durable state."""
+        with (
+            patch(
+                "cli_agent_orchestrator.services.session_service.get_session_unresolved_work_plan",
+                return_value={
+                    "eligible": True,
+                    "cancellable": False,
+                    "requires_cancellation_confirmation": False,
+                    "plan_token": None,
+                    "blockers": [],
+                    "cancellable_count": 0,
+                    "unsafe_count": 0,
+                    "plan_limit": 500,
+                    "reason_codes": [],
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.get_session_hard_deletion_operation",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service."
+                "bind_session_hard_deletion_workspace_authority",
+                return_value={
+                    "bound": True,
+                    "workspace_authority_sha256": "0" * 64,
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service."
+                "list_session_historical_terminal_cleanup_authorities",
+                return_value=[],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.begin_session_hard_deletion",
+                side_effect=lambda session_id, session_name, expected_terminal_ids, allow_dirty_workspace: {
+                    "started": True,
+                    "session_id": session_id,
+                    "session_name": session_name,
+                    "state": "fenced",
+                    "terminal_ids": list(expected_terminal_ids),
+                    "allow_dirty_workspace": allow_dirty_workspace,
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.mark_session_hard_deletion_workspace_retired",
+                return_value={"marked": True},
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.get_writable_work_context_by_session",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.housekeeping_mutation_fence",
+                side_effect=lambda: nullcontext(),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.purge_session_terminal_artifacts",
+                return_value={"runtime_artifacts_absent": True, "terminals": []},
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.revalidate_session_hard_deletion",
+                return_value={
+                    "valid": True,
+                    "terminal_ids": ["terminal1", "terminal2"],
+                },
+            ),
+        ):
+            yield
+
     def _patch_common(self, durable):
         return (
             patch(
@@ -232,20 +307,207 @@ class TestDeleteSession:
                 "cli_agent_orchestrator.services.session_service.validate_managed_worktree_cleanup",
                 create=True,
             ),
-            patch("cli_agent_orchestrator.services.session_service.cleanup_managed_worktree"),
+            patch(
+                "cli_agent_orchestrator.services.session_service."
+                "purge_session_managed_worktrees",
+                return_value={
+                    "removed": True,
+                    "evidence": [
+                        {
+                            "terminal_id": str(terminal["id"]),
+                            "managed": False,
+                            "path_absent": True,
+                            "git_unregistered": True,
+                            "branch_absent": True,
+                            "runtime_artifacts_absent": True,
+                        }
+                        for terminal in durable["terminals"]
+                    ],
+                },
+            ),
             patch("cli_agent_orchestrator.services.session_service.provider_manager"),
             patch(
-                "cli_agent_orchestrator.services.session_service.delete_terminals_by_session_lifetime",
+                "cli_agent_orchestrator.services.session_service.complete_session_hard_deletion",
                 return_value={
-                    "deleted": len(durable["terminals"]),
-                    "logical_deleted": len(durable["terminals"]),
-                    "retained": 0,
-                    "retained_resources": [],
+                    "completed": True,
                     "already_deleted": False,
+                    "before_counts": {"terminals": len(durable["terminals"])},
+                    "after_counts": {"terminals": 0},
+                    "tombstone_count": 1,
                 },
             ),
             patch("cli_agent_orchestrator.services.inbox_service.wake_provider_execution_queue"),
         )
+
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_receipt_only_session_uses_former_terminal_authority_and_hard_deletes(self, mock_tmux):
+        mock_tmux.session_exists.return_value = False
+        durable = {
+            "session_id": "session-lifetime-1",
+            "session_name": "cao-test",
+            "deleted": False,
+            "retained_resources": [],
+            "terminals": [],
+            "receipt_terminal_ids": ["former-terminal"],
+            "lifetime_authority": "terminal_deletion_receipts",
+        }
+        contexts = self._patch_common(durable)
+        historical_cleanup = {
+            "terminal_id": "former-terminal",
+            "managed": False,
+            "workspace_cleanup_authority_version": 1,
+        }
+        with (
+            contexts[0],
+            contexts[1] as prepare,
+            contexts[2] as cancel,
+            contexts[3],
+            contexts[4] as current_cleanup,
+            contexts[5] as providers,
+            contexts[6] as complete,
+            contexts[7],
+            patch(
+                "cli_agent_orchestrator.services.session_service.revalidate_session_hard_deletion",
+                return_value={
+                    "valid": True,
+                    "terminal_ids": [],
+                    "graph_terminal_ids": ["former-terminal"],
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service."
+                "list_session_historical_terminal_cleanup_authorities",
+                return_value=[historical_cleanup],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.purge_session_terminal_artifacts",
+                return_value={
+                    "runtime_artifacts_absent": True,
+                    "terminals": ["former-terminal"],
+                },
+            ) as artifacts,
+            patch(
+                "cli_agent_orchestrator.services.session_service.purge_managed_worktree",
+                return_value={
+                    "removed": False,
+                    "managed": False,
+                    "path_absent": True,
+                    "git_unregistered": True,
+                    "branch_absent": True,
+                },
+            ) as cleanup,
+        ):
+            result = delete_session("session-lifetime-1")
+
+        assert result["deleted"] == ["cao-test"]
+        prepare.assert_not_called()
+        cancel.assert_not_called()
+        providers.cleanup_provider.assert_not_called()
+        current_cleanup.assert_called_once_with(
+            [], ANY, allow_dirty=False, require_already_absent=False
+        )
+        cleanup.assert_called_once_with(historical_cleanup, require_already_absent=True)
+        artifacts.assert_called_once_with(["former-terminal"])
+        complete.assert_called_once_with("session-lifetime-1", "cao-test")
+
+    def test_retired_absent_workspace_with_already_removed_branch_is_preflight_eligible(self):
+        durable = _durable_session(lifecycle="exited")
+        durable["terminals"][0].update(
+            {
+                "managed_worktree_kind": "supervisor",
+                "writable_work_context_id": "context-1",
+            }
+        )
+        authority = SessionAuthority(
+            session_id="session-lifetime-1",
+            session_name="cao-test",
+            terminals=durable["terminals"],
+            retained_resources=[],
+            deleted=False,
+            runtime_exists=False,
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.services.session_service.get_writable_work_context_by_session",
+                return_value={
+                    "id": "context-1",
+                    "session_id": "session-lifetime-1",
+                    "state": "retired",
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service."
+                "capture_session_worktree_retirement_authority",
+                return_value={
+                    "safe": True,
+                    "authority": {
+                        "version": 1,
+                        "worktrees": [{"terminal_id": "terminal1", "present": False}],
+                    },
+                    "authority_sha256": "1" * 64,
+                    "modified_files": 0,
+                    "untracked_files": 0,
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.interaction_read_model_service.list_session_current_queue_counts",
+                return_value={"session-lifetime-1": 0},
+            ),
+        ):
+            preflight = _session_deletion_preflight(authority)
+
+        assert preflight["eligible"] is True
+        assert preflight["deletion_mode"] == "eligible_normal"
+
+    def test_retired_context_with_live_managed_worktree_is_preflight_unsafe(self):
+        durable = _durable_session(lifecycle="exited")
+        durable["terminals"][0].update(
+            {
+                "managed_worktree_kind": "supervisor",
+                "writable_work_context_id": "context-1",
+            }
+        )
+        authority = SessionAuthority(
+            session_id="session-lifetime-1",
+            session_name="cao-test",
+            terminals=durable["terminals"],
+            retained_resources=[],
+            deleted=False,
+            runtime_exists=False,
+        )
+        with (
+            patch(
+                "cli_agent_orchestrator.services.session_service.get_writable_work_context_by_session",
+                return_value={
+                    "id": "context-1",
+                    "session_id": "session-lifetime-1",
+                    "state": "retired",
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service."
+                "capture_session_worktree_retirement_authority",
+                return_value={
+                    "safe": True,
+                    "authority": {
+                        "version": 1,
+                        "worktrees": [{"terminal_id": "terminal1", "present": True}],
+                    },
+                    "authority_sha256": "2" * 64,
+                    "modified_files": 0,
+                    "untracked_files": 0,
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.interaction_read_model_service.list_session_current_queue_counts",
+                return_value={"session-lifetime-1": 0},
+            ),
+        ):
+            preflight = _session_deletion_preflight(authority)
+
+        assert preflight["eligible"] is False
+        assert preflight["deletion_mode"] == "blocked_live_or_unsafe_authority"
+        assert preflight["reason_code"] == "WORKSPACE_RETIREMENT_STATE_CONFLICT"
 
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
     def test_live_session_is_truthfully_blocked_before_mutation(self, mock_tmux):
@@ -319,12 +581,396 @@ class TestDeleteSession:
         assert result["deleted"] == ["cao-test"]
         assert retire.call_count == 2
         mock_tmux.kill_session.assert_not_called()
-        delete.assert_called_once_with(
-            "session-lifetime-1",
-            "cao-test",
-            expected_terminal_ids=["terminal1", "terminal2"],
-            retained_resources=[],
+        delete.assert_called_once_with("session-lifetime-1", "cao-test")
+
+    @patch("cli_agent_orchestrator.services.session_service.retire_exited_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_changed_authority_is_rejected_before_any_physical_cleanup(self, mock_tmux, retire):
+        mock_tmux.session_exists.return_value = False
+        retire.return_value = True
+        contexts = self._patch_common(_durable_session(lifecycle="exited"))
+        with (
+            contexts[0],
+            contexts[1],
+            contexts[2],
+            contexts[3],
+            contexts[4] as worktrees,
+            contexts[5] as providers,
+            contexts[6] as complete,
+            contexts[7],
+            patch(
+                "cli_agent_orchestrator.services.session_service.revalidate_session_hard_deletion",
+                return_value={
+                    "valid": False,
+                    "reason_code": "SESSION_DELETE_PLAN_CHANGED",
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.purge_session_terminal_artifacts"
+            ) as artifacts,
+        ):
+            with pytest.raises(SessionLifecycleError) as error:
+                delete_session("session-lifetime-1")
+
+        assert error.value.reason_code == "SESSION_DELETE_PLAN_CHANGED"
+        providers.cleanup_provider.assert_not_called()
+        worktrees.assert_not_called()
+        artifacts.assert_not_called()
+        complete.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.session_service.retire_exited_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_already_retired_workspace_is_satisfied_when_physical_absence_is_proven(
+        self, mock_tmux, retire
+    ):
+        mock_tmux.session_exists.return_value = False
+        retire.return_value = True
+        durable = _durable_session(lifecycle="exited")
+        contexts = self._patch_common(durable)
+        operation = {
+            "session_id": "session-lifetime-1",
+            "session_name": "cao-test",
+            "state": "fenced",
+            "terminal_ids": ["terminal1", "terminal2"],
+            "allow_dirty_workspace": False,
+        }
+        with (
+            contexts[0],
+            contexts[1] as prepare,
+            contexts[2] as cancel,
+            contexts[3],
+            contexts[4] as cleanup,
+            contexts[5],
+            contexts[6] as complete,
+            contexts[7],
+            patch(
+                "cli_agent_orchestrator.services.session_service.get_session_hard_deletion_operation",
+                return_value=operation,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.get_writable_work_context_by_session",
+                return_value={
+                    "id": "context-1",
+                    "session_id": "session-lifetime-1",
+                    "state": "retired",
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.claim_session_workspace_retirement"
+            ) as claim,
+            patch(
+                "cli_agent_orchestrator.services.session_service.get_session_workspace_retirement_snapshot"
+            ) as snapshot,
+            patch(
+                "cli_agent_orchestrator.services.session_service.purge_session_terminal_artifacts",
+                return_value={
+                    "runtime_artifacts_absent": True,
+                    "terminals": [
+                        {
+                            "terminal_id": "terminal1",
+                            "logs_removed": 1,
+                            "attachments_removed": 1,
+                        },
+                        {
+                            "terminal_id": "terminal2",
+                            "logs_removed": 1,
+                            "attachments_removed": 0,
+                        },
+                    ],
+                },
+            ) as artifacts,
+        ):
+            result = delete_session("session-lifetime-1")
+
+        assert result["deleted"] == ["cao-test"]
+        prepare.assert_not_called()
+        cancel.assert_not_called()
+        claim.assert_not_called()
+        snapshot.assert_not_called()
+        cleanup.assert_called_once_with(
+            durable["terminals"],
+            ANY,
+            allow_dirty=False,
+            require_already_absent=True,
         )
+        artifacts.assert_called_once_with(["terminal1", "terminal2"])
+        assert result["terminal_artifacts"]["runtime_artifacts_absent"] is True
+        complete.assert_called_once_with("session-lifetime-1", "cao-test")
+
+    @patch("cli_agent_orchestrator.services.session_service.retire_exited_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_hard_delete_cleans_artifacts_for_previously_retired_session_terminal(
+        self, mock_tmux, retire
+    ):
+        mock_tmux.session_exists.return_value = False
+        retire.return_value = True
+        durable = _durable_session(lifecycle="exited")
+        contexts = self._patch_common(durable)
+        graph_ids = ["terminal1", "terminal2", "retired-child"]
+        with (
+            contexts[0],
+            contexts[1],
+            contexts[2],
+            contexts[3],
+            contexts[4],
+            contexts[5],
+            contexts[6],
+            contexts[7],
+            patch(
+                "cli_agent_orchestrator.services.session_service.revalidate_session_hard_deletion",
+                return_value={
+                    "valid": True,
+                    "terminal_ids": ["terminal1", "terminal2"],
+                    "graph_terminal_ids": graph_ids,
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.purge_session_terminal_artifacts",
+                return_value={"runtime_artifacts_absent": True, "terminals": []},
+            ) as artifacts,
+            patch(
+                "cli_agent_orchestrator.services.session_service."
+                "mark_session_hard_deletion_workspace_retired",
+                return_value={"marked": True},
+            ) as mark,
+            patch(
+                "cli_agent_orchestrator.services.session_service."
+                "list_session_historical_terminal_cleanup_authorities",
+                return_value=[
+                    {
+                        "id": "retired-child",
+                        "terminal_id": "retired-child",
+                        "managed": True,
+                        "workspace_cleanup_authority_version": 1,
+                        "managed_worktree_kind": "task",
+                        "managed_worktree_source": "/source/project",
+                        "launch_worktree": "/work/retired-child",
+                        "managed_worktree_branch": "cao/task/retired-child",
+                        "managed_worktree_branch_object_id": "a" * 40,
+                        "managed_worktree_identity": "retired-child",
+                    }
+                ],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.purge_managed_worktree",
+                side_effect=lambda metadata, **_kwargs: {
+                    "removed": True,
+                    "managed": metadata.get("terminal_id") == "retired-child",
+                    "path_absent": True,
+                    "git_unregistered": True,
+                    "branch_absent": True,
+                },
+            ) as cleanup,
+        ):
+            result = delete_session("session-lifetime-1")
+
+        artifacts.assert_called_once_with(graph_ids)
+        evidence = mark.call_args.kwargs["workspace_evidence"]
+        assert [item["terminal_id"] for item in evidence] == graph_ids
+        assert evidence[-1] == {
+            "terminal_id": "retired-child",
+            "managed": True,
+            "path_absent": True,
+            "git_unregistered": True,
+            "branch_absent": True,
+            "runtime_artifacts_absent": True,
+        }
+        cleanup.assert_any_call(
+            {
+                "id": "retired-child",
+                "terminal_id": "retired-child",
+                "managed": True,
+                "workspace_cleanup_authority_version": 1,
+                "managed_worktree_kind": "task",
+                "managed_worktree_source": "/source/project",
+                "launch_worktree": "/work/retired-child",
+                "managed_worktree_branch": "cao/task/retired-child",
+                "managed_worktree_branch_object_id": "a" * 40,
+                "managed_worktree_identity": "retired-child",
+            },
+            require_already_absent=True,
+        )
+        assert result["deleted"] == ["cao-test"]
+
+    @patch("cli_agent_orchestrator.services.session_service.retire_exited_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_explicit_plan_cancels_session_owned_work_then_rechecks_and_deletes(
+        self, mock_tmux, retire
+    ):
+        mock_tmux.session_exists.return_value = False
+        retire.return_value = True
+        contexts = self._patch_common(_durable_session(lifecycle="exited"))
+        cancellable = {
+            "eligible": False,
+            "deletion_mode": "eligible_with_cancellable_work",
+            "cancellable": True,
+            "can_resolve_and_delete": True,
+            "plan_token": "a" * 64,
+            "_unresolved_plan_token": "u" * 64,
+            "_workspace_authority": {"version": 1, "worktrees": []},
+            "_workspace_authority_sha256": "4" * 64,
+            "requires_dirty_confirmation": False,
+            "reason_code": "QUEUED_WORK",
+        }
+        eligible = {
+            "eligible": True,
+            "deletion_mode": "eligible_normal",
+            "cancellable": False,
+            "can_resolve_and_delete": False,
+            "plan_token": None,
+            "_workspace_authority": {"version": 1, "worktrees": []},
+            "_workspace_authority_sha256": "4" * 64,
+            "requires_dirty_confirmation": False,
+            "reason_code": None,
+        }
+        with (
+            contexts[0],
+            contexts[1],
+            contexts[2],
+            contexts[3],
+            contexts[4],
+            contexts[5],
+            contexts[6] as delete,
+            contexts[7],
+            patch(
+                "cli_agent_orchestrator.services.session_service._session_deletion_preflight",
+                side_effect=[cancellable, eligible],
+            ) as preflight,
+            patch(
+                "cli_agent_orchestrator.services.session_service.cancel_session_work_for_deletion",
+                return_value={
+                    "cancelled": True,
+                    "cancelled_count": 2,
+                    "residual": {"eligible": True},
+                },
+            ) as cancel_work,
+        ):
+            result = delete_session(
+                "session-lifetime-1",
+                cancel_unresolved_work=True,
+                cancellation_plan_token="a" * 64,
+            )
+
+        assert result["deleted"] == ["cao-test"]
+        assert preflight.call_count == 2
+        cancel_work.assert_called_once_with(
+            "session-lifetime-1",
+            expected_plan_token="u" * 64,
+            expected_terminal_ids=["terminal1", "terminal2"],
+            cancel_unresolved_work=True,
+            retire_historical_indeterminate=False,
+        )
+        delete.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.session_service.retire_exited_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_explicit_historical_unknown_retirement_then_rechecks_and_deletes(
+        self, mock_tmux, retire
+    ):
+        mock_tmux.session_exists.return_value = False
+        retire.return_value = True
+        contexts = self._patch_common(_durable_session(lifecycle="exited"))
+        retirement = {
+            "eligible": False,
+            "deletion_mode": "eligible_with_historical_indeterminate_retirement",
+            "can_resolve_and_delete": True,
+            "cancellable": False,
+            "requires_historical_indeterminate_confirmation": True,
+            "plan_token": "r" * 64,
+            "_unresolved_plan_token": "v" * 64,
+            "_workspace_authority": {"version": 1, "worktrees": []},
+            "_workspace_authority_sha256": "5" * 64,
+            "requires_dirty_confirmation": False,
+            "reason_code": "HISTORICAL_EFFECT_OUTCOME_UNKNOWN",
+        }
+        eligible = {
+            "eligible": True,
+            "deletion_mode": "eligible_normal",
+            "can_resolve_and_delete": False,
+            "cancellable": False,
+            "plan_token": None,
+            "_workspace_authority": {"version": 1, "worktrees": []},
+            "_workspace_authority_sha256": "5" * 64,
+            "requires_dirty_confirmation": False,
+            "reason_code": None,
+        }
+        with (
+            contexts[0],
+            contexts[1],
+            contexts[2],
+            contexts[3],
+            contexts[4],
+            contexts[5],
+            contexts[6] as delete,
+            contexts[7],
+            patch(
+                "cli_agent_orchestrator.services.session_service._session_deletion_preflight",
+                side_effect=[retirement, eligible],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.cancel_session_work_for_deletion",
+                return_value={
+                    "cancelled": True,
+                    "cancelled_count": 0,
+                    "retired_indeterminate_count": 4,
+                    "residual": {"eligible": True},
+                },
+            ) as resolve_work,
+        ):
+            result = delete_session(
+                "session-lifetime-1",
+                retire_historical_indeterminate=True,
+                cancellation_plan_token="r" * 64,
+            )
+
+        assert result["deleted"] == ["cao-test"]
+        resolve_work.assert_called_once_with(
+            "session-lifetime-1",
+            expected_plan_token="v" * 64,
+            expected_terminal_ids=["terminal1", "terminal2"],
+            cancel_unresolved_work=False,
+            retire_historical_indeterminate=True,
+        )
+        delete.assert_called_once()
+
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_stale_or_unsafe_cancellation_intent_mutates_nothing(self, mock_tmux):
+        mock_tmux.session_exists.return_value = False
+        contexts = self._patch_common(_durable_session(lifecycle="exited"))
+        with (
+            contexts[0],
+            contexts[1] as prepare,
+            contexts[2],
+            contexts[3],
+            contexts[4],
+            contexts[5],
+            contexts[6] as delete,
+            contexts[7],
+            patch(
+                "cli_agent_orchestrator.services.session_service._session_deletion_preflight",
+                return_value={
+                    "eligible": False,
+                    "cancellable": False,
+                    "plan_token": None,
+                    "requires_dirty_confirmation": False,
+                    "reason_code": "INDETERMINATE_EFFECT",
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.cancel_session_work_for_deletion"
+            ) as cancel_work,
+        ):
+            with pytest.raises(SessionLifecycleError) as error:
+                delete_session(
+                    "session-lifetime-1",
+                    cancel_unresolved_work=True,
+                    cancellation_plan_token="b" * 64,
+                )
+
+        assert error.value.reason_code == "SESSION_DELETE_PLAN_CHANGED"
+        cancel_work.assert_not_called()
+        prepare.assert_not_called()
+        delete.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.session_service.retire_exited_terminal_runtime")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
@@ -355,6 +1001,16 @@ class TestDeleteSession:
                     "modified_files": 1,
                     "untracked_files": 1,
                     "reason_code": None,
+                    "_workspace_authority": {
+                        "version": 1,
+                        "work_context": {
+                            "id": "context-1",
+                            "session_id": "session-lifetime-1",
+                            "state": "admitted",
+                        },
+                        "worktrees": [],
+                    },
+                    "_workspace_authority_sha256": "3" * 64,
                 },
             ),
             patch(
@@ -369,7 +1025,15 @@ class TestDeleteSession:
                 return_value={"claimed": True},
             ) as claim,
             patch(
-                "cli_agent_orchestrator.clients.database.transition_writable_work_context",
+                "cli_agent_orchestrator.services.session_service.get_writable_work_context_by_session",
+                return_value={
+                    "id": "context-1",
+                    "session_id": "session-lifetime-1",
+                    "state": "admitted",
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.transition_writable_work_context",
                 return_value=True,
             ),
         ):
@@ -384,15 +1048,21 @@ class TestDeleteSession:
         assert result["deleted"] == ["cao-test"]
         assert result["retained_resources"] == []
         claim.assert_called_once_with("context-1", "exact-session-workspace", allow_dirty=True)
-        assert cleanup.call_count == 2
-        for terminal in durable["terminals"]:
-            cleanup.assert_any_call(terminal, allow_dirty=True)
-        delete.assert_called_once_with(
-            "session-lifetime-1",
-            "cao-test",
-            expected_terminal_ids=["terminal1", "terminal2"],
-            retained_resources=[],
+        cleanup.assert_called_once_with(
+            durable["terminals"],
+            {
+                "version": 1,
+                "work_context": {
+                    "id": "context-1",
+                    "session_id": "session-lifetime-1",
+                    "state": "admitted",
+                },
+                "worktrees": [],
+            },
+            allow_dirty=True,
+            require_already_absent=False,
         )
+        delete.assert_called_once_with("session-lifetime-1", "cao-test")
 
     @patch("cli_agent_orchestrator.services.session_service.resolve_session_lifetime")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")

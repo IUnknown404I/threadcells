@@ -40,20 +40,27 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 from watchdog.observers.polling import PollingObserver
 
+from cli_agent_orchestrator.cli.commands.init import seed_default_skills
 from cli_agent_orchestrator.clients.database import (
     HandoffResultSubmissionError,
+    WorkflowContinuationAuthorityConflict,
     acquire_terminal_runtime_transport,
     cancel_child_assignments_for_terminal,
     create_inbox_message,
     get_inbox_messages,
+    get_session_hard_deletion_operation,
     get_terminal_metadata,
+    get_workflow_compaction_continuation_authority,
     get_writable_work_context_by_session,
     init_db,
     queue_workflow_input_for_provider,
     release_terminal_runtime_operation,
     resolve_workflow_input_binding,
+    retain_queued_workflow_input_binding,
     submit_handoff_result_v1,
     terminal_auth_token_matches,
+    terminal_deletion_auth_token_matches,
+    terminal_deletion_receipt_exists,
 )
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
@@ -101,6 +108,7 @@ from cli_agent_orchestrator.services import (
 from cli_agent_orchestrator.services.inbox_service import LogFileHandler
 from cli_agent_orchestrator.services.operations_service import (
     AdmissionDenied,
+    context_lifecycle_fence,
     get_resource_status,
     load_operations_config,
     set_capacity_settings,
@@ -295,6 +303,7 @@ class HousekeepingRunRequest(BaseModel):
 class FullCleanupRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
+    operation_id: str = Field(min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$")
     expected_plan_id: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     confirmed: Literal[True]
     retire_dirty_worktrees: bool = False
@@ -330,6 +339,31 @@ def _decode_terminal_filename(encoded_filename: str) -> str:
     if not filename or any(ord(character) < 32 or ord(character) == 127 for character in filename):
         raise ValueError("Invalid terminal attachment filename")
     return filename
+
+
+def _store_terminal_attachment(
+    terminal_id: str,
+    store: Any,
+    *args: Any,
+) -> tuple[str | None, str | None]:
+    """Serialize one artifact write against permanent Session deletion."""
+    with context_lifecycle_fence():
+        metadata = get_terminal_metadata(terminal_id)
+        if metadata is None:
+            reason = (
+                "SESSION_DELETED"
+                if terminal_deletion_receipt_exists(terminal_id)
+                else "TERMINAL_NOT_FOUND"
+            )
+            return None, reason
+        session_id = metadata.get("session_id")
+        tmux_session = metadata.get("tmux_session")
+        lifetime = (
+            str(session_id) if session_id else (f"legacy:{tmux_session}" if tmux_session else None)
+        )
+        if lifetime is not None and get_session_hard_deletion_operation(lifetime) is not None:
+            return None, "SESSION_DELETION_IN_PROGRESS"
+        return str(store(terminal_id, *args)), None
 
 
 async def flow_daemon():
@@ -372,6 +406,12 @@ async def _workflow_reconciliation_tick(
 ) -> bool:
     """Run one isolated recovery tick and return whether startup replay remains due."""
     performed_full_recovery = False
+    try:
+        fenced = await _run_workflow_io(workflow_service.fence_stale_provider_runtime_compatibility)
+        if fenced:
+            logger.info("Fenced %s stale Codex runtimes for provider reconnect", fenced)
+    except Exception as exc:
+        logger.warning("Provider runtime compatibility reconciliation failed: %s", exc)
     try:
         workspaces = await _run_workflow_io(
             managed_worktree_service.reconcile_writable_work_context_provisioning
@@ -482,7 +522,7 @@ class CodexSessionIdentityRequest(BaseModel):
     session_id: str = Field(pattern=r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
     transcript_path: str
     cwd: str
-    source: Literal["startup", "resume"]
+    source: Literal["startup", "resume", "compact"]
     runtime_generation: str = Field(pattern=r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 
 
@@ -548,6 +588,26 @@ async def lifespan(app: FastAPI):
     logger.info("Starting CLI Agent Orchestrator server...")
     setup_logging()
     init_db()
+    from cli_agent_orchestrator.services.full_cleanup_operation_service import (
+        reconcile_interrupted_full_cleanup_operations,
+    )
+
+    cleanup_recovery = reconcile_interrupted_full_cleanup_operations(include_admitted=True)
+    if cleanup_recovery["terminalized"]:
+        logger.warning(
+            "Terminalized %s interrupted Full Cleanup operations at startup",
+            cleanup_recovery["terminalized"],
+        )
+    # This durable barrier precedes API availability and every startup queue
+    # replay. A resident Codex process retains the hook matcher parsed by its
+    # launch release; it must be reconnected before current code can restore
+    # compacted authority or send another workflow continuation.
+    startup_fenced_runtimes = workflow_service.fence_stale_provider_runtime_compatibility()
+    if startup_fenced_runtimes:
+        logger.info(
+            "Fenced %s pre-promotion Codex runtimes before startup replay",
+            startup_fenced_runtimes,
+        )
     from cli_agent_orchestrator.services.control_plane_registry import (
         initialize_control_plane_registries,
     )
@@ -1398,10 +1458,10 @@ async def get_housekeeping_plan_endpoint(
         plan = await run_in_threadpool(lambda: plan_housekeeping_serialized(mode=mode))
         return plan.as_dict()
     except RuntimeError as exc:
-        if str(exc) == "HOUSEKEEPING_BUSY":
+        if str(exc) in {"HOUSEKEEPING_BUSY", "FULL_CLEANUP_OPERATION_ACTIVE"}:
             raise HTTPException(
                 status_code=status.HTTP_423_LOCKED,
-                detail={"reason_code": "HOUSEKEEPING_BUSY"},
+                detail={"reason_code": str(exc)},
             ) from exc
         raise
 
@@ -1432,10 +1492,10 @@ async def run_housekeeping_endpoint(
         )
         return summary.as_dict()
     except RuntimeError as exc:
-        if str(exc) == "HOUSEKEEPING_BUSY":
+        if str(exc) in {"HOUSEKEEPING_BUSY", "FULL_CLEANUP_OPERATION_ACTIVE"}:
             raise HTTPException(
                 status_code=status.HTTP_423_LOCKED,
-                detail={"reason_code": "HOUSEKEEPING_BUSY"},
+                detail={"reason_code": str(exc)},
             ) from exc
         if str(exc) == "HOUSEKEEPING_PLAN_CHANGED":
             raise HTTPException(
@@ -1454,10 +1514,11 @@ async def get_full_cleanup_plan_endpoint(retire_dirty_worktrees: bool = False) -
     )
 
     try:
-        return await run_in_threadpool(
+        result = await run_in_threadpool(
             plan_full_cleanup_serialized,
             retire_dirty_worktrees=retire_dirty_worktrees,
         )
+        return {**result, "operation_id": uuid4().hex}
     except RuntimeError as exc:
         if str(exc) == "HOUSEKEEPING_BUSY":
             raise HTTPException(
@@ -1482,18 +1543,31 @@ async def run_full_cleanup_endpoint(
     from cli_agent_orchestrator.services.housekeeping_service import run_full_cleanup
 
     actor = _require_operator(request, authorization)
-    session_token = (
-        request.cookies.get(OPERATOR_SESSION_COOKIE)
-        if actor.startswith("operator_session:")
-        else None
+    actor_kind = "operator_session" if actor.startswith("operator_session:") else "operator_bearer"
+    from cli_agent_orchestrator.clients.database import get_full_cleanup_operation
+    from cli_agent_orchestrator.services.full_cleanup_operation_service import (
+        public_operation,
+        report_from_operation,
     )
-    bearer_secret = (
-        authorization[len("Bearer ") :]
-        if actor == "operator_bearer"
-        and authorization is not None
-        and authorization.startswith("Bearer ")
-        else None
-    )
+
+    existing = get_full_cleanup_operation(body.operation_id)
+    if existing is not None:
+        if (
+            existing["plan_id"] != body.expected_plan_id
+            or existing["retire_dirty_worktrees"] != body.retire_dirty_worktrees
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"reason_code": "FULL_CLEANUP_OPERATION_AUTHORITY_CHANGED"},
+            )
+        recovered = report_from_operation(existing)
+        if recovered is not None:
+            return {
+                **recovered.as_dict(),
+                "operation_id": body.operation_id,
+                "operation_state": existing["state"],
+            }
+        return public_operation(existing)
     try:
         summary = await run_in_threadpool(
             lambda: run_full_cleanup(
@@ -1501,15 +1575,20 @@ async def run_full_cleanup_endpoint(
                 confirmed=body.confirmed,
                 retire_dirty_worktrees=body.retire_dirty_worktrees,
                 privileged_cleanup_executor=lambda **_kwargs: execute_via_privileged_helper(
+                    operation_id=body.operation_id,
                     expected_plan_id=body.expected_plan_id,
                     confirmed=True,
-                    session_token=session_token,
-                    bearer_secret=bearer_secret,
+                    actor_kind=actor_kind,
                     retire_dirty_worktrees=body.retire_dirty_worktrees,
                 ),
             )
         )
-        return summary.as_dict()
+        operation = get_full_cleanup_operation(body.operation_id)
+        return {
+            **summary.as_dict(),
+            "operation_id": body.operation_id,
+            "operation_state": (operation or {}).get("state"),
+        }
     except (FullCleanupHelperError, RuntimeError) as exc:
         reason = str(exc)
         diagnostic_id = (
@@ -1525,7 +1604,11 @@ async def run_full_cleanup_endpoint(
         if not re.fullmatch(r"[A-Z0-9_]{3,96}", reason):
             reason = "FULL_CLEANUP_EXECUTION_FAILED"
             detail["reason_code"] = reason
-        if reason in {"HOUSEKEEPING_BUSY", "FULL_CLEANUP_ADMISSION_BUSY"}:
+        if reason in {
+            "HOUSEKEEPING_BUSY",
+            "FULL_CLEANUP_ADMISSION_BUSY",
+            "FULL_CLEANUP_OPERATION_ACTIVE",
+        }:
             raise HTTPException(
                 status_code=status.HTTP_423_LOCKED,
                 detail=detail,
@@ -1534,6 +1617,7 @@ async def run_full_cleanup_endpoint(
             "HOUSEKEEPING_PLAN_CHANGED",
             "FULL_CLEANUP_NOT_IDLE",
             "FULL_CLEANUP_IDLE_INVENTORY_UNKNOWN",
+            "FULL_CLEANUP_OPERATION_AUTHORITY_CHANGED",
         }:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -1553,6 +1637,41 @@ async def run_full_cleanup_endpoint(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=detail,
         ) from exc
+
+
+@app.get("/api/v1/housekeeping/full-cleanup/operations/latest")
+async def get_latest_full_cleanup_operation_endpoint() -> Dict:
+    from cli_agent_orchestrator.clients.database import get_latest_full_cleanup_operation
+    from cli_agent_orchestrator.services.full_cleanup_operation_service import (
+        public_operation,
+        reconcile_interrupted_full_cleanup_operations,
+    )
+
+    reconcile_interrupted_full_cleanup_operations(include_admitted=False)
+    return public_operation(get_latest_full_cleanup_operation())
+
+
+@app.get("/api/v1/housekeeping/full-cleanup/operations/{operation_id}")
+async def get_full_cleanup_operation_endpoint(operation_id: str) -> Dict:
+    from cli_agent_orchestrator.clients.database import get_full_cleanup_operation
+    from cli_agent_orchestrator.services.full_cleanup_operation_service import (
+        public_operation,
+        reconcile_interrupted_full_cleanup_operations,
+    )
+
+    if not re.fullmatch(r"[0-9a-f]{32}", operation_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"reason_code": "FULL_CLEANUP_OPERATION_NOT_FOUND"},
+        )
+    reconcile_interrupted_full_cleanup_operations(include_admitted=False)
+    operation = get_full_cleanup_operation(operation_id)
+    if operation is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"reason_code": "FULL_CLEANUP_OPERATION_NOT_FOUND"},
+        )
+    return public_operation(operation)
 
 
 @app.get("/api/v1/housekeeping/report")
@@ -1974,6 +2093,11 @@ async def list_ui_interactions(
             limit=limit,
             cursor=cursor,
         )
+    except interaction_read_model_service.SessionInteractionsDeleted as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "SESSION_DELETED", "message": "Session was permanently deleted"},
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -2024,6 +2148,9 @@ async def delete_session(
     request: Request,
     session_name: str,
     confirm_dirty_workspace: bool = False,
+    cancel_unresolved_work: bool = False,
+    retire_historical_indeterminate: bool = False,
+    cancellation_plan_token: Optional[str] = None,
 ) -> Dict:
     try:
         result = await run_in_threadpool(
@@ -2031,6 +2158,9 @@ async def delete_session(
             session_name,
             registry=get_plugin_registry(request),
             confirm_dirty_workspace=confirm_dirty_workspace,
+            cancel_unresolved_work=cancel_unresolved_work,
+            retire_historical_indeterminate=retire_historical_indeterminate,
+            cancellation_plan_token=cancellation_plan_token,
         )
         return {"success": True, **result}
     except (SessionNotFoundError, ValueError, SessionLifecycleError) as e:
@@ -2487,18 +2617,50 @@ async def send_orchestrated_terminal_input(
     Its opaque binding is issued by CAO and resolves only while that durable
     turn remains current; it never accepts a caller-selected logical turn.
     """
-    turn_id = resolve_workflow_input_binding(terminal_id, binding)
-    if turn_id is None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="input binding is stale")
-    return await run_in_threadpool(
-        _send_server_bound_input,
-        request,
-        terminal_id,
-        message,
-        turn_id,
-        sender_id=sender_id,
-        orchestration_type=orchestration_type,
-    )
+
+    def deliver_bound_input() -> Dict:
+        from cli_agent_orchestrator.services.operations_service import (
+            workflow_execution_admission_fence,
+        )
+
+        # Re-resolve the opaque binding only after taking the global admission
+        # fence. A newer workflow input that wins first invalidates this send;
+        # once this fence wins, no competing direct/public input can replace
+        # the review turn between checkout preparation and tmux transport.
+        with workflow_execution_admission_fence():
+            turn_id = resolve_workflow_input_binding(terminal_id, binding)
+            if turn_id is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT, detail="input binding is stale"
+                )
+            queued_delivery = retain_queued_workflow_input_binding(terminal_id, binding, message)
+            if queued_delivery is not None:
+                # Rolling-upgrade/runtime recovery already owns this exact
+                # server-bound turn.  Persist its payload, wake the canonical
+                # queue, and acknowledge durable acceptance without touching
+                # the incompatible resident provider process.
+                inbox_service.wake_provider_execution_queue(get_plugin_registry(request))
+                return {
+                    "success": True,
+                    "queued": True,
+                    "status": (
+                        "queued_runtime_recovery"
+                        if queued_delivery["reconnect_pending"]
+                        else "queued_provider_execution"
+                    ),
+                    "reason_code": queued_delivery["queue_reason"],
+                    "turn_id": queued_delivery["turn_id"],
+                }
+            return _send_server_bound_input(
+                request,
+                terminal_id,
+                message,
+                turn_id,
+                sender_id=sender_id,
+                orchestration_type=orchestration_type,
+            )
+
+    return await run_in_threadpool(deliver_bound_input)
 
 
 @app.post("/_internal/delegation-results/handoff-v1", include_in_schema=False)
@@ -2526,8 +2688,8 @@ async def bind_codex_session_identity_endpoint(
     terminal_id: TerminalId,
     request: Request,
     body: CodexSessionIdentityRequest,
-) -> Dict[str, str]:
-    """Bind the exact foreground Codex root before its first model request."""
+) -> Dict[str, Any]:
+    """Bind the foreground Codex root and restore proven compact authority."""
     authorization = request.headers.get("authorization", "")
     scheme, _, token = authorization.partition(" ")
     if (
@@ -2535,6 +2697,8 @@ async def bind_codex_session_identity_endpoint(
         or not token
         or not terminal_auth_token_matches(terminal_id, token)
     ):
+        if token and terminal_deletion_auth_token_matches(terminal_id, token):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="session_deleted")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_terminal_auth"
         )
@@ -2545,6 +2709,8 @@ async def bind_codex_session_identity_endpoint(
     # terminal authority. It may request only the exact durable rebind below;
     # malformed/missing generations and every fresh identity remain fenced.
     if not caller_generation_is_current and not re.fullmatch(r"[0-9a-f]{64}", caller_generation):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="stale_runtime_generation")
+    if body.source == "compact" and not caller_generation_is_current:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="stale_runtime_generation")
     try:
         identity = await run_in_threadpool(
@@ -2568,7 +2734,26 @@ async def bind_codex_session_identity_endpoint(
                 else "stale_identity_rebind_not_proven"
             ),
         ) from exc
-    return {"session_id": identity}
+    response: Dict[str, Any] = {"session_id": identity}
+    if body.source == "compact":
+        try:
+            continuation_authority = await run_in_threadpool(
+                partial(
+                    get_workflow_compaction_continuation_authority,
+                    terminal_id,
+                    terminal_auth_token=token,
+                    runtime_generation=body.runtime_generation,
+                    provider_resume_identity=identity,
+                )
+            )
+        except WorkflowContinuationAuthorityConflict as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="continuation_authority_not_proven",
+            ) from exc
+        if continuation_authority is not None:
+            response["continuation_authority"] = continuation_authority
+    return response
 
 
 @app.post(
@@ -2588,6 +2773,8 @@ async def persist_codex_turn_complete_endpoint(
         or not token
         or not terminal_auth_token_matches(terminal_id, token)
     ):
+        if token and terminal_deletion_auth_token_matches(terminal_id, token):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="session_deleted")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_terminal_auth"
         )
@@ -2625,6 +2812,8 @@ async def create_terminal_image_attachment(
 ) -> TerminalAttachmentResponse:
     """Store one browser image in a generated, short-lived terminal runtime path."""
     if not get_terminal_metadata(terminal_id):
+        if terminal_deletion_receipt_exists(terminal_id):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="session_deleted")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"Terminal '{terminal_id}' not found"
         )
@@ -2646,9 +2835,25 @@ async def create_terminal_image_attachment(
                 )
             content.extend(chunk)
 
-        path = terminal_attachments.store_terminal_image(
-            terminal_id, normalized_mime, bytes(content)
+        path, denial = await run_in_threadpool(
+            partial(
+                _store_terminal_attachment,
+                terminal_id,
+                terminal_attachments.store_terminal_image,
+                normalized_mime,
+                bytes(content),
+            )
         )
+        if denial is not None:
+            raise HTTPException(
+                status_code=(
+                    status.HTTP_404_NOT_FOUND
+                    if denial == "TERMINAL_NOT_FOUND"
+                    else status.HTTP_409_CONFLICT
+                ),
+                detail=denial.lower(),
+            )
+        assert path is not None
         return TerminalAttachmentResponse(path=str(path))
     except HTTPException:
         raise
@@ -2677,6 +2882,8 @@ async def create_terminal_file_attachment(
 ) -> TerminalAttachmentResponse:
     """Store one validated text or opaque ZIP file in a generated private runtime path."""
     if not get_terminal_metadata(terminal_id):
+        if terminal_deletion_receipt_exists(terminal_id):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="session_deleted")
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"Terminal '{terminal_id}' not found"
         )
@@ -2704,7 +2911,25 @@ async def create_terminal_file_attachment(
                     detail=size_error,
                 )
             content.extend(chunk)
-        path = terminal_attachments.store_terminal_file(terminal_id, filename, bytes(content))
+        path, denial = await run_in_threadpool(
+            partial(
+                _store_terminal_attachment,
+                terminal_id,
+                terminal_attachments.store_terminal_file,
+                filename,
+                bytes(content),
+            )
+        )
+        if denial is not None:
+            raise HTTPException(
+                status_code=(
+                    status.HTTP_404_NOT_FOUND
+                    if denial == "TERMINAL_NOT_FOUND"
+                    else status.HTTP_409_CONFLICT
+                ),
+                detail=denial.lower(),
+            )
+        assert path is not None
         return TerminalAttachmentResponse(path=str(path))
     except HTTPException:
         raise
@@ -3356,6 +3581,7 @@ def main():
         constants.KIRO_AGENTS_DIR = Path(args.agents_dir)
         logger.info(f"Using agents directory: {args.agents_dir}")
 
+    seed_default_skills()
     host = args.host or SERVER_HOST
     port = args.port or SERVER_PORT
     uvicorn.run(app, host=host, port=port)

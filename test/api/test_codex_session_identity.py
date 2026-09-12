@@ -2,6 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
+from cli_agent_orchestrator.clients.database import WorkflowContinuationAuthorityConflict
 from cli_agent_orchestrator.runtime_generation import (
     ACTIVE_RUNTIME_GENERATION,
     RUNTIME_GENERATION_HEADER,
@@ -44,6 +45,31 @@ def test_codex_session_identity_requires_exact_terminal_bearer(client):
             headers=_headers(),
         )
     assert response.status_code == 401
+
+
+def test_deleted_terminal_callback_is_rejected_without_resurrection(client):
+    with (
+        patch("cli_agent_orchestrator.api.main.terminal_auth_token_matches", return_value=False),
+        patch(
+            "cli_agent_orchestrator.api.main.terminal_deletion_auth_token_matches",
+            return_value=True,
+        ),
+    ):
+        identity = client.post(
+            "/_internal/terminals/abcdef12/codex-session-identity",
+            json=_payload(),
+            headers=_headers(),
+        )
+        completion = client.post(
+            "/_internal/terminals/abcdef12/codex-turn-complete",
+            json=_completion_payload(),
+            headers=_headers(),
+        )
+
+    assert identity.status_code == 409
+    assert identity.json()["detail"] == "session_deleted"
+    assert completion.status_code == 409
+    assert completion.json()["detail"] == "session_deleted"
 
 
 def test_codex_session_identity_allows_stale_api_generation_only_as_exact_rebind(
@@ -103,6 +129,28 @@ def test_codex_session_identity_allows_stale_api_generation_only_as_exact_rebind
         runtime_generation=generation,
         require_existing_binding=True,
     )
+
+
+def test_codex_compaction_rejects_stale_hook_generation_before_identity_rebind(client):
+    payload = {**_payload(), "source": "compact"}
+    stale_generation = "b" * 64
+    if stale_generation == ACTIVE_RUNTIME_GENERATION:
+        stale_generation = "c" * 64
+    with (
+        patch("cli_agent_orchestrator.api.main.terminal_auth_token_matches", return_value=True),
+        patch(
+            "cli_agent_orchestrator.api.main.terminal_service.bind_provider_runtime_session_identity"
+        ) as bind,
+    ):
+        response = client.post(
+            "/_internal/terminals/abcdef12/codex-session-identity",
+            json=payload,
+            headers=_headers(stale_generation),
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "stale_runtime_generation"
+    bind.assert_not_called()
 
 
 def test_codex_session_identity_rejects_malformed_api_generation_before_proof(client):
@@ -192,6 +240,70 @@ def test_codex_session_identity_fails_closed_when_foreground_proof_fails(client)
         )
     assert response.status_code == 409
     assert response.json()["detail"] == "identity_not_proven"
+
+
+def test_codex_compaction_restores_only_server_proven_current_authority(client):
+    payload = {**_payload(), "source": "compact"}
+    authority = {
+        "authority_version": 1,
+        "workflow_id": 9,
+        "logical_turn_id": 73,
+        "resume_token": "r" * 43,
+        "receiver_terminal_id": "abcdef12",
+        "runtime_generation": payload["runtime_generation"],
+    }
+    with (
+        patch("cli_agent_orchestrator.api.main.terminal_auth_token_matches", return_value=True),
+        patch(
+            "cli_agent_orchestrator.api.main.terminal_service.bind_provider_runtime_session_identity",
+            return_value=payload["session_id"],
+        ) as bind,
+        patch(
+            "cli_agent_orchestrator.api.main.get_workflow_compaction_continuation_authority",
+            return_value=authority,
+        ) as restore,
+    ):
+        response = client.post(
+            "/_internal/terminals/abcdef12/codex-session-identity",
+            json=payload,
+            headers=_headers(),
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "session_id": payload["session_id"],
+        "continuation_authority": authority,
+    }
+    assert bind.call_args.kwargs["source"] == "compact"
+    restore.assert_called_once_with(
+        "abcdef12",
+        terminal_auth_token="terminal-secret",
+        runtime_generation=payload["runtime_generation"],
+        provider_resume_identity=payload["session_id"],
+    )
+
+
+def test_codex_compaction_fails_closed_when_admitted_authority_is_unproven(client):
+    payload = {**_payload(), "source": "compact"}
+    with (
+        patch("cli_agent_orchestrator.api.main.terminal_auth_token_matches", return_value=True),
+        patch(
+            "cli_agent_orchestrator.api.main.terminal_service.bind_provider_runtime_session_identity",
+            return_value=payload["session_id"],
+        ),
+        patch(
+            "cli_agent_orchestrator.api.main.get_workflow_compaction_continuation_authority",
+            side_effect=WorkflowContinuationAuthorityConflict("continuation_authority_not_proven"),
+        ),
+    ):
+        response = client.post(
+            "/_internal/terminals/abcdef12/codex-session-identity",
+            json=payload,
+            headers=_headers(),
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "continuation_authority_not_proven"
 
 
 def test_codex_turn_complete_requires_exact_terminal_bearer(client):

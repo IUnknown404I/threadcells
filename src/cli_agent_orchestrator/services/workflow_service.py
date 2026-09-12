@@ -15,6 +15,7 @@ from cli_agent_orchestrator.clients.database import (
     claim_workflow_provider_reconnect,
     claim_workflow_turn,
     complete_workflow_provider_reconnect,
+    count_stale_provider_runtime_compatibilities,
     fail_workflow_provider_reconnect_attempt,
     get_handoff_child_status,
     get_open_workflow_root_terminal_ids,
@@ -31,6 +32,7 @@ from cli_agent_orchestrator.clients.database import (
     prepare_workflow_input,
     renew_workflow_provider_reconnect,
     renew_workflow_turn_claim,
+    request_stale_provider_runtime_reconnects,
     request_workflow_provider_reconnect,
     requeue_expired_workflow_turn_claims,
     requeue_workflow_turn,
@@ -52,6 +54,19 @@ class ProviderResumeIdentityUnavailable(RuntimeError):
     """Reconnect has no launch-bound identity it can safely resume."""
 
     reconnect_outcome_code = "resume_identity_unavailable_or_unproven"
+
+
+def fence_stale_provider_runtime_compatibility(now: datetime | None = None) -> int:
+    """Audit all stale residents and eagerly reconnect eligible executions."""
+    from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
+
+    stale = count_stale_provider_runtime_compatibilities(ACTIVE_RUNTIME_GENERATION)
+    if stale:
+        logger.debug(
+            "Observed %s resident Codex runtimes behind the active compatibility generation",
+            stale,
+        )
+    return request_stale_provider_runtime_reconnects(ACTIVE_RUNTIME_GENERATION, now=now)
 
 
 class _WorkflowTurnClaimHeartbeat:

@@ -2,6 +2,10 @@
 
 from unittest.mock import patch
 
+from cli_agent_orchestrator.services.interaction_read_model_service import (
+    SessionInteractionsDeleted,
+)
+
 
 def _page(mode: str):
     return {
@@ -49,3 +53,17 @@ def test_interaction_endpoint_rejects_service_cursor_error(client):
 def test_interaction_endpoint_bounds_page_size(client):
     response = client.get("/ui/interactions?session_id=session-1&limit=51")
     assert response.status_code == 422
+
+
+def test_interaction_endpoint_returns_deleted_semantics_after_hard_purge(client):
+    with patch(
+        "cli_agent_orchestrator.api.main.interaction_read_model_service.list_interactions",
+        side_effect=SessionInteractionsDeleted("SESSION_DELETED"),
+    ):
+        response = client.get("/ui/interactions?session_id=session-1&mode=history")
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == {
+        "code": "SESSION_DELETED",
+        "message": "Session was permanently deleted",
+    }

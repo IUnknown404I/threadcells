@@ -48,6 +48,8 @@ from cli_agent_orchestrator.clients.database import (
     bind_workflow_turn_provider_outcome_cursor,
     cancel_child_assignments_for_terminal,
     cancel_workflows_for_terminal,
+    claim_exited_terminal_provider_execution_reconciliation,
+    claim_review_worktree_preparation,
     claim_terminal_runtime_exit,
 )
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
@@ -65,6 +67,7 @@ from cli_agent_orchestrator.clients.database import (
     get_writable_work_context_by_request,
     has_admitted_workflow_turn,
     list_all_terminals,
+    list_exited_terminal_provider_execution_candidates,
     mark_handoff_child_input_received,
     mark_recovery_takeover_completed,
     mark_recovery_takeover_dispatch_uncertain,
@@ -76,10 +79,13 @@ from cli_agent_orchestrator.clients.database import (
     persist_terminal_provider_last_response,
     persist_terminal_result_snapshot,
     promote_terminal_context_role_to_supervisor,
+    reconcile_exited_terminal_provider_execution_authority,
     reconcile_legacy_terminal_runtime_identity,
     reconcile_terminal_runtime_process_identity,
     record_workflow_provider_reconnect_output_boundary,
+    release_exited_terminal_provider_execution_reconciliation_claim,
     release_provider_execution,
+    release_review_worktree_preparation,
     release_terminal_runtime_operation,
     replace_starting_terminal_runtime_identity,
     requeue_settled_unadmitted_workflow_turn,
@@ -87,6 +93,7 @@ from cli_agent_orchestrator.clients.database import (
     reserve_writable_work_context,
     reset_recovery_takeover_after_confirmed_prestart_failure,
     resolve_session_lifetime,
+    review_worktree_preparation_owned,
     terminal_deletion_receipt_exists,
     terminal_requires_result_snapshot,
     terminal_runtime_operation_owned,
@@ -114,6 +121,7 @@ from cli_agent_orchestrator.providers.codex import (
     _bounded_response_suffix,
 )
 from cli_agent_orchestrator.providers.manager import provider_manager
+from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
 from cli_agent_orchestrator.services.compressed_output_index import (
     CompressedOutputIndex,
     open_compressed_output_index,
@@ -1283,7 +1291,7 @@ def reconcile_terminal_runtime(
     if metadata.get("runtime_lifecycle") in {"exited", "recovery_fenced"}:
         if metadata.get("runtime_lifecycle") == "recovery_fenced":
             return True
-        _retire_exited_terminal_runtime(metadata)
+        _reconcile_exited_terminal_provider_execution_authority(metadata, proc_root=proc_root)
         return True
     if metadata.get("runtime_lifecycle") == TerminalLifecycle.RECOVERY_REQUIRED.value:
         # This is already a durable non-writable recovery boundary. Runtime
@@ -1489,6 +1497,70 @@ def retire_exited_terminal_runtime(
     if not metadata:
         return None
     return _retire_exited_terminal_runtime(metadata, proc_root=proc_root)
+
+
+def _reconcile_exited_terminal_provider_execution_authority(
+    metadata: Dict[str, Any], *, proc_root: Path = Path("/proc")
+) -> bool:
+    """Fence claimants, prove physical death, and atomically settle one runtime."""
+    terminal_id = str(metadata.get("id") or "")
+    if not terminal_id:
+        return False
+    observed_authority = {
+        field: metadata.get(field) for field in TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
+    }
+    claim = claim_exited_terminal_provider_execution_reconciliation(
+        terminal_id,
+        expected_runtime_authority=observed_authority,
+    )
+    if claim is None:
+        return False
+    claim_token = str(claim["claim_token"])
+    claimed_authority = claim["runtime_authority"]
+    retired, _reason = _retire_observed_dead_runtime(metadata, proc_root=proc_root)
+    if not retired:
+        release_exited_terminal_provider_execution_reconciliation_claim(terminal_id, claim_token)
+        return False
+    reconciled = reconcile_exited_terminal_provider_execution_authority(
+        terminal_id,
+        expected_runtime_authority=claimed_authority,
+        claim_token=claim_token,
+    )
+    if not reconciled:
+        release_exited_terminal_provider_execution_reconciliation_claim(terminal_id, claim_token)
+    return reconciled
+
+
+def reconcile_exited_terminal_provider_execution_authorities(
+    *, proc_root: Path = Path("/proc"), limit: int = 100
+) -> int:
+    """Settle exited provider turns only after exact physical death proof.
+
+    Runtime lifecycle is necessary but not sufficient here.  The exact pane
+    must also be absent or safely retired before the database CAS rechecks
+    generation, writer, reconnect, recovery, and operation authority.
+    """
+    reconciled = 0
+    after_terminal_id: str | None = None
+    while True:
+        candidates = list_exited_terminal_provider_execution_candidates(
+            limit=limit, after_terminal_id=after_terminal_id
+        )
+        if not candidates:
+            break
+        for terminal_id in candidates:
+            metadata = get_terminal_metadata(terminal_id)
+            if not metadata or metadata.get("runtime_lifecycle") != "exited":
+                continue
+            reconciled += int(
+                _reconcile_exited_terminal_provider_execution_authority(
+                    metadata, proc_root=proc_root
+                )
+            )
+        after_terminal_id = candidates[-1]
+        if len(candidates) < limit:
+            break
+    return reconciled
 
 
 def _canonical_worktree(working_directory: Optional[str]) -> str:
@@ -1775,6 +1847,9 @@ def _create_terminal_after_admission(
                 runtime_process_start_ticks=runtime_target.process_start_ticks,
                 runtime_process_group_id=runtime_target.process_group_id,
                 runtime_process_session_id=runtime_target.process_session_id,
+                provider_runtime_compatibility_generation=(
+                    ACTIVE_RUNTIME_GENERATION if provider == ProviderType.CODEX.value else None
+                ),
                 recovery_takeover_id=recovery_takeover_id,
             )
             metadata_persisted = True
@@ -2667,16 +2742,16 @@ def bind_provider_runtime_session_identity(
     A fresh Codex TUI has no conversation while idle. The provider-native
     identity first exists at ``SessionStart``, before the first model request;
     this method fences that callback to the managed terminal generation and
-    exact foreground writable transcript. An immutable pre-promotion hook may
-    request only an exact rebind of the already-durable provider identity; it
-    cannot introduce or rotate provider authority under the new service.
+    exact foreground writable transcript. Resume and compaction callbacks may
+    only re-prove an already-durable provider identity; neither may introduce
+    or rotate provider authority.
     """
     metadata = get_terminal_metadata(terminal_id)
     if (
         metadata is None
         or metadata.get("provider") != ProviderType.CODEX.value
         or metadata.get("runtime_lifecycle") not in {"starting", "running"}
-        or source not in {"startup", "resume"}
+        or source not in {"startup", "resume", "compact"}
         or not isinstance(runtime_generation, str)
         or not hmac.compare_digest(
             str(metadata.get("runtime_generation") or ""), runtime_generation
@@ -2685,7 +2760,8 @@ def bind_provider_runtime_session_identity(
         or not os.path.isabs(transcript_path)
     ):
         raise RuntimeError("Codex session identity callback is stale or malformed")
-    if require_existing_binding and (
+    exact_rebind_required = require_existing_binding or source == "compact"
+    if exact_rebind_required and (
         not isinstance(metadata.get("provider_resume_identity"), str)
         or not hmac.compare_digest(str(metadata["provider_resume_identity"]), resume_identity)
         or not isinstance(metadata.get("provider_resume_runtime_generation"), str)
@@ -2731,7 +2807,7 @@ def bind_provider_runtime_session_identity(
         provider=ProviderType.CODEX.value,
         resume_identity=verified,
         runtime_generation=runtime_generation,
-        require_existing_binding=require_existing_binding,
+        require_existing_binding=exact_rebind_required,
     ):
         raise RuntimeError("Could not durably bind Codex session identity")
     bootstrap_turn_id = get_workflow_turn_provider_outcome_cursor_bootstrap(
@@ -2923,6 +2999,7 @@ def request_provider_runtime_sidecar_reconnect(
     reconnect_kwargs: Dict[str, Any] = {}
     if claim_token is not None:
         reconnect_kwargs["runtime_operation_claim_token"] = claim_token
+        reconnect_kwargs["runtime_operation_claim_kind"] = "reconnect"
     send_input(
         terminal_id,
         reconnect_input,
@@ -3138,6 +3215,8 @@ def send_input(
     orchestration_type: OrchestrationType | None = None,
     logical_turn_id: int | None = None,
     runtime_operation_claim_token: str | None = None,
+    runtime_operation_claim_kind: str | None = None,
+    expected_review_revision: str | None = None,
     workflow_turn_claim_token: str | None = None,
     workflow_turn_claim_generation: int | None = None,
 ) -> bool:
@@ -3149,6 +3228,7 @@ def send_input(
     bracketed paste triggers multi-line mode).
     """
     runtime_operation_token: str | None = None
+    review_preparation_claim_acquired = False
     provider_execution_released = False
     try:
         metadata = get_terminal_metadata(terminal_id)
@@ -3168,13 +3248,52 @@ def send_input(
 
         execution_acquired = False
         transport_accepted = False
+        if runtime_operation_claim_token is None and logical_turn_id is not None:
+            preparation = claim_review_worktree_preparation(terminal_id, logical_turn_id)
+            if preparation.get("required"):
+                if not preparation.get("claimed"):
+                    from cli_agent_orchestrator.services.operations_service import AdmissionDenied
+
+                    raise AdmissionDenied(
+                        str(
+                            preparation.get(
+                                "reason_code", "REVIEW_WORKTREE_PREPARATION_UNAVAILABLE"
+                            )
+                        ),
+                        {},
+                    )
+                runtime_operation_claim_token = str(preparation["claim_token"])
+                runtime_operation_claim_kind = "review_worktree_prepare"
+                expected_review_revision = str(preparation["revision"])
+                review_preparation_claim_acquired = True
+                runtime_operation_token = runtime_operation_claim_token
+                from cli_agent_orchestrator.services.managed_worktree_service import (
+                    prepare_reviewer_worktree_revision,
+                )
+
+                prepare_reviewer_worktree_revision(metadata, expected_review_revision)
         if runtime_operation_claim_token is not None:
-            if not terminal_runtime_operation_owned(
-                terminal_id, runtime_operation_claim_token, "reconnect"
-            ):
-                raise RuntimeError("provider reconnect lost runtime-operation ownership")
+            if runtime_operation_claim_kind == "review_worktree_prepare":
+                if (
+                    logical_turn_id is None
+                    or expected_review_revision is None
+                    or not review_worktree_preparation_owned(
+                        terminal_id,
+                        logical_turn_id,
+                        runtime_operation_claim_token,
+                        expected_review_revision,
+                    )
+                ):
+                    raise RuntimeError("review worktree preparation lost authority")
+            elif runtime_operation_claim_kind == "reconnect":
+                if not terminal_runtime_operation_owned(
+                    terminal_id, runtime_operation_claim_token, "reconnect"
+                ):
+                    raise RuntimeError("provider reconnect lost runtime-operation ownership")
+            else:
+                raise RuntimeError("runtime-operation claim kind is invalid")
             runtime_operation_token = runtime_operation_claim_token
-        elif logical_turn_id is not None:
+        if logical_turn_id is not None and runtime_operation_claim_kind != "reconnect":
             from cli_agent_orchestrator.services.operations_service import (
                 acquire_provider_execution_slot,
             )
@@ -3190,6 +3309,13 @@ def send_input(
                 _wake_queued_provider_execution(registry)
             raise AdmissionDenied("TERMINAL_RUNTIME_OPERATION_BUSY", {})
         try:
+            if expected_review_revision is not None:
+                from cli_agent_orchestrator.services.managed_worktree_service import (
+                    reviewer_worktree_matches_revision,
+                )
+
+                if not reviewer_worktree_matches_revision(metadata, expected_review_revision):
+                    raise RuntimeError("review worktree revision changed before provider transport")
             if logical_turn_id is not None:
                 cursor_requirement = getattr(provider, "turn_outcome_cursor_required", None)
                 cursor_required = bool(cursor_requirement and cursor_requirement() is True)
@@ -3233,6 +3359,8 @@ def send_input(
                     workflow_turn_claim_token,
                     workflow_turn_claim_generation,
                     runtime_operation_token,
+                    runtime_operation_kind=runtime_operation_claim_kind or "transport",
+                    expected_review_revision=expected_review_revision,
                 ) as permitted:
                     if not permitted:
                         raise RuntimeError("workflow turn was fenced before provider transport")
@@ -3305,7 +3433,10 @@ def send_input(
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
         raise
     finally:
-        if runtime_operation_token is not None and runtime_operation_claim_token is None:
+        if review_preparation_claim_acquired and runtime_operation_claim_token is not None:
+            if release_review_worktree_preparation(terminal_id, runtime_operation_claim_token):
+                _wake_queued_provider_execution(registry)
+        elif runtime_operation_token is not None and runtime_operation_claim_token is None:
             if (
                 release_terminal_runtime_operation(terminal_id, runtime_operation_token)
                 or provider_execution_released
@@ -3377,10 +3508,10 @@ def prepare_terminal_for_destruction(terminal_id: str) -> None:
         raise RuntimeError(f"Could not persist durable result snapshot for {terminal_id}")
 
 
-def cleanup_managed_worktree(metadata: Dict, *, allow_dirty: bool = False) -> None:
+def cleanup_managed_worktree(metadata: Dict, *, allow_dirty: bool = False) -> Dict[str, object]:
     """Remove a clean managed worktree or retain all authority fail-closed."""
     if not metadata.get("managed_worktree_kind"):
-        return
+        return {"removed": False, "managed": False}
     from cli_agent_orchestrator.services.managed_worktree_service import (
         remove_managed_worktree,
     )
@@ -3388,6 +3519,7 @@ def cleanup_managed_worktree(metadata: Dict, *, allow_dirty: bool = False) -> No
     cleanup = remove_managed_worktree(metadata, allow_dirty=allow_dirty)
     if not cleanup.get("removed"):
         raise ManagedWorktreeCleanupError(cleanup.get("reason_code", "MANAGED_WORKTREE_UNVERIFIED"))
+    return cleanup
 
 
 def validate_managed_worktree_cleanup(metadata: Dict) -> None:
@@ -3995,6 +4127,7 @@ _TERMINAL_DELETION_IDENTITY_FIELDS = (
     "managed_worktree_source",
     "managed_worktree_branch",
     "managed_worktree_commit",
+    "managed_worktree_origin_terminal_id",
     "writable_work_context_id",
     "writer_authority_generation",
     "runtime_pane_id",
@@ -4103,7 +4236,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
             except Exception:
                 logger.warning("Provider cleanup failed for exited terminal %s", terminal_id)
             try:
-                cleanup_managed_worktree(metadata)
+                workspace_cleanup = cleanup_managed_worktree(metadata)
             except ManagedWorktreeCleanupError as exc:
                 raise TerminalDeletionError(
                     "TERMINAL_WORKTREE_PROTECTED",
@@ -4114,6 +4247,30 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 deletion = db_delete_exited_terminal(
                     terminal_id,
                     expected_identity=_terminal_deletion_identity(metadata),
+                    workspace_cleanup_authority=(
+                        {
+                            "version": 1,
+                            "managed": True,
+                            "kind": metadata.get("managed_worktree_kind"),
+                            "source": metadata.get("managed_worktree_source"),
+                            "path": metadata.get("launch_worktree"),
+                            "branch": metadata.get("managed_worktree_branch"),
+                            "branch_object_id": (
+                                workspace_cleanup.get("commit")
+                                if metadata.get("managed_worktree_branch") is not None
+                                else None
+                            ),
+                            "identity": (
+                                metadata.get("writable_work_context_id")
+                                or metadata.get("managed_worktree_origin_terminal_id")
+                                or metadata.get("id")
+                            ),
+                            "path_absent": bool(workspace_cleanup.get("removed")),
+                            "git_unregistered": bool(workspace_cleanup.get("removed")),
+                        }
+                        if metadata.get("managed_worktree_kind")
+                        else None
+                    ),
                 )
             except AmbiguousTerminalIdentity as exc:
                 raise TerminalDeletionError(

@@ -81,7 +81,7 @@ class TestHandoffMessageContext:
         )
         monkeypatch.setattr(
             "cli_agent_orchestrator.mcp_server.server.issue_workflow_input_binding",
-            lambda *_: "binding",
+            lambda *_, **__: "binding",
         )
 
     @patch("cli_agent_orchestrator.mcp_server.server._send_direct_input")
@@ -226,7 +226,9 @@ class TestInitialHandoffRuntimeGenerationFence:
         assert result.state == HandoffState.WAITING
         mock_claim.assert_not_called()
         mock_register.assert_called_once()
-        mock_binding.assert_called_once_with("child-processing")
+        assert mock_binding.call_count == 1
+        assert mock_binding.call_args.args[0] == "child-processing"
+        assert "still processing" in mock_binding.call_args.args[1]
         mock_send.assert_called_once()
         mock_await.assert_awaited_once()
         mock_active_generation.assert_called_once()
@@ -250,18 +252,21 @@ class TestInitialHandoffRuntimeGenerationFence:
             success=False,
             message="waiting",
             terminal_id="child-existing",
+            reason_code="WAIT_SLICE_EXPIRED",
             state=HandoffState.WAITING,
         )
 
         result = asyncio.run(await_handoff(763, "child-existing", timeout=3))
 
         assert result.state == HandoffState.WAITING
+        assert result.wait_slice_id == 0
+        assert result.next_wait_slice_id == 1
         # This unit isolates the await orchestration by replacing the central
         # effect-claim helper; focused lifecycle tests exercise the real gate.
         mock_active_generation.assert_not_called()
         mock_claim.assert_called_once_with(763, "await_handoff", "child-existing")
         mock_await.assert_awaited_once_with("child-existing", 3)
-        mock_finish.assert_called_once_with(mock_claim.return_value, "indeterminate")
+        mock_finish.assert_called_once_with(mock_claim.return_value, "wait_timeout")
 
 
 @pytest.mark.integration
@@ -1164,5 +1169,7 @@ class TestResumableHandoffWait:
         result = asyncio.run(_handoff_impl("developer", "Produce a final marker.", timeout=1))
 
         assert result.state == HandoffState.WAITING
+        assert result.wait_slice_id is None
+        assert result.next_wait_slice_id == 0
         mock_send.assert_called_once()
         mock_await.assert_awaited_once()

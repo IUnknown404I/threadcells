@@ -166,13 +166,13 @@ export function StatusBadge({ status, workflowState }: { status: TerminalStatus,
   if (normalized?.startsWith('WORKFLOW_') && providerDiagnostic) {
     const activity = providerDiagnostic.toUpperCase()
     const activityConfig = activity === 'PROCESSING' ? STATUS_CONFIG.PROCESSING : activity === 'QUEUED' ? STATUS_CONFIG.QUEUED : activity === 'EXITED' ? { ...STATUS_CONFIG.COMPLETED, labelKey: 'status.exited' as TranslationKey } : STATUS_CONFIG[activity] || { ...STATUS_CONFIG.IDLE, labelKey: 'status.ready' as TranslationKey }
-    return <span data-status-badge className="inline-flex flex-wrap items-center gap-1.5"><span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full ${activityConfig.bgClass}`}><span className={`w-2 h-2 rounded-full ${activityConfig.dotClass} ${activityConfig.pulse ? 'animate-pulse' : ''}`} /><span className={`text-xs font-medium ${activityConfig.textClass}`}>{t(activityConfig.labelKey)}</span></span><span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full ${config.bgClass} ${config.textClass}`}><span className="text-[10px]">{t('common.workflowPrefix')}</span><span className="text-xs font-medium">{t(config.labelKey)}</span></span></span>
+    return <span data-status-badge className="inline-flex max-w-full flex-wrap items-center gap-1.5"><span className={`inline-flex max-w-full items-center gap-1.5 rounded-full px-2 py-0.5 ${activityConfig.bgClass}`}><span className={`h-2 w-2 shrink-0 rounded-full ${activityConfig.dotClass} ${activityConfig.pulse ? 'animate-pulse' : ''}`} /><span className={`break-words text-xs font-medium ${activityConfig.textClass}`}>{t(activityConfig.labelKey)}</span></span><span className={`inline-flex max-w-full items-center gap-1 rounded-full px-2 py-0.5 ${config.bgClass} ${config.textClass}`}><span className="shrink-0 text-[10px]">{t('common.workflowPrefix')}</span><span className="break-words text-xs font-medium">{t(config.labelKey)}</span></span></span>
   }
 
   return (
-    <span data-status-badge className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full ${config.bgClass}`}>
-      <span className={`w-2 h-2 rounded-full ${config.dotClass} ${config.pulse ? 'animate-pulse' : ''}`} />
-      <span className={`text-xs font-medium ${config.textClass}`}>{t(config.labelKey)}</span>
+    <span data-status-badge className={`inline-flex max-w-full items-center gap-1.5 rounded-full px-2 py-0.5 ${config.bgClass}`}>
+      <span className={`h-2 w-2 shrink-0 rounded-full ${config.dotClass} ${config.pulse ? 'animate-pulse' : ''}`} />
+      <span className={`break-words text-xs font-medium ${config.textClass}`}>{t(config.labelKey)}</span>
       {providerDiagnostic && <span className="text-[10px] text-gray-500">{t('common.providerPrefix')} {providerDiagnostic}</span>}
     </span>
   )

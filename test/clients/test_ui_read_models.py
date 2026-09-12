@@ -14,6 +14,7 @@ from cli_agent_orchestrator.clients.database import (
     ProviderExecutionLeaseModel,
     RecoveryTakeoverModel,
     SessionDeletionReceiptModel,
+    TerminalDeletionReceiptModel,
     TerminalModel,
     WorkflowEffectModel,
     WorkflowModel,
@@ -43,6 +44,8 @@ def _install_database(monkeypatch, url="sqlite:///:memory:"):
         "_ensure_delegation_result_schema",
     ):
         monkeypatch.setattr(database, name, lambda: None)
+    database._ensure_session_deletion_receipt_schema()
+    database._ensure_terminal_deletion_receipt_schema()
     return engine
 
 
@@ -927,6 +930,8 @@ def test_session_lifetime_filter_never_coalesces_reused_tmux_name(monkeypatch):
 def test_projection_lazily_creates_session_receipt_table_for_older_schema(monkeypatch):
     engine = _install_database(monkeypatch)
     SessionDeletionReceiptModel.__table__.drop(bind=engine)
+    monkeypatch.setattr(database, "_session_deletion_receipt_schema_ready", False)
+    monkeypatch.setattr(database, "_session_deletion_receipt_schema_engine_identity", None)
     with database.SessionLocal() as db:
         db.add(
             TerminalModel(
@@ -1465,6 +1470,824 @@ def test_interaction_projection_preserves_current_and_history_axes(monkeypatch):
     assert owner["activity"] == "ready"
 
 
+def test_open_workflow_projects_consumed_turns_as_history_and_only_unresolved_as_current(
+    monkeypatch,
+):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 7, 8, 0, 0)
+    with database.SessionLocal() as db:
+        db.add_all([_interaction_terminal(), _interaction_terminal("reviewer")])
+        workflow = WorkflowModel(
+            root_terminal_id="owner", status="open", created_at=now, updated_at=now
+        )
+        db.add(workflow)
+        db.flush()
+
+        processed_operator = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="processed-operator",
+            payload="Already processed operator input",
+            state="sent",
+            provider_processing_observed_at=now + timedelta(seconds=1),
+            created_at=now,
+            updated_at=now + timedelta(seconds=1),
+        )
+        db.add(processed_operator)
+        db.flush()
+        db.add(
+            WorkflowTurnReceiptModel(
+                workflow_turn_id=processed_operator.id,
+                receiver_terminal_id="owner",
+                consumed_at=now + timedelta(seconds=1),
+            )
+        )
+        db.add(
+            WorkflowEffectModel(
+                workflow_id=workflow.id,
+                workflow_turn_id=processed_operator.id,
+                effect_kind="assign",
+                effect_key="processed-effect",
+                state="completed",
+                claim_token="processed-effect-token",
+                created_at=now + timedelta(seconds=1),
+                updated_at=now + timedelta(seconds=2),
+            )
+        )
+
+        callback_specs = (
+            (
+                "superseded-result",
+                "result-processed-superseded",
+                "result_acknowledged",
+                now + timedelta(seconds=5),
+            ),
+            (
+                "acknowledged-result",
+                "result-processed-acknowledged",
+                "result_acknowledged",
+                None,
+            ),
+        )
+        processed_callbacks = []
+        for offset, (dedupe_key, result_id, assignment_status, superseded_at) in enumerate(
+            callback_specs, start=3
+        ):
+            inbox = InboxModel(
+                sender_id="reviewer",
+                receiver_id="owner",
+                message=f"Canonical result {result_id}",
+                status="delivered",
+                result_id=result_id,
+                kind="delegation_result_notice",
+                superseded_at=superseded_at,
+                created_at=now + timedelta(seconds=offset),
+            )
+            db.add(inbox)
+            db.flush()
+            callback = WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="assigned_result",
+                dedupe_key=dedupe_key,
+                payload=inbox.message,
+                state="sent",
+                inbox_message_id=inbox.id,
+                provider_processing_observed_at=now + timedelta(seconds=offset + 1),
+                created_at=now + timedelta(seconds=offset),
+                updated_at=now + timedelta(seconds=offset + 1),
+            )
+            db.add(callback)
+            db.flush()
+            db.add(
+                WorkflowTurnReceiptModel(
+                    workflow_turn_id=callback.id,
+                    receiver_terminal_id="owner",
+                    consumed_at=now + timedelta(seconds=offset + 1),
+                )
+            )
+            assignment = ChildAssignmentModel(
+                parent_terminal_id="owner",
+                child_terminal_id="reviewer",
+                status=assignment_status,
+                result_message_id=inbox.id,
+                request_workflow_id=workflow.id,
+                request_workflow_turn_id=processed_operator.id,
+                review_superseded_at=superseded_at,
+                created_at=now + timedelta(seconds=offset - 2),
+                updated_at=now + timedelta(seconds=offset + 1),
+            )
+            db.add(assignment)
+            db.flush()
+            db.add(
+                DelegationResultModel(
+                    id=result_id,
+                    child_assignment_id=assignment.id,
+                    schema_version=1,
+                    delegation_kind="assign",
+                    parent_terminal_id="owner",
+                    child_terminal_id="reviewer",
+                    authorship="child_submission",
+                    status="complete",
+                    document_json=json.dumps(
+                        {
+                            "format": "v1",
+                            "summary": f"Reviewed {result_id}",
+                            "body_markdown": "Durable canonical result",
+                        }
+                    ),
+                    created_at=assignment.created_at,
+                    finalized_at=assignment.updated_at,
+                    updated_at=assignment.updated_at,
+                )
+            )
+            processed_callbacks.append(callback)
+
+        unresolved = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="genuinely-unresolved",
+            payload="Not admitted yet",
+            state="sent",
+            created_at=now + timedelta(seconds=10),
+            updated_at=now + timedelta(seconds=10),
+        )
+        db.add(unresolved)
+        db.flush()
+        workflow.active_turn_id = unresolved.id
+        processed_turn_ids = [processed_operator.id, *(turn.id for turn in processed_callbacks)]
+        processed_operator_id = processed_operator.id
+        unresolved_id = unresolved.id
+        db.commit()
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    current_ids = [item["workflow"]["turn_id"] for item in current["items"]]
+    assert current["total"] == 1
+    assert current_ids == [unresolved_id]
+    assert current["items"][0]["queue"] == {
+        "state": "sent",
+        "wait_reason": "admission",
+        "admission_pending": True,
+    }
+    assert interaction_read_model_service.list_session_current_queue_counts(
+        ["interaction-session"]
+    ) == {"interaction-session": 1}
+    assert (
+        ui_read_model_service.list_session_summaries(limit=10)["items"][0]["current_queue_count"]
+        == 1
+    )
+
+    history = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="history", limit=20
+    )
+    history_by_turn = {
+        item["workflow"]["turn_id"]: item
+        for item in history["items"]
+        if item["interaction_type"] == "workflow_turn"
+    }
+    for turn_id in processed_turn_ids:
+        assert history_by_turn[turn_id]["final_disposition"] == "processed"
+        assert history_by_turn[turn_id]["queue"]["wait_reason"] is None
+        assert history_by_turn[turn_id]["queue"]["admission_pending"] is False
+    processed_operator_item = history_by_turn[processed_operator_id]
+    assert processed_operator_item["workflow"]["effect_state"] == "completed"
+    assert not any(item["interaction_type"] == "effect" for item in current["items"])
+    assert {
+        item["final_disposition"]
+        for item in history["items"]
+        if item["interaction_type"] == "delegation"
+    } == {"superseded", "acknowledged"}
+
+    with database.SessionLocal() as db:
+        unresolved_row = db.get(WorkflowTurnModel, unresolved_id)
+        unresolved_row.provider_processing_observed_at = now + timedelta(seconds=11)
+        db.add(
+            WorkflowTurnReceiptModel(
+                workflow_turn_id=unresolved_id,
+                receiver_terminal_id="owner",
+                consumed_at=now + timedelta(seconds=11),
+            )
+        )
+        db.commit()
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert current["total"] == 1
+    assert current["items"][0]["interaction_type"] == "workflow"
+    assert current["items"][0]["queue"]["wait_reason"] == "workflow_continuation"
+    owner = ui_read_model_service.list_agent_summaries(limit=10, session_id="interaction-session")[
+        "items"
+    ][0]
+    assert owner["activity"] == "ready"
+    assert owner["lifecycle"] == "running"
+    assert owner["workflow_state"] == "active"
+
+    with database.SessionLocal() as db:
+        unresolved_row = db.get(WorkflowTurnModel, unresolved_id)
+        unresolved_row.provider_reconnect_requested_at = now + timedelta(seconds=12)
+        db.commit()
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert current["total"] == 1
+    assert current["items"][0]["workflow"]["turn_id"] == unresolved_id
+    assert current["items"][0]["queue"]["wait_reason"] == "reconnect"
+
+    with database.SessionLocal() as db:
+        unresolved_row = db.get(WorkflowTurnModel, unresolved_id)
+        unresolved_row.provider_reconnect_requested_at = None
+        db.add(
+            ProviderExecutionLeaseModel(
+                terminal_id="owner",
+                workflow_turn_id=unresolved_id,
+                acquired_at=now + timedelta(seconds=13),
+            )
+        )
+        db.commit()
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert current["total"] == 1
+    assert current["items"][0]["workflow"]["turn_id"] == unresolved_id
+    assert current["items"][0]["queue"]["wait_reason"] == "current_provider_turn"
+    owner = ui_read_model_service.list_agent_summaries(limit=10, session_id="interaction-session")[
+        "items"
+    ][0]
+    assert owner["activity"] == "processing"
+    assert owner["lifecycle"] == "running"
+    assert owner["workflow_state"] == "active"
+
+    with database.SessionLocal() as db:
+        db.query(ProviderExecutionLeaseModel).delete()
+        db.commit()
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert current["total"] == 1
+    assert current["items"][0]["interaction_type"] == "workflow"
+    assert not any(item["task_type"] == "provider_execution" for item in current["items"])
+    assert interaction_read_model_service.list_session_current_queue_counts(
+        ["interaction-session"]
+    ) == {"interaction-session": 1}
+    owner = ui_read_model_service.list_agent_summaries(limit=10, session_id="interaction-session")[
+        "items"
+    ][0]
+    assert owner["activity"] == "ready"
+    assert owner["lifecycle"] == "running"
+
+    with database.SessionLocal() as db:
+        workflow_row = db.query(WorkflowModel).one()
+        workflow_row.status = "terminal"
+        workflow_row.terminal_reason = "completed"
+        db.commit()
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert current["total"] == 0
+    assert interaction_read_model_service.list_session_current_queue_counts(
+        ["interaction-session"]
+    ) == {"interaction-session": 0}
+
+
+def test_resumed_owner_gate_chain_is_history_while_unresolved_gate_remains_current(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 7, 18, 0, 0)
+    with database.SessionLocal() as db:
+        db.add(_interaction_terminal())
+        first_gate = WorkflowModel(
+            root_terminal_id="owner",
+            status="owner_gate",
+            terminal_reason="first owner decision",
+            created_at=now,
+            updated_at=now + timedelta(seconds=1),
+        )
+        second_gate = WorkflowModel(
+            root_terminal_id="owner",
+            status="owner_gate",
+            terminal_reason="second owner decision",
+            created_at=now + timedelta(seconds=2),
+            updated_at=now + timedelta(seconds=3),
+        )
+        completed = WorkflowModel(
+            root_terminal_id="owner",
+            status="terminal",
+            terminal_reason="owner-approved work completed",
+            created_at=now + timedelta(seconds=4),
+            updated_at=now + timedelta(seconds=5),
+        )
+        current_gate = WorkflowModel(
+            root_terminal_id="owner",
+            status="owner_gate",
+            terminal_reason="genuinely waiting for owner",
+            created_at=now + timedelta(seconds=6),
+            updated_at=now + timedelta(seconds=7),
+        )
+        db.add_all([first_gate, second_gate, completed, current_gate])
+        db.flush()
+        second_gate.resumed_from_owner_gate_workflow_id = first_gate.id
+        completed.resumed_from_owner_gate_workflow_id = second_gate.id
+
+        for index, workflow in enumerate((first_gate, second_gate, current_gate)):
+            turn = WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="external_input",
+                dedupe_key=f"owner-gate-currentness-{index}",
+                state="sent",
+                created_at=workflow.created_at,
+                updated_at=workflow.updated_at,
+            )
+            db.add(turn)
+            db.flush()
+            workflow.active_turn_id = turn.id
+            db.add(
+                WorkflowTurnReceiptModel(
+                    workflow_turn_id=turn.id,
+                    receiver_terminal_id="owner",
+                    consumed_at=workflow.updated_at,
+                )
+            )
+            db.add(
+                WorkflowEffectModel(
+                    workflow_id=workflow.id,
+                    workflow_turn_id=turn.id,
+                    effect_kind="owner_gate_workflow",
+                    effect_key=f"owner-gate-currentness-{index}",
+                    state="completed",
+                    claim_token=f"claim-{index}",
+                    created_at=workflow.updated_at,
+                    updated_at=workflow.updated_at,
+                )
+            )
+        first_gate_id = first_gate.id
+        second_gate_id = second_gate.id
+        current_gate_id = current_gate.id
+        db.commit()
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert current["total"] == 1
+    assert current["items"][0]["workflow"]["id"] == current_gate_id
+    assert current["items"][0]["queue"]["wait_reason"] == "owner_gate"
+    assert interaction_read_model_service.list_session_current_queue_counts(
+        ["interaction-session"]
+    ) == {"interaction-session": 1}
+    assert (
+        ui_read_model_service.list_session_summaries(limit=10)["items"][0]["current_queue_count"]
+        == 1
+    )
+
+    history = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="history", limit=20
+    )
+    gate_shells = {
+        item["workflow"]["id"]: item
+        for item in history["items"]
+        if item["interaction_type"] == "workflow" and item["workflow"]["status"] == "owner_gate"
+    }
+    assert set(gate_shells) == {first_gate_id, second_gate_id}
+    assert {item["final_disposition"] for item in gate_shells.values()} == {"superseded"}
+    assert {item["workflow"]["reason"] for item in gate_shells.values()} == {
+        "first owner decision",
+        "second owner decision",
+    }
+
+    with database.SessionLocal() as db:
+        db.add(
+            WorkflowModel(
+                root_terminal_id="owner",
+                status="cancelled",
+                terminal_reason="owner cancelled",
+                resumed_from_owner_gate_workflow_id=current_gate_id,
+                created_at=now + timedelta(seconds=8),
+                updated_at=now + timedelta(seconds=9),
+            )
+        )
+        db.commit()
+
+    # Currentness is reconstructed from durable linkage on every query, so a
+    # browser reload or service restart cannot resurrect the historical gate.
+    for _ in range(2):
+        assert (
+            interaction_read_model_service.list_interactions(
+                "interaction-session", mode="current", limit=20
+            )["total"]
+            == 0
+        )
+        assert interaction_read_model_service.list_session_current_queue_counts(
+            ["interaction-session"]
+        ) == {"interaction-session": 0}
+
+
+def test_resumed_owner_gate_does_not_hide_indeterminate_effect_authority(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 7, 19, 0, 0)
+    with database.SessionLocal() as db:
+        db.add(_interaction_terminal())
+        gate = WorkflowModel(root_terminal_id="owner", status="owner_gate", created_at=now)
+        db.add(gate)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=gate.id,
+            kind="external_input",
+            dedupe_key="owner-gate-indeterminate",
+            state="sent",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(turn)
+        db.flush()
+        gate.active_turn_id = turn.id
+        db.add(
+            WorkflowEffectModel(
+                workflow_id=gate.id,
+                workflow_turn_id=turn.id,
+                effect_kind="send_message",
+                effect_key="owner-gate-indeterminate",
+                state="indeterminate",
+                claim_token="indeterminate-claim",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        db.add(
+            WorkflowModel(
+                root_terminal_id="owner",
+                status="terminal",
+                resumed_from_owner_gate_workflow_id=gate.id,
+                created_at=now + timedelta(seconds=1),
+                updated_at=now + timedelta(seconds=2),
+            )
+        )
+        db.commit()
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert current["total"] == 1
+    assert current["items"][0]["interaction_type"] == "effect"
+    assert current["items"][0]["queue"]["wait_reason"] == "indeterminate_effect"
+
+
+def test_resumed_owner_gate_does_not_hide_provider_execution_authority(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 7, 19, 30, 0)
+    terminal = _interaction_terminal()
+    terminal.runtime_lifecycle = "exited"
+    terminal.runtime_exited_at = now
+    with database.SessionLocal() as db:
+        db.add(terminal)
+        gate = WorkflowModel(
+            root_terminal_id="owner",
+            status="owner_gate",
+            terminal_reason="historical owner decision",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(gate)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=gate.id,
+            kind="external_input",
+            dedupe_key="historical-owner-gate-provider-lease",
+            state="sent",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(turn)
+        db.flush()
+        gate.active_turn_id = turn.id
+        db.add(
+            WorkflowTurnReceiptModel(
+                workflow_turn_id=turn.id,
+                receiver_terminal_id="owner",
+                consumed_at=now,
+            )
+        )
+        db.add(
+            WorkflowModel(
+                root_terminal_id="owner",
+                status="terminal",
+                terminal_reason="owner-approved work completed",
+                resumed_from_owner_gate_workflow_id=gate.id,
+                created_at=now + timedelta(seconds=1),
+                updated_at=now + timedelta(seconds=2),
+            )
+        )
+        db.add(
+            ProviderExecutionLeaseModel(
+                terminal_id="owner",
+                workflow_turn_id=turn.id,
+                acquired_at=now,
+            )
+        )
+        db.commit()
+        gate_id = int(gate.id)
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert current["total"] == 1
+    assert current["items"][0]["interaction_type"] == "runtime_authority"
+    assert current["items"][0]["task_type"] == "provider_execution"
+    assert current["items"][0]["queue"]["wait_reason"] == "current_provider_turn"
+    assert current["items"][0]["workflow"]["id"] == gate_id
+    assert interaction_read_model_service.list_session_current_queue_counts(
+        ["interaction-session"]
+    ) == {"interaction-session": 1}
+    plan = database.get_session_unresolved_work_plan("interaction-session")
+    assert plan["live_unsafe_count"] == 1
+    assert plan["reason_codes"] == ["PROVIDER_EXECUTION_ACTIVE"]
+
+    with database.SessionLocal() as db:
+        db.query(ProviderExecutionLeaseModel).delete()
+        db.commit()
+
+    assert (
+        interaction_read_model_service.list_interactions(
+            "interaction-session", mode="current", limit=20
+        )["total"]
+        == 0
+    )
+    assert database.get_session_unresolved_work_plan("interaction-session")["eligible"] is True
+    history = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="history", limit=20
+    )
+    historical_gate = next(
+        item
+        for item in history["items"]
+        if item["interaction_type"] == "workflow" and item["workflow"]["id"] == gate_id
+    )
+    assert historical_gate["final_disposition"] == "superseded"
+    assert historical_gate["workflow"]["reason"] == "historical owner decision"
+
+
+def test_wait_timeout_is_history_while_open_workflow_and_provider_axes_stay_independent(
+    monkeypatch,
+):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 7, 12, 0, 0)
+    with database.SessionLocal() as db:
+        db.add(_interaction_terminal())
+        workflows = [
+            WorkflowModel(root_terminal_id="owner", status=status, created_at=now, updated_at=now)
+            for status in ("open", "terminal")
+        ]
+        db.add_all(workflows)
+        db.flush()
+        turns = []
+        for index, workflow in enumerate(workflows):
+            turn = WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="external_input",
+                dedupe_key=f"await-timeout-{index}",
+                state="sent",
+                provider_processing_observed_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(turn)
+            db.flush()
+            db.add(
+                WorkflowTurnReceiptModel(
+                    workflow_turn_id=turn.id,
+                    receiver_terminal_id="owner",
+                    consumed_at=now,
+                )
+            )
+            db.add(
+                WorkflowEffectModel(
+                    workflow_id=workflow.id,
+                    workflow_turn_id=turn.id,
+                    effect_kind="await_handoff",
+                    effect_key=f"wait-slice-{index}",
+                    state="wait_timeout",
+                    claim_token=f"claim-{index}",
+                    created_at=now,
+                    updated_at=now + timedelta(seconds=30),
+                )
+            )
+            turns.append(turn)
+        db.add(
+            WorkflowEffectModel(
+                workflow_id=workflows[0].id,
+                workflow_turn_id=turns[0].id,
+                effect_kind="await_handoff",
+                effect_key="wait-slice-open-completed",
+                state="completed",
+                claim_token="claim-open-completed",
+                created_at=now + timedelta(seconds=31),
+                updated_at=now + timedelta(seconds=32),
+            )
+        )
+        db.add(
+            WorkflowEffectModel(
+                workflow_id=workflows[0].id,
+                workflow_turn_id=turns[0].id,
+                effect_kind="handoff",
+                effect_key="initial-handoff-known-timeout",
+                state="wait_timeout",
+                claim_token="claim-initial-handoff",
+                created_at=now + timedelta(seconds=33),
+                updated_at=now + timedelta(seconds=34),
+            )
+        )
+        workflows[0].active_turn_id = turns[0].id
+        open_turn_id, terminal_turn_id = (turn.id for turn in turns)
+        db.commit()
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert current["total"] == 1
+    assert current["items"][0]["interaction_type"] == "workflow"
+    assert current["items"][0]["queue"]["wait_reason"] == "workflow_continuation"
+    assert not any(item["workflow"]["effect_state"] == "wait_timeout" for item in current["items"])
+    assert interaction_read_model_service.list_session_current_queue_counts(
+        ["interaction-session"]
+    ) == {"interaction-session": 1}
+
+    history = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="history", limit=20
+    )
+    history_by_turn = {
+        item["workflow"]["turn_id"]: item
+        for item in history["items"]
+        if item["interaction_type"] == "workflow_turn"
+    }
+    assert history_by_turn[open_turn_id]["final_disposition"] == "processed"
+    assert history_by_turn[open_turn_id]["workflow"]["effect_kind"] == "handoff"
+    assert history_by_turn[open_turn_id]["workflow"]["effect_state"] == "wait_timeout"
+    assert history_by_turn[terminal_turn_id]["final_disposition"] == "completed"
+    known_waits = [
+        item
+        for item in history["items"]
+        if item["interaction_type"] == "effect"
+        and item["workflow"]["effect_kind"] == "await_handoff"
+    ]
+    assert len(known_waits) == 3
+    assert len({item["id"] for item in known_waits}) == 3
+    assert sorted(item["workflow"]["effect_state"] for item in known_waits) == [
+        "completed",
+        "wait_timeout",
+        "wait_timeout",
+    ]
+    assert sorted(item["final_disposition"] for item in known_waits) == [
+        "completed",
+        "wait_slice_expired",
+        "wait_slice_expired",
+    ]
+    initial_handoff_waits = [
+        item
+        for item in history["items"]
+        if item["interaction_type"] == "effect" and item["workflow"]["effect_kind"] == "handoff"
+    ]
+    assert len(initial_handoff_waits) == 1
+    assert initial_handoff_waits[0]["final_disposition"] == "wait_slice_expired"
+
+    with database.SessionLocal() as db:
+        db.add(
+            ProviderExecutionLeaseModel(
+                terminal_id="owner", workflow_turn_id=open_turn_id, acquired_at=now
+            )
+        )
+        db.commit()
+    executing = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert executing["total"] == 1
+    assert executing["items"][0]["queue"]["wait_reason"] == "current_provider_turn"
+    assert not any(
+        item["workflow"]["effect_state"] == "wait_timeout" for item in executing["items"]
+    )
+
+
+def test_wait_history_collapses_only_explicit_reconnect_mirrors(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 7, 12, 30, 0)
+    with database.SessionLocal() as db:
+        db.add(_interaction_terminal())
+        workflow = WorkflowModel(
+            root_terminal_id="owner",
+            status="terminal",
+            terminal_reason="completed",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(workflow)
+        db.flush()
+        turns = []
+        for index in range(3):
+            turn = WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="external_input" if index != 1 else "execution_resume",
+                dedupe_key=f"wait-operation-{index}",
+                state="finished",
+                created_at=now + timedelta(seconds=index),
+                updated_at=now + timedelta(seconds=index),
+            )
+            db.add(turn)
+            db.flush()
+            turns.append(turn)
+        first = WorkflowEffectModel(
+            workflow_id=workflow.id,
+            workflow_turn_id=turns[0].id,
+            effect_kind="await_handoff",
+            effect_key="same-child-slice-zero",
+            state="wait_timeout",
+            claim_token="first",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(first)
+        db.flush()
+        db.add_all(
+            [
+                WorkflowEffectModel(
+                    workflow_id=workflow.id,
+                    workflow_turn_id=turns[1].id,
+                    effect_kind="await_handoff",
+                    effect_key="same-child-slice-zero",
+                    state="wait_timeout",
+                    claim_token="mirror",
+                    mirrored_from_effect_id=first.id,
+                    created_at=now + timedelta(seconds=1),
+                    updated_at=now + timedelta(seconds=1),
+                ),
+                WorkflowEffectModel(
+                    workflow_id=workflow.id,
+                    workflow_turn_id=turns[2].id,
+                    effect_kind="await_handoff",
+                    effect_key="same-child-slice-zero",
+                    state="wait_timeout",
+                    claim_token="independent",
+                    created_at=now + timedelta(seconds=2),
+                    updated_at=now + timedelta(seconds=2),
+                ),
+            ]
+        )
+        turn_ids = [int(turn.id) for turn in turns]
+        db.commit()
+
+    history = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="history", limit=20
+    )
+    wait_turn_ids = {
+        item["workflow"]["turn_id"]
+        for item in history["items"]
+        if item["interaction_type"] == "effect"
+    }
+    assert wait_turn_ids == {turn_ids[0], turn_ids[2]}
+
+
+def test_open_workflow_unadmitted_transport_states_remain_current(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 7, 8, 30, 0)
+    session_ids = []
+    with database.SessionLocal() as db:
+        for index, state in enumerate(("queued", "claimed", "sent")):
+            session_id = f"unadmitted-{state}"
+            terminal_id = f"owner-{state}"
+            session_ids.append(session_id)
+            db.add(_interaction_terminal(terminal_id, session_id=session_id))
+            workflow = WorkflowModel(
+                root_terminal_id=terminal_id,
+                status="open",
+                created_at=now + timedelta(seconds=index),
+                updated_at=now + timedelta(seconds=index),
+            )
+            db.add(workflow)
+            db.flush()
+            turn = WorkflowTurnModel(
+                workflow_id=workflow.id,
+                kind="external_input",
+                dedupe_key=f"unadmitted-{state}",
+                state=state,
+                created_at=now + timedelta(seconds=index),
+                updated_at=now + timedelta(seconds=index),
+            )
+            db.add(turn)
+            db.flush()
+            workflow.active_turn_id = turn.id
+        db.commit()
+
+    assert interaction_read_model_service.list_session_current_queue_counts(session_ids) == {
+        session_id: 1 for session_id in session_ids
+    }
+    for state, session_id in zip(("queued", "claimed", "sent"), session_ids):
+        page = interaction_read_model_service.list_interactions(
+            session_id, mode="current", limit=20
+        )
+        assert page["total"] == 1
+        assert page["items"][0]["workflow"]["turn_state"] == state
+        assert page["items"][0]["queue"]["admission_pending"] is True
+
+
 def test_interaction_history_cursor_is_stable_bounded_and_query_constant(monkeypatch):
     engine = _install_database(monkeypatch)
     now = datetime(2026, 9, 5, 8, 0, 0)
@@ -1771,6 +2594,52 @@ def test_session_page_adds_one_bounded_current_only_count_query(monkeypatch):
     }.issubset(indexes)
 
 
+def test_receipt_only_undeleted_session_remains_visible_and_counted(monkeypatch):
+    _install_database(monkeypatch)
+    deleted_at = datetime(2026, 9, 8, 12, 0, 0)
+    with database.SessionLocal() as db:
+        db.add_all(
+            [
+                TerminalDeletionReceiptModel(
+                    terminal_id="former-owner",
+                    session_id="receipt-only-session",
+                    session_name="cao-receipt-only",
+                    window_name="owner",
+                    session_lifetime_authority_version=1,
+                    workspace_cleanup_authority_version=1,
+                    deleted_at=deleted_at,
+                ),
+                TerminalDeletionReceiptModel(
+                    terminal_id="former-child",
+                    session_id="receipt-only-session",
+                    session_name="cao-receipt-only",
+                    window_name="child",
+                    session_lifetime_authority_version=1,
+                    workspace_cleanup_authority_version=1,
+                    deleted_at=deleted_at + timedelta(seconds=1),
+                ),
+            ]
+        )
+        db.commit()
+
+    page = ui_read_model_service.list_session_summaries(limit=10)
+    overview = ui_read_model_service.get_overview()
+
+    assert page["total"] == 1
+    item = page["items"][0]
+    assert item["id"] == "receipt-only-session"
+    assert item["name"] == "cao-receipt-only"
+    assert item["status"] == "history"
+    assert item["created_at"] == deleted_at.isoformat()
+    assert item["last_active"] == (deleted_at + timedelta(seconds=1)).isoformat()
+    assert item["agent_count"] == item["active_agent_count"] == 0
+    assert item["current_queue_count"] == 0
+    assert item["first_agent"] is item["last_agent"] is None
+    assert overview["sessions"] == 1
+    assert overview["agents"] == 0
+    assert overview["active"] == 0
+
+
 def test_current_queue_matches_workspace_retirement_safety_boundary(monkeypatch):
     _install_database(monkeypatch)
     now = datetime(2026, 9, 5, 8, 0, 0)
@@ -1836,6 +2705,45 @@ def test_current_queue_matches_workspace_retirement_safety_boundary(monkeypatch)
     )
     snapshot = database.get_session_workspace_retirement_snapshot("context-1")
     assert snapshot is not None and snapshot["reason_code"] == "WORKFLOW_OPEN"
+
+    with database.SessionLocal() as db:
+        turn = db.query(WorkflowTurnModel).one()
+        turn.provider_processing_observed_at = now + timedelta(seconds=1)
+        db.add(
+            WorkflowTurnReceiptModel(
+                workflow_turn_id=turn.id,
+                receiver_terminal_id="owner",
+                consumed_at=now + timedelta(seconds=1),
+            )
+        )
+        db.commit()
+    assert (
+        interaction_read_model_service.list_session_current_queue_counts(["interaction-session"])[
+            "interaction-session"
+        ]
+        == 1
+    )
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    assert [
+        (item["interaction_type"], item["queue"]["wait_reason"]) for item in current["items"]
+    ] == [("workflow", "workflow_continuation")]
+    snapshot = database.get_session_workspace_retirement_snapshot("context-1")
+    assert snapshot is not None and snapshot["reason_code"] == "WORKFLOW_OPEN"
+
+    with database.SessionLocal() as db:
+        workflow = db.query(WorkflowModel).one()
+        workflow.status = "terminal"
+        db.commit()
+    assert (
+        interaction_read_model_service.list_session_current_queue_counts(["interaction-session"])[
+            "interaction-session"
+        ]
+        == 0
+    )
+    snapshot = database.get_session_workspace_retirement_snapshot("context-1")
+    assert snapshot is not None and snapshot["reason_code"] is None
 
 
 def test_superseded_review_attempts_are_history_not_current_or_retirement_authority(

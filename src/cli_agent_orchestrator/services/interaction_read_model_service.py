@@ -22,6 +22,10 @@ DEFAULT_HISTORY_PAGE_SIZE = 20
 MAX_PAGE_SIZE = 50
 
 
+class SessionInteractionsDeleted(ValueError):
+    """The requested Session was permanently deleted."""
+
+
 def _validate_limit(limit: int) -> None:
     if isinstance(limit, bool) or not 1 <= limit <= MAX_PAGE_SIZE:
         raise ValueError(f"limit must be between 1 and {MAX_PAGE_SIZE}")
@@ -46,7 +50,7 @@ def _scope_sql(
     clause = f" AND {_stable_session_id_sql()} IN ({', '.join(placeholders)})"
     if terminal_id:
         parameters["interaction_terminal_id"] = terminal_id
-        clause += " AND t.id = :interaction_terminal_id"
+        clause += " AND t.terminal_id = :interaction_terminal_id"
     return clause, parameters
 
 
@@ -57,7 +61,14 @@ def _projection_cte(
     current_only: bool = False,
     history_candidate_filter: Optional[str] = None,
 ) -> tuple[str, Dict[str, Any]]:
-    scope, parameters = _scope_sql(session_ids, terminal_id)
+    normalized_session_ids = list(dict.fromkeys(str(value) for value in session_ids if value))
+    scope, parameters = _scope_sql(normalized_session_ids, terminal_id)
+    audit_retirement_scope = (
+        " AND 1 = 0" if current_only else " AND audit.session_id = :interaction_session_0"
+    )
+    audit_terminal_scope = (
+        " AND w.root_terminal_id = :interaction_terminal_id" if terminal_id else ""
+    )
     current_effect_scope = (
         " AND effect.state IN ('claimed', 'indeterminate')" if current_only else ""
     )
@@ -77,19 +88,47 @@ def _projection_cte(
     # this prevents a raw-table/event contract from leaking into React.
     return (
         """
-WITH interaction_terminals AS MATERIALIZED (
+WITH terminal_lifetimes AS MATERIALIZED (
     SELECT t.id AS terminal_id,
-           COALESCE(t.session_id, 'legacy:' || t.tmux_session) AS session_id,
+           t.session_id, t.tmux_session,
            t.runtime_lifecycle, t.runtime_operation_kind,
            t.writer_authority_generation, t.last_active
     FROM terminals t
+    UNION ALL
+    SELECT receipt.terminal_id,
+           receipt.session_id, receipt.session_name,
+           'exited', NULL, NULL, receipt.deleted_at
+    FROM terminal_deletion_receipts receipt
+    WHERE NOT EXISTS (
+        SELECT 1 FROM terminals current_terminal
+        WHERE current_terminal.id = receipt.terminal_id
+    )
+), interaction_terminals AS MATERIALIZED (
+    SELECT t.terminal_id,
+           COALESCE(t.session_id, 'legacy:' || t.tmux_session) AS session_id,
+           t.runtime_lifecycle, t.runtime_operation_kind,
+           t.writer_authority_generation, t.last_active
+    FROM terminal_lifetimes t
     WHERE NOT EXISTS (
         SELECT 1 FROM session_deletion_receipts receipt
         WHERE receipt.session_id = COALESCE(t.session_id, 'legacy:' || t.tmux_session)
     )
+      AND NOT EXISTS (
+        SELECT 1 FROM session_deletion_operations operation
+        WHERE operation.session_id = COALESCE(t.session_id, 'legacy:' || t.tmux_session)
+      )
 """
         + scope
         + """
+), workflow_execution_authority AS MATERIALIZED (
+    SELECT w.id AS workflow_id,
+           CASE WHEN
+"""
+        + database.WORKFLOW_CURRENT_EXECUTION_AUTHORITY_SQL
+        + """
+           THEN 1 ELSE 0 END AS is_current
+    FROM workflows w
+    JOIN interaction_terminals terminals ON terminals.terminal_id = w.root_terminal_id
 ), provider_capacity AS (
     SELECT (SELECT COUNT(*) FROM provider_execution_leases) AS active_count,
            COALESCE((SELECT max_provider_executions FROM capacity_settings WHERE id = 1),
@@ -109,6 +148,9 @@ WITH interaction_terminals AS MATERIALIZED (
     JOIN workflows ew ON ew.id = effect.workflow_id
     JOIN interaction_terminals et ON et.terminal_id = ew.root_terminal_id
     WHERE 1 = 1
+      AND NOT (effect.effect_kind = 'await_handoff'
+               AND effect.state IN ('completed', 'rejected',
+                                    'wait_timeout', 'wait_retryable'))
 """
         + current_effect_scope
         + """
@@ -119,9 +161,14 @@ WITH interaction_terminals AS MATERIALIZED (
            wt.superseded_at, wt.created_at, wt.updated_at,
            w.root_terminal_id, w.status AS workflow_status,
            w.terminal_reason AS workflow_reason, terminals.session_id,
+           workflow_authority.is_current AS workflow_execution_current,
            inbox.sender_id AS inbox_sender_id, inbox.kind AS inbox_kind,
            inbox.status AS inbox_status,
            CASE WHEN receipt.id IS NOT NULL THEN 1 ELSE 0 END AS receipt_exists,
+           CASE WHEN wt.state IN ('queued', 'claimed')
+                  OR (wt.state = 'sent' AND receipt.id IS NULL)
+                THEN 1 ELSE 0 END AS transport_unresolved,
+           CASE WHEN w.active_turn_id = wt.id THEN 1 ELSE 0 END AS is_active_turn,
            CASE WHEN lease.workflow_turn_id IS NOT NULL THEN 1 ELSE 0 END
              AS provider_execution_active,
            ranked_effect.effect_kind, ranked_effect.state AS effect_state,
@@ -129,6 +176,8 @@ WITH interaction_terminals AS MATERIALIZED (
            0 AS workflow_turn_count, 0 AS superseded_turn_count
     FROM workflow_turns wt
     JOIN workflows w ON w.id = wt.workflow_id
+    JOIN workflow_execution_authority workflow_authority
+      ON workflow_authority.workflow_id = w.id
     JOIN interaction_terminals terminals ON terminals.terminal_id = w.root_terminal_id
     LEFT JOIN inbox ON inbox.id = wt.inbox_message_id
     LEFT JOIN workflow_turn_receipts receipt
@@ -152,42 +201,53 @@ WITH interaction_terminals AS MATERIALIZED (
            SUBSTR(COALESCE(facts.payload, ''), 1, 1200) AS input_preview,
            facts.created_at, facts.updated_at,
            CASE
-             WHEN facts.workflow_status IN ('open', 'owner_gate')
-              AND facts.state IN ('queued', 'claimed', 'sent')
+             WHEN facts.workflow_execution_current = 1
+              AND facts.transport_unresolved = 1
               AND facts.superseded_by_turn_id IS NULL THEN 1
-             WHEN facts.workflow_status IN ('open', 'owner_gate')
+             WHEN facts.workflow_execution_current = 1
               AND facts.superseded_by_turn_id IS NULL
               AND (facts.inbox_status = 'pending'
                    OR facts.unresolved_effect_count > 0
-                   OR facts.provider_execution_active = 1) THEN 1
+                   OR facts.provider_execution_active = 1
+                   OR (facts.is_active_turn = 1
+                       AND facts.provider_reconnect_requested_at IS NOT NULL)) THEN 1
              ELSE 0
            END AS is_current,
            CASE
              WHEN facts.provider_execution_active = 1 THEN 'executing'
-             WHEN facts.workflow_status = 'owner_gate' THEN 'owner_gate'
+             WHEN facts.workflow_status = 'owner_gate'
+              AND facts.transport_unresolved = 1
+               THEN 'owner_gate'
              ELSE facts.state
            END AS queue_state,
            CASE
              WHEN facts.provider_execution_active = 1 THEN 'current_provider_turn'
-             WHEN facts.workflow_status = 'owner_gate' THEN 'owner_gate'
              WHEN facts.inbox_status = 'pending' THEN 'delivery'
              WHEN facts.effect_state = 'indeterminate' THEN 'indeterminate_effect'
              WHEN facts.effect_state = 'claimed' THEN 'claimed_effect'
-             WHEN facts.provider_reconnect_requested_at IS NOT NULL
-               OR facts.queue_reason LIKE '%RECONNECT%' THEN 'reconnect'
-             WHEN facts.queue_reason = 'RESOURCE_HEALTH_REJECTED' THEN 'resource_health'
+             WHEN facts.workflow_status = 'owner_gate'
+              AND facts.transport_unresolved = 1
+               THEN 'owner_gate'
+             WHEN facts.is_active_turn = 1
+              AND facts.provider_reconnect_requested_at IS NOT NULL
+               THEN 'reconnect'
+             WHEN facts.queue_reason LIKE '%RECONNECT%'
+              AND facts.transport_unresolved = 1
+               THEN 'reconnect'
+             WHEN facts.queue_reason = 'RESOURCE_HEALTH_REJECTED'
+              AND facts.transport_unresolved = 1
+               THEN 'resource_health'
              WHEN facts.queue_reason IN ('TERMINAL_RUNTIME_OPERATION_BUSY',
                                          'TERMINAL_RUNTIME_RECONNECT_PENDING')
+              AND facts.transport_unresolved = 1
                THEN 'writer_recovery_authority'
              WHEN facts.state = 'sent' AND facts.receipt_exists = 0 THEN 'admission'
              WHEN facts.state = 'queued'
               AND capacity.active_count >= capacity.execution_limit THEN 'provider_capacity'
-             WHEN facts.state IN ('queued', 'claimed', 'sent') THEN 'workflow_continuation'
+             WHEN facts.state IN ('queued', 'claimed') THEN 'workflow_continuation'
              ELSE NULL
            END AS wait_reason,
-           CASE WHEN facts.inbox_status = 'pending'
-                      OR facts.state IN ('queued', 'claimed')
-                      OR (facts.state = 'sent' AND facts.receipt_exists = 0)
+           CASE WHEN facts.inbox_status = 'pending' OR facts.transport_unresolved = 1
                 THEN 1 ELSE 0 END AS admission_pending,
            facts.workflow_id, facts.id AS workflow_turn_id, facts.workflow_status,
            facts.workflow_reason, facts.state AS turn_state, facts.kind AS turn_kind,
@@ -198,8 +258,17 @@ WITH interaction_terminals AS MATERIALIZED (
            NULL AS delivery_status, 0 AS delivery_pending,
            CASE
              WHEN facts.superseded_by_turn_id IS NOT NULL THEN 'superseded'
+             WHEN facts.workflow_status = 'owner_gate'
+              AND facts.workflow_execution_current = 0 THEN 'superseded'
              WHEN facts.workflow_status = 'cancelled' THEN 'cancelled'
              WHEN facts.workflow_status = 'terminal' THEN 'completed'
+             WHEN facts.state = 'sent' AND facts.receipt_exists = 1
+              AND facts.inbox_status IS NOT 'pending'
+              AND facts.unresolved_effect_count = 0
+              AND facts.provider_execution_active = 0
+              AND NOT (facts.is_active_turn = 1
+                       AND facts.provider_reconnect_requested_at IS NOT NULL)
+               THEN 'processed'
              ELSE NULL
            END AS final_disposition,
            CAST(facts.id AS TEXT) AS diagnostic_id
@@ -210,10 +279,13 @@ WITH interaction_terminals AS MATERIALIZED (
            'system' AS source_kind, w.root_terminal_id AS source_terminal_id,
            w.root_terminal_id AS target_terminal_id, '' AS input_preview,
            w.created_at, w.updated_at,
-           CASE WHEN w.status IN ('open', 'owner_gate') THEN 1 ELSE 0 END AS is_current,
+           workflow_authority.is_current,
            w.status AS queue_state,
-           CASE WHEN w.status = 'owner_gate' THEN 'owner_gate'
-                WHEN w.status = 'open' THEN 'workflow_continuation' ELSE NULL END AS wait_reason,
+           CASE WHEN workflow_authority.is_current = 1 AND w.status = 'owner_gate'
+                  THEN 'owner_gate'
+                WHEN workflow_authority.is_current = 1 AND w.status = 'open'
+                  THEN 'workflow_continuation'
+                ELSE NULL END AS wait_reason,
            0 AS admission_pending, w.id AS workflow_id, NULL AS workflow_turn_id,
            w.status AS workflow_status, w.terminal_reason AS workflow_reason,
            NULL AS turn_state, NULL AS turn_kind, NULL AS provider_outcome_code,
@@ -223,21 +295,32 @@ WITH interaction_terminals AS MATERIALIZED (
            NULL AS result_summary, 0 AS result_available, NULL AS delivery_status,
            0 AS delivery_pending,
            CASE WHEN w.status = 'cancelled' THEN 'cancelled'
-                WHEN w.status = 'terminal' THEN 'completed' ELSE NULL END AS final_disposition,
+                WHEN w.status = 'terminal' THEN 'completed'
+                WHEN w.status = 'owner_gate' AND workflow_authority.is_current = 0
+                  THEN 'superseded'
+                ELSE NULL END AS final_disposition,
            CAST(w.id AS TEXT) AS diagnostic_id
     FROM workflows w
+    JOIN workflow_execution_authority workflow_authority
+      ON workflow_authority.workflow_id = w.id
     JOIN interaction_terminals terminals ON terminals.terminal_id = w.root_terminal_id
     WHERE NOT EXISTS (SELECT 1 FROM workflow_turns wt WHERE wt.workflow_id = w.id)
        OR (w.status IN ('open', 'owner_gate') AND NOT EXISTS (
          SELECT 1 FROM workflow_turns wt
          LEFT JOIN inbox linked_inbox ON linked_inbox.id = wt.inbox_message_id
+         LEFT JOIN workflow_turn_receipts linked_receipt
+           ON linked_receipt.workflow_turn_id = wt.id
+          AND linked_receipt.receiver_terminal_id = w.root_terminal_id
          LEFT JOIN provider_execution_leases linked_lease
            ON linked_lease.workflow_turn_id = wt.id
          WHERE wt.workflow_id = w.id AND (
-           (wt.state IN ('queued', 'claimed', 'sent')
+           ((wt.state IN ('queued', 'claimed')
+             OR (wt.state = 'sent' AND linked_receipt.id IS NULL))
              AND wt.superseded_by_turn_id IS NULL)
            OR linked_inbox.status = 'pending'
            OR linked_lease.workflow_turn_id IS NOT NULL
+           OR (w.active_turn_id = wt.id
+               AND wt.provider_reconnect_requested_at IS NOT NULL)
            OR EXISTS (
              SELECT 1 FROM workflow_effects linked_effect
              WHERE linked_effect.workflow_id = w.id
@@ -246,17 +329,46 @@ WITH interaction_terminals AS MATERIALIZED (
            )
          )
        ))
+), effect_authority_sessions AS MATERIALIZED (
+    SELECT DISTINCT effect.id AS effect_id, terminals.session_id
+    FROM workflow_effects effect
+    LEFT JOIN workflows declared_workflow
+      ON declared_workflow.id = effect.workflow_id
+    LEFT JOIN workflow_turns linked_turn
+      ON linked_turn.id = effect.workflow_turn_id
+    LEFT JOIN workflows turn_workflow
+      ON turn_workflow.id = linked_turn.workflow_id
+    JOIN interaction_terminals terminals
+      ON terminals.terminal_id = declared_workflow.root_terminal_id
+      OR terminals.terminal_id = turn_workflow.root_terminal_id
+    WHERE effect.state IN ('claimed', 'indeterminate')
 ), unresolved_authority_item_rows AS NOT MATERIALIZED (
     SELECT 'effect:' || printf('%020d', effect.id) AS interaction_id,
-           terminals.session_id, 'effect' AS interaction_type,
+           scoped.session_id, 'effect' AS interaction_type,
            effect.effect_kind AS task_type, 'system' AS source_kind,
-           w.root_terminal_id AS source_terminal_id,
-           w.root_terminal_id AS target_terminal_id, '' AS input_preview,
-           effect.created_at, effect.updated_at, 1 AS is_current,
+           COALESCE(w.root_terminal_id, linked_workflow.root_terminal_id)
+             AS source_terminal_id,
+           COALESCE(w.root_terminal_id, linked_workflow.root_terminal_id)
+             AS target_terminal_id, '' AS input_preview,
+           effect.created_at, effect.updated_at,
+           CASE WHEN w.status IN ('terminal', 'cancelled')
+                       AND w.active_turn_id = wt.id
+                       AND wt.state IN ('finished', 'cancelled')
+                       AND wt.queue_reason = 'PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED'
+                THEN 0 ELSE 1 END AS is_current,
            effect.state AS queue_state,
-           CASE WHEN effect.state = 'indeterminate' THEN 'indeterminate_effect'
+           CASE WHEN w.status IN ('terminal', 'cancelled')
+                       AND w.active_turn_id = wt.id
+                       AND wt.state IN ('finished', 'cancelled')
+                       AND wt.queue_reason = 'PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED'
+                  THEN NULL
+                WHEN effect.state = 'indeterminate' THEN 'indeterminate_effect'
                 ELSE 'claimed_effect' END AS wait_reason,
-           1 AS admission_pending, effect.workflow_id,
+           CASE WHEN w.status IN ('terminal', 'cancelled')
+                       AND w.active_turn_id = wt.id
+                       AND wt.state IN ('finished', 'cancelled')
+                       AND wt.queue_reason = 'PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED'
+                THEN 0 ELSE 1 END AS admission_pending, effect.workflow_id,
            effect.workflow_turn_id, w.status AS workflow_status,
            w.terminal_reason AS workflow_reason, wt.state AS turn_state,
            wt.kind AS turn_kind, wt.provider_outcome_code,
@@ -264,15 +376,99 @@ WITH interaction_terminals AS MATERIALIZED (
            0 AS workflow_turn_count, 0 AS superseded_turn_count,
            NULL AS assignment_id, NULL AS result_id, NULL AS result_status,
            NULL AS result_summary, 0 AS result_available, NULL AS delivery_status,
-           0 AS delivery_pending, NULL AS final_disposition,
+           0 AS delivery_pending,
+           CASE WHEN w.status IN ('terminal', 'cancelled')
+                       AND w.active_turn_id = wt.id
+                       AND wt.state IN ('finished', 'cancelled')
+                       AND wt.queue_reason = 'PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED'
+                THEN 'provider_runtime_exited_indeterminate' ELSE NULL END
+             AS final_disposition,
            CAST(effect.id AS TEXT) AS diagnostic_id
-    FROM workflow_effects effect
-    JOIN workflows w ON w.id = effect.workflow_id
-    JOIN interaction_terminals terminals ON terminals.terminal_id = w.root_terminal_id
-    JOIN workflow_turns wt ON wt.id = effect.workflow_turn_id
+    FROM effect_authority_sessions scoped
+    JOIN workflow_effects effect ON effect.id = scoped.effect_id
+    LEFT JOIN workflows w ON w.id = effect.workflow_id
+    LEFT JOIN workflow_turns linked_turn ON linked_turn.id = effect.workflow_turn_id
+    LEFT JOIN workflows linked_workflow ON linked_workflow.id = linked_turn.workflow_id
+    LEFT JOIN workflow_turns wt
+      ON wt.id = effect.workflow_turn_id
+     AND wt.workflow_id = effect.workflow_id
+    LEFT JOIN workflow_execution_authority workflow_authority
+      ON workflow_authority.workflow_id = w.id
     WHERE effect.state IN ('claimed', 'indeterminate')
-      AND (w.status IN ('terminal', 'cancelled')
+      AND (w.id IS NULL OR wt.id IS NULL
+           OR w.status IN ('terminal', 'cancelled')
+           OR workflow_authority.is_current = 0
            OR wt.superseded_by_turn_id IS NOT NULL)
+), retired_effect_item_rows AS NOT MATERIALIZED (
+    SELECT 'effect:' || printf('%020d', effect.id) AS interaction_id,
+           audit.session_id, 'effect' AS interaction_type,
+           effect.effect_kind AS task_type, 'system' AS source_kind,
+           w.root_terminal_id AS source_terminal_id,
+           w.root_terminal_id AS target_terminal_id, '' AS input_preview,
+           effect.created_at, audit.created_at AS updated_at, 0 AS is_current,
+           effect.state AS queue_state, NULL AS wait_reason,
+           0 AS admission_pending, effect.workflow_id,
+           effect.workflow_turn_id, w.status AS workflow_status,
+           w.terminal_reason AS workflow_reason, wt.state AS turn_state,
+           wt.kind AS turn_kind, wt.provider_outcome_code,
+           wt.provider_outcome_detail, effect.effect_kind, effect.state AS effect_state,
+           0 AS workflow_turn_count, 0 AS superseded_turn_count,
+           NULL AS assignment_id, NULL AS result_id, NULL AS result_status,
+           NULL AS result_summary, 0 AS result_available, NULL AS delivery_status,
+           0 AS delivery_pending,
+           'operator_retired_unknown_outcome' AS final_disposition,
+           CAST(effect.id AS TEXT) AS diagnostic_id
+    FROM session_deletion_cancellation_audit audit
+    JOIN workflow_effects effect ON effect.id = CAST(audit.item_id AS INTEGER)
+    JOIN workflows w ON w.id = effect.workflow_id
+    JOIN workflow_turns wt
+      ON wt.id = effect.workflow_turn_id
+     AND wt.workflow_id = effect.workflow_id
+    WHERE audit.item_kind = 'workflow_effect'
+      AND audit.final_state = 'operator_retired_indeterminate'
+      AND audit.reason_code = 'OPERATOR_RETIRED_UNKNOWN_OUTCOME'
+"""
+        + audit_retirement_scope
+        + audit_terminal_scope
+        + """
+), known_wait_effect_item_rows AS NOT MATERIALIZED (
+    SELECT 'effect:' || printf('%020d', effect.id) AS interaction_id,
+           terminals.session_id, 'effect' AS interaction_type,
+           effect.effect_kind AS task_type, 'system' AS source_kind,
+           w.root_terminal_id AS source_terminal_id,
+           w.root_terminal_id AS target_terminal_id, '' AS input_preview,
+           effect.created_at, effect.updated_at, 0 AS is_current,
+           effect.state AS queue_state, NULL AS wait_reason,
+           0 AS admission_pending, effect.workflow_id,
+           effect.workflow_turn_id, w.status AS workflow_status,
+           w.terminal_reason AS workflow_reason, wt.state AS turn_state,
+           wt.kind AS turn_kind, wt.provider_outcome_code,
+           wt.provider_outcome_detail, effect.effect_kind, effect.state AS effect_state,
+           0 AS workflow_turn_count, 0 AS superseded_turn_count,
+           NULL AS assignment_id, NULL AS result_id, NULL AS result_status,
+           NULL AS result_summary, 0 AS result_available, NULL AS delivery_status,
+           0 AS delivery_pending,
+           CASE effect.state
+             WHEN 'wait_timeout' THEN 'wait_slice_expired'
+             WHEN 'wait_retryable' THEN 'wait_retryable'
+             WHEN 'completed' THEN 'completed'
+             ELSE 'failed'
+           END AS final_disposition,
+           CAST(effect.id AS TEXT) AS diagnostic_id
+    FROM interaction_terminals terminals
+    CROSS JOIN workflows w ON w.root_terminal_id = terminals.terminal_id
+    CROSS JOIN workflow_turns wt ON wt.workflow_id = w.id
+    CROSS JOIN workflow_effects effect
+      ON effect.workflow_id = w.id
+     AND effect.workflow_turn_id = wt.id
+    WHERE (
+        (effect.effect_kind = 'await_handoff'
+         AND effect.state IN ('completed', 'rejected', 'wait_timeout', 'wait_retryable'))
+        OR
+        (effect.effect_kind = 'handoff'
+         AND effect.state IN ('wait_timeout', 'wait_retryable'))
+      )
+      AND effect.mirrored_from_effect_id IS NULL
 ), provider_authority_item_rows AS NOT MATERIALIZED (
     SELECT 'provider:' || lease.terminal_id || ':' || printf('%020d', wt.id)
              AS interaction_id,
@@ -295,9 +491,12 @@ WITH interaction_terminals AS MATERIALIZED (
     FROM provider_execution_leases lease
     JOIN workflow_turns wt ON wt.id = lease.workflow_turn_id
     JOIN workflows w ON w.id = wt.workflow_id
+    JOIN workflow_execution_authority workflow_authority
+      ON workflow_authority.workflow_id = w.id
     JOIN interaction_terminals terminals ON terminals.terminal_id = lease.terminal_id
     WHERE w.status IN ('terminal', 'cancelled')
        OR wt.superseded_by_turn_id IS NOT NULL
+       OR workflow_authority.is_current = 0
 ), writer_authority_item_rows AS NOT MATERIALIZED (
     SELECT 'writer:' || terminals.terminal_id AS interaction_id,
            terminals.session_id, 'runtime_authority' AS interaction_type,
@@ -404,8 +603,11 @@ WITH interaction_terminals AS MATERIALIZED (
           inbox.status = 'pending' AND EXISTS (
             SELECT 1 FROM workflow_turns wt
             JOIN workflows w ON w.id = wt.workflow_id
+            JOIN workflow_execution_authority workflow_authority
+              ON workflow_authority.workflow_id = w.id
             WHERE wt.inbox_message_id = inbox.id
               AND (w.status IN ('terminal', 'cancelled')
+                   OR workflow_authority.is_current = 0
                    OR wt.superseded_by_turn_id IS NOT NULL)
           )
         )
@@ -496,6 +698,8 @@ WITH interaction_terminals AS MATERIALIZED (
                 "workflow_turn_item_rows",
                 "workflow_shell_item_rows",
                 "unresolved_authority_item_rows",
+                "retired_effect_item_rows",
+                *(("known_wait_effect_item_rows",) if not current_only else ()),
                 "provider_authority_item_rows",
                 "writer_authority_item_rows",
                 "assignment_item_rows",
@@ -671,10 +875,20 @@ def list_interactions(
     LIMIT :page_limit
 )
 """
+    deletion_meta = """, deletion_meta AS (
+    SELECT CASE WHEN EXISTS (
+      SELECT 1 FROM session_deletion_receipts receipt
+      WHERE receipt.session_id = :interaction_session_0
+        AND COALESCE(receipt.receipt_version, 1) >= 2
+    ) THEN 1 ELSE 0 END AS hard_deleted
+)
+"""
     if mode == "current":
-        sql = cte + base_page + f""", meta AS (SELECT COUNT(*) AS total_count FROM base_page)
-SELECT page.*, meta.total_count
-FROM meta LEFT JOIN page ON 1 = 1
+        sql = cte + base_page + deletion_meta + f""", meta AS (
+    SELECT COUNT(*) AS total_count FROM base_page
+)
+SELECT page.*, meta.total_count, deletion_meta.hard_deleted
+FROM meta CROSS JOIN deletion_meta LEFT JOIN page ON 1 = 1
 ORDER BY page.created_at {direction}, page.interaction_id {direction}
 """
     else:
@@ -683,12 +897,15 @@ ORDER BY page.created_at {direction}, page.interaction_id {direction}
         # has-more through the limit+1 cursor and deliberately leaves total
         # unknown. Current Queue retains its exact total because that value is
         # the canonical session indicator.
-        sql = cte + base_page + f"""
-SELECT page.*, NULL AS total_count FROM page
+        sql = cte + base_page + deletion_meta + f"""
+SELECT page.*, NULL AS total_count, deletion_meta.hard_deleted
+FROM deletion_meta LEFT JOIN page ON 1 = 1
 ORDER BY page.created_at {direction}, page.interaction_id {direction}
 """
     with database.SessionLocal() as db:
         rows = db.execute(text(sql), parameters).mappings().all()
+    if rows and int(rows[0]["hard_deleted"] or 0):
+        raise SessionInteractionsDeleted("SESSION_DELETED")
     total = int(rows[0]["total_count"] or 0) if mode == "current" else None
     fetched_rows = [dict(row) for row in rows if row["interaction_id"] is not None]
     has_more = len(fetched_rows) > resolved_limit

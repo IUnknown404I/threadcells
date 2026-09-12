@@ -25,6 +25,7 @@ from cli_agent_orchestrator.providers.codex import (
     CodexStartupNoReadyError,
     ProviderError,
 )
+from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
 from cli_agent_orchestrator.services.compressed_output_index import (
     precompute_compressed_output_index,
 )
@@ -269,8 +270,12 @@ def test_bind_provider_runtime_session_identity_proves_exact_hook_path(monkeypat
     )
 
 
+@pytest.mark.parametrize(
+    ("source", "require_existing_binding"),
+    (("resume", True), ("compact", False)),
+)
 def test_bind_provider_runtime_session_identity_rebinds_exact_durable_identity(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, source, require_existing_binding
 ):
     identity = "01234567-89ab-cdef-0123-456789abcdef"
     generation = "a" * 64
@@ -317,9 +322,9 @@ def test_bind_provider_runtime_session_identity_rebinds_exact_durable_identity(
             resume_identity=identity,
             transcript_path=str(transcript),
             working_directory=str(working_directory),
-            source="resume",
+            source=source,
             runtime_generation=generation,
-            require_existing_binding=True,
+            require_existing_binding=require_existing_binding,
         )
         == identity
     )
@@ -1985,6 +1990,10 @@ class TestCodexStartupReliability:
         mock_tmux.kill_session.assert_called_once_with("cao-retry")
         assert mock_tmux.kill_window.call_count == 0
         assert mock_provider_manager.create_provider.call_count == 2
+        assert (
+            mock_db_create.call_args.kwargs["provider_runtime_compatibility_generation"]
+            == ACTIVE_RUNTIME_GENERATION
+        )
         bind_identity.assert_not_called()
         mock_log_path.touch.assert_called_once()
 

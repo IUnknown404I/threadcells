@@ -29,13 +29,15 @@ def _repository(tmp_path: Path) -> Path:
 
 
 def _metadata(worktree):
+    identity = Path(worktree.path).name.removeprefix(f"{worktree.kind}-")
     return {
-        "id": Path(worktree.path).name.removeprefix(f"{worktree.kind}-"),
+        "id": identity,
         "launch_worktree": worktree.path,
         "managed_worktree_kind": worktree.kind,
         "managed_worktree_source": worktree.source,
         "managed_worktree_branch": worktree.branch,
         "managed_worktree_commit": worktree.commit,
+        "managed_worktree_origin_terminal_id": identity,
     }
 
 
@@ -93,6 +95,65 @@ def test_reviewer_is_detached_at_exact_commit_and_dirty_cleanup_is_fail_closed(
     assert repeated["removed"] is True
     assert repeated["already_removed"] is True
     assert repeated["commit"] == reviewer.commit
+
+
+def test_reviewer_preparation_moves_clean_detached_worktree_to_exact_later_revision(
+    tmp_path, monkeypatch
+):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    reviewer = managed_worktree_service.create_managed_worktree(
+        str(repository), "reviewer-b", "reviewer"
+    )
+    assert reviewer is not None
+    launch_revision = reviewer.commit
+    (repository / "tracked.txt").write_text("correction B\n", encoding="utf-8")
+    _git(repository, "add", "tracked.txt")
+    _git(repository, "commit", "-qm", "correction B")
+    correction_revision = _git(repository, "rev-parse", "HEAD")
+
+    prepared = managed_worktree_service.prepare_reviewer_worktree_revision(
+        _metadata(reviewer), correction_revision
+    )
+
+    assert launch_revision != correction_revision
+    assert reviewer.commit == launch_revision
+    assert prepared["commit"] == correction_revision
+    assert prepared["detached"] is True
+    assert prepared["clean"] is True
+    assert managed_worktree_service.reviewer_worktree_matches_revision(
+        _metadata(reviewer), correction_revision
+    )
+
+
+def test_reviewer_preparation_refuses_dirty_or_foreign_managed_identity(tmp_path, monkeypatch):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    reviewer = managed_worktree_service.create_managed_worktree(
+        str(repository), "reviewer-c", "reviewer"
+    )
+    assert reviewer is not None
+    (repository / "tracked.txt").write_text("correction C\n", encoding="utf-8")
+    _git(repository, "add", "tracked.txt")
+    _git(repository, "commit", "-qm", "correction C")
+    correction_revision = _git(repository, "rev-parse", "HEAD")
+    (Path(reviewer.path) / "notes.txt").write_text("local evidence\n", encoding="utf-8")
+
+    with pytest.raises(
+        managed_worktree_service.ManagedWorktreeError,
+        match="REVIEW_WORKTREE_AUTHORITY_CHANGED",
+    ):
+        managed_worktree_service.prepare_reviewer_worktree_revision(
+            _metadata(reviewer), correction_revision
+        )
+
+    (Path(reviewer.path) / "notes.txt").unlink()
+    foreign = {**_metadata(reviewer), "managed_worktree_origin_terminal_id": "another-terminal"}
+    with pytest.raises(
+        managed_worktree_service.ManagedWorktreeError,
+        match="REVIEW_WORKTREE_AUTHORITY_CHANGED",
+    ):
+        managed_worktree_service.prepare_reviewer_worktree_revision(foreign, correction_revision)
 
 
 def test_supervisor_worktrees_are_isolated_unique_branches_and_idempotent(tmp_path, monkeypatch):
@@ -306,3 +367,488 @@ def test_cleanup_never_targets_source_or_paths_outside_managed_root(tmp_path, mo
     assert result["removed"] is False
     assert result["reason_code"] == "MANAGED_WORKTREE_IDENTITY_MISMATCH"
     assert repository.exists()
+
+
+def test_hard_purge_removes_worktree_registration_and_private_branch(tmp_path, monkeypatch):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(
+        str(repository), "terminal-hard-delete", "task"
+    )
+    assert task is not None
+
+    result = managed_worktree_service.purge_managed_worktree(_metadata(task))
+
+    assert result == {
+        "removed": True,
+        "managed": True,
+        "already_removed": False,
+        "path_absent": True,
+        "git_unregistered": True,
+        "branch_absent": True,
+    }
+    assert not Path(task.path).exists()
+    inventory = _git(repository, "worktree", "list", "--porcelain")
+    assert task.path not in inventory
+    assert (
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "show-ref",
+                "--verify",
+                f"refs/heads/{task.branch}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        ).returncode
+        != 0
+    )
+
+
+def test_session_purge_accepts_clean_supervisor_mission_branch_and_preserves_it(
+    tmp_path, monkeypatch
+):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    supervisor = managed_worktree_service.create_managed_worktree(
+        str(repository), "session-drift", "supervisor"
+    )
+    assert supervisor is not None
+    metadata = {
+        **_metadata(supervisor),
+        "session_id": "session",
+        "writer_authority_generation": "writer-generation",
+        "writable_work_context_id": "session-drift",
+    }
+    worktree = Path(supervisor.path)
+    _git(worktree, "switch", "-c", "fix/mission-branch")
+    (worktree / "tracked.txt").write_text("advanced\n", encoding="utf-8")
+    _git(worktree, "commit", "-qam", "mission change")
+    mission_head = _git(worktree, "rev-parse", "HEAD")
+
+    captured = managed_worktree_service.capture_session_worktree_retirement_authority([metadata])
+    row = captured["authority"]["worktrees"][0]
+    assert captured["safe"] is True
+    assert row["branch"] == "fix/mission-branch"
+    assert row["head"] == mission_head
+    assert row["owned_ref"] == "refs/heads/cao/session/session-drift"
+
+    retired = managed_worktree_service.purge_session_managed_worktrees(
+        [metadata], captured["authority"]
+    )
+
+    assert retired["removed"] is True
+    assert not worktree.exists()
+    assert _git(repository, "rev-parse", "refs/heads/fix/mission-branch") == mission_head
+    assert (
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repository),
+                "show-ref",
+                "--verify",
+                "refs/heads/cao/session/session-drift",
+            ],
+            check=False,
+        ).returncode
+        != 0
+    )
+    assert supervisor.path not in _git(repository, "worktree", "list", "--porcelain")
+
+
+def test_session_purge_accepts_clean_reviewer_at_later_detached_revision(tmp_path, monkeypatch):
+    repository = _repository(tmp_path)
+    launch_revision = _git(repository, "rev-parse", "HEAD")
+    (repository / "tracked.txt").write_text("review target\n", encoding="utf-8")
+    _git(repository, "commit", "-qam", "review target")
+    later_revision = _git(repository, "rev-parse", "HEAD")
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    reviewer = managed_worktree_service.create_managed_worktree(
+        str(repository), "reviewer-drift", "reviewer", expected_commit=launch_revision
+    )
+    assert reviewer is not None
+    metadata = {**_metadata(reviewer), "session_id": "session"}
+    _git(Path(reviewer.path), "switch", "--detach", later_revision)
+
+    captured = managed_worktree_service.capture_session_worktree_retirement_authority([metadata])
+    row = captured["authority"]["worktrees"][0]
+    assert captured["safe"] is True
+    assert row["detached"] is True
+    assert row["head"] == later_revision
+    assert row["head"] != reviewer.commit
+
+    retired = managed_worktree_service.purge_session_managed_worktrees(
+        [metadata], captured["authority"]
+    )
+
+    assert retired["removed"] is True
+    assert not Path(reviewer.path).exists()
+
+
+@pytest.mark.parametrize("mutation", ["branch", "head", "dirty", "owned-ref"])
+def test_session_purge_fails_closed_when_current_authority_changes_after_capture(
+    tmp_path, monkeypatch, mutation
+):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    supervisor = managed_worktree_service.create_managed_worktree(
+        str(repository), "session-race", "supervisor"
+    )
+    assert supervisor is not None
+    metadata = {
+        **_metadata(supervisor),
+        "session_id": "session",
+        "writer_authority_generation": "writer-a",
+        "writable_work_context_id": "session-race",
+    }
+    worktree = Path(supervisor.path)
+    captured = managed_worktree_service.capture_session_worktree_retirement_authority([metadata])
+    if mutation == "branch":
+        _git(worktree, "switch", "-c", "fix/changed-after-preflight")
+    elif mutation == "head":
+        (worktree / "tracked.txt").write_text("later\n", encoding="utf-8")
+        _git(worktree, "commit", "-qam", "later")
+    elif mutation == "dirty":
+        (worktree / "untracked.txt").write_text("later\n", encoding="utf-8")
+    else:
+        moved = _git(repository, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "moved")
+        _git(repository, "update-ref", "refs/heads/cao/session/session-race", moved)
+
+    retired = managed_worktree_service.purge_session_managed_worktrees(
+        [metadata], captured["authority"]
+    )
+
+    assert retired["removed"] is False
+    assert retired["reason_code"] == "WRITABLE_WORKTREE_AUTHORITY_CHANGED"
+    assert worktree.exists()
+
+
+def test_session_purge_fails_closed_when_writer_generation_changes(tmp_path, monkeypatch):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(str(repository), "writer-race", "task")
+    assert task is not None
+    metadata = {**_metadata(task), "session_id": "session", "writer_authority_generation": "a"}
+    captured = managed_worktree_service.capture_session_worktree_retirement_authority([metadata])
+    changed = {**metadata, "writer_authority_generation": "b"}
+
+    retired = managed_worktree_service.purge_session_managed_worktrees(
+        [changed], captured["authority"]
+    )
+
+    assert retired["removed"] is False
+    assert retired["reason_code"] == "WRITABLE_WORKTREE_AUTHORITY_CHANGED"
+    assert Path(task.path).exists()
+
+
+def test_session_purge_retry_accepts_monotonic_path_and_owned_ref_absence(tmp_path, monkeypatch):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(
+        str(repository), "partial-cleanup", "task"
+    )
+    assert task is not None
+    metadata = {**_metadata(task), "session_id": "session"}
+    captured = managed_worktree_service.capture_session_worktree_retirement_authority([metadata])
+    _git(repository, "worktree", "remove", task.path)
+    _git(repository, "update-ref", "-d", "refs/heads/cao/task/partial-cleanup")
+
+    first = managed_worktree_service.purge_session_managed_worktrees(
+        [metadata], captured["authority"], require_already_absent=True
+    )
+    second = managed_worktree_service.purge_session_managed_worktrees(
+        [metadata], captured["authority"], require_already_absent=True
+    )
+
+    assert first["removed"] is True
+    assert second["removed"] is True
+
+
+def test_session_purge_rejects_replaced_worktree_path(tmp_path, monkeypatch):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    reviewer = managed_worktree_service.create_managed_worktree(
+        str(repository), "replaced-path", "reviewer"
+    )
+    assert reviewer is not None
+    metadata = {**_metadata(reviewer), "session_id": "session"}
+    captured = managed_worktree_service.capture_session_worktree_retirement_authority([metadata])
+    _git(repository, "worktree", "remove", reviewer.path)
+    Path(reviewer.path).symlink_to(repository, target_is_directory=True)
+
+    retired = managed_worktree_service.purge_session_managed_worktrees(
+        [metadata], captured["authority"]
+    )
+
+    assert retired["removed"] is False
+    assert retired["reason_code"] == "MANAGED_WORKTREE_IDENTITY_MISMATCH"
+
+
+def test_session_capture_rejects_moved_worktree_registration(tmp_path, monkeypatch):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(
+        str(repository), "moved-registration", "task"
+    )
+    assert task is not None
+    metadata = {**_metadata(task), "session_id": "session"}
+    moved_path = tmp_path / "moved-elsewhere"
+    _git(repository, "worktree", "move", task.path, str(moved_path))
+
+    captured = managed_worktree_service.capture_session_worktree_retirement_authority([metadata])
+
+    assert captured == {
+        "safe": False,
+        "reason_code": "MANAGED_WORKTREE_AUTHORITY_CHANGED",
+    }
+    assert moved_path.exists()
+
+
+def test_session_capture_rejects_ambiguous_private_branch(tmp_path, monkeypatch):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(str(repository), "owned-task", "task")
+    assert task is not None
+    metadata = {**_metadata(task), "session_id": "session"}
+    _git(Path(task.path), "switch", "-c", "cao/task/another-session")
+
+    captured = managed_worktree_service.capture_session_worktree_retirement_authority([metadata])
+
+    assert captured == {
+        "safe": False,
+        "reason_code": "WRITABLE_WORKTREE_AUTHORITY_CHANGED",
+    }
+    assert Path(task.path).exists()
+
+
+def test_session_purge_rechecks_each_row_immediately_without_another_inventory_scan(
+    tmp_path, monkeypatch
+):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    first = managed_worktree_service.create_managed_worktree(str(repository), "a-first", "task")
+    second = managed_worktree_service.create_managed_worktree(str(repository), "b-second", "task")
+    assert first is not None and second is not None
+    metadata = [
+        {**_metadata(first), "session_id": "session"},
+        {**_metadata(second), "session_id": "session"},
+    ]
+    captured = managed_worktree_service.capture_session_worktree_retirement_authority(metadata)
+    original_git = managed_worktree_service._git
+    original_inventory = managed_worktree_service._bounded_git_output
+    removal_seen = False
+    inventory_scans = 0
+
+    def mutate_after_first_removal(*args, **kwargs):
+        nonlocal removal_seen
+        result = original_git(*args, **kwargs)
+        if args[:2] == ("worktree", "remove") and not removal_seen:
+            removal_seen = True
+            _git(Path(second.path), "switch", "-c", "fix/changed-during-cleanup")
+        return result
+
+    def count_inventory(*args, **kwargs):
+        nonlocal inventory_scans
+        inventory_scans += 1
+        return original_inventory(*args, **kwargs)
+
+    monkeypatch.setattr(managed_worktree_service, "_git", mutate_after_first_removal)
+    monkeypatch.setattr(managed_worktree_service, "_bounded_git_output", count_inventory)
+    retired = managed_worktree_service.purge_session_managed_worktrees(
+        metadata, captured["authority"]
+    )
+
+    assert retired["removed"] is False
+    assert retired["terminal_id"] == "b-second"
+    assert retired["reason_code"] == "MANAGED_WORKTREE_AUTHORITY_CHANGED"
+    assert not Path(first.path).exists()
+    assert Path(second.path).exists()
+    assert inventory_scans == 1
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit_value"),
+    [
+        ("_MAX_WORKTREE_INVENTORY_BYTES", 1),
+        ("_MAX_WORKTREE_INVENTORY_ROWS", 0),
+    ],
+)
+def test_session_capture_fails_closed_when_repository_inventory_exceeds_bound(
+    tmp_path, monkeypatch, limit_name, limit_value
+):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(
+        str(repository), "bounded-inventory", "task"
+    )
+    assert task is not None
+    monkeypatch.setattr(managed_worktree_service, limit_name, limit_value)
+
+    captured = managed_worktree_service.capture_session_worktree_retirement_authority(
+        [{**_metadata(task), "session_id": "session"}]
+    )
+
+    assert captured == {
+        "safe": False,
+        "reason_code": "MANAGED_WORKTREE_INVENTORY_LIMIT",
+    }
+    assert Path(task.path).exists()
+
+
+def test_session_purge_rejects_registration_move_after_cached_inventory(tmp_path, monkeypatch):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(
+        str(repository), "registration-race", "task"
+    )
+    assert task is not None
+    metadata = {**_metadata(task), "session_id": "session"}
+    captured = managed_worktree_service.capture_session_worktree_retirement_authority([metadata])
+    moved_path = tmp_path / "moved-after-inventory"
+    original_git = managed_worktree_service._git
+    moved = False
+
+    def move_during_live_revalidation(*args, **kwargs):
+        nonlocal moved
+        if (
+            not moved
+            and args[:2] == ("rev-parse", "--show-toplevel")
+            and Path(kwargs["cwd"]) == Path(task.path)
+        ):
+            moved = True
+            _git(repository, "worktree", "move", task.path, str(moved_path))
+        return original_git(*args, **kwargs)
+
+    monkeypatch.setattr(managed_worktree_service, "_git", move_during_live_revalidation)
+    retired = managed_worktree_service.purge_session_managed_worktrees(
+        [metadata], captured["authority"]
+    )
+
+    assert retired["removed"] is False
+    assert retired["reason_code"] in {
+        "MANAGED_WORKTREE_IDENTITY_MISMATCH",
+        "MANAGED_WORKTREE_AUTHORITY_CHANGED",
+    }
+    assert moved_path.exists()
+
+
+def test_session_purge_revalidates_repository_identity_before_private_ref_cas(
+    tmp_path, monkeypatch
+):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(
+        str(repository), "repository-race", "task"
+    )
+    assert task is not None and task.branch is not None
+    metadata = {**_metadata(task), "session_id": "session"}
+    captured = managed_worktree_service.capture_session_worktree_retirement_authority([metadata])
+    expected_object = captured["authority"]["worktrees"][0]["owned_ref_object_id"]
+    original_git = managed_worktree_service._git
+    original_repository = tmp_path / "original-source"
+    replaced = False
+
+    def replace_after_worktree_removal(*args, **kwargs):
+        nonlocal replaced
+        result = original_git(*args, **kwargs)
+        if not replaced and args[:2] == ("worktree", "remove"):
+            replaced = True
+            repository.rename(original_repository)
+            subprocess.run(
+                ["git", "clone", "-q", "--no-hardlinks", str(original_repository), str(repository)],
+                check=True,
+            )
+            _git(repository, "update-ref", f"refs/heads/{task.branch}", expected_object)
+        return result
+
+    monkeypatch.setattr(managed_worktree_service, "_git", replace_after_worktree_removal)
+    retired = managed_worktree_service.purge_session_managed_worktrees(
+        [metadata], captured["authority"]
+    )
+
+    assert retired["removed"] is False
+    assert retired["reason_code"] == "MANAGED_WORKTREE_IDENTITY_MISMATCH"
+    assert _git(repository, "rev-parse", f"refs/heads/{task.branch}") == expected_object
+
+
+def test_authoritatively_retired_workspace_must_already_be_physically_absent(tmp_path, monkeypatch):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(
+        str(repository), "terminal-retired-conflict", "task"
+    )
+    assert task is not None
+
+    result = managed_worktree_service.purge_managed_worktree(
+        _metadata(task), require_already_absent=True
+    )
+
+    assert result["removed"] is False
+    assert result["reason_code"] == "WORKSPACE_RETIREMENT_STATE_CONFLICT"
+    assert Path(task.path).exists()
+    assert _git(repository, "show-ref", "--verify", f"refs/heads/{task.branch}")
+
+
+def test_hard_purge_retry_finishes_private_branch_after_worktree_is_already_absent(
+    tmp_path, monkeypatch
+):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(
+        str(repository), "terminal-retry", "task"
+    )
+    assert task is not None
+    metadata = _metadata(task)
+    removed = managed_worktree_service.remove_managed_worktree(metadata)
+    assert removed["removed"] is True
+    assert _git(repository, "show-ref", "--verify", f"refs/heads/{task.branch}")
+
+    first = managed_worktree_service.purge_managed_worktree(metadata, require_already_absent=True)
+    second = managed_worktree_service.purge_managed_worktree(metadata, require_already_absent=True)
+
+    assert first["removed"] is True
+    assert first["already_removed"] is True
+    assert second["removed"] is True
+    assert second["already_removed"] is True
+    assert not Path(task.path).exists()
+
+
+def test_historical_terminal_cleanup_deletes_only_the_receipted_branch_object(
+    tmp_path, monkeypatch
+):
+    repository = _repository(tmp_path)
+    monkeypatch.setattr(managed_worktree_service, "MANAGED_WORKTREE_DIR", tmp_path / "managed")
+    task = managed_worktree_service.create_managed_worktree(
+        str(repository), "terminal-history", "task"
+    )
+    assert task is not None
+    metadata = _metadata(task)
+    removed = managed_worktree_service.remove_managed_worktree(metadata)
+    assert removed["removed"] is True
+    receipt_authority = {
+        **metadata,
+        "managed_worktree_identity": "terminal-history",
+        "managed_worktree_branch_object_id": removed["commit"],
+    }
+
+    moved = _git(repository, "commit-tree", "HEAD^{tree}", "-p", "HEAD", "-m", "late move")
+    _git(repository, "update-ref", f"refs/heads/{task.branch}", moved)
+    changed = managed_worktree_service.purge_managed_worktree(
+        receipt_authority,
+        require_already_absent=True,
+    )
+    assert changed["removed"] is False
+    assert changed["reason_code"] == "MANAGED_WORKTREE_BRANCH_CHANGED"
+    assert _git(repository, "rev-parse", f"refs/heads/{task.branch}") == moved
+
+    receipt_authority["managed_worktree_branch_object_id"] = moved
+    purged = managed_worktree_service.purge_managed_worktree(
+        receipt_authority,
+        require_already_absent=True,
+    )
+    assert purged["removed"] is True
+    assert purged["branch_absent"] is True

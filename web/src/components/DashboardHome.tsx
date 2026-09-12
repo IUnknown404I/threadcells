@@ -17,6 +17,7 @@ import { RecoveryTakeoverAction } from './RecoveryTakeoverAction'
 import { WorkflowRecoveryNotice } from './WorkflowRecoveryNotice'
 import { useRecoveryTakeoverCapabilities } from '../recoveryCapabilities'
 import { InteractionHistoryDrawer } from './InteractionHistoryDrawer'
+import { SessionDeletionDialog } from './SessionDeletionDialog'
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })))
 
@@ -87,8 +88,8 @@ function ExpandedSessionAgents({
             <button onClick={() => onOutput(agent.id)} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white" title={t('home.output')}><FileText size={14}/></button>
             <button onClick={() => onTerminal(agent)} disabled={workspaceUnavailable} title={workspaceUnavailable ? t('agents.openComposerUnavailable') : undefined} className="flex min-h-11 items-center gap-1.5 rounded-lg bg-emerald-600 px-3 text-xs font-medium text-white hover:bg-emerald-500 disabled:cursor-not-allowed disabled:opacity-40"><Monitor size={12}/>{t('home.terminal')}</button>
             {!workspaceUnavailable && <RecoveryTakeoverAction agent={agent} capability={recoveryCapabilities[agent.id]} onCompleted={onRecoveryCompleted} className="flex min-h-11 items-center gap-1.5 rounded-lg bg-indigo-700 px-3 text-xs font-medium text-white hover:bg-indigo-600"/>}
-            <button onClick={() => onExit(agent)} disabled={exitingTerminal === agent.id || agent.lifecycle === 'exited' || agent.lifecycle === 'recovery_fenced'} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-amber-400 disabled:opacity-30" title={t('home.gracefulExit')}><LogOut size={14}/></button>
-            <button onClick={() => onClose(agent)} disabled={closingTerminal === agent.id || agent.lifecycle !== 'exited'} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-red-400 disabled:opacity-30" title={agent.lifecycle === 'exited' ? t('home.deleteExited') : t('home.exitBeforeDelete')}><Trash2 size={14}/></button>
+            <button onClick={() => onExit(agent)} disabled={exitingTerminal === agent.id || agent.lifecycle === 'exited' || agent.lifecycle === 'recovery_fenced'} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-amber-600 text-white hover:bg-amber-500 disabled:cursor-not-allowed disabled:bg-gray-800 disabled:text-gray-500 disabled:opacity-60" title={t('home.gracefulExit')}><LogOut size={14}/></button>
+            <button onClick={() => onClose(agent)} disabled={closingTerminal === agent.id || agent.lifecycle !== 'exited'} className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg bg-red-600 text-white hover:bg-red-500 disabled:cursor-not-allowed disabled:bg-gray-800 disabled:text-gray-500 disabled:opacity-60" title={agent.lifecycle === 'exited' ? t('home.deleteExited') : t('home.exitBeforeDelete')}><Trash2 size={14}/></button>
           </div>
         </div>
         <ProviderOutcomeNotice code={agent.provider_outcome_code} />
@@ -168,19 +169,32 @@ export function DashboardHome({ onNavigate, overviewState }: { onNavigate: (dest
   }
 
   const handleDeleteSession = async () => {
-    if (!pendingDeleteSession || !deletePreflight?.eligible || deletingSessionRef.current) return
+    if (!pendingDeleteSession || !deletePreflight || deletingSessionRef.current) return
+    if (!deletePreflight.eligible && !deletePreflight.can_resolve_and_delete) return
     deletingSessionRef.current = true
     setDeletingSession(pendingDeleteSession.id)
-    try { await deleteSession(pendingDeleteSession.id, deletePreflight.requires_dirty_confirmation); sessionFeed.reload(); setPendingDeleteSession(null); setDeletePreflight(null) } finally { deletingSessionRef.current = false; setDeletingSession(null) }
+    try {
+      const deleted = await deleteSession(
+        pendingDeleteSession.id,
+        deletePreflight.requires_dirty_confirmation,
+        deletePreflight.requires_cancellation_confirmation,
+        deletePreflight.plan_token,
+        deletePreflight.requires_historical_indeterminate_confirmation,
+      )
+      if (deleted) {
+        sessionFeed.reload()
+        setPendingDeleteSession(null)
+        setDeletePreflight(null)
+      } else {
+        const refreshed = await api.getSessionDeletionPreflight(pendingDeleteSession.id)
+        setDeletePreflight(refreshed)
+      }
+    } finally { deletingSessionRef.current = false; setDeletingSession(null) }
   }
 
   const openDeleteSession = async (session: Session) => {
     try {
       const preflight = await api.getSessionDeletionPreflight(session.id)
-      if (!preflight.eligible) {
-        showSnackbar({ type: 'error', message: preflight.reason_code || t('store.deleteFailed') })
-        return
-      }
       setDeletePreflight(preflight)
       setPendingDeleteSession(session)
     } catch (reason: any) {
@@ -234,7 +248,7 @@ export function DashboardHome({ onNavigate, overviewState }: { onNavigate: (dest
     {outputTerminalId && <OutputViewer terminalId={outputTerminalId} onClose={() => setOutputTerminalId(null)}/>}
     <ConfirmModal open={!!pendingClose} title={t('home.deleteTerminalTitle')} message={t('home.deleteTerminalMessage')} details={pendingClose ? [{ label: t('home.terminalDetail'), value: `${pendingClose.agent_profile || 'default'} (${pendingClose.id})` }, { label: t('home.sessionDetail'), value: sessionDisplayName(pendingClose.tmux_session) }] : []} confirmLabel={t('home.deleteTerminalConfirm')} variant="danger" loading={!!closingTerminal} onConfirm={handleDeleteTerminal} onCancel={() => setPendingClose(null)}/>
     <ConfirmModal open={!!pendingExit} title={t('home.gracefulExit')} message={t('home.exitMessage')} details={pendingExit ? [{ label: t('home.terminalDetail'), value: `${pendingExit.agent_profile || 'default'} (${pendingExit.id})` }, { label: t('common.provider'), value: pendingExit.provider }] : []} confirmLabel={t('home.sendExit')} variant="warning" loading={!!exitingTerminal} onConfirm={handleExitTerminal} onCancel={() => setPendingExit(null)}/>
-    <ConfirmModal open={!!pendingDeleteSession} title={t('home.deleteSessionTitle')} message={t(deletePreflight?.requires_dirty_confirmation ? 'home.deleteSessionDirty' : 'home.deleteSessionMessage')} details={pendingDeleteSession ? [{ label: t('home.sessionDetail'), value: sessionDisplayName(pendingDeleteSession.name) }, { label: t('home.statusDetail'), value: t(sessionStatusTranslationKey(pendingDeleteSession.status)) }, ...(deletePreflight?.requires_dirty_confirmation ? [{ label: t('agents.modifiedFiles'), value: String(deletePreflight.modified_files) }, { label: t('agents.untrackedFiles'), value: String(deletePreflight.untracked_files) }] : [])] : []} confirmLabel={t('home.deleteSessionTitle')} variant="danger" loading={!!deletingSession} onConfirm={handleDeleteSession} onCancel={() => { setPendingDeleteSession(null); setDeletePreflight(null) }}/>
+    <SessionDeletionDialog open={!!pendingDeleteSession} sessionName={pendingDeleteSession ? sessionDisplayName(pendingDeleteSession.name) : ''} statusLabel={pendingDeleteSession ? t(sessionStatusTranslationKey(pendingDeleteSession.status)) : ''} preflight={deletePreflight} loading={!!deletingSession} onConfirm={handleDeleteSession} onCancel={() => { setPendingDeleteSession(null); setDeletePreflight(null) }}/>
   </div>
 }
 

@@ -7,6 +7,7 @@ flow_daemon, lifespan, and the main() entry point.
 
 import asyncio
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -109,6 +110,7 @@ class TestCapacitySettings:
             "max_work_contexts": 7,
             "max_heavy_execution_slots": 2,
         }
+
         with (
             patch(
                 "cli_agent_orchestrator.api.main._require_operator",
@@ -585,7 +587,10 @@ class TestPublicControlPlaneApi:
             )
 
         assert response.status_code == 200
-        assert response.json() == preview
+        assert {
+            key: value for key, value in response.json().items() if key != "operation_id"
+        } == preview
+        assert re.fullmatch(r"[0-9a-f]{32}", response.json()["operation_id"])
         service.assert_called_once_with(retire_dirty_worktrees=retire_dirty_worktrees)
 
     @pytest.mark.parametrize(
@@ -615,6 +620,7 @@ class TestPublicControlPlaneApi:
         self, client, retire_dirty_worktrees
     ):
         plan_id = "b" * 64
+        operation_id = "c" * 32
         summary = MagicMock()
         summary.as_dict.return_value = {"ok": True, "full_cleanup": True}
 
@@ -639,6 +645,7 @@ class TestPublicControlPlaneApi:
             response = client.post(
                 "/api/v1/housekeeping/full-cleanup/run",
                 json={
+                    "operation_id": operation_id,
                     "expected_plan_id": plan_id,
                     "confirmed": True,
                     "retire_dirty_worktrees": retire_dirty_worktrees,
@@ -649,11 +656,11 @@ class TestPublicControlPlaneApi:
         assert response.status_code == 200
         authorize.assert_called_once()
         helper.assert_called_once_with(
+            operation_id=operation_id,
             expected_plan_id=plan_id,
             confirmed=True,
             retire_dirty_worktrees=retire_dirty_worktrees,
-            session_token=None,
-            bearer_secret="existing-secret",
+            actor_kind="operator_bearer",
         )
         service.assert_called_once_with(
             expected_plan_id=plan_id,
@@ -674,7 +681,7 @@ class TestPublicControlPlaneApi:
         ):
             response = client.post(
                 "/api/v1/housekeeping/full-cleanup/run",
-                json={"expected_plan_id": "a" * 64, "confirmed": True},
+                json={"operation_id": "a" * 32, "expected_plan_id": "a" * 64, "confirmed": True},
             )
 
         assert response.status_code == 401
@@ -692,7 +699,7 @@ class TestPublicControlPlaneApi:
         ):
             response = client.post(
                 "/api/v1/housekeeping/full-cleanup/run",
-                json={"expected_plan_id": "a" * 64},
+                json={"operation_id": "a" * 32, "expected_plan_id": "a" * 64},
             )
 
         assert response.status_code == 422
@@ -718,7 +725,7 @@ class TestPublicControlPlaneApi:
         ):
             response = client.post(
                 "/api/v1/housekeeping/full-cleanup/run",
-                json={"expected_plan_id": "a" * 64, "confirmed": True},
+                json={"operation_id": "d" * 32, "expected_plan_id": "a" * 64, "confirmed": True},
                 headers={"Authorization": "Bearer existing-secret"},
             )
 
@@ -747,7 +754,7 @@ class TestPublicControlPlaneApi:
         ):
             response = client.post(
                 "/api/v1/housekeeping/full-cleanup/run",
-                json={"expected_plan_id": "a" * 64, "confirmed": True},
+                json={"operation_id": "e" * 32, "expected_plan_id": "a" * 64, "confirmed": True},
                 headers={"Authorization": "Bearer existing-secret"},
             )
 
@@ -756,6 +763,76 @@ class TestPublicControlPlaneApi:
             "reason_code": "FULL_CLEANUP_HELPER_FAILED",
             "diagnostic_id": "e" * 32,
         }
+
+    def test_full_cleanup_duplicate_operation_observes_without_reexecution(self, client):
+        operation_id = "9" * 32
+        plan_id = "8" * 64
+        operation = {
+            "operation_id": operation_id,
+            "plan_id": plan_id,
+            "retire_dirty_worktrees": False,
+            "state": "running",
+            "progress": {"sequence": 2, "processed_candidates": 2},
+            "report": None,
+            "reason_code": None,
+            "diagnostic_id": None,
+        }
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main._require_operator",
+                return_value="operator_session:test",
+            ),
+            patch(
+                "cli_agent_orchestrator.clients.database.get_full_cleanup_operation",
+                return_value=operation,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.housekeeping_service.run_full_cleanup",
+            ) as service,
+        ):
+            response = client.post(
+                "/api/v1/housekeeping/full-cleanup/run",
+                json={
+                    "operation_id": operation_id,
+                    "expected_plan_id": plan_id,
+                    "confirmed": True,
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json()["operation_id"] == operation_id
+        assert response.json()["state"] == "running"
+        assert response.json()["progress"]["processed_candidates"] == 2
+        service.assert_not_called()
+
+    def test_full_cleanup_operation_poll_reconciles_dead_helper(self, client):
+        operation_id = "7" * 32
+        operation = {
+            "operation_id": operation_id,
+            "plan_id": "6" * 64,
+            "retire_dirty_worktrees": False,
+            "state": "indeterminate",
+            "progress": {"sequence": 1},
+            "report": None,
+            "reason_code": "FULL_CLEANUP_HELPER_EXITED_WITHOUT_RECEIPT",
+            "diagnostic_id": None,
+        }
+        with (
+            patch(
+                "cli_agent_orchestrator.services.full_cleanup_operation_service.reconcile_interrupted_full_cleanup_operations",
+                return_value={"inspected": 1, "active": 0, "terminalized": 1},
+            ) as reconcile,
+            patch(
+                "cli_agent_orchestrator.clients.database.get_full_cleanup_operation",
+                return_value=operation,
+            ),
+        ):
+            response = client.get(f"/api/v1/housekeeping/full-cleanup/operations/{operation_id}")
+
+        assert response.status_code == 200
+        assert response.json()["state"] == "indeterminate"
+        assert response.json()["reason_code"] == ("FULL_CLEANUP_HELPER_EXITED_WITHOUT_RECEIPT")
+        reconcile.assert_called_once_with(include_admitted=False)
 
     def test_housekeeping_report_is_available_before_the_first_run(self, client, tmp_path):
         with patch(
@@ -1534,7 +1611,12 @@ class TestDeleteSession:
         assert data["success"] is True
         assert data["deleted"] == ["test-session"]
         mock_svc.delete_session.assert_called_once_with(
-            "test-session", registry=ANY, confirm_dirty_workspace=False
+            "test-session",
+            registry=ANY,
+            confirm_dirty_workspace=False,
+            cancel_unresolved_work=False,
+            retire_historical_indeterminate=False,
+            cancellation_plan_token=None,
         )
 
     def test_delete_session_forwards_explicit_dirty_confirmation(self, client):
@@ -1547,7 +1629,58 @@ class TestDeleteSession:
 
         assert response.status_code == 200
         mock_svc.delete_session.assert_called_once_with(
-            "test-session", registry=ANY, confirm_dirty_workspace=True
+            "test-session",
+            registry=ANY,
+            confirm_dirty_workspace=True,
+            cancel_unresolved_work=False,
+            retire_historical_indeterminate=False,
+            cancellation_plan_token=None,
+        )
+
+    def test_delete_session_forwards_exact_cancellation_intent(self, client):
+        token = "a" * 64
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.delete_session.return_value = {"deleted": ["test-session"], "errors": []}
+
+            response = client.delete(
+                "/sessions/test-session",
+                params={
+                    "cancel_unresolved_work": True,
+                    "cancellation_plan_token": token,
+                },
+            )
+
+        assert response.status_code == 200
+        mock_svc.delete_session.assert_called_once_with(
+            "test-session",
+            registry=ANY,
+            confirm_dirty_workspace=False,
+            cancel_unresolved_work=True,
+            retire_historical_indeterminate=False,
+            cancellation_plan_token=token,
+        )
+
+    def test_delete_session_forwards_exact_historical_retirement_intent(self, client):
+        token = "b" * 64
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.delete_session.return_value = {"deleted": ["test-session"], "errors": []}
+
+            response = client.delete(
+                "/sessions/test-session",
+                params={
+                    "retire_historical_indeterminate": True,
+                    "cancellation_plan_token": token,
+                },
+            )
+
+        assert response.status_code == 200
+        mock_svc.delete_session.assert_called_once_with(
+            "test-session",
+            registry=ANY,
+            confirm_dirty_workspace=False,
+            cancel_unresolved_work=False,
+            retire_historical_indeterminate=True,
+            cancellation_plan_token=token,
         )
 
     def test_delete_session_not_found(self, client):
@@ -2318,6 +2451,54 @@ class TestSendTerminalInput:
         assert call.kwargs["sender_id"] == "supervisor-1"
         assert call.kwargs["orchestration_type"] == "assign"
 
+    def test_internal_orchestration_accepts_exact_turn_already_queued_for_reconnect(self, client):
+        """A server-bound task remains durable without reaching the stale process."""
+        queued = {
+            "turn_id": 76,
+            "state": "queued",
+            "queue_reason": "TERMINAL_RUNTIME_OPERATION_BUSY",
+            "reconnect_pending": True,
+            "accepted": True,
+            "queued": True,
+            "provider_admitted": False,
+            "receipted": False,
+        }
+        with (
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_workflow_input_binding",
+                return_value=76,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.retain_queued_workflow_input_binding",
+                return_value=queued,
+            ) as retain,
+            patch(
+                "cli_agent_orchestrator.api.main.inbox_service.wake_provider_execution_queue"
+            ) as wake,
+        ):
+            response = client.post(
+                "/_internal/terminals/abcd1234/input",
+                params={
+                    "message": "review exact correction",
+                    "binding": "exact-binding",
+                    "sender_id": "owner",
+                    "orchestration_type": "assign",
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "success": True,
+            "queued": True,
+            "status": "queued_runtime_recovery",
+            "reason_code": "TERMINAL_RUNTIME_OPERATION_BUSY",
+            "turn_id": 76,
+        }
+        retain.assert_called_once_with("abcd1234", "exact-binding", "review exact correction")
+        wake.assert_called_once()
+        mock_svc.send_input.assert_not_called()
+
     def test_send_input_terminal_not_found(self, client):
         """POST /terminals/{id}/input returns 404 for nonexistent terminal."""
         with patch(
@@ -2691,7 +2872,15 @@ class TestWorkflowDaemon:
             if failed_reconciliation == "assigned":
                 raise RuntimeError("assigned child failure")
 
+        def reconcile_compatibility():
+            calls.append("compatibility")
+
         with (
+            patch(
+                "cli_agent_orchestrator.api.main.workflow_service."
+                "fence_stale_provider_runtime_compatibility",
+                side_effect=reconcile_compatibility,
+            ) as compatibility,
             patch(
                 "cli_agent_orchestrator.api.main.inbox_service.reconcile_handoff_continuations",
                 side_effect=reconcile_handoffs,
@@ -2707,7 +2896,8 @@ class TestWorkflowDaemon:
         ):
             assert await _workflow_reconciliation_tick(None, False) is False
 
-        assert calls == ["handoff", "assigned", "queue"]
+        assert calls == ["compatibility", "handoff", "assigned", "queue"]
+        compatibility.assert_called_once_with()
         handoffs.assert_called_once_with(None)
         assigned.assert_called_once_with()
         queue.assert_called_once_with(None)
@@ -2733,6 +2923,11 @@ class TestLifespan:
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
             patch(
+                "cli_agent_orchestrator.api.main.workflow_service."
+                "fence_stale_provider_runtime_compatibility",
+                return_value=0,
+            ) as compatibility,
+            patch(
                 "cli_agent_orchestrator.api.main.PollingObserver",
                 return_value=mock_observer,
             ),
@@ -2751,6 +2946,7 @@ class TestLifespan:
         ):
             async with lifespan(app):
                 # Inside the lifespan — startup completed
+                compatibility.assert_called_once_with()
                 mock_observer.schedule.assert_called_once()
                 mock_observer.start.assert_called_once()
 
@@ -2770,6 +2966,7 @@ class TestMainEntryPoint:
         with (
             patch("argparse.ArgumentParser.parse_args") as mock_args,
             patch("uvicorn.run") as mock_uvicorn,
+            patch("cli_agent_orchestrator.api.main.seed_default_skills") as mock_seed,
         ):
             mock_args.return_value = MagicMock(agents_dir=None, host=None, port=None)
 
@@ -2781,12 +2978,14 @@ class TestMainEntryPoint:
             call_kwargs = mock_uvicorn.call_args
             # Should use SERVER_HOST and SERVER_PORT defaults
             assert call_kwargs[0][0] is app
+            mock_seed.assert_called_once_with()
 
     def test_main_custom_host_port(self):
         """main() uses custom host and port from args."""
         with (
             patch("argparse.ArgumentParser.parse_args") as mock_args,
             patch("uvicorn.run") as mock_uvicorn,
+            patch("cli_agent_orchestrator.api.main.seed_default_skills"),
         ):
             mock_args.return_value = MagicMock(agents_dir=None, host="0.0.0.0", port=9999)
 
@@ -2802,6 +3001,7 @@ class TestMainEntryPoint:
             patch("argparse.ArgumentParser.parse_args") as mock_args,
             patch("uvicorn.run"),
             patch("cli_agent_orchestrator.constants.KIRO_AGENTS_DIR") as _,
+            patch("cli_agent_orchestrator.api.main.seed_default_skills"),
         ):
             mock_args.return_value = MagicMock(agents_dir="/custom/agents", host=None, port=None)
 

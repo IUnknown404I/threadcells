@@ -99,6 +99,58 @@ def test_orphan_authority_reconciliation_cancels_edges_and_preserves_history(wor
         assert db.query(WorktreeWriterLeaseModel).count() == 0
 
 
+def test_orphan_reconciliation_and_terminal_cancellation_preserve_resumed_gate_history(
+    workflow_db,
+):
+    root = "missing-resumed-gate-root"
+    with workflow_db() as db:
+        gate = WorkflowModel(
+            root_terminal_id=root,
+            status="owner_gate",
+            terminal_reason="historical owner decision",
+        )
+        db.add(gate)
+        db.flush()
+        completed = WorkflowModel(
+            root_terminal_id=root,
+            status="terminal",
+            terminal_reason="first continuation completed",
+            resumed_from_owner_gate_workflow_id=gate.id,
+        )
+        current = WorkflowModel(root_terminal_id=root, status="open")
+        db.add_all([completed, current])
+        db.commit()
+        gate_id = int(gate.id)
+        current_id = int(current.id)
+
+    assert database.get_protected_workflow_root_terminal_ids() == [root]
+    inventory = database.list_orphaned_protected_workflow_authorities()
+    assert len(inventory) == 1
+    assert [row["id"] for row in inventory[0]["workflows"]] == [current_id]
+    fingerprint = database._workflow_authority_snapshot_fingerprint(inventory[0])
+
+    result = database.reconcile_orphaned_protected_workflow_authority(
+        root,
+        [current_id],
+        fingerprint,
+        "",
+        [],
+    )
+    assert result == {
+        "reconciled": 1,
+        "already_reconciled": False,
+        "reason": "root_terminal_absent",
+    }
+    assert database.list_orphaned_protected_workflow_authorities() == []
+    assert root not in database.get_protected_workflow_root_terminal_ids()
+    assert database.cancel_workflows_for_terminal(root) == 0
+    with workflow_db() as db:
+        historical = db.get(WorkflowModel, gate_id)
+        assert historical.status == "owner_gate"
+        assert historical.terminal_reason == "historical owner decision"
+        assert db.get(WorkflowModel, current_id).status == "cancelled"
+
+
 def test_existing_terminal_prevents_orphan_reconciliation(workflow_db):
     root = "live-root"
     with workflow_db() as db:

@@ -76,6 +76,8 @@ Submitting a new Workflow Composer message is the owner decision that resumes an
 
 On restart, ThreadCells reconstructs workflow ownership from durable state. Delivered-but-unacknowledged results remain available. A waiting handoff can be resumed against the same child instead of launching a duplicate. Once a newer logical turn is admitted for an open workflow, an older pending continuation is durably superseded and cannot later replay as independent work after compaction or interruption.
 
+If an authoritatively exited managed child has no submitted result, ThreadCells advances the same bounded recovery budget even when the provider's last rendered status is stale. Exhaustion records an `incomplete` lifecycle result, queues it once for the open parent to read and acknowledge, and rejects late submissions; it never invents a successful outcome.
+
 Restart reconciliation also reopens a latest owner-gated workflow when its cancelled transport head already has a later explicit Composer successor. It promotes that existing successor without creating a replacement turn, and never uses this repair to revive Inbox callbacks or Exited terminals.
 
 If provider/model execution is interrupted after its logical input was admitted but before the required work finishes, ThreadCells resumes through a fresh durable continuation turn instead of replaying the original receipt. Completed effects remain fenced, provider-execution ownership follows the resumed turn, and the same immutable child result and completion barrier remain available for incorporation and exactly-once acknowledgement.

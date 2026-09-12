@@ -351,13 +351,48 @@ export interface SessionBoundaryAgent {
   workflow_reason: string | null
 }
 
+export interface SessionDeletionBlocker {
+  category: string
+  count: number
+  disposition: 'cancellable' | 'historical_indeterminate' | 'unsafe'
+  reason_codes: string[]
+}
+
 export interface SessionDeletionPreflight {
   eligible: boolean
+  deletion_mode: 'eligible_normal' | 'eligible_with_cancellable_work' | 'eligible_with_historical_indeterminate_retirement' | 'blocked_live_or_unsafe_authority' | 'deletion_in_progress'
+  deletion_in_progress?: boolean
+  cancellable: boolean
+  can_resolve_and_delete: boolean
   already_deleted: boolean
+  requires_cancellation_confirmation: boolean
+  requires_historical_indeterminate_confirmation: boolean
   requires_dirty_confirmation: boolean
   modified_files: number
   untracked_files: number
   reason_code: string | null
+  reason_codes: string[]
+  plan_token: string | null
+  current_queue_count: number
+  cancellable_count: number
+  historical_indeterminate_count: number
+  unsafe_count: number
+  live_unsafe_count: number
+  active_runtime_count: number
+  active_execution_count: number
+  plan_limit: number
+  blockers: SessionDeletionBlocker[]
+  cancellable_blockers: SessionDeletionBlocker[]
+  historical_indeterminate_blockers: SessionDeletionBlocker[]
+  unsafe_blockers: SessionDeletionBlocker[]
+  cancellation_plan: {
+    count: number
+    categories: SessionDeletionBlocker[]
+  }
+  historical_indeterminate_plan: {
+    count: number
+    categories: SessionDeletionBlocker[]
+  }
 }
 
 export type TerminalLifecycle = 'starting' | 'running' | 'recovery_required' | 'exit_pending' | 'exited' | 'recovery_fenced'
@@ -724,6 +759,7 @@ export interface FullCleanupIdleGate {
 
 export interface FullCleanupPlan extends Omit<HousekeepingPlan, 'mode'> {
   mode: 'full'
+  operation_id: string
   idle_gate: FullCleanupIdleGate
   release_state: {
     metadata_certain: boolean
@@ -735,6 +771,32 @@ export interface FullCleanupPlan extends Omit<HousekeepingPlan, 'mode'> {
     rollback_releases_to_delete: number
     rollback_available: boolean
   }
+}
+
+export interface FullCleanupOperation {
+  status?: 'never_run'
+  operation_id?: string
+  plan_id?: string
+  retire_dirty_worktrees?: boolean
+  state?: 'admitted' | 'running' | 'completed' | 'completed_with_issues' | 'failed' | 'indeterminate'
+  progress?: {
+    sequence?: number
+    phase?: string
+    processed_candidates?: number
+    executed_candidates?: number
+    skipped_candidates?: number
+    failed_candidates?: number
+    freed_bytes?: number
+    last_candidate_sha256?: string
+    last_outcome?: string
+  }
+  report?: Record<string, any> | null
+  reason_code?: string | null
+  diagnostic_id?: string | null
+  created_at?: string | null
+  started_at?: string | null
+  updated_at?: string | null
+  completed_at?: string | null
 }
 
 export interface OwnerLaunchGrant {
@@ -886,7 +948,9 @@ export const api = {
       planningNetworkError(reason, true)
     }
   },
-  runFullCleanup: (expectedPlanId: string, retireDirtyWorktrees = false) => fetchJSON<Record<string, any>>('/api/v1/housekeeping/full-cleanup/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_plan_id: expectedPlanId, confirmed: true, retire_dirty_worktrees: retireDirtyWorktrees }), timeoutMs: null }),
+  runFullCleanup: (operationId: string, expectedPlanId: string, retireDirtyWorktrees = false) => fetchJSON<Record<string, any>>('/api/v1/housekeeping/full-cleanup/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ operation_id: operationId, expected_plan_id: expectedPlanId, confirmed: true, retire_dirty_worktrees: retireDirtyWorktrees }), timeoutMs: null }),
+  getLatestFullCleanupOperation: () => fetchJSON<FullCleanupOperation>('/api/v1/housekeeping/full-cleanup/operations/latest'),
+  getFullCleanupOperation: (operationId: string) => fetchJSON<FullCleanupOperation>(`/api/v1/housekeeping/full-cleanup/operations/${encodeURIComponent(operationId)}`),
   getHousekeepingReport: () => fetchJSON<Record<string, any>>('/api/v1/housekeeping/report'),
   getUsageStatistics: () => fetchJSON<UsageStatistics>('/usage/statistics'),
   getBranding: () => fetchJSON<RuntimeBranding>('/settings/branding'),
@@ -937,7 +1001,23 @@ export const api = {
     // runs for genuine caller cancellation (navigation, disconnect, etc.).
     fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}${projectId ? `&projectId=${encodeURIComponent(projectId)}` : ''}${ownerGrant ? `&owner_grant_launch_id=${encodeURIComponent(ownerGrant.launch_id)}` : ''}${workContextRequestId ? `&workContextRequestId=${encodeURIComponent(workContextRequestId)}` : ''}`, { method: 'POST', headers: ownerGrant ? { 'X-ThreadCells-Owner-Grant': ownerGrant.grant } : undefined, timeoutMs: null }),
   getSessionDeletionPreflight: (name: string) => fetchJSON<SessionDeletionPreflight>(`/sessions/${encodeURIComponent(name)}/deletion-preflight`),
-  deleteSession: (name: string, confirmDirtyWorkspace = false) => fetchJSON<{ success: boolean; deleted: string[]; errors: any[] }>(`/sessions/${encodeURIComponent(name)}?confirm_dirty_workspace=${confirmDirtyWorkspace}`, { method: 'DELETE' }),
+  deleteSession: (name: string, confirmDirtyWorkspace = false, cancelUnresolvedWork = false, cancellationPlanToken?: string | null, retireHistoricalIndeterminate = false) => {
+    const search = new URLSearchParams({
+      confirm_dirty_workspace: String(confirmDirtyWorkspace),
+      cancel_unresolved_work: String(cancelUnresolvedWork),
+      retire_historical_indeterminate: String(retireHistoricalIndeterminate),
+    })
+    if (cancellationPlanToken) search.set('cancellation_plan_token', cancellationPlanToken)
+    return fetchJSON<{
+      success: boolean
+      deleted: string[]
+      errors: any[]
+      already_deleted?: boolean
+      purged_rows?: Record<string, number>
+      remaining_rows?: Record<string, number>
+      tombstone_count?: number
+    }>(`/sessions/${encodeURIComponent(name)}?${search}`, { method: 'DELETE' })
+  },
 
   // Terminals
   getTerminalStatus: (id: string) => fetchJSON<Terminal>(`/terminals/${id}`),

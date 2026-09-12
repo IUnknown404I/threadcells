@@ -80,7 +80,10 @@ describe('InteractionHistoryDrawer', () => {
   it('loads Current Queue immediately and History only after the operator opens it', async () => {
     const list = vi.spyOn(api, 'listInteractions').mockImplementation(async params => (
       params.mode === 'history'
-        ? page([interaction({ id: 'inbox:0002', interaction_type: 'inbox', current: false, final_disposition: 'delivered', queue: { state: 'delivered', wait_reason: null, admission_pending: false } })])
+        ? page([
+          interaction({ id: 'inbox:0002', interaction_type: 'inbox', current: false, final_disposition: 'delivered', queue: { state: 'delivered', wait_reason: null, admission_pending: false } }),
+          interaction({ id: 'workflow-turn:0003', current: false, final_disposition: 'processed', queue: { state: 'sent', wait_reason: null, admission_pending: false } }),
+        ])
         : page([interaction()])
     ))
 
@@ -92,6 +95,7 @@ describe('InteractionHistoryDrawer', () => {
 
     fireEvent.click(screen.getByRole('tab', { name: 'History' }))
     expect(await screen.findByText('Inbox message')).toBeInTheDocument()
+    expect(screen.getByText('Processed')).toBeInTheDocument()
     expect(list).toHaveBeenCalledTimes(2)
     expect(list.mock.calls[1][0]).toMatchObject({ mode: 'history', sessionId: 'session-1' })
   })
@@ -154,6 +158,81 @@ describe('InteractionHistoryDrawer', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Show details' }))
     expect(await screen.findByText('Canonical body')).toBeInTheDocument()
     expect(readResult).toHaveBeenCalledOnce()
+  })
+
+  it('renders operator-retired effects as unknown outcomes without a fabricated result', async () => {
+    const retired = interaction({
+      id: 'effect:00000000000000000042',
+      interaction_type: 'effect',
+      task_type: 'handoff',
+      current: false,
+      queue: {
+        state: 'operator_retired_indeterminate',
+        wait_reason: null,
+        admission_pending: false,
+      },
+      workflow: {
+        id: 7,
+        turn_id: 11,
+        status: 'cancelled',
+        reason: 'operator retirement fixture',
+        turn_state: 'cancelled',
+        turn_kind: 'external_input',
+        provider_outcome_code: null,
+        provider_outcome_detail: null,
+        effect_kind: 'handoff',
+        effect_state: 'operator_retired_indeterminate',
+        turn_count: 0,
+        superseded_turn_count: 0,
+      },
+      result: { id: null, status: null, summary: null, available: false },
+      final_disposition: 'operator_retired_unknown_outcome',
+    })
+    vi.spyOn(api, 'listInteractions').mockImplementation(async params => (
+      page(params.mode === 'history' ? [retired] : [])
+    ))
+
+    render(<I18nProvider><InteractionHistoryDrawer sessionId="session-1" sessionName="cao-session-1" initialMode="history" onClose={() => {}} /></I18nProvider>)
+
+    expect(await screen.findByText('Outcome unknown · retired by operator')).toBeInTheDocument()
+    expect(screen.getByText('No canonical result exists for this interaction.')).toBeInTheDocument()
+  })
+
+  it('renders a bounded handoff timeout as a known History disposition', async () => {
+    const timeout = interaction({
+      id: 'workflow-turn:00000000000000000011',
+      interaction_type: 'effect',
+      task_type: 'await_handoff',
+      current: false,
+      queue: { state: 'sent', wait_reason: null, admission_pending: false },
+      workflow: {
+        id: 7,
+        turn_id: 11,
+        status: 'open',
+        reason: null,
+        turn_state: 'sent',
+        turn_kind: 'assigned_result',
+        provider_outcome_code: null,
+        provider_outcome_detail: null,
+        effect_kind: 'await_handoff',
+        effect_state: 'wait_timeout',
+        turn_count: 0,
+        superseded_turn_count: 0,
+      },
+      result: { id: null, status: null, summary: null, available: false },
+      final_disposition: 'wait_slice_expired',
+    })
+    vi.spyOn(api, 'listInteractions').mockImplementation(async params => (
+      page(params.mode === 'history' ? [timeout] : [])
+    ))
+
+    render(<I18nProvider><InteractionHistoryDrawer sessionId="session-1" sessionName="cao-session-1" initialMode="history" onClose={() => {}} /></I18nProvider>)
+
+    expect(await screen.findByText('Wait slice expired')).toBeInTheDocument()
+    expect(screen.getByText('Wait for handoff')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Show details' }))
+    expect(screen.getByText('await_handoff · wait_timeout')).toBeInTheDocument()
+    expect(screen.getAllByText('No canonical result exists for this interaction.')).toHaveLength(2)
   })
 
   it('is a responsive modal drawer with trapped initial focus and Escape close', async () => {

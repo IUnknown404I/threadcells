@@ -1,5 +1,7 @@
 """Tests for plugin event emission from service-layer operations."""
 
+import hashlib
+import json
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -108,14 +110,22 @@ class TestSessionPluginEvents:
 
         registry.dispatch.assert_not_awaited()
 
-    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_session_lifetime")
+    @patch("cli_agent_orchestrator.services.session_service.complete_session_hard_deletion")
     @patch("cli_agent_orchestrator.services.session_service.resolve_session_authority")
     def test_delete_session_dispatches_post_kill_session_event_after_cleanup(
-        self, mock_resolve, mock_delete_terminals
+        self, mock_resolve, mock_complete_deletion
     ):
-        """Logical session deletion should emit only after DB cleanup succeeds."""
+        """Permanent session deletion should emit only after the purge succeeds."""
         registry = _registry_mock()
         call_order: list[str] = []
+        workspace_authority = {
+            "version": 1,
+            "worktrees": [],
+            "work_context": None,
+        }
+        workspace_authority_sha256 = hashlib.sha256(
+            json.dumps(workspace_authority, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
 
         async def record_dispatch(*_args):
             call_order.append("dispatch")
@@ -125,28 +135,96 @@ class TestSessionPluginEvents:
             session_name="cao-demo",
             terminals=[],
             deleted=False,
+            runtime_exists=False,
             has_live_runtime_owner=False,
             has_recovery_fenced_history=False,
         )
-        mock_delete_terminals.side_effect = lambda *_args, **_kwargs: (
-            call_order.append("delete_terminals")
+        mock_complete_deletion.side_effect = lambda *_args, **_kwargs: (
+            call_order.append("complete_hard_delete")
             or {
+                "completed": True,
                 "already_deleted": False,
-                "logical_deleted": 0,
-                "retained_resources": [],
+                "before_counts": {},
+                "after_counts": {},
+                "tombstone_count": 1,
             }
         )
         registry.dispatch.side_effect = record_dispatch
 
-        result = delete_session("cao-demo", registry=registry)
+        with (
+            patch(
+                "cli_agent_orchestrator.services.session_service.get_session_hard_deletion_operation",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service._session_deletion_preflight",
+                return_value={
+                    "eligible": True,
+                    "requires_dirty_confirmation": False,
+                    "_workspace_authority": workspace_authority,
+                    "_workspace_authority_sha256": workspace_authority_sha256,
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.begin_session_hard_deletion",
+                return_value={
+                    "started": True,
+                    "session_id": "session-lifetime-1",
+                    "session_name": "cao-demo",
+                    "state": "fenced",
+                    "terminal_ids": [],
+                    "allow_dirty_workspace": False,
+                },
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.bind_session_hard_deletion_workspace_authority",
+                return_value={
+                    "bound": True,
+                    "workspace_authority_sha256": workspace_authority_sha256,
+                },
+            ) as mock_bind_workspace,
+            patch(
+                "cli_agent_orchestrator.services.session_service.get_writable_work_context_by_session",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.mark_session_hard_deletion_workspace_retired",
+                return_value={"marked": True},
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.housekeeping_mutation_fence",
+                side_effect=lambda: nullcontext(),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.purge_session_terminal_artifacts",
+                return_value={"runtime_artifacts_absent": True, "terminals": []},
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.revalidate_session_hard_deletion",
+                return_value={"valid": True, "terminal_ids": []},
+            ),
+        ):
+            result = delete_session("cao-demo", registry=registry)
 
         assert result == {
             "deleted": ["cao-demo"],
             "errors": [],
             "already_deleted": False,
             "retained_resources": [],
+            "purged_rows": {},
+            "remaining_rows": {},
+            "tombstone_count": 1,
+            "terminal_artifacts": {
+                "runtime_artifacts_absent": True,
+                "terminals": [],
+            },
         }
-        assert call_order == ["delete_terminals", "dispatch"]
+        assert call_order == ["complete_hard_delete", "dispatch"]
+        mock_bind_workspace.assert_called_once_with(
+            "session-lifetime-1",
+            "cao-demo",
+            workspace_authority=workspace_authority,
+        )
         event_type, event = registry.dispatch.await_args.args
         assert event_type == "post_kill_session"
         assert isinstance(event, PostKillSessionEvent)

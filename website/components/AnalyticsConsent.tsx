@@ -37,7 +37,12 @@ function startAnalytics() {
   if (!isProduction() || isLoopback || window.__threadcellsAnalyticsStarted) return
   window.__threadcellsAnalyticsStarted = true
   window.dataLayer = window.dataLayer || []
-  window.gtag = (...args: unknown[]) => { window.dataLayer?.push(args) }
+  // Google Tag consumes its command queue as Arguments objects, matching the
+  // canonical gtag snippet. Plain arrays load the library but do not dispatch.
+  window.gtag = function gtag() {
+    // eslint-disable-next-line prefer-rest-params
+    window.dataLayer?.push(arguments)
+  }
   window.gtag('js', new Date())
   // `config` sends one automatic page_view. The window guard prevents a second
   // config call if React remounts this component or settings are saved again.

@@ -40,9 +40,10 @@ img { display: block; max-width: 100%; }
 ::selection { color: #031107; background: var(--green); }
 :focus-visible { outline: 2px solid var(--green); outline-offset: 4px; }
 
-.consent-banner { position: fixed; right: 18px; bottom: 18px; z-index: 70; width: min(440px, calc(100vw - 36px)); padding: 18px; border: 1px solid rgba(121,255,157,.36); border-radius: 12px; background: rgba(8,12,9,.97); box-shadow: 0 20px 55px rgba(0,0,0,.48); }
+.consent-banner { position: fixed; right: 18px; bottom: 18px; z-index: 70; width: min(360px, calc(100vw - 36px)); padding: 14px; border: 1px solid rgba(121,255,157,.36); border-radius: 12px; background: rgba(8,12,9,.97); box-shadow: 0 20px 55px rgba(0,0,0,.48); }
+.consent-banner h2 { margin: 0 0 5px; font-size: 15px; letter-spacing: -.02em; }
 .consent-banner p, .privacy-dialog p { margin: 0; color: var(--ink-soft); font-size: 13px; line-height: 1.55; }
-.consent-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin-top: 14px; }
+.consent-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
 .consent-button, .consent-link, .privacy-settings { min-height: 38px; border: 1px solid rgba(121,255,157,.55); border-radius: 7px; padding: 0 12px; color: var(--green-ink); background: var(--green); cursor: pointer; font-size: 12px; font-weight: 650; }
 .consent-button-secondary { color: var(--ink); border-color: var(--line); background: transparent; }
 .consent-link { min-height: auto; padding: 3px 0; border: 0; color: var(--ink-soft); background: transparent; text-decoration: underline; text-underline-offset: 3px; }

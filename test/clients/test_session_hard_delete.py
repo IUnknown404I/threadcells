@@ -23,6 +23,8 @@ from cli_agent_orchestrator.clients.database import (
     DelegationResultSubmissionModel,
     HandoffResultSubmissionError,
     InboxModel,
+    ManagedAttemptLifecycleEventModel,
+    ManagedAttemptLifecycleModel,
     OwnerLaunchGrantModel,
     ProjectModel,
     ProviderExecutionLeaseModel,
@@ -763,6 +765,24 @@ def test_hard_delete_purges_owned_graph_and_preserves_shared_registry_and_other_
         )
         db.add(other_assignment)
         db.flush()
+        other_lifecycle = ManagedAttemptLifecycleModel(
+            assignment_id=other_assignment.id,
+            attempt_id=other_assignment.attempt_id,
+            parent_terminal_id="other",
+            child_terminal_id="other",
+            request_workflow_effect_id=other_effect.id,
+            state="completed",
+        )
+        db.add(other_lifecycle)
+        db.flush()
+        db.add(
+            ManagedAttemptLifecycleEventModel(
+                assignment_id=other_assignment.id,
+                event_key="other-managed-attempt:completed",
+                event_type="completed",
+                state="completed",
+            )
+        )
         other_result = DelegationResultModel(
             id="other-result",
             child_assignment_id=other_assignment.id,
@@ -864,6 +884,24 @@ def test_hard_delete_purges_owned_graph_and_preserves_shared_registry_and_other_
         )
         db.add(assignment)
         db.flush()
+        lifecycle = ManagedAttemptLifecycleModel(
+            assignment_id=assignment.id,
+            attempt_id=assignment.attempt_id,
+            parent_terminal_id="owner",
+            child_terminal_id="child",
+            request_workflow_effect_id=effect.id,
+            state="completed",
+        )
+        db.add(lifecycle)
+        db.flush()
+        db.add(
+            ManagedAttemptLifecycleEventModel(
+                assignment_id=assignment.id,
+                event_key="owned-managed-attempt:completed",
+                event_type="completed",
+                state="completed",
+            )
+        )
         result = DelegationResultModel(
             id="result",
             child_assignment_id=assignment.id,
@@ -994,6 +1032,8 @@ def test_hard_delete_purges_owned_graph_and_preserves_shared_registry_and_other_
         "provider_execution_leases": 0,
         "worktree_writer_leases": 0,
         "child_assignments": 1,
+        "managed_attempt_lifecycle": 1,
+        "managed_attempt_lifecycle_events": 1,
         "delegation_results": 1,
         "delegation_result_submissions": 1,
         "delegation_result_events": 1,
@@ -1017,6 +1057,13 @@ def test_hard_delete_purges_owned_graph_and_preserves_shared_registry_and_other_
         assert db.get(WorkflowTurnModel, other_turn_id) is not None
         assert db.get(WorkflowEffectModel, other_effect_id) is not None
         assert db.get(ChildAssignmentModel, other_assignment_id) is not None
+        assert db.get(ManagedAttemptLifecycleModel, other_assignment_id) is not None
+        assert (
+            db.query(ManagedAttemptLifecycleEventModel)
+            .filter_by(assignment_id=other_assignment_id)
+            .count()
+            == 1
+        )
         assert db.get(DelegationResultModel, "other-result") is not None
         assert db.query(WorkflowTurnReceiptModel).count() == 1
         assert db.query(WorkflowProviderReconnectAttemptModel).count() == 1
@@ -2424,6 +2471,6 @@ def test_hard_purge_sql_shape_is_fixed_with_one_session_tombstone(
 
     one = run(1)
     fifty = run(50)
-    assert one[:2] == fifty[:2] == (98, 71)
+    assert one[:2] == fifty[:2] == (104, 75)
     assert one[2] == 0
     assert fifty[2] == 1

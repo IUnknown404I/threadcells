@@ -6,6 +6,7 @@ import { locales, type Locale } from '@/lib/locales'
 
 const measurementId = 'G-WWBZSZ4N7T'
 const consentKey = 'threadcells.analytics-consent.v1'
+const analyticsCookieName = /^(?:_ga(?:_.+)?|_gid|_gat(?:_.+)?|_gac_.+)$/
 
 declare global {
   interface Window {
@@ -42,6 +43,26 @@ function readConsent(): Consent {
     return value === 'accepted' || value === 'declined' ? value : null
   } catch {
     return null
+  }
+}
+
+function clearAnalyticsCookies() {
+  const names = document.cookie
+    .split(';')
+    .map(cookie => cookie.slice(0, cookie.indexOf('=')).trim())
+    .filter(name => analyticsCookieName.test(name))
+  if (names.length === 0) return
+  const labels = window.location.hostname.split('.').filter(Boolean)
+  const domains = new Set<string | null>([null, window.location.hostname])
+  for (let index = 0; index < labels.length - 1; index += 1) {
+    domains.add(`.${labels.slice(index).join('.')}`)
+  }
+  const expiry = 'Thu, 01 Jan 1970 00:00:00 GMT'
+  for (const name of names) {
+    for (const domain of domains) {
+      const domainAttribute = domain ? `; Domain=${domain}` : ''
+      document.cookie = `${name}=; Path=/; Max-Age=0; Expires=${expiry}; SameSite=Lax${domainAttribute}`
+    }
   }
 }
 
@@ -110,6 +131,7 @@ export function AnalyticsConsent() {
     // before the one guarded config call so a saved Allow is granted before
     // config instead of being downgraded to the hydration default.
     const effectiveConsent = readConsent()
+    if (effectiveConsent !== 'accepted') clearAnalyticsCookies()
     startAnalytics(effectiveConsent)
     if (window.gtag) {
       window.gtag('consent', 'update', {
@@ -135,6 +157,7 @@ export function AnalyticsConsent() {
       // Consent remains active for this page even when storage is unavailable.
     }
     setConsentVersion(version => version + 1)
+    if (next === 'declined') clearAnalyticsCookies()
     startAnalytics(next)
     window.gtag?.('consent', 'update', {
       analytics_storage: next === 'accepted' ? 'granted' : 'denied',
@@ -161,7 +184,7 @@ export function AnalyticsConsent() {
       <button className="privacy-settings" type="button" onClick={() => setSettingsOpen(true)}>{copy.settings}</button>
       <dialog ref={settings} className="privacy-dialog" aria-labelledby="privacy-dialog-title" onClose={() => setSettingsOpen(false)}>
         <div>
-          <p className="privacy-kicker">PRIVACY NOTICE</p>
+          <p className="privacy-kicker">{copy.privacyKicker}</p>
           <h2 id="privacy-dialog-title">{copy.choice}</h2>
           <p>{copy.notice}</p>
           <div className="consent-actions">

@@ -3321,7 +3321,50 @@ def _backfill_managed_attempt_lifecycle() -> None:
                 ChildAssignmentStatus.CANCELLED.value,
                 ChildAssignmentStatus.FENCED.value,
             }
-            state = "completed" if completed else ("failed" if failed else "assignment_created")
+            receipt = (
+                db.query(WorkflowTurnReceiptModel)
+                .filter(
+                    WorkflowTurnReceiptModel.workflow_turn_id == assignment.child_workflow_turn_id,
+                    WorkflowTurnReceiptModel.receiver_terminal_id == assignment.child_terminal_id,
+                )
+                .first()
+                if assignment.child_workflow_turn_id is not None
+                else None
+            )
+            exact_recovery_authority = bool(
+                assignment.request_workflow_effect_id is not None
+                and assignment.child_workflow_id is not None
+                and assignment.child_workflow_turn_id is not None
+                and terminal is not None
+                and terminal.runtime_generation
+                and terminal.writer_authority_generation
+            )
+            if completed:
+                state = "completed"
+                reason_code = None
+            elif failed:
+                state = "failed"
+                reason_code = "LEGACY_ASSIGNMENT_CANCELLED"
+            elif receipt is not None:
+                # A durable receiver receipt proves both delivery and provider
+                # admission.  Do not put an already-running legacy child under
+                # the absent-admission watchdog merely because older releases
+                # had no lifecycle ledger.
+                state = "waiting_for_result"
+                reason_code = None
+            elif exact_recovery_authority:
+                # Missing delivery/admission remains unknown, but it is never
+                # allowed to wait forever.  Give the upgraded process one
+                # bounded interval before the ordinary exactly-once recovery
+                # path purchases its single same-child retry.
+                state = "prompt_delivery_scheduled"
+                reason_code = "LEGACY_PROMPT_ADMISSION_UNCONFIRMED"
+            else:
+                state = "failed"
+                reason_code = "MANAGED_ATTEMPT_AUTHORITY_MISSING"
+            receipt_time = (
+                receipt.consumed_at if receipt is not None and receipt.consumed_at else now
+            )
             lifecycle = ManagedAttemptLifecycleModel(
                 assignment_id=assignment.id,
                 attempt_id=assignment.attempt_id,
@@ -3331,12 +3374,25 @@ def _backfill_managed_attempt_lifecycle() -> None:
                 child_workflow_id=assignment.child_workflow_id,
                 child_workflow_turn_id=assignment.child_workflow_turn_id,
                 state=state,
-                reason_code=("legacy_assignment_cancelled" if failed else None),
+                reason_code=reason_code,
                 expected_runtime_generation=(terminal.runtime_generation if terminal else None),
                 expected_writer_authority_generation=(
                     terminal.writer_authority_generation if terminal else None
                 ),
-                failed_at=(now if failed else None),
+                prompt_delivery_scheduled_at=(
+                    receipt_time
+                    if receipt is not None
+                    else now if state == "prompt_delivery_scheduled" else None
+                ),
+                prompt_delivery_acknowledged_at=(receipt_time if receipt is not None else None),
+                provider_admitted_at=(receipt_time if receipt is not None else None),
+                waiting_result_at=(receipt_time if receipt is not None else None),
+                recovery_deadline_at=(
+                    now + timedelta(seconds=_MANAGED_ATTEMPT_ADMISSION_DEADLINE_SECONDS)
+                    if state == "prompt_delivery_scheduled"
+                    else None
+                ),
+                failed_at=(now if state == "failed" else None),
                 completed_at=(now if completed else None),
                 created_at=assignment.created_at or now,
                 updated_at=now,
@@ -3349,6 +3405,10 @@ def _backfill_managed_attempt_lifecycle() -> None:
                 f"managed-attempt-backfill:{assignment.id}",
                 "backfilled",
                 reason_code=lifecycle.reason_code,
+                detail={
+                    "provider_admission_proven": receipt is not None,
+                    "bounded_recovery_scheduled": state == "prompt_delivery_scheduled",
+                },
             )
             changed = True
         if changed:
@@ -9155,6 +9215,9 @@ def _session_owned_graph_queries(
         ChildAssignmentModel.parent_terminal_id.in_(terminal_values),
         ChildAssignmentModel.child_terminal_id.in_(terminal_values),
     )
+    managed_attempt_ids = db.query(ManagedAttemptLifecycleModel.assignment_id).filter(
+        ManagedAttemptLifecycleModel.assignment_id.in_(assignment_ids)
+    )
     result_ids = db.query(DelegationResultModel.id).filter(
         DelegationResultModel.child_assignment_id.in_(assignment_ids),
         DelegationResultModel.parent_terminal_id.in_(terminal_values),
@@ -9173,6 +9236,7 @@ def _session_owned_graph_queries(
         "turn_ids": turn_ids,
         "effect_ids": effect_ids,
         "assignment_ids": assignment_ids,
+        "managed_attempt_ids": managed_attempt_ids,
         "result_ids": result_ids,
         "context_ids": context_ids,
         "takeover_ids": takeover_ids,
@@ -9222,6 +9286,18 @@ def _session_owned_row_counts_in_transaction(
         "child_assignments": int(
             db.query(ChildAssignmentModel.id)
             .filter(ChildAssignmentModel.id.in_(owned["assignment_ids"]))
+            .count()
+        ),
+        "managed_attempt_lifecycle": int(
+            db.query(ManagedAttemptLifecycleModel.assignment_id)
+            .filter(ManagedAttemptLifecycleModel.assignment_id.in_(owned["managed_attempt_ids"]))
+            .count()
+        ),
+        "managed_attempt_lifecycle_events": int(
+            db.query(ManagedAttemptLifecycleEventModel.id)
+            .filter(
+                ManagedAttemptLifecycleEventModel.assignment_id.in_(owned["managed_attempt_ids"])
+            )
             .count()
         ),
         "delegation_results": int(
@@ -9531,6 +9607,7 @@ def begin_session_hard_deletion(
     _ensure_terminal_ui_projection_schema()
     _ensure_terminal_deletion_receipt_schema()
     _ensure_session_deletion_receipt_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         receipt = db.get(SessionDeletionReceiptModel, session_id)
@@ -10027,6 +10104,7 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
     """Atomically purge one fenced Session graph and leave only replay tombstones."""
     _ensure_terminal_deletion_receipt_schema()
     _ensure_session_deletion_receipt_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         receipt = db.get(SessionDeletionReceiptModel, session_id)
@@ -10153,6 +10231,16 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
         _delete_query(
             db.query(DelegationResultModel).filter(
                 DelegationResultModel.id.in_(owned["result_ids"])
+            )
+        )
+        _delete_query(
+            db.query(ManagedAttemptLifecycleEventModel).filter(
+                ManagedAttemptLifecycleEventModel.assignment_id.in_(owned["managed_attempt_ids"])
+            )
+        )
+        _delete_query(
+            db.query(ManagedAttemptLifecycleModel).filter(
+                ManagedAttemptLifecycleModel.assignment_id.in_(owned["managed_attempt_ids"])
             )
         )
         _delete_query(
@@ -13524,9 +13612,8 @@ def _cancel_parent_assignments(db, parent_terminal_id: str, now: datetime) -> in
         kind = "handoff" if assignment.status.startswith("handoff_") else "assign"
         assignment.status = ChildAssignmentStatus.CANCELLED.value
         assignment.updated_at = now
-        result = _create_result_for_assignment(
-            db, assignment, kind, _open_workflow(db, parent_terminal_id, create=False)
-        )
+        parent_workflow = _open_workflow(db, parent_terminal_id, create=False)
+        result = _create_result_for_assignment(db, assignment, kind, parent_workflow)
         if result.status == DelegationResultStatus.AWAITING.value:
             result.status = DelegationResultStatus.CANCELLED.value
             result.reason_code = "parent_cancelled"
@@ -13540,6 +13627,28 @@ def _cancel_parent_assignments(db, parent_terminal_id: str, now: datetime) -> in
                 parent_terminal_id,
             )
             _purge_staged_handoff_submission(db, result.id)
+        lifecycle = db.get(ManagedAttemptLifecycleModel, assignment.id)
+        if lifecycle is not None and lifecycle.state not in (
+            _MANAGED_ATTEMPT_TERMINAL_STATES | {"fence_claimed"}
+        ):
+            parent_state = (
+                str(parent_workflow.status).upper()
+                if parent_workflow is not None
+                else "UNAVAILABLE"
+            )
+            lifecycle.state = "failed"
+            lifecycle.reason_code = f"PARENT_WORKFLOW_{parent_state}"
+            lifecycle.failed_at = lifecycle.failed_at or now
+            lifecycle.recovery_next_retry_at = None
+            lifecycle.recovery_deadline_at = None
+            lifecycle.updated_at = now
+            _managed_attempt_event(
+                db,
+                lifecycle,
+                f"managed-attempt-parent-cancelled:{assignment.id}",
+                "failed",
+                reason_code=lifecycle.reason_code,
+            )
     return len(assignments)
 
 
@@ -24595,11 +24704,45 @@ def reconcile_managed_attempt_timeouts(now: Optional[datetime] = None) -> Dict[s
         )
         for lifecycle in candidates:
             assignment = db.get(ChildAssignmentModel, lifecycle.assignment_id)
+            parent_workflow = _open_workflow(db, lifecycle.parent_terminal_id, create=False)
             turn = (
                 db.get(WorkflowTurnModel, lifecycle.child_workflow_turn_id)
                 if lifecycle.child_workflow_turn_id is not None
                 else None
             )
+            if assignment is not None and (
+                assignment.status not in _active_child_assignment_statuses()
+                or parent_workflow is None
+                or parent_workflow.status != WORKFLOW_OPEN
+            ):
+                lifecycle.state = "failed"
+                if assignment.status not in _active_child_assignment_statuses():
+                    lifecycle.reason_code = (
+                        f"MANAGED_ATTEMPT_ASSIGNMENT_{str(assignment.status).upper()}"
+                    )
+                elif parent_workflow is None:
+                    lifecycle.reason_code = "PARENT_WORKFLOW_NOT_OPEN"
+                else:
+                    lifecycle.reason_code = f"PARENT_WORKFLOW_{str(parent_workflow.status).upper()}"
+                lifecycle.failed_at = lifecycle.failed_at or now
+                lifecycle.recovery_next_retry_at = None
+                lifecycle.recovery_deadline_at = None
+                lifecycle.updated_at = now
+                if turn is not None and turn.state in (TURN_QUEUED, TURN_CLAIMED):
+                    turn.state = TURN_CANCELLED
+                    turn.queue_reason = lifecycle.reason_code
+                    turn.not_before = None
+                    turn.claim_token = None
+                    turn.claim_expires_at = None
+                    turn.updated_at = now
+                _managed_attempt_event(
+                    db,
+                    lifecycle,
+                    f"managed-attempt-parent-not-open:{lifecycle.assignment_id}",
+                    "failed",
+                    reason_code=lifecycle.reason_code,
+                )
+                continue
             if assignment is None or turn is None:
                 lifecycle.state = "fence_pending"
                 lifecycle.reason_code = "MANAGED_ATTEMPT_AUTHORITY_MISSING"
@@ -24636,8 +24779,146 @@ class ManagedAttemptFenceError(RuntimeError):
         super().__init__(reason_code)
 
 
+def managed_attempt_fence_identity_matches(
+    lifecycle: Mapping[str, Any],
+    *,
+    assignment_id: int,
+    attempt_id: str,
+    parent_terminal_id: str,
+    child_terminal_id: str,
+    request_workflow_effect_id: int,
+    child_workflow_turn_id: int,
+    reason_code: str,
+    expected_runtime_generation: str,
+    expected_writer_authority_generation: str,
+) -> bool:
+    """Compare every immutable field required for an exact fence replay."""
+    return bool(
+        lifecycle.get("assignment_id") == assignment_id
+        and lifecycle.get("attempt_id") == attempt_id
+        and lifecycle.get("parent_terminal_id") == parent_terminal_id
+        and lifecycle.get("child_terminal_id") == child_terminal_id
+        and lifecycle.get("request_workflow_effect_id") == request_workflow_effect_id
+        and lifecycle.get("child_workflow_turn_id") == child_workflow_turn_id
+        and lifecycle.get("reason_code") == reason_code
+        and lifecycle.get("expected_runtime_generation") == expected_runtime_generation
+        and lifecycle.get("expected_writer_authority_generation")
+        == expected_writer_authority_generation
+    )
+
+
+def _critical_owner_recovery_scope_matches_in_transaction(
+    db: Any,
+    caller_terminal_id: str,
+    parent_terminal_id: str,
+    *,
+    reason_code: Optional[str] = None,
+) -> bool:
+    """Bind cross-terminal owner recovery to one gated parent and project grant.
+
+    An owner-executor may always fence its own exact child relation.  Crossing
+    a terminal boundary additionally requires the target parent to be at a
+    genuine owner gate whose reason matches the requested fence.  The consumed
+    owner grant must name the same canonical project authority, so an owner in
+    another project or an ordinary privileged-looking terminal cannot inspect
+    or mutate this attempt.
+    """
+    caller = db.get(TerminalModel, caller_terminal_id)
+    parent = db.get(TerminalModel, parent_terminal_id)
+    grant = (
+        db.get(OwnerLaunchGrantModel, caller.owner_grant_id)
+        if caller is not None and caller.owner_grant_id
+        else None
+    )
+    if (
+        caller is None
+        or parent is None
+        or grant is None
+        or caller.agent_profile != "critical_sol_xhigh_owner"
+        or grant.agent_profile != caller.agent_profile
+        or grant.provider != caller.provider
+        or grant.consumed_terminal_id != caller_terminal_id
+        or grant.consumed_at is None
+        or not caller.project_id
+        or caller.project_id != parent.project_id
+        or not caller.profile_revision_id
+        or not caller.provider_config_revision_id
+    ):
+        return False
+    try:
+        scope = json.loads(str(grant.scope_json or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    canonical_parent = parent.managed_worktree_source or parent.project_path
+    if (
+        not isinstance(scope, dict)
+        or scope.get("project_id") != parent.project_id
+        or grant.canonical_worktree != canonical_parent
+        or scope.get("profile_revision_id") != caller.profile_revision_id
+        or scope.get("provider_config_revision_id") != caller.provider_config_revision_id
+    ):
+        return False
+    if caller_terminal_id == parent_terminal_id:
+        return True
+    parent_workflow = _open_workflow(db, parent_terminal_id, create=False)
+    if parent_workflow is None or parent_workflow.status != WORKFLOW_OWNER_GATE:
+        return False
+    if reason_code is None:
+        return True
+    parent_reason = str(parent_workflow.terminal_reason or "")
+    return parent_reason == reason_code or parent_reason.startswith(reason_code + ":")
+
+
+def managed_attempt_fence_caller_is_authorized(
+    caller_terminal_id: str,
+    *,
+    assignment_id: int,
+    parent_terminal_id: str,
+    reason_code: str,
+) -> bool:
+    """Preflight the exact owner/parent scope; the claim repeats it atomically."""
+    _ensure_managed_attempt_lifecycle_schema()
+    with SessionLocal() as db:
+        assignment = db.get(ChildAssignmentModel, assignment_id)
+        lifecycle = db.get(ManagedAttemptLifecycleModel, assignment_id)
+        return bool(
+            assignment is not None
+            and lifecycle is not None
+            and assignment.parent_terminal_id == parent_terminal_id
+            and lifecycle.parent_terminal_id == parent_terminal_id
+            and _critical_owner_recovery_scope_matches_in_transaction(
+                db,
+                caller_terminal_id,
+                parent_terminal_id,
+                reason_code=reason_code,
+            )
+        )
+
+
+def managed_attempt_lifecycle_caller_is_authorized(
+    caller_terminal_id: str, assignment_id: int
+) -> bool:
+    """Allow lifecycle reads only to the relation or its scoped recovery owner."""
+    _ensure_managed_attempt_lifecycle_schema()
+    with SessionLocal() as db:
+        lifecycle = db.get(ManagedAttemptLifecycleModel, assignment_id)
+        if lifecycle is None:
+            return False
+        if caller_terminal_id in {
+            lifecycle.parent_terminal_id,
+            lifecycle.child_terminal_id,
+        }:
+            return True
+        return _critical_owner_recovery_scope_matches_in_transaction(
+            db,
+            caller_terminal_id,
+            str(lifecycle.parent_terminal_id),
+        )
+
+
 def claim_managed_attempt_fence(
     *,
+    caller_terminal_id: Optional[str] = None,
     assignment_id: int,
     attempt_id: str,
     parent_terminal_id: str,
@@ -24689,6 +24970,27 @@ def claim_managed_attempt_fence(
             db.rollback()
             raise ManagedAttemptFenceError("MANAGED_ATTEMPT_IDENTITY_MISMATCH")
         assert assignment is not None and lifecycle is not None and terminal is not None
+        if caller_terminal_id is not None:
+            caller_authorized = _critical_owner_recovery_scope_matches_in_transaction(
+                db,
+                caller_terminal_id,
+                parent_terminal_id,
+                reason_code=reason_code,
+            )
+        else:
+            parent_workflow = _open_workflow(db, parent_terminal_id, create=False)
+            caller_authorized = bool(
+                lifecycle.state == "fence_claimed"
+                or (
+                    lifecycle.state == "fence_pending"
+                    and assignment.status in _active_child_assignment_statuses()
+                    and parent_workflow is not None
+                    and parent_workflow.status == WORKFLOW_OPEN
+                )
+            )
+        if not caller_authorized:
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_FENCE_CALLER_SCOPE_MISMATCH")
         if lifecycle.state == "fenced":
             result = _managed_attempt_dict(lifecycle)
             result.update({"accepted": True, "duplicate": True})
@@ -24883,42 +25185,46 @@ def complete_managed_attempt_fence(
         lifecycle.updated_at = now
         if lifecycle.parent_wake_message_id is None:
             parent_workflow = _open_workflow(db, lifecycle.parent_terminal_id, create=False)
-            if parent_workflow is None or parent_workflow.status != WORKFLOW_OPEN:
-                successor = WorkflowModel(
-                    root_terminal_id=lifecycle.parent_terminal_id,
-                    status=WORKFLOW_OPEN,
-                    no_progress_count=0,
-                    resumed_from_owner_gate_workflow_id=(
-                        parent_workflow.id if parent_workflow is not None else None
+            if parent_workflow is not None and parent_workflow.status == WORKFLOW_OPEN:
+                message = InboxModel(
+                    sender_id=lifecycle.child_terminal_id,
+                    receiver_id=lifecycle.parent_terminal_id,
+                    message=(
+                        "Managed child attempt failed explicitly. "
+                        f"assignment_id={assignment.id}; attempt_id={assignment.attempt_id}; "
+                        f"reason_code={reason_code}. The old attempt is fenced; one replacement "
+                        "may be created with replaces_assignment_id="
+                        f"{assignment.id}."
                     ),
+                    status=MessageStatus.PENDING.value,
+                    kind="managed_attempt_failure",
                     created_at=now,
-                    updated_at=now,
                 )
-                db.add(successor)
+                db.add(message)
                 db.flush()
-                parent_workflow = successor
-            message = InboxModel(
-                sender_id=lifecycle.child_terminal_id,
-                receiver_id=lifecycle.parent_terminal_id,
-                message=(
-                    "Managed child attempt failed explicitly. "
-                    f"assignment_id={assignment.id}; attempt_id={assignment.attempt_id}; "
-                    f"reason_code={reason_code}. The old attempt is fenced; one replacement "
-                    "may be created with replaces_assignment_id="
-                    f"{assignment.id}."
-                ),
-                status=MessageStatus.PENDING.value,
-                kind="managed_attempt_failure",
-                created_at=now,
-            )
-            db.add(message)
-            db.flush()
-            wake_turn = _materialize_pending_inbox_turn_in_transaction(
-                db, message, parent_workflow, now
-            )
-            if parent_workflow.active_turn_id is None:
-                parent_workflow.active_turn_id = wake_turn.id
-            lifecycle.parent_wake_message_id = message.id
+                wake_turn = _materialize_pending_inbox_turn_in_transaction(
+                    db, message, parent_workflow, now
+                )
+                if parent_workflow.active_turn_id is None:
+                    parent_workflow.active_turn_id = wake_turn.id
+                lifecycle.parent_wake_message_id = message.id
+            else:
+                # Terminal/owner-gated parents are explicit execution fences.
+                # Physical orphan retirement may finish, but it must not mint
+                # a successor, wake the parent, or implicitly authorize a
+                # replacement. A later owner input can resume the parent and
+                # deliberately create the replacement from this fenced row.
+                _managed_attempt_event(
+                    db,
+                    lifecycle,
+                    f"managed-attempt-parent-wake-suppressed:{assignment.id}",
+                    "parent_wake_suppressed",
+                    reason_code=(
+                        "PARENT_WORKFLOW_NOT_OPEN"
+                        if parent_workflow is None
+                        else f"PARENT_WORKFLOW_{str(parent_workflow.status).upper()}"
+                    ),
+                )
         _managed_attempt_event(
             db,
             lifecycle,

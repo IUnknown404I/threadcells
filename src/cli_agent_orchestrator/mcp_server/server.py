@@ -55,6 +55,8 @@ from cli_agent_orchestrator.clients.database import (
     is_delegated_child_terminal,
     is_managed_structured_handoff_child,
     issue_workflow_input_binding,
+    managed_attempt_fence_caller_is_authorized,
+    managed_attempt_fence_identity_matches,
     managed_final_problem,
     managed_handoff_retirement_required,
     parse_v1_result_capture,
@@ -3063,11 +3065,20 @@ async def fence_managed_attempt(
 ) -> Dict[str, Any]:
     """Atomically fence one orphaned managed attempt and retire its runtime."""
     owner_terminal_id = os.environ.get("CAO_TERMINAL_ID")
-    if not owner_terminal_id or not terminal_has_critical_owner_authority(owner_terminal_id):
+    if (
+        not owner_terminal_id
+        or not terminal_has_critical_owner_authority(owner_terminal_id)
+        or not managed_attempt_fence_caller_is_authorized(
+            owner_terminal_id,
+            assignment_id=assignment_id,
+            parent_terminal_id=parent_terminal_id,
+            reason_code=reason_code,
+        )
+    ):
         return {
             "success": False,
             "accepted": False,
-            "reason_code": "MANAGED_ATTEMPT_FENCE_OWNER_AUTHORITY_REQUIRED",
+            "reason_code": "MANAGED_ATTEMPT_FENCE_CALLER_SCOPE_MISMATCH",
         }
     identity = (
         assignment_id,
@@ -3086,24 +3097,24 @@ async def fence_managed_attempt(
         if (
             lifecycle is not None
             and lifecycle.get("state") == "fenced"
-            and all(
-                (
-                    lifecycle.get("attempt_id") == attempt_id,
-                    lifecycle.get("parent_terminal_id") == parent_terminal_id,
-                    lifecycle.get("child_terminal_id") == child_terminal_id,
-                    lifecycle.get("request_workflow_effect_id") == request_workflow_effect_id,
-                    lifecycle.get("child_workflow_turn_id") == child_workflow_turn_id,
-                    lifecycle.get("reason_code") == reason_code,
-                    lifecycle.get("expected_runtime_generation") == expected_runtime_generation,
-                    lifecycle.get("expected_writer_authority_generation")
-                    == expected_writer_authority_generation,
-                )
+            and managed_attempt_fence_identity_matches(
+                lifecycle,
+                assignment_id=assignment_id,
+                attempt_id=attempt_id,
+                parent_terminal_id=parent_terminal_id,
+                child_terminal_id=child_terminal_id,
+                request_workflow_effect_id=request_workflow_effect_id,
+                child_workflow_turn_id=child_workflow_turn_id,
+                reason_code=reason_code,
+                expected_runtime_generation=expected_runtime_generation,
+                expected_writer_authority_generation=expected_writer_authority_generation,
             )
         ):
             return {"success": True, "accepted": True, "duplicate": True, **lifecycle}
         return _privileged_effect_rejection(logical_turn_id, "fence_managed_attempt", *identity)
     try:
         result = managed_attempt_service.fence_managed_attempt(
+            caller_terminal_id=owner_terminal_id,
             assignment_id=assignment_id,
             attempt_id=attempt_id,
             parent_terminal_id=parent_terminal_id,

@@ -58,6 +58,9 @@ from cli_agent_orchestrator.clients.database import (
     get_workflow_compaction_continuation_authority,
     get_writable_work_context_by_session,
     init_db,
+    managed_attempt_fence_caller_is_authorized,
+    managed_attempt_fence_identity_matches,
+    managed_attempt_lifecycle_caller_is_authorized,
     queue_workflow_input_for_provider,
     reconcile_managed_attempt_timeouts,
     release_terminal_runtime_operation,
@@ -2733,6 +2736,12 @@ async def fence_managed_attempt_endpoint(
         or not token
         or not terminal_auth_token_matches(str(body.caller_terminal_id), token)
         or not terminal_has_critical_owner_authority(str(body.caller_terminal_id))
+        or not managed_attempt_fence_caller_is_authorized(
+            str(body.caller_terminal_id),
+            assignment_id=body.assignment_id,
+            parent_terminal_id=str(body.parent_terminal_id),
+            reason_code=body.reason_code,
+        )
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -2761,7 +2770,22 @@ async def fence_managed_attempt_endpoint(
     )
     if effect is None:
         lifecycle = get_managed_attempt_lifecycle(assignment_id=body.assignment_id)
-        if lifecycle is not None and lifecycle.get("state") == "fenced":
+        if (
+            lifecycle is not None
+            and lifecycle.get("state") == "fenced"
+            and managed_attempt_fence_identity_matches(
+                lifecycle,
+                assignment_id=body.assignment_id,
+                attempt_id=body.attempt_id,
+                parent_terminal_id=str(body.parent_terminal_id),
+                child_terminal_id=str(child_terminal_id),
+                request_workflow_effect_id=body.request_workflow_effect_id,
+                child_workflow_turn_id=body.child_workflow_turn_id,
+                reason_code=body.reason_code,
+                expected_runtime_generation=body.expected_runtime_generation,
+                expected_writer_authority_generation=(body.expected_writer_authority_generation),
+            )
+        ):
             return {**lifecycle, "accepted": True, "duplicate": True}
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -2770,6 +2794,7 @@ async def fence_managed_attempt_endpoint(
     try:
         result = await _run_operational_io(
             managed_attempt_service.fence_managed_attempt,
+            caller_terminal_id=str(body.caller_terminal_id),
             assignment_id=body.assignment_id,
             attempt_id=body.attempt_id,
             parent_terminal_id=str(body.parent_terminal_id),
@@ -2811,6 +2836,11 @@ async def get_managed_attempt_endpoint(
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_terminal_auth"
+        )
+    if not managed_attempt_lifecycle_caller_is_authorized(str(caller_terminal_id), assignment_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="managed_attempt_caller_scope_mismatch",
         )
     lifecycle = get_managed_attempt_lifecycle(assignment_id=assignment_id)
     if lifecycle is None:

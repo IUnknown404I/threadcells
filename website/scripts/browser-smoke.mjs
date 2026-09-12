@@ -168,7 +168,14 @@ try {
   assert.equal(await consentPage.evaluate(() => window.dataLayer?.filter(event => Array.from(event ?? [])[0] === 'config' && Array.from(event ?? [])[1] === 'G-WWBZSZ4N7T').length), 1, 'each page lifecycle emits exactly one GA4 config/page_view')
   await consentPage.getByRole('button', { name: 'Analytics settings' }).click()
   await privacyDialog.waitFor({ state: 'visible' })
+  await consentPage.evaluate(() => {
+    document.cookie = '_ga=GA1.1.synthetic; Path=/'
+    document.cookie = '_ga_WWBZSZ4N7T=GS1.1.synthetic; Path=/'
+    document.cookie = '_gid=GA1.2.synthetic; Path=/'
+  })
+  assert.match(await consentPage.evaluate(() => document.cookie), /_ga=/, 'accepted operation can own analytics cookies before withdrawal')
   await privacyDialog.getByRole('button', { name: 'Decline' }).click()
+  assert.equal(await consentPage.evaluate(() => /(?:^|;\s*)_(?:ga|gid|gat|gac_)/.test(document.cookie)), false, 'withdrawing consent removes existing analytics cookies')
   await consentPage.reload({ waitUntil: 'networkidle' })
   assert.equal(analyticsRequests, 4, 'persisted decline keeps the cookieless tag on the next page view')
   await consentContext.close()

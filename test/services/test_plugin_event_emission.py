@@ -214,6 +214,8 @@ class TestSessionPluginEvents:
             "purged_rows": {},
             "remaining_rows": {},
             "tombstone_count": 1,
+            "workspace_disposition": None,
+            "workspace_evidence_sha256": None,
             "terminal_artifacts": {
                 "runtime_artifacts_absent": True,
                 "terminals": [],

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -19,6 +20,7 @@ from cli_agent_orchestrator.clients.database import (
     ManagedAttemptFenceError,
     ManagedAttemptLifecycleEventModel,
     ManagedAttemptLifecycleModel,
+    OwnerLaunchGrantModel,
     TerminalModel,
     WorkflowEffectModel,
     WorkflowModel,
@@ -62,9 +64,39 @@ def _add_terminal(
     *,
     session_id: str = "synthetic-attempt-session",
     writer: bool = False,
+    owner: bool = False,
+    project_id: str = "synthetic-project",
 ) -> None:
     worktree = f"/synthetic/{terminal_id}"
+    canonical_source = "/synthetic/source"
+    owner_grant_id = f"grant-{terminal_id}" if owner else None
+    profile_revision_id = "synthetic-owner-profile-r1" if owner else None
+    provider_config_revision_id = "synthetic-codex-provider-r1" if owner else None
     with database.SessionLocal() as db:
+        if owner:
+            now = datetime.now()
+            db.add(
+                OwnerLaunchGrantModel(
+                    id=owner_grant_id,
+                    token_sha256=hashlib.sha256(f"token-{terminal_id}".encode()).hexdigest(),
+                    launch_id=f"launch-{terminal_id}",
+                    agent_profile="critical_sol_xhigh_owner",
+                    provider="codex",
+                    canonical_worktree=canonical_source,
+                    scope_json=json.dumps(
+                        {
+                            "profile_revision_id": profile_revision_id,
+                            "provider_config_revision_id": provider_config_revision_id,
+                            "project_id": project_id,
+                        }
+                    ),
+                    issued_by="synthetic-owner",
+                    created_at=now,
+                    expires_at=now + timedelta(minutes=5),
+                    consumed_at=now,
+                    consumed_terminal_id=terminal_id,
+                )
+            )
         db.add(
             TerminalModel(
                 id=terminal_id,
@@ -72,7 +104,13 @@ def _add_terminal(
                 session_id=session_id,
                 tmux_window=f"window-{terminal_id}",
                 provider="codex",
-                agent_profile="developer",
+                agent_profile=("critical_sol_xhigh_owner" if owner else "developer"),
+                owner_grant_id=owner_grant_id,
+                profile_revision_id=profile_revision_id,
+                provider_config_revision_id=provider_config_revision_id,
+                project_id=project_id,
+                project_path=canonical_source,
+                managed_worktree_source=canonical_source,
                 launch_worktree=worktree,
                 write_enabled=writer,
                 writer_authority_generation=(WRITER_GENERATION if writer else None),
@@ -105,7 +143,7 @@ def _add_terminal(
 
 def _create_attempt(*, bind: bool = True, child: str = "child-one") -> dict:
     parent = "parent-one"
-    _add_terminal(parent)
+    _add_terminal(parent, owner=True)
     _add_terminal(child, writer=True)
     parent_turn = database.start_workflow_input(parent)
     assert parent_turn is not None
@@ -161,6 +199,12 @@ def _fence_kwargs(attempt: dict, **overrides) -> dict:
     return values
 
 
+def _owner_fence_kwargs(attempt: dict, **overrides) -> dict:
+    values = _fence_kwargs(attempt, **overrides)
+    values["caller_terminal_id"] = attempt["parent"]
+    return values
+
+
 def _expire_initial_admission(attempt: dict, now: datetime) -> None:
     with database.SessionLocal() as db:
         lifecycle = db.get(ManagedAttemptLifecycleModel, attempt["assignment_id"])
@@ -186,7 +230,7 @@ def _exhaust_recovery(attempt: dict, now: datetime) -> None:
 
 
 def _claim_and_complete_fence(attempt: dict) -> tuple[dict, dict]:
-    claim = database.claim_managed_attempt_fence(**_fence_kwargs(attempt))
+    claim = database.claim_managed_attempt_fence(**_owner_fence_kwargs(attempt))
     completed = database.complete_managed_attempt_fence(
         attempt["assignment_id"],
         claim["fence_claim_token"],
@@ -387,7 +431,7 @@ def test_restart_before_delivery_ack_preserves_truthful_state(attempt_db, monkey
 def test_restart_after_fence_claim_resumes_wake_without_duplicates(attempt_db, monkeypatch):
     """Regression 14: interrupted physical fence resumes and publishes one wake."""
     attempt = _create_attempt()
-    claim = database.claim_managed_attempt_fence(**_fence_kwargs(attempt))
+    claim = database.claim_managed_attempt_fence(**_owner_fence_kwargs(attempt))
     monkeypatch.setattr(database, "_managed_attempt_lifecycle_schema_ready", False)
     candidates = database.list_managed_attempt_fence_candidates()
     assert [candidate["assignment_id"] for candidate in candidates] == [attempt["assignment_id"]]
@@ -434,7 +478,7 @@ def test_runtime_fence_saga_can_resume_after_physical_retirement_failure(attempt
         ),
     ):
         interrupted = managed_attempt_service.fence_managed_attempt(
-            **_fence_kwargs(attempt), timeout=0
+            **_owner_fence_kwargs(attempt), timeout=0
         )
     assert interrupted["accepted"] is False
     assert interrupted["state"] == "fence_claimed"
@@ -451,7 +495,9 @@ def test_runtime_fence_saga_can_resume_after_physical_retirement_failure(attempt
         ),
         patch.object(managed_attempt_service, "_retire_claimed_runtime"),
     ):
-        resumed = managed_attempt_service.fence_managed_attempt(**_fence_kwargs(attempt), timeout=0)
+        resumed = managed_attempt_service.fence_managed_attempt(
+            **_owner_fence_kwargs(attempt), timeout=0
+        )
     assert resumed["accepted"] is True
     assert resumed["state"] == "fenced"
 
@@ -485,7 +531,7 @@ def test_duplicate_fence_is_idempotent(attempt_db):
     """Regression 15: repeated exact fencing is a stable success, never a 500."""
     attempt = _create_attempt()
     _claim_and_complete_fence(attempt)
-    duplicate = database.claim_managed_attempt_fence(**_fence_kwargs(attempt))
+    duplicate = database.claim_managed_attempt_fence(**_owner_fence_kwargs(attempt))
     assert duplicate["accepted"] is True
     assert duplicate["duplicate"] is True
     assert duplicate["state"] == "fenced"
@@ -494,11 +540,6 @@ def test_duplicate_fence_is_idempotent(attempt_db):
 def test_owner_mcp_fence_is_machine_readable_and_idempotent(attempt_db, monkeypatch):
     """The public owner primitive returns stable success for an exact replay."""
     attempt = _create_attempt()
-    with database.SessionLocal() as db:
-        owner = db.get(TerminalModel, attempt["parent"])
-        owner.agent_profile = "critical_sol_xhigh_owner"
-        owner.owner_grant_id = "synthetic-owner-grant"
-        db.commit()
     monkeypatch.setenv("CAO_TERMINAL_ID", attempt["parent"])
     metadata = {
         "id": attempt["child"],
@@ -535,6 +576,125 @@ def test_owner_mcp_fence_is_machine_readable_and_idempotent(attempt_db, monkeypa
     finish.assert_called_once_with(admitted_effect, "completed")
 
 
+def test_cross_terminal_owner_requires_exact_gated_parent_scope(attempt_db):
+    """A project owner cannot inspect or fence another still-running parent."""
+    attempt = _create_attempt()
+    _add_terminal("recovery-owner", owner=True)
+    assert not database.managed_attempt_fence_caller_is_authorized(
+        "recovery-owner",
+        assignment_id=attempt["assignment_id"],
+        parent_terminal_id=attempt["parent"],
+        reason_code=FENCE_REASON,
+    )
+    assert database.set_workflow_terminal_state(
+        attempt["parent"], database.WORKFLOW_OWNER_GATE, FENCE_REASON
+    )
+    assert database.managed_attempt_fence_caller_is_authorized(
+        "recovery-owner",
+        assignment_id=attempt["assignment_id"],
+        parent_terminal_id=attempt["parent"],
+        reason_code=FENCE_REASON,
+    )
+    _add_terminal("foreign-owner", owner=True, project_id="foreign-project")
+    assert not database.managed_attempt_fence_caller_is_authorized(
+        "foreign-owner",
+        assignment_id=attempt["assignment_id"],
+        parent_terminal_id=attempt["parent"],
+        reason_code=FENCE_REASON,
+    )
+    _add_terminal("legacy-owner", owner=True)
+    with database.SessionLocal() as db:
+        db.get(TerminalModel, "legacy-owner").profile_revision_id = None
+        db.commit()
+    assert not database.managed_attempt_fence_caller_is_authorized(
+        "legacy-owner",
+        assignment_id=attempt["assignment_id"],
+        parent_terminal_id=attempt["parent"],
+        reason_code=FENCE_REASON,
+    )
+
+
+def test_owner_gate_terminalizes_timeout_and_suppresses_fence_wake(attempt_db):
+    """An explicit owner gate cannot be undone by timeout or physical fencing."""
+    attempt = _create_attempt()
+    assert database.set_workflow_terminal_state(
+        attempt["parent"], database.WORKFLOW_OWNER_GATE, FENCE_REASON
+    )
+    lifecycle = database.get_managed_attempt_lifecycle(assignment_id=attempt["assignment_id"])
+    assert lifecycle["state"] == "failed"
+    assert lifecycle["reason_code"] == "PARENT_WORKFLOW_OWNER_GATE"
+    assert database.reconcile_managed_attempt_timeouts(datetime.now() + timedelta(days=1)) == {
+        "recovery_scheduled": 0,
+        "fence_pending": 0,
+    }
+    claim = database.claim_managed_attempt_fence(**_owner_fence_kwargs(attempt))
+    completed = database.complete_managed_attempt_fence(
+        attempt["assignment_id"],
+        claim["fence_claim_token"],
+        reason_code=FENCE_REASON,
+    )
+    assert completed["state"] == "fenced"
+    assert completed["parent_wake_message_id"] is None
+    with database.SessionLocal() as db:
+        assert db.query(InboxModel).filter_by(kind="managed_attempt_failure").count() == 0
+        workflows = db.query(WorkflowModel).filter_by(root_terminal_id=attempt["parent"]).all()
+        assert [workflow.status for workflow in workflows] == [database.WORKFLOW_OWNER_GATE]
+
+
+def test_timeout_reports_inactive_assignment_without_blame_on_open_parent(attempt_db):
+    """A stale assignment edge fails explicitly without a false parent reason."""
+    attempt = _create_attempt()
+    with database.SessionLocal() as db:
+        assignment = db.get(ChildAssignmentModel, attempt["assignment_id"])
+        assignment.status = ChildAssignmentStatus.CANCELLED.value
+        lifecycle = db.get(ManagedAttemptLifecycleModel, attempt["assignment_id"])
+        lifecycle.recovery_deadline_at = datetime.now() - timedelta(seconds=1)
+        db.commit()
+
+    assert database.reconcile_managed_attempt_timeouts()["recovery_scheduled"] == 0
+    lifecycle = database.get_managed_attempt_lifecycle(assignment_id=attempt["assignment_id"])
+    assert lifecycle["state"] == "failed"
+    assert lifecycle["reason_code"] == "MANAGED_ATTEMPT_ASSIGNMENT_CANCELLED"
+
+
+def test_legacy_unreceipted_attempt_gets_bounded_upgrade_deadline(attempt_db, monkeypatch):
+    """Upgrade backfill cannot leave an old active attempt inert forever."""
+    attempt = _create_attempt()
+    with database.SessionLocal() as db:
+        db.query(ManagedAttemptLifecycleEventModel).filter_by(
+            assignment_id=attempt["assignment_id"]
+        ).delete()
+        db.query(ManagedAttemptLifecycleModel).filter_by(
+            assignment_id=attempt["assignment_id"]
+        ).delete()
+        db.commit()
+    monkeypatch.setattr(database, "_managed_attempt_lifecycle_schema_ready", False)
+    lifecycle = database.get_managed_attempt_lifecycle(assignment_id=attempt["assignment_id"])
+    assert lifecycle["state"] == "prompt_delivery_scheduled"
+    assert lifecycle["reason_code"] == "LEGACY_PROMPT_ADMISSION_UNCONFIRMED"
+    assert lifecycle["recovery_deadline_at"] is not None
+    assert lifecycle["provider_admitted_at"] is None
+
+
+def test_legacy_receipted_attempt_backfills_as_admitted(attempt_db, monkeypatch):
+    """Upgrade backfill does not retry a legacy child with a durable receipt."""
+    attempt = _create_attempt()
+    assert database.claim_workflow_turn_receipt(attempt["child"], attempt["child_turn"])
+    with database.SessionLocal() as db:
+        db.query(ManagedAttemptLifecycleEventModel).filter_by(
+            assignment_id=attempt["assignment_id"]
+        ).delete()
+        db.query(ManagedAttemptLifecycleModel).filter_by(
+            assignment_id=attempt["assignment_id"]
+        ).delete()
+        db.commit()
+    monkeypatch.setattr(database, "_managed_attempt_lifecycle_schema_ready", False)
+    lifecycle = database.get_managed_attempt_lifecycle(assignment_id=attempt["assignment_id"])
+    assert lifecycle["state"] == "waiting_for_result"
+    assert lifecycle["provider_admitted_at"] is not None
+    assert lifecycle["recovery_deadline_at"] is None
+
+
 def test_wrong_assignment_or_effect_identity_cannot_fence(attempt_db):
     """Regression 16: every immutable assignment/effect identity is compared."""
     attempt = _create_attempt()
@@ -543,7 +703,7 @@ def test_wrong_assignment_or_effect_identity_cannot_fence(attempt_db):
         {"request_workflow_effect_id": attempt["effect_id"] + 1},
     ):
         with pytest.raises(ManagedAttemptFenceError) as exc_info:
-            database.claim_managed_attempt_fence(**_fence_kwargs(attempt, **overrides))
+            database.claim_managed_attempt_fence(**_owner_fence_kwargs(attempt, **overrides))
         assert exc_info.value.reason_code == "MANAGED_ATTEMPT_IDENTITY_MISMATCH"
     assert (
         database.get_managed_attempt_lifecycle(assignment_id=attempt["assignment_id"])["state"]
@@ -560,7 +720,7 @@ def test_foreign_writer_authority_is_untouched(attempt_db):
         writer.terminal_id = "foreign-terminal"
         db.commit()
     with pytest.raises(ManagedAttemptFenceError) as exc_info:
-        database.claim_managed_attempt_fence(**_fence_kwargs(attempt))
+        database.claim_managed_attempt_fence(**_owner_fence_kwargs(attempt))
     assert exc_info.value.reason_code == "MANAGED_ATTEMPT_FOREIGN_WRITER_AUTHORITY"
     with database.SessionLocal() as db:
         terminal = db.get(TerminalModel, attempt["child"])

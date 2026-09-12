@@ -132,6 +132,7 @@ def _retire_claimed_runtime(metadata: dict[str, Any], *, timeout: float) -> None
 
 def fence_managed_attempt(
     *,
+    caller_terminal_id: str | None = None,
     assignment_id: int,
     attempt_id: str,
     parent_terminal_id: str,
@@ -145,6 +146,7 @@ def fence_managed_attempt(
 ) -> dict[str, Any]:
     """Fence one exact attempt, retire its runtime, and publish one parent wake."""
     claim = database.claim_managed_attempt_fence(
+        caller_terminal_id=caller_terminal_id,
         assignment_id=assignment_id,
         attempt_id=attempt_id,
         parent_terminal_id=parent_terminal_id,

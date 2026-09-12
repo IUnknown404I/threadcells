@@ -117,6 +117,7 @@ try {
   await consentPage.getByRole('button', { name: 'Privacy & analytics settings' }).click()
   await privacyDialog.getByRole('button', { name: 'Allow analytics' }).click()
   assert.equal(await consentPage.locator('script[data-threadcells-analytics="G-WWBZSZ4N7T"]').count(), 1, 'settings cannot duplicate the GA4 page view tag')
+  assert.equal(await consentPage.evaluate(() => window.dataLayer?.filter(event => Array.isArray(event) && event[0] === 'config' && event[1] === 'G-WWBZSZ4N7T').length), 1, 'the local guard permits one GA4 config/page_view per page')
   await consentContext.close()
   console.log(JSON.stringify({ basePath, evidenceDir, results, lightbox: true, docs: true, reducedMotion: true, analyticsConsent: true }))
 } finally {

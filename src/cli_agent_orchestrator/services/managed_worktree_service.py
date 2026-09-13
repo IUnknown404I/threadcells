@@ -906,7 +906,11 @@ def purge_session_managed_worktrees(
                 "terminal_id": terminal_id,
                 "reason_code": "WRITABLE_WORKTREE_AUTHORITY_CHANGED",
             }
-        if not bool(expected[terminal_id].get("clean")) and not allow_dirty:
+        if (
+            expected[terminal_id].get("managed")
+            and not bool(expected[terminal_id].get("clean"))
+            and not allow_dirty
+        ):
             return {
                 "removed": False,
                 "terminal_id": terminal_id,

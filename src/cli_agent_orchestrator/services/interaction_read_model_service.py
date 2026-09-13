@@ -133,6 +133,22 @@ WITH terminal_lifetimes AS MATERIALIZED (
     SELECT (SELECT COUNT(*) FROM provider_execution_leases) AS active_count,
            COALESCE((SELECT max_provider_executions FROM capacity_settings WHERE id = 1),
                     2147483647) AS execution_limit
+), resolved_assignment_effects AS MATERIALIZED (
+    SELECT assignment.request_workflow_effect_id AS effect_id,
+           CASE
+             WHEN assignment.review_superseded_at IS NOT NULL THEN 'superseded'
+             WHEN assignment.status IN ('result_acknowledged',
+                                        'handoff_result_acknowledged')
+               THEN 'acknowledged'
+             ELSE 'delivered'
+           END AS final_disposition
+    FROM child_assignments assignment
+    JOIN delegation_results result ON result.child_assignment_id = assignment.id
+    WHERE assignment.request_workflow_effect_id IS NOT NULL
+      AND result.status = 'complete'
+      AND assignment.status IN ('result_delivered', 'result_acknowledged',
+                                'handoff_result_delivered',
+                                'handoff_result_acknowledged')
 ), effect_ranked AS (
     SELECT effect.workflow_id, effect.workflow_turn_id, effect.effect_kind, effect.state,
            ROW_NUMBER() OVER (
@@ -141,12 +157,16 @@ WITH terminal_lifetimes AS MATERIALIZED (
                                         ELSE 2 END,
                       effect.id DESC
            ) AS effect_rank,
-           SUM(CASE WHEN effect.state IN ('claimed', 'indeterminate') THEN 1 ELSE 0 END)
+           SUM(CASE WHEN effect.state IN ('claimed', 'indeterminate')
+                         AND resolved_effect.effect_id IS NULL
+                    THEN 1 ELSE 0 END)
              OVER (PARTITION BY effect.workflow_id, effect.workflow_turn_id)
              AS unresolved_effect_count
     FROM workflow_effects effect
     JOIN workflows ew ON ew.id = effect.workflow_id
     JOIN interaction_terminals et ON et.terminal_id = ew.root_terminal_id
+    LEFT JOIN resolved_assignment_effects resolved_effect
+      ON resolved_effect.effect_id = effect.id
     WHERE 1 = 1
       AND NOT (effect.effect_kind = 'await_handoff'
                AND effect.state IN ('completed', 'rejected',
@@ -351,20 +371,23 @@ WITH terminal_lifetimes AS MATERIALIZED (
            COALESCE(w.root_terminal_id, linked_workflow.root_terminal_id)
              AS target_terminal_id, '' AS input_preview,
            effect.created_at, effect.updated_at,
-           CASE WHEN w.status IN ('terminal', 'cancelled')
+           CASE WHEN resolved_effect.effect_id IS NOT NULL THEN 0
+                WHEN w.status IN ('terminal', 'cancelled')
                        AND w.active_turn_id = wt.id
                        AND wt.state IN ('finished', 'cancelled')
                        AND wt.queue_reason = 'PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED'
                 THEN 0 ELSE 1 END AS is_current,
            effect.state AS queue_state,
-           CASE WHEN w.status IN ('terminal', 'cancelled')
+           CASE WHEN resolved_effect.effect_id IS NOT NULL THEN NULL
+                WHEN w.status IN ('terminal', 'cancelled')
                        AND w.active_turn_id = wt.id
                        AND wt.state IN ('finished', 'cancelled')
                        AND wt.queue_reason = 'PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED'
                   THEN NULL
                 WHEN effect.state = 'indeterminate' THEN 'indeterminate_effect'
                 ELSE 'claimed_effect' END AS wait_reason,
-           CASE WHEN w.status IN ('terminal', 'cancelled')
+           CASE WHEN resolved_effect.effect_id IS NOT NULL THEN 0
+                WHEN w.status IN ('terminal', 'cancelled')
                        AND w.active_turn_id = wt.id
                        AND wt.state IN ('finished', 'cancelled')
                        AND wt.queue_reason = 'PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED'
@@ -377,7 +400,9 @@ WITH terminal_lifetimes AS MATERIALIZED (
            NULL AS assignment_id, NULL AS result_id, NULL AS result_status,
            NULL AS result_summary, 0 AS result_available, NULL AS delivery_status,
            0 AS delivery_pending,
-           CASE WHEN w.status IN ('terminal', 'cancelled')
+           CASE WHEN resolved_effect.effect_id IS NOT NULL
+                  THEN resolved_effect.final_disposition
+                WHEN w.status IN ('terminal', 'cancelled')
                        AND w.active_turn_id = wt.id
                        AND wt.state IN ('finished', 'cancelled')
                        AND wt.queue_reason = 'PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED'
@@ -394,6 +419,8 @@ WITH terminal_lifetimes AS MATERIALIZED (
      AND wt.workflow_id = effect.workflow_id
     LEFT JOIN workflow_execution_authority workflow_authority
       ON workflow_authority.workflow_id = w.id
+    LEFT JOIN resolved_assignment_effects resolved_effect
+      ON resolved_effect.effect_id = effect.id
     WHERE effect.state IN ('claimed', 'indeterminate')
       AND (w.id IS NULL OR wt.id IS NULL
            OR w.status IN ('terminal', 'cancelled')

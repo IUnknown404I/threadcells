@@ -1754,6 +1754,101 @@ def test_open_workflow_projects_consumed_turns_as_history_and_only_unresolved_as
     ) == {"interaction-session": 0}
 
 
+def test_completed_superseded_handoff_effect_stays_history_and_badge_matches(monkeypatch):
+    _install_database(monkeypatch)
+    now = datetime(2026, 9, 13, 1, 20, 0)
+    with database.SessionLocal() as db:
+        db.add(_interaction_terminal())
+        workflow = WorkflowModel(
+            root_terminal_id="owner",
+            status="terminal",
+            terminal_reason="DISCOVERY.P1 completed",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(workflow)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="handoff_result",
+            dedupe_key="completed-discovery",
+            state="sent",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(turn)
+        db.flush()
+        workflow.active_turn_id = turn.id
+        effect = WorkflowEffectModel(
+            workflow_id=workflow.id,
+            workflow_turn_id=turn.id,
+            effect_kind="handoff",
+            effect_key="completed-discovery-handoff",
+            state="claimed",
+            claim_token="completed-discovery-claim",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(effect)
+        db.flush()
+        assignment = ChildAssignmentModel(
+            parent_terminal_id="owner",
+            child_terminal_id="reviewer",
+            status="handoff_result_delivered",
+            request_workflow_id=workflow.id,
+            request_workflow_turn_id=turn.id,
+            request_workflow_effect_id=effect.id,
+            review_superseded_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(assignment)
+        db.flush()
+        assignment_id = assignment.id
+        db.add(
+            DelegationResultModel(
+                id="authoritative-discovery-result",
+                child_assignment_id=assignment_id,
+                schema_version=1,
+                delegation_kind="handoff",
+                parent_terminal_id="owner",
+                child_terminal_id="reviewer",
+                authorship="child_structured_submission",
+                status="complete",
+                document_json=json.dumps(
+                    {"format": "v1", "summary": "DISCOVERY.P1 completed"}
+                ),
+                created_at=now,
+                finalized_at=now,
+                updated_at=now,
+            )
+        )
+        db.commit()
+
+    current = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="current", limit=20
+    )
+    history = interaction_read_model_service.list_interactions(
+        "interaction-session", mode="history", limit=20
+    )
+
+    assert current["total"] == 0
+    assert interaction_read_model_service.list_session_current_queue_counts(
+        ["interaction-session"]
+    ) == {"interaction-session": 0}
+    historical_effect = next(
+        item for item in history["items"] if item["interaction_type"] == "effect"
+    )
+    assert historical_effect["final_disposition"] == "superseded"
+    authoritative = next(
+        item
+        for item in history["items"]
+        if item["diagnostics"]["assignment_id"] == assignment_id
+    )
+    assert authoritative["result"]["id"] == "authoritative-discovery-result"
+    assert authoritative["result"]["available"] is True
+
+
 def test_resumed_owner_gate_chain_is_history_while_unresolved_gate_remains_current(monkeypatch):
     _install_database(monkeypatch)
     now = datetime(2026, 9, 7, 18, 0, 0)

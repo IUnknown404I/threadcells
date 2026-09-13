@@ -146,9 +146,13 @@ WITH terminal_lifetimes AS MATERIALIZED (
     JOIN delegation_results result ON result.child_assignment_id = assignment.id
     WHERE assignment.request_workflow_effect_id IS NOT NULL
       AND result.status = 'complete'
-      AND assignment.status IN ('result_delivered', 'result_acknowledged',
-                                'handoff_result_delivered',
-                                'handoff_result_acknowledged')
+      AND (
+        assignment.status IN ('result_delivered', 'result_acknowledged',
+                              'handoff_result_delivered',
+                              'handoff_result_acknowledged')
+        OR (assignment.status = 'result_superseded'
+            AND assignment.review_superseded_at IS NOT NULL)
+      )
 ), effect_ranked AS (
     SELECT effect.workflow_id, effect.workflow_turn_id, effect.effect_kind, effect.state,
            ROW_NUMBER() OVER (

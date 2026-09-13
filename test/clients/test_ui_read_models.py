@@ -1,6 +1,7 @@
 import json
 from datetime import datetime, timedelta
 
+import pytest
 from sqlalchemy import create_engine, event, inspect
 from sqlalchemy.orm import sessionmaker
 
@@ -1754,7 +1755,16 @@ def test_open_workflow_projects_consumed_turns_as_history_and_only_unresolved_as
     ) == {"interaction-session": 0}
 
 
-def test_completed_superseded_handoff_effect_stays_history_and_badge_matches(monkeypatch):
+@pytest.mark.parametrize(
+    ("effect_kind", "assignment_status"),
+    (
+        ("handoff", "handoff_result_delivered"),
+        ("assign", "result_superseded"),
+    ),
+)
+def test_completed_superseded_handoff_effect_stays_history_and_badge_matches(
+    monkeypatch, effect_kind, assignment_status
+):
     _install_database(monkeypatch)
     now = datetime(2026, 9, 13, 1, 20, 0)
     with database.SessionLocal() as db:
@@ -1782,8 +1792,8 @@ def test_completed_superseded_handoff_effect_stays_history_and_badge_matches(mon
         effect = WorkflowEffectModel(
             workflow_id=workflow.id,
             workflow_turn_id=turn.id,
-            effect_kind="handoff",
-            effect_key="completed-discovery-handoff",
+            effect_kind=effect_kind,
+            effect_key=f"completed-discovery-{effect_kind}",
             state="claimed",
             claim_token="completed-discovery-claim",
             created_at=now,
@@ -1794,7 +1804,7 @@ def test_completed_superseded_handoff_effect_stays_history_and_badge_matches(mon
         assignment = ChildAssignmentModel(
             parent_terminal_id="owner",
             child_terminal_id="reviewer",
-            status="handoff_result_delivered",
+            status=assignment_status,
             request_workflow_id=workflow.id,
             request_workflow_turn_id=turn.id,
             request_workflow_effect_id=effect.id,
@@ -1810,14 +1820,12 @@ def test_completed_superseded_handoff_effect_stays_history_and_badge_matches(mon
                 id="authoritative-discovery-result",
                 child_assignment_id=assignment_id,
                 schema_version=1,
-                delegation_kind="handoff",
+                delegation_kind=effect_kind,
                 parent_terminal_id="owner",
                 child_terminal_id="reviewer",
                 authorship="child_structured_submission",
                 status="complete",
-                document_json=json.dumps(
-                    {"format": "v1", "summary": "DISCOVERY.P1 completed"}
-                ),
+                document_json=json.dumps({"format": "v1", "summary": "DISCOVERY.P1 completed"}),
                 created_at=now,
                 finalized_at=now,
                 updated_at=now,
@@ -1841,9 +1849,7 @@ def test_completed_superseded_handoff_effect_stays_history_and_badge_matches(mon
     )
     assert historical_effect["final_disposition"] == "superseded"
     authoritative = next(
-        item
-        for item in history["items"]
-        if item["diagnostics"]["assignment_id"] == assignment_id
+        item for item in history["items"] if item["diagnostics"]["assignment_id"] == assignment_id
     )
     assert authoritative["result"]["id"] == "authoritative-discovery-result"
     assert authoritative["result"]["available"] is True

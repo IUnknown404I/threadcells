@@ -12,6 +12,7 @@ from cli_agent_orchestrator.clients.database import (
     DelegationResultModel,
     TerminalModel,
     WorkflowEffectModel,
+    WorkflowEffectReconciliationCursorModel,
     WorkflowEffectResolutionModel,
     WorkflowModel,
     WorkflowTurnModel,
@@ -32,6 +33,7 @@ def _install_database(monkeypatch, tmp_path):
     for name in (
         "_ensure_workflow_schema",
         "_ensure_child_assignment_schema",
+        "_ensure_managed_attempt_lifecycle_schema",
         "_ensure_delegation_result_schema",
         "_ensure_terminal_ui_projection_schema",
     ):
@@ -232,6 +234,316 @@ def test_uncertain_and_cross_workflow_effects_remain_current(monkeypatch, tmp_pa
     assert (
         interaction_read_model_service.list_interactions("session-b", mode="current")["total"] == 1
     )
+
+
+def test_pre_delivery_cross_session_assignment_remains_uncertain(monkeypatch, tmp_path):
+    _install_database(monkeypatch, tmp_path)
+    now = datetime(2026, 9, 13, 1, 15, 0)
+    with database.SessionLocal() as db:
+        db.add_all([_terminal("parent", "session-a"), _terminal("child", "session-b")])
+        parent_workflow = WorkflowModel(
+            root_terminal_id="parent",
+            status="terminal",
+            terminal_reason="parent stopped",
+            created_at=now,
+            updated_at=now,
+        )
+        child_workflow = WorkflowModel(
+            root_terminal_id="child", status="open", created_at=now, updated_at=now
+        )
+        db.add_all([parent_workflow, child_workflow])
+        db.flush()
+        parent_turn = WorkflowTurnModel(
+            workflow_id=parent_workflow.id,
+            kind="external_input",
+            dedupe_key="parent-input",
+            state="finished",
+            created_at=now,
+            updated_at=now,
+        )
+        child_turn = WorkflowTurnModel(
+            workflow_id=child_workflow.id,
+            kind="external_input",
+            dedupe_key="child-input",
+            state="sent",
+            transport_binding="bound-before-send",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add_all([parent_turn, child_turn])
+        db.flush()
+        parent_workflow.active_turn_id = parent_turn.id
+        child_workflow.active_turn_id = child_turn.id
+        db.add(
+            WorkflowTurnReceiptModel(
+                workflow_turn_id=parent_turn.id,
+                receiver_terminal_id="parent",
+                consumed_at=now,
+            )
+        )
+        effect = WorkflowEffectModel(
+            workflow_id=parent_workflow.id,
+            workflow_turn_id=parent_turn.id,
+            effect_kind="assign",
+            effect_key=_effect_key("assign", "pre-send"),
+            state="indeterminate",
+            claim_token="pre-send",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(effect)
+        db.flush()
+        db.add(
+            ChildAssignmentModel(
+                parent_terminal_id="parent",
+                child_terminal_id="child",
+                status="awaiting_result",
+                request_workflow_id=parent_workflow.id,
+                request_workflow_turn_id=parent_turn.id,
+                request_workflow_effect_id=effect.id,
+                child_workflow_id=child_workflow.id,
+                child_workflow_turn_id=child_turn.id,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        db.commit()
+
+    assert database.reconcile_workflow_effect_resolutions() == 0
+    with database.SessionLocal() as db:
+        assert db.query(WorkflowEffectResolutionModel).count() == 0
+    current = interaction_read_model_service.list_interactions("session-a", mode="current")
+    assert any(item["interaction_type"] == "effect" for item in current["items"])
+
+
+def test_exact_receipted_assignment_moves_from_current_to_history(monkeypatch, tmp_path):
+    _install_database(monkeypatch, tmp_path)
+    now = datetime(2026, 9, 13, 1, 16, 0)
+    with database.SessionLocal() as db:
+        db.add_all([_terminal("parent", "session-a"), _terminal("child", "session-a")])
+        parent_workflow = WorkflowModel(
+            root_terminal_id="parent", status="open", created_at=now, updated_at=now
+        )
+        child_workflow = WorkflowModel(
+            root_terminal_id="child", status="open", created_at=now, updated_at=now
+        )
+        db.add_all([parent_workflow, child_workflow])
+        db.flush()
+        parent_turn = WorkflowTurnModel(
+            workflow_id=parent_workflow.id,
+            kind="external_input",
+            dedupe_key="parent-input",
+            state="finished",
+            created_at=now,
+            updated_at=now,
+        )
+        child_turn = WorkflowTurnModel(
+            workflow_id=child_workflow.id,
+            kind="external_input",
+            dedupe_key="child-input",
+            state="sent",
+            transport_binding="exact-delivery",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add_all([parent_turn, child_turn])
+        db.flush()
+        parent_workflow.active_turn_id = parent_turn.id
+        child_workflow.active_turn_id = child_turn.id
+        db.add_all(
+            [
+                WorkflowTurnReceiptModel(
+                    workflow_turn_id=parent_turn.id,
+                    receiver_terminal_id="parent",
+                    consumed_at=now,
+                ),
+                WorkflowTurnReceiptModel(
+                    workflow_turn_id=child_turn.id,
+                    receiver_terminal_id="child",
+                    consumed_at=now,
+                ),
+            ]
+        )
+        effect = WorkflowEffectModel(
+            workflow_id=parent_workflow.id,
+            workflow_turn_id=parent_turn.id,
+            effect_kind="assign",
+            effect_key=_effect_key("assign", "delivered"),
+            state="indeterminate",
+            claim_token="delivered",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(effect)
+        db.flush()
+        db.add(
+            ChildAssignmentModel(
+                parent_terminal_id="parent",
+                child_terminal_id="child",
+                status="awaiting_result",
+                request_workflow_id=parent_workflow.id,
+                request_workflow_turn_id=parent_turn.id,
+                request_workflow_effect_id=effect.id,
+                child_workflow_id=child_workflow.id,
+                child_workflow_turn_id=child_turn.id,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        effect_id = effect.id
+        db.commit()
+
+    assert database.reconcile_workflow_effect_resolutions() == 1
+    with database.SessionLocal() as db:
+        effect = db.get(WorkflowEffectModel, effect_id)
+        resolution = db.query(WorkflowEffectResolutionModel).one()
+        assert effect.state == "indeterminate"
+        assert resolution.outcome == "completed"
+        assert resolution.reason_code == "DELEGATION_ATTEMPT_DELIVERED"
+    current = interaction_read_model_service.list_interactions("session-a", mode="current")
+    assert not any(item["interaction_type"] == "effect" for item in current["items"])
+    history = interaction_read_model_service.list_interactions("session-a", mode="history")
+    assert any(
+        item["interaction_type"] == "effect" and item["final_disposition"] == "completed"
+        for item in history["items"]
+    )
+
+
+def test_resolution_is_mirrored_without_rewriting_transport(monkeypatch, tmp_path):
+    _install_database(monkeypatch, tmp_path)
+    now = datetime(2026, 9, 13, 1, 17, 0)
+    with database.SessionLocal() as db:
+        db.add(_terminal("owner", "session-a"))
+        workflow = WorkflowModel(
+            root_terminal_id="owner", status="open", created_at=now, updated_at=now
+        )
+        db.add(workflow)
+        db.flush()
+        source = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="source",
+            state="finished",
+            created_at=now,
+            updated_at=now,
+        )
+        target = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="execution_resume",
+            dedupe_key="target",
+            state="sent",
+            resume_parent_turn_id=None,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add_all([source, target])
+        db.flush()
+        target.resume_parent_turn_id = source.id
+        effect = WorkflowEffectModel(
+            workflow_id=workflow.id,
+            workflow_turn_id=source.id,
+            effect_kind="send_message",
+            effect_key=_effect_key("send_message", "same-operation"),
+            state="indeterminate",
+            claim_token="source-effect",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(effect)
+        db.flush()
+        db.add(
+            WorkflowEffectResolutionModel(
+                workflow_effect_id=effect.id,
+                outcome="completed",
+                reason_code="MANAGED_RESULT_FINALIZED",
+                created_at=now,
+            )
+        )
+        db.flush()
+        database._mirror_workflow_effect_ledger(
+            db, workflow.id, source.id, target.id, now + timedelta(seconds=1)
+        )
+        db.commit()
+
+    with database.SessionLocal() as db:
+        effects = db.query(WorkflowEffectModel).order_by(WorkflowEffectModel.id).all()
+        resolutions = (
+            db.query(WorkflowEffectResolutionModel)
+            .order_by(WorkflowEffectResolutionModel.workflow_effect_id)
+            .all()
+        )
+        assert [effect.state for effect in effects] == ["indeterminate", "indeterminate"]
+        assert [row.outcome for row in resolutions] == ["completed", "completed"]
+        assert resolutions[-1].reason_code == "EFFECT_RESOLUTION_MIRRORED"
+        assert resolutions[-1].evidence_effect_id == effects[0].id
+
+
+def test_fair_cursor_eventually_reaches_newer_resolvable_effect(monkeypatch, tmp_path):
+    _install_database(monkeypatch, tmp_path)
+    now = datetime(2026, 9, 13, 1, 18, 0)
+    with database.SessionLocal() as db:
+        db.add(_terminal("owner", "session-a"))
+        workflow = WorkflowModel(
+            root_terminal_id="owner",
+            status="terminal",
+            terminal_reason="done",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(workflow)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="turn",
+            state="finished",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(turn)
+        db.flush()
+        workflow.active_turn_id = turn.id
+        db.add(
+            WorkflowTurnReceiptModel(
+                workflow_turn_id=turn.id,
+                receiver_terminal_id="owner",
+                consumed_at=now,
+            )
+        )
+        for index in range(200):
+            db.add(
+                WorkflowEffectModel(
+                    workflow_id=workflow.id,
+                    workflow_turn_id=turn.id,
+                    effect_kind="complete_workflow",
+                    effect_key=_effect_key("complete_workflow", f"uncertain-{index}"),
+                    state="indeterminate",
+                    claim_token=f"uncertain-{index}",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        resolvable = WorkflowEffectModel(
+            workflow_id=workflow.id,
+            workflow_turn_id=turn.id,
+            effect_kind="complete_workflow",
+            effect_key=_effect_key("complete_workflow", "done"),
+            state="indeterminate",
+            claim_token="resolvable",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(resolvable)
+        db.flush()
+        resolvable_id = resolvable.id
+        db.commit()
+
+    assert database.reconcile_workflow_effect_resolutions(limit=200) == 0
+    assert database.reconcile_workflow_effect_resolutions(limit=200) == 1
+    with database.SessionLocal() as db:
+        assert db.query(WorkflowEffectResolutionModel).count() == 1
+        cursor = db.get(WorkflowEffectReconciliationCursorModel, 1)
+        assert cursor.last_workflow_effect_id == resolvable_id
 
 
 def test_superseded_review_acknowledgement_is_rejected_once_under_concurrency(

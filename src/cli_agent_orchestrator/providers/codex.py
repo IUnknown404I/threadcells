@@ -1731,7 +1731,7 @@ class CodexProvider(BaseProvider):
             [sys.executable, "-m", "cli_agent_orchestrator.codex_session_hook"]
         )
         hook_config = (
-            'hooks.SessionStart=[{matcher="^(startup|resume)$",hooks=[{type="command",'
+            'hooks.SessionStart=[{matcher="^(startup|resume|compact)$",hooks=[{type="command",'
             f"command={_toml_scalar(hook_command)},timeout=30}}]}}]"
         )
         command_parts.extend(["-c", hook_config])

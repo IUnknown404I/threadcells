@@ -11,6 +11,7 @@ interface ConfirmModalProps {
   cancelLabel?: string
   variant?: 'danger' | 'warning'
   loading?: boolean
+  showConfirm?: boolean
   onConfirm: () => void
   onCancel: () => void
   children?: ReactNode
@@ -25,21 +26,45 @@ export function ConfirmModal({
   cancelLabel,
   variant = 'danger',
   loading = false,
+  showConfirm = true,
   onConfirm,
   onCancel,
   children,
 }: ConfirmModalProps) {
   const { t } = useI18n()
   const cancelRef = useRef<HTMLButtonElement>(null)
+  const dialogRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    if (open) cancelRef.current?.focus()
+    if (!open) return
+    const previousFocus = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null
+    cancelRef.current?.focus()
+    return () => previousFocus?.focus()
   }, [open])
 
   useEffect(() => {
     if (!open) return
     const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onCancel()
+      if (e.key === 'Escape') {
+        onCancel()
+        return
+      }
+      if (e.key !== 'Tab') return
+      const focusable = dialogRef.current?.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      )
+      if (!focusable?.length) return
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault()
+        last.focus()
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault()
+        first.focus()
+      }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
@@ -57,7 +82,7 @@ export function ConfirmModal({
       <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onCancel} />
 
       {/* Modal */}
-      <div role="dialog" aria-modal="true" aria-label={title} className="relative bg-gray-900 border border-gray-700/50 rounded-xl sm:rounded-2xl shadow-2xl w-full max-w-md max-h-[calc(100dvh-1.5rem)] overflow-y-auto animate-in fade-in zoom-in-95">
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label={title} className="relative bg-gray-900 border border-gray-700/50 rounded-xl sm:rounded-2xl shadow-2xl w-full max-w-md max-h-[calc(100dvh-1.5rem)] overflow-y-auto animate-in fade-in zoom-in-95">
         {/* Header */}
         <div className="flex items-start gap-3 sm:gap-4 p-4 sm:p-6 pb-4">
           <div className={`shrink-0 w-10 h-10 rounded-xl flex items-center justify-center ${colors.icon}`}>
@@ -95,14 +120,14 @@ export function ConfirmModal({
           >
             {cancelLabel || t('common.cancel')}
           </button>
-          <button
+          {showConfirm && <button
             onClick={onConfirm}
             disabled={loading}
             className={`min-h-11 justify-center px-4 py-2 text-sm font-medium text-white rounded-lg transition-all focus:outline-none focus:ring-2 disabled:opacity-60 flex items-center gap-2 ${colors.btn}`}
           >
             {loading && <Loader2 size={14} className="animate-spin" />}
             {loading ? t('common.working') : confirmLabel || t('common.confirm')}
-          </button>
+          </button>}
         </div>
       </div>
     </div>

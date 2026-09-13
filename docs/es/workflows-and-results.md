@@ -1,7 +1,7 @@
 ---
 slug: workflows-and-results
 source: docs/WORKFLOWS_AND_RESULTS.md
-source_sha256: sha256:2075858d138b70bafe8c6605e1d77b69a0aafee4faaa8042ef3437e6ebae71ff
+source_sha256: sha256:96ac4e69b487f09d35f8aaa05ea5c343a7a6010be84f2f1bc7b8592994c441c0
 ---
 
 # Flujos de trabajo y resultados duraderos
@@ -81,6 +81,8 @@ Un mensaje nuevo en Workflow Composer es la decisión del propietario que reanud
 ## Recuperación
 
 Al reiniciar, ThreadCells reconstruye la propiedad del flujo de trabajo desde el estado duradero. Los resultados entregados pero no acusados siguen disponibles. Un handoff en espera puede reanudarse con el mismo hijo en vez de lanzar un duplicado. Una vez que se admite un turno lógico más nuevo para un flujo de trabajo abierto, una continuación pendiente más antigua queda sustituida de forma duradera y no puede reproducirse después como trabajo independiente tras una compactación o interrupción.
+
+Si un hijo gestionado ha salido de forma autoritativa sin enviar un resultado, ThreadCells avanza el mismo presupuesto limitado de recuperación aunque el último estado mostrado por el proveedor esté obsoleto. Al agotarse, registra un resultado de ciclo de vida `incomplete`, lo pone una sola vez en cola para que el padre abierto lo lea y confirme, y rechaza envíos tardíos; nunca inventa un resultado exitoso.
 
 La reconciliación al reiniciar también vuelve a abrir el flujo de trabajo más reciente en puerta del propietario cuando su cabecera de transporte cancelada ya tiene un sucesor explícito posterior de Composer. Promueve ese sucesor existente sin crear un turno de reemplazo y nunca usa esta reparación para revivir callbacks de Inbox ni terminales Exited.
 

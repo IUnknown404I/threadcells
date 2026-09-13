@@ -29,6 +29,11 @@ def _validate_page(limit: int, offset: int) -> None:
 def _iso(value: Any) -> Optional[str]:
     if isinstance(value, datetime):
         return value.isoformat()
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value).isoformat()
+        except ValueError:
+            return value
     return str(value) if value else None
 
 

@@ -226,7 +226,11 @@ class TestDefaultBundledSkills:
         return Path(__file__).resolve().parents[2] / "src" / "cli_agent_orchestrator" / "skills"
 
     def test_default_skill_folders_exist_with_valid_metadata(self):
-        skill_names = ["cao-supervisor-protocols", "cao-worker-protocols"]
+        skill_names = [
+            "cao-session-management",
+            "cao-supervisor-protocols",
+            "cao-worker-protocols",
+        ]
 
         for skill_name in skill_names:
             metadata = validate_skill_folder(self.bundled_skills_dir / skill_name)
@@ -237,12 +241,19 @@ class TestDefaultBundledSkills:
         supervisor_content = (
             self.bundled_skills_dir / "cao-supervisor-protocols" / "SKILL.md"
         ).read_text()
+        session_content = (
+            self.bundled_skills_dir / "cao-session-management" / "SKILL.md"
+        ).read_text()
         worker_content = (self.bundled_skills_dir / "cao-worker-protocols" / "SKILL.md").read_text()
 
         assert "assign" in supervisor_content
         assert "handoff" in supervisor_content
+        assert "next_wait_slice_id" in supervisor_content
+        assert "wait_slice_id=next_wait_slice_id" in supervisor_content
         assert "send_message" in supervisor_content
         assert "idle" in supervisor_content.lower()
+        assert "next_wait_slice_id" in session_content
+        assert "wait_slice_id=next_wait_slice_id" in session_content
         assert "assign" in worker_content
         assert "handoff" in worker_content
         assert "send_message" in worker_content

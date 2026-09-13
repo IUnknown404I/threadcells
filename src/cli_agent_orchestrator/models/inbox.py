@@ -40,6 +40,7 @@ class ChildAssignmentStatus(str, Enum):
     HANDOFF_RESULT_DELIVERED = "handoff_result_delivered"
     HANDOFF_RESULT_FAILED = "handoff_result_failed"
     HANDOFF_RESULT_ACKNOWLEDGED = "handoff_result_acknowledged"
+    FENCED = "fenced"
     CANCELLED = "cancelled"
 
 

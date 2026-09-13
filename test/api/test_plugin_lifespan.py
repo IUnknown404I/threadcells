@@ -37,6 +37,11 @@ class TestPluginRegistryLifespan:
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
             patch(
+                "cli_agent_orchestrator.api.main.workflow_service."
+                "fence_stale_provider_runtime_compatibility",
+                return_value=0,
+            ),
+            patch(
                 "cli_agent_orchestrator.api.main.PollingObserver",
                 return_value=mock_observer,
             ),
@@ -71,6 +76,11 @@ class TestPluginRegistryLifespan:
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
             patch(
+                "cli_agent_orchestrator.api.main.workflow_service."
+                "fence_stale_provider_runtime_compatibility",
+                return_value=0,
+            ),
+            patch(
                 "cli_agent_orchestrator.api.main.PollingObserver",
                 return_value=mock_observer,
             ),
@@ -101,6 +111,11 @@ class TestPluginRegistryLifespan:
         with (
             patch("cli_agent_orchestrator.api.main.setup_logging"),
             patch("cli_agent_orchestrator.api.main.init_db"),
+            patch(
+                "cli_agent_orchestrator.api.main.workflow_service."
+                "fence_stale_provider_runtime_compatibility",
+                return_value=0,
+            ),
             patch(
                 "cli_agent_orchestrator.api.main.PollingObserver",
                 return_value=mock_observer,

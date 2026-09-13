@@ -1,7 +1,7 @@
 ---
 slug: web-ui
 source: docs/WEB_UI.md
-source_sha256: sha256:dc45952406ae34d9be16d78c4e5b4a6f73d8862fe8b5fe6a557528cecaf45928
+source_sha256: sha256:44f2268614b3be15c7e01062819795ffcd7f44e5793dbd28a4739f4c876c17da
 ---
 
 # Die Web UI verwenden
@@ -22,6 +22,8 @@ Die Web UI ist die Live-Ansicht für Betreiber von ThreadCells. Sie ist für ein
 - **Add Agent** startet ein weiteres Terminal in der exakt gewählten Sitzungslaufzeit; es tritt nicht einer anderen historischen Sitzung bei, die zufällig denselben Namen hat.
 
 Direkte URLs werden unterstützt. Der Browserverlauf sollte die gewählte Settings- und Docs-Seite beibehalten.
+
+Unter Settings → General kann jeder Browser absolute Server-Zeitstempel in seiner erkannten Zeitzone oder in einer manuell gewählten IANA-Zone anzeigen. Die Einstellung bleibt im Browser-Speicher und ist keine Servereinstellung. Nur Zeitstempel mit explizitem UTC- oder numerischem Offset werden umgerechnet. Dauern, reine Kalenderdaten und mehrdeutige Zeitstempel bleiben unverändert.
 
 ## Ein normaler Betriebsablauf
 

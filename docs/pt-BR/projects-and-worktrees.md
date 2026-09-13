@@ -1,7 +1,7 @@
 ---
 slug: projects-and-worktrees
 source: docs/PROJECTS_AND_WORKTREES.md
-source_sha256: sha256:c296e8fec6654451a29dbef47bde79d19fda28f7bbfdf926c857e2cc8508ad3a
+source_sha256: sha256:b59a766757b888181ab6f564f9f3994953943a50ff2d15a820edd33e02d7ae6e
 ---
 
 # Projetos e worktrees gerenciados
@@ -43,6 +43,8 @@ Sessões legacy ativas anteriores a este contrato permanecem no workspace existe
 ## Autoridade de escrita
 
 Somente o contexto que detém a autoridade de escrita deve modificar um worktree gerenciado. Revisores podem inspecionar diffs e executar verificações seguras sem se tornarem um segundo escritor não rastreado.
+
+Uma revisão de revisão exata vincula tanto a tentativa de revisão durável quanto o checkout físico do revisor. Antes de entregar a tarefa de revisão, o ThreadCells bloqueia a entrada do terminal, verifica um worktree de revisor limpo e pertencente à Sessão, move-o para o commit solicitado em modo detached e confere novamente a revisão no transporte ao provedor. Reutilizar um revisor para uma correção focada cria uma nova tentativa e prepara a nova revisão; o resultado anterior permanece no histórico e não pode aprovar a correção.
 
 Não edite manualmente um worktree gerenciado enquanto o agente dele estiver ativo. Se uma intervenção de emergência for necessária, primeiro pare ou coordene com o escritor e registre o que mudou.
 

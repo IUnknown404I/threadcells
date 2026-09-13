@@ -462,6 +462,16 @@ def require_resource_admission(
 ) -> dict[str, Any]:
     """Recover once from RED, recheck, then enforce health and optional capacity."""
     cfg = _canonical_capacity_config(config or load_operations_config())
+    from cli_agent_orchestrator.services.full_cleanup_operation_service import (
+        require_no_active_full_cleanup_operation,
+    )
+
+    try:
+        require_no_active_full_cleanup_operation()
+    except RuntimeError as exc:
+        if str(exc) == "FULL_CLEANUP_OPERATION_ACTIVE":
+            raise AdmissionDenied("FULL_CLEANUP_OPERATION_ACTIVE", {}) from exc
+        raise
     probe = status_probe or (lambda: get_resource_status(cfg))
     status = probe()
     if status["resource_state"] == "RED" and attempt_pressure_recovery:
@@ -559,6 +569,22 @@ def workflow_execution_admission_fence(
                 return
         else:
             _lock_with_timeout(handle, float(cfg["context_launch_lock_timeout_seconds"]))
+        # The filesystem lock covers the ordinary request lifetime. A root
+        # helper may legitimately outlive an API restart, so its durable row
+        # is the cross-process continuation fence.
+        from cli_agent_orchestrator.services.full_cleanup_operation_service import (
+            require_no_active_full_cleanup_operation,
+        )
+
+        try:
+            require_no_active_full_cleanup_operation()
+        except RuntimeError as exc:
+            if str(exc) != "FULL_CLEANUP_OPERATION_ACTIVE":
+                raise
+            if nonblocking:
+                yield False
+                return
+            raise AdmissionDenied("FULL_CLEANUP_OPERATION_ACTIVE", {}) from exc
         _workflow_execution_fence_local.depth = 1
         try:
             yield True
@@ -625,6 +651,16 @@ def acquire_provider_execution_slot(
     lock_dir.mkdir(parents=True, exist_ok=True)
     with (lock_dir / "provider-execution-admission.lock").open("a+") as handle:
         _lock_with_timeout(handle, float(cfg["context_launch_lock_timeout_seconds"]))
+        from cli_agent_orchestrator.services.full_cleanup_operation_service import (
+            require_no_active_full_cleanup_operation,
+        )
+
+        try:
+            require_no_active_full_cleanup_operation()
+        except RuntimeError as exc:
+            if str(exc) == "FULL_CLEANUP_OPERATION_ACTIVE":
+                raise AdmissionDenied("FULL_CLEANUP_OPERATION_ACTIVE", status) from exc
+            raise
         if config is None:
             from cli_agent_orchestrator.clients.database import ensure_capacity_settings
 

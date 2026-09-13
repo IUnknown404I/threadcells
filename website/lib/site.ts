@@ -16,6 +16,9 @@ const optionalUrl = (name: 'SITE_URL') => {
 const configuredBasePath = process.env.NEXT_PUBLIC_BASE_PATH?.trim() || ''
 export const basePath = configuredBasePath === '/' ? '' : trimTrailingSlash(configuredBasePath)
 
+// Public Search Console verification for the canonical Pages property.
+export const googleSiteVerification = 'AWUVlfzo2OLGNrlvn0Ji59Lsn5bqA0Moh6lrtiS6zkc'
+
 export const assetPath = (path: string) => `${basePath}${path.startsWith('/') ? path : `/${path}`}`
 
 export const publicRepositoryUrl = 'https://github.com/IUnknown404I/threadcells'

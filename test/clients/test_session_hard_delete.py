@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -98,6 +99,51 @@ def _terminal(
         ),
         last_active=datetime(2026, 9, 8, 10, 0, 0),
     )
+
+
+def _resolved_effect_graph(
+    db,
+    *,
+    terminal_id: str,
+    count: int,
+    key_prefix: str,
+):
+    workflow = WorkflowModel(root_terminal_id=terminal_id, status="terminal")
+    db.add(workflow)
+    db.flush()
+    turn = WorkflowTurnModel(
+        workflow_id=workflow.id,
+        kind="external_input",
+        dedupe_key=f"{key_prefix}-turn",
+        state="finished",
+    )
+    db.add(turn)
+    db.flush()
+    effects = [
+        WorkflowEffectModel(
+            workflow_id=workflow.id,
+            workflow_turn_id=turn.id,
+            effect_kind="complete_workflow",
+            effect_key=f"{key_prefix}-{index}",
+            state="indeterminate",
+            claim_token=f"{key_prefix}-claim-{index}",
+        )
+        for index in range(count)
+    ]
+    db.add_all(effects)
+    db.flush()
+    resolutions = [
+        WorkflowEffectResolutionModel(
+            workflow_effect_id=effect.id,
+            outcome="completed",
+            reason_code="WORKFLOW_TERMINALIZED",
+            evidence_workflow_turn_id=turn.id,
+        )
+        for effect in effects
+    ]
+    db.add_all(resolutions)
+    db.flush()
+    return workflow, turn, effects, resolutions
 
 
 def _fence_and_mark(
@@ -1170,6 +1216,141 @@ def test_hard_delete_purges_owned_effect_resolutions_without_cross_session_orpha
             .count()
             == 0
         )
+
+
+@pytest.mark.parametrize("owned_count", [0, 1, 50, 51, 60, 200])
+def test_resolution_purge_is_fixed_shape_across_sqlite_variable_boundary(
+    monkeypatch,
+    owned_count,
+):
+    engine = _install_database(monkeypatch)
+    with database.SessionLocal() as db:
+        db.add_all(
+            [
+                _terminal("owner"),
+                _terminal("foreign", session_id="foreign", session_name="cao-foreign"),
+            ]
+        )
+        _resolved_effect_graph(
+            db,
+            terminal_id="owner",
+            count=owned_count,
+            key_prefix="owned",
+        )
+        foreign_workflow, _, foreign_effects, foreign_resolutions = _resolved_effect_graph(
+            db,
+            terminal_id="foreign",
+            count=2,
+            key_prefix="foreign",
+        )
+        db.commit()
+        foreign_workflow_id = int(foreign_workflow.id)
+        foreign_effect_ids = tuple(int(effect.id) for effect in foreign_effects)
+        foreign_resolution_ids = tuple(int(resolution.id) for resolution in foreign_resolutions)
+
+    variable_boundary = 50
+    with engine.connect() as connection:
+        raw_connection = connection.connection.driver_connection
+        raw_connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, variable_boundary)
+        assert raw_connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) == variable_boundary
+
+    resolution_deletes: list[tuple[str, int]] = []
+
+    def record(_connection, _cursor, statement, parameters, _context, many):
+        normalized = " ".join(statement.split())
+        if normalized.startswith("DELETE FROM workflow_effect_resolutions"):
+            resolution_deletes.append((normalized, len(parameters) if not many else -1))
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        _fence_and_mark()
+        completed = database.complete_session_hard_deletion("session", "cao-session")
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert completed["completed"] is True
+    assert completed["before_counts"]["workflow_effect_resolutions"] == owned_count
+    assert completed["after_counts"]["workflow_effect_resolutions"] == 0
+    assert len(resolution_deletes) == 1
+    resolution_delete_sql, resolution_delete_parameter_count = resolution_deletes[0]
+    assert "SELECT workflow_effects.id" in resolution_delete_sql
+    assert resolution_delete_parameter_count == 1
+    repeated = database.complete_session_hard_deletion("session", "cao-session")
+    assert repeated["completed"] is True
+    assert repeated["already_deleted"] is True
+    assert repeated["before_counts"] == {}
+    assert repeated["after_counts"] == {}
+    assert repeated["tombstone_count"] == 1
+    assert repeated["workspace_disposition"] == "retired"
+    assert repeated["workspace_evidence_sha256"] == completed["workspace_evidence_sha256"]
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowModel, foreign_workflow_id) is not None
+        assert {int(row[0]) for row in db.query(WorkflowEffectModel.id).all()} == set(
+            foreign_effect_ids
+        )
+        assert {int(row[0]) for row in db.query(WorkflowEffectResolutionModel.id).all()} == set(
+            foreign_resolution_ids
+        )
+        assert (
+            db.query(WorkflowEffectResolutionModel)
+            .outerjoin(
+                WorkflowEffectModel,
+                WorkflowEffectModel.id == WorkflowEffectResolutionModel.workflow_effect_id,
+            )
+            .filter(WorkflowEffectModel.id.is_(None))
+            .count()
+            == 0
+        )
+
+
+def test_resolution_purge_affected_count_mismatch_rolls_back_and_retry_converges(
+    monkeypatch,
+):
+    _install_database(monkeypatch)
+    with database.SessionLocal() as db:
+        db.add(_terminal("owner"))
+        workflow, turn, effects, resolutions = _resolved_effect_graph(
+            db,
+            terminal_id="owner",
+            count=1,
+            key_prefix="owned",
+        )
+        db.commit()
+        workflow_id = int(workflow.id)
+        turn_id = int(turn.id)
+        effect_id = int(effects[0].id)
+        resolution_id = int(resolutions[0].id)
+
+    _fence_and_mark()
+    original_delete = database._delete_query
+
+    def mismatched_delete(query):
+        deleted = original_delete(query)
+        entity = query.column_descriptions[0].get("entity")
+        if entity is WorkflowEffectResolutionModel:
+            return deleted + 1
+        return deleted
+
+    monkeypatch.setattr(database, "_delete_query", mismatched_delete)
+    failed = database.complete_session_hard_deletion("session", "cao-session")
+    assert failed == {"completed": False, "reason_code": "SESSION_PURGE_INCOMPLETE"}
+    with database.SessionLocal() as db:
+        assert db.get(TerminalModel, "owner") is not None
+        assert db.get(WorkflowModel, workflow_id) is not None
+        assert db.get(WorkflowTurnModel, turn_id) is not None
+        assert db.get(WorkflowEffectModel, effect_id) is not None
+        assert db.get(WorkflowEffectResolutionModel, resolution_id) is not None
+        assert db.get(SessionDeletionOperationModel, "session") is not None
+        assert db.get(SessionDeletionReceiptModel, "session") is None
+        assert db.query(SessionDeletedTerminalFenceModel).count() == 0
+
+    monkeypatch.setattr(database, "_delete_query", original_delete)
+    retried = database.complete_session_hard_deletion("session", "cao-session")
+    assert retried["completed"] is True
+    assert retried["already_deleted"] is False
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowEffectResolutionModel, resolution_id) is None
+        assert db.query(SessionDeletionReceiptModel).count() == 1
 
 
 def test_historical_indeterminate_is_fenced_then_purged_without_result_fabrication(monkeypatch):
@@ -2562,6 +2743,6 @@ def test_hard_purge_sql_shape_is_fixed_with_one_session_tombstone(
 
     one = run(1)
     fifty = run(50)
-    assert one[:2] == fifty[:2] == (109, 79)
+    assert one[:2] == fifty[:2] == (108, 78)
     assert one[2] == 0
     assert fifty[2] == 1

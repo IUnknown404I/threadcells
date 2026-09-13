@@ -10210,9 +10210,6 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
 
         owned = _session_owned_graph_queries(db, session_id, terminal_ids)
         terminal_values = owned["terminal_ids"]
-        owned_effect_resolution_ids = tuple(
-            int(row[0]) for row in owned["effect_resolution_ids"].all()
-        )
         terminal_auth_digests: dict[str, str | None] = {
             str(row.id): (str(row.auth_token_sha256) if row.auth_token_sha256 else None)
             for row in terminals
@@ -10317,11 +10314,22 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
                 WorkflowTurnReceiptModel.workflow_turn_id.in_(owned["turn_ids"])
             )
         )
-        _delete_query(
+        deleted_effect_resolutions = _delete_query(
             db.query(WorkflowEffectResolutionModel).filter(
-                WorkflowEffectResolutionModel.id.in_(owned_effect_resolution_ids)
+                WorkflowEffectResolutionModel.workflow_effect_id.in_(owned["effect_ids"])
             )
         )
+        remaining_effect_resolutions = int(
+            db.query(WorkflowEffectResolutionModel.id)
+            .filter(WorkflowEffectResolutionModel.workflow_effect_id.in_(owned["effect_ids"]))
+            .count()
+        )
+        if (
+            deleted_effect_resolutions != before_counts["workflow_effect_resolutions"]
+            or remaining_effect_resolutions != 0
+        ):
+            db.rollback()
+            return {"completed": False, "reason_code": "SESSION_PURGE_INCOMPLETE"}
         _delete_query(
             db.query(WorkflowEffectModel).filter(WorkflowEffectModel.id.in_(owned["effect_ids"]))
         )
@@ -10433,11 +10441,6 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
         db.delete(operation)
         db.flush()
         after_counts = _session_owned_row_counts_in_transaction(db, session_id, terminal_ids)
-        after_counts["workflow_effect_resolutions"] = int(
-            db.query(WorkflowEffectResolutionModel.id)
-            .filter(WorkflowEffectResolutionModel.id.in_(owned_effect_resolution_ids))
-            .count()
-        )
         if any(after_counts.values()):
             db.rollback()
             return {"completed": False, "reason_code": "SESSION_PURGE_INCOMPLETE"}

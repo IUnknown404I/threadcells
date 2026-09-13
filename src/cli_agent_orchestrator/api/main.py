@@ -50,6 +50,7 @@ from cli_agent_orchestrator.clients.database import (
     get_writable_work_context_by_session,
     init_db,
     queue_workflow_input_for_provider,
+    reconcile_workflow_effect_resolutions,
     release_terminal_runtime_operation,
     resolve_workflow_input_binding,
     submit_handoff_result_v1,
@@ -372,6 +373,12 @@ async def _workflow_reconciliation_tick(
 ) -> bool:
     """Run one isolated recovery tick and return whether startup replay remains due."""
     performed_full_recovery = False
+    try:
+        effect_resolutions = await _run_workflow_io(reconcile_workflow_effect_resolutions)
+        if effect_resolutions:
+            logger.info("Reconciled %s privileged operation outcomes", effect_resolutions)
+    except Exception as exc:
+        logger.warning("Privileged operation outcome reconciliation failed: %s", exc)
     try:
         workspaces = await _run_workflow_io(
             managed_worktree_service.reconcile_writable_work_context_provisioning

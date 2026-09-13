@@ -54,6 +54,7 @@ const DISPOSITION_KEYS: Record<string, TranslationKey> = {
   failed: 'interactions.disposition.failed',
   cancelled: 'interactions.disposition.cancelled',
   superseded: 'interactions.disposition.superseded',
+  rejected: 'interactions.disposition.rejected',
 }
 
 const STATE_KEYS: Record<string, TranslationKey> = {
@@ -200,7 +201,9 @@ function InteractionCard({
           <span>{translatedValue(item.workflow.status, STATE_KEYS, t) || item.workflow.status || t('common.unknown')}</span>
           {item.workflow.turn_state && <><ArrowRight size={12} className="text-gray-600"/><span>{translatedValue(item.workflow.turn_state, STATE_KEYS, t)}</span></>}
           {item.workflow.effect_state && <><ArrowRight size={12} className="text-gray-600"/><span>{item.workflow.effect_kind} · {item.workflow.effect_state}</span></>}
+          {item.workflow.effect_outcome && <><ArrowRight size={12} className="text-gray-600"/><span>{translatedValue(item.workflow.effect_outcome, DISPOSITION_KEYS, t) || item.workflow.effect_outcome}</span></>}
         </div>
+        {item.workflow.effect_reason_code && <p className="mt-1 text-gray-400">{item.workflow.effect_reason_code}</p>}
         {item.workflow.reason && <p className="mt-1 text-amber-200">{item.workflow.reason}</p>}
         {item.workflow.provider_outcome_code && <p className="mt-1 text-gray-400">{t('interactions.providerOutcome')} · {item.workflow.provider_outcome_code}</p>}
       </div>}

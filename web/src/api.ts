@@ -433,6 +433,8 @@ export interface InteractionItem {
     provider_outcome_detail: string | null
     effect_kind: string | null
     effect_state: string | null
+    effect_outcome: string | null
+    effect_reason_code: string | null
     turn_count: number
     superseded_turn_count: number
   }

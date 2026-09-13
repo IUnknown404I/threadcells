@@ -1053,6 +1053,30 @@ class WorkflowEffectModel(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
+class WorkflowEffectResolutionModel(Base):
+    """Append-only semantic resolution for an uncertain privileged transport.
+
+    ``workflow_effects.state`` remains the transport observation made by the
+    process that owned the non-transactional boundary.  Later durable facts
+    may prove the logical operation's outcome without proving that process's
+    response path.  This one-row ledger records that exact evidence while
+    preserving the original claimed/indeterminate history.
+    """
+
+    __tablename__ = "workflow_effect_resolutions"
+    __table_args__ = (UniqueConstraint("workflow_effect_id", name="uq_workflow_effect_resolution"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    workflow_effect_id = Column(Integer, nullable=False, index=True)
+    outcome = Column(String, nullable=False)
+    reason_code = Column(String, nullable=False)
+    evidence_effect_id = Column(Integer, nullable=True)
+    evidence_workflow_turn_id = Column(Integer, nullable=True)
+    evidence_assignment_id = Column(Integer, nullable=True)
+    evidence_result_id = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
 # Module-level singletons
 DB_DIR.mkdir(parents=True, exist_ok=True)
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
@@ -2433,6 +2457,7 @@ def _ensure_workflow_schema() -> None:
     WorkflowProviderReconnectAttemptModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowTurnReceiptModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowEffectModel.__table__.create(bind=engine, checkfirst=True)
+    WorkflowEffectResolutionModel.__table__.create(bind=engine, checkfirst=True)
     _migrate_workflow_turn_columns()
 
 
@@ -10635,6 +10660,317 @@ def finish_workflow_effect(
             return False
         db.commit()
         return True
+
+
+def _durable_workflow_effect_key(kind: str, *parts: object) -> str:
+    """Build the MCP ledger key without importing the MCP server."""
+    digest = hashlib.sha256("\x1f".join(map(str, parts)).encode()).hexdigest()
+    return f"{kind}:{digest}"
+
+
+def _resumed_effect_descends_from(
+    db: Any, workflow_id: int, descendant_turn_id: int, ancestor_turn_id: int
+) -> bool:
+    """Prove one same-workflow replay chain through turns and receipts."""
+    workflow = db.get(WorkflowModel, workflow_id)
+    if workflow is None:
+        return False
+    current_id = descendant_turn_id
+    visited: set[int] = set()
+    while current_id not in visited:
+        if current_id == ancestor_turn_id:
+            return True
+        visited.add(current_id)
+        turn = db.get(WorkflowTurnModel, current_id)
+        if turn is None or turn.workflow_id != workflow_id or turn.resume_parent_turn_id is None:
+            return False
+        parent_id = int(turn.resume_parent_turn_id)
+        receipt = (
+            db.query(WorkflowTurnReceiptModel)
+            .filter_by(
+                workflow_turn_id=parent_id,
+                receiver_terminal_id=workflow.root_terminal_id,
+            )
+            .one_or_none()
+        )
+        if (
+            receipt is None
+            or receipt.resumed_by_turn_id != current_id
+            or receipt.resumed_at is None
+        ):
+            return False
+        current_id = parent_id
+    return False
+
+
+def reconcile_workflow_effect_resolutions(
+    *, limit: int = 200, now: Optional[datetime] = None
+) -> int:
+    """Persist bounded exact outcomes for formerly uncertain effects.
+
+    This never rewrites the transport observation in ``workflow_effects``.
+    It records a semantic resolution only when an immutable relation proves
+    the exact workflow, logical turn, effect, and target/result identity.  A
+    same-key effect may resolve an ancestor only across a fully receipted
+    resume chain; unrelated workflows and turns are never considered.
+    """
+    if isinstance(limit, bool) or limit < 1 or limit > 1000:
+        raise ValueError("limit must be between 1 and 1000")
+    _ensure_workflow_schema()
+    _ensure_child_assignment_schema()
+    _ensure_delegation_result_schema()
+    now = now or datetime.now()
+    resolved = 0
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        effects = (
+            db.query(WorkflowEffectModel)
+            .outerjoin(
+                WorkflowEffectResolutionModel,
+                WorkflowEffectResolutionModel.workflow_effect_id == WorkflowEffectModel.id,
+            )
+            .filter(
+                WorkflowEffectModel.state.in_(("claimed", "indeterminate")),
+                WorkflowEffectResolutionModel.id.is_(None),
+            )
+            .order_by(WorkflowEffectModel.id.desc())
+            .limit(limit)
+            .all()
+        )
+
+        def record(
+            effect: WorkflowEffectModel,
+            outcome: str,
+            reason_code: str,
+            *,
+            evidence_effect_id: Optional[int] = None,
+            evidence_turn_id: Optional[int] = None,
+            assignment_id: Optional[int] = None,
+            result_id: Optional[str] = None,
+        ) -> None:
+            nonlocal resolved
+            db.add(
+                WorkflowEffectResolutionModel(
+                    workflow_effect_id=effect.id,
+                    outcome=outcome,
+                    reason_code=reason_code,
+                    evidence_effect_id=evidence_effect_id,
+                    evidence_workflow_turn_id=evidence_turn_id,
+                    evidence_assignment_id=assignment_id,
+                    evidence_result_id=result_id,
+                    created_at=now,
+                )
+            )
+            db.flush()
+            resolved += 1
+
+        # Strong direct evidence first. This also creates the replay anchors
+        # used by the second pass in the same transaction.
+        for effect in effects:
+            workflow = db.get(WorkflowModel, effect.workflow_id)
+            turn = db.get(WorkflowTurnModel, effect.workflow_turn_id)
+            if workflow is None or turn is None or turn.workflow_id != workflow.id:
+                continue
+            receipt = (
+                db.query(WorkflowTurnReceiptModel.id)
+                .filter_by(
+                    workflow_turn_id=turn.id,
+                    receiver_terminal_id=workflow.root_terminal_id,
+                )
+                .one_or_none()
+            )
+            if receipt is None:
+                continue
+
+            if effect.effect_kind in {"assign", "handoff"}:
+                assignment = (
+                    db.query(ChildAssignmentModel)
+                    .filter_by(request_workflow_effect_id=effect.id)
+                    .one_or_none()
+                )
+                child_turn = (
+                    db.get(WorkflowTurnModel, assignment.child_workflow_turn_id)
+                    if assignment is not None and assignment.child_workflow_turn_id is not None
+                    else None
+                )
+                if (
+                    assignment is not None
+                    and assignment.request_workflow_id == workflow.id
+                    and assignment.request_workflow_turn_id == turn.id
+                    and assignment.parent_terminal_id == workflow.root_terminal_id
+                    and assignment.child_workflow_id is not None
+                    and child_turn is not None
+                    and child_turn.workflow_id == assignment.child_workflow_id
+                    and child_turn.transport_binding is not None
+                ):
+                    record(
+                        effect,
+                        "completed",
+                        "DELEGATION_ATTEMPT_BOUND",
+                        evidence_turn_id=turn.id,
+                        assignment_id=assignment.id,
+                    )
+                    continue
+
+            result = (
+                db.query(DelegationResultModel)
+                .filter_by(workflow_effect_id=effect.id)
+                .one_or_none()
+            )
+            if result is not None:
+                assignment = db.get(ChildAssignmentModel, result.child_assignment_id)
+                if (
+                    result.status == DelegationResultStatus.COMPLETE.value
+                    and result.finalized_at is not None
+                    and isinstance(result.content_sha256, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", result.content_sha256) is not None
+                    and isinstance(result.content_bytes, int)
+                    and result.content_bytes > 0
+                    and assignment is not None
+                    and result.child_terminal_id == workflow.root_terminal_id
+                    and assignment.child_terminal_id == workflow.root_terminal_id
+                    and assignment.child_workflow_id == workflow.id
+                    and result.parent_workflow_id == assignment.request_workflow_id
+                    and result.workflow_turn_id == turn.id
+                    and effect.effect_kind
+                    in {"send_message", "complete_workflow", "submit_handoff_result_v1"}
+                    and assignment.child_workflow_turn_id is not None
+                    and _child_workflow_authority_descends_from_assignment(
+                        db,
+                        workflow,
+                        int(assignment.child_workflow_turn_id),
+                        str(assignment.child_terminal_id),
+                        authority_turn_id=int(turn.id),
+                    )
+                ):
+                    record(
+                        effect,
+                        "completed",
+                        "MANAGED_RESULT_FINALIZED",
+                        evidence_turn_id=turn.id,
+                        assignment_id=assignment.id,
+                        result_id=result.id,
+                    )
+                    continue
+
+            if effect.effect_kind == "acknowledge_assignment":
+                matched = None
+                candidates = (
+                    db.query(DelegationResultModel)
+                    .join(
+                        ChildAssignmentModel,
+                        ChildAssignmentModel.id == DelegationResultModel.child_assignment_id,
+                    )
+                    .filter(
+                        ChildAssignmentModel.parent_terminal_id == workflow.root_terminal_id,
+                        ChildAssignmentModel.request_workflow_id == workflow.id,
+                    )
+                    .order_by(DelegationResultModel.created_at.desc())
+                    .limit(1000)
+                    .all()
+                )
+                for candidate in candidates:
+                    if effect.effect_key == _durable_workflow_effect_key(
+                        "acknowledge_assignment", candidate.id
+                    ):
+                        matched = candidate
+                        break
+                if matched is not None:
+                    assignment = db.get(ChildAssignmentModel, matched.child_assignment_id)
+                    if (
+                        assignment is not None
+                        and assignment.parent_terminal_id == workflow.root_terminal_id
+                        and assignment.request_workflow_id == workflow.id
+                    ):
+                        if assignment.status in {
+                            ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
+                            ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value,
+                        }:
+                            record(
+                                effect,
+                                "completed",
+                                "RESULT_ACKNOWLEDGED",
+                                evidence_turn_id=turn.id,
+                                assignment_id=assignment.id,
+                                result_id=matched.id,
+                            )
+                            continue
+                        if (
+                            assignment.review_superseded_at is not None
+                            and assignment.status == ChildAssignmentStatus.RESULT_SUPERSEDED.value
+                        ):
+                            record(
+                                effect,
+                                "rejected",
+                                "RESULT_REVIEW_ATTEMPT_SUPERSEDED",
+                                evidence_turn_id=turn.id,
+                                assignment_id=assignment.id,
+                                result_id=matched.id,
+                            )
+                            continue
+
+            if (
+                effect.effect_kind == "complete_workflow"
+                and workflow.status == WORKFLOW_TERMINAL
+                and workflow.active_turn_id == turn.id
+                and effect.effect_key
+                == _durable_workflow_effect_key("complete_workflow", workflow.terminal_reason or "")
+            ):
+                record(
+                    effect,
+                    "completed",
+                    "WORKFLOW_TERMINALIZED",
+                    evidence_turn_id=turn.id,
+                )
+
+        # A later exact same-key attempt resolves only ancestors in its
+        # receipted resume chain. The original transport remains indeterminate.
+        db.flush()
+        for effect in effects:
+            if (
+                db.query(WorkflowEffectResolutionModel.id)
+                .filter_by(workflow_effect_id=effect.id)
+                .one_or_none()
+                is not None
+            ):
+                continue
+            evidence = (
+                db.query(WorkflowEffectModel, WorkflowEffectResolutionModel)
+                .join(
+                    WorkflowEffectResolutionModel,
+                    WorkflowEffectResolutionModel.workflow_effect_id == WorkflowEffectModel.id,
+                    isouter=True,
+                )
+                .filter(
+                    WorkflowEffectModel.workflow_id == effect.workflow_id,
+                    WorkflowEffectModel.effect_kind == effect.effect_kind,
+                    WorkflowEffectModel.effect_key == effect.effect_key,
+                    WorkflowEffectModel.workflow_turn_id != effect.workflow_turn_id,
+                    or_(
+                        WorkflowEffectModel.state == "completed",
+                        WorkflowEffectResolutionModel.outcome == "completed",
+                    ),
+                )
+                .order_by(WorkflowEffectModel.id.desc())
+                .all()
+            )
+            for evidence_effect, _resolution in evidence:
+                if _resumed_effect_descends_from(
+                    db,
+                    int(effect.workflow_id),
+                    int(evidence_effect.workflow_turn_id),
+                    int(effect.workflow_turn_id),
+                ):
+                    record(
+                        effect,
+                        "completed",
+                        "EFFECT_COMPLETED_BY_REPLAY",
+                        evidence_effect_id=evidence_effect.id,
+                        evidence_turn_id=evidence_effect.workflow_turn_id,
+                    )
+                    break
+        db.commit()
+    return resolved
 
 
 def describe_workflow_effect_rejection(

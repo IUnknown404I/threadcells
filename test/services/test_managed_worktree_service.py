@@ -460,6 +460,47 @@ def test_session_purge_accepts_clean_supervisor_mission_branch_and_preserves_it(
     assert supervisor.path not in _git(repository, "worktree", "list", "--porcelain")
 
 
+def test_session_purge_preserves_unmanaged_workspace(tmp_path):
+    marker = tmp_path / "foreign-marker.txt"
+    marker.write_text("foreign workspace must survive\n", encoding="utf-8")
+    metadata = {
+        "id": "external-terminal",
+        "session_id": "session",
+        "launch_worktree": str(tmp_path),
+        "managed_worktree_kind": None,
+    }
+    captured = managed_worktree_service.capture_session_worktree_retirement_authority(
+        [metadata], session_id="session"
+    )
+
+    assert captured["safe"] is True
+    assert captured["authority"]["worktrees"] == [
+        {
+            "version": 1,
+            "terminal_id": "external-terminal",
+            "session_id": "session",
+            "managed": False,
+        }
+    ]
+
+    retired = managed_worktree_service.purge_session_managed_worktrees(
+        [metadata], captured["authority"]
+    )
+
+    assert retired["removed"] is True
+    assert retired["evidence"] == [
+        {
+            "terminal_id": "external-terminal",
+            "managed": False,
+            "path_absent": True,
+            "git_unregistered": True,
+            "branch_absent": True,
+            "runtime_artifacts_absent": True,
+        }
+    ]
+    assert marker.read_text(encoding="utf-8") == "foreign workspace must survive\n"
+
+
 def test_session_purge_accepts_clean_reviewer_at_later_detached_revision(tmp_path, monkeypatch):
     repository = _repository(tmp_path)
     launch_revision = _git(repository, "rev-parse", "HEAD")

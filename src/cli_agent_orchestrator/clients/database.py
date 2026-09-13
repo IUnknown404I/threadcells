@@ -200,6 +200,13 @@ class SessionDeletionReceiptModel(Base):
     # reject stale terminal callbacks. Transitional per-terminal receipts and
     # their workspace/history metadata are purged with the Session graph.
     terminal_fences_json = Column(Text, nullable=False, default="[]", server_default="[]")
+    # Machine-readable proof of whether this Session's physical workspace was
+    # retired or deliberately preserved because another durable authority had
+    # acquired the same path/ref.  The latter must survive operation-row purge.
+    workspace_disposition = Column(
+        String, nullable=False, default="retired", server_default="retired"
+    )
+    workspace_evidence_json = Column(Text, nullable=False, default="[]", server_default="[]")
     receipt_version = Column(Integer, nullable=False, default=2, server_default=text("2"))
     deleted_at = Column(DateTime, nullable=False, default=datetime.now)
 
@@ -237,6 +244,8 @@ class SessionDeletionOperationModel(Base):
     # bind this once on their first safe retry.
     workspace_authority_json = Column(Text, nullable=True)
     workspace_authority_sha256 = Column(String, nullable=True)
+    workspace_disposition = Column(String, nullable=True)
+    workspace_evidence_json = Column(Text, nullable=True)
     workspace_evidence_sha256 = Column(String, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.now)
     updated_at = Column(DateTime, nullable=False, default=datetime.now)
@@ -800,6 +809,60 @@ class ChildAssignmentModel(Base):
     updated_at = Column(DateTime, default=datetime.now)
 
 
+class ManagedAttemptLifecycleModel(Base):
+    """Truthful delivery/admission and fencing state for one child attempt."""
+
+    __tablename__ = "managed_attempt_lifecycle"
+
+    assignment_id = Column(Integer, primary_key=True)
+    attempt_id = Column(String, nullable=False, unique=True, index=True)
+    parent_terminal_id = Column(String, nullable=False, index=True)
+    child_terminal_id = Column(String, nullable=False, index=True)
+    request_workflow_effect_id = Column(Integer, nullable=True, unique=True)
+    child_workflow_id = Column(Integer, nullable=True, unique=True)
+    child_workflow_turn_id = Column(Integer, nullable=True, unique=True)
+    state = Column(String, nullable=False, default="assignment_created", index=True)
+    reason_code = Column(String, nullable=True)
+    delivery_attempt_count = Column(Integer, nullable=False, default=0)
+    recovery_attempt_count = Column(Integer, nullable=False, default=0)
+    prompt_delivery_scheduled_at = Column(DateTime, nullable=True)
+    prompt_delivery_acknowledged_at = Column(DateTime, nullable=True)
+    provider_admitted_at = Column(DateTime, nullable=True)
+    provider_running_at = Column(DateTime, nullable=True)
+    waiting_result_at = Column(DateTime, nullable=True)
+    recovery_scheduled_at = Column(DateTime, nullable=True)
+    recovery_next_retry_at = Column(DateTime, nullable=True)
+    recovery_deadline_at = Column(DateTime, nullable=True)
+    fence_claim_token = Column(String, nullable=True, unique=True)
+    fence_claimed_at = Column(DateTime, nullable=True)
+    fenced_at = Column(DateTime, nullable=True)
+    failed_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    expected_runtime_generation = Column(String, nullable=True)
+    expected_writer_authority_generation = Column(String, nullable=True)
+    parent_wake_message_id = Column(Integer, nullable=True, unique=True)
+    replacement_assignment_id = Column(Integer, nullable=True, unique=True)
+    replacement_effect_id = Column(Integer, nullable=True, unique=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class ManagedAttemptLifecycleEventModel(Base):
+    """Append-only machine-readable evidence for managed-attempt transitions."""
+
+    __tablename__ = "managed_attempt_lifecycle_events"
+    __table_args__ = (UniqueConstraint("event_key", name="uq_managed_attempt_event_key"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    assignment_id = Column(Integer, nullable=False, index=True)
+    event_key = Column(String, nullable=False)
+    event_type = Column(String, nullable=False)
+    state = Column(String, nullable=False)
+    reason_code = Column(String, nullable=True)
+    detail_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
 class DelegationResultModel(Base):
     """One immutable semantic result for one durable child assignment."""
 
@@ -1214,6 +1277,8 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 _child_assignment_schema_lock = threading.Lock()
 _child_assignment_schema_ready = False
+_managed_attempt_lifecycle_schema_lock = threading.Lock()
+_managed_attempt_lifecycle_schema_ready = False
 _delegation_result_schema_lock = threading.Lock()
 _delegation_result_schema_ready = False
 _terminal_authority_schema_lock = threading.Lock()
@@ -1267,6 +1332,7 @@ def init_db() -> None:
     # verify every additive assignment migration before any such query.
     _ensure_child_assignment_schema()
     _ensure_delegation_result_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     _ensure_project_schema()
     _ensure_runtime_branding_schema()
     _ensure_usage_schema()
@@ -3209,6 +3275,161 @@ def _ensure_child_assignment_schema() -> None:
             _child_assignment_schema_ready = True
 
 
+def _managed_attempt_event(
+    db: Any,
+    lifecycle: ManagedAttemptLifecycleModel,
+    event_key: str,
+    event_type: str,
+    *,
+    reason_code: Optional[str] = None,
+    detail: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Append one idempotent lifecycle event inside the caller transaction."""
+    if db.query(ManagedAttemptLifecycleEventModel.id).filter_by(event_key=event_key).first():
+        return
+    db.add(
+        ManagedAttemptLifecycleEventModel(
+            assignment_id=lifecycle.assignment_id,
+            event_key=event_key,
+            event_type=event_type,
+            state=lifecycle.state,
+            reason_code=reason_code,
+            detail_json=(
+                json.dumps(dict(detail), sort_keys=True, separators=(",", ":"))
+                if detail is not None
+                else None
+            ),
+        )
+    )
+
+
+def _backfill_managed_attempt_lifecycle() -> None:
+    """Create conservative truthful rows for attempts written by older releases."""
+    now = datetime.now()
+    with SessionLocal() as db:
+        assignments = db.query(ChildAssignmentModel).order_by(ChildAssignmentModel.id).all()
+        changed = False
+        for assignment in assignments:
+            if db.get(ManagedAttemptLifecycleModel, assignment.id) is not None:
+                continue
+            terminal = db.get(TerminalModel, assignment.child_terminal_id)
+            completed = assignment.status in {
+                ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
+                ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value,
+            }
+            failed = assignment.status in {
+                ChildAssignmentStatus.CANCELLED.value,
+                ChildAssignmentStatus.FENCED.value,
+            }
+            receipt = (
+                db.query(WorkflowTurnReceiptModel)
+                .filter(
+                    WorkflowTurnReceiptModel.workflow_turn_id == assignment.child_workflow_turn_id,
+                    WorkflowTurnReceiptModel.receiver_terminal_id == assignment.child_terminal_id,
+                )
+                .first()
+                if assignment.child_workflow_turn_id is not None
+                else None
+            )
+            exact_recovery_authority = bool(
+                assignment.request_workflow_effect_id is not None
+                and assignment.child_workflow_id is not None
+                and assignment.child_workflow_turn_id is not None
+                and terminal is not None
+                and terminal.runtime_generation
+                and terminal.writer_authority_generation
+            )
+            if completed:
+                state = "completed"
+                reason_code = None
+            elif failed:
+                state = "failed"
+                reason_code = "LEGACY_ASSIGNMENT_CANCELLED"
+            elif receipt is not None:
+                # A durable receiver receipt proves both delivery and provider
+                # admission.  Do not put an already-running legacy child under
+                # the absent-admission watchdog merely because older releases
+                # had no lifecycle ledger.
+                state = "waiting_for_result"
+                reason_code = None
+            elif exact_recovery_authority:
+                # Missing delivery/admission remains unknown, but it is never
+                # allowed to wait forever.  Give the upgraded process one
+                # bounded interval before the ordinary exactly-once recovery
+                # path purchases its single same-child retry.
+                state = "prompt_delivery_scheduled"
+                reason_code = "LEGACY_PROMPT_ADMISSION_UNCONFIRMED"
+            else:
+                state = "failed"
+                reason_code = "MANAGED_ATTEMPT_AUTHORITY_MISSING"
+            receipt_time = (
+                receipt.consumed_at if receipt is not None and receipt.consumed_at else now
+            )
+            lifecycle = ManagedAttemptLifecycleModel(
+                assignment_id=assignment.id,
+                attempt_id=assignment.attempt_id,
+                parent_terminal_id=assignment.parent_terminal_id,
+                child_terminal_id=assignment.child_terminal_id,
+                request_workflow_effect_id=assignment.request_workflow_effect_id,
+                child_workflow_id=assignment.child_workflow_id,
+                child_workflow_turn_id=assignment.child_workflow_turn_id,
+                state=state,
+                reason_code=reason_code,
+                expected_runtime_generation=(terminal.runtime_generation if terminal else None),
+                expected_writer_authority_generation=(
+                    terminal.writer_authority_generation if terminal else None
+                ),
+                prompt_delivery_scheduled_at=(
+                    receipt_time
+                    if receipt is not None
+                    else now if state == "prompt_delivery_scheduled" else None
+                ),
+                prompt_delivery_acknowledged_at=(receipt_time if receipt is not None else None),
+                provider_admitted_at=(receipt_time if receipt is not None else None),
+                waiting_result_at=(receipt_time if receipt is not None else None),
+                recovery_deadline_at=(
+                    now + timedelta(seconds=_MANAGED_ATTEMPT_ADMISSION_DEADLINE_SECONDS)
+                    if state == "prompt_delivery_scheduled"
+                    else None
+                ),
+                failed_at=(now if state == "failed" else None),
+                completed_at=(now if completed else None),
+                created_at=assignment.created_at or now,
+                updated_at=now,
+            )
+            db.add(lifecycle)
+            db.flush()
+            _managed_attempt_event(
+                db,
+                lifecycle,
+                f"managed-attempt-backfill:{assignment.id}",
+                "backfilled",
+                reason_code=lifecycle.reason_code,
+                detail={
+                    "provider_admission_proven": receipt is not None,
+                    "bounded_recovery_scheduled": state == "prompt_delivery_scheduled",
+                },
+            )
+            changed = True
+        if changed:
+            db.commit()
+
+
+def _ensure_managed_attempt_lifecycle_schema() -> None:
+    """Create the additive lifecycle ledger and backfill once per engine."""
+    global _managed_attempt_lifecycle_schema_ready
+    if _managed_attempt_lifecycle_schema_ready:
+        return
+    with _managed_attempt_lifecycle_schema_lock:
+        if _managed_attempt_lifecycle_schema_ready:
+            return
+        _ensure_child_assignment_schema()
+        ManagedAttemptLifecycleModel.__table__.create(bind=engine, checkfirst=True)
+        ManagedAttemptLifecycleEventModel.__table__.create(bind=engine, checkfirst=True)
+        _backfill_managed_attempt_lifecycle()
+        _managed_attempt_lifecycle_schema_ready = True
+
+
 def _ensure_delegation_result_schema() -> None:
     """Create the additive F14 schema and non-destructively backfill it once."""
     global _delegation_result_schema_ready
@@ -3754,17 +3975,39 @@ def _migrate_child_assignment_columns() -> bool:
             reviewer_predicates.append(
                 "(agent_profile = 'reviewer' OR agent_profile LIKE 'reviewer\\_%' ESCAPE '\\')"
             )
-        if "launch_snapshot_json" in terminal_columns:
-            reviewer_predicates.append(
-                "(launch_snapshot_json LIKE '%\"execution_mode\"%' "
-                "AND launch_snapshot_json LIKE '%reviewer%')"
-            )
         if reviewer_predicates:
             conn.execute(
                 "UPDATE child_assignments SET review_subject_kind = 'legacy_unscoped' "
                 "WHERE review_subject_kind IS NULL AND child_terminal_id IN ("
                 "SELECT id FROM terminals WHERE " + " OR ".join(reviewer_predicates) + ")"
             )
+            # Pre-fix code searched arbitrary launch prose for ``reviewer``.
+            # Developer profiles describe review policy too, so that heuristic
+            # could silently turn an ordinary child into a reviewer and block
+            # its first prompt. Correct only rows that have no review subject
+            # and whose structured terminal classification is non-review.
+            nonreview_predicates = []
+            if "managed_worktree_kind" in terminal_columns:
+                nonreview_predicates.append("COALESCE(managed_worktree_kind, '') != 'reviewer'")
+            if "agent_profile" in terminal_columns:
+                nonreview_predicates.extend(
+                    (
+                        "COALESCE(agent_profile, '') != 'reviewer'",
+                        "COALESCE(agent_profile, '') NOT LIKE 'reviewer\\_%' ESCAPE '\\'",
+                    )
+                )
+            if nonreview_predicates:
+                conn.execute(
+                    "UPDATE child_assignments SET review_subject_kind = NULL "
+                    "WHERE review_subject_kind = 'legacy_unscoped' "
+                    "AND review_scope_sha256 IS NULL AND review_subject_id IS NULL "
+                    "AND review_subject_revision IS NULL "
+                    "AND review_subject_revision_source IS NULL "
+                    "AND review_subject_worktree IS NULL "
+                    "AND child_terminal_id IN (SELECT id FROM terminals WHERE "
+                    + " AND ".join(nonreview_predicates)
+                    + ")"
+                )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_child_assignments_child_terminal_id "
             "ON child_assignments(child_terminal_id)"
@@ -6179,6 +6422,23 @@ def terminal_auth_token_matches(terminal_id: str, token: str) -> bool:
         )
 
 
+def terminal_has_critical_owner_authority(terminal_id: str) -> bool:
+    """Verify the immutable owner-executor launch receipt without exposing it."""
+    if not isinstance(terminal_id, str) or not terminal_id:
+        return False
+    with SessionLocal() as db:
+        authority = (
+            db.query(TerminalModel.agent_profile, TerminalModel.owner_grant_id)
+            .filter(TerminalModel.id == terminal_id)
+            .one_or_none()
+        )
+        return bool(
+            authority is not None
+            and authority.agent_profile == "critical_sol_xhigh_owner"
+            and authority.owner_grant_id
+        )
+
+
 def terminal_deletion_auth_token_matches(terminal_id: str, token: str) -> bool:
     """Recognize one deleted terminal capability without reviving live authority."""
     if not isinstance(token, str) or not token:
@@ -6329,6 +6589,16 @@ def _ensure_session_deletion_receipt_schema() -> None:
                     "ALTER TABLE session_deletion_receipts "
                     "ADD COLUMN receipt_version INTEGER NOT NULL DEFAULT 1"
                 )
+            if "workspace_disposition" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_receipts "
+                    "ADD COLUMN workspace_disposition VARCHAR NOT NULL DEFAULT 'retired'"
+                )
+            if "workspace_evidence_json" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_receipts "
+                    "ADD COLUMN workspace_evidence_json TEXT NOT NULL DEFAULT '[]'"
+                )
             operation_columns = {
                 row[1]
                 for row in connection.exec_driver_sql(
@@ -6344,6 +6614,21 @@ def _ensure_session_deletion_receipt_schema() -> None:
                 connection.exec_driver_sql(
                     "ALTER TABLE session_deletion_operations "
                     "ADD COLUMN workspace_authority_sha256 VARCHAR"
+                )
+            if "workspace_disposition" not in operation_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_operations "
+                    "ADD COLUMN workspace_disposition VARCHAR"
+                )
+            if "workspace_evidence_json" not in operation_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_operations "
+                    "ADD COLUMN workspace_evidence_json TEXT"
+                )
+            if "workspace_evidence_sha256" not in operation_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_operations "
+                    "ADD COLUMN workspace_evidence_sha256 VARCHAR"
                 )
         _ensure_session_deleted_terminal_fence_backfill()
         _session_deletion_receipt_schema_engine_identity = engine_identity
@@ -6385,6 +6670,24 @@ def _session_receipt_retained_resources(
         return _normalize_session_retained_resources(value)
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise AmbiguousSessionIdentity(str(receipt.session_id)) from exc
+
+
+def _session_receipt_workspace_projection(
+    receipt: SessionDeletionReceiptModel,
+) -> tuple[str, str]:
+    disposition = str(receipt.workspace_disposition or _SESSION_WORKSPACE_DISPOSITION_RETIRED)
+    if disposition not in {
+        _SESSION_WORKSPACE_DISPOSITION_RETIRED,
+        _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN,
+    }:
+        raise AmbiguousSessionIdentity(str(receipt.session_id))
+    try:
+        _evidence, _encoded, digest = _canonical_session_workspace_evidence(
+            json.loads(str(receipt.workspace_evidence_json or "[]"))
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AmbiguousSessionIdentity(str(receipt.session_id)) from exc
+    return disposition, digest
 
 
 def _normalize_session_terminal_fences(value: Any) -> list[dict[str, str | None]]:
@@ -6923,6 +7226,7 @@ def _validate_session_workspace_relational_authority_in_transaction(
     workspace_authority: Mapping[str, Any],
     allow_dirty_workspace: bool,
     require_exact_context: bool,
+    allow_foreign_workspace: bool = False,
 ) -> str | None:
     """Prove every destructive target belongs only to this Session."""
     terminals = _session_plan_terminals(db, session_id, terminal_ids)
@@ -7058,6 +7362,7 @@ def _validate_session_workspace_relational_authority_in_transaction(
             )
             .first()
             is not None
+            and not allow_foreign_workspace
         ):
             return "WORKSPACE_FOREIGN_OWNER"
         receipt_filters = [TerminalDeletionReceiptModel.managed_worktree_path.in_(target_paths)]
@@ -7079,6 +7384,7 @@ def _validate_session_workspace_relational_authority_in_transaction(
             )
             .first()
             is not None
+            and not allow_foreign_workspace
         ):
             return "WORKSPACE_FOREIGN_OWNER"
         foreign_context_filters = [WritableWorkContextModel.canonical_worktree.in_(target_paths)]
@@ -7100,16 +7406,172 @@ def _validate_session_workspace_relational_authority_in_transaction(
             )
             .first()
             is not None
+            and not allow_foreign_workspace
         ):
             return "WORKSPACE_FOREIGN_OWNER"
-        if (
+        writer_leases = (
             db.query(WorktreeWriterLeaseModel.terminal_id)
             .filter(WorktreeWriterLeaseModel.canonical_worktree.in_(target_paths))
-            .first()
-            is not None
-        ):
+            .all()
+        )
+        if any(str(row[0]) in terminal_by_id for row in writer_leases):
             return "WRITER_LEASE_ACTIVE"
+        if writer_leases and not allow_foreign_workspace:
+            return "WORKSPACE_FOREIGN_OWNER"
     return None
+
+
+def _session_foreign_workspace_evidence_in_transaction(
+    db: Any,
+    *,
+    session_id: str,
+    terminal_ids: Sequence[str],
+    workspace_authority: Mapping[str, Any],
+) -> Dict[str, Any] | None:
+    """Capture bounded foreign ownership that requires non-destructive preservation."""
+    local_terminal_ids = tuple(sorted(str(value) for value in terminal_ids))
+    managed_rows = [
+        row
+        for row in workspace_authority.get("worktrees", ())
+        if isinstance(row, Mapping) and row.get("managed") is True
+    ]
+    target_paths = tuple(sorted({str(row["path"]) for row in managed_rows}))
+    target_sources = tuple(sorted({str(row["source"]) for row in managed_rows}))
+    target_branches = tuple(
+        sorted(
+            {
+                str(row["owned_ref"]).removeprefix("refs/heads/")
+                for row in managed_rows
+                if isinstance(row.get("owned_ref"), str)
+            }
+        )
+    )
+    if not target_paths:
+        return None
+
+    terminal_filters = [TerminalModel.launch_worktree.in_(target_paths)]
+    receipt_filters = [TerminalDeletionReceiptModel.managed_worktree_path.in_(target_paths)]
+    context_filters = [WritableWorkContextModel.canonical_worktree.in_(target_paths)]
+    if target_sources and target_branches:
+        source_branch = and_(
+            TerminalModel.managed_worktree_source.in_(target_sources),
+            TerminalModel.managed_worktree_branch.in_(target_branches),
+        )
+        terminal_filters.append(source_branch)
+        receipt_filters.append(
+            and_(
+                TerminalDeletionReceiptModel.managed_worktree_source.in_(target_sources),
+                TerminalDeletionReceiptModel.managed_worktree_branch.in_(target_branches),
+            )
+        )
+        context_filters.append(
+            and_(
+                WritableWorkContextModel.canonical_source.in_(target_sources),
+                WritableWorkContextModel.branch.in_(target_branches),
+            )
+        )
+
+    terminals = (
+        db.query(TerminalModel)
+        .filter(TerminalModel.id.notin_(local_terminal_ids), or_(*terminal_filters))
+        .order_by(TerminalModel.id.asc())
+        .limit(_SESSION_DELETION_PLAN_LIMIT + 1)
+        .all()
+    )
+    receipts = (
+        db.query(TerminalDeletionReceiptModel)
+        .filter(
+            or_(
+                TerminalDeletionReceiptModel.session_id != session_id,
+                TerminalDeletionReceiptModel.session_id.is_(None),
+            ),
+            or_(*receipt_filters),
+        )
+        .order_by(TerminalDeletionReceiptModel.terminal_id.asc())
+        .limit(_SESSION_DELETION_PLAN_LIMIT + 1)
+        .all()
+    )
+    contexts = (
+        db.query(WritableWorkContextModel)
+        .filter(
+            or_(
+                WritableWorkContextModel.session_id != session_id,
+                WritableWorkContextModel.session_id.is_(None),
+            ),
+            or_(*context_filters),
+        )
+        .order_by(WritableWorkContextModel.id.asc())
+        .limit(_SESSION_DELETION_PLAN_LIMIT + 1)
+        .all()
+    )
+    writer_leases = (
+        db.query(WorktreeWriterLeaseModel)
+        .filter(
+            WorktreeWriterLeaseModel.canonical_worktree.in_(target_paths),
+            WorktreeWriterLeaseModel.terminal_id.notin_(local_terminal_ids),
+        )
+        .order_by(WorktreeWriterLeaseModel.canonical_worktree.asc())
+        .limit(_SESSION_DELETION_PLAN_LIMIT + 1)
+        .all()
+    )
+    if any(
+        len(rows) > _SESSION_DELETION_PLAN_LIMIT
+        for rows in (terminals, receipts, contexts, writer_leases)
+    ):
+        raise AmbiguousSessionIdentity(session_id)
+    if not any((terminals, receipts, contexts, writer_leases)):
+        return None
+    return {
+        "version": 1,
+        "terminals": [
+            {
+                "terminal_id": str(row.id),
+                "session_id": row.session_id,
+                "launch_worktree": row.launch_worktree,
+                "runtime_generation": row.runtime_generation,
+                "writer_authority_generation": row.writer_authority_generation,
+            }
+            for row in terminals
+        ],
+        "terminal_receipts": [
+            {
+                "terminal_id": str(row.terminal_id),
+                "session_id": row.session_id,
+                "managed_worktree_path": row.managed_worktree_path,
+                "managed_worktree_source": row.managed_worktree_source,
+                "managed_worktree_branch": row.managed_worktree_branch,
+            }
+            for row in receipts
+        ],
+        "work_contexts": [
+            {
+                "id": str(row.id),
+                "session_id": row.session_id,
+                "terminal_id": str(row.terminal_id),
+                "canonical_worktree": row.canonical_worktree,
+                "state": str(row.state),
+                "writer_authority_generation": row.writer_authority_generation,
+            }
+            for row in contexts
+        ],
+        "writer_leases": [
+            {
+                "canonical_worktree": str(row.canonical_worktree),
+                "terminal_id": str(row.terminal_id),
+                "authority_generation": str(row.authority_generation),
+            }
+            for row in writer_leases
+        ],
+    }
+
+
+def _canonical_session_workspace_evidence(value: Any) -> tuple[Any, str, str]:
+    if not isinstance(value, (list, dict)):
+        raise ValueError("workspace evidence is invalid")
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode()) > 1_000_000:
+        raise ValueError("workspace evidence is too large")
+    return value, encoded, hashlib.sha256(encoded.encode()).hexdigest()
 
 
 def _session_deletion_operation_dict(
@@ -7148,6 +7610,38 @@ def _session_deletion_operation_dict(
             workspace_authority_sha256, digest
         ):
             raise AmbiguousSessionIdentity(str(operation.session_id))
+    disposition = operation.workspace_disposition
+    if disposition is None and operation.state == _SESSION_HARD_DELETE_WORKSPACE_RETIRED:
+        disposition = _SESSION_WORKSPACE_DISPOSITION_RETIRED
+    if disposition not in {
+        None,
+        _SESSION_WORKSPACE_DISPOSITION_RETIRED,
+        _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN,
+    }:
+        raise AmbiguousSessionIdentity(str(operation.session_id))
+    workspace_evidence = None
+    if operation.workspace_evidence_json is not None:
+        if not (
+            isinstance(operation.workspace_evidence_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", operation.workspace_evidence_sha256)
+        ):
+            raise AmbiguousSessionIdentity(str(operation.session_id))
+        try:
+            decoded_evidence = json.loads(operation.workspace_evidence_json)
+            workspace_evidence, evidence_json, evidence_sha256 = (
+                _canonical_session_workspace_evidence(decoded_evidence)
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AmbiguousSessionIdentity(str(operation.session_id)) from exc
+        if operation.workspace_evidence_json != evidence_json or not hmac.compare_digest(
+            operation.workspace_evidence_sha256, evidence_sha256
+        ):
+            raise AmbiguousSessionIdentity(str(operation.session_id))
+    elif (
+        disposition == _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN
+        or operation.state == _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN
+    ):
+        raise AmbiguousSessionIdentity(str(operation.session_id))
     return {
         "session_id": str(operation.session_id),
         "session_name": str(operation.session_name),
@@ -7157,6 +7651,8 @@ def _session_deletion_operation_dict(
         "authority_fingerprint": str(operation.authority_fingerprint),
         "workspace_authority": workspace_authority,
         "workspace_authority_sha256": workspace_authority_sha256,
+        "workspace_disposition": disposition,
+        "workspace_evidence": workspace_evidence,
         "workspace_evidence_sha256": operation.workspace_evidence_sha256,
         "created_at": operation.created_at,
         "updated_at": operation.updated_at,
@@ -7471,12 +7967,15 @@ def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
     with SessionLocal() as db:
         exact_receipt = db.get(SessionDeletionReceiptModel, identifier)
         if exact_receipt is not None:
+            disposition, evidence_sha256 = _session_receipt_workspace_projection(exact_receipt)
             return {
                 "session_id": str(exact_receipt.session_id),
                 "session_name": str(exact_receipt.session_name),
                 "deleted": True,
                 "terminals": [],
                 "retained_resources": _session_receipt_retained_resources(exact_receipt),
+                "workspace_disposition": disposition,
+                "workspace_evidence_sha256": evidence_sha256,
             }
 
         terminals = (
@@ -7664,12 +8163,15 @@ def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
         if not final_receipts:
             return None
         final_receipt = final_receipts[0]
+        disposition, evidence_sha256 = _session_receipt_workspace_projection(final_receipt)
         return {
             "session_id": str(final_receipt.session_id),
             "session_name": str(final_receipt.session_name),
             "deleted": True,
             "terminals": [],
             "retained_resources": _session_receipt_retained_resources(final_receipt),
+            "workspace_disposition": disposition,
+            "workspace_evidence_sha256": evidence_sha256,
         }
 
 
@@ -8678,6 +9180,9 @@ def delete_terminals_by_session(tmux_session: str) -> int:
 
 _SESSION_HARD_DELETE_FENCED = "fenced"
 _SESSION_HARD_DELETE_WORKSPACE_RETIRED = "workspace_retired"
+_SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN = "workspace_preserved_foreign"
+_SESSION_WORKSPACE_DISPOSITION_RETIRED = "retired"
+_SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN = "preserved_foreign"
 
 
 def _session_terminal_scope(db: Any, session_id: str) -> Any:
@@ -8710,6 +9215,9 @@ def _session_owned_graph_queries(
         ChildAssignmentModel.parent_terminal_id.in_(terminal_values),
         ChildAssignmentModel.child_terminal_id.in_(terminal_values),
     )
+    managed_attempt_ids = db.query(ManagedAttemptLifecycleModel.assignment_id).filter(
+        ManagedAttemptLifecycleModel.assignment_id.in_(assignment_ids)
+    )
     result_ids = db.query(DelegationResultModel.id).filter(
         DelegationResultModel.child_assignment_id.in_(assignment_ids),
         DelegationResultModel.parent_terminal_id.in_(terminal_values),
@@ -8728,6 +9236,7 @@ def _session_owned_graph_queries(
         "turn_ids": turn_ids,
         "effect_ids": effect_ids,
         "assignment_ids": assignment_ids,
+        "managed_attempt_ids": managed_attempt_ids,
         "result_ids": result_ids,
         "context_ids": context_ids,
         "takeover_ids": takeover_ids,
@@ -8777,6 +9286,18 @@ def _session_owned_row_counts_in_transaction(
         "child_assignments": int(
             db.query(ChildAssignmentModel.id)
             .filter(ChildAssignmentModel.id.in_(owned["assignment_ids"]))
+            .count()
+        ),
+        "managed_attempt_lifecycle": int(
+            db.query(ManagedAttemptLifecycleModel.assignment_id)
+            .filter(ManagedAttemptLifecycleModel.assignment_id.in_(owned["managed_attempt_ids"]))
+            .count()
+        ),
+        "managed_attempt_lifecycle_events": int(
+            db.query(ManagedAttemptLifecycleEventModel.id)
+            .filter(
+                ManagedAttemptLifecycleEventModel.assignment_id.in_(owned["managed_attempt_ids"])
+            )
             .count()
         ),
         "delegation_results": int(
@@ -9015,6 +9536,10 @@ def _revalidate_session_hard_deletion_in_transaction(
             workspace_authority=workspace_authority,
             allow_dirty_workspace=bool(parsed["allow_dirty_workspace"]),
             require_exact_context=False,
+            allow_foreign_workspace=(
+                parsed.get("workspace_disposition")
+                == _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN
+            ),
         )
         if relational_error is not None:
             return None, relational_error
@@ -9064,6 +9589,9 @@ def revalidate_session_hard_deletion(
                 "valid": True,
                 "terminal_ids": terminal_ids,
                 "graph_terminal_ids": graph_terminal_ids,
+                "workspace_disposition": (
+                    _session_deletion_operation_dict(operation).get("workspace_disposition")
+                ),
             }
         )
 
@@ -9079,6 +9607,7 @@ def begin_session_hard_deletion(
     _ensure_terminal_ui_projection_schema()
     _ensure_terminal_deletion_receipt_schema()
     _ensure_session_deletion_receipt_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         receipt = db.get(SessionDeletionReceiptModel, session_id)
@@ -9197,6 +9726,24 @@ def begin_session_hard_deletion(
         return {"started": True, **parsed_operation}
 
 
+def _session_foreign_workspace_preservation_document(
+    *,
+    workspace_authority_sha256: str,
+    graph_terminal_ids: Sequence[str],
+    foreign_authority: Mapping[str, Any],
+    runtime_artifacts: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "disposition": _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN,
+        "reason_code": "WORKSPACE_FOREIGN_OWNER",
+        "workspace_authority_sha256": workspace_authority_sha256,
+        "graph_terminal_ids": sorted(str(value) for value in graph_terminal_ids),
+        "foreign_authority": dict(foreign_authority),
+        "runtime_artifacts": dict(runtime_artifacts) if runtime_artifacts is not None else None,
+    }
+
+
 def bind_session_hard_deletion_workspace_authority(
     session_id: str,
     session_name: str,
@@ -9244,7 +9791,15 @@ def bind_session_hard_deletion_workspace_authority(
             allow_dirty_workspace=bool(parsed["allow_dirty_workspace"]),
             require_exact_context=True,
         )
-        if relational_error is not None:
+        foreign_authority = None
+        if relational_error == "WORKSPACE_FOREIGN_OWNER":
+            foreign_authority = _session_foreign_workspace_evidence_in_transaction(
+                db,
+                session_id=session_id,
+                terminal_ids=parsed["terminal_ids"],
+                workspace_authority=normalized,
+            )
+        if relational_error is not None and foreign_authority is None:
             db.rollback()
             return {"bound": False, "reason_code": relational_error}
         if parsed["workspace_authority"] is not None:
@@ -9266,9 +9821,120 @@ def bind_session_hard_deletion_workspace_authority(
             return {"bound": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
         operation.workspace_authority_json = encoded
         operation.workspace_authority_sha256 = digest
+        operation.workspace_disposition = (
+            _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN
+            if foreign_authority is not None
+            else _SESSION_WORKSPACE_DISPOSITION_RETIRED
+        )
+        if foreign_authority is not None:
+            graph_terminal_ids = _session_graph_terminal_ids(db, session_id, parsed["terminal_ids"])
+            if graph_terminal_ids is None:
+                db.rollback()
+                return {"bound": False, "reason_code": "SESSION_DELETE_PLAN_TOO_LARGE"}
+            evidence, evidence_json, evidence_sha256 = _canonical_session_workspace_evidence(
+                _session_foreign_workspace_preservation_document(
+                    workspace_authority_sha256=digest,
+                    graph_terminal_ids=graph_terminal_ids,
+                    foreign_authority=foreign_authority,
+                )
+            )
+            operation.workspace_evidence_json = evidence_json
+            operation.workspace_evidence_sha256 = evidence_sha256
         operation.updated_at = datetime.now()
         db.commit()
-        return {"bound": True, "workspace_authority_sha256": digest}
+        return {
+            "bound": True,
+            "workspace_authority_sha256": digest,
+            "workspace_disposition": operation.workspace_disposition,
+        }
+
+
+def admit_session_foreign_workspace_preservation(
+    session_id: str,
+    session_name: str,
+) -> Dict[str, Any]:
+    """Atomically replace destructive cleanup with foreign-authority preservation."""
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        operation = db.get(SessionDeletionOperationModel, session_id)
+        if operation is None or str(operation.session_name) != session_name:
+            db.rollback()
+            return {"admitted": False, "reason_code": "SESSION_DELETE_FENCE_MISSING"}
+        parsed = _session_deletion_operation_dict(operation)
+        if parsed["workspace_authority"] is None:
+            db.rollback()
+            return {"admitted": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
+        if parsed["workspace_disposition"] == _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN:
+            db.rollback()
+            return {
+                "admitted": True,
+                "already_admitted": True,
+                "workspace_evidence_sha256": parsed["workspace_evidence_sha256"],
+            }
+        if operation.state != _SESSION_HARD_DELETE_FENCED:
+            db.rollback()
+            return {"admitted": False, "reason_code": "SESSION_DELETE_STATE_INVALID"}
+        terminals, reason_code = _revalidate_session_hard_deletion_in_transaction(
+            db,
+            operation,
+            require_workspace_retired=False,
+        )
+        if reason_code != "WORKSPACE_FOREIGN_OWNER":
+            db.rollback()
+            return {
+                "admitted": False,
+                "reason_code": reason_code or "WORKSPACE_FOREIGN_OWNER_UNPROVEN",
+            }
+        terminals = _session_plan_terminals(db, session_id, parsed["terminal_ids"])
+        if terminals is None:
+            db.rollback()
+            return {"admitted": False, "reason_code": "SESSION_IDENTITY_CHANGED"}
+        base_error = _validate_session_workspace_relational_authority_in_transaction(
+            db,
+            session_id=session_id,
+            terminal_ids=parsed["terminal_ids"],
+            workspace_authority=parsed["workspace_authority"],
+            allow_dirty_workspace=bool(parsed["allow_dirty_workspace"]),
+            require_exact_context=False,
+            allow_foreign_workspace=True,
+        )
+        if base_error is not None:
+            db.rollback()
+            return {"admitted": False, "reason_code": base_error}
+        foreign_authority = _session_foreign_workspace_evidence_in_transaction(
+            db,
+            session_id=session_id,
+            terminal_ids=parsed["terminal_ids"],
+            workspace_authority=parsed["workspace_authority"],
+        )
+        graph_terminal_ids = _session_graph_terminal_ids(db, session_id, parsed["terminal_ids"])
+        if foreign_authority is None or graph_terminal_ids is None:
+            db.rollback()
+            return {
+                "admitted": False,
+                "reason_code": (
+                    "WORKSPACE_FOREIGN_OWNER_UNPROVEN"
+                    if foreign_authority is None
+                    else "SESSION_DELETE_PLAN_TOO_LARGE"
+                ),
+            }
+        _evidence, evidence_json, evidence_sha256 = _canonical_session_workspace_evidence(
+            _session_foreign_workspace_preservation_document(
+                workspace_authority_sha256=str(parsed["workspace_authority_sha256"]),
+                graph_terminal_ids=graph_terminal_ids,
+                foreign_authority=foreign_authority,
+            )
+        )
+        operation.workspace_disposition = _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN
+        operation.workspace_evidence_json = evidence_json
+        operation.workspace_evidence_sha256 = evidence_sha256
+        operation.updated_at = datetime.now()
+        db.commit()
+        return {
+            "admitted": True,
+            "workspace_evidence_sha256": evidence_sha256,
+        }
 
 
 def mark_session_hard_deletion_workspace_retired(
@@ -9309,9 +9975,9 @@ def mark_session_hard_deletion_workspace_retired(
     ):
         return {"marked": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
     evidence.sort(key=lambda item: item["terminal_id"])
-    evidence_sha256 = hashlib.sha256(
-        json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    _normalized_evidence, evidence_json, evidence_sha256 = _canonical_session_workspace_evidence(
+        evidence
+    )
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         operation = db.get(SessionDeletionOperationModel, session_id)
@@ -9356,6 +10022,74 @@ def mark_session_hard_deletion_workspace_retired(
             db.rollback()
             return {"marked": False, "reason_code": "SESSION_DELETE_STATE_INVALID"}
         operation.state = _SESSION_HARD_DELETE_WORKSPACE_RETIRED
+        operation.workspace_disposition = _SESSION_WORKSPACE_DISPOSITION_RETIRED
+        operation.workspace_evidence_json = evidence_json
+        operation.workspace_evidence_sha256 = evidence_sha256
+        operation.updated_at = datetime.now()
+        db.commit()
+        return {"marked": True, "workspace_evidence_sha256": evidence_sha256}
+
+
+def mark_session_hard_deletion_workspace_preserved(
+    session_id: str,
+    *,
+    runtime_artifacts: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Record that foreign workspace authority was preserved and only artifacts retired."""
+    if runtime_artifacts.get("runtime_artifacts_absent") is not True:
+        return {"marked": False, "reason_code": "TERMINAL_ARTIFACT_CLEANUP_UNPROVEN"}
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        operation = db.get(SessionDeletionOperationModel, session_id)
+        if operation is None:
+            receipt = db.get(SessionDeletionReceiptModel, session_id)
+            db.rollback()
+            return (
+                {"marked": True, "already_deleted": True}
+                if receipt is not None
+                else {"marked": False, "reason_code": "SESSION_DELETE_FENCE_MISSING"}
+            )
+        parsed = _session_deletion_operation_dict(operation)
+        if parsed[
+            "workspace_disposition"
+        ] != _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN or not isinstance(
+            parsed["workspace_evidence"], Mapping
+        ):
+            db.rollback()
+            return {"marked": False, "reason_code": "WORKSPACE_FOREIGN_OWNER_UNPROVEN"}
+        if operation.state == _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN:
+            recorded = parsed["workspace_evidence"].get("runtime_artifacts")
+            matched = recorded == dict(runtime_artifacts)
+            db.rollback()
+            return (
+                {"marked": True, "already_marked": True}
+                if matched
+                else {"marked": False, "reason_code": "WORKSPACE_AUTHORITY_CHANGED"}
+            )
+        if operation.state != _SESSION_HARD_DELETE_FENCED:
+            db.rollback()
+            return {"marked": False, "reason_code": "SESSION_DELETE_STATE_INVALID"}
+        terminals, reason_code = _revalidate_session_hard_deletion_in_transaction(
+            db,
+            operation,
+            require_workspace_retired=False,
+        )
+        if reason_code is not None or terminals is None:
+            db.rollback()
+            return {"marked": False, "reason_code": reason_code}
+        draft = parsed["workspace_evidence"]
+        final_document = _session_foreign_workspace_preservation_document(
+            workspace_authority_sha256=str(parsed["workspace_authority_sha256"]),
+            graph_terminal_ids=draft.get("graph_terminal_ids", ()),
+            foreign_authority=draft.get("foreign_authority", {}),
+            runtime_artifacts=runtime_artifacts,
+        )
+        _evidence, evidence_json, evidence_sha256 = _canonical_session_workspace_evidence(
+            final_document
+        )
+        operation.state = _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN
+        operation.workspace_evidence_json = evidence_json
         operation.workspace_evidence_sha256 = evidence_sha256
         operation.updated_at = datetime.now()
         db.commit()
@@ -9370,6 +10104,7 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
     """Atomically purge one fenced Session graph and leave only replay tombstones."""
     _ensure_terminal_deletion_receipt_schema()
     _ensure_session_deletion_receipt_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         receipt = db.get(SessionDeletionReceiptModel, session_id)
@@ -9377,6 +10112,7 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
             if str(receipt.session_name) != session_name:
                 db.rollback()
                 raise AmbiguousSessionIdentity(session_id)
+            disposition, evidence_sha256 = _session_receipt_workspace_projection(receipt)
             db.rollback()
             return {
                 "completed": True,
@@ -9384,19 +10120,27 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
                 "before_counts": {},
                 "after_counts": {},
                 "tombstone_count": 1,
+                "workspace_disposition": disposition,
+                "workspace_evidence_sha256": evidence_sha256,
             }
         operation = db.get(SessionDeletionOperationModel, session_id)
         if operation is None or str(operation.session_name) != session_name:
             db.rollback()
             return {"completed": False, "reason_code": "SESSION_DELETE_FENCE_MISSING"}
-        if operation.state != _SESSION_HARD_DELETE_WORKSPACE_RETIRED:
+        if operation.state not in {
+            _SESSION_HARD_DELETE_WORKSPACE_RETIRED,
+            _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN,
+        }:
             db.rollback()
             return {"completed": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
         parsed = _session_deletion_operation_dict(operation)
+        preserved_foreign = (
+            parsed["workspace_disposition"] == _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN
+        )
         terminals, reason_code = _revalidate_session_hard_deletion_in_transaction(
             db,
             operation,
-            require_workspace_retired=True,
+            require_workspace_retired=not preserved_foreign,
         )
         if reason_code is not None or terminals is None:
             db.rollback()
@@ -9487,6 +10231,16 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
         _delete_query(
             db.query(DelegationResultModel).filter(
                 DelegationResultModel.id.in_(owned["result_ids"])
+            )
+        )
+        _delete_query(
+            db.query(ManagedAttemptLifecycleEventModel).filter(
+                ManagedAttemptLifecycleEventModel.assignment_id.in_(owned["managed_attempt_ids"])
+            )
+        )
+        _delete_query(
+            db.query(ManagedAttemptLifecycleModel).filter(
+                ManagedAttemptLifecycleModel.assignment_id.in_(owned["managed_attempt_ids"])
             )
         )
         _delete_query(
@@ -9604,7 +10358,11 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
                 terminal_fences_json=json.dumps(
                     terminal_fences, sort_keys=True, separators=(",", ":")
                 ),
-                receipt_version=3,
+                workspace_disposition=str(
+                    parsed["workspace_disposition"] or _SESSION_WORKSPACE_DISPOSITION_RETIRED
+                ),
+                workspace_evidence_json=str(operation.workspace_evidence_json or "[]"),
+                receipt_version=4,
                 deleted_at=now,
             )
         )
@@ -9622,6 +10380,8 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
             "after_counts": after_counts,
             "tombstone_count": 1,
             "terminal_fence_count": len(terminal_fences),
+            "workspace_disposition": parsed["workspace_disposition"],
+            "workspace_evidence_sha256": parsed["workspace_evidence_sha256"],
         }
 
 
@@ -12113,6 +12873,7 @@ def schedule_managed_handoff_continuation(
     """
     _ensure_child_assignment_schema()
     _ensure_delegation_result_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
         assignment = (
@@ -12221,7 +12982,32 @@ def schedule_managed_handoff_continuation(
             # schedulers before either can append recovery evidence.
             db.flush()
             assignment.status = ChildAssignmentStatus.HANDOFF_RECOVERY_AWAITING_RESULT.value
-            assignment.updated_at = datetime.now()
+            now = datetime.now()
+            assignment.updated_at = now
+            lifecycle = db.get(ManagedAttemptLifecycleModel, assignment.id)
+            if lifecycle is not None and lifecycle.state not in _MANAGED_ATTEMPT_TERMINAL_STATES:
+                lifecycle.child_workflow_id = child_workflow.id
+                lifecycle.child_workflow_turn_id = successor.id
+                lifecycle.state = "prompt_delivery_scheduled"
+                lifecycle.reason_code = None
+                lifecycle.prompt_delivery_scheduled_at = now
+                lifecycle.prompt_delivery_acknowledged_at = None
+                lifecycle.provider_admitted_at = None
+                lifecycle.provider_running_at = None
+                lifecycle.waiting_result_at = None
+                lifecycle.recovery_attempt_count = 0
+                lifecycle.recovery_scheduled_at = None
+                lifecycle.recovery_next_retry_at = None
+                lifecycle.recovery_deadline_at = now + timedelta(
+                    seconds=_MANAGED_ATTEMPT_ADMISSION_DEADLINE_SECONDS
+                )
+                lifecycle.updated_at = now
+                _managed_attempt_event(
+                    db,
+                    lifecycle,
+                    f"prompt-delivery-scheduled:{assignment.id}:{successor.id}",
+                    "prompt_delivery_scheduled",
+                )
             _record_result_event(
                 db,
                 result.id,
@@ -12826,9 +13612,8 @@ def _cancel_parent_assignments(db, parent_terminal_id: str, now: datetime) -> in
         kind = "handoff" if assignment.status.startswith("handoff_") else "assign"
         assignment.status = ChildAssignmentStatus.CANCELLED.value
         assignment.updated_at = now
-        result = _create_result_for_assignment(
-            db, assignment, kind, _open_workflow(db, parent_terminal_id, create=False)
-        )
+        parent_workflow = _open_workflow(db, parent_terminal_id, create=False)
+        result = _create_result_for_assignment(db, assignment, kind, parent_workflow)
         if result.status == DelegationResultStatus.AWAITING.value:
             result.status = DelegationResultStatus.CANCELLED.value
             result.reason_code = "parent_cancelled"
@@ -12842,6 +13627,28 @@ def _cancel_parent_assignments(db, parent_terminal_id: str, now: datetime) -> in
                 parent_terminal_id,
             )
             _purge_staged_handoff_submission(db, result.id)
+        lifecycle = db.get(ManagedAttemptLifecycleModel, assignment.id)
+        if lifecycle is not None and lifecycle.state not in (
+            _MANAGED_ATTEMPT_TERMINAL_STATES | {"fence_claimed"}
+        ):
+            parent_state = (
+                str(parent_workflow.status).upper()
+                if parent_workflow is not None
+                else "UNAVAILABLE"
+            )
+            lifecycle.state = "failed"
+            lifecycle.reason_code = f"PARENT_WORKFLOW_{parent_state}"
+            lifecycle.failed_at = lifecycle.failed_at or now
+            lifecycle.recovery_next_retry_at = None
+            lifecycle.recovery_deadline_at = None
+            lifecycle.updated_at = now
+            _managed_attempt_event(
+                db,
+                lifecycle,
+                f"managed-attempt-parent-cancelled:{assignment.id}",
+                "failed",
+                reason_code=lifecycle.reason_code,
+            )
     return len(assignments)
 
 
@@ -13374,6 +14181,7 @@ def queue_workflow_input_for_provider(
 ) -> bool:
     """Retain an unsent direct input in the existing workflow-turn queue."""
     _ensure_workflow_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         if not _workspace_accepts_new_work(db, root_terminal_id):
@@ -13386,27 +14194,46 @@ def queue_workflow_input_for_provider(
             or workflow.active_turn_id != logical_turn_id
         ):
             return False
-        changed = (
-            db.query(WorkflowTurnModel)
-            .filter(
-                WorkflowTurnModel.id == logical_turn_id,
-                WorkflowTurnModel.workflow_id == workflow.id,
-                WorkflowTurnModel.state == TURN_SENT,
+        turn = db.get(WorkflowTurnModel, logical_turn_id)
+        if turn is None or turn.workflow_id != workflow.id or turn.state != TURN_SENT:
+            db.rollback()
+            return False
+        now = datetime.now()
+        lifecycle = _managed_attempt_for_turn(db, root_terminal_id, logical_turn_id)
+        if lifecycle is not None:
+            turn.payload = payload
+            turn.provider_outcome_cursor = None
+            turn.provider_outcome_cursor_bootstrap_generation = None
+            resulting = _schedule_managed_attempt_recovery_in_transaction(
+                db,
+                lifecycle,
+                turn,
+                reason_code or "MANAGED_ATTEMPT_INITIAL_DELIVERY_FAILED",
+                now,
             )
-            .update(
-                {
-                    WorkflowTurnModel.payload: payload,
-                    WorkflowTurnModel.state: TURN_QUEUED,
-                    WorkflowTurnModel.queue_reason: reason_code,
-                    WorkflowTurnModel.claim_token: None,
-                    WorkflowTurnModel.claim_expires_at: None,
-                    WorkflowTurnModel.provider_outcome_cursor: None,
-                    WorkflowTurnModel.provider_outcome_cursor_bootstrap_generation: None,
-                    WorkflowTurnModel.updated_at: datetime.now(),
-                },
-                synchronize_session=False,
+            changed = int(resulting in {"recovery_scheduled", "fence_pending"})
+        else:
+            changed = (
+                db.query(WorkflowTurnModel)
+                .filter(
+                    WorkflowTurnModel.id == logical_turn_id,
+                    WorkflowTurnModel.workflow_id == workflow.id,
+                    WorkflowTurnModel.state == TURN_SENT,
+                )
+                .update(
+                    {
+                        WorkflowTurnModel.payload: payload,
+                        WorkflowTurnModel.state: TURN_QUEUED,
+                        WorkflowTurnModel.queue_reason: reason_code,
+                        WorkflowTurnModel.claim_token: None,
+                        WorkflowTurnModel.claim_expires_at: None,
+                        WorkflowTurnModel.provider_outcome_cursor: None,
+                        WorkflowTurnModel.provider_outcome_cursor_bootstrap_generation: None,
+                        WorkflowTurnModel.updated_at: now,
+                    },
+                    synchronize_session=False,
+                )
             )
-        )
         db.commit()
         return changed == 1
 
@@ -14997,6 +15824,7 @@ def claim_or_resume_workflow_turn_receipt(
     """
     _ensure_workflow_schema()
     _ensure_provider_execution_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     now = now or datetime.now()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
@@ -15200,6 +16028,9 @@ def claim_or_resume_workflow_turn_receipt(
         if execution_conflict is not None:
             db.rollback()
             return {"accepted": False, "reason": execution_conflict}
+        _mark_managed_attempt_provider_admitted_in_transaction(
+            db, receiver_terminal_id, logical_turn_id, now
+        )
         next_resume_token, next_resume_nonce = _mint_workflow_execution_resume_token(
             db,
             receiver_terminal_id,
@@ -18103,6 +18934,7 @@ def claim_workflow_turn(
     bypassing the other's claim and acknowledgement boundaries.
     """
     _ensure_workflow_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     now = now or datetime.now()
     with SessionLocal() as db:
         workflow = _open_workflow(db, root_terminal_id, create=False)
@@ -18157,6 +18989,26 @@ def claim_workflow_turn(
             turn = query.order_by(WorkflowTurnModel.id.asc()).first()
         if turn is None:
             return None
+        lifecycle = _managed_attempt_for_turn(db, root_terminal_id, int(turn.id))
+        if lifecycle is not None:
+            assignment = db.get(ChildAssignmentModel, lifecycle.assignment_id)
+            if (
+                assignment is None
+                or assignment.status
+                in {ChildAssignmentStatus.CANCELLED.value, ChildAssignmentStatus.FENCED.value}
+                or lifecycle.state
+                in _MANAGED_ATTEMPT_TERMINAL_STATES | {"fence_claimed", "fence_pending"}
+            ):
+                turn.state = TURN_CANCELLED
+                turn.queue_reason = lifecycle.reason_code or "MANAGED_ATTEMPT_NOT_EXECUTABLE"
+                turn.claim_token = None
+                turn.claim_expires_at = None
+                turn.updated_at = now
+                workflow.status = WORKFLOW_CANCELLED
+                workflow.terminal_reason = turn.queue_reason
+                workflow.updated_at = now
+                db.commit()
+                return None
         # Do not rely on the ORM identity-map assignment as a claim. Two
         # reconciler threads can read the same QUEUED row; the compare-and-set
         # update makes exactly one of them its transport owner.
@@ -18430,6 +19282,7 @@ def requeue_workflow_turn(
     stranding it beneath an owner gate.
     """
     _ensure_workflow_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     now = now or datetime.now()
     with SessionLocal() as db:
         turn = db.query(WorkflowTurnModel).filter(WorkflowTurnModel.id == turn_id).first()
@@ -18438,6 +19291,19 @@ def requeue_workflow_turn(
         workflow = db.query(WorkflowModel).filter(WorkflowModel.id == turn.workflow_id).first()
         if workflow is None or workflow.status != WORKFLOW_OPEN:
             return False
+        lifecycle = _managed_attempt_for_turn(
+            db, cast(str, workflow.root_terminal_id), int(turn.id)
+        )
+        if lifecycle is not None and lifecycle.provider_admitted_at is None:
+            resulting = _schedule_managed_attempt_recovery_in_transaction(
+                db,
+                lifecycle,
+                turn,
+                admission_reason_code or "MANAGED_ATTEMPT_PROVIDER_TRANSPORT_FAILED",
+                now,
+            )
+            db.commit()
+            return resulting in {"recovery_scheduled", "fence_pending"}
         values: Dict[Any, Any] = {
             WorkflowTurnModel.claim_token: None,
             WorkflowTurnModel.claim_expires_at: None,
@@ -22631,6 +23497,19 @@ def _finalize_managed_delegation_result(
             _terminalize_child_after_authoritative_result(
                 db, assignment.child_terminal_id, "repaired authoritative delegated result"
             )
+            lifecycle = db.get(ManagedAttemptLifecycleModel, assignment.id)
+            if lifecycle is not None and lifecycle.state not in {"fenced", "completed"}:
+                now = datetime.now()
+                lifecycle.state = "completed"
+                lifecycle.completed_at = now
+                lifecycle.reason_code = None
+                lifecycle.updated_at = now
+                _managed_attempt_event(
+                    db,
+                    lifecycle,
+                    f"managed-attempt-completed:{assignment.id}",
+                    "completed",
+                )
         return (
             _inbox_model_to_message(inbox) if inbox is not None else None,
             True,
@@ -22653,6 +23532,22 @@ def _finalize_managed_delegation_result(
         db, assignment.child_terminal_id, "authoritative delegated result accepted"
     ):
         return None, False, "CHILD_WORKFLOW_NOT_ELIGIBLE"
+
+    lifecycle = db.get(ManagedAttemptLifecycleModel, assignment.id)
+    if lifecycle is not None and lifecycle.state not in {"fenced", "completed"}:
+        now = datetime.now()
+        lifecycle.state = "completed"
+        lifecycle.completed_at = now
+        lifecycle.reason_code = None
+        lifecycle.recovery_next_retry_at = None
+        lifecycle.recovery_deadline_at = None
+        lifecycle.updated_at = now
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"managed-attempt-completed:{assignment.id}",
+            "completed",
+        )
 
     parent_workflow = _open_workflow(db, assignment.parent_terminal_id, create=False)
     if parent_workflow is None or parent_workflow.status != WORKFLOW_OPEN:
@@ -23126,10 +24021,12 @@ def _register_child_attempt(
     request_message: Optional[str] = None,
     require_existing_reviewer_attempt: bool = False,
     requested_review_revision: Optional[str] = None,
+    replaces_assignment_id: Optional[int] = None,
 ) -> bool:
     """Persist one immutable callback attempt and its exact review subject."""
     _ensure_child_assignment_schema()
     _ensure_delegation_result_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
@@ -23163,6 +24060,25 @@ def _register_child_attempt(
             workflow_turn_id,
             workflow_effect_id,
         )
+        replaced_assignment = None
+        replaced_lifecycle = None
+        if replaces_assignment_id is not None:
+            if delegation_kind != "handoff" or effect is None:
+                db.rollback()
+                return False
+            replaced_assignment = db.get(ChildAssignmentModel, replaces_assignment_id)
+            replaced_lifecycle = db.get(ManagedAttemptLifecycleModel, replaces_assignment_id)
+            if (
+                replaced_assignment is None
+                or replaced_lifecycle is None
+                or replaced_assignment.parent_terminal_id != parent_terminal_id
+                or replaced_assignment.status != ChildAssignmentStatus.FENCED.value
+                or replaced_lifecycle.state != "fenced"
+                or replaced_lifecycle.replacement_assignment_id is not None
+                or replaced_lifecycle.replacement_effect_id is not None
+            ):
+                db.rollback()
+                return False
         child = db.query(TerminalModel).filter_by(id=child_terminal_id).first()
         prior = _latest_child_assignment(db, child_terminal_id)
         reused_review_child = False
@@ -23298,6 +24214,42 @@ def _register_child_attempt(
                         notice.status = MessageStatus.SUPERSEDED.value
         db.add(assignment)
         db.flush()
+        lifecycle = ManagedAttemptLifecycleModel(
+            assignment_id=assignment.id,
+            attempt_id=assignment.attempt_id,
+            parent_terminal_id=parent_terminal_id,
+            child_terminal_id=child_terminal_id,
+            request_workflow_effect_id=assignment.request_workflow_effect_id,
+            state="assignment_created",
+            expected_runtime_generation=(child.runtime_generation if child else None),
+            expected_writer_authority_generation=(
+                child.writer_authority_generation if child else None
+            ),
+            created_at=assignment.created_at or datetime.now(),
+            updated_at=datetime.now(),
+        )
+        db.add(lifecycle)
+        db.flush()
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"managed-attempt-created:{assignment.id}",
+            "assignment_created",
+        )
+        if replaced_lifecycle is not None and effect is not None:
+            replaced_lifecycle.replacement_assignment_id = assignment.id
+            replaced_lifecycle.replacement_effect_id = effect.id
+            replaced_lifecycle.updated_at = datetime.now()
+            _managed_attempt_event(
+                db,
+                replaced_lifecycle,
+                f"managed-attempt-replaced:{replaced_lifecycle.assignment_id}",
+                "replacement_created",
+                detail={
+                    "replacement_assignment_id": assignment.id,
+                    "replacement_effect_id": effect.id,
+                },
+            )
         _create_result_for_assignment(db, assignment, delegation_kind, workflow)
         if not _retirement_quiescence_allows_commit(db, parent_terminal_id):
             db.rollback()
@@ -23374,6 +24326,7 @@ def register_handoff_child(
     workflow_turn_id: Optional[int] = None,
     workflow_effect_id: Optional[int] = None,
     request_message: Optional[str] = None,
+    replaces_assignment_id: Optional[int] = None,
 ) -> bool:
     """Persist a blocking handoff before its task can produce a result.
 
@@ -23387,6 +24340,7 @@ def register_handoff_child(
         workflow_turn_id=workflow_turn_id,
         workflow_effect_id=workflow_effect_id,
         request_message=request_message,
+        replaces_assignment_id=replaces_assignment_id,
     )
 
 
@@ -23399,6 +24353,7 @@ def bind_child_assignment_input_turn(child_terminal_id: str, transport_binding: 
     later review request.
     """
     _ensure_child_assignment_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
@@ -23427,6 +24382,23 @@ def bind_child_assignment_input_turn(child_terminal_id: str, transport_binding: 
                 and int(assignment.child_workflow_id) == int(turn.workflow_id)
                 and int(assignment.child_workflow_turn_id) == int(turn.id)
             )
+            lifecycle = db.get(ManagedAttemptLifecycleModel, assignment.id)
+            if matches and lifecycle is not None and lifecycle.child_workflow_turn_id is None:
+                now = datetime.now()
+                lifecycle.child_workflow_id = turn.workflow_id
+                lifecycle.child_workflow_turn_id = turn.id
+                lifecycle.state = "prompt_delivery_scheduled"
+                lifecycle.prompt_delivery_scheduled_at = now
+                lifecycle.recovery_deadline_at = now + timedelta(seconds=30)
+                lifecycle.updated_at = now
+                _managed_attempt_event(
+                    db,
+                    lifecycle,
+                    f"prompt-delivery-scheduled:{assignment.id}:{turn.id}",
+                    "prompt_delivery_scheduled",
+                )
+                db.commit()
+                return True
             db.rollback()
             return matches
         changed = (
@@ -23448,8 +24420,856 @@ def bind_child_assignment_input_turn(child_terminal_id: str, transport_binding: 
         if changed != 1:
             db.rollback()
             return False
+        lifecycle = db.get(ManagedAttemptLifecycleModel, assignment.id)
+        if lifecycle is None:
+            db.rollback()
+            return False
+        now = datetime.now()
+        lifecycle.child_workflow_id = turn.workflow_id
+        lifecycle.child_workflow_turn_id = turn.id
+        lifecycle.state = "prompt_delivery_scheduled"
+        lifecycle.prompt_delivery_scheduled_at = now
+        lifecycle.recovery_deadline_at = now + timedelta(seconds=30)
+        lifecycle.updated_at = now
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"prompt-delivery-scheduled:{assignment.id}:{turn.id}",
+            "prompt_delivery_scheduled",
+        )
         db.commit()
         return True
+
+
+_MANAGED_ATTEMPT_RECOVERY_DELAY_SECONDS = 2
+_MANAGED_ATTEMPT_ADMISSION_DEADLINE_SECONDS = 30
+_MANAGED_ATTEMPT_TERMINAL_STATES = {"fenced", "failed", "completed"}
+
+
+def _managed_attempt_for_turn(
+    db: Any, child_terminal_id: str, workflow_turn_id: int
+) -> Optional[ManagedAttemptLifecycleModel]:
+    return (
+        db.query(ManagedAttemptLifecycleModel)
+        .filter(
+            ManagedAttemptLifecycleModel.child_terminal_id == child_terminal_id,
+            ManagedAttemptLifecycleModel.child_workflow_turn_id == workflow_turn_id,
+        )
+        .one_or_none()
+    )
+
+
+def _managed_attempt_dict(lifecycle: ManagedAttemptLifecycleModel) -> Dict[str, Any]:
+    return {
+        "assignment_id": int(lifecycle.assignment_id),
+        "attempt_id": str(lifecycle.attempt_id),
+        "parent_terminal_id": str(lifecycle.parent_terminal_id),
+        "child_terminal_id": str(lifecycle.child_terminal_id),
+        "request_workflow_effect_id": lifecycle.request_workflow_effect_id,
+        "child_workflow_id": lifecycle.child_workflow_id,
+        "child_workflow_turn_id": lifecycle.child_workflow_turn_id,
+        "state": str(lifecycle.state),
+        "reason_code": lifecycle.reason_code,
+        "delivery_attempt_count": int(lifecycle.delivery_attempt_count),
+        "recovery_attempt_count": int(lifecycle.recovery_attempt_count),
+        "prompt_delivery_scheduled_at": lifecycle.prompt_delivery_scheduled_at,
+        "prompt_delivery_acknowledged_at": lifecycle.prompt_delivery_acknowledged_at,
+        "provider_admitted_at": lifecycle.provider_admitted_at,
+        "provider_running_at": lifecycle.provider_running_at,
+        "waiting_result_at": lifecycle.waiting_result_at,
+        "recovery_scheduled_at": lifecycle.recovery_scheduled_at,
+        "recovery_next_retry_at": lifecycle.recovery_next_retry_at,
+        "recovery_deadline_at": lifecycle.recovery_deadline_at,
+        "fence_claimed_at": lifecycle.fence_claimed_at,
+        "fenced_at": lifecycle.fenced_at,
+        "failed_at": lifecycle.failed_at,
+        "completed_at": lifecycle.completed_at,
+        "expected_runtime_generation": lifecycle.expected_runtime_generation,
+        "expected_writer_authority_generation": (lifecycle.expected_writer_authority_generation),
+        "parent_wake_message_id": lifecycle.parent_wake_message_id,
+        "replacement_assignment_id": lifecycle.replacement_assignment_id,
+        "replacement_effect_id": lifecycle.replacement_effect_id,
+        "created_at": lifecycle.created_at,
+        "updated_at": lifecycle.updated_at,
+    }
+
+
+def get_managed_attempt_lifecycle(
+    *,
+    assignment_id: Optional[int] = None,
+    child_terminal_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return the non-secret lifecycle projection for one exact attempt."""
+    if assignment_id is None and not child_terminal_id:
+        raise ValueError("assignment_id or child_terminal_id is required")
+    _ensure_managed_attempt_lifecycle_schema()
+    with SessionLocal() as db:
+        query = db.query(ManagedAttemptLifecycleModel)
+        if assignment_id is not None:
+            query = query.filter(ManagedAttemptLifecycleModel.assignment_id == assignment_id)
+        if child_terminal_id:
+            query = query.filter(
+                ManagedAttemptLifecycleModel.child_terminal_id == child_terminal_id
+            )
+        lifecycle = query.order_by(ManagedAttemptLifecycleModel.assignment_id.desc()).first()
+        return _managed_attempt_dict(lifecycle) if lifecycle is not None else None
+
+
+def mark_managed_attempt_prompt_delivered(
+    child_terminal_id: str, workflow_turn_id: int, now: Optional[datetime] = None
+) -> bool:
+    """Durably acknowledge that the exact prompt crossed provider transport."""
+    _ensure_managed_attempt_lifecycle_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        lifecycle = _managed_attempt_for_turn(db, child_terminal_id, workflow_turn_id)
+        if lifecycle is None or lifecycle.state in _MANAGED_ATTEMPT_TERMINAL_STATES | {
+            "fence_claimed"
+        }:
+            db.rollback()
+            return False
+        if lifecycle.prompt_delivery_acknowledged_at is None:
+            lifecycle.prompt_delivery_acknowledged_at = now
+            lifecycle.delivery_attempt_count = int(lifecycle.delivery_attempt_count) + 1
+        lifecycle.state = "prompt_delivery_acknowledged"
+        lifecycle.reason_code = None
+        lifecycle.recovery_next_retry_at = None
+        lifecycle.recovery_deadline_at = now + timedelta(
+            seconds=_MANAGED_ATTEMPT_ADMISSION_DEADLINE_SECONDS
+        )
+        lifecycle.updated_at = now
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"prompt-delivery-acknowledged:{lifecycle.assignment_id}:"
+            f"{lifecycle.delivery_attempt_count}",
+            "prompt_delivery_acknowledged",
+        )
+        db.commit()
+        return True
+
+
+def _mark_managed_attempt_provider_admitted_in_transaction(
+    db: Any, child_terminal_id: str, workflow_turn_id: int, now: datetime
+) -> None:
+    lifecycle = _managed_attempt_for_turn(db, child_terminal_id, workflow_turn_id)
+    if lifecycle is None or lifecycle.state in _MANAGED_ATTEMPT_TERMINAL_STATES | {"fence_claimed"}:
+        return
+    if lifecycle.provider_admitted_at is None:
+        lifecycle.provider_admitted_at = now
+    lifecycle.state = "provider_admitted"
+    lifecycle.reason_code = None
+    lifecycle.recovery_next_retry_at = None
+    lifecycle.recovery_deadline_at = None
+    lifecycle.updated_at = now
+    _managed_attempt_event(
+        db,
+        lifecycle,
+        f"provider-admitted:{lifecycle.assignment_id}:{workflow_turn_id}",
+        "provider_admitted",
+    )
+
+
+def observe_managed_attempt_provider_state(
+    child_terminal_id: str,
+    state: str,
+    *,
+    workflow_turn_id: Optional[int] = None,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Record running/waiting-result truth without manufacturing admission."""
+    if state not in {"provider_running", "waiting_for_result"}:
+        raise ValueError("managed attempt provider state is invalid")
+    _ensure_managed_attempt_lifecycle_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        query = db.query(ManagedAttemptLifecycleModel).filter(
+            ManagedAttemptLifecycleModel.child_terminal_id == child_terminal_id
+        )
+        if workflow_turn_id is not None:
+            query = query.filter(
+                ManagedAttemptLifecycleModel.child_workflow_turn_id == workflow_turn_id
+            )
+        lifecycle = query.order_by(ManagedAttemptLifecycleModel.assignment_id.desc()).first()
+        if (
+            lifecycle is None
+            or lifecycle.provider_admitted_at is None
+            or lifecycle.state in _MANAGED_ATTEMPT_TERMINAL_STATES | {"fence_claimed"}
+        ):
+            return False
+        if state == "provider_running":
+            lifecycle.provider_running_at = lifecycle.provider_running_at or now
+        else:
+            lifecycle.waiting_result_at = lifecycle.waiting_result_at or now
+        lifecycle.state = state
+        lifecycle.updated_at = now
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"{state}:{lifecycle.assignment_id}:{lifecycle.child_workflow_turn_id}",
+            state,
+        )
+        db.commit()
+        return True
+
+
+def _schedule_managed_attempt_recovery_in_transaction(
+    db: Any,
+    lifecycle: ManagedAttemptLifecycleModel,
+    turn: WorkflowTurnModel,
+    reason_code: str,
+    now: datetime,
+) -> str:
+    """Purchase the single same-child retry or make its failure explicit."""
+    if lifecycle.state in _MANAGED_ATTEMPT_TERMINAL_STATES | {"fence_claimed"}:
+        return lifecycle.state
+    if lifecycle.provider_admitted_at is not None:
+        return lifecycle.state
+    if int(lifecycle.recovery_attempt_count) == 0:
+        lifecycle.recovery_attempt_count = 1
+        lifecycle.state = "recovery_scheduled"
+        lifecycle.reason_code = reason_code
+        # This timestamp describes acknowledgement of the *current* scheduled
+        # delivery. Historical acknowledgements remain in the event ledger.
+        lifecycle.prompt_delivery_acknowledged_at = None
+        lifecycle.recovery_scheduled_at = now
+        lifecycle.recovery_next_retry_at = now + timedelta(
+            seconds=_MANAGED_ATTEMPT_RECOVERY_DELAY_SECONDS
+        )
+        lifecycle.recovery_deadline_at = now + timedelta(
+            seconds=_MANAGED_ATTEMPT_ADMISSION_DEADLINE_SECONDS
+        )
+        turn.state = TURN_QUEUED
+        turn.queue_reason = "MANAGED_ATTEMPT_RECOVERY_SCHEDULED"
+        turn.not_before = lifecycle.recovery_next_retry_at
+        turn.claim_token = None
+        turn.claim_expires_at = None
+        turn.updated_at = now
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"same-child-recovery:{lifecycle.assignment_id}:1",
+            "recovery_scheduled",
+            reason_code=reason_code,
+            detail={"attempt": 1},
+        )
+    else:
+        lifecycle.state = "fence_pending"
+        lifecycle.reason_code = reason_code
+        lifecycle.failed_at = now
+        lifecycle.recovery_next_retry_at = None
+        lifecycle.recovery_deadline_at = None
+        turn.state = TURN_CANCELLED
+        turn.queue_reason = reason_code
+        turn.not_before = None
+        turn.claim_token = None
+        turn.claim_expires_at = None
+        turn.updated_at = now
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"managed-attempt-recovery-failed:{lifecycle.assignment_id}",
+            "recovery_failed",
+            reason_code=reason_code,
+        )
+    lifecycle.updated_at = now
+    return lifecycle.state
+
+
+def reconcile_managed_attempt_timeouts(now: Optional[datetime] = None) -> Dict[str, int]:
+    """Bound absent admission to one same-child retry and then explicit fencing."""
+    _ensure_managed_attempt_lifecycle_schema()
+    _ensure_provider_execution_schema()
+    now = now or datetime.now()
+    scheduled = 0
+    fence_pending = 0
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        candidates = (
+            db.query(ManagedAttemptLifecycleModel)
+            .filter(
+                ManagedAttemptLifecycleModel.state.in_(
+                    (
+                        "prompt_delivery_scheduled",
+                        "prompt_delivery_acknowledged",
+                        "recovery_scheduled",
+                    )
+                ),
+                ManagedAttemptLifecycleModel.provider_admitted_at.is_(None),
+                ManagedAttemptLifecycleModel.recovery_deadline_at.is_not(None),
+                ManagedAttemptLifecycleModel.recovery_deadline_at <= now,
+            )
+            .all()
+        )
+        for lifecycle in candidates:
+            assignment = db.get(ChildAssignmentModel, lifecycle.assignment_id)
+            parent_workflow = _open_workflow(db, lifecycle.parent_terminal_id, create=False)
+            turn = (
+                db.get(WorkflowTurnModel, lifecycle.child_workflow_turn_id)
+                if lifecycle.child_workflow_turn_id is not None
+                else None
+            )
+            if assignment is not None and (
+                assignment.status not in _active_child_assignment_statuses()
+                or parent_workflow is None
+                or parent_workflow.status != WORKFLOW_OPEN
+            ):
+                lifecycle.state = "failed"
+                if assignment.status not in _active_child_assignment_statuses():
+                    lifecycle.reason_code = (
+                        f"MANAGED_ATTEMPT_ASSIGNMENT_{str(assignment.status).upper()}"
+                    )
+                elif parent_workflow is None:
+                    lifecycle.reason_code = "PARENT_WORKFLOW_NOT_OPEN"
+                else:
+                    lifecycle.reason_code = f"PARENT_WORKFLOW_{str(parent_workflow.status).upper()}"
+                lifecycle.failed_at = lifecycle.failed_at or now
+                lifecycle.recovery_next_retry_at = None
+                lifecycle.recovery_deadline_at = None
+                lifecycle.updated_at = now
+                if turn is not None and turn.state in (TURN_QUEUED, TURN_CLAIMED):
+                    turn.state = TURN_CANCELLED
+                    turn.queue_reason = lifecycle.reason_code
+                    turn.not_before = None
+                    turn.claim_token = None
+                    turn.claim_expires_at = None
+                    turn.updated_at = now
+                _managed_attempt_event(
+                    db,
+                    lifecycle,
+                    f"managed-attempt-parent-not-open:{lifecycle.assignment_id}",
+                    "failed",
+                    reason_code=lifecycle.reason_code,
+                )
+                continue
+            if assignment is None or turn is None:
+                lifecycle.state = "fence_pending"
+                lifecycle.reason_code = "MANAGED_ATTEMPT_AUTHORITY_MISSING"
+                lifecycle.failed_at = now
+                lifecycle.updated_at = now
+                fence_pending += 1
+                continue
+            lease = db.get(ProviderExecutionLeaseModel, lifecycle.child_terminal_id)
+            if lease is not None and lease.workflow_turn_id == turn.id:
+                db.delete(lease)
+            resulting = _schedule_managed_attempt_recovery_in_transaction(
+                db,
+                lifecycle,
+                turn,
+                "PROVIDER_TURN_NOT_ADMITTED_BEFORE_DEADLINE",
+                now,
+            )
+            if resulting == "recovery_scheduled":
+                scheduled += 1
+            elif resulting == "fence_pending":
+                fence_pending += 1
+        if candidates:
+            db.commit()
+        else:
+            db.rollback()
+    return {"recovery_scheduled": scheduled, "fence_pending": fence_pending}
+
+
+class ManagedAttemptFenceError(RuntimeError):
+    """Stable machine-readable rejection from exact managed-attempt fencing."""
+
+    def __init__(self, reason_code: str):
+        self.reason_code = reason_code
+        super().__init__(reason_code)
+
+
+def managed_attempt_fence_identity_matches(
+    lifecycle: Mapping[str, Any],
+    *,
+    assignment_id: int,
+    attempt_id: str,
+    parent_terminal_id: str,
+    child_terminal_id: str,
+    request_workflow_effect_id: int,
+    child_workflow_turn_id: int,
+    reason_code: str,
+    expected_runtime_generation: str,
+    expected_writer_authority_generation: str,
+) -> bool:
+    """Compare every immutable field required for an exact fence replay."""
+    return bool(
+        lifecycle.get("assignment_id") == assignment_id
+        and lifecycle.get("attempt_id") == attempt_id
+        and lifecycle.get("parent_terminal_id") == parent_terminal_id
+        and lifecycle.get("child_terminal_id") == child_terminal_id
+        and lifecycle.get("request_workflow_effect_id") == request_workflow_effect_id
+        and lifecycle.get("child_workflow_turn_id") == child_workflow_turn_id
+        and lifecycle.get("reason_code") == reason_code
+        and lifecycle.get("expected_runtime_generation") == expected_runtime_generation
+        and lifecycle.get("expected_writer_authority_generation")
+        == expected_writer_authority_generation
+    )
+
+
+def _critical_owner_recovery_scope_matches_in_transaction(
+    db: Any,
+    caller_terminal_id: str,
+    parent_terminal_id: str,
+    *,
+    reason_code: Optional[str] = None,
+) -> bool:
+    """Bind cross-terminal owner recovery to one gated parent and project grant.
+
+    An owner-executor may always fence its own exact child relation.  Crossing
+    a terminal boundary additionally requires the target parent to be at a
+    genuine owner gate whose reason matches the requested fence.  The consumed
+    owner grant must name the same canonical project authority, so an owner in
+    another project or an ordinary privileged-looking terminal cannot inspect
+    or mutate this attempt.
+    """
+    caller = db.get(TerminalModel, caller_terminal_id)
+    parent = db.get(TerminalModel, parent_terminal_id)
+    grant = (
+        db.get(OwnerLaunchGrantModel, caller.owner_grant_id)
+        if caller is not None and caller.owner_grant_id
+        else None
+    )
+    if (
+        caller is None
+        or parent is None
+        or grant is None
+        or caller.agent_profile != "critical_sol_xhigh_owner"
+        or grant.agent_profile != caller.agent_profile
+        or grant.provider != caller.provider
+        or grant.consumed_terminal_id != caller_terminal_id
+        or grant.consumed_at is None
+        or not caller.project_id
+        or caller.project_id != parent.project_id
+        or not caller.profile_revision_id
+        or not caller.provider_config_revision_id
+    ):
+        return False
+    try:
+        scope = json.loads(str(grant.scope_json or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    canonical_parent = parent.managed_worktree_source or parent.project_path
+    if (
+        not isinstance(scope, dict)
+        or scope.get("project_id") != parent.project_id
+        or grant.canonical_worktree != canonical_parent
+        or scope.get("profile_revision_id") != caller.profile_revision_id
+        or scope.get("provider_config_revision_id") != caller.provider_config_revision_id
+    ):
+        return False
+    if caller_terminal_id == parent_terminal_id:
+        return True
+    parent_workflow = _open_workflow(db, parent_terminal_id, create=False)
+    if parent_workflow is None or parent_workflow.status != WORKFLOW_OWNER_GATE:
+        return False
+    if reason_code is None:
+        return True
+    parent_reason = str(parent_workflow.terminal_reason or "")
+    return parent_reason == reason_code or parent_reason.startswith(reason_code + ":")
+
+
+def managed_attempt_fence_caller_is_authorized(
+    caller_terminal_id: str,
+    *,
+    assignment_id: int,
+    parent_terminal_id: str,
+    reason_code: str,
+) -> bool:
+    """Preflight the exact owner/parent scope; the claim repeats it atomically."""
+    _ensure_managed_attempt_lifecycle_schema()
+    with SessionLocal() as db:
+        assignment = db.get(ChildAssignmentModel, assignment_id)
+        lifecycle = db.get(ManagedAttemptLifecycleModel, assignment_id)
+        return bool(
+            assignment is not None
+            and lifecycle is not None
+            and assignment.parent_terminal_id == parent_terminal_id
+            and lifecycle.parent_terminal_id == parent_terminal_id
+            and _critical_owner_recovery_scope_matches_in_transaction(
+                db,
+                caller_terminal_id,
+                parent_terminal_id,
+                reason_code=reason_code,
+            )
+        )
+
+
+def managed_attempt_lifecycle_caller_is_authorized(
+    caller_terminal_id: str, assignment_id: int
+) -> bool:
+    """Allow lifecycle reads only to the relation or its scoped recovery owner."""
+    _ensure_managed_attempt_lifecycle_schema()
+    with SessionLocal() as db:
+        lifecycle = db.get(ManagedAttemptLifecycleModel, assignment_id)
+        if lifecycle is None:
+            return False
+        if caller_terminal_id in {
+            lifecycle.parent_terminal_id,
+            lifecycle.child_terminal_id,
+        }:
+            return True
+        return _critical_owner_recovery_scope_matches_in_transaction(
+            db,
+            caller_terminal_id,
+            str(lifecycle.parent_terminal_id),
+        )
+
+
+def claim_managed_attempt_fence(
+    *,
+    caller_terminal_id: Optional[str] = None,
+    assignment_id: int,
+    attempt_id: str,
+    parent_terminal_id: str,
+    child_terminal_id: str,
+    request_workflow_effect_id: int,
+    child_workflow_turn_id: int,
+    reason_code: str,
+    expected_runtime_generation: str,
+    expected_writer_authority_generation: str,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Atomically fence all logical authority and reserve exact runtime retirement."""
+    if not re.fullmatch(r"[A-Z0-9_]{3,128}", reason_code or ""):
+        raise ManagedAttemptFenceError("MANAGED_ATTEMPT_FENCE_REASON_INVALID")
+    _ensure_managed_attempt_lifecycle_schema()
+    _ensure_delegation_result_schema()
+    _ensure_workflow_schema()
+    _ensure_provider_execution_schema()
+    _ensure_terminal_worktree_authority_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        assignment = db.get(ChildAssignmentModel, assignment_id)
+        lifecycle = db.get(ManagedAttemptLifecycleModel, assignment_id)
+        terminal = db.get(TerminalModel, child_terminal_id)
+        identity_matches = bool(
+            assignment is not None
+            and lifecycle is not None
+            and terminal is not None
+            and assignment.attempt_id == attempt_id
+            and lifecycle.attempt_id == attempt_id
+            and assignment.parent_terminal_id == parent_terminal_id
+            and lifecycle.parent_terminal_id == parent_terminal_id
+            and assignment.child_terminal_id == child_terminal_id
+            and lifecycle.child_terminal_id == child_terminal_id
+            and assignment.request_workflow_effect_id == request_workflow_effect_id
+            and lifecycle.request_workflow_effect_id == request_workflow_effect_id
+            and assignment.child_workflow_id == lifecycle.child_workflow_id
+            and lifecycle.child_workflow_turn_id == child_workflow_turn_id
+            and terminal.runtime_generation == expected_runtime_generation
+            and terminal.writer_authority_generation == expected_writer_authority_generation
+            and isinstance(terminal.launch_worktree, str)
+            and bool(terminal.launch_worktree)
+            and lifecycle.expected_runtime_generation == expected_runtime_generation
+            and lifecycle.expected_writer_authority_generation
+            == expected_writer_authority_generation
+        )
+        if not identity_matches:
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_IDENTITY_MISMATCH")
+        assert assignment is not None and lifecycle is not None and terminal is not None
+        if caller_terminal_id is not None:
+            caller_authorized = _critical_owner_recovery_scope_matches_in_transaction(
+                db,
+                caller_terminal_id,
+                parent_terminal_id,
+                reason_code=reason_code,
+            )
+        else:
+            parent_workflow = _open_workflow(db, parent_terminal_id, create=False)
+            caller_authorized = bool(
+                lifecycle.state == "fence_claimed"
+                or (
+                    lifecycle.state == "fence_pending"
+                    and assignment.status in _active_child_assignment_statuses()
+                    and parent_workflow is not None
+                    and parent_workflow.status == WORKFLOW_OPEN
+                )
+            )
+        if not caller_authorized:
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_FENCE_CALLER_SCOPE_MISMATCH")
+        if lifecycle.state == "fenced":
+            result = _managed_attempt_dict(lifecycle)
+            result.update({"accepted": True, "duplicate": True})
+            db.rollback()
+            return result
+        if lifecycle.state == "completed":
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_ALREADY_COMPLETED")
+        if terminal.runtime_operation_kind not in {None, "managed_attempt_fence"}:
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_RUNTIME_OPERATION_CONFLICT")
+        if (
+            terminal.runtime_operation_kind == "managed_attempt_fence"
+            and lifecycle.fence_claim_token
+            and terminal.runtime_operation_token != lifecycle.fence_claim_token
+        ):
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_FENCE_CLAIM_CONFLICT")
+        writer = db.get(WorktreeWriterLeaseModel, terminal.launch_worktree)
+        if writer is not None and (
+            writer.terminal_id != child_terminal_id
+            or writer.authority_generation != expected_writer_authority_generation
+        ):
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_FOREIGN_WRITER_AUTHORITY")
+        provider_lease = db.get(ProviderExecutionLeaseModel, child_terminal_id)
+        if provider_lease is not None and provider_lease.workflow_turn_id != child_workflow_turn_id:
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_PROVIDER_AUTHORITY_CONFLICT")
+        claim_token = lifecycle.fence_claim_token or secrets.token_urlsafe(32)
+        lifecycle.fence_claim_token = claim_token
+        lifecycle.fence_claimed_at = lifecycle.fence_claimed_at or now
+        lifecycle.state = "fence_claimed"
+        lifecycle.reason_code = reason_code
+        lifecycle.failed_at = lifecycle.failed_at or now
+        lifecycle.recovery_next_retry_at = None
+        lifecycle.recovery_deadline_at = None
+        lifecycle.updated_at = now
+        assignment.status = ChildAssignmentStatus.FENCED.value
+        assignment.updated_at = now
+        # The logical CAS is the authority boundary. Revoke the exact writer
+        # here, before attempting non-transactional provider retirement, so a
+        # crash can never leave the orphan advertised as a writable owner.
+        if writer is not None:
+            db.delete(writer)
+        terminal.write_enabled = False
+        terminal.runtime_operation_kind = "managed_attempt_fence"
+        terminal.runtime_operation_token = claim_token
+        terminal.runtime_operation_claimed_at = now
+        terminal.runtime_operation_expires_at = None
+        # Clear the child bearer at the same logical fence. A late callback can
+        # no longer authenticate even if the provider process has not exited.
+        terminal.auth_token_sha256 = None
+        if provider_lease is not None:
+            db.delete(provider_lease)
+        child_workflow = db.get(WorkflowModel, assignment.child_workflow_id)
+        if child_workflow is not None:
+            child_workflow.status = WORKFLOW_CANCELLED
+            child_workflow.terminal_reason = reason_code
+            child_workflow.updated_at = now
+            pending_child_inbox_ids = [
+                row[0]
+                for row in db.query(WorkflowTurnModel.inbox_message_id)
+                .filter(
+                    WorkflowTurnModel.workflow_id == child_workflow.id,
+                    WorkflowTurnModel.inbox_message_id.is_not(None),
+                    WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED, TURN_SENT)),
+                )
+                .all()
+            ]
+            db.query(WorkflowTurnModel).filter(
+                WorkflowTurnModel.workflow_id == child_workflow.id,
+                WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED, TURN_SENT)),
+            ).update(
+                {
+                    WorkflowTurnModel.state: TURN_CANCELLED,
+                    WorkflowTurnModel.queue_reason: reason_code,
+                    WorkflowTurnModel.claim_token: None,
+                    WorkflowTurnModel.claim_expires_at: None,
+                    WorkflowTurnModel.updated_at: now,
+                },
+                synchronize_session=False,
+            )
+            if pending_child_inbox_ids:
+                db.query(InboxModel).filter(
+                    InboxModel.id.in_(pending_child_inbox_ids),
+                    InboxModel.status == MessageStatus.PENDING.value,
+                ).update(
+                    {InboxModel.status: MessageStatus.FAILED.value},
+                    synchronize_session=False,
+                )
+        result_row = (
+            db.query(DelegationResultModel)
+            .filter_by(child_assignment_id=assignment.id)
+            .one_or_none()
+        )
+        if result_row is not None and result_row.status != DelegationResultStatus.COMPLETE.value:
+            result_row.status = DelegationResultStatus.INCOMPLETE.value
+            result_row.reason_code = reason_code
+            result_row.finalized_at = result_row.finalized_at or now
+            result_row.updated_at = now
+            _purge_staged_handoff_submission(db, result_row.id)
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"managed-attempt-fence-claimed:{assignment.id}",
+            "fence_claimed",
+            reason_code=reason_code,
+        )
+        db.commit()
+        return {
+            **_managed_attempt_dict(lifecycle),
+            "accepted": True,
+            "duplicate": False,
+            "fence_claim_token": claim_token,
+            "terminal": {
+                "id": child_terminal_id,
+                "tmux_session": terminal.tmux_session,
+                "tmux_window": terminal.tmux_window,
+                "runtime_pane_id": terminal.runtime_pane_id,
+                "runtime_pane_pid": terminal.runtime_pane_pid,
+                "runtime_generation": terminal.runtime_generation,
+                "runtime_generation_origin": terminal.runtime_generation_origin,
+                "runtime_process_start_ticks": terminal.runtime_process_start_ticks,
+                "runtime_process_group_id": terminal.runtime_process_group_id,
+                "runtime_process_session_id": terminal.runtime_process_session_id,
+                "provider": terminal.provider,
+            },
+        }
+
+
+def complete_managed_attempt_fence(
+    assignment_id: int,
+    claim_token: str,
+    *,
+    reason_code: str,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Publish physical retirement, revoke the exact writer, and wake once."""
+    _ensure_managed_attempt_lifecycle_schema()
+    _ensure_delegation_result_schema()
+    _ensure_workflow_schema()
+    _ensure_terminal_worktree_authority_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        lifecycle = db.get(ManagedAttemptLifecycleModel, assignment_id)
+        assignment = db.get(ChildAssignmentModel, assignment_id)
+        if lifecycle is None or assignment is None:
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_NOT_FOUND")
+        if lifecycle.state == "fenced":
+            result = _managed_attempt_dict(lifecycle)
+            result.update({"accepted": True, "duplicate": True})
+            db.rollback()
+            return result
+        terminal = db.get(TerminalModel, lifecycle.child_terminal_id)
+        if (
+            lifecycle.state != "fence_claimed"
+            or lifecycle.fence_claim_token != claim_token
+            or lifecycle.reason_code != reason_code
+            or terminal is None
+            or terminal.runtime_operation_kind != "managed_attempt_fence"
+            or terminal.runtime_operation_token != claim_token
+            or terminal.runtime_generation != lifecycle.expected_runtime_generation
+            or terminal.writer_authority_generation
+            != lifecycle.expected_writer_authority_generation
+        ):
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_FENCE_CLAIM_STALE")
+        writer = db.get(WorktreeWriterLeaseModel, terminal.launch_worktree)
+        if writer is not None:
+            if (
+                writer.terminal_id != lifecycle.child_terminal_id
+                or writer.authority_generation != lifecycle.expected_writer_authority_generation
+            ):
+                db.rollback()
+                raise ManagedAttemptFenceError("MANAGED_ATTEMPT_FOREIGN_WRITER_AUTHORITY")
+            # A matching row can only be a conservative rolling-upgrade
+            # remainder: normal fence claims revoke it atomically.
+            db.delete(writer)
+        terminal.runtime_lifecycle = "recovery_fenced"
+        terminal.recovery_fenced_at = now
+        terminal.recovery_fenced_reason = reason_code
+        terminal.write_enabled = False
+        terminal.runtime_operation_kind = None
+        terminal.runtime_operation_token = None
+        terminal.runtime_operation_claimed_at = None
+        terminal.runtime_operation_expires_at = None
+        lifecycle.state = "fenced"
+        lifecycle.fenced_at = lifecycle.fenced_at or now
+        lifecycle.updated_at = now
+        if lifecycle.parent_wake_message_id is None:
+            parent_workflow = _open_workflow(db, lifecycle.parent_terminal_id, create=False)
+            if parent_workflow is not None and parent_workflow.status == WORKFLOW_OPEN:
+                message = InboxModel(
+                    sender_id=lifecycle.child_terminal_id,
+                    receiver_id=lifecycle.parent_terminal_id,
+                    message=(
+                        "Managed child attempt failed explicitly. "
+                        f"assignment_id={assignment.id}; attempt_id={assignment.attempt_id}; "
+                        f"reason_code={reason_code}. The old attempt is fenced; one replacement "
+                        "may be created with replaces_assignment_id="
+                        f"{assignment.id}."
+                    ),
+                    status=MessageStatus.PENDING.value,
+                    kind="managed_attempt_failure",
+                    created_at=now,
+                )
+                db.add(message)
+                db.flush()
+                wake_turn = _materialize_pending_inbox_turn_in_transaction(
+                    db, message, parent_workflow, now
+                )
+                if parent_workflow.active_turn_id is None:
+                    parent_workflow.active_turn_id = wake_turn.id
+                lifecycle.parent_wake_message_id = message.id
+            else:
+                # Terminal/owner-gated parents are explicit execution fences.
+                # Physical orphan retirement may finish, but it must not mint
+                # a successor, wake the parent, or implicitly authorize a
+                # replacement. A later owner input can resume the parent and
+                # deliberately create the replacement from this fenced row.
+                _managed_attempt_event(
+                    db,
+                    lifecycle,
+                    f"managed-attempt-parent-wake-suppressed:{assignment.id}",
+                    "parent_wake_suppressed",
+                    reason_code=(
+                        "PARENT_WORKFLOW_NOT_OPEN"
+                        if parent_workflow is None
+                        else f"PARENT_WORKFLOW_{str(parent_workflow.status).upper()}"
+                    ),
+                )
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"managed-attempt-fenced:{assignment.id}",
+            "fenced",
+            reason_code=reason_code,
+            detail={"parent_wake_message_id": lifecycle.parent_wake_message_id},
+        )
+        db.commit()
+        return {**_managed_attempt_dict(lifecycle), "accepted": True, "duplicate": False}
+
+
+def list_managed_attempt_fence_candidates(limit: int = 20) -> List[Dict[str, Any]]:
+    """Return exact authority for pending or interrupted fencing sagas."""
+    if isinstance(limit, bool) or not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100")
+    _ensure_managed_attempt_lifecycle_schema()
+    with SessionLocal() as db:
+        rows = (
+            db.query(ManagedAttemptLifecycleModel)
+            .filter(ManagedAttemptLifecycleModel.state.in_(("fence_pending", "fence_claimed")))
+            .order_by(ManagedAttemptLifecycleModel.updated_at.asc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "assignment_id": int(row.assignment_id),
+                "attempt_id": str(row.attempt_id),
+                "parent_terminal_id": str(row.parent_terminal_id),
+                "child_terminal_id": str(row.child_terminal_id),
+                "request_workflow_effect_id": int(row.request_workflow_effect_id),
+                "child_workflow_turn_id": int(row.child_workflow_turn_id),
+                "reason_code": str(row.reason_code or "MANAGED_ATTEMPT_RECOVERY_FAILED"),
+                "expected_runtime_generation": str(row.expected_runtime_generation),
+                "expected_writer_authority_generation": str(
+                    row.expected_writer_authority_generation
+                ),
+            }
+            for row in rows
+            if row.request_workflow_effect_id is not None
+            and row.child_workflow_turn_id is not None
+            and row.expected_runtime_generation
+            and row.expected_writer_authority_generation
+        ]
 
 
 def _review_input_authority_in_transaction(

@@ -44,6 +44,7 @@ from cli_agent_orchestrator.clients.database import (
     get_delegation_result,
     get_delegation_result_for_assignment,
     get_handoff_parent_terminal_id,
+    get_managed_attempt_lifecycle,
     get_parent_completion_barrier,
     get_terminal_metadata,
     get_workflow_effect_state,
@@ -54,6 +55,8 @@ from cli_agent_orchestrator.clients.database import (
     is_delegated_child_terminal,
     is_managed_structured_handoff_child,
     issue_workflow_input_binding,
+    managed_attempt_fence_caller_is_authorized,
+    managed_attempt_fence_identity_matches,
     managed_final_problem,
     managed_handoff_retirement_required,
     parse_v1_result_capture,
@@ -67,6 +70,7 @@ from cli_agent_orchestrator.clients.database import (
     revalidate_historical_assigned_child_retirement,
     schedule_managed_handoff_continuation,
     set_workflow_terminal_state,
+    terminal_has_critical_owner_authority,
 )
 from cli_agent_orchestrator.constants import API_BASE_URL, DEFAULT_PROVIDER
 from cli_agent_orchestrator.mcp_server.models import HandoffResult, HandoffState
@@ -78,7 +82,7 @@ from cli_agent_orchestrator.runtime_generation import (
     PROVIDER_RECONNECT_ATTEMPT_ENV,
     RUNTIME_GENERATION_ENV,
 )
-from cli_agent_orchestrator.services import inbox_service, terminal_service
+from cli_agent_orchestrator.services import inbox_service, managed_attempt_service, terminal_service
 from cli_agent_orchestrator.utils.terminal import generate_session_name, wait_until_terminal_status
 
 logger = logging.getLogger(__name__)
@@ -1564,6 +1568,7 @@ async def _handoff_impl(
     runtime_fence: bool = True,
     request_effect: Optional[Dict[str, Any]] = None,
     request_workflow_turn_id: Optional[int] = None,
+    replaces_assignment_id: Optional[int] = None,
 ) -> HandoffResult:
     """Create a child, submit one task, then wait through one resumable slice."""
     start_time = time.time()
@@ -1611,6 +1616,7 @@ async def _handoff_impl(
                     workflow_turn_id=request_workflow_turn_id,
                     workflow_effect_id=request_effect.get("id"),
                     request_message=message,
+                    replaces_assignment_id=replaces_assignment_id,
                 )
             )
             if not registered and (
@@ -1744,6 +1750,10 @@ if ENABLE_WORKING_DIRECTORY:
             default=None,
             description='Optional working directory where the agent should execute (e.g., "/path/to/workspace/src/Package")',
         ),
+        replaces_assignment_id: Optional[int] = Field(
+            default=None,
+            description=("Exact fenced assignment replaced by this one-time recovery handoff"),
+        ),
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -1782,11 +1792,20 @@ if ENABLE_WORKING_DIRECTORY:
         Returns:
             HandoffResult with success status, message, and agent output
         """
-        effect = _claim_privileged_effect(logical_turn_id, "handoff", agent_profile, message)
+        replaces_assignment_id = (
+            replaces_assignment_id
+            if isinstance(replaces_assignment_id, int)
+            and not isinstance(replaces_assignment_id, bool)
+            else None
+        )
+        effect_identity = (
+            (agent_profile, message)
+            if replaces_assignment_id is None
+            else (agent_profile, message, replaces_assignment_id)
+        )
+        effect = _claim_privileged_effect(logical_turn_id, "handoff", *effect_identity)
         if effect is None:
-            rejection = _privileged_effect_rejection(
-                logical_turn_id, "handoff", agent_profile, message
-            )
+            rejection = _privileged_effect_rejection(logical_turn_id, "handoff", *effect_identity)
             return HandoffResult(
                 success=False,
                 message=str(rejection["error"]),
@@ -1798,14 +1817,15 @@ if ENABLE_WORKING_DIRECTORY:
             )
         execution_terminal, execution_suspended = _suspend_provider_execution(logical_turn_id)
         try:
+            handoff_kwargs: Dict[str, Any] = {
+                "runtime_fence": False,
+                "request_effect": effect,
+                "request_workflow_turn_id": logical_turn_id,
+            }
+            if replaces_assignment_id is not None:
+                handoff_kwargs["replaces_assignment_id"] = replaces_assignment_id
             result = await _handoff_impl(
-                agent_profile,
-                message,
-                timeout,
-                working_directory,
-                runtime_fence=False,
-                request_effect=effect,
-                request_workflow_turn_id=logical_turn_id,
+                agent_profile, message, timeout, working_directory, **handoff_kwargs
             )
         except Exception:
             _finish_privileged_effect(effect, "indeterminate")
@@ -1833,6 +1853,10 @@ else:
             description="Maximum time to wait for the agent to complete the task (in seconds)",
             ge=1,
             le=3600,
+        ),
+        replaces_assignment_id: Optional[int] = Field(
+            default=None,
+            description=("Exact fenced assignment replaced by this one-time recovery handoff"),
         ),
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
@@ -1863,11 +1887,20 @@ else:
         Returns:
             HandoffResult with success status, message, and agent output
         """
-        effect = _claim_privileged_effect(logical_turn_id, "handoff", agent_profile, message)
+        replaces_assignment_id = (
+            replaces_assignment_id
+            if isinstance(replaces_assignment_id, int)
+            and not isinstance(replaces_assignment_id, bool)
+            else None
+        )
+        effect_identity = (
+            (agent_profile, message)
+            if replaces_assignment_id is None
+            else (agent_profile, message, replaces_assignment_id)
+        )
+        effect = _claim_privileged_effect(logical_turn_id, "handoff", *effect_identity)
         if effect is None:
-            rejection = _privileged_effect_rejection(
-                logical_turn_id, "handoff", agent_profile, message
-            )
+            rejection = _privileged_effect_rejection(logical_turn_id, "handoff", *effect_identity)
             return HandoffResult(
                 success=False,
                 message=str(rejection["error"]),
@@ -1879,15 +1912,14 @@ else:
             )
         execution_terminal, execution_suspended = _suspend_provider_execution(logical_turn_id)
         try:
-            result = await _handoff_impl(
-                agent_profile,
-                message,
-                timeout,
-                None,
-                runtime_fence=False,
-                request_effect=effect,
-                request_workflow_turn_id=logical_turn_id,
-            )
+            handoff_kwargs: Dict[str, Any] = {
+                "runtime_fence": False,
+                "request_effect": effect,
+                "request_workflow_turn_id": logical_turn_id,
+            }
+            if replaces_assignment_id is not None:
+                handoff_kwargs["replaces_assignment_id"] = replaces_assignment_id
+            result = await _handoff_impl(agent_profile, message, timeout, None, **handoff_kwargs)
         except Exception:
             _finish_privileged_effect(effect, "indeterminate")
             raise
@@ -3010,6 +3042,100 @@ async def claim_workflow_turn_receipt(
         terminal_auth_token=terminal_auth_token,
     )
     return {**admission, "receiver_terminal_id": receiver_terminal_id}
+
+
+@mcp.tool()
+async def fence_managed_attempt(
+    logical_turn_id: int = Field(description="Admitted owner workflow turn that owns this fence"),
+    assignment_id: int = Field(description="Exact child assignment ID", ge=1),
+    attempt_id: str = Field(description="Exact immutable child attempt ID"),
+    parent_terminal_id: str = Field(description="Exact parent terminal ID"),
+    child_terminal_id: str = Field(description="Exact child terminal ID"),
+    request_workflow_effect_id: int = Field(
+        description="Exact parent handoff/assign effect ID", ge=1
+    ),
+    child_workflow_turn_id: int = Field(description="Exact current child workflow turn ID", ge=1),
+    reason_code: str = Field(description="Stable uppercase fencing reason code"),
+    expected_runtime_generation: str = Field(
+        description="Exact child runtime generation observed before fencing"
+    ),
+    expected_writer_authority_generation: str = Field(
+        description="Exact child writer authority generation observed before fencing"
+    ),
+) -> Dict[str, Any]:
+    """Atomically fence one orphaned managed attempt and retire its runtime."""
+    owner_terminal_id = os.environ.get("CAO_TERMINAL_ID")
+    if (
+        not owner_terminal_id
+        or not terminal_has_critical_owner_authority(owner_terminal_id)
+        or not managed_attempt_fence_caller_is_authorized(
+            owner_terminal_id,
+            assignment_id=assignment_id,
+            parent_terminal_id=parent_terminal_id,
+            reason_code=reason_code,
+        )
+    ):
+        return {
+            "success": False,
+            "accepted": False,
+            "reason_code": "MANAGED_ATTEMPT_FENCE_CALLER_SCOPE_MISMATCH",
+        }
+    identity = (
+        assignment_id,
+        attempt_id,
+        parent_terminal_id,
+        child_terminal_id,
+        request_workflow_effect_id,
+        child_workflow_turn_id,
+        reason_code,
+        expected_runtime_generation,
+        expected_writer_authority_generation,
+    )
+    effect = _claim_privileged_effect(logical_turn_id, "fence_managed_attempt", *identity)
+    if effect is None:
+        lifecycle = get_managed_attempt_lifecycle(assignment_id=assignment_id)
+        if (
+            lifecycle is not None
+            and lifecycle.get("state") == "fenced"
+            and managed_attempt_fence_identity_matches(
+                lifecycle,
+                assignment_id=assignment_id,
+                attempt_id=attempt_id,
+                parent_terminal_id=parent_terminal_id,
+                child_terminal_id=child_terminal_id,
+                request_workflow_effect_id=request_workflow_effect_id,
+                child_workflow_turn_id=child_workflow_turn_id,
+                reason_code=reason_code,
+                expected_runtime_generation=expected_runtime_generation,
+                expected_writer_authority_generation=expected_writer_authority_generation,
+            )
+        ):
+            return {"success": True, "accepted": True, "duplicate": True, **lifecycle}
+        return _privileged_effect_rejection(logical_turn_id, "fence_managed_attempt", *identity)
+    try:
+        result = managed_attempt_service.fence_managed_attempt(
+            caller_terminal_id=owner_terminal_id,
+            assignment_id=assignment_id,
+            attempt_id=attempt_id,
+            parent_terminal_id=parent_terminal_id,
+            child_terminal_id=child_terminal_id,
+            request_workflow_effect_id=request_workflow_effect_id,
+            child_workflow_turn_id=child_workflow_turn_id,
+            reason_code=reason_code,
+            expected_runtime_generation=expected_runtime_generation,
+            expected_writer_authority_generation=expected_writer_authority_generation,
+        )
+    except Exception as exc:
+        _finish_privileged_effect(effect, "rejected")
+        return {
+            "success": False,
+            "accepted": False,
+            "reason_code": getattr(exc, "reason_code", "MANAGED_ATTEMPT_FENCE_FAILED"),
+        }
+    _finish_privileged_effect(
+        effect, "completed" if result.get("state") == "fenced" else "indeterminate"
+    )
+    return {"success": result.get("state") == "fenced", **result}
 
 
 @mcp.tool(description=LOAD_SKILL_TOOL_DESCRIPTION)

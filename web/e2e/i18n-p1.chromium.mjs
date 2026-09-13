@@ -103,14 +103,14 @@ const labels = {
     lang: 'Language', home: 'Home', agents: 'Agents', settings: 'Settings', docs: 'Docs', sessions: 'Sessions',
     create: 'Create Session & Spawn Agent', sessionName: 'Session name', cancel: 'Cancel', inbox: 'Inbox',
     inboxTitle: 'Agent Inbox', housekeeping: 'Housekeeping', full: 'Delete all system files — Full Cleanup',
-    docsTitle: 'Start here: What is ThreadCells?', targetLocale: 'English', graceful: 'Graceful Exit',
+    docsTitle: 'Start here: What is ThreadCells?', targetLocale: 'English', graceful: 'Finish',
     deleteDisabled: 'Gracefully exit this terminal before deleting it',
   },
   ru: {
     lang: 'Язык', home: 'Главная', agents: 'Агенты', settings: 'Настройки', docs: 'Документация', sessions: 'Сессии',
     create: 'Создать сессию и запустить агента', sessionName: 'Название сессии', cancel: 'Отмена', inbox: 'Почта',
     inboxTitle: 'Почта агента', housekeeping: 'Обслуживание', full: 'Удалить все системные файлы — полная очистка',
-    docsTitle: 'Начните здесь: что такое ThreadCells?', targetLocale: 'Русский', graceful: 'Корректно завершить',
+    docsTitle: 'Начните здесь: что такое ThreadCells?', targetLocale: 'Русский', graceful: 'Завершить',
     deleteDisabled: 'Корректно завершите терминал перед удалением',
   },
 }
@@ -153,13 +153,17 @@ async function assertSurfaceSet(page, locale, viewport) {
   await page.getByRole('link', { name: new RegExp(`^${copy.agents}`) }).click()
   await page.getByText(`${copy.sessions} (1)`, { exact: true }).waitFor()
   await page.getByRole('button', { name: new RegExp(`^(Expand|Развернуть) ${session.name}$`) }).click()
-  const actionLabels = (await page.getByTestId(`agent-detail-card-${agent.id}`).getByRole('button').allTextContents()).map(value => value.trim()).filter(Boolean)
+  const agentCard = page.getByTestId(`agent-detail-card-${agent.id}`)
+  await agentCard.getByRole('button').first().waitFor()
+  const actionLabels = (await agentCard.getByRole('button').allTextContents()).map(value => value.trim()).filter(Boolean)
   assert.deepEqual(actionLabels.slice(0, 6), locale === 'ru'
-    ? ['История', 'Почта', 'Вывод', 'Открыть терминал', 'Корректно завершить', 'Удалить']
-    : ['History', 'Inbox', 'Output', 'Open Terminal', 'Graceful Exit', 'Delete'], `agent action order in ${locale}`)
+    ? ['История', 'Почта', 'Вывод', 'Терминал', 'Завершить', 'Удалить']
+    : ['History', 'Inbox', 'Output', 'Terminal', 'Finish', 'Delete'], `agent action order in ${locale}`)
   await page.getByRole('button', { name: copy.inbox, exact: true }).click()
   await page.getByRole('heading', { name: copy.inboxTitle, exact: true }).waitFor()
-  assert.equal(await page.getByText(rawMessage, { exact: true }).count(), 1, 'Inbox content must remain byte-equivalent')
+  const inboxPayload = page.getByText(rawMessage, { exact: true })
+  await inboxPayload.waitFor()
+  assert.equal(await inboxPayload.count(), 1, 'Inbox content must remain byte-equivalent')
   await overflow(page, 'inbox', locale, viewport.width)
   await page.getByRole('button', { name: /^(Close|Закрыть)$/ }).click()
   await page.getByRole('button', { name: copy.create, exact: true }).click()

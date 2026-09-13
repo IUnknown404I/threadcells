@@ -28,6 +28,7 @@ from typing import Any, Dict, List
 from cli_agent_orchestrator.clients.database import (
     AmbiguousSessionIdentity,
     SessionLifetimeAuthorityError,
+    admit_session_foreign_workspace_preservation,
     begin_session_hard_deletion,
     bind_session_hard_deletion_workspace_authority,
     cancel_session_work_for_deletion,
@@ -39,6 +40,7 @@ from cli_agent_orchestrator.clients.database import (
     get_session_workspace_retirement_snapshot,
     get_writable_work_context_by_session,
     list_session_historical_terminal_cleanup_authorities,
+    mark_session_hard_deletion_workspace_preserved,
     mark_session_hard_deletion_workspace_retired,
     resolve_session_lifetime,
     revalidate_session_hard_deletion,
@@ -97,6 +99,8 @@ class SessionAuthority:
     deleted: bool
     runtime_exists: bool | None
     deletion_in_progress: bool = False
+    workspace_disposition: str | None = None
+    workspace_evidence_sha256: str | None = None
 
     @property
     def has_live_runtime_owner(self) -> bool:
@@ -139,6 +143,8 @@ def resolve_session_authority(identifier: str, *, require_live: bool = False) ->
         deleted=bool(durable["deleted"]),
         runtime_exists=runtime_exists,
         deletion_in_progress=bool(durable.get("deletion_in_progress")),
+        workspace_disposition=durable.get("workspace_disposition"),
+        workspace_evidence_sha256=durable.get("workspace_evidence_sha256"),
     )
     if not require_live:
         return authority
@@ -635,6 +641,10 @@ def delete_session(
             if authority.deleted:
                 result["already_deleted"] = True
                 result["retained_resources"] = authority.retained_resources
+                if authority.workspace_disposition is not None:
+                    result["workspace_disposition"] = authority.workspace_disposition
+                if authority.workspace_evidence_sha256 is not None:
+                    result["workspace_evidence_sha256"] = authority.workspace_evidence_sha256
                 return result
             terminals = authority.terminals
             terminal_ids = [str(terminal["id"]) for terminal in terminals]
@@ -783,6 +793,28 @@ def delete_session(
                     authority.session_id,
                     authority.session_name,
                 )
+                if (
+                    not revalidated.get("valid")
+                    and revalidated.get("reason_code") == "WORKSPACE_FOREIGN_OWNER"
+                ):
+                    preservation = admit_session_foreign_workspace_preservation(
+                        authority.session_id,
+                        authority.session_name,
+                    )
+                    if preservation.get("admitted"):
+                        refreshed_operation = get_session_hard_deletion_operation(
+                            authority.session_id
+                        )
+                        if refreshed_operation is None:
+                            raise SessionLifecycleError(
+                                "SESSION_DELETE_FENCE_MISSING",
+                                "The durable Session deletion fence disappeared",
+                            )
+                        operation = refreshed_operation
+                        revalidated = revalidate_session_hard_deletion(
+                            authority.session_id,
+                            authority.session_name,
+                        )
                 if not revalidated.get("valid") or set(revalidated.get("terminal_ids", ())) != set(
                     terminal_ids
                 ):
@@ -840,6 +872,17 @@ def delete_session(
                     operation["workspace_authority_sha256"] = bound.get(
                         "workspace_authority_sha256"
                     )
+                    operation["workspace_disposition"] = bound.get("workspace_disposition")
+                    if operation["workspace_disposition"] == "preserved_foreign":
+                        refreshed_operation = get_session_hard_deletion_operation(
+                            authority.session_id
+                        )
+                        if refreshed_operation is None:
+                            raise SessionLifecycleError(
+                                "SESSION_DELETE_FENCE_MISSING",
+                                "The durable Session deletion fence disappeared",
+                            )
+                        operation = refreshed_operation
             else:
                 graph_terminal_ids = terminal_ids
                 historical_terminal_cleanup = []
@@ -861,6 +904,23 @@ def delete_session(
                             authority.session_id,
                             authority.session_name,
                         )
+                        if (
+                            not destructive_revalidation.get("valid")
+                            and destructive_revalidation.get("reason_code")
+                            == "WORKSPACE_FOREIGN_OWNER"
+                        ):
+                            preservation = admit_session_foreign_workspace_preservation(
+                                authority.session_id,
+                                authority.session_name,
+                            )
+                            if preservation.get("admitted"):
+                                operation = get_session_hard_deletion_operation(
+                                    authority.session_id
+                                )
+                                destructive_revalidation = revalidate_session_hard_deletion(
+                                    authority.session_id,
+                                    authority.session_name,
+                                )
                         if not destructive_revalidation.get("valid") or set(
                             destructive_revalidation.get("terminal_ids", ())
                         ) != set(terminal_ids):
@@ -870,6 +930,11 @@ def delete_session(
                                     or "SESSION_DELETE_PLAN_CHANGED"
                                 ),
                                 "Session workspace authority changed before destructive cleanup",
+                            )
+                        if operation is None:
+                            raise SessionLifecycleError(
+                                "SESSION_DELETE_FENCE_MISSING",
+                                "The durable Session deletion fence disappeared",
                             )
                         context = get_writable_work_context_by_session(authority.session_id)
                         context_already_retired = bool(
@@ -884,7 +949,14 @@ def delete_session(
                                 "Writable workspace context changed during deletion",
                             )
                         allow_dirty = bool(operation["allow_dirty_workspace"])
-                        if context is not None and not context_already_retired:
+                        preserve_foreign = (
+                            operation.get("workspace_disposition") == "preserved_foreign"
+                        )
+                        if (
+                            not preserve_foreign
+                            and context is not None
+                            and not context_already_retired
+                        ):
                             snapshot = get_session_workspace_retirement_snapshot(str(context["id"]))
                             if snapshot is None:
                                 raise SessionLifecycleError(
@@ -913,55 +985,64 @@ def delete_session(
                                     str(claim.get("reason_code") or "WORKSPACE_AUTHORITY_CHANGED"),
                                     "Managed workspace authority changed during deletion",
                                 )
-
-                        cleanup = purge_session_managed_worktrees(
-                            terminals,
-                            operation["workspace_authority"],
-                            allow_dirty=allow_dirty,
-                            require_already_absent=context_already_retired,
-                        )
-                        if not cleanup.get("removed"):
-                            raise SessionLifecycleError(
-                                str(cleanup.get("reason_code") or "MANAGED_WORKTREE_UNVERIFIED"),
-                                "Managed worktree cleanup could not be proven",
+                        workspace_evidence: list[dict[str, object]] = []
+                        if not preserve_foreign:
+                            cleanup = purge_session_managed_worktrees(
+                                terminals,
+                                operation["workspace_authority"],
+                                allow_dirty=allow_dirty,
+                                require_already_absent=context_already_retired,
                             )
-                        workspace_evidence: list[dict[str, object]] = list(
-                            cleanup.get("evidence") or []
-                        )
+                            if not cleanup.get("removed"):
+                                raise SessionLifecycleError(
+                                    str(
+                                        cleanup.get("reason_code") or "MANAGED_WORKTREE_UNVERIFIED"
+                                    ),
+                                    "Managed worktree cleanup could not be proven",
+                                )
+                            workspace_evidence = list(cleanup.get("evidence") or [])
                         artifact_cleanup = purge_session_terminal_artifacts(graph_terminal_ids)
                         if not artifact_cleanup.get("runtime_artifacts_absent"):
                             raise SessionLifecycleError(
                                 "TERMINAL_ARTIFACT_CLEANUP_UNPROVEN",
                                 "Terminal output or attachment cleanup could not be proven",
                             )
-                        # Individual terminal retirement removes the worktree
-                        # but deliberately preserves its private task branch.
-                        # Consume the exact receipt-bound Git identity here;
-                        # legacy receipts without that authority remain unsafe
-                        # in preflight rather than receiving fabricated proof.
-                        for historical in historical_terminal_cleanup:
-                            cleanup = purge_managed_worktree(
-                                historical,
-                                require_already_absent=True,
-                            )
-                            if not cleanup.get("removed") and cleanup.get("managed"):
-                                raise SessionLifecycleError(
-                                    str(
-                                        cleanup.get("reason_code") or "MANAGED_WORKTREE_UNVERIFIED"
-                                    ),
-                                    "Historical managed-worktree cleanup could not be proven",
+                        if not preserve_foreign:
+                            # Individual terminal retirement removes the worktree
+                            # but deliberately preserves its private task branch.
+                            # Consume the exact receipt-bound Git identity here;
+                            # legacy receipts without that authority remain unsafe
+                            # in preflight rather than receiving fabricated proof.
+                            for historical in historical_terminal_cleanup:
+                                cleanup = purge_managed_worktree(
+                                    historical,
+                                    require_already_absent=True,
                                 )
-                            workspace_evidence.append(
-                                {
-                                    "terminal_id": str(historical["terminal_id"]),
-                                    "managed": bool(cleanup.get("managed")),
-                                    "path_absent": bool(cleanup.get("path_absent", True)),
-                                    "git_unregistered": bool(cleanup.get("git_unregistered", True)),
-                                    "branch_absent": bool(cleanup.get("branch_absent", True)),
-                                    "runtime_artifacts_absent": True,
-                                }
-                            )
-                        if context is not None and not context_already_retired:
+                                if not cleanup.get("removed") and cleanup.get("managed"):
+                                    raise SessionLifecycleError(
+                                        str(
+                                            cleanup.get("reason_code")
+                                            or "MANAGED_WORKTREE_UNVERIFIED"
+                                        ),
+                                        "Historical managed-worktree cleanup could not be proven",
+                                    )
+                                workspace_evidence.append(
+                                    {
+                                        "terminal_id": str(historical["terminal_id"]),
+                                        "managed": bool(cleanup.get("managed")),
+                                        "path_absent": bool(cleanup.get("path_absent", True)),
+                                        "git_unregistered": bool(
+                                            cleanup.get("git_unregistered", True)
+                                        ),
+                                        "branch_absent": bool(cleanup.get("branch_absent", True)),
+                                        "runtime_artifacts_absent": True,
+                                    }
+                                )
+                        if (
+                            not preserve_foreign
+                            and context is not None
+                            and not context_already_retired
+                        ):
                             if not transition_writable_work_context(
                                 str(context["id"]),
                                 expected_states=("admitted", "retiring"),
@@ -972,8 +1053,16 @@ def delete_session(
                                     "WORKSPACE_AUTHORITY_CHANGED",
                                     "Workspace state changed before cleanup completion",
                                 )
-                        marked = mark_session_hard_deletion_workspace_retired(
-                            authority.session_id, workspace_evidence=workspace_evidence
+                        marked = (
+                            mark_session_hard_deletion_workspace_preserved(
+                                authority.session_id,
+                                runtime_artifacts=artifact_cleanup,
+                            )
+                            if preserve_foreign
+                            else mark_session_hard_deletion_workspace_retired(
+                                authority.session_id,
+                                workspace_evidence=workspace_evidence,
+                            )
                         )
                         if not marked.get("marked"):
                             raise SessionLifecycleError(
@@ -1021,6 +1110,8 @@ def delete_session(
         result["remaining_rows"] = dict(deletion.get("after_counts", {}))
         result["tombstone_count"] = int(deletion.get("tombstone_count", 1))
         result["terminal_artifacts"] = artifact_cleanup
+        result["workspace_disposition"] = deletion.get("workspace_disposition")
+        result["workspace_evidence_sha256"] = deletion.get("workspace_evidence_sha256")
         logger.info(f"Deleted session lifetime: {authority.session_id}")
         dispatch_plugin_event(
             registry,

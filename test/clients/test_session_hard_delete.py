@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +23,8 @@ from cli_agent_orchestrator.clients.database import (
     DelegationResultSubmissionModel,
     HandoffResultSubmissionError,
     InboxModel,
+    ManagedAttemptLifecycleEventModel,
+    ManagedAttemptLifecycleModel,
     OwnerLaunchGrantModel,
     ProjectModel,
     ProviderExecutionLeaseModel,
@@ -554,7 +557,8 @@ def test_individually_retired_private_branch_is_receipted_then_session_purged(
     with database.SessionLocal() as db:
         assert db.get(TerminalDeletionReceiptModel, "retired-child") is None
         tombstone = db.get(SessionDeletionReceiptModel, "session")
-        assert tombstone.receipt_version == 3
+        assert tombstone.receipt_version == 4
+        assert tombstone.workspace_disposition == "retired"
         assert {
             item["terminal_id"] for item in database._session_receipt_terminal_fences(tombstone)
         } == {
@@ -761,6 +765,24 @@ def test_hard_delete_purges_owned_graph_and_preserves_shared_registry_and_other_
         )
         db.add(other_assignment)
         db.flush()
+        other_lifecycle = ManagedAttemptLifecycleModel(
+            assignment_id=other_assignment.id,
+            attempt_id=other_assignment.attempt_id,
+            parent_terminal_id="other",
+            child_terminal_id="other",
+            request_workflow_effect_id=other_effect.id,
+            state="completed",
+        )
+        db.add(other_lifecycle)
+        db.flush()
+        db.add(
+            ManagedAttemptLifecycleEventModel(
+                assignment_id=other_assignment.id,
+                event_key="other-managed-attempt:completed",
+                event_type="completed",
+                state="completed",
+            )
+        )
         other_result = DelegationResultModel(
             id="other-result",
             child_assignment_id=other_assignment.id,
@@ -862,6 +884,24 @@ def test_hard_delete_purges_owned_graph_and_preserves_shared_registry_and_other_
         )
         db.add(assignment)
         db.flush()
+        lifecycle = ManagedAttemptLifecycleModel(
+            assignment_id=assignment.id,
+            attempt_id=assignment.attempt_id,
+            parent_terminal_id="owner",
+            child_terminal_id="child",
+            request_workflow_effect_id=effect.id,
+            state="completed",
+        )
+        db.add(lifecycle)
+        db.flush()
+        db.add(
+            ManagedAttemptLifecycleEventModel(
+                assignment_id=assignment.id,
+                event_key="owned-managed-attempt:completed",
+                event_type="completed",
+                state="completed",
+            )
+        )
         result = DelegationResultModel(
             id="result",
             child_assignment_id=assignment.id,
@@ -992,6 +1032,8 @@ def test_hard_delete_purges_owned_graph_and_preserves_shared_registry_and_other_
         "provider_execution_leases": 0,
         "worktree_writer_leases": 0,
         "child_assignments": 1,
+        "managed_attempt_lifecycle": 1,
+        "managed_attempt_lifecycle_events": 1,
         "delegation_results": 1,
         "delegation_result_submissions": 1,
         "delegation_result_events": 1,
@@ -1015,6 +1057,13 @@ def test_hard_delete_purges_owned_graph_and_preserves_shared_registry_and_other_
         assert db.get(WorkflowTurnModel, other_turn_id) is not None
         assert db.get(WorkflowEffectModel, other_effect_id) is not None
         assert db.get(ChildAssignmentModel, other_assignment_id) is not None
+        assert db.get(ManagedAttemptLifecycleModel, other_assignment_id) is not None
+        assert (
+            db.query(ManagedAttemptLifecycleEventModel)
+            .filter_by(assignment_id=other_assignment_id)
+            .count()
+            == 1
+        )
         assert db.get(DelegationResultModel, "other-result") is not None
         assert db.query(WorkflowTurnReceiptModel).count() == 1
         assert db.query(WorkflowProviderReconnectAttemptModel).count() == 1
@@ -1025,7 +1074,8 @@ def test_hard_delete_purges_owned_graph_and_preserves_shared_registry_and_other_
         assert db.query(SessionDeletionOperationModel).count() == 0
         tombstone = db.get(SessionDeletionReceiptModel, "session")
         assert tombstone is not None
-        assert tombstone.receipt_version == 3
+        assert tombstone.receipt_version == 4
+        assert tombstone.workspace_disposition == "retired"
         assert tombstone.deletion_reason == "operator_session_hard_delete"
         assert tombstone.retained_resources_json == "[]"
         assert db.query(TerminalDeletionReceiptModel).count() == 0
@@ -1770,6 +1820,7 @@ def test_workspace_authority_revalidation_rejects_late_foreign_terminal_target_o
     foreign.managed_worktree_source = managed.source
     foreign.managed_worktree_branch = managed.branch
     foreign.managed_worktree_commit = managed.commit
+    foreign_writer_generation = foreign.writer_authority_generation
     with database.SessionLocal() as db:
         db.add(foreign)
         db.commit()
@@ -1778,9 +1829,43 @@ def test_workspace_authority_revalidation_rejects_late_foreign_terminal_target_o
         "valid": False,
         "reason_code": "WORKSPACE_FOREIGN_OWNER",
     }
+    admitted = database.admit_session_foreign_workspace_preservation("session", "cao-session")
+    assert admitted["admitted"] is True
+    assert (
+        database.admit_session_foreign_workspace_preservation("session", "cao-session")[
+            "already_admitted"
+        ]
+        is True
+    )
+    revalidated = database.revalidate_session_hard_deletion("session", "cao-session")
+    assert revalidated["valid"] is True
+    assert revalidated["workspace_disposition"] == "preserved_foreign"
+    runtime_artifacts = {"runtime_artifacts_absent": True, "terminals": []}
+    assert database.mark_session_hard_deletion_workspace_preserved(
+        "session", runtime_artifacts=runtime_artifacts
+    )["marked"]
+    assert database.mark_session_hard_deletion_workspace_preserved(
+        "session", runtime_artifacts=runtime_artifacts
+    )["already_marked"]
+
+    completed = database.complete_session_hard_deletion("session", "cao-session")
+    assert completed["completed"] is True
+    assert completed["workspace_disposition"] == "preserved_foreign"
+    assert Path(managed.path).is_dir()
+    with database.SessionLocal() as db:
+        preserved = db.get(TerminalModel, "foreign-owner")
+        assert preserved is not None
+        assert preserved.launch_worktree == managed.path
+        assert preserved.writer_authority_generation == foreign_writer_generation
+        receipt = db.get(SessionDeletionReceiptModel, "session")
+        assert receipt.receipt_version == 4
+        assert receipt.workspace_disposition == "preserved_foreign"
+        evidence = json.loads(receipt.workspace_evidence_json)
+        assert evidence["reason_code"] == "WORKSPACE_FOREIGN_OWNER"
+        assert evidence["foreign_authority"]["terminals"][0]["terminal_id"] == "foreign-owner"
 
 
-def test_workspace_authority_rejects_foreign_writer_on_target_path(monkeypatch, tmp_path):
+def test_workspace_authority_preserves_foreign_writer_on_target_path(monkeypatch, tmp_path):
     managed, authority = _managed_supervisor_deletion_fixture(monkeypatch, tmp_path)
     assert database.begin_session_hard_deletion(
         "session",
@@ -1798,12 +1883,23 @@ def test_workspace_authority_rejects_foreign_writer_on_target_path(monkeypatch, 
         )
         db.commit()
 
-    assert database.bind_session_hard_deletion_workspace_authority(
+    bound = database.bind_session_hard_deletion_workspace_authority(
         "session", "cao-session", workspace_authority=authority
-    ) == {
-        "bound": False,
-        "reason_code": "WRITER_LEASE_ACTIVE",
-    }
+    )
+    assert bound["bound"] is True
+    assert bound["workspace_disposition"] == "preserved_foreign"
+    runtime_artifacts = {"runtime_artifacts_absent": True, "terminals": []}
+    assert database.mark_session_hard_deletion_workspace_preserved(
+        "session", runtime_artifacts=runtime_artifacts
+    )["marked"]
+    completed = database.complete_session_hard_deletion("session", "cao-session")
+    assert completed["completed"] is True
+    assert Path(managed.path).is_dir()
+    with database.SessionLocal() as db:
+        lease = db.get(WorktreeWriterLeaseModel, managed.path)
+        assert lease is not None
+        assert lease.terminal_id == "foreign-writer"
+        assert lease.authority_generation == "foreign-generation"
 
 
 def test_workspace_context_change_after_preflight_cannot_be_bound(monkeypatch):
@@ -1928,7 +2024,7 @@ def test_partial_database_purge_rolls_back_and_retry_converges(monkeypatch):
     assert database.complete_session_hard_deletion("session", "cao-session")["completed"] is True
     with database.SessionLocal() as db:
         assert db.get(SessionDeletionOperationModel, "session") is None
-        assert db.get(SessionDeletionReceiptModel, "session").receipt_version == 3
+        assert db.get(SessionDeletionReceiptModel, "session").receipt_version == 4
         assert db.query(TerminalModel).count() == 0
         assert db.query(WorkflowModel).count() == 0
         assert db.query(WorkflowTurnModel).count() == 0
@@ -2375,6 +2471,6 @@ def test_hard_purge_sql_shape_is_fixed_with_one_session_tombstone(
 
     one = run(1)
     fifty = run(50)
-    assert one[:2] == fifty[:2] == (98, 71)
+    assert one[:2] == fifty[:2] == (104, 75)
     assert one[2] == 0
     assert fifty[2] == 1

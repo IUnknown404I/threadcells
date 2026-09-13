@@ -101,7 +101,7 @@ const REASON_COPY = {
   FULL_CLEANUP_NOT_IDLE: ['Agents are still working', 'Full Cleanup is available only when every agent is Ready or Exited and no provider or Heavy execution is active.'],
   FULL_CLEANUP_IDLE_INVENTORY_UNKNOWN: ['Idle state could not be proven', 'ThreadCells could not prove that every agent and execution lane is idle, so Full Cleanup was blocked.'],
   OPERATOR_AUTH_NOT_CONFIGURED: ['Operator authorization unavailable', 'The privileged Full Cleanup helper could not validate the configured operator authority. No files were deleted.'],
-  TERMINAL_RUNTIME_ACTIVE: ['Exit terminal first', 'Use Graceful Exit and wait until ThreadCells confirms the provider has exited before deleting terminal history.'],
+  TERMINAL_RUNTIME_ACTIVE: ['Exit terminal first', 'Use Finish and wait until ThreadCells confirms the provider has exited before deleting terminal history.'],
   TERMINAL_EXIT_PENDING: ['Terminal exit is pending', 'ThreadCells has not confirmed provider death yet. Wait for exit reconciliation before deleting terminal history.'],
   TERMINAL_DEATH_UNCONFIRMED: ['Terminal death is not confirmed', 'ThreadCells could not retire the exact exited runtime, so terminal metadata remains protected.'],
   TERMINAL_RUNTIME_AUTHORITY_UNCERTAIN: ['Terminal authority is uncertain', 'ThreadCells could not verify the exact terminal runtime identity, so metadata remains protected.'],
@@ -112,7 +112,7 @@ const REASON_COPY = {
   TERMINAL_WORKTREE_PROTECTED: ['Managed worktree retained', 'ThreadCells cannot delete this terminal history because its managed worktree contains state that must remain recoverable.'],
   SESSION_RUNTIME_ACTIVE: ['Exit every agent first', 'A live or Ready agent still owns this session. Gracefully exit every agent before deleting the session.'],
   SESSION_RUNTIME_AUTHORITY_UNPROVEN: ['Session runtime authority is uncertain', 'ThreadCells could not prove that every historical runtime is gone, so the session remains protected.'],
-  EXIT_PANE_AMBIGUOUS: ['Terminal exit needs attention', 'The terminal window has multiple panes. Resolve the terminal layout before trying Graceful Exit again.'],
+  EXIT_PANE_AMBIGUOUS: ['Terminal exit needs attention', 'The terminal window has multiple panes. Resolve the terminal layout before trying Finish again.'],
 } satisfies Record<string, [string, string]>
 
 type KnownReasonCode = keyof typeof REASON_COPY
@@ -473,6 +473,16 @@ export interface InteractionItem {
   }
   result: { id: string | null; status: string | null; summary: string | null; available: boolean }
   delivery: { status: string | null; pending: boolean; acknowledged: boolean }
+  attempt?: {
+    state: string | null
+    reason_code: string | null
+    delivery_attempt_count: number
+    recovery_attempt_count: number
+    next_retry_at: string | null
+    deadline_at: string | null
+    prompt_delivery_acknowledged: boolean
+    provider_admitted: boolean
+  }
   final_disposition: string | null
   diagnostics: { interaction_id: string; durable_id: string | null; assignment_id: number | null }
 }

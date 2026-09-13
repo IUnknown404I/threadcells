@@ -8,6 +8,36 @@ import { chromium } from 'playwright'
 const webRoot = fileURLToPath(new URL('..', import.meta.url))
 const terminalId = 'e2e-terminal'
 const sessionId = 'cao-e2e-terminal-paste'
+const sessionSummary = {
+  id: sessionId,
+  name: sessionId,
+  status: 'active',
+  created_at: '1',
+  agent_count: 1,
+  active_agent_count: 1,
+  workflow_counts: { completed: 1 },
+  activity_counts: { idle: 1 },
+  first_agent: { id: terminalId, activity: 'idle', execution_state: 'ready', lifecycle: 'running', workflow_state: 'completed' },
+  last_agent: { id: terminalId, activity: 'idle', execution_state: 'ready', lifecycle: 'running', workflow_state: 'completed' },
+}
+const agentSummary = {
+  id: terminalId,
+  name: '0',
+  provider: 'codex',
+  session_id: sessionId,
+  session_name: sessionId,
+  agent_profile: 'developer',
+  activity: 'idle',
+  execution_state: 'ready',
+  lifecycle: 'running',
+  workflow_state: 'completed',
+  workflow_status: 'completed',
+  assignment_status: null,
+  result_status: null,
+  delivery_status: null,
+  creation_order: 1,
+  last_active: null,
+}
 const receivedFrames = []
 const uploads = []
 const workflowInputs = []
@@ -69,7 +99,16 @@ const server = http.createServer((request, response) => {
     return
   }
   if (request.method === 'GET' && url.pathname === '/sessions') {
-    return json(response, [{ id: sessionId, name: sessionId, status: 'active', created_at: '1' }])
+    return json(response, [sessionSummary])
+  }
+  if (request.method === 'GET' && url.pathname === '/ui/overview') {
+    return json(response, { sessions: 1, agents: 1, active: 1, waiting: 0, owner_gate: 0, cancelled: 0, completed: 1 })
+  }
+  if (request.method === 'GET' && url.pathname === '/ui/sessions') {
+    return json(response, { items: [sessionSummary], total: 1, limit: 10, offset: 0, next_offset: null })
+  }
+  if (request.method === 'GET' && url.pathname === '/ui/agents') {
+    return json(response, { items: [agentSummary], total: 1, limit: 40, offset: 0, next_offset: null, facets: { activities: ['idle'], workflow_states: ['completed'], profiles: ['developer'] } })
   }
   if (request.method === 'GET' && url.pathname === `/sessions/${sessionId}`) {
     return json(response, {
@@ -139,7 +178,7 @@ try {
   await page.goto(origin)
   await page.getByRole('link', { name: 'Agents' }).click()
   await page.getByText('e2e-terminal-paste', { exact: true }).click()
-  await page.getByRole('button', { name: 'Open Terminal' }).click()
+  await page.getByTestId(`agent-detail-card-${terminalId}`).getByRole('button', { name: 'Terminal' }).click()
   const composer = page.getByRole('textbox', { name: 'Workflow Composer' })
   await composer.waitFor({ state: 'visible' })
 

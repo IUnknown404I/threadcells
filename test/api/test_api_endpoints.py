@@ -101,6 +101,96 @@ class TestHealthCheck:
         assert "/settings/housekeeping" not in paths
 
 
+class TestManagedAttemptInternalEndpoints:
+    @staticmethod
+    def _fence_payload(**overrides):
+        payload = {
+            "logical_turn_id": 3591,
+            "caller_terminal_id": "deadbeef",
+            "assignment_id": 735,
+            "attempt_id": "5a369a1f-7e20-4f1d-b92e-7d223d9e211b",
+            "parent_terminal_id": "feedface",
+            "request_workflow_effect_id": 2963,
+            "child_workflow_turn_id": 3589,
+            "reason_code": "ORPHANED_MANAGED_CONTINUATION_AFTER_HANDOFF_TIMEOUT",
+            "expected_runtime_generation": "runtime-generation-a",
+            "expected_writer_authority_generation": "writer-generation-a",
+        }
+        payload.update(overrides)
+        return payload
+
+    @classmethod
+    def _fenced_lifecycle(cls):
+        payload = cls._fence_payload()
+        payload.pop("logical_turn_id")
+        payload.pop("caller_terminal_id")
+        payload["child_terminal_id"] = "cafebabe"
+        payload["state"] = "fenced"
+        return payload
+
+    def test_duplicate_fence_requires_every_identity_field(self, client):
+        lifecycle = self._fenced_lifecycle()
+        lifecycle["expected_writer_authority_generation"] = "writer-generation-b"
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.terminal_auth_token_matches",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.terminal_has_critical_owner_authority",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.managed_attempt_fence_caller_is_authorized",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.claim_workflow_effect",
+                return_value=None,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.get_managed_attempt_lifecycle",
+                return_value=lifecycle,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.managed_attempt_service.fence_managed_attempt"
+            ) as fence,
+        ):
+            response = client.post(
+                "/_internal/managed-attempts/cafebabe/fence",
+                headers={"authorization": "Bearer exact-owner-token"},
+                json=self._fence_payload(),
+            )
+
+        assert response.status_code == 409
+        assert response.json() == {"detail": "managed_attempt_fence_effect_not_admitted"}
+        fence.assert_not_called()
+
+    def test_lifecycle_read_rejects_valid_bearer_outside_relation_scope(self, client):
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.terminal_auth_token_matches",
+                return_value=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.managed_attempt_lifecycle_caller_is_authorized",
+                return_value=False,
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.get_managed_attempt_lifecycle"
+            ) as read_lifecycle,
+        ):
+            response = client.get(
+                "/_internal/managed-attempts/735",
+                params={"caller_terminal_id": "deadbeef"},
+                headers={"authorization": "Bearer unrelated-terminal-token"},
+            )
+
+        assert response.status_code == 403
+        assert response.json() == {"detail": "managed_attempt_caller_scope_mismatch"}
+        read_lifecycle.assert_not_called()
+
+
 class TestCapacitySettings:
     def test_put_capacity_settings_updates_all_limits_atomically(self, client):
         projection = {"capacity_settings": {"schema_version": 1}}

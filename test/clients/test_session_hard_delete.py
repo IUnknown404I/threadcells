@@ -38,6 +38,7 @@ from cli_agent_orchestrator.clients.database import (
     TerminalModel,
     UsageRecordModel,
     WorkflowEffectModel,
+    WorkflowEffectResolutionModel,
     WorkflowModel,
     WorkflowProviderReconnectAttemptModel,
     WorkflowTurnModel,
@@ -1028,6 +1029,7 @@ def test_hard_delete_purges_owned_graph_and_preserves_shared_registry_and_other_
         "workflow_turns": 1,
         "workflow_turn_receipts": 1,
         "workflow_effects": 1,
+        "workflow_effect_resolutions": 0,
         "workflow_provider_reconnect_attempts": 1,
         "provider_execution_leases": 0,
         "worktree_writer_leases": 0,
@@ -1079,6 +1081,95 @@ def test_hard_delete_purges_owned_graph_and_preserves_shared_registry_and_other_
         assert tombstone.deletion_reason == "operator_session_hard_delete"
         assert tombstone.retained_resources_json == "[]"
         assert db.query(TerminalDeletionReceiptModel).count() == 0
+
+
+def test_hard_delete_purges_owned_effect_resolutions_without_cross_session_orphans(
+    monkeypatch,
+):
+    _install_database(monkeypatch)
+    with database.SessionLocal() as db:
+        db.add_all(
+            [
+                _terminal("owner"),
+                _terminal("foreign", session_id="foreign", session_name="cao-foreign"),
+            ]
+        )
+        workflow = WorkflowModel(root_terminal_id="owner", status="terminal")
+        foreign_workflow = WorkflowModel(root_terminal_id="foreign", status="terminal")
+        db.add_all([workflow, foreign_workflow])
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="owned-resolved",
+            state="finished",
+        )
+        foreign_turn = WorkflowTurnModel(
+            workflow_id=foreign_workflow.id,
+            kind="external_input",
+            dedupe_key="foreign-resolved",
+            state="finished",
+        )
+        db.add_all([turn, foreign_turn])
+        db.flush()
+        effect = WorkflowEffectModel(
+            workflow_id=workflow.id,
+            workflow_turn_id=turn.id,
+            effect_kind="complete_workflow",
+            effect_key="owned-resolved",
+            state="indeterminate",
+            claim_token="owned-claim",
+        )
+        foreign_effect = WorkflowEffectModel(
+            workflow_id=foreign_workflow.id,
+            workflow_turn_id=foreign_turn.id,
+            effect_kind="complete_workflow",
+            effect_key="foreign-resolved",
+            state="indeterminate",
+            claim_token="foreign-claim",
+        )
+        db.add_all([effect, foreign_effect])
+        db.flush()
+        resolution = WorkflowEffectResolutionModel(
+            workflow_effect_id=effect.id,
+            outcome="completed",
+            reason_code="WORKFLOW_TERMINALIZED",
+            evidence_workflow_turn_id=turn.id,
+        )
+        foreign_resolution = WorkflowEffectResolutionModel(
+            workflow_effect_id=foreign_effect.id,
+            outcome="completed",
+            reason_code="WORKFLOW_TERMINALIZED",
+            evidence_workflow_turn_id=foreign_turn.id,
+        )
+        db.add_all([resolution, foreign_resolution])
+        db.commit()
+        effect_id = int(effect.id)
+        resolution_id = int(resolution.id)
+        foreign_effect_id = int(foreign_effect.id)
+        foreign_resolution_id = int(foreign_resolution.id)
+
+    _fence_and_mark()
+    completed = database.complete_session_hard_deletion("session", "cao-session")
+
+    assert completed["completed"] is True
+    assert completed["before_counts"]["workflow_effect_resolutions"] == 1
+    assert completed["after_counts"]["workflow_effect_resolutions"] == 0
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowEffectModel, effect_id) is None
+        assert db.get(WorkflowEffectResolutionModel, resolution_id) is None
+        assert db.get(WorkflowEffectModel, foreign_effect_id) is not None
+        assert db.get(WorkflowEffectResolutionModel, foreign_resolution_id) is not None
+        assert (
+            db.query(WorkflowEffectResolutionModel)
+            .outerjoin(
+                WorkflowEffectModel,
+                WorkflowEffectModel.id == WorkflowEffectResolutionModel.workflow_effect_id,
+            )
+            .filter(WorkflowEffectModel.id.is_(None))
+            .count()
+            == 0
+        )
 
 
 def test_historical_indeterminate_is_fenced_then_purged_without_result_fabrication(monkeypatch):
@@ -2471,6 +2562,6 @@ def test_hard_purge_sql_shape_is_fixed_with_one_session_tombstone(
 
     one = run(1)
     fifty = run(50)
-    assert one[:2] == fifty[:2] == (104, 75)
+    assert one[:2] == fifty[:2] == (109, 79)
     assert one[2] == 0
     assert fifty[2] == 1

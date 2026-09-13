@@ -17,6 +17,7 @@ from cli_agent_orchestrator.clients.database import (
     SessionDeletionCancellationAuditModel,
     TerminalModel,
     WorkflowEffectModel,
+    WorkflowEffectResolutionModel,
     WorkflowModel,
     WorkflowProviderReconnectAttemptModel,
     WorkflowTurnModel,
@@ -410,6 +411,172 @@ def test_queued_unadmitted_input_is_cancellable_audited_and_idempotent(monkeypat
             ("workflow", "open", "cancelled"),
             ("workflow_turn", "queued", "cancelled"),
         }
+
+
+def test_resolved_effect_survives_session_cancellation_retry_and_restart(monkeypatch, tmp_path):
+    database_url = f"sqlite:///{tmp_path / 'resolved-cancellation.sqlite'}"
+    engine = _install_database(monkeypatch, database_url)
+    with database.SessionLocal() as db:
+        db.add_all([_terminal(), _terminal("foreign", "foreign-session")])
+        workflow = WorkflowModel(root_terminal_id="owner", status="open")
+        foreign_workflow = WorkflowModel(root_terminal_id="foreign", status="terminal")
+        db.add_all([workflow, foreign_workflow])
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="resolved-cancellation",
+            state="queued",
+        )
+        foreign_turn = WorkflowTurnModel(
+            workflow_id=foreign_workflow.id,
+            kind="external_input",
+            dedupe_key="foreign-resolved",
+            state="finished",
+        )
+        db.add_all([turn, foreign_turn])
+        db.flush()
+        effect = WorkflowEffectModel(
+            workflow_id=workflow.id,
+            workflow_turn_id=turn.id,
+            effect_kind="complete_workflow",
+            effect_key="resolved-cancellation",
+            state="indeterminate",
+            claim_token="resolved-claim",
+        )
+        foreign_effect = WorkflowEffectModel(
+            workflow_id=foreign_workflow.id,
+            workflow_turn_id=foreign_turn.id,
+            effect_kind="complete_workflow",
+            effect_key="foreign-resolved",
+            state="indeterminate",
+            claim_token="foreign-claim",
+        )
+        db.add_all([effect, foreign_effect])
+        db.flush()
+        resolution = WorkflowEffectResolutionModel(
+            workflow_effect_id=effect.id,
+            outcome="completed",
+            reason_code="WORKFLOW_TERMINALIZED",
+            evidence_workflow_turn_id=turn.id,
+        )
+        foreign_resolution = WorkflowEffectResolutionModel(
+            workflow_effect_id=foreign_effect.id,
+            outcome="completed",
+            reason_code="WORKFLOW_TERMINALIZED",
+            evidence_workflow_turn_id=foreign_turn.id,
+        )
+        db.add_all([resolution, foreign_resolution])
+        db.commit()
+        workflow_id = int(workflow.id)
+        turn_id = int(turn.id)
+        effect_id = int(effect.id)
+        resolution_id = int(resolution.id)
+        foreign_effect_id = int(foreign_effect.id)
+        foreign_resolution_id = int(foreign_resolution.id)
+
+    before = _plan()
+    assert before["deletion_mode"] == "eligible_with_cancellable_work"
+    assert before["cancellable_count"] == 2
+    assert before["historical_indeterminate_count"] == 0
+    assert before["unsafe_count"] == 0
+
+    first = database.cancel_session_work_for_deletion(
+        "session", expected_plan_token=before["plan_token"]
+    )
+    retry = database.cancel_session_work_for_deletion(
+        "session", expected_plan_token=before["plan_token"]
+    )
+    assert first["cancelled"] is True and first["residual"]["eligible"] is True
+    assert retry["cancelled"] is True and retry["already_cancelled"] is True
+
+    engine.dispose()
+    _install_database(monkeypatch, database_url)
+    assert _plan()["eligible"] is True
+    history = interaction_read_model_service.list_interactions("session", mode="history", limit=20)
+    resolved_item = next(
+        item for item in history["items"] if item["id"] == f"effect:{effect_id:020d}"
+    )
+    assert resolved_item["workflow"]["effect_state"] == "indeterminate"
+    assert resolved_item["workflow"]["effect_outcome"] == "completed"
+    assert resolved_item["final_disposition"] == "completed"
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowModel, workflow_id).status == "cancelled"
+        assert db.get(WorkflowTurnModel, turn_id).state == "cancelled"
+        assert db.get(WorkflowEffectModel, effect_id).state == "indeterminate"
+        preserved = db.get(WorkflowEffectResolutionModel, resolution_id)
+        assert preserved is not None
+        assert (preserved.outcome, preserved.reason_code) == (
+            "completed",
+            "WORKFLOW_TERMINALIZED",
+        )
+        assert {
+            (row.item_kind, row.previous_state, row.final_state)
+            for row in db.query(SessionDeletionCancellationAuditModel).all()
+        } == {
+            ("workflow", "open", "cancelled"),
+            ("workflow_turn", "queued", "cancelled"),
+        }
+        assert db.get(WorkflowEffectModel, foreign_effect_id).state == "indeterminate"
+        assert db.get(WorkflowEffectResolutionModel, foreign_resolution_id) is not None
+
+
+def test_genuinely_unresolved_effect_retirement_stays_explicit_and_idempotent(monkeypatch):
+    _install_database(monkeypatch)
+    with database.SessionLocal() as db:
+        db.add(_terminal())
+        workflow = WorkflowModel(root_terminal_id="owner", status="terminal")
+        db.add(workflow)
+        db.flush()
+        turn = WorkflowTurnModel(
+            workflow_id=workflow.id,
+            kind="external_input",
+            dedupe_key="genuinely-unresolved",
+            state="finished",
+        )
+        db.add(turn)
+        db.flush()
+        db.add(
+            WorkflowEffectModel(
+                workflow_id=workflow.id,
+                workflow_turn_id=turn.id,
+                effect_kind="send_message",
+                effect_key="genuinely-unresolved",
+                state="indeterminate",
+                claim_token="unresolved-claim",
+            )
+        )
+        db.commit()
+
+    plan = _plan()
+    assert plan["historical_indeterminate_count"] == 1
+    first = database.cancel_session_work_for_deletion(
+        "session",
+        expected_plan_token=plan["plan_token"],
+        cancel_unresolved_work=False,
+        retire_historical_indeterminate=True,
+    )
+    retry = database.cancel_session_work_for_deletion(
+        "session",
+        expected_plan_token=plan["plan_token"],
+        cancel_unresolved_work=False,
+        retire_historical_indeterminate=True,
+    )
+    assert first["cancelled"] is True and first["retired_indeterminate_count"] == 1
+    assert retry["cancelled"] is True and retry["already_cancelled"] is True
+    with database.SessionLocal() as db:
+        assert db.query(WorkflowEffectResolutionModel).count() == 0
+        assert db.query(WorkflowEffectModel).one().state == ("operator_retired_indeterminate")
+        audit = db.query(SessionDeletionCancellationAuditModel).one()
+        assert (
+            audit.previous_state,
+            audit.final_state,
+            audit.reason_code,
+        ) == (
+            "indeterminate",
+            "operator_retired_indeterminate",
+            "OPERATOR_RETIRED_UNKNOWN_OUTCOME",
+        )
 
 
 def test_sent_turn_requires_exact_receiver_receipt_to_be_historical(monkeypatch):

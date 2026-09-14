@@ -257,7 +257,19 @@ function HousekeepingWarnings({ warnings, className = '' }: { warnings: string[]
 </span>}</li> })}</ul>
 }
 
-function HousekeepingReport({ report, diskState }: { report: Record<string, any> | null; diskState: string }) {
+function reportWithOperationTiming(operation: FullCleanupOperation, fallback?: Record<string, any> | null) {
+  const report = operation.report || fallback
+  if (!report) return null
+  const startedAt = report.started_at || operation.started_at || null
+  const completedAt = report.completed_at || operation.completed_at || null
+  let duration = report.duration_seconds
+  if (duration === undefined && startedAt && completedAt) {
+    duration = Math.max(0, (Date.parse(completedAt) - Date.parse(startedAt)) / 1000)
+  }
+  return { ...report, started_at: startedAt, completed_at: completedAt, duration_seconds: duration }
+}
+
+function HousekeepingReport({ report }: { report: Record<string, any> | null }) {
   const { t, tp, locale } = useI18n()
   const { timeZone } = useTimeZone()
   if (!report || report.status === 'never_run') return <div className="rounded-xl border border-dashed border-gray-700 p-6 text-center">
@@ -267,21 +279,33 @@ function HousekeepingReport({ report, diskState }: { report: Record<string, any>
 </div>
   const protectedResources = Array.isArray(report.protected_resources) ? report.protected_resources : []
   const executionSkips = Array.isArray(report.execution_skips) ? report.execution_skips : []
-  const skipped = protectedResources.length + executionSkips.length
-  const started = report.started_at ? formatAbsoluteTimestamp(report.started_at, locale, timeZone) : t('housekeeping.notRecorded')
-  const completed = report.completed_at ? formatAbsoluteTimestamp(report.completed_at, locale, timeZone) : t('housekeeping.recordedServer')
-  const duration = report.duration_seconds === undefined ? t('housekeeping.notRecorded') : t('housekeeping.seconds', { count: Number(report.duration_seconds).toFixed(1) })
+  const executionFailures = Array.isArray(report.execution_failures) ? report.execution_failures : []
+  const warnings = Array.isArray(report.warnings) ? report.warnings : []
+  const started = report.started_at ? formatAbsoluteTimestamp(report.started_at, locale, timeZone) : t('housekeeping.notAvailable')
+  const completed = report.completed_at ? formatAbsoluteTimestamp(report.completed_at, locale, timeZone) : t('housekeeping.notAvailable')
+  const duration = report.duration_seconds === undefined || report.duration_seconds === null ? t('housekeeping.notAvailable') : t('housekeeping.seconds', { count: Number(report.duration_seconds).toFixed(1) })
   const classes = Object.entries(report.reclaimed_bytes_by_class || {})
-  const completedWithIssues = report.ok === false || report.completed_with_issues === true
+  const resultKey: TranslationKey = report.final_status === 'failed' || report.ok === false
+    ? 'housekeeping.failedResult'
+    : report.final_status === 'completed_with_issues' || report.completed_with_issues === true
+      ? 'housekeeping.completedWarnings'
+      : 'status.workflow.completed'
+  const resultingDisk = report.post_disk_state
+  const diskResult = resultingDisk?.state
+    ? t(resourceStateTranslationKey(String(resultingDisk.state)))
+    : t('housekeeping.notAvailable')
+  const diskDetail = resultingDisk?.used_percent === undefined
+    ? undefined
+    : t('housekeeping.diskSnapshot', { percent: resultingDisk.used_percent, free: bytes(resultingDisk.free_bytes) })
   const fullCounts = Number(report.cache_pruned || 0) + Number(report.reproducible_caches_removed || 0) + Number(report.browser_revisions_removed || 0) + Number(report.ephemeral_resources_removed || 0) + Number(report.build_artifacts_removed || 0)
   return <div className="space-y-3">
     <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-      <Summary label={t('housekeeping.result')} value={t(completedWithIssues ? 'housekeeping.completedIssues' : 'status.workflow.completed')} />
+      <Summary label={t('housekeeping.result')} value={t(resultKey)} />
       <Summary label={t('housekeeping.started')} value={started} />
       <Summary label={t('housekeeping.completedAt')} value={completed} />
       <Summary label={t('housekeeping.duration')} value={duration} />
       <Summary label={t('housekeeping.reclaimedTotal')} value={bytes(report.freed_bytes)} detail={report.observed_disk_free_delta === undefined ? undefined : t('housekeeping.observedDelta', { size: bytes(report.observed_disk_free_delta) })} />
-      <Summary label={t('housekeeping.resultingHealth')} value={t(resourceStateTranslationKey(diskState))} />
+      <Summary label={t('housekeeping.resultingHealth')} value={diskResult} detail={diskDetail} />
     </div>
     {report.full_cleanup && <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
       <Summary label={t('housekeeping.plannedReclaim')} value={bytes(report.reclaimable_bytes)} detail={tp('resources', Number(report.planned_candidates || 0))} />
@@ -291,7 +315,7 @@ function HousekeepingReport({ report, diskState }: { report: Record<string, any>
       <Summary label={t('housekeeping.worktreesRetired')} value={String(Number(report.worktrees_retired || 0))} />
       <Summary label={t('housekeeping.cachesRemoved')} value={String(fullCounts)} />
       <Summary label={t('housekeeping.logsRemoved')} value={String(Number(report.logs_deleted || 0))} />
-      <Summary label={t('housekeeping.protectedSkipped')} value={String(skipped)} />
+      <Summary label={t('housekeeping.protectedSkipped')} value={String(protectedResources.length + executionSkips.length)} />
     </div>}
     <div className="grid gap-3 lg:grid-cols-2">
       <div className="rounded-xl border border-gray-700/60 bg-gray-800/60 p-4">
@@ -299,10 +323,28 @@ function HousekeepingReport({ report, diskState }: { report: Record<string, any>
 <dt className="text-xs text-gray-400">{label}</dt>
 <dd className="mt-1 text-sm text-gray-200">{bytes(Number(value || 0))}</dd>
 </div>)}</dl> : <p className="mt-3 text-xs text-gray-400">{t('housekeeping.noClassReclaim')}</p>}</div>
-      <div className="rounded-xl border border-gray-700/60 bg-gray-800/60 p-4">
-<h3 className="text-sm font-semibold text-gray-200">{t('housekeeping.protectionErrors')}</h3>
-<p className="mt-3 text-sm text-gray-300">{tp('housekeeping.protectedItems', skipped)}</p>{protectedResources.length ? <ul className="mt-2 max-h-40 list-disc space-y-1 overflow-auto pl-5 text-xs text-amber-200">{protectedResources.map((item: any, index: number) => <li key={`protected-${index}`}>{item.canonical_identity ? `${item.canonical_identity}: ` : ''}{item.reason || t('housekeeping.protected')}{item.category ? ` · ${String(item.category)}` : ''}{item.bytes === undefined ? '' : ` · ${bytes(Number(item.bytes || 0))}`}</li>)}</ul> : null}{executionSkips.length ? <ul className="mt-2 max-h-40 list-disc space-y-1 overflow-auto pl-5 text-xs text-amber-200">{executionSkips.map((item: any, index: number) => <li key={`skip-${index}`}>{item.candidate ? `${item.candidate}: ` : ''}{item.reason_code || 'EXECUTION_SKIPPED'}</li>)}</ul> : null}{report.execution_failures?.length ? <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-red-300">{report.execution_failures.map((item: any, index: number) => <li key={`failure-${index}`}>{item.reason_code || 'EXECUTION_FAILURE'}</li>)}</ul> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noFailures')}</p>}<HousekeepingWarnings warnings={report.warnings || []} className="mt-2" />
-</div>
+    </div>
+    <div className="grid gap-3 sm:grid-cols-2">
+      <section className="rounded-xl border border-gray-700/60 bg-gray-800/60 p-4">
+        <h3 className="text-sm font-semibold text-gray-200">{t('housekeeping.protectedResources')}</h3>
+        <p className="mt-1 text-xs text-gray-400">{tp('housekeeping.protectedResourcesCount', protectedResources.length)}</p>
+        {protectedResources.length ? <ul className="mt-2 max-h-40 list-disc space-y-1 overflow-auto pl-5 text-xs text-gray-300">{protectedResources.map((item: any, index: number) => <li key={`protected-${index}`}>{item.canonical_identity ? `${item.canonical_identity}: ` : ''}{item.reason || t('housekeeping.protected')}{item.category ? ` · ${String(item.category)}` : ''}{item.bytes === undefined ? '' : ` · ${bytes(Number(item.bytes || 0))}`}</li>)}</ul> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noneRecorded')}</p>}
+      </section>
+      <section className="rounded-xl border border-gray-700/60 bg-gray-800/60 p-4">
+        <h3 className="text-sm font-semibold text-gray-200">{t('housekeeping.executionSkips')}</h3>
+        <p className="mt-1 text-xs text-gray-400">{t('housekeeping.executionSkipCount', { count: executionSkips.length })}</p>
+        {executionSkips.length ? <ul className="mt-2 max-h-40 list-disc space-y-1 overflow-auto pl-5 text-xs text-cyan-200">{executionSkips.map((item: any, index: number) => <li key={`skip-${index}`}>{item.candidate ? `${item.candidate}: ` : ''}{item.reason_code || 'EXECUTION_SKIPPED'}</li>)}</ul> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noneRecorded')}</p>}
+      </section>
+      <section className="rounded-xl border border-amber-800/50 bg-amber-950/10 p-4">
+        <h3 className="text-sm font-semibold text-amber-100">{t('housekeeping.diagnosticWarnings')}</h3>
+        <p className="mt-1 text-xs text-amber-200/70">{t('housekeeping.warningCount', { count: warnings.length })}</p>
+        {warnings.length ? <HousekeepingWarnings warnings={warnings} className="mt-2 max-h-40 overflow-auto" /> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noneRecorded')}</p>}
+      </section>
+      <section className="rounded-xl border border-red-900/50 bg-red-950/10 p-4">
+        <h3 className="text-sm font-semibold text-red-100">{t('housekeeping.executionFailures')}</h3>
+        <p className="mt-1 text-xs text-red-200/70">{t('housekeeping.failureCount', { count: executionFailures.length })}</p>
+        {executionFailures.length ? <ul className="mt-2 max-h-40 list-disc space-y-1 overflow-auto pl-5 text-xs text-red-300">{executionFailures.map((item: any, index: number) => <li key={`failure-${index}`}>{item.candidate ? `${item.candidate}: ` : ''}{item.reason_code || 'EXECUTION_FAILURE'}</li>)}</ul> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noFailures')}</p>}
+      </section>
     </div>
     <Artifact value={report} label={t('housekeeping.rawReport')}/>
   </div>
@@ -360,8 +402,9 @@ function HousekeepingSettingsPage() {
         const active = operation.state === 'admitted' || operation.state === 'running'
         setFullRunning(active)
         if (operation.report) {
-          setFullReport(operation.report)
-          setReport(operation.report)
+          const timedReport = reportWithOperationTiming(operation)
+          setFullReport(timedReport)
+          setReport(timedReport)
         }
         if (active) timer = setTimeout(() => void observe(), 1500)
       } catch {
@@ -463,7 +506,7 @@ function HousekeepingSettingsPage() {
       const result = await api.runFullCleanup(fullPlan.operation_id, fullPlan.plan_id, retireDirtyWorktrees)
       const operation = await api.getFullCleanupOperation(fullPlan.operation_id)
       setFullOperation(operation)
-      const report = operation.report || result
+      const report = reportWithOperationTiming(operation, result)
       setFullReport(report)
       setReport(report)
       setFullPlan(null)
@@ -621,7 +664,7 @@ function HousekeepingSettingsPage() {
 </div>
 </details>
         </div>}
-        {fullReport && <HousekeepingReport report={fullReport} diskState={diskState} />}
+        {fullReport && <HousekeepingReport report={fullReport} />}
       </div>
     </section>
     <ConfirmModal open={fullConfirm} title={t('housekeeping.full.confirmTitle')} message={t(fullPlan?.release_state.active_only_expected ? 'housekeeping.full.confirmActive' : 'housekeeping.full.confirmAmbiguous')} details={fullPlan ? [{ label: t('housekeeping.full.estimated'), value: bytes(fullPlan.reclaimable_bytes) }, { label: t('common.resources'), value: String(fullActionable.length) }, { label: t('housekeeping.full.activePreserved'), value: fullPlan.release_state.active_release || t('housekeeping.authorityUnproven') }] : []} confirmLabel={t('housekeeping.full.run')} variant="danger" loading={fullRunning} onConfirm={() => void runFull()} onCancel={() => setFullConfirm(false)}>
@@ -638,7 +681,7 @@ function HousekeepingSettingsPage() {
 <Summary label={t('housekeeping.diskHealth')} value={t(resourceStateTranslationKey(diskState))} detail={capacity ? t('housekeeping.diskUsed', { percent: used, gib: capacity.root_disk.free_gib }) : t('housekeeping.resourceUnavailable')} />
 <Summary label={t('housekeeping.safelyReclaimable')} value={plan ? bytes(plan.reclaimable_bytes) : t('housekeeping.buildPlan')} detail={plan ? t('housekeeping.actionableCandidates', { count: actionable.length }) : t('housekeeping.noEstimate')} />
 <Summary label={t('housekeeping.currentState')} value={t(running ? 'housekeeping.running' : 'status.idle')} detail={t(running ? 'housekeeping.operationProgress' : 'housekeeping.noOperation')} />
-<Summary label={t('housekeeping.lastRun')} value={report?.status === 'never_run' ? t('housekeeping.never') : report ? t(report.ok === false || report.completed_with_issues ? 'housekeeping.completedIssues' : 'status.workflow.completed') : t('output.unavailable')} />
+<Summary label={t('housekeeping.lastRun')} value={report?.status === 'never_run' ? t('housekeeping.never') : report ? t(report.final_status === 'failed' || report.ok === false ? 'housekeeping.failedResult' : report.final_status === 'completed_with_issues' || report.completed_with_issues ? 'housekeeping.completedWarnings' : 'status.workflow.completed') : t('output.unavailable')} />
 <Summary label={t('housekeeping.nextRun')} value={humanInterval(settings.schedule.frequent, locale)} detail={`${t(weekdayKey(weekly[1] as Weekday))} ${weekly[2]} UTC · ${t('housekeeping.pressureRecovery')}`} />
 <Summary label={t('housekeeping.backups')} value={t('housekeeping.protected')} detail={t('housekeeping.inventoryOnly')} />
 </div>
@@ -755,7 +798,7 @@ function HousekeepingSettingsPage() {
 </div>}</section>
 <section aria-labelledby="latest-report-heading">
 <h2 id="latest-report-heading" className="mb-3 text-base font-semibold text-gray-100">{t('housekeeping.latestReport')}</h2>
-<HousekeepingReport report={report} diskState={diskState}/>
+<HousekeepingReport report={report}/>
 </section>{error && <p role="alert" className="rounded-lg border border-red-700/50 bg-red-950/30 p-3 text-sm text-red-300">{error}</p>}{fullCleanupDanger}</section>
 }
 

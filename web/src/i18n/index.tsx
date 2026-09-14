@@ -6,7 +6,7 @@ export { appLocales, catalogs, type AppLocale, type TranslationKey } from './cat
 export const APP_LOCALE_STORAGE_KEY = 'threadcells.app.locale'
 
 type Params = Record<string, string | number>
-type PluralStem = 'sessions' | 'agents' | 'resources' | 'releases' | 'operator.unlocked' | 'housekeeping.protectedItems'
+type PluralStem = 'sessions' | 'agents' | 'resources' | 'releases' | 'operator.unlocked' | 'housekeeping.protectedItems' | 'housekeeping.protectedResourcesCount'
 
 export function isAppLocale(value: unknown): value is AppLocale {
   return typeof value === 'string' && (appLocales as readonly string[]).includes(value)

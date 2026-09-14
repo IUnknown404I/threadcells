@@ -428,6 +428,8 @@ describe('Control-plane settings routes', () => {
         plan_id: 'b'.repeat(64),
         state: 'completed',
         progress: { sequence: 4, processed_candidates: 4 },
+        started_at: '2026-08-20T10:00:00Z',
+        completed_at: '2026-08-20T10:00:02Z',
         report,
       })
 
@@ -437,6 +439,7 @@ describe('Control-plane settings routes', () => {
     await waitFor(() => expect(latest).toHaveBeenCalledTimes(2))
     expect(await screen.findByText('completed')).toBeInTheDocument()
     expect(screen.getByText('Processed resources: 4')).toBeInTheDocument()
+    expect(screen.getAllByText('2.0 seconds').length).toBeGreaterThan(0)
   })
 
   it('shows the authoritative Full Cleanup idle blocker', async () => {
@@ -562,13 +565,15 @@ describe('Control-plane settings routes', () => {
       schedule: { frequent: '6h', weekly: 'Sun 04:00 UTC', pressure: 'on_red' },
     })
     vi.spyOn(api, 'getHousekeepingReport').mockResolvedValue({
-      ok: false, started_at: '2026-08-20T10:00:00Z', completed_at: '2026-08-20T10:00:02.5Z',
+      ok: false, final_status: 'failed', started_at: '2026-08-20T10:00:00Z', completed_at: '2026-08-20T10:00:02.5Z',
       duration_seconds: 2.5, freed_bytes: 1536, logs_compressed: 2, logs_deleted: 1,
       reclaimed_bytes_by_class: { logs: 1024, package_cache: 512 }, observed_disk_free_delta: 2048,
       attachments_deleted: 0, ephemeral_resources_removed: 1, browser_revisions_removed: 0,
       cache_pruned: 1,
       protected_resources: [{ canonical_identity: 'logs:/protected/current.log', category: 'logs', bytes: 256, reason: 'OPEN_BY_RUNTIME' }],
+      execution_skips: [{ candidate: 'logs:/changed.log', reason_code: 'BECAME_ACTIVE' }],
       execution_failures: [{ reason_code: 'FINGERPRINT_CHANGED' }], warnings: ['metadata_unknown'],
+      post_disk_state: { state: 'YELLOW', used_percent: 72, free_bytes: 12 * 1024 ** 3, total_bytes: 40 * 1024 ** 3 },
     })
     vi.spyOn(api, 'getOperatorSession').mockResolvedValue(operatorStatus())
     vi.spyOn(api, 'getOrchestrationCapacity').mockResolvedValue({
@@ -577,12 +582,17 @@ describe('Control-plane settings routes', () => {
 
     render(<ControlPlaneSettings section="housekeeping" navigate={() => {}} />)
 
-    expect((await screen.findAllByText('Completed with issues')).length).toBeGreaterThan(0)
+    expect((await screen.findAllByText('Failed')).length).toBeGreaterThan(0)
     expect(screen.getByText('2.5 seconds')).toBeInTheDocument()
     expect(screen.getByText('1.5 KiB')).toBeInTheDocument()
     expect(screen.getByText('logs')).toBeInTheDocument()
     expect(screen.getByText('package_cache')).toBeInTheDocument()
-    expect(screen.getByText('1 protected or skipped item')).toBeInTheDocument()
+    expect(screen.getByText('1 protected resource')).toBeInTheDocument()
+    expect(screen.getByText('Protected resources')).toBeInTheDocument()
+    expect(screen.getByText('Safety skips during execution')).toBeInTheDocument()
+    expect(screen.getByText('Diagnostic warnings')).toBeInTheDocument()
+    expect(screen.getByText('Execution failures')).toBeInTheDocument()
+    expect(screen.getByText(/logs:\/changed\.log: BECAME_ACTIVE/)).toBeInTheDocument()
     expect(screen.getByText('FINGERPRINT_CHANGED')).toBeInTheDocument()
     expect(screen.getByText('metadata_unknown')).toBeInTheDocument()
     expect(screen.getByText('Raw report')).toBeInTheDocument()

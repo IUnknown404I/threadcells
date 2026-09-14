@@ -19,10 +19,12 @@ import socket
 import stat
 import struct
 import sys
+import time
 import traceback
 import uuid
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -66,6 +68,44 @@ def _socket_path(config: Mapping[str, Any]) -> Path:
     if not value.is_absolute() or value.name != "full-cleanup.sock":
         raise FullCleanupHelperError("FULL_CLEANUP_HELPER_CONFIG_INVALID")
     return value
+
+
+def inventory_via_privileged_helper(*, config: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Read config-owned protected inventory without granting delete authority."""
+    if not config.get("full_cleanup_helper_socket"):
+        return None
+    request = {"schema_version": 2, "operation": "protected_inventory"}
+    payload = json.dumps(request, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            timeout = min(
+                30.0,
+                float(config.get("full_cleanup_helper_timeout_seconds", 30)),
+            )
+            connection.settimeout(timeout)
+            connection.connect(str(_socket_path(config)))
+            connection.sendall(payload)
+            connection.shutdown(socket.SHUT_WR)
+            response_payload = _receive_line(connection, _MAX_RESPONSE_BYTES)
+        response = json.loads(response_payload.decode("utf-8", "strict"))
+    except (
+        OSError,
+        TimeoutError,
+        UnicodeDecodeError,
+        ValueError,
+        TypeError,
+        FullCleanupHelperError,
+    ):
+        return None
+    if (
+        not isinstance(response, dict)
+        or response.get("schema_version") != 2
+        or response.get("ok") is not True
+        or response.get("operation") != "protected_inventory"
+        or not isinstance(response.get("inventory"), dict)
+    ):
+        return None
+    return dict(response["inventory"])
 
 
 def execute_via_privileged_helper(
@@ -318,6 +358,24 @@ def _handle_request(connection: socket.socket) -> dict[str, Any]:
         request = json.loads(raw.decode("utf-8", "strict"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise FullCleanupHelperError("FULL_CLEANUP_HELPER_PROTOCOL_INVALID") from exc
+    if request == {"schema_version": 2, "operation": "protected_inventory"}:
+        from cli_agent_orchestrator.services.housekeeping.planner import (
+            collect_protected_inventory_snapshot,
+        )
+
+        root = Path(str(bootstrap.get("root", "")))
+        if not root.is_absolute():
+            raise FullCleanupHelperError("FULL_CLEANUP_HELPER_CONFIG_INVALID")
+        inventory = collect_protected_inventory_snapshot(root=root, config=bootstrap)
+        response = {
+            "schema_version": 2,
+            "ok": True,
+            "operation": "protected_inventory",
+            "inventory": inventory,
+        }
+        if len(json.dumps(response, separators=(",", ":")).encode("utf-8")) > _MAX_RESPONSE_BYTES:
+            raise FullCleanupHelperError("FULL_CLEANUP_HELPER_MESSAGE_TOO_LARGE")
+        return response
     required_keys = {
         "schema_version",
         "operation",
@@ -411,6 +469,7 @@ def _handle_request(connection: socket.socket) -> dict[str, Any]:
                 raise FullCleanupHelperError("HOUSEKEEPING_PLAN_CHANGED")
             settings = get_housekeeping_settings(config)
             summary = HousekeepingSummary(mode="full", full_cleanup=True, idle_gate=idle_gate)
+            summary.started_at = datetime.now(timezone.utc).isoformat()
             summary.disk_before = shutil.disk_usage("/").free
             actionable = _prepare_housekeeping_summary(summary, plan)
 
@@ -533,7 +592,7 @@ def _handle_request(connection: socket.socket) -> dict[str, Any]:
                 root=Path(plan.root),
                 config=config,
                 proc_root=Path("/proc"),
-                completed_at=plan.generated_at,
+                completed_at=time.time(),
                 write_status=False,
             )
             if not complete_full_cleanup_operation(

@@ -12,6 +12,7 @@ from cli_agent_orchestrator.services.housekeeping_service import (
     _cleanup_labelled_docker_resources,
     _cleanup_logs,
     _cleanup_marked_orphan_browsers,
+    _complete_housekeeping_summary,
     _inventory_warnings,
     _open_paths,
     _open_paths_inventory,
@@ -20,6 +21,8 @@ from cli_agent_orchestrator.services.housekeeping_service import (
     _reconcile_supervisor_context_roles,
     _reconcile_writer_leases,
     _runtime_open_paths_inventory,
+    housekeeping_main,
+    run_housekeeping,
     run_pressure_recovery,
 )
 
@@ -70,6 +73,127 @@ def test_pressure_recovery_executes_the_exact_fresh_plan(tmp_path, monkeypatch):
     assert observed["plan"]["mode"] == "pressure"
     assert observed["run"]["dry_run"] is False
     assert observed["run"]["expected_plan_id"] == "a" * 64
+
+
+def test_summary_records_separate_outcome_timing_and_post_disk_state(monkeypatch):
+    summary = HousekeepingSummary(
+        started_at="2026-09-14T10:00:00+00:00",
+        disk_before=400,
+        warnings=["backup_inventory_incomplete"],
+        protected_resources=[{"canonical_identity": "backups:daily"}],
+    )
+    monkeypatch.setattr(
+        shutil,
+        "disk_usage",
+        lambda _path: shutil._ntuple_diskusage(total=1000, used=800, free=200),
+    )
+
+    result = _complete_housekeeping_summary(
+        summary,
+        config={
+            "root_used_yellow_percent": 70,
+            "root_used_red_percent": 85,
+            "root_used_critical_percent": 92,
+        },
+        completed_at=1_789_380_202.5,
+    )
+
+    assert result.completed_at == "2026-09-14T10:03:22.500000+00:00"
+    assert result.duration_seconds == 202.5
+    assert result.final_status == "completed_with_issues"
+    assert result.completed_with_issues is True
+    assert result.post_disk_state == {
+        "state": "YELLOW",
+        "used_percent": 80.0,
+        "free_bytes": 200,
+        "total_bytes": 1000,
+    }
+    assert result.protected_resources == [{"canonical_identity": "backups:daily"}]
+    assert result.execution_failures == []
+
+
+def test_failed_dry_run_is_reported_as_failed_not_preview(monkeypatch):
+    summary = HousekeepingSummary(
+        ok=False,
+        dry_run=True,
+        started_at="2026-09-14T10:00:00+00:00",
+        disk_before=400,
+        warnings=["RuntimeError:planner failed"],
+    )
+    monkeypatch.setattr(
+        shutil,
+        "disk_usage",
+        lambda _path: shutil._ntuple_diskusage(total=1000, used=800, free=200),
+    )
+
+    result = _complete_housekeeping_summary(
+        summary,
+        config={},
+        completed_at=1_789_380_001,
+    )
+
+    assert result.final_status == "failed"
+
+
+def test_plain_formatter_renders_structured_report_lists(monkeypatch, capsys):
+    summary = HousekeepingSummary(
+        protected_resources=[{"canonical_identity": "backups:daily", "bytes": 10}],
+        execution_skips=[{"candidate": "logs:active", "reason_code": "OPEN"}],
+        execution_failures=[{"candidate": "cache:changed", "reason_code": "CHANGED"}],
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service.run_housekeeping",
+        lambda **_kwargs: summary,
+    )
+
+    assert housekeeping_main(["--dry-run", "--mode", "frequent"]) == 0
+    output = capsys.readouterr().out
+    assert 'protected_resources=[{"bytes":10,"canonical_identity":"backups:daily"}]' in output
+    assert 'execution_skips=[{"candidate":"logs:active","reason_code":"OPEN"}]' in output
+    assert 'execution_failures=[{"candidate":"cache:changed","reason_code":"CHANGED"}]' in output
+
+
+def test_dry_run_keeps_estimates_separate_from_actual_results(tmp_path, monkeypatch):
+    candidate = SimpleNamespace(
+        action="delete",
+        category="logs",
+        resource_kind="path",
+        canonical_identity="logs:old",
+    )
+    plan = SimpleNamespace(
+        plan_id="a" * 64,
+        candidates=(candidate,),
+        reclaimable_bytes=1024,
+        class_summaries={
+            "logs": {
+                "reclaimable_bytes": 1024,
+                "preserved_bytes": 0,
+            }
+        },
+        warnings=(),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service.get_housekeeping_settings",
+        lambda _config: {"policy": {}},
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service.plan_housekeeping",
+        lambda **_kwargs: plan,
+    )
+
+    summary = run_housekeeping(
+        config=_config(tmp_path),
+        dry_run=True,
+        mode="frequent",
+        now=1000,
+        proc_root=tmp_path / "proc",
+    )
+
+    assert summary.reclaimable_bytes == 1024
+    assert summary.reclaimable_bytes_by_class == {"logs": 1024}
+    assert summary.freed_bytes == 0
+    assert summary.logs_deleted == 0
+    assert summary.final_status == "preview"
 
 
 def test_housekeeping_reuses_canonical_supervisor_role_reconciliation(monkeypatch):

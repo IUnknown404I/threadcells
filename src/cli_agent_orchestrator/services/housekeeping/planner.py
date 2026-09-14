@@ -135,7 +135,7 @@ def _tree_size_inventory(path: Path) -> tuple[int, bool]:
             return 0, False
     try:
         completed = subprocess.run(
-            ["du", "-sb", "--apparent-size", "--", str(path)],
+            ["du", "-sb", "--apparent-size", "--one-file-system", "--", str(path)],
             capture_output=True,
             text=True,
             check=False,
@@ -157,6 +157,392 @@ def _parallel_tree_sizes(paths: list[Path]) -> dict[Path, tuple[int, bool]]:
     workers = max(1, min(8, len(paths) or 1))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         return dict(zip(paths, pool.map(_tree_size_inventory, paths), strict=True))
+
+
+_MAX_INVENTORY_ENTRIES = 4096
+_INVENTORY_TIMEOUT_SECONDS = 20
+
+
+def _inventory_tree_sizes(paths: list[Path]) -> dict[Path, tuple[int, bool]]:
+    """Measure a trusted path set in one bounded ``du`` invocation."""
+    unique_paths = list(dict.fromkeys(paths))
+    if not unique_paths:
+        return {}
+    encoded_paths = {os.fsencode(str(path)): path for path in unique_paths}
+    payload = b"".join(raw_path + b"\0" for raw_path in encoded_paths)
+    try:
+        completed = subprocess.run(
+            [
+                "du",
+                "-sb",
+                "--apparent-size",
+                "--one-file-system",
+                "--null",
+                "--files0-from=-",
+            ],
+            input=payload,
+            capture_output=True,
+            check=False,
+            env={**os.environ, "LC_ALL": "C", "QUOTING_STYLE": "literal"},
+            timeout=_INVENTORY_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {path: (0, False) for path in unique_paths}
+
+    parsed: dict[Path, int] = {}
+    for record in completed.stdout.split(b"\0"):
+        if not record:
+            continue
+        raw_size, separator, raw_path = record.partition(b"\t")
+        path = encoded_paths.get(raw_path)
+        if not separator or path is None:
+            continue
+        try:
+            parsed[path] = max(0, int(raw_size))
+        except ValueError:
+            continue
+    implicated = {path for raw_path, path in encoded_paths.items() if raw_path in completed.stderr}
+    diagnostics_bound = completed.returncode == 0 or bool(implicated)
+    return {
+        path: (
+            parsed.get(path, 0),
+            path in parsed and diagnostics_bound and path not in implicated,
+        )
+        for path in unique_paths
+    }
+
+
+def _inventory_kind(path: Path) -> str:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return "unknown"
+    if stat.S_ISLNK(metadata.st_mode):
+        return "symlink"
+    if stat.S_ISDIR(metadata.st_mode):
+        return "directory"
+    if stat.S_ISREG(metadata.st_mode):
+        return "file"
+    return "other"
+
+
+def _prepare_inventory_root(path: Path, *, expand_entries: bool) -> dict[str, Any]:
+    """Capture identities and a bounded measurement set for one trusted root."""
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return {
+            "result": {"present": False, "entries": [], "entries_certain": True},
+            "path": path,
+            "metadata": None,
+            "entries": [],
+            "before": {},
+            "expanded": False,
+            "measurement_paths": [],
+        }
+    except OSError:
+        return {
+            "result": {"present": True, "entries": [], "entries_certain": False},
+            "path": path,
+            "metadata": None,
+            "entries": [],
+            "before": {},
+            "expanded": False,
+            "measurement_paths": [],
+        }
+    kind = _inventory_kind(path)
+    result: dict[str, Any] = {
+        "present": True,
+        "kind": kind,
+        "size": 0,
+        "size_certain": False,
+        "mtime_ns": metadata.st_mtime_ns,
+        "entries": [],
+        "entries_certain": True,
+    }
+    if not expand_entries or kind != "directory":
+        return {
+            "result": result,
+            "path": path,
+            "metadata": metadata,
+            "entries": [],
+            "before": {},
+            "expanded": False,
+            "measurement_paths": [path],
+        }
+    try:
+        entries = sorted(path.iterdir(), key=lambda item: item.name)
+    except OSError:
+        result["entries_certain"] = False
+        return {
+            "result": result,
+            "path": path,
+            "metadata": metadata,
+            "entries": [],
+            "before": {},
+            "expanded": False,
+            "measurement_paths": [path],
+        }
+    if len(entries) > _MAX_INVENTORY_ENTRIES:
+        result["entries_certain"] = False
+        return {
+            "result": result,
+            "path": path,
+            "metadata": metadata,
+            "entries": [],
+            "before": {},
+            "expanded": False,
+            "measurement_paths": [path],
+        }
+    before: dict[Path, os.stat_result | None] = {}
+    for entry in entries:
+        try:
+            before[entry] = entry.lstat()
+        except OSError:
+            before[entry] = None
+    return {
+        "result": result,
+        "path": path,
+        "metadata": metadata,
+        "entries": entries,
+        "before": before,
+        "expanded": True,
+        "measurement_paths": entries,
+    }
+
+
+def _finish_inventory_root(
+    prepared: Mapping[str, Any], measurements: Mapping[Path, tuple[int, bool]]
+) -> dict[str, Any]:
+    result = dict(prepared["result"])
+    metadata = prepared["metadata"]
+    if metadata is None:
+        return result
+    path = prepared["path"]
+    entries: list[Path] = prepared["entries"]
+    before: Mapping[Path, os.stat_result | None] = prepared["before"]
+    expanded = bool(prepared["expanded"])
+
+    if not expanded:
+        result["size"], result["size_certain"] = measurements.get(path, (0, False))
+    else:
+        # Each child measurement includes its own directory entry. Adding the
+        # configured root's stat size produces the same apparent-size model
+        # without scanning the whole tree a second time.
+        result["size"] = metadata.st_size
+        result["size_certain"] = True
+    records: list[dict[str, Any]] = []
+    for entry in entries:
+        try:
+            entry_metadata = entry.lstat()
+        except OSError:
+            records.append(
+                {
+                    "name": entry.name,
+                    "kind": "unknown",
+                    "size": 0,
+                    "size_certain": False,
+                    "mtime_ns": 0,
+                }
+            )
+            result["size_certain"] = False
+            continue
+        entry_size, entry_certain = measurements.get(entry, (0, False))
+        original = before[entry]
+        entry_certain = bool(
+            entry_certain
+            and original is not None
+            and (
+                original.st_dev,
+                original.st_ino,
+                original.st_mode,
+                original.st_size,
+                original.st_mtime_ns,
+            )
+            == (
+                entry_metadata.st_dev,
+                entry_metadata.st_ino,
+                entry_metadata.st_mode,
+                entry_metadata.st_size,
+                entry_metadata.st_mtime_ns,
+            )
+        )
+        records.append(
+            {
+                "name": entry.name,
+                "kind": _inventory_kind(entry),
+                "size": entry_size,
+                "size_certain": entry_certain,
+                "mtime_ns": entry_metadata.st_mtime_ns,
+            }
+        )
+        result["size"] += entry_size
+        result["size_certain"] = bool(result["size_certain"] and entry_certain)
+    if expanded:
+        result["entries"] = records
+    try:
+        final_metadata = path.lstat()
+    except OSError:
+        result["entries_certain"] = False
+        result["size_certain"] = False
+    else:
+        if (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_mtime_ns,
+        ) != (
+            final_metadata.st_dev,
+            final_metadata.st_ino,
+            final_metadata.st_mode,
+            final_metadata.st_mtime_ns,
+        ):
+            result["entries_certain"] = False
+            result["size_certain"] = False
+    return result
+
+
+def _inventory_root_snapshot(path: Path, *, expand_entries: bool) -> dict[str, Any]:
+    """Measure one trusted configured root without following inventory symlinks."""
+    prepared = _prepare_inventory_root(path, expand_entries=expand_entries)
+    measurements = _inventory_tree_sizes(prepared["measurement_paths"])
+    return _finish_inventory_root(prepared, measurements)
+
+
+def collect_protected_inventory_snapshot(
+    *, root: Path, config: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Collect bounded read-only inventory for config-owned protected roots."""
+    prepared_records: list[tuple[str, int, dict[str, Any]]] = [
+        ("backups", -1, _prepare_inventory_root(root / "backups", expand_entries=True))
+    ]
+    values = config.get("protected_inventory_roots", [])
+    if isinstance(values, list):
+        for index, entry in enumerate(values):
+            if not isinstance(entry, Mapping):
+                continue
+            category = str(entry.get("category", "protected_storage"))
+            path = Path(str(entry.get("path", "")))
+            if not path.is_absolute():
+                continue
+            prepared_records.append(
+                (
+                    "protected",
+                    index,
+                    _prepare_inventory_root(path, expand_entries=category == "tools"),
+                )
+            )
+    measurement_paths = [
+        path
+        for _source, _index, prepared in prepared_records
+        for path in prepared["measurement_paths"]
+    ]
+    measurements = _inventory_tree_sizes(measurement_paths)
+    records = [
+        {
+            "source": source,
+            "index": index,
+            **_finish_inventory_root(prepared, measurements),
+        }
+        for source, index, prepared in prepared_records
+    ]
+    return {"schema_version": 1, "roots": records}
+
+
+def _valid_inventory_measurement(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and isinstance(value.get("present"), bool)
+        and isinstance(value.get("entries_certain"), bool)
+        and isinstance(value.get("entries"), list)
+        and (
+            value.get("present") is False
+            or (
+                value.get("kind") in {"file", "directory", "symlink", "other", "unknown"}
+                and isinstance(value.get("size"), int)
+                and not isinstance(value.get("size"), bool)
+                and value.get("size", -1) >= 0
+                and isinstance(value.get("size_certain"), bool)
+                and isinstance(value.get("mtime_ns"), int)
+                and not isinstance(value.get("mtime_ns"), bool)
+                and value.get("mtime_ns", -1) >= 0
+            )
+        )
+    )
+
+
+def _validated_inventory_snapshot(
+    value: Any, *, root: Path, config: Mapping[str, Any]
+) -> dict[tuple[str, int], Mapping[str, Any]] | None:
+    """Bind a helper response back to configured roots; caller supplies no paths."""
+    if not isinstance(value, Mapping) or value.get("schema_version") != 1:
+        return None
+    records = value.get("roots")
+    if not isinstance(records, list):
+        return None
+    expected: set[tuple[str, int]] = {("backups", -1)}
+    values = config.get("protected_inventory_roots", [])
+    if isinstance(values, list):
+        expected.update(
+            ("protected", index)
+            for index, entry in enumerate(values)
+            if isinstance(entry, Mapping) and Path(str(entry.get("path", ""))).is_absolute()
+        )
+    result: dict[tuple[str, int], Mapping[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, Mapping):
+            return None
+        source = record.get("source")
+        index = record.get("index")
+        if (
+            not isinstance(source, str)
+            or source not in {"backups", "protected"}
+            or not isinstance(index, int)
+            or isinstance(index, bool)
+        ):
+            return None
+        key = (source, index)
+        if key not in expected or key in result or not _valid_inventory_measurement(record):
+            return None
+        entries = record.get("entries", [])
+        if len(entries) > _MAX_INVENTORY_ENTRIES:
+            return None
+        for entry in entries:
+            if not isinstance(entry, Mapping) or not _valid_inventory_measurement(
+                {**entry, "present": True, "entries": [], "entries_certain": True}
+            ):
+                return None
+            name = entry.get("name")
+            if (
+                not isinstance(name, str)
+                or not name
+                or name in {".", ".."}
+                or Path(name).name != name
+                or "\x00" in name
+            ):
+                return None
+        result[key] = record
+    return result if set(result) == expected else None
+
+
+def _load_protected_inventory_snapshot(
+    *, root: Path, config: Mapping[str, Any]
+) -> dict[tuple[str, int], Mapping[str, Any]]:
+    snapshot: Any = None
+    if config.get("full_cleanup_helper_socket"):
+        try:
+            from cli_agent_orchestrator.services.full_cleanup_helper import (
+                inventory_via_privileged_helper,
+            )
+
+            snapshot = inventory_via_privileged_helper(config=config)
+        except Exception:
+            snapshot = None
+    validated = _validated_inventory_snapshot(snapshot, root=root, config=config)
+    if validated is not None:
+        return validated
+    local = collect_protected_inventory_snapshot(root=root, config=config)
+    return _validated_inventory_snapshot(local, root=root, config=config) or {}
 
 
 def _ephemeral_marker(path: Path) -> dict[str, Any] | None:
@@ -684,54 +1070,94 @@ def _plan_full_cleanup_artifacts(
 
 def _plan_protected_inventory(
     config: Mapping[str, Any],
+    protection: ProtectedSet,
+    snapshot: Mapping[tuple[str, int], Mapping[str, Any]],
 ) -> tuple[list[HousekeepingCandidate], list[str]]:
     result: list[HousekeepingCandidate] = []
     warnings: list[str] = []
     values = config.get("protected_inventory_roots", [])
     if not isinstance(values, list):
         return [], ["protected_inventory_roots_invalid"]
-    inventories: list[tuple[Mapping[str, Any], Path, Path, str, str]] = []
-    for entry in values:
+    inventories: list[tuple[int, Mapping[str, Any], Path, str, str]] = []
+    for index, entry in enumerate(values):
         if not isinstance(entry, Mapping):
             warnings.append("protected_inventory_entry_invalid")
             continue
         path = Path(str(entry.get("path", "")))
         category = str(entry.get("category", "protected_storage"))
         reason = str(entry.get("reason", "RETENTION_AUTHORITY_UNKNOWN"))
-        try:
-            if not path.is_absolute() or path.is_symlink() or not path.exists():
-                continue
-            inventories.append((entry, path, path.resolve(strict=True), category, reason))
-        except OSError:
+        if not path.is_absolute():
             warnings.append(f"protected_inventory_unreadable:{category}")
-    measured = _parallel_tree_sizes(
-        [path for _entry, path, _resolved, _category, _reason in inventories]
-    )
-    for entry, path, resolved, category, reason in inventories:
+            continue
+        inventories.append((index, entry, path, category, reason))
+    for index, entry, path, category, reason in inventories:
+        measurement = snapshot.get(("protected", index))
+        if measurement is None or measurement.get("present") is not True:
+            continue
+        if not measurement.get("size_certain") or not measurement.get("entries_certain"):
+            warnings.append(f"protected_inventory_incomplete:{category}")
+        entries = measurement.get("entries", []) if category == "tools" else []
+        if category == "tools" and entries and measurement.get("entries_certain"):
+            for record in entries:
+                child = path / str(record["name"])
+                dynamic_reason = protection.reason(child, category)
+                child_reason = dynamic_reason or reason
+                authority = "active_runtime" if dynamic_reason else "unknown"
+                result.append(
+                    _resource_candidate(
+                        category=category,
+                        resource_kind="inventory",
+                        identity=str(child.absolute()),
+                        fingerprint_payload={
+                            "path": str(child.absolute()),
+                            "kind": record["kind"],
+                            "size": record["size"],
+                            "mtime_ns": record["mtime_ns"],
+                        },
+                        size=int(record["size"]),
+                        action="preserve",
+                        retention_reason="inventory_only",
+                        protection_reason=child_reason,
+                        attributes={
+                            "purpose": str(entry.get("purpose", "protected storage")),
+                            "authority": authority,
+                            "resource_type": str(record["kind"]),
+                            "measurement": ("complete" if record["size_certain"] else "partial"),
+                        },
+                    )
+                )
+                if not record["size_certain"]:
+                    warnings.append(f"protected_inventory_incomplete:{category}")
+            continue
         try:
-            size, certain = measured[path]
-            if not certain:
-                warnings.append(f"protected_inventory_incomplete:{category}")
             result.append(
                 _resource_candidate(
                     category=category,
                     resource_kind="inventory",
-                    identity=str(resolved),
+                    identity=str(path.absolute()),
                     fingerprint_payload={
-                        "path": str(resolved),
-                        "size": size,
-                        "mtime_ns": path.lstat().st_mtime_ns,
+                        "path": str(path.absolute()),
+                        "kind": measurement.get("kind", "unknown"),
+                        "size": measurement.get("size", 0),
+                        "mtime_ns": measurement.get("mtime_ns", 0),
                     },
-                    size=size,
+                    size=int(measurement.get("size", 0)),
                     action="preserve",
                     retention_reason="inventory_only",
                     protection_reason=reason,
-                    attributes={"purpose": str(entry.get("purpose", "protected storage"))},
+                    attributes={
+                        "purpose": str(entry.get("purpose", "protected storage")),
+                        "authority": "unknown" if category == "tools" else "protected",
+                        "resource_type": str(measurement.get("kind", "unknown")),
+                        "measurement": (
+                            "complete" if measurement.get("size_certain") else "partial"
+                        ),
+                    },
                 )
             )
-        except OSError:
+        except (TypeError, ValueError):
             warnings.append(f"protected_inventory_unreadable:{category}")
-    return result, warnings
+    return result, list(dict.fromkeys(warnings))
 
 
 def _process_start_epoch(process: Path, proc_root: Path, now: float) -> float | None:
@@ -1772,6 +2198,7 @@ def build_plan(
         open_inventory=open_inventory,
         full_cleanup=full_cleanup,
     )
+    protected_snapshot = _load_protected_inventory_snapshot(root=root, config=config)
     candidates = [
         *_plan_logs(
             root,
@@ -1875,28 +2302,70 @@ def build_plan(
             candidates.extend(artifacts)
             runtime_warnings.extend(artifact_warnings)
     backups = root / "backups"
-    if backups.exists():
-        backup_size, backup_inventory_certain = _tree_size_inventory(backups)
-        candidates.append(
-            _resource_candidate(
-                category="backups",
-                resource_kind="inventory",
-                identity=str(backups.resolve()),
-                fingerprint_payload={
-                    "path": str(backups.resolve()),
-                    "size": backup_size,
-                    "mtime_ns": backups.lstat().st_mtime_ns,
-                },
-                size=backup_size,
-                action="preserve",
-                retention_reason="inventory_only",
-                protection_reason="BACKUP_PROTECTED",
-                attributes={"purpose": "recovery points and source snapshots"},
-            )
-        )
-        if not backup_inventory_certain:
+    backup_measurement = protected_snapshot.get(("backups", -1))
+    if backup_measurement is not None and backup_measurement.get("present") is True:
+        if not backup_measurement.get("size_certain") or not backup_measurement.get(
+            "entries_certain"
+        ):
             runtime_warnings.append("backup_inventory_incomplete")
-    protected_inventory, protected_warnings = _plan_protected_inventory(config)
+        backup_entries = backup_measurement.get("entries", [])
+        if backup_entries and backup_measurement.get("entries_certain"):
+            for record in backup_entries:
+                path = backups / str(record["name"])
+                candidates.append(
+                    _resource_candidate(
+                        category="backups",
+                        resource_kind="inventory",
+                        identity=str(path.absolute()),
+                        fingerprint_payload={
+                            "path": str(path.absolute()),
+                            "kind": record["kind"],
+                            "size": record["size"],
+                            "mtime_ns": record["mtime_ns"],
+                        },
+                        size=int(record["size"]),
+                        action="preserve",
+                        retention_reason="inventory_only",
+                        protection_reason="BACKUP_PROTECTED",
+                        attributes={
+                            "purpose": "recovery points and source snapshots",
+                            "authority": "protected",
+                            "resource_type": str(record["kind"]),
+                            "measurement": ("complete" if record["size_certain"] else "partial"),
+                        },
+                    )
+                )
+                if not record["size_certain"]:
+                    runtime_warnings.append("backup_inventory_incomplete")
+        else:
+            candidates.append(
+                _resource_candidate(
+                    category="backups",
+                    resource_kind="inventory",
+                    identity=str(backups.absolute()),
+                    fingerprint_payload={
+                        "path": str(backups.absolute()),
+                        "kind": backup_measurement.get("kind", "unknown"),
+                        "size": backup_measurement.get("size", 0),
+                        "mtime_ns": backup_measurement.get("mtime_ns", 0),
+                    },
+                    size=int(backup_measurement.get("size", 0)),
+                    action="preserve",
+                    retention_reason="inventory_only",
+                    protection_reason="BACKUP_PROTECTED",
+                    attributes={
+                        "purpose": "recovery points and source snapshots",
+                        "authority": "protected",
+                        "resource_type": str(backup_measurement.get("kind", "unknown")),
+                        "measurement": (
+                            "complete" if backup_measurement.get("size_certain") else "partial"
+                        ),
+                    },
+                )
+            )
+    protected_inventory, protected_warnings = _plan_protected_inventory(
+        config, protection, protected_snapshot
+    )
     candidates.extend(protected_inventory)
     runtime_warnings.extend(protected_warnings)
     if mode == "pressure":
@@ -1915,5 +2384,5 @@ def build_plan(
         mode=mode,
         root=root,
         candidates=candidates,
-        warnings=[*protection.warnings, *runtime_warnings],
+        warnings=list(dict.fromkeys([*protection.warnings, *runtime_warnings])),
     )

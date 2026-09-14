@@ -178,6 +178,40 @@ def _submit_result(parent_id: str, child_id: str, body: str) -> dict:
     return {"notice_id": notice.id, "result_id": notice.result_id}
 
 
+def test_acknowledgement_accepts_append_only_request_effect_resolution(authority_db, tmp_path):
+    repo, revision = _repository(tmp_path)
+    with database.SessionLocal() as db:
+        db.add(_reviewer("reviewer", repo, revision))
+        db.commit()
+
+    request = _start_review("parent", "reviewer", "Review exact revision")
+    with database.SessionLocal() as db:
+        request_effect = db.get(database.WorkflowEffectModel, request["effect_id"])
+        request_effect.state = "indeterminate"
+        db.add(
+            database.WorkflowEffectResolutionModel(
+                workflow_effect_id=request_effect.id,
+                outcome="completed",
+                reason_code="DELEGATION_ATTEMPT_DELIVERED",
+            )
+        )
+        db.commit()
+    result = _submit_result("parent", "reviewer", "PASS for exact revision")
+
+    accepted = acknowledge_child_assignment_result_outcome("parent", result_id=result["result_id"])
+    assert accepted["accepted"] is True
+    with database.SessionLocal() as db:
+        request_effect = db.get(database.WorkflowEffectModel, request["effect_id"])
+        assert request_effect.state == "indeterminate"
+        assert (
+            db.query(database.WorkflowEffectResolutionModel)
+            .filter_by(workflow_effect_id=request_effect.id)
+            .one()
+            .outcome
+            == "completed"
+        )
+
+
 def test_pass_becomes_stale_when_same_branch_moves(authority_db, tmp_path):
     repo, revision_a = _repository(tmp_path)
     with database.SessionLocal() as db:

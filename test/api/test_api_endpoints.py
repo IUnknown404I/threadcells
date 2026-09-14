@@ -2940,7 +2940,7 @@ class TestFlowDaemon:
 
 class TestWorkflowDaemon:
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("failed_reconciliation", ["handoff", "assigned", "queue"])
+    @pytest.mark.parametrize("failed_reconciliation", ["effect", "handoff", "assigned", "queue"])
     async def test_workflow_daemon_reconciles_handoffs_before_queue_and_isolates_failures(
         self, failed_reconciliation
     ):
@@ -2951,6 +2951,12 @@ class TestWorkflowDaemon:
             calls.append("handoff")
             if failed_reconciliation == "handoff":
                 raise RuntimeError("handoff failure")
+
+        def reconcile_effects():
+            calls.append("effect")
+            if failed_reconciliation == "effect":
+                raise RuntimeError("effect reconciliation failure")
+            return 0
 
         def reconcile_queue(_registry=None):
             calls.append("queue")
@@ -2966,6 +2972,10 @@ class TestWorkflowDaemon:
             calls.append("compatibility")
 
         with (
+            patch(
+                "cli_agent_orchestrator.api.main.reconcile_workflow_effect_resolutions",
+                side_effect=reconcile_effects,
+            ) as effects,
             patch(
                 "cli_agent_orchestrator.api.main.workflow_service."
                 "fence_stale_provider_runtime_compatibility",
@@ -2986,7 +2996,8 @@ class TestWorkflowDaemon:
         ):
             assert await _workflow_reconciliation_tick(None, False) is False
 
-        assert calls == ["compatibility", "handoff", "assigned", "queue"]
+        assert calls == ["effect", "compatibility", "handoff", "assigned", "queue"]
+        effects.assert_called_once_with()
         compatibility.assert_called_once_with()
         handoffs.assert_called_once_with(None)
         assigned.assert_called_once_with()

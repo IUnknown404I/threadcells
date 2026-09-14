@@ -1271,6 +1271,43 @@ class WorkflowEffectModel(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
+class WorkflowEffectResolutionModel(Base):
+    """Append-only semantic resolution for an uncertain privileged transport.
+
+    ``workflow_effects.state`` remains the transport observation made by the
+    process that owned the non-transactional boundary.  Later durable facts
+    may prove the logical operation's outcome without proving that process's
+    response path.  This one-row ledger records that exact evidence while
+    preserving the original claimed/indeterminate history.
+    """
+
+    __tablename__ = "workflow_effect_resolutions"
+    __table_args__ = (UniqueConstraint("workflow_effect_id", name="uq_workflow_effect_resolution"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    workflow_effect_id = Column(Integer, nullable=False, index=True)
+    outcome = Column(String, nullable=False)
+    reason_code = Column(String, nullable=False)
+    evidence_effect_id = Column(Integer, nullable=True)
+    evidence_workflow_turn_id = Column(Integer, nullable=True)
+    evidence_assignment_id = Column(Integer, nullable=True)
+    evidence_result_id = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class WorkflowEffectReconciliationCursorModel(Base):
+    """Persistent fair-scan position for unresolved privileged effects."""
+
+    __tablename__ = "workflow_effect_reconciliation_cursor"
+
+    id = Column(Integer, primary_key=True)
+    last_workflow_effect_id = Column(Integer, nullable=False, default=0)
+    last_fence_effect_id = Column(Integer, nullable=False, default=0)
+    fence_probe_effect_id = Column(Integer, nullable=True)
+    last_fence_assignment_id = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
 # Module-level singletons
 DB_DIR.mkdir(parents=True, exist_ok=True)
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
@@ -3039,6 +3076,8 @@ def _ensure_workflow_schema() -> None:
     ProviderRuntimeCompatibilityScanModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowTurnReceiptModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowEffectModel.__table__.create(bind=engine, checkfirst=True)
+    WorkflowEffectResolutionModel.__table__.create(bind=engine, checkfirst=True)
+    WorkflowEffectReconciliationCursorModel.__table__.create(bind=engine, checkfirst=True)
     _migrate_workflow_turn_columns()
 
 
@@ -4954,6 +4993,7 @@ def _session_unresolved_work_plan_in_transaction(
         effect_workflow = aliased(WorkflowModel)
         effect_turn = aliased(WorkflowTurnModel)
         turn_workflow = aliased(WorkflowModel)
+        effect_resolution = aliased(WorkflowEffectResolutionModel)
         effects = bounded(
             db.query(WorkflowEffectModel, effect_workflow, effect_turn)
             .outerjoin(
@@ -4965,12 +5005,17 @@ def _session_unresolved_work_plan_in_transaction(
                 effect_turn.id == WorkflowEffectModel.workflow_turn_id,
             )
             .outerjoin(turn_workflow, turn_workflow.id == effect_turn.workflow_id)
+            .outerjoin(
+                effect_resolution,
+                effect_resolution.workflow_effect_id == WorkflowEffectModel.id,
+            )
             .filter(
                 or_(
                     effect_workflow.root_terminal_id.in_(terminal_ids),
                     turn_workflow.root_terminal_id.in_(terminal_ids),
                 ),
                 WorkflowEffectModel.state.in_(("claimed", "indeterminate")),
+                effect_resolution.id.is_(None),
             )
             .order_by(WorkflowEffectModel.id.asc())
         )
@@ -5416,6 +5461,7 @@ def cancel_session_work_for_deletion(
     _ensure_terminal_worktree_authority_schema()
     _ensure_workflow_schema()
     _ensure_child_assignment_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     _ensure_delegation_result_schema()
     _ensure_provider_execution_schema()
     _ensure_session_deletion_receipt_schema()
@@ -8486,6 +8532,7 @@ def _ensure_terminal_ui_projection_schema() -> None:
     _ensure_provider_execution_schema()
     _ensure_workflow_schema()
     _ensure_child_assignment_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     _ensure_delegation_result_schema()
     _ensure_session_deletion_receipt_schema()
     engine_identity = id(engine)
@@ -9211,6 +9258,9 @@ def _session_owned_graph_queries(
     effect_ids = db.query(WorkflowEffectModel.id).filter(
         WorkflowEffectModel.workflow_id.in_(workflow_ids)
     )
+    effect_resolution_ids = db.query(WorkflowEffectResolutionModel.id).filter(
+        WorkflowEffectResolutionModel.workflow_effect_id.in_(effect_ids)
+    )
     assignment_ids = db.query(ChildAssignmentModel.id).filter(
         ChildAssignmentModel.parent_terminal_id.in_(terminal_values),
         ChildAssignmentModel.child_terminal_id.in_(terminal_values),
@@ -9235,6 +9285,7 @@ def _session_owned_graph_queries(
         "workflow_ids": workflow_ids,
         "turn_ids": turn_ids,
         "effect_ids": effect_ids,
+        "effect_resolution_ids": effect_resolution_ids,
         "assignment_ids": assignment_ids,
         "managed_attempt_ids": managed_attempt_ids,
         "result_ids": result_ids,
@@ -9266,6 +9317,11 @@ def _session_owned_row_counts_in_transaction(
         "workflow_effects": int(
             db.query(WorkflowEffectModel.id)
             .filter(WorkflowEffectModel.id.in_(owned["effect_ids"]))
+            .count()
+        ),
+        "workflow_effect_resolutions": int(
+            db.query(WorkflowEffectResolutionModel.id)
+            .filter(WorkflowEffectResolutionModel.id.in_(owned["effect_resolution_ids"]))
             .count()
         ),
         "workflow_provider_reconnect_attempts": int(
@@ -10258,6 +10314,22 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
                 WorkflowTurnReceiptModel.workflow_turn_id.in_(owned["turn_ids"])
             )
         )
+        deleted_effect_resolutions = _delete_query(
+            db.query(WorkflowEffectResolutionModel).filter(
+                WorkflowEffectResolutionModel.workflow_effect_id.in_(owned["effect_ids"])
+            )
+        )
+        remaining_effect_resolutions = int(
+            db.query(WorkflowEffectResolutionModel.id)
+            .filter(WorkflowEffectResolutionModel.workflow_effect_id.in_(owned["effect_ids"]))
+            .count()
+        )
+        if (
+            deleted_effect_resolutions != before_counts["workflow_effect_resolutions"]
+            or remaining_effect_resolutions != 0
+        ):
+            db.rollback()
+            return {"completed": False, "reason_code": "SESSION_PURGE_INCOMPLETE"}
         _delete_query(
             db.query(WorkflowEffectModel).filter(WorkflowEffectModel.id.in_(owned["effect_ids"]))
         )
@@ -15628,6 +15700,11 @@ def _mirror_workflow_effect_ledger(
         .all()
     )
     for prior in prior_effects:
+        prior_resolution = (
+            db.query(WorkflowEffectResolutionModel)
+            .filter_by(workflow_effect_id=prior.id)
+            .one_or_none()
+        )
         state = "indeterminate" if prior.state == "claimed" else prior.state
         if (
             state == "rejected"
@@ -15672,24 +15749,44 @@ def _mirror_workflow_effect_ledger(
             else:
                 existing.state = "not_admitted"
             existing.updated_at = now
+            if prior_resolution is not None:
+                _append_workflow_effect_resolution(
+                    db,
+                    existing,
+                    str(prior_resolution.outcome),
+                    "EFFECT_RESOLUTION_MIRRORED",
+                    now,
+                    evidence_effect_id=prior.id,
+                    evidence_turn_id=source_turn_id,
+                )
             continue
-        db.add(
-            WorkflowEffectModel(
-                workflow_id=workflow_id,
-                workflow_turn_id=target_turn_id,
-                effect_kind=prior.effect_kind,
-                effect_key=prior.effect_key,
-                state=state,
-                claim_token=uuid.uuid4().hex,
-                mirrored_from_effect_id=(
-                    prior.mirrored_from_effect_id
-                    if prior.mirrored_from_effect_id is not None
-                    else prior.id
-                ),
-                created_at=now,
-                updated_at=now,
-            )
+        mirrored = WorkflowEffectModel(
+            workflow_id=workflow_id,
+            workflow_turn_id=target_turn_id,
+            effect_kind=prior.effect_kind,
+            effect_key=prior.effect_key,
+            state=state,
+            claim_token=uuid.uuid4().hex,
+            mirrored_from_effect_id=(
+                prior.mirrored_from_effect_id
+                if prior.mirrored_from_effect_id is not None
+                else prior.id
+            ),
+            created_at=now,
+            updated_at=now,
         )
+        db.add(mirrored)
+        db.flush()
+        if prior_resolution is not None:
+            _append_workflow_effect_resolution(
+                db,
+                mirrored,
+                str(prior_resolution.outcome),
+                "EFFECT_RESOLUTION_MIRRORED",
+                now,
+                evidence_effect_id=prior.id,
+                evidence_turn_id=source_turn_id,
+            )
 
 
 def _bind_receipted_provider_execution(
@@ -16390,6 +16487,600 @@ def finish_workflow_effect(
         return True
 
 
+def _durable_workflow_effect_key(kind: str, *parts: object) -> str:
+    """Build the MCP ledger key without importing the MCP server."""
+    digest = hashlib.sha256("\x1f".join(map(str, parts)).encode()).hexdigest()
+    return f"{kind}:{digest}"
+
+
+def _append_workflow_effect_resolution(
+    db: Any,
+    effect: WorkflowEffectModel,
+    outcome: str,
+    reason_code: str,
+    now: datetime,
+    *,
+    evidence_effect_id: Optional[int] = None,
+    evidence_turn_id: Optional[int] = None,
+    assignment_id: Optional[int] = None,
+    result_id: Optional[str] = None,
+) -> bool:
+    """Append one exact semantic outcome without rewriting transport history."""
+    if (
+        db.query(WorkflowEffectResolutionModel.id)
+        .filter_by(workflow_effect_id=effect.id)
+        .one_or_none()
+        is not None
+    ):
+        return False
+    db.add(
+        WorkflowEffectResolutionModel(
+            workflow_effect_id=effect.id,
+            outcome=outcome,
+            reason_code=reason_code,
+            evidence_effect_id=evidence_effect_id,
+            evidence_workflow_turn_id=evidence_turn_id,
+            evidence_assignment_id=assignment_id,
+            evidence_result_id=result_id,
+            created_at=now,
+        )
+    )
+    db.flush()
+    return True
+
+
+def _workflow_effect_semantic_outcome(db: Any, effect: WorkflowEffectModel) -> str:
+    """Return canonical logical truth while retaining the raw transport state."""
+    resolution = (
+        db.query(WorkflowEffectResolutionModel.outcome)
+        .filter_by(workflow_effect_id=effect.id)
+        .one_or_none()
+    )
+    return str(resolution[0]) if resolution is not None else str(effect.state)
+
+
+def _terminal_session_identity_in_transaction(db: Any, terminal_id: str) -> Optional[str]:
+    terminal = db.get(TerminalModel, terminal_id)
+    if terminal is not None:
+        return str(terminal.session_id or f"legacy:{terminal.tmux_session}")
+    receipt = db.get(TerminalDeletionReceiptModel, terminal_id)
+    return _terminal_receipt_session_identity(receipt) if receipt is not None else None
+
+
+def _assignment_effect_resolution_evidence(
+    db: Any,
+    effect: WorkflowEffectModel,
+    workflow: WorkflowModel,
+    turn: WorkflowTurnModel,
+) -> Optional[tuple[str, str, int, Optional[str]]]:
+    """Prove the exact delegation target and a durable delivery or failure boundary."""
+    assignment = (
+        db.query(ChildAssignmentModel).filter_by(request_workflow_effect_id=effect.id).one_or_none()
+    )
+    if assignment is None or assignment.child_workflow_id is None:
+        return None
+    child_workflow = db.get(WorkflowModel, assignment.child_workflow_id)
+    child_turn = (
+        db.get(WorkflowTurnModel, assignment.child_workflow_turn_id)
+        if assignment.child_workflow_turn_id is not None
+        else None
+    )
+    parent_session = _terminal_session_identity_in_transaction(
+        db, str(assignment.parent_terminal_id)
+    )
+    child_session = _terminal_session_identity_in_transaction(db, str(assignment.child_terminal_id))
+    if (
+        assignment.request_workflow_id != workflow.id
+        or assignment.request_workflow_turn_id != turn.id
+        or assignment.parent_terminal_id != workflow.root_terminal_id
+        or child_workflow is None
+        or child_workflow.root_terminal_id != assignment.child_terminal_id
+        or child_turn is None
+        or child_turn.workflow_id != child_workflow.id
+        or child_turn.transport_binding is None
+        or parent_session is None
+        or child_session is None
+        or parent_session != child_session
+    ):
+        return None
+    child_receipt = (
+        db.query(WorkflowTurnReceiptModel.id)
+        .filter_by(
+            workflow_turn_id=child_turn.id,
+            receiver_terminal_id=assignment.child_terminal_id,
+        )
+        .one_or_none()
+    )
+    lifecycle = db.get(ManagedAttemptLifecycleModel, assignment.id)
+    lifecycle_matches = bool(
+        lifecycle is not None
+        and lifecycle.attempt_id == assignment.attempt_id
+        and lifecycle.parent_terminal_id == assignment.parent_terminal_id
+        and lifecycle.child_terminal_id == assignment.child_terminal_id
+        and lifecycle.request_workflow_effect_id == effect.id
+        and lifecycle.child_workflow_id == child_workflow.id
+        and lifecycle.child_workflow_turn_id == child_turn.id
+    )
+    result = (
+        db.query(DelegationResultModel).filter_by(child_assignment_id=assignment.id).one_or_none()
+    )
+    result_matches = bool(
+        result is not None
+        and result.parent_terminal_id == assignment.parent_terminal_id
+        and result.child_terminal_id == assignment.child_terminal_id
+        and result.parent_workflow_id == workflow.id
+        and result.delegation_kind == effect.effect_kind
+    )
+    delivered = bool(
+        child_receipt is not None
+        or (
+            lifecycle_matches
+            and (
+                lifecycle.prompt_delivery_acknowledged_at is not None
+                or lifecycle.provider_admitted_at is not None
+            )
+        )
+        or (effect.effect_kind == "handoff" and assignment.handoff_input_received)
+        or (result_matches and result.status == DelegationResultStatus.COMPLETE.value)
+    )
+    result_id = str(result.id) if result_matches and result is not None else None
+    if delivered:
+        return "completed", "DELEGATION_ATTEMPT_DELIVERED", int(assignment.id), result_id
+    terminal_failure = bool(
+        (lifecycle_matches and lifecycle.state in {"failed", "fenced"})
+        or assignment.status
+        in {
+            ChildAssignmentStatus.FENCED.value,
+            ChildAssignmentStatus.CANCELLED.value,
+        }
+        or (
+            result_matches
+            and result is not None
+            and result.status
+            in {
+                DelegationResultStatus.INCOMPLETE.value,
+                DelegationResultStatus.CANCELLED.value,
+            }
+            and result.finalized_at is not None
+        )
+    )
+    if terminal_failure:
+        return "rejected", "DELEGATION_ATTEMPT_TERMINALIZED", int(assignment.id), result_id
+    return None
+
+
+def _fence_effect_matches_lifecycle(
+    db: Any,
+    effect: WorkflowEffectModel,
+    workflow: WorkflowModel,
+    lifecycle: ManagedAttemptLifecycleModel,
+) -> bool:
+    """Match an owner fence only to its complete immutable lifecycle identity."""
+    identity = (
+        lifecycle.assignment_id,
+        lifecycle.attempt_id,
+        lifecycle.parent_terminal_id,
+        lifecycle.child_terminal_id,
+        lifecycle.request_workflow_effect_id,
+        lifecycle.child_workflow_turn_id,
+        lifecycle.reason_code,
+        lifecycle.expected_runtime_generation,
+        lifecycle.expected_writer_authority_generation,
+    )
+    if lifecycle.state != "fenced" or any(value is None for value in identity):
+        return False
+    if not _critical_owner_recovery_scope_matches_in_transaction(
+        db,
+        str(workflow.root_terminal_id),
+        str(lifecycle.parent_terminal_id),
+        reason_code=str(lifecycle.reason_code),
+    ):
+        return False
+    return effect.effect_key == _durable_workflow_effect_key("fence_managed_attempt", *identity)
+
+
+def _resumed_effect_descends_from(
+    db: Any, workflow_id: int, descendant_turn_id: int, ancestor_turn_id: int
+) -> bool:
+    """Prove one same-workflow replay chain through turns and receipts."""
+    workflow = db.get(WorkflowModel, workflow_id)
+    if workflow is None:
+        return False
+    current_id = descendant_turn_id
+    visited: set[int] = set()
+    while current_id not in visited:
+        if current_id == ancestor_turn_id:
+            return True
+        visited.add(current_id)
+        turn = db.get(WorkflowTurnModel, current_id)
+        if turn is None or turn.workflow_id != workflow_id or turn.resume_parent_turn_id is None:
+            return False
+        parent_id = int(turn.resume_parent_turn_id)
+        receipt = (
+            db.query(WorkflowTurnReceiptModel)
+            .filter_by(
+                workflow_turn_id=parent_id,
+                receiver_terminal_id=workflow.root_terminal_id,
+            )
+            .one_or_none()
+        )
+        if (
+            receipt is None
+            or receipt.resumed_by_turn_id != current_id
+            or receipt.resumed_at is None
+        ):
+            return False
+        current_id = parent_id
+    return False
+
+
+def reconcile_workflow_effect_resolutions(
+    *, limit: int = 200, now: Optional[datetime] = None
+) -> int:
+    """Persist bounded exact outcomes for formerly uncertain effects.
+
+    This never rewrites the transport observation in ``workflow_effects``.
+    It records a semantic resolution only when an immutable relation proves
+    the exact workflow, logical turn, effect, and target/result identity.  A
+    same-key effect may resolve an ancestor only across a fully receipted
+    resume chain; unrelated workflows and turns are never considered.
+    """
+    if isinstance(limit, bool) or limit < 1 or limit > 1000:
+        raise ValueError("limit must be between 1 and 1000")
+    _ensure_workflow_schema()
+    _ensure_child_assignment_schema()
+    _ensure_managed_attempt_lifecycle_schema()
+    _ensure_delegation_result_schema()
+    now = now or datetime.now()
+    resolved = 0
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        cursor = db.get(WorkflowEffectReconciliationCursorModel, 1)
+        if cursor is None:
+            cursor = WorkflowEffectReconciliationCursorModel(id=1, updated_at=now)
+            db.add(cursor)
+            db.flush()
+
+        def unresolved_effect_page(after_id: int) -> List[WorkflowEffectModel]:
+            return cast(
+                List[WorkflowEffectModel],
+                db.query(WorkflowEffectModel)
+                .outerjoin(
+                    WorkflowEffectResolutionModel,
+                    WorkflowEffectResolutionModel.workflow_effect_id == WorkflowEffectModel.id,
+                )
+                .filter(
+                    WorkflowEffectModel.id > after_id,
+                    WorkflowEffectModel.state.in_(("claimed", "indeterminate")),
+                    WorkflowEffectModel.effect_kind != "fence_managed_attempt",
+                    WorkflowEffectResolutionModel.id.is_(None),
+                )
+                .order_by(WorkflowEffectModel.id.asc())
+                .limit(limit)
+                .all(),
+            )
+
+        effects = unresolved_effect_page(int(cursor.last_workflow_effect_id))
+        if not effects and cursor.last_workflow_effect_id:
+            cursor.last_workflow_effect_id = 0
+            effects = unresolved_effect_page(0)
+        if effects:
+            cursor.last_workflow_effect_id = int(effects[-1].id)
+        cursor.updated_at = now
+
+        def record(
+            effect: WorkflowEffectModel,
+            outcome: str,
+            reason_code: str,
+            *,
+            evidence_effect_id: Optional[int] = None,
+            evidence_turn_id: Optional[int] = None,
+            assignment_id: Optional[int] = None,
+            result_id: Optional[str] = None,
+        ) -> None:
+            nonlocal resolved
+            resolved += int(
+                _append_workflow_effect_resolution(
+                    db,
+                    effect,
+                    outcome,
+                    reason_code,
+                    now,
+                    evidence_effect_id=evidence_effect_id,
+                    evidence_turn_id=evidence_turn_id,
+                    assignment_id=assignment_id,
+                    result_id=result_id,
+                )
+            )
+
+        # Strong direct evidence first. This also creates the replay anchors
+        # used by the second pass in the same transaction.
+        for effect in effects:
+            workflow = db.get(WorkflowModel, effect.workflow_id)
+            turn = db.get(WorkflowTurnModel, effect.workflow_turn_id)
+            if workflow is None or turn is None or turn.workflow_id != workflow.id:
+                continue
+            receipt = (
+                db.query(WorkflowTurnReceiptModel.id)
+                .filter_by(
+                    workflow_turn_id=turn.id,
+                    receiver_terminal_id=workflow.root_terminal_id,
+                )
+                .one_or_none()
+            )
+            if receipt is None:
+                continue
+
+            if effect.effect_kind in {"assign", "handoff"}:
+                delegation = _assignment_effect_resolution_evidence(db, effect, workflow, turn)
+                if delegation is not None:
+                    outcome, reason_code, assignment_id, result_id = delegation
+                    record(
+                        effect,
+                        outcome,
+                        reason_code,
+                        evidence_turn_id=turn.id,
+                        assignment_id=assignment_id,
+                        result_id=result_id,
+                    )
+                    continue
+
+            result = (
+                db.query(DelegationResultModel)
+                .filter_by(workflow_effect_id=effect.id)
+                .one_or_none()
+            )
+            if result is not None:
+                assignment = db.get(ChildAssignmentModel, result.child_assignment_id)
+                if (
+                    result.status == DelegationResultStatus.COMPLETE.value
+                    and result.finalized_at is not None
+                    and isinstance(result.content_sha256, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", result.content_sha256) is not None
+                    and isinstance(result.content_bytes, int)
+                    and result.content_bytes > 0
+                    and assignment is not None
+                    and result.child_terminal_id == workflow.root_terminal_id
+                    and assignment.child_terminal_id == workflow.root_terminal_id
+                    and assignment.child_workflow_id == workflow.id
+                    and result.parent_workflow_id == assignment.request_workflow_id
+                    and result.workflow_turn_id == turn.id
+                    and effect.effect_kind
+                    in {"send_message", "complete_workflow", "submit_handoff_result_v1"}
+                    and assignment.child_workflow_turn_id is not None
+                    and _child_workflow_authority_descends_from_assignment(
+                        db,
+                        workflow,
+                        int(assignment.child_workflow_turn_id),
+                        str(assignment.child_terminal_id),
+                        authority_turn_id=int(turn.id),
+                    )
+                ):
+                    record(
+                        effect,
+                        "completed",
+                        "MANAGED_RESULT_FINALIZED",
+                        evidence_turn_id=turn.id,
+                        assignment_id=assignment.id,
+                        result_id=result.id,
+                    )
+                    continue
+
+            if effect.effect_kind == "acknowledge_assignment":
+                matched = None
+                candidates = (
+                    db.query(DelegationResultModel)
+                    .join(
+                        ChildAssignmentModel,
+                        ChildAssignmentModel.id == DelegationResultModel.child_assignment_id,
+                    )
+                    .filter(
+                        ChildAssignmentModel.parent_terminal_id == workflow.root_terminal_id,
+                        ChildAssignmentModel.request_workflow_id == workflow.id,
+                    )
+                    .order_by(DelegationResultModel.created_at.desc())
+                    .limit(1000)
+                    .all()
+                )
+                for candidate in candidates:
+                    if effect.effect_key == _durable_workflow_effect_key(
+                        "acknowledge_assignment", candidate.id
+                    ):
+                        matched = candidate
+                        break
+                if matched is not None:
+                    assignment = db.get(ChildAssignmentModel, matched.child_assignment_id)
+                    if (
+                        assignment is not None
+                        and assignment.parent_terminal_id == workflow.root_terminal_id
+                        and assignment.request_workflow_id == workflow.id
+                    ):
+                        if assignment.status in {
+                            ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
+                            ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value,
+                        }:
+                            record(
+                                effect,
+                                "completed",
+                                "RESULT_ACKNOWLEDGED",
+                                evidence_turn_id=turn.id,
+                                assignment_id=assignment.id,
+                                result_id=matched.id,
+                            )
+                            continue
+                        if (
+                            assignment.review_superseded_at is not None
+                            and assignment.status == ChildAssignmentStatus.RESULT_SUPERSEDED.value
+                        ):
+                            record(
+                                effect,
+                                "rejected",
+                                "RESULT_REVIEW_ATTEMPT_SUPERSEDED",
+                                evidence_turn_id=turn.id,
+                                assignment_id=assignment.id,
+                                result_id=matched.id,
+                            )
+                            continue
+
+            if (
+                effect.effect_kind == "complete_workflow"
+                and workflow.status == WORKFLOW_TERMINAL
+                and workflow.active_turn_id == turn.id
+                and effect.effect_key
+                == _durable_workflow_effect_key("complete_workflow", workflow.terminal_reason or "")
+            ):
+                record(
+                    effect,
+                    "completed",
+                    "WORKFLOW_TERMINALIZED",
+                    evidence_turn_id=turn.id,
+                )
+
+        # A later exact same-key attempt resolves only ancestors in its
+        # receipted resume chain. The original transport remains indeterminate.
+        db.flush()
+        for effect in effects:
+            if (
+                db.query(WorkflowEffectResolutionModel.id)
+                .filter_by(workflow_effect_id=effect.id)
+                .one_or_none()
+                is not None
+            ):
+                continue
+            evidence = (
+                db.query(WorkflowEffectModel, WorkflowEffectResolutionModel)
+                .join(
+                    WorkflowEffectResolutionModel,
+                    WorkflowEffectResolutionModel.workflow_effect_id == WorkflowEffectModel.id,
+                    isouter=True,
+                )
+                .filter(
+                    WorkflowEffectModel.workflow_id == effect.workflow_id,
+                    WorkflowEffectModel.effect_kind == effect.effect_kind,
+                    WorkflowEffectModel.effect_key == effect.effect_key,
+                    WorkflowEffectModel.workflow_turn_id != effect.workflow_turn_id,
+                    or_(
+                        WorkflowEffectModel.state == "completed",
+                        WorkflowEffectResolutionModel.outcome == "completed",
+                    ),
+                )
+                .order_by(WorkflowEffectModel.id.desc())
+                .all()
+            )
+            for evidence_effect, _resolution in evidence:
+                if _resumed_effect_descends_from(
+                    db,
+                    int(effect.workflow_id),
+                    int(evidence_effect.workflow_turn_id),
+                    int(effect.workflow_turn_id),
+                ):
+                    record(
+                        effect,
+                        "completed",
+                        "EFFECT_COMPLETED_BY_REPLAY",
+                        evidence_effect_id=evidence_effect.id,
+                        evidence_turn_id=evidence_effect.workflow_turn_id,
+                    )
+                    break
+
+        # Fence identities are intentionally opaque hashes. Probe one effect
+        # against one bounded, persistent lifecycle page per tick so old exact
+        # matches are eventually found without an unbounded cross-product.
+        fence_effect = None
+        if cursor.fence_probe_effect_id is not None:
+            fence_effect = db.get(WorkflowEffectModel, cursor.fence_probe_effect_id)
+            fence_resolution = (
+                db.query(WorkflowEffectResolutionModel.id)
+                .filter_by(workflow_effect_id=cursor.fence_probe_effect_id)
+                .one_or_none()
+            )
+            if (
+                fence_effect is None
+                or fence_effect.effect_kind != "fence_managed_attempt"
+                or fence_effect.state not in {"claimed", "indeterminate"}
+                or fence_resolution is not None
+            ):
+                fence_effect = None
+                cursor.fence_probe_effect_id = None
+                cursor.last_fence_assignment_id = 0
+        if fence_effect is None:
+
+            def next_fence_effect(after_id: int) -> Optional[WorkflowEffectModel]:
+                return cast(
+                    Optional[WorkflowEffectModel],
+                    db.query(WorkflowEffectModel)
+                    .outerjoin(
+                        WorkflowEffectResolutionModel,
+                        WorkflowEffectResolutionModel.workflow_effect_id == WorkflowEffectModel.id,
+                    )
+                    .filter(
+                        WorkflowEffectModel.id > after_id,
+                        WorkflowEffectModel.effect_kind == "fence_managed_attempt",
+                        WorkflowEffectModel.state.in_(("claimed", "indeterminate")),
+                        WorkflowEffectResolutionModel.id.is_(None),
+                    )
+                    .order_by(WorkflowEffectModel.id.asc())
+                    .first(),
+                )
+
+            fence_effect = next_fence_effect(int(cursor.last_fence_effect_id))
+            if fence_effect is None and cursor.last_fence_effect_id:
+                cursor.last_fence_effect_id = 0
+                fence_effect = next_fence_effect(0)
+            if fence_effect is not None:
+                cursor.fence_probe_effect_id = int(fence_effect.id)
+                cursor.last_fence_assignment_id = 0
+        if fence_effect is not None:
+            lifecycle_page = (
+                db.query(ManagedAttemptLifecycleModel)
+                .filter(
+                    ManagedAttemptLifecycleModel.assignment_id > cursor.last_fence_assignment_id,
+                    ManagedAttemptLifecycleModel.state == "fenced",
+                )
+                .order_by(ManagedAttemptLifecycleModel.assignment_id.asc())
+                .limit(limit)
+                .all()
+            )
+            matched_fence = False
+            fence_workflow = db.get(WorkflowModel, fence_effect.workflow_id)
+            fence_turn = db.get(WorkflowTurnModel, fence_effect.workflow_turn_id)
+            fence_receipt = (
+                db.query(WorkflowTurnReceiptModel.id)
+                .filter_by(
+                    workflow_turn_id=fence_effect.workflow_turn_id,
+                    receiver_terminal_id=(
+                        fence_workflow.root_terminal_id if fence_workflow is not None else ""
+                    ),
+                )
+                .one_or_none()
+            )
+            if (
+                fence_workflow is not None
+                and fence_turn is not None
+                and fence_turn.workflow_id == fence_workflow.id
+                and fence_receipt is not None
+            ):
+                for lifecycle in lifecycle_page:
+                    if _fence_effect_matches_lifecycle(db, fence_effect, fence_workflow, lifecycle):
+                        record(
+                            fence_effect,
+                            "completed",
+                            "MANAGED_ATTEMPT_FENCED",
+                            evidence_turn_id=fence_turn.id,
+                            assignment_id=lifecycle.assignment_id,
+                        )
+                        matched_fence = True
+                        break
+            if lifecycle_page:
+                cursor.last_fence_assignment_id = int(lifecycle_page[-1].assignment_id)
+            if matched_fence or len(lifecycle_page) < limit:
+                cursor.last_fence_effect_id = int(fence_effect.id)
+                cursor.fence_probe_effect_id = None
+                cursor.last_fence_assignment_id = 0
+        db.commit()
+    return resolved
+
+
 def describe_workflow_effect_rejection(
     receiver_terminal_id: Optional[str], logical_turn_id: int, effect_kind: str, effect_key: str
 ) -> Dict[str, Optional[str]]:
@@ -16818,13 +17509,24 @@ def _reconcile_proven_result_effect_authority(
         )
         if result is None or request_effect is None:
             continue
-        if request_effect.state in {"claimed", "indeterminate"}:
+        if request_effect.state in {
+            "claimed",
+            "indeterminate",
+        } and _workflow_effect_semantic_outcome(db, request_effect) in {"claimed", "indeterminate"}:
             # The exact finalized result/assignment join was validated by the
             # caller. It is positive evidence that the request effect created
-            # this child and ran to completion, not an assumption that an
-            # uncertain external operation may be replayed.
-            request_effect.state = "completed"
-            request_effect.updated_at = now
+            # this child and ran to completion. Preserve the original
+            # transport observation and append the later semantic proof.
+            _append_workflow_effect_resolution(
+                db,
+                request_effect,
+                "completed",
+                "MANAGED_RESULT_FINALIZED",
+                now,
+                evidence_turn_id=source_turn.id,
+                assignment_id=assignment.id,
+                result_id=str(result.id),
+            )
         if _review_acknowledgement_reason(db, assignment, workflow, result) is not None:
             continue
         effect_key = _canonical_acknowledgement_effect_key(str(result.id))
@@ -26051,7 +26753,7 @@ def _review_acknowledgement_reason(
         or request_effect.workflow_id != parent_workflow.id
         or request_effect.workflow_turn_id != assignment.request_workflow_turn_id
         or (
-            request_effect.state != "completed"
+            _workflow_effect_semantic_outcome(db, request_effect) != "completed"
             and not (
                 request_effect.effect_kind == "handoff"
                 and request_effect.state in {"wait_timeout", "wait_retryable"}

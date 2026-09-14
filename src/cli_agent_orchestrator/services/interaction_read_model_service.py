@@ -70,7 +70,10 @@ def _projection_cte(
         " AND w.root_terminal_id = :interaction_terminal_id" if terminal_id else ""
     )
     current_effect_scope = (
-        " AND effect.state IN ('claimed', 'indeterminate')" if current_only else ""
+        " AND effect.state IN ('claimed', 'indeterminate')"
+        " AND resolution.id IS NULL AND resolved_effect.effect_id IS NULL"
+        if current_only
+        else ""
     )
 
     def item_source(name: str) -> str:
@@ -155,6 +158,8 @@ WITH terminal_lifetimes AS MATERIALIZED (
       )
 ), effect_ranked AS (
     SELECT effect.workflow_id, effect.workflow_turn_id, effect.effect_kind, effect.state,
+           resolution.outcome AS resolution_outcome,
+           resolution.reason_code AS resolution_reason_code,
            ROW_NUMBER() OVER (
              PARTITION BY effect.workflow_id, effect.workflow_turn_id
              ORDER BY CASE effect.state WHEN 'indeterminate' THEN 0 WHEN 'claimed' THEN 1
@@ -162,11 +167,14 @@ WITH terminal_lifetimes AS MATERIALIZED (
                       effect.id DESC
            ) AS effect_rank,
            SUM(CASE WHEN effect.state IN ('claimed', 'indeterminate')
+                         AND resolution.id IS NULL
                          AND resolved_effect.effect_id IS NULL
                     THEN 1 ELSE 0 END)
              OVER (PARTITION BY effect.workflow_id, effect.workflow_turn_id)
              AS unresolved_effect_count
     FROM workflow_effects effect
+    LEFT JOIN workflow_effect_resolutions resolution
+      ON resolution.workflow_effect_id = effect.id
     JOIN workflows ew ON ew.id = effect.workflow_id
     JOIN interaction_terminals et ON et.terminal_id = ew.root_terminal_id
     LEFT JOIN resolved_assignment_effects resolved_effect
@@ -196,6 +204,8 @@ WITH terminal_lifetimes AS MATERIALIZED (
            CASE WHEN lease.workflow_turn_id IS NOT NULL THEN 1 ELSE 0 END
              AS provider_execution_active,
            ranked_effect.effect_kind, ranked_effect.state AS effect_state,
+           ranked_effect.resolution_outcome AS effect_resolution_outcome,
+           ranked_effect.resolution_reason_code AS effect_resolution_reason_code,
            COALESCE(ranked_effect.unresolved_effect_count, 0) AS unresolved_effect_count,
            0 AS workflow_turn_count, 0 AS superseded_turn_count
     FROM workflow_turns wt
@@ -276,7 +286,8 @@ WITH terminal_lifetimes AS MATERIALIZED (
            facts.workflow_id, facts.id AS workflow_turn_id, facts.workflow_status,
            facts.workflow_reason, facts.state AS turn_state, facts.kind AS turn_kind,
            facts.provider_outcome_code, facts.provider_outcome_detail,
-           facts.effect_kind, facts.effect_state, facts.workflow_turn_count,
+           facts.effect_kind, facts.effect_state, facts.effect_resolution_outcome,
+           facts.effect_resolution_reason_code, facts.workflow_turn_count,
            facts.superseded_turn_count, NULL AS assignment_id, NULL AS result_id,
            NULL AS result_status, NULL AS result_summary, 0 AS result_available,
            NULL AS delivery_status, 0 AS delivery_pending,
@@ -314,6 +325,7 @@ WITH terminal_lifetimes AS MATERIALIZED (
            w.status AS workflow_status, w.terminal_reason AS workflow_reason,
            NULL AS turn_state, NULL AS turn_kind, NULL AS provider_outcome_code,
            NULL AS provider_outcome_detail, NULL AS effect_kind, NULL AS effect_state,
+           NULL AS effect_resolution_outcome, NULL AS effect_resolution_reason_code,
            0 AS workflow_turn_count, 0 AS superseded_turn_count,
            NULL AS assignment_id, NULL AS result_id, NULL AS result_status,
            NULL AS result_summary, 0 AS result_available, NULL AS delivery_status,
@@ -347,9 +359,15 @@ WITH terminal_lifetimes AS MATERIALIZED (
                AND wt.provider_reconnect_requested_at IS NOT NULL)
            OR EXISTS (
              SELECT 1 FROM workflow_effects linked_effect
+             LEFT JOIN workflow_effect_resolutions linked_resolution
+               ON linked_resolution.workflow_effect_id = linked_effect.id
+             LEFT JOIN resolved_assignment_effects linked_assignment_resolution
+               ON linked_assignment_resolution.effect_id = linked_effect.id
              WHERE linked_effect.workflow_id = w.id
                AND linked_effect.workflow_turn_id = wt.id
                AND linked_effect.state IN ('claimed', 'indeterminate')
+               AND linked_resolution.id IS NULL
+               AND linked_assignment_resolution.effect_id IS NULL
            )
          )
        ))
@@ -374,15 +392,18 @@ WITH terminal_lifetimes AS MATERIALIZED (
              AS source_terminal_id,
            COALESCE(w.root_terminal_id, linked_workflow.root_terminal_id)
              AS target_terminal_id, '' AS input_preview,
-           effect.created_at, effect.updated_at,
-           CASE WHEN resolved_effect.effect_id IS NOT NULL THEN 0
+           effect.created_at,
+           COALESCE(resolution.created_at, effect.updated_at) AS updated_at,
+           CASE WHEN resolution.id IS NOT NULL
+                     OR resolved_effect.effect_id IS NOT NULL THEN 0
                 WHEN w.status IN ('terminal', 'cancelled')
                        AND w.active_turn_id = wt.id
                        AND wt.state IN ('finished', 'cancelled')
                        AND wt.queue_reason = 'PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED'
                 THEN 0 ELSE 1 END AS is_current,
            effect.state AS queue_state,
-           CASE WHEN resolved_effect.effect_id IS NOT NULL THEN NULL
+           CASE WHEN resolution.id IS NOT NULL
+                     OR resolved_effect.effect_id IS NOT NULL THEN NULL
                 WHEN w.status IN ('terminal', 'cancelled')
                        AND w.active_turn_id = wt.id
                        AND wt.state IN ('finished', 'cancelled')
@@ -390,7 +411,8 @@ WITH terminal_lifetimes AS MATERIALIZED (
                   THEN NULL
                 WHEN effect.state = 'indeterminate' THEN 'indeterminate_effect'
                 ELSE 'claimed_effect' END AS wait_reason,
-           CASE WHEN resolved_effect.effect_id IS NOT NULL THEN 0
+           CASE WHEN resolution.id IS NOT NULL
+                     OR resolved_effect.effect_id IS NOT NULL THEN 0
                 WHEN w.status IN ('terminal', 'cancelled')
                        AND w.active_turn_id = wt.id
                        AND wt.state IN ('finished', 'cancelled')
@@ -400,11 +422,14 @@ WITH terminal_lifetimes AS MATERIALIZED (
            w.terminal_reason AS workflow_reason, wt.state AS turn_state,
            wt.kind AS turn_kind, wt.provider_outcome_code,
            wt.provider_outcome_detail, effect.effect_kind, effect.state AS effect_state,
+           resolution.outcome AS effect_resolution_outcome,
+           resolution.reason_code AS effect_resolution_reason_code,
            0 AS workflow_turn_count, 0 AS superseded_turn_count,
            NULL AS assignment_id, NULL AS result_id, NULL AS result_status,
            NULL AS result_summary, 0 AS result_available, NULL AS delivery_status,
            0 AS delivery_pending,
-           CASE WHEN resolved_effect.effect_id IS NOT NULL
+           CASE WHEN resolution.id IS NOT NULL THEN resolution.outcome
+                WHEN resolved_effect.effect_id IS NOT NULL
                   THEN resolved_effect.final_disposition
                 WHEN w.status IN ('terminal', 'cancelled')
                        AND w.active_turn_id = wt.id
@@ -415,6 +440,8 @@ WITH terminal_lifetimes AS MATERIALIZED (
            CAST(effect.id AS TEXT) AS diagnostic_id
     FROM effect_authority_sessions scoped
     JOIN workflow_effects effect ON effect.id = scoped.effect_id
+    LEFT JOIN workflow_effect_resolutions resolution
+      ON resolution.workflow_effect_id = effect.id
     LEFT JOIN workflows w ON w.id = effect.workflow_id
     LEFT JOIN workflow_turns linked_turn ON linked_turn.id = effect.workflow_turn_id
     LEFT JOIN workflows linked_workflow ON linked_workflow.id = linked_turn.workflow_id
@@ -426,7 +453,9 @@ WITH terminal_lifetimes AS MATERIALIZED (
     LEFT JOIN resolved_assignment_effects resolved_effect
       ON resolved_effect.effect_id = effect.id
     WHERE effect.state IN ('claimed', 'indeterminate')
-      AND (w.id IS NULL OR wt.id IS NULL
+      AND (resolution.id IS NOT NULL
+           OR resolved_effect.effect_id IS NOT NULL
+           OR w.id IS NULL OR wt.id IS NULL
            OR w.status IN ('terminal', 'cancelled')
            OR workflow_authority.is_current = 0
            OR wt.superseded_by_turn_id IS NOT NULL)
@@ -443,6 +472,7 @@ WITH terminal_lifetimes AS MATERIALIZED (
            w.terminal_reason AS workflow_reason, wt.state AS turn_state,
            wt.kind AS turn_kind, wt.provider_outcome_code,
            wt.provider_outcome_detail, effect.effect_kind, effect.state AS effect_state,
+           NULL AS effect_resolution_outcome, NULL AS effect_resolution_reason_code,
            0 AS workflow_turn_count, 0 AS superseded_turn_count,
            NULL AS assignment_id, NULL AS result_id, NULL AS result_status,
            NULL AS result_summary, 0 AS result_available, NULL AS delivery_status,
@@ -475,6 +505,7 @@ WITH terminal_lifetimes AS MATERIALIZED (
            w.terminal_reason AS workflow_reason, wt.state AS turn_state,
            wt.kind AS turn_kind, wt.provider_outcome_code,
            wt.provider_outcome_detail, effect.effect_kind, effect.state AS effect_state,
+           NULL AS effect_resolution_outcome, NULL AS effect_resolution_reason_code,
            0 AS workflow_turn_count, 0 AS superseded_turn_count,
            NULL AS assignment_id, NULL AS result_id, NULL AS result_status,
            NULL AS result_summary, 0 AS result_available, NULL AS delivery_status,
@@ -514,6 +545,7 @@ WITH terminal_lifetimes AS MATERIALIZED (
            w.terminal_reason AS workflow_reason, wt.state AS turn_state,
            wt.kind AS turn_kind, wt.provider_outcome_code,
            wt.provider_outcome_detail, NULL AS effect_kind, NULL AS effect_state,
+           NULL AS effect_resolution_outcome, NULL AS effect_resolution_reason_code,
            0 AS workflow_turn_count, 0 AS superseded_turn_count,
            NULL AS assignment_id, NULL AS result_id, NULL AS result_status,
            NULL AS result_summary, 0 AS result_available, NULL AS delivery_status,
@@ -541,7 +573,8 @@ WITH terminal_lifetimes AS MATERIALIZED (
            NULL AS workflow_status, NULL AS workflow_reason,
            NULL AS turn_state, NULL AS turn_kind, NULL AS provider_outcome_code,
            NULL AS provider_outcome_detail, NULL AS effect_kind,
-           NULL AS effect_state, 0 AS workflow_turn_count,
+           NULL AS effect_state, NULL AS effect_resolution_outcome,
+           NULL AS effect_resolution_reason_code, 0 AS workflow_turn_count,
            0 AS superseded_turn_count, NULL AS assignment_id,
            NULL AS result_id, NULL AS result_status, NULL AS result_summary,
            0 AS result_available, NULL AS delivery_status,
@@ -600,6 +633,7 @@ WITH terminal_lifetimes AS MATERIALIZED (
            COALESCE(attempt.reason_code, request_workflow.terminal_reason) AS workflow_reason,
            NULL AS turn_state, NULL AS turn_kind, NULL AS provider_outcome_code,
            NULL AS provider_outcome_detail, NULL AS effect_kind, NULL AS effect_state,
+           NULL AS effect_resolution_outcome, NULL AS effect_resolution_reason_code,
            0 AS workflow_turn_count, 0 AS superseded_turn_count, ca.id AS assignment_id,
            result.id AS result_id, result.status AS result_status,
            CASE WHEN result.document_json IS NOT NULL AND json_valid(result.document_json)
@@ -668,7 +702,9 @@ WITH terminal_lifetimes AS MATERIALIZED (
            NULL AS workflow_id, NULL AS workflow_turn_id, NULL AS workflow_status,
            NULL AS workflow_reason, NULL AS turn_state, NULL AS turn_kind,
            NULL AS provider_outcome_code, NULL AS provider_outcome_detail,
-           NULL AS effect_kind, NULL AS effect_state, 0 AS workflow_turn_count,
+           NULL AS effect_kind, NULL AS effect_state,
+           NULL AS effect_resolution_outcome, NULL AS effect_resolution_reason_code,
+           0 AS workflow_turn_count,
            0 AS superseded_turn_count, NULL AS assignment_id, NULL AS result_id,
            NULL AS result_status, NULL AS result_summary, 0 AS result_available,
            inbox.status AS delivery_status,
@@ -700,6 +736,7 @@ WITH terminal_lifetimes AS MATERIALIZED (
            recovery.failure_reason AS workflow_reason, NULL AS turn_state,
            NULL AS turn_kind, NULL AS provider_outcome_code,
            NULL AS provider_outcome_detail, NULL AS effect_kind, NULL AS effect_state,
+           NULL AS effect_resolution_outcome, NULL AS effect_resolution_reason_code,
            0 AS workflow_turn_count, 0 AS superseded_turn_count,
            NULL AS assignment_id, NULL AS result_id, NULL AS result_status,
            NULL AS result_summary, 0 AS result_available, NULL AS delivery_status,
@@ -724,7 +761,9 @@ WITH terminal_lifetimes AS MATERIALIZED (
            NULL AS workflow_id, NULL AS workflow_turn_id, NULL AS workflow_status,
            NULL AS workflow_reason, NULL AS turn_state, NULL AS turn_kind,
            NULL AS provider_outcome_code, NULL AS provider_outcome_detail,
-           NULL AS effect_kind, NULL AS effect_state, 0 AS workflow_turn_count,
+           NULL AS effect_kind, NULL AS effect_state,
+           NULL AS effect_resolution_outcome, NULL AS effect_resolution_reason_code,
+           0 AS workflow_turn_count,
            0 AS superseded_turn_count, NULL AS assignment_id, NULL AS result_id,
            NULL AS result_status, NULL AS result_summary, 0 AS result_available,
            NULL AS delivery_status, 0 AS delivery_pending, NULL AS final_disposition,
@@ -823,6 +862,8 @@ def _interaction_dto(row: Dict[str, Any]) -> Dict[str, Any]:
             "provider_outcome_detail": row.get("provider_outcome_detail"),
             "effect_kind": row.get("effect_kind"),
             "effect_state": row.get("effect_state"),
+            "effect_outcome": row.get("effect_resolution_outcome"),
+            "effect_reason_code": row.get("effect_resolution_reason_code"),
             "turn_count": int(row.get("workflow_turn_count") or 0),
             "superseded_turn_count": int(row.get("superseded_turn_count") or 0),
         },

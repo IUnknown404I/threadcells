@@ -30,6 +30,8 @@ function interaction(overrides: Partial<InteractionItem> = {}): InteractionItem 
       provider_outcome_detail: null,
       effect_kind: null,
       effect_state: null,
+      effect_outcome: null,
+      effect_reason_code: null,
       turn_count: 1,
       superseded_turn_count: 0,
     },
@@ -160,6 +162,32 @@ describe('InteractionHistoryDrawer', () => {
     expect(readResult).toHaveBeenCalledOnce()
   })
 
+  it('shows the durable outcome of a reconciled privileged operation', async () => {
+    const base = interaction()
+    const item = interaction({
+      id: 'effect:0004',
+      interaction_type: 'effect',
+      task_type: 'complete_workflow',
+      current: false,
+      queue: { state: 'indeterminate', wait_reason: null, admission_pending: false },
+      workflow: {
+        ...base.workflow,
+        status: 'terminal',
+        effect_kind: 'complete_workflow',
+        effect_state: 'indeterminate',
+        effect_outcome: 'completed',
+        effect_reason_code: 'EFFECT_COMPLETED_BY_REPLAY',
+      },
+      final_disposition: 'completed',
+    })
+    vi.spyOn(api, 'listInteractions').mockImplementation(async params => page(params.mode === 'history' ? [item] : []))
+
+    render(<I18nProvider><InteractionHistoryDrawer sessionId="session-1" sessionName="cao-session-1" initialMode="history" onClose={() => {}} /></I18nProvider>)
+    fireEvent.click(await screen.findByRole('button', { name: 'Show details' }))
+    expect(screen.getByText('EFFECT_COMPLETED_BY_REPLAY')).toBeInTheDocument()
+    expect(screen.getAllByText('Completed').length).toBeGreaterThan(0)
+  })
+
   it('renders operator-retired effects as unknown outcomes without a fabricated result', async () => {
     const retired = interaction({
       id: 'effect:00000000000000000042',
@@ -182,6 +210,8 @@ describe('InteractionHistoryDrawer', () => {
         provider_outcome_detail: null,
         effect_kind: 'handoff',
         effect_state: 'operator_retired_indeterminate',
+        effect_outcome: null,
+        effect_reason_code: null,
         turn_count: 0,
         superseded_turn_count: 0,
       },
@@ -216,6 +246,8 @@ describe('InteractionHistoryDrawer', () => {
         provider_outcome_detail: null,
         effect_kind: 'await_handoff',
         effect_state: 'wait_timeout',
+        effect_outcome: null,
+        effect_reason_code: null,
         turn_count: 0,
         superseded_turn_count: 0,
       },

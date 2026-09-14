@@ -28,6 +28,7 @@ from cli_agent_orchestrator.clients.database import (
     InboxModel,
     TerminalModel,
     WorkflowEffectModel,
+    WorkflowEffectResolutionModel,
     WorkflowModel,
     WorkflowProviderReconnectAttemptModel,
     WorkflowTurnModel,
@@ -851,6 +852,61 @@ def _complete_ready_test_reconnect(root: str, turn_id: int) -> None:
         reconnect["claim_token"],
         reconnect["attempt_token"],
     )
+
+
+def _assert_reconciled_request_effect(
+    db,
+    *,
+    effect_id: int,
+    workflow_id: int,
+    request_turn_id: int,
+    evidence_turn_id: int,
+    assignment_id: int,
+    result_id: str,
+) -> int:
+    """Require exact append-only completion evidence for one raw request."""
+    request = db.get(WorkflowEffectModel, effect_id)
+    assert request is not None
+    assert (
+        request.workflow_id,
+        request.workflow_turn_id,
+        request.state,
+    ) == (
+        workflow_id,
+        request_turn_id,
+        "claimed",
+    )
+    # An absent resolution or one belonging to a different effect cannot
+    # satisfy this exact-effect lookup.
+    resolution = (
+        db.query(WorkflowEffectResolutionModel).filter_by(workflow_effect_id=effect_id).one()
+    )
+    assert (
+        resolution.outcome,
+        resolution.reason_code,
+        resolution.evidence_effect_id,
+        resolution.evidence_workflow_turn_id,
+        resolution.evidence_assignment_id,
+        resolution.evidence_result_id,
+    ) == (
+        "completed",
+        "MANAGED_RESULT_FINALIZED",
+        None,
+        evidence_turn_id,
+        assignment_id,
+        result_id,
+    )
+    return int(resolution.id)
+
+
+def _assert_resolution_reconciliation_is_idempotent(effect_id: int, resolution_id: int) -> None:
+    assert database.reconcile_workflow_effect_resolutions() == 0
+    assert database.reconcile_workflow_effect_resolutions() == 0
+    with database.SessionLocal() as db:
+        resolutions = (
+            db.query(WorkflowEffectResolutionModel).filter_by(workflow_effect_id=effect_id).all()
+        )
+        assert [int(row.id) for row in resolutions] == [resolution_id]
 
 
 def _queued_authoritative_handoff_result(
@@ -3268,7 +3324,6 @@ def test_f13_receipted_callback_reconnect_continues_once_before_composer(workflo
         assignment = (
             db.query(database.ChildAssignmentModel).filter_by(child_terminal_id=child).one()
         )
-        request_row = db.get(WorkflowEffectModel, request_effect["id"])
         successor_ack = (
             db.query(WorkflowEffectModel)
             .filter_by(
@@ -3286,7 +3341,15 @@ def test_f13_receipted_callback_reconnect_continues_once_before_composer(workflo
         assert source.superseded_by_turn_id == successor_id
         assert db.get(InboxModel, notice.id).status == "pending"
         assert assignment.status == "handoff_result_queued"
-        assert request_row.state == "completed"
+        request_resolution_id = _assert_reconciled_request_effect(
+            db,
+            effect_id=request_effect["id"],
+            workflow_id=workflow.id,
+            request_turn_id=parent_turn,
+            evidence_turn_id=callback_turn,
+            assignment_id=assignment.id,
+            result_id=notice.result_id,
+        )
         assert successor_ack.state == "not_admitted"
         assert all(
             db.get(WorkflowTurnModel, turn_id).state == "queued" for turn_id in composer_turns
@@ -3295,6 +3358,7 @@ def test_f13_receipted_callback_reconnect_continues_once_before_composer(workflo
         assert (
             db.query(WorkflowTurnReceiptModel).filter_by(workflow_turn_id=successor_id).count() == 0
         )
+    _assert_resolution_reconciliation_is_idempotent(request_effect["id"], request_resolution_id)
     assert database.get_terminal_workflow_projection(parent)["workflow_recovery_pending"] is True
 
     provider = MagicMock()
@@ -3477,8 +3541,20 @@ def test_f13_reconnect_preserves_exact_git_review_authority(
     _complete_ready_test_reconnect(parent, callback_turn)
     with database.SessionLocal() as db:
         workflow = db.query(WorkflowModel).filter_by(root_terminal_id=parent).one()
-        request_row = db.get(WorkflowEffectModel, request_effect["id"])
-        assert request_row.state == "completed"
+        assignment = (
+            db.query(database.ChildAssignmentModel)
+            .filter_by(request_workflow_effect_id=request_effect["id"])
+            .one()
+        )
+        request_resolution_id = _assert_reconciled_request_effect(
+            db,
+            effect_id=request_effect["id"],
+            workflow_id=workflow.id,
+            request_turn_id=parent_turn,
+            evidence_turn_id=callback_turn,
+            assignment_id=assignment.id,
+            result_id=notice.result_id,
+        )
         assert db.get(WorkflowTurnModel, queued["turn_id"]).state == "queued"
         if stale_review:
             assert workflow.status == "owner_gate"
@@ -3509,6 +3585,7 @@ def test_f13_reconnect_preserves_exact_git_review_authority(
             )
             assert successor.resume_parent_turn_id == callback_turn
             assert retryable.state == "not_admitted"
+    _assert_resolution_reconciliation_is_idempotent(request_effect["id"], request_resolution_id)
 
 
 def test_f13_reconnect_resumes_after_acknowledged_review_is_superseded(workflow_db, tmp_path):

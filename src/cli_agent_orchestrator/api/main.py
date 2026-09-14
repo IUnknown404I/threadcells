@@ -63,6 +63,7 @@ from cli_agent_orchestrator.clients.database import (
     managed_attempt_lifecycle_caller_is_authorized,
     queue_workflow_input_for_provider,
     reconcile_managed_attempt_timeouts,
+    reconcile_workflow_effect_resolutions,
     release_terminal_runtime_operation,
     resolve_workflow_input_binding,
     retain_queued_workflow_input_binding,
@@ -434,6 +435,12 @@ async def _workflow_reconciliation_tick(
 ) -> bool:
     """Run one isolated recovery tick and return whether startup replay remains due."""
     performed_full_recovery = False
+    try:
+        effect_resolutions = await _run_workflow_io(reconcile_workflow_effect_resolutions)
+        if effect_resolutions:
+            logger.info("Reconciled %s privileged operation outcomes", effect_resolutions)
+    except Exception as exc:
+        logger.warning("Privileged operation outcome reconciliation failed: %s", exc)
     try:
         attempt_recovery = await _run_workflow_io(reconcile_managed_attempt_timeouts)
         if any(attempt_recovery.values()):

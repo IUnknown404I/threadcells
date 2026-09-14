@@ -23,6 +23,7 @@ from cli_agent_orchestrator.clients.database import (
     OwnerLaunchGrantModel,
     TerminalModel,
     WorkflowEffectModel,
+    WorkflowEffectResolutionModel,
     WorkflowModel,
     WorkflowTurnModel,
     WorktreeWriterLeaseModel,
@@ -535,6 +536,64 @@ def test_duplicate_fence_is_idempotent(attempt_db):
     assert duplicate["accepted"] is True
     assert duplicate["duplicate"] is True
     assert duplicate["state"] == "fenced"
+
+
+def test_fenced_lifecycle_resolves_exact_owner_effect_without_rewriting_transport(attempt_db):
+    attempt = _create_attempt()
+    _claim_and_complete_fence(attempt)
+    identity = _fence_kwargs(attempt)
+    with database.SessionLocal() as db:
+        parent_workflow = (
+            db.query(WorkflowModel).filter_by(root_terminal_id=attempt["parent"]).one()
+        )
+        fence_effect = WorkflowEffectModel(
+            workflow_id=parent_workflow.id,
+            workflow_turn_id=attempt["parent_turn"],
+            effect_kind="fence_managed_attempt",
+            effect_key=database._durable_workflow_effect_key(
+                "fence_managed_attempt",
+                identity["assignment_id"],
+                identity["attempt_id"],
+                identity["parent_terminal_id"],
+                identity["child_terminal_id"],
+                identity["request_workflow_effect_id"],
+                identity["child_workflow_turn_id"],
+                identity["reason_code"],
+                identity["expected_runtime_generation"],
+                identity["expected_writer_authority_generation"],
+            ),
+            state="indeterminate",
+            claim_token="lost-fence-response",
+        )
+        db.add(fence_effect)
+        db.flush()
+        fence_effect_id = fence_effect.id
+        db.commit()
+
+    assert database.reconcile_workflow_effect_resolutions() == 2
+    with database.SessionLocal() as db:
+        fence_effect = db.get(WorkflowEffectModel, fence_effect_id)
+        resolution = (
+            db.query(WorkflowEffectResolutionModel)
+            .filter_by(workflow_effect_id=fence_effect_id)
+            .one()
+        )
+        assert fence_effect.state == "indeterminate"
+        assert resolution.outcome == "completed"
+        assert resolution.reason_code == "MANAGED_ATTEMPT_FENCED"
+        assert resolution.evidence_assignment_id == attempt["assignment_id"]
+
+    current = interaction_read_model_service.list_interactions(
+        "synthetic-attempt-session", mode="current", limit=50
+    )
+    assert all(item["id"] != f"effect:{fence_effect_id:020d}" for item in current["items"])
+    history = interaction_read_model_service.list_interactions(
+        "synthetic-attempt-session", mode="history", limit=50
+    )
+    assert any(
+        item["id"] == f"effect:{fence_effect_id:020d}" and item["final_disposition"] == "completed"
+        for item in history["items"]
+    )
 
 
 def test_owner_mcp_fence_is_machine_readable_and_idempotent(attempt_db, monkeypatch):

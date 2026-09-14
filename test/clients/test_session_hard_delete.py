@@ -1251,8 +1251,14 @@ def test_resolution_purge_is_fixed_shape_across_sqlite_variable_boundary(
     variable_boundary = 50
     with engine.connect() as connection:
         raw_connection = connection.connection.driver_connection
-        raw_connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, variable_boundary)
-        assert raw_connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) == variable_boundary
+        # Python 3.10's sqlite3 wrapper cannot lower a connection limit. The
+        # 3.11+ matrix exercises the real boundary while every version still
+        # proves below that the owned delete has one fixed bound parameter.
+        if hasattr(raw_connection, "setlimit"):
+            raw_connection.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, variable_boundary)
+            assert raw_connection.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) == (
+                variable_boundary
+            )
 
     resolution_deletes: list[tuple[str, int]] = []
 

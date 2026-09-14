@@ -72,6 +72,25 @@ try {
   assert.equal(await bDetail.evaluate(detail => detail.parentElement?.dataset.testid), `agent-session-${sessions[1].id}`, 'B detail must be inline below B')
   assert.equal(await b.evaluate(node => node.nextElementSibling?.dataset.testid || null), null, 'no detached detail may follow the Sessions list')
 
+  const actionStrip = bDetail.getByTestId(`agent-actions-${sessions[1].id}-terminal`)
+  const actionLayout = await actionStrip.evaluate(element => {
+    const bounds = element.getBoundingClientRect()
+    const parentBounds = element.parentElement?.getBoundingClientRect()
+    const buttons = [...element.querySelectorAll('button')]
+    return {
+      columns: getComputedStyle(element).gridTemplateColumns.split(' ').length,
+      rightGap: parentBounds ? Math.round(parentBounds.right - bounds.right) : null,
+      rows: new Set(buttons.map(button => Math.round(button.getBoundingClientRect().top))).size,
+      widths: new Set(buttons.map(button => Math.round(button.getBoundingClientRect().width))).size,
+      text: buttons.map(button => button.textContent?.trim() || ''),
+    }
+  })
+  assert.equal(actionLayout.columns, 7, 'agent actions must reserve seven stable columns')
+  assert.equal(actionLayout.rightGap, 0, 'agent actions must remain flush right in the card header')
+  assert.equal(actionLayout.rows, 1, 'agent actions must remain on one row')
+  assert.equal(actionLayout.widths, 1, 'agent actions must use one stable button width')
+  assert.deepEqual(actionLayout.text, actionLayout.text.map(() => ''), 'agent action buttons must be icon-only')
+
   await bDetail.getByTitle('Close terminal').click()
   await page.getByRole('heading', { name: 'Close Terminal' }).waitFor()
   assert.equal(await bDetail.count(), 1, 'terminal actions must not collapse the selected session')
@@ -86,7 +105,7 @@ try {
   await b.getByRole('button', { name: `Collapse ${sessions[1].name}` }).click()
   assert.equal(await bDetail.count(), 0, 'clicking selected B must collapse it')
   assert.equal(await page.getByTestId(/agent-session-detail-/).count(), 0, 'no detached bottom detail may remain after collapse')
-  console.log(JSON.stringify({ evidenceDir, widths: [1440, 834, 390], assertions: ['keyboard expansion of A inline', 'A to B detail move', 'single inline detail with no detached bottom copy', 'Close Terminal modal keeps B expanded', 'B collapse', 'no horizontal overflow'] }))
+  console.log(JSON.stringify({ evidenceDir, widths: [1440, 834, 390], assertions: ['keyboard expansion of A inline', 'A to B detail move', 'single inline detail with no detached bottom copy', 'stable one-row icon action strip aligned right', 'Close Terminal modal keeps B expanded', 'B collapse', 'no horizontal overflow'] }))
 } finally {
   await browser?.close()
   await new Promise(resolve => server.close(resolve))

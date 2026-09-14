@@ -110,6 +110,7 @@ const REASON_COPY = {
   WORKFLOW_INPUT_IDEMPOTENCY_CONFLICT: ['Workflow input changed', 'This retry identity is already bound to different workflow text. Edit the draft and submit it as a new task.'],
   WORKFLOW_INPUT_NO_LONGER_EXECUTABLE: ['Workflow input is no longer executable', 'This retry identity belongs to a workflow turn that closed before admission. Submit the text again as a new task.'],
   TERMINAL_WORKTREE_PROTECTED: ['Managed worktree retained', 'ThreadCells cannot delete this terminal history because its managed worktree contains state that must remain recoverable.'],
+  SESSION_RECOVERY_AUTHORITY_ACTIVE: ['Recovery needs owner resolution', 'This Session still owns unresolved recovery authority. An owner must resolve the reported recovery operation before deletion.'],
   SESSION_RUNTIME_ACTIVE: ['Exit every agent first', 'A live or Ready agent still owns this session. Gracefully exit every agent before deleting the session.'],
   SESSION_RUNTIME_AUTHORITY_UNPROVEN: ['Session runtime authority is uncertain', 'ThreadCells could not prove that every historical runtime is gone, so the session remains protected.'],
   EXIT_PANE_AMBIGUOUS: ['Terminal exit needs attention', 'The terminal window has multiple panes. Resolve the terminal layout before trying Graceful Exit again.'],
@@ -172,6 +173,7 @@ const REASON_COPY_RU = {
   WORKFLOW_INPUT_IDEMPOTENCY_CONFLICT: ['Задача рабочего процесса изменилась', 'Этот идентификатор повтора уже связан с другим текстом задачи. Измените черновик и отправьте его как новую задачу.'],
   WORKFLOW_INPUT_NO_LONGER_EXECUTABLE: ['Задачу рабочего процесса больше нельзя выполнить', 'Этот идентификатор повтора относится к ходу, который закрылся до допуска. Отправьте текст ещё раз как новую задачу.'],
   TERMINAL_WORKTREE_PROTECTED: ['Управляемое рабочее дерево сохранено', 'Историю терминала нельзя удалить: его управляемое рабочее дерево содержит состояние, которое должно оставаться восстанавливаемым.'],
+  SESSION_RECOVERY_AUTHORITY_ACTIVE: ['Восстановление требует решения владельца', 'Эта сессия всё ещё владеет неразрешёнными полномочиями восстановления. Перед удалением владелец должен разрешить указанную операцию восстановления.'],
   SESSION_RUNTIME_ACTIVE: ['Сначала завершите всех агентов', 'В этой сессии остаётся активный или готовый агент. Корректно завершите всех агентов перед удалением сессии.'],
   SESSION_RUNTIME_AUTHORITY_UNPROVEN: ['Полномочия среды сессии не подтверждены', 'ThreadCells не удалось подтвердить остановку всех исторических процессов, поэтому сессия остаётся защищена.'],
   EXIT_PANE_AMBIGUOUS: ['Требуется проверить завершение терминала', 'В окне терминала несколько панелей. Исправьте структуру терминала и повторите корректное завершение.'],
@@ -228,6 +230,7 @@ const REASON_KEYS: Record<string, ErrorKeyPair> = {
   WORKFLOW_INPUT_IDEMPOTENCY_CONFLICT: ['error.conflict.title', 'error.conflict.body'],
   WORKFLOW_INPUT_NO_LONGER_EXECUTABLE: ['error.operationUnavailable', 'error.conflict.body'],
   TERMINAL_WORKTREE_PROTECTED: ['error.operationUnavailable', 'error.conflict.body'],
+  SESSION_RECOVERY_AUTHORITY_ACTIVE: ['error.operationUnavailable', 'error.conflict.body'],
   SESSION_RUNTIME_ACTIVE: ['error.operationUnavailable', 'error.conflict.body'],
   SESSION_RUNTIME_AUTHORITY_UNPROVEN: ['error.operationUnavailable', 'error.conflict.body'],
   EXIT_PANE_AMBIGUOUS: ['error.exitPaneAmbiguous.title', 'error.exitPaneAmbiguous.body'],
@@ -357,6 +360,15 @@ export interface SessionDeletionPreflight {
   requires_dirty_confirmation: boolean
   modified_files: number
   untracked_files: number
+  reason_code: string | null
+  blocking_recovery_operations?: SessionRecoveryOperation[]
+}
+
+export interface SessionRecoveryOperation {
+  operation_id: string
+  terminal_id: string
+  kind: 'runtime_recovery' | 'recovery_takeover'
+  state: string
   reason_code: string | null
 }
 

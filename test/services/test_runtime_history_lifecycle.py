@@ -410,6 +410,25 @@ def test_recovery_fenced_terminal_history_remains_available(tmp_path, monkeypatc
     assert terminal_service.get_output("fenced00") == "preserved recovery history"
 
 
+def test_recovery_fenced_terminal_uses_terminalized_runtime_retirement(monkeypatch):
+    metadata = {
+        "id": "fenced00",
+        "tmux_session": "cao-history",
+        "tmux_window": "old-owner",
+        "runtime_lifecycle": "recovery_fenced",
+    }
+    retire = MagicMock(return_value=True)
+    monkeypatch.setattr(terminal_service, "get_terminal_metadata", lambda *_: metadata)
+    monkeypatch.setattr(terminal_service, "_retire_inactive_terminal_runtime", retire)
+
+    assert terminal_service.retire_exited_terminal_runtime("fenced00") is True
+    retire.assert_called_once_with(
+        metadata,
+        expected_lifecycle="recovery_fenced",
+        proc_root=terminal_service.Path("/proc"),
+    )
+
+
 def test_exited_terminal_output_reads_housekeeping_compressed_log(tmp_path, monkeypatch):
     import gzip
 

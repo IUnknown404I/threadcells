@@ -219,6 +219,22 @@ class TestSessionAuthority:
 
 class TestDeleteSession:
     def _patch_common(self, durable):
+        def delete_lifetime(
+            _session_id,
+            _session_name,
+            *,
+            expected_terminal_ids,
+            retained_resources=(),
+        ):
+            retained = list(retained_resources)
+            return {
+                "deleted": len(expected_terminal_ids) - len(retained),
+                "logical_deleted": len(expected_terminal_ids),
+                "retained": len(retained),
+                "retained_resources": retained,
+                "already_deleted": False,
+            }
+
         return (
             patch(
                 "cli_agent_orchestrator.services.session_service.resolve_session_lifetime",
@@ -236,13 +252,7 @@ class TestDeleteSession:
             patch("cli_agent_orchestrator.services.session_service.provider_manager"),
             patch(
                 "cli_agent_orchestrator.services.session_service.delete_terminals_by_session_lifetime",
-                return_value={
-                    "deleted": len(durable["terminals"]),
-                    "logical_deleted": len(durable["terminals"]),
-                    "retained": 0,
-                    "retained_resources": [],
-                    "already_deleted": False,
-                },
+                side_effect=delete_lifetime,
             ),
             patch("cli_agent_orchestrator.services.inbox_service.wake_provider_execution_queue"),
         )
@@ -274,9 +284,19 @@ class TestDeleteSession:
         delete.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")
-    def test_recovery_fenced_session_is_retained_as_takeover_evidence(self, mock_tmux):
+    def test_unfinished_recovery_authority_is_truthfully_blocked(self, mock_tmux):
         mock_tmux.session_exists.return_value = False
-        contexts = self._patch_common(_durable_session(lifecycle="recovery_fenced"))
+        durable = _durable_session(lifecycle="recovery_fenced")
+        durable["blocking_recovery_operations"] = [
+            {
+                "operation_id": "takeover-1",
+                "terminal_id": "terminal1",
+                "kind": "recovery_takeover",
+                "state": "dispatch_uncertain",
+                "reason_code": "RECOVERY_PROVIDER_DISPATCH_UNCERTAIN",
+            }
+        ]
+        contexts = self._patch_common(durable)
         with (
             contexts[0],
             contexts[1] as prepare,
@@ -290,13 +310,100 @@ class TestDeleteSession:
             with pytest.raises(SessionLifecycleError) as error:
                 delete_session("session-lifetime-1")
 
-        assert error.value.reason_code == "SESSION_RECOVERY_EVIDENCE_PROTECTED"
+        assert error.value.reason_code == "SESSION_RECOVERY_AUTHORITY_ACTIVE"
         prepare.assert_not_called()
         cancel.assert_not_called()
         validate.assert_not_called()
         cleanup.assert_not_called()
         providers.cleanup_provider.assert_not_called()
         delete.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.session_service.retire_exited_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_recovery_fenced_session_deletes_without_touching_successor_workspace(
+        self, mock_tmux, retire
+    ):
+        mock_tmux.session_exists.return_value = False
+        retire.return_value = True
+        durable = _durable_session(lifecycle="recovery_fenced")
+        for terminal in durable["terminals"]:
+            terminal.update(
+                {
+                    "managed_worktree_kind": "supervisor",
+                    "writable_work_context_id": "successor-context",
+                }
+            )
+        contexts = self._patch_common(durable)
+        with (
+            contexts[0],
+            contexts[1],
+            contexts[2],
+            contexts[3] as validate,
+            contexts[4] as cleanup,
+            contexts[5],
+            contexts[6] as delete,
+            contexts[7],
+        ):
+            result = delete_session("session-lifetime-1")
+
+        assert result["deleted"] == ["cao-test"]
+        assert result["retained_resources"] == [
+            {
+                "terminal_id": "terminal1",
+                "reason_code": "RECOVERY_FENCED_RESOURCE_RETAINED",
+            },
+            {
+                "terminal_id": "terminal2",
+                "reason_code": "RECOVERY_FENCED_RESOURCE_RETAINED",
+            },
+        ]
+        assert retire.call_count == 2
+        validate.assert_not_called()
+        cleanup.assert_not_called()
+        delete.assert_called_once_with(
+            "session-lifetime-1",
+            "cao-test",
+            expected_terminal_ids=["terminal1", "terminal2"],
+            retained_resources=result["retained_resources"],
+        )
+
+    @patch("cli_agent_orchestrator.services.session_service.retire_exited_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.session_service.tmux_client")
+    def test_archived_legacy_saved_workspace_does_not_block_deletion(self, mock_tmux, retire):
+        mock_tmux.session_exists.return_value = False
+        retire.return_value = True
+        durable = _durable_session(lifecycle="exited")
+        for terminal in durable["terminals"]:
+            terminal.update(
+                {
+                    "launch_worktree": "/legacy/shared",
+                    "workspace_classification": "legacy_shared_root",
+                    "managed_worktree_kind": None,
+                    "writable_work_context_id": None,
+                }
+            )
+        contexts = self._patch_common(durable)
+        with (
+            contexts[0],
+            contexts[1],
+            contexts[2],
+            contexts[3],
+            contexts[4] as cleanup,
+            contexts[5],
+            contexts[6] as delete,
+            contexts[7],
+        ):
+            result = delete_session("session-lifetime-1")
+
+        assert result["deleted"] == ["cao-test"]
+        assert result["retained_resources"] == []
+        assert cleanup.call_count == 2
+        delete.assert_called_once_with(
+            "session-lifetime-1",
+            "cao-test",
+            expected_terminal_ids=["terminal1", "terminal2"],
+            retained_resources=[],
+        )
 
     @patch("cli_agent_orchestrator.services.session_service.retire_exited_terminal_runtime")
     @patch("cli_agent_orchestrator.services.session_service.tmux_client")

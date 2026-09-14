@@ -4411,6 +4411,61 @@ def _ensure_terminal_deletion_receipt_schema() -> None:
     TerminalDeletionReceiptModel.__table__.create(bind=engine, checkfirst=True)
 
 
+def _session_recovery_authorities(
+    db: Any, session_id: str, terminals: Sequence[TerminalModel]
+) -> list[dict[str, Any]]:
+    """Project only recovery state that still owns unfinished authority.
+
+    ``recovery_fenced`` is durable history after a successful takeover, not by
+    itself an unfinished operation.  A takeover remains authoritative until it
+    completes, while a pre-fence terminal failure releases the claim.  A
+    ``recovery_required`` terminal without such a claim is its own explicit
+    recovery opportunity and must still fence destructive Session deletion.
+    """
+    takeover_rows = (
+        db.query(RecoveryTakeoverModel)
+        .filter(
+            RecoveryTakeoverModel.old_session_id == session_id,
+            or_(
+                RecoveryTakeoverModel.state.notin_(("completed", "failed")),
+                and_(
+                    RecoveryTakeoverModel.state == "failed",
+                    RecoveryTakeoverModel.fenced_at.is_not(None),
+                ),
+            ),
+        )
+        .order_by(RecoveryTakeoverModel.created_at.asc(), RecoveryTakeoverModel.id.asc())
+        .all()
+    )
+    operations = [
+        {
+            "operation_id": str(row.id),
+            "terminal_id": str(row.old_terminal_id),
+            "kind": "recovery_takeover",
+            "state": str(row.state),
+            "reason_code": str(row.failure_reason) if row.failure_reason else None,
+        }
+        for row in takeover_rows
+    ]
+    claimed_terminal_ids = {str(row.old_terminal_id) for row in takeover_rows}
+    operations.extend(
+        {
+            "operation_id": str(terminal.id),
+            "terminal_id": str(terminal.id),
+            "kind": "runtime_recovery",
+            "state": "recovery_required",
+            "reason_code": "RECOVERY_TAKEOVER_REQUIRED",
+        }
+        for terminal in terminals
+        if terminal.runtime_lifecycle == "recovery_required"
+        and str(terminal.id) not in claimed_terminal_ids
+    )
+    return sorted(
+        operations,
+        key=lambda item: (str(item["terminal_id"]), str(item["operation_id"])),
+    )
+
+
 def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
     """Resolve a stable lifetime ID or a unique legacy/raw tmux name.
 
@@ -4434,6 +4489,7 @@ def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
                 "deleted": True,
                 "terminals": [],
                 "retained_resources": _session_receipt_retained_resources(exact_receipt),
+                "blocking_recovery_operations": [],
             }
         terminals = (
             db.query(TerminalModel)
@@ -4496,12 +4552,16 @@ def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
             }
             if len(names) != 1 or len(identities) != 1:
                 raise AmbiguousSessionIdentity(identifier)
+            session_id = identities.pop()
             return {
-                "session_id": identities.pop(),
+                "session_id": session_id,
                 "session_name": names.pop(),
                 "deleted": False,
                 "terminals": [_session_terminal_dict(row) for row in terminals],
                 "retained_resources": [],
+                "blocking_recovery_operations": _session_recovery_authorities(
+                    db, session_id, terminals
+                ),
             }
 
         receipt = (
@@ -4527,6 +4587,7 @@ def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
             "deleted": True,
             "terminals": [],
             "retained_resources": _session_receipt_retained_resources(receipt),
+            "blocking_recovery_operations": [],
         }
 
 

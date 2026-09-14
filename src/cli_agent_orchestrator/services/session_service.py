@@ -73,6 +73,7 @@ class SessionAuthority:
     session_name: str
     terminals: List[Dict]
     retained_resources: List[Dict]
+    blocking_recovery_operations: List[Dict]
     deleted: bool
     runtime_exists: bool | None
 
@@ -82,12 +83,6 @@ class SessionAuthority:
             terminal.get("runtime_lifecycle")
             not in {"exited", "recovery_fenced", "recovery_required"}
             for terminal in self.terminals
-        )
-
-    @property
-    def has_recovery_fenced_history(self) -> bool:
-        return any(
-            terminal.get("runtime_lifecycle") == "recovery_fenced" for terminal in self.terminals
         )
 
 
@@ -108,6 +103,7 @@ def resolve_session_authority(identifier: str, *, require_live: bool = False) ->
         session_name=str(durable["session_name"]),
         terminals=list(durable["terminals"]),
         retained_resources=list(durable.get("retained_resources", [])),
+        blocking_recovery_operations=list(durable.get("blocking_recovery_operations", [])),
         deleted=bool(durable["deleted"]),
         runtime_exists=runtime_exists,
     )
@@ -239,10 +235,11 @@ def _session_deletion_preflight(authority: SessionAuthority) -> Dict[str, object
             "modified_files": 0,
             "untracked_files": 0,
             "reason_code": None,
+            "blocking_recovery_operations": [],
         }
     reason_code: str | None = None
-    if authority.has_recovery_fenced_history:
-        reason_code = "SESSION_RECOVERY_EVIDENCE_PROTECTED"
+    if authority.blocking_recovery_operations:
+        reason_code = "SESSION_RECOVERY_AUTHORITY_ACTIVE"
     elif authority.has_live_runtime_owner:
         reason_code = "SESSION_RUNTIME_ACTIVE"
     context = get_writable_work_context_by_session(authority.session_id)
@@ -260,6 +257,11 @@ def _session_deletion_preflight(authority: SessionAuthority) -> Dict[str, object
         )
 
         for terminal in authority.terminals:
+            # A recovery-fenced predecessor no longer owns the writable
+            # workspace. The successor (or retained cleanup metadata) is the
+            # only authority allowed to inspect or retire that resource.
+            if terminal.get("runtime_lifecycle") == "recovery_fenced":
+                continue
             if not terminal.get("managed_worktree_kind"):
                 continue
             worktree = managed_worktree_status(terminal)
@@ -276,6 +278,7 @@ def _session_deletion_preflight(authority: SessionAuthority) -> Dict[str, object
         "modified_files": modified_files,
         "untracked_files": untracked_files,
         "reason_code": reason_code,
+        "blocking_recovery_operations": list(authority.blocking_recovery_operations),
     }
 
 
@@ -310,8 +313,8 @@ def delete_session(
             if not preflight["eligible"]:
                 reason = str(preflight["reason_code"])
                 messages = {
-                    "SESSION_RECOVERY_EVIDENCE_PROTECTED": (
-                        "This session contains recovery-takeover evidence and must be retained"
+                    "SESSION_RECOVERY_AUTHORITY_ACTIVE": (
+                        "This session still owns unfinished recovery authority"
                     ),
                     "SESSION_RUNTIME_ACTIVE": (
                         "Every agent must be durably exited before deleting this session"
@@ -362,7 +365,24 @@ def delete_session(
             # The destructive confirmation covers dirty bytes, never active
             # authority. Any Git identity change still aborts fail-closed.
             claimed_contexts: dict[str, bool] = {}
+            retained_resources: list[dict[str, str]] = []
             for terminal in terminals:
+                if terminal.get("runtime_lifecycle") == "recovery_fenced":
+                    # Successful replacement moves workspace/writer authority
+                    # to a different Session. Never retire that shared resource
+                    # while deleting predecessor history. Retain this exact
+                    # predecessor metadata behind the Session tombstone as a
+                    # cleanup fallback without reviving its writer authority.
+                    if terminal.get("managed_worktree_kind") or terminal.get(
+                        "writable_work_context_id"
+                    ):
+                        retained_resources.append(
+                            {
+                                "terminal_id": str(terminal["id"]),
+                                "reason_code": "RECOVERY_FENCED_RESOURCE_RETAINED",
+                            }
+                        )
+                    continue
                 try:
                     work_context_id = terminal.get("writable_work_context_id")
                     if work_context_id and str(work_context_id) not in claimed_contexts:
@@ -416,7 +436,7 @@ def delete_session(
                     authority.session_id,
                     authority.session_name,
                     expected_terminal_ids=[terminal["id"] for terminal in terminals],
-                    retained_resources=[],
+                    retained_resources=retained_resources,
                 )
             except AmbiguousSessionIdentity as exc:
                 raise SessionLifecycleError(

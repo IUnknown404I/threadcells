@@ -55,7 +55,7 @@ async function allAgents(): Promise<AgentSummary[]> {
       const state = await statusFor(terminal.id)
       const activity = String(state.activity || state.status || 'idle').toLowerCase()
       const lifecycleValue = String(state.lifecycle || 'running').toLowerCase()
-      const lifecycle: AgentSummary['lifecycle'] = ['starting', 'running', 'exit_pending', 'exited', 'recovery_fenced'].includes(lifecycleValue)
+      const lifecycle: AgentSummary['lifecycle'] = ['starting', 'running', 'recovery_required', 'exit_pending', 'exited', 'recovery_fenced'].includes(lifecycleValue)
         ? lifecycleValue as AgentSummary['lifecycle']
         : 'running'
       result.push({

@@ -1275,7 +1275,8 @@ def test_release_gc_preserves_active_rollback_and_backups_and_removes_only_stale
     assert by_name["active"].protection_reason == "ACTIVE_RELEASE"
     assert by_name["rollback"].protection_reason == "CANONICAL_ROLLBACK_RELEASE"
     assert by_name["stale"].action == "delete"
-    assert by_name["backups"].protection_reason == "BACKUP_PROTECTED"
+    assert by_name["database.sqlite"].protection_reason == "BACKUP_PROTECTED"
+    assert by_name["database.sqlite"].action == "preserve"
 
     report = execute_plan(plan, config=config, open_inventory=lambda: (set(), True))
     assert report.ok is True

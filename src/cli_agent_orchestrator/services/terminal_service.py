@@ -1493,11 +1493,21 @@ def _retire_recovery_required_terminal_runtime(
 def retire_exited_terminal_runtime(
     terminal_id: str, *, proc_root: Path = Path("/proc")
 ) -> bool | None:
-    """Public idempotent retirement entry point for Housekeeping/recovery."""
+    """Retire an exact terminalized runtime without erasing lifecycle history."""
     metadata = get_terminal_metadata(terminal_id)
     if not metadata:
         return None
-    return _retire_exited_terminal_runtime(metadata, proc_root=proc_root)
+    lifecycle = metadata.get("runtime_lifecycle")
+    if lifecycle not in {
+        TerminalLifecycle.EXITED.value,
+        TerminalLifecycle.RECOVERY_FENCED.value,
+    }:
+        return None
+    return _retire_inactive_terminal_runtime(
+        metadata,
+        expected_lifecycle=str(lifecycle),
+        proc_root=proc_root,
+    )
 
 
 def _reconcile_exited_terminal_provider_execution_authority(

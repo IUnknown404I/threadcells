@@ -29,11 +29,13 @@ export function RecoveryTakeoverAction({
   capability,
   onCompleted,
   className,
+  iconOnly = false,
 }: {
   agent: AgentSummary
   capability?: RecoveryTakeoverCapability
   onCompleted: () => void
   className: string
+  iconOnly?: boolean
 }) {
   const { t } = useI18n()
   const { showSnackbar } = useStore()
@@ -151,8 +153,8 @@ export function RecoveryTakeoverAction({
   }
 
   return <>
-    <button type="button" onClick={openDialog} className={className} title={t('agents.recoverTitle')}>
-      <ShieldAlert size={14}/>{t('agents.recoverTakeover')}
+    <button type="button" onClick={openDialog} className={className} title={t('agents.recoverTitle')} aria-label={iconOnly ? t('agents.recoverTakeover') : undefined}>
+      <ShieldAlert size={14}/>{!iconOnly && t('agents.recoverTakeover')}
     </button>
     {open && <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6">
       <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={close}/>

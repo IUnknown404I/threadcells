@@ -4651,6 +4651,7 @@ def _session_unresolved_work_plan_in_transaction(
     cancellable_items: list[dict[str, Any]] = []
     retirement_items: list[dict[str, Any]] = []
     unsafe_items: list[dict[str, Any]] = []
+    blocking_recovery_operations: list[dict[str, Any]] = []
     category_counts: dict[tuple[str, str], dict[str, Any]] = {}
     overflow = terminal_scope_overflow
 
@@ -4720,7 +4721,7 @@ def _session_unresolved_work_plan_in_transaction(
             )
 
         fingerprint_document = {
-            "version": 4,
+            "version": 5,
             "session_id": session_id,
             "terminal_authority": sorted(
                 (
@@ -4783,6 +4784,16 @@ def _session_unresolved_work_plan_in_transaction(
                 (item["item_kind"], item["item_id"], item["state"], item["reason_code"])
                 for item in unsafe_items
             ),
+            "blocking_recovery_operations": sorted(
+                (
+                    str(item.get("operation_id") or ""),
+                    str(item.get("terminal_id") or ""),
+                    str(item["kind"]),
+                    str(item["state"]),
+                    str(item["reason_code"]),
+                )
+                for item in blocking_recovery_operations
+            ),
         }
         plan_token = hashlib.sha256(
             json.dumps(fingerprint_document, sort_keys=True, separators=(",", ":")).encode()
@@ -4822,6 +4833,7 @@ def _session_unresolved_work_plan_in_transaction(
                     for item in unsafe_items + retirement_items + cancellable_items
                 }
             ),
+            "blocking_recovery_operations": blocking_recovery_operations,
             "_cancellable_items": cancellable_items,
             "_retirement_items": retirement_items,
             "_unsafe_items": unsafe_items,
@@ -4829,6 +4841,73 @@ def _session_unresolved_work_plan_in_transaction(
 
     if terminal_scope_overflow:
         return finish()
+
+    recovery_terminal_ids: set[str] = set()
+    if terminal_ids:
+        recoveries = bounded(
+            db.query(RecoveryTakeoverModel)
+            .filter(
+                or_(
+                    RecoveryTakeoverModel.old_session_id == session_id,
+                    RecoveryTakeoverModel.new_session_id == session_id,
+                    RecoveryTakeoverModel.old_terminal_id.in_(terminal_ids),
+                    RecoveryTakeoverModel.new_terminal_id.in_(terminal_ids),
+                ),
+                or_(
+                    RecoveryTakeoverModel.state.notin_(("completed", "failed")),
+                    and_(
+                        RecoveryTakeoverModel.state == "failed",
+                        RecoveryTakeoverModel.fenced_at.is_not(None),
+                    ),
+                ),
+            )
+            .order_by(RecoveryTakeoverModel.id.asc())
+        )
+        for recovery in recoveries:
+            if str(recovery.old_session_id) == session_id:
+                recovery_terminal_id = str(recovery.old_terminal_id)
+            elif str(recovery.new_session_id) == session_id:
+                recovery_terminal_id = str(recovery.new_terminal_id)
+            elif str(recovery.old_terminal_id) in terminal_id_set:
+                recovery_terminal_id = str(recovery.old_terminal_id)
+            else:
+                recovery_terminal_id = str(recovery.new_terminal_id)
+            recovery_terminal_ids.update(
+                {
+                    value
+                    for value in (
+                        str(recovery.old_terminal_id),
+                        str(recovery.new_terminal_id),
+                    )
+                    if value in terminal_id_set
+                }
+            )
+            reason_code = (
+                "RECOVERY_DISPATCH_UNCERTAIN"
+                if recovery.state == "dispatch_uncertain"
+                else (
+                    "RECOVERY_TAKEOVER_FAILED_AFTER_FENCE"
+                    if recovery.state == "failed"
+                    else "RECOVERY_TAKEOVER_ACTIVE"
+                )
+            )
+            blocking_recovery_operations.append(
+                {
+                    "operation_id": str(recovery.id),
+                    "terminal_id": recovery_terminal_id,
+                    "kind": "recovery_takeover",
+                    "state": str(recovery.state),
+                    "reason_code": reason_code,
+                }
+            )
+            record(
+                "unsafe",
+                "recovery_authority",
+                reason_code,
+                "recovery_takeover",
+                recovery.id,
+                recovery.state,
+            )
 
     for terminal in terminals:
         lifecycle = str(terminal.runtime_lifecycle or "unknown")
@@ -4841,13 +4920,42 @@ def _session_unresolved_work_plan_in_transaction(
                 terminal.runtime_operation_expires_at,
             )
         )
-        if lifecycle != "exited" or runtime_operation_active:
-            if lifecycle == "recovery_fenced":
+        terminal_id = str(terminal.id)
+        if lifecycle == "recovery_required" and terminal_id not in recovery_terminal_ids:
+            blocking_recovery_operations.append(
+                {
+                    "operation_id": None,
+                    "terminal_id": terminal_id,
+                    "kind": "terminal_runtime",
+                    "state": lifecycle,
+                    "reason_code": "RECOVERY_RECONCILIATION_REQUIRED",
+                }
+            )
+            record(
+                "unsafe",
+                "recovery_authority",
+                "RECOVERY_RECONCILIATION_REQUIRED",
+                "terminal",
+                terminal.id,
+                lifecycle,
+            )
+        elif runtime_operation_active and not (
+            lifecycle in {"recovery_fenced", "recovery_required"}
+            and terminal_id in recovery_terminal_ids
+        ):
+            if lifecycle in {"recovery_fenced", "recovery_required"}:
                 category = "recovery_authority"
-                reason = "SESSION_RECOVERY_EVIDENCE_PROTECTED"
-            elif lifecycle == "recovery_required":
-                category = "recovery_authority"
-                reason = "RECOVERY_RECONCILIATION_REQUIRED"
+                reason = "RUNTIME_RECOVERY_OPERATION_ACTIVE"
+                if terminal_id not in recovery_terminal_ids:
+                    blocking_recovery_operations.append(
+                        {
+                            "operation_id": None,
+                            "terminal_id": terminal_id,
+                            "kind": str(terminal.runtime_operation_kind or "runtime_recovery"),
+                            "state": "runtime_operation_claim",
+                            "reason_code": reason,
+                        }
+                    )
             else:
                 category = "runtime_authority"
                 reason = (
@@ -4863,6 +4971,15 @@ def _session_unresolved_work_plan_in_transaction(
                 terminal.id,
                 terminal.runtime_operation_kind
                 or ("runtime_operation_claim" if runtime_operation_active else lifecycle),
+            )
+        elif lifecycle not in {"exited", "recovery_fenced"}:
+            record(
+                "unsafe",
+                "runtime_authority",
+                "RUNTIME_DEATH_UNCONFIRMED",
+                "terminal",
+                terminal.id,
+                lifecycle,
             )
 
     for receipt in historical_terminal_receipts:
@@ -5159,27 +5276,6 @@ def _session_unresolved_work_plan_in_transaction(
                 "active",
             )
 
-        recoveries = bounded(
-            db.query(RecoveryTakeoverModel)
-            .filter(
-                or_(
-                    RecoveryTakeoverModel.old_terminal_id.in_(terminal_ids),
-                    RecoveryTakeoverModel.new_terminal_id.in_(terminal_ids),
-                ),
-                RecoveryTakeoverModel.state.in_(("claimed", "fenced", "dispatching", "admitted")),
-            )
-            .order_by(RecoveryTakeoverModel.id.asc())
-        )
-        for recovery in recoveries:
-            record(
-                "unsafe",
-                "recovery_authority",
-                "RECOVERY_TAKEOVER_ACTIVE",
-                "recovery_takeover",
-                recovery.id,
-                recovery.state,
-            )
-
     return finish()
 
 
@@ -5211,12 +5307,11 @@ def _session_workspace_snapshot_in_transaction(
         reason_code = "WORKSPACE_STATE_NOT_RETIRABLE"
     elif not terminals:
         reason_code = "WORKSPACE_HISTORY_MISSING"
-    elif any(
-        terminal.runtime_lifecycle in {"recovery_fenced", "recovery_required"}
-        for terminal in terminals
-    ):
+    elif any(terminal.runtime_lifecycle == "recovery_required" for terminal in terminals):
         reason_code = "RECOVERY_PROTECTED"
-    elif any(terminal.runtime_lifecycle != "exited" for terminal in terminals):
+    elif any(
+        terminal.runtime_lifecycle not in {"exited", "recovery_fenced"} for terminal in terminals
+    ):
         reason_code = "WORKTREE_ACTIVE"
     elif any(terminal.runtime_operation_kind is not None for terminal in terminals):
         reason_code = "RECOVERY_PROTECTED"
@@ -5355,6 +5450,7 @@ def _session_identity_changed_plan() -> Dict[str, Any]:
         "live_unsafe_count": 1,
         "plan_limit": _SESSION_DELETION_PLAN_LIMIT,
         "reason_codes": ["SESSION_IDENTITY_CHANGED"],
+        "blocking_recovery_operations": [],
     }
 
 
@@ -7264,6 +7360,74 @@ def _session_workspace_context_progress_is_valid(
     )
 
 
+def _completed_takeover_foreign_workspace_is_valid(
+    db: Any,
+    *,
+    session_id: str,
+    terminal_by_id: Mapping[str, TerminalModel],
+    supervisor_rows: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Prove that every former supervisor workspace has one exact successor owner."""
+    if not supervisor_rows:
+        return False
+    local_terminal_ids = set(terminal_by_id)
+    for row in supervisor_rows:
+        old_terminal = terminal_by_id.get(str(row.get("terminal_id") or ""))
+        context_id = row.get("writable_work_context_id")
+        if old_terminal is None or not isinstance(context_id, str):
+            return False
+        context = db.get(WritableWorkContextModel, context_id)
+        if not (
+            context is not None
+            and str(context.session_id) != session_id
+            and str(context.terminal_id) not in local_terminal_ids
+            and context.state == "admitted"
+            and context.project_id == row.get("project_id")
+            and context.canonical_source == row.get("source")
+            and context.canonical_worktree == row.get("path")
+            and context.branch == str(row.get("owned_ref") or "").removeprefix("refs/heads/")
+            and context.base_revision == old_terminal.managed_worktree_commit
+        ):
+            return False
+        successor = db.get(TerminalModel, context.terminal_id)
+        takeover = (
+            db.get(RecoveryTakeoverModel, old_terminal.recovery_takeover_id)
+            if old_terminal.recovery_takeover_id is not None
+            else None
+        )
+        lease = db.get(WorktreeWriterLeaseModel, context.canonical_worktree)
+        if not (
+            old_terminal.runtime_lifecycle == "recovery_fenced"
+            and old_terminal.replaced_by_terminal_id == context.terminal_id
+            and takeover is not None
+            and takeover.state == "completed"
+            and takeover.old_terminal_id == old_terminal.id
+            and takeover.old_session_id == session_id
+            and takeover.new_terminal_id == context.terminal_id
+            and takeover.new_session_id == context.session_id
+            and takeover.canonical_worktree == context.canonical_worktree
+            and takeover.project_id == context.project_id
+            and successor is not None
+            and successor.session_id == context.session_id
+            and successor.writable_work_context_id == context.id
+            and successor.launch_worktree == context.canonical_worktree
+            and successor.writer_authority_generation == context.writer_authority_generation
+        ):
+            return False
+        if successor.runtime_lifecycle == "exited":
+            if lease is not None:
+                return False
+        elif successor.runtime_lifecycle in {"recovery_fenced", "recovery_required"}:
+            return False
+        elif not (
+            lease is not None
+            and lease.terminal_id == successor.id
+            and lease.authority_generation == context.writer_authority_generation
+        ):
+            return False
+    return True
+
+
 def _validate_session_workspace_relational_authority_in_transaction(
     db: Any,
     *,
@@ -7344,7 +7508,21 @@ def _validate_session_workspace_relational_authority_in_transaction(
     supervisor_rows = [row for row in managed_rows if row.get("kind") == "supervisor"]
     if context is None:
         if supervisor_rows or any(row.get("writable_work_context_id") for row in managed_rows):
-            return "WORKSPACE_AUTHORITY_CHANGED"
+            if any(
+                row.get("kind") != "supervisor" and row.get("writable_work_context_id")
+                for row in managed_rows
+            ):
+                return "WORKSPACE_AUTHORITY_CHANGED"
+            completed_takeover = _completed_takeover_foreign_workspace_is_valid(
+                db,
+                session_id=session_id,
+                terminal_by_id=terminal_by_id,
+                supervisor_rows=supervisor_rows,
+            )
+            if not completed_takeover:
+                return "WORKSPACE_AUTHORITY_CHANGED"
+            if not allow_foreign_workspace:
+                return "WORKSPACE_FOREIGN_OWNER"
     elif not supervisor_rows and context.state == "retired":
         # Receipt-only legacy Sessions may retain an already-retired context
         # after its physical supervisor worktree authority was retired.  Other
@@ -9540,7 +9718,7 @@ def _revalidate_session_hard_deletion_in_transaction(
         return None, lifetime_error
     if any(
         str(row.tmux_session) != parsed["session_name"]
-        or str(row.runtime_lifecycle or "") != "exited"
+        or str(row.runtime_lifecycle or "") not in {"exited", "recovery_fenced"}
         or row.runtime_operation_kind is not None
         or row.runtime_operation_token is not None
         for row in terminals
@@ -9705,7 +9883,7 @@ def begin_session_hard_deletion(
             return {"started": False, "reason_code": lifetime_error}
         if any(
             str(terminal.tmux_session) != session_name
-            or str(terminal.runtime_lifecycle or "") != "exited"
+            or str(terminal.runtime_lifecycle or "") not in {"exited", "recovery_fenced"}
             or terminal.runtime_operation_kind is not None
             or terminal.runtime_operation_token is not None
             for terminal in terminals

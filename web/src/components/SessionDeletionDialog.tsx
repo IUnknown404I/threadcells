@@ -29,6 +29,8 @@ const REASON_KEYS: Record<string, TranslationKey> = {
   PROVIDER_EXECUTION_ACTIVE: 'sessionDeletion.reason.providerActive',
   WRITER_LEASE_ACTIVE: 'sessionDeletion.reason.writerActive',
   RECOVERY_TAKEOVER_ACTIVE: 'sessionDeletion.reason.recoveryActive',
+  RECOVERY_DISPATCH_UNCERTAIN: 'sessionDeletion.reason.recoveryUncertain',
+  RECOVERY_TAKEOVER_FAILED_AFTER_FENCE: 'sessionDeletion.reason.recoveryFailedAfterFence',
   RECOVERY_RECONCILIATION_REQUIRED: 'sessionDeletion.reason.recoveryRequired',
   INDETERMINATE_EFFECT: 'sessionDeletion.reason.indeterminateEffect',
   CLAIMED_EFFECT: 'sessionDeletion.reason.claimedEffect',
@@ -84,6 +86,7 @@ export function SessionDeletionDialog({
     : retirement
       ? [...preflight.historical_indeterminate_blockers, ...preflight.cancellable_blockers]
       : preflight.cancellable_blockers
+  const recoveryOperations = preflight.blocking_recovery_operations || []
 
   return (
     <ConfirmModal
@@ -149,6 +152,21 @@ export function SessionDeletionDialog({
               <li key={reason}>• {t(REASON_KEYS[reason] || 'sessionDeletion.reason.unknown')}</li>
             ))}
           </ul>
+        </div>
+      )}
+      {unsafe && recoveryOperations.length > 0 && (
+        <div data-testid="session-deletion-recovery-authority" role="status" className="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3">
+          <p className="text-sm font-medium text-amber-300">{t('sessionDeletion.recoveryAuthorityTitle')}</p>
+          <p className="mt-1 text-sm leading-5 text-gray-300">{t('sessionDeletion.recoveryOwnerResolution')}</p>
+          <div className="mt-3 space-y-3">
+            {recoveryOperations.map((operation, index) => (
+              <dl key={`${operation.operation_id || operation.terminal_id}:${index}`} className="grid gap-x-3 gap-y-1 rounded-md border border-gray-700/50 bg-gray-900/50 p-2 text-xs sm:grid-cols-[auto_minmax(0,1fr)]">
+                <dt className="text-gray-500">{t('sessionDeletion.recoveryState')}</dt><dd className="break-all font-mono text-gray-200">{operation.state}</dd>
+                <dt className="text-gray-500">{t('sessionDeletion.recoveryTerminal')}</dt><dd className="break-all font-mono text-gray-200">{operation.terminal_id}</dd>
+                {operation.operation_id && <><dt className="text-gray-500">{t('sessionDeletion.recoveryOperation')}</dt><dd className="break-all font-mono text-gray-200">{operation.operation_id}</dd></>}
+              </dl>
+            ))}
+          </div>
         </div>
       )}
       {preflight.requires_dirty_confirmation && !unsafe && (

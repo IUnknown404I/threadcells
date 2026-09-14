@@ -3,6 +3,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
+import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
@@ -1707,6 +1708,112 @@ def test_recovery_lifecycle_states_remain_structured_unsafe_authority(monkeypatc
             "count": 1,
             "disposition": "unsafe",
             "reason_codes": ["RECOVERY_RECONCILIATION_REQUIRED"],
+        }
+    ]
+    assert plan["blocking_recovery_operations"] == [
+        {
+            "operation_id": None,
+            "terminal_id": "owner",
+            "kind": "terminal_runtime",
+            "state": "recovery_required",
+            "reason_code": "RECOVERY_RECONCILIATION_REQUIRED",
+        }
+    ]
+
+
+def test_completed_takeover_leaves_replaced_terminal_as_nonblocking_history(monkeypatch):
+    _install_database(monkeypatch)
+    terminal = _terminal()
+    terminal.runtime_lifecycle = "recovery_fenced"
+    terminal.recovery_takeover_id = "completed-takeover"
+    terminal.replaced_by_terminal_id = "replacement"
+    with database.SessionLocal() as db:
+        db.add(terminal)
+        db.add(
+            RecoveryTakeoverModel(
+                id="completed-takeover",
+                request_id="completed-request",
+                old_terminal_id="owner",
+                new_terminal_id="replacement",
+                old_session_id="session",
+                expected_authority_generation="old-writer",
+                expected_runtime_generation="old-runtime",
+                new_authority_generation="new-writer",
+                canonical_worktree="/tmp/session",
+                project_id="project",
+                agent_profile="developer",
+                provider="codex",
+                owner_grant_id="completed-grant",
+                new_session_name="cao-replacement",
+                new_session_id="replacement-session",
+                new_window_name="replacement",
+                new_runtime_generation="new-runtime",
+                state="completed",
+                fenced_at=datetime(2026, 9, 7, 10, 1, 0),
+                completed_at=datetime(2026, 9, 7, 10, 2, 0),
+            )
+        )
+        db.commit()
+
+    plan = _plan()
+    assert plan["eligible"] is True
+    assert plan["reason_codes"] == []
+    assert plan["blocking_recovery_operations"] == []
+
+
+@pytest.mark.parametrize(
+    ("state", "reason_code"),
+    [
+        ("claimed", "RECOVERY_TAKEOVER_ACTIVE"),
+        ("dispatch_uncertain", "RECOVERY_DISPATCH_UNCERTAIN"),
+        ("failed", "RECOVERY_TAKEOVER_FAILED_AFTER_FENCE"),
+    ],
+)
+def test_unresolved_takeover_states_remain_exact_recovery_authority(
+    monkeypatch, state, reason_code
+):
+    _install_database(monkeypatch)
+    terminal = _terminal()
+    terminal.runtime_lifecycle = "recovery_fenced"
+    terminal.recovery_takeover_id = "unfinished-takeover"
+    terminal.replaced_by_terminal_id = "replacement"
+    with database.SessionLocal() as db:
+        db.add(terminal)
+        db.add(
+            RecoveryTakeoverModel(
+                id="unfinished-takeover",
+                request_id=f"{state}-request",
+                old_terminal_id="owner",
+                new_terminal_id="replacement",
+                old_session_id="session",
+                expected_authority_generation="old-writer",
+                expected_runtime_generation="old-runtime",
+                new_authority_generation="new-writer",
+                canonical_worktree="/tmp/session",
+                project_id="project",
+                agent_profile="developer",
+                provider="codex",
+                owner_grant_id=f"{state}-grant",
+                new_session_name=f"cao-{state}-replacement",
+                new_session_id=f"{state}-replacement-session",
+                new_window_name="replacement",
+                new_runtime_generation=f"{state}-runtime",
+                state=state,
+                fenced_at=datetime(2026, 9, 7, 10, 1, 0),
+            )
+        )
+        db.commit()
+
+    plan = _plan()
+    assert plan["eligible"] is False
+    assert plan["reason_codes"] == [reason_code]
+    assert plan["blocking_recovery_operations"] == [
+        {
+            "operation_id": "unfinished-takeover",
+            "terminal_id": "owner",
+            "kind": "recovery_takeover",
+            "state": state,
+            "reason_code": reason_code,
         }
     ]
 

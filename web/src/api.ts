@@ -358,6 +358,14 @@ export interface SessionDeletionBlocker {
   reason_codes: string[]
 }
 
+export interface SessionRecoveryOperation {
+  operation_id: string | null
+  terminal_id: string
+  kind: string
+  state: string
+  reason_code: string
+}
+
 export interface SessionDeletionPreflight {
   eligible: boolean
   deletion_mode: 'eligible_normal' | 'eligible_with_cancellable_work' | 'eligible_with_historical_indeterminate_retirement' | 'blocked_live_or_unsafe_authority' | 'deletion_in_progress'
@@ -385,6 +393,7 @@ export interface SessionDeletionPreflight {
   cancellable_blockers: SessionDeletionBlocker[]
   historical_indeterminate_blockers: SessionDeletionBlocker[]
   unsafe_blockers: SessionDeletionBlocker[]
+  blocking_recovery_operations: SessionRecoveryOperation[]
   cancellation_plan: {
     count: number
     categories: SessionDeletionBlocker[]

@@ -36,6 +36,7 @@ const deletionPreflight = (overrides: Partial<SessionDeletionPreflight> = {}): S
   cancellable_blockers: [],
   historical_indeterminate_blockers: [],
   unsafe_blockers: [],
+  blocking_recovery_operations: [],
   cancellation_plan: { count: 0, categories: [] },
   historical_indeterminate_plan: { count: 0, categories: [] },
   ...overrides,
@@ -347,6 +348,52 @@ describe('session creation and canonical ordering', () => {
 
     fireEvent.keyDown(screen.getByRole('button', { name: `Collapse ${sessionDisplayName(sessionB.name)}` }), { key: ' ' })
     await waitFor(() => expect(screen.queryByTestId(`agent-session-detail-${sessionB.id}`)).not.toBeInTheDocument())
+  })
+
+  it('keeps a stable right-aligned action strip across terminal lifecycle states', async () => {
+    const currentSession = session('action-layout', '100')
+    const terminals = [
+      { id: 'running-actions', tmux_session: currentSession.name, tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null },
+      { id: 'exited-actions', tmux_session: currentSession.name, tmux_window: '1', provider: 'codex', agent_profile: 'reviewer', last_active: null },
+    ]
+    useStore.setState({
+      sessions: [currentSession],
+      terminalStatuses: {
+        'running-actions': { lifecycle: 'running', activity: 'idle' },
+        'exited-actions': { lifecycle: 'exited', activity: 'exited' },
+      } as never,
+    })
+    vi.spyOn(api, 'getSession').mockResolvedValue({ session: currentSession, terminals } as never)
+
+    render(<AgentPanel />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand action-layout' }))
+
+    const runningActions = await screen.findByTestId('agent-actions-running-actions')
+    const exitedActions = await screen.findByTestId('agent-actions-exited-actions')
+    for (const actions of [runningActions, exitedActions]) {
+      expect(actions).toHaveClass(
+        'ml-auto', 'grid', 'h-11', 'w-full', 'max-w-[20.75rem]', 'shrink-0', 'grid-cols-7', 'self-end',
+      )
+      expect(actions).toHaveAttribute('role', 'group')
+      expect(actions).toHaveAttribute('aria-label', 'Agent actions')
+      expect(within(actions).getByRole('button', { name: 'Open work and interaction history' })).toHaveTextContent('History')
+      expect(within(actions).getByRole('button', { name: 'View inbox' })).toHaveTextContent('Inbox')
+      expect(within(actions).getByRole('button', { name: 'View output' })).toHaveTextContent('Output')
+    }
+
+    const runningCard = screen.getByTestId('agent-detail-card-running-actions')
+    const terminalAction = within(runningCard).getByTitle('Open live terminal')
+    const exitAction = within(runningCard).getByTitle('Finish terminal')
+    const deleteAction = within(runningCard).getByTitle(
+      'Gracefully exit this terminal before deleting it',
+    )
+    expect(terminalAction).toHaveTextContent('')
+    expect(exitAction).toHaveTextContent('')
+    expect(deleteAction).toHaveTextContent('')
+    expect(terminalAction).toHaveAttribute('aria-label', 'Open live terminal')
+    expect(exitAction).toHaveAttribute('aria-label', 'Finish terminal')
+    expect(deleteAction).toHaveAttribute('aria-label', 'Delete Terminal')
+    expect(deleteAction).toBeDisabled()
   })
 
   it('shows each Agents session total next to its status without disturbing row actions', async () => {
@@ -997,10 +1044,10 @@ describe('session creation and canonical ordering', () => {
     expect(addAgent).toBeDisabled()
     expect(addAgent).toHaveAttribute('title', 'A retired workspace cannot accept agents, tasks, or terminal input')
     const agent = await screen.findByTestId(`agent-detail-card-${terminal.id}`)
-    expect(within(agent).getByRole('button', { name: 'Terminal' })).toBeDisabled()
-    const inbox = within(agent).getByRole('button', { name: 'Inbox' })
+    expect(within(agent).getByRole('button', { name: 'A retired workspace cannot accept agents, tasks, or terminal input' })).toBeDisabled()
+    const inbox = within(agent).getByRole('button', { name: 'View inbox' })
     expect(inbox).not.toBeDisabled()
-    expect(within(agent).getByRole('button', { name: 'Output' })).not.toBeDisabled()
+    expect(within(agent).getByRole('button', { name: 'View output' })).not.toBeDisabled()
     expect(within(agent).getByText('Managed workspace removed')).toBeInTheDocument()
     expect(within(agent).queryByText('Recover')).not.toBeInTheDocument()
     fireEvent.click(inbox)
@@ -1070,6 +1117,51 @@ describe('session deletion confirmation', () => {
     )
     expect(screen.queryByRole('button', { name: 'Delete Session' })).not.toBeInTheDocument()
     expect(remove).not.toHaveBeenCalled()
+  })
+
+  it('shows exact unresolved recovery authority instead of a historical-data blocker', async () => {
+    const blocker = {
+      category: 'recovery_authority',
+      count: 1,
+      disposition: 'unsafe' as const,
+      reason_codes: ['RECOVERY_DISPATCH_UNCERTAIN'],
+    }
+    vi.mocked(api.getSessionDeletionPreflight).mockResolvedValue(deletionPreflight({
+      eligible: false,
+      deletion_mode: 'blocked_live_or_unsafe_authority',
+      reason_code: 'RECOVERY_DISPATCH_UNCERTAIN',
+      reason_codes: ['RECOVERY_DISPATCH_UNCERTAIN'],
+      unsafe_count: 1,
+      blockers: [blocker],
+      unsafe_blockers: [blocker],
+      blocking_recovery_operations: [{
+        operation_id: 'takeover-pending',
+        terminal_id: 'replaced-terminal',
+        kind: 'recovery_takeover',
+        state: 'dispatch_uncertain',
+        reason_code: 'RECOVERY_DISPATCH_UNCERTAIN',
+      }],
+    }))
+    render(<AgentPanel />)
+
+    fireEvent.click(await screen.findByTitle('Delete session'))
+
+    expect(await screen.findByTestId('session-deletion-recovery-authority')).toHaveTextContent(
+      'This is live recovery authority, not historical evidence.',
+    )
+    expect(screen.getByTestId('session-deletion-recovery-authority')).toHaveTextContent(
+      'dispatch_uncertain',
+    )
+    expect(screen.getByTestId('session-deletion-recovery-authority')).toHaveTextContent(
+      'replaced-terminal',
+    )
+    expect(screen.getByTestId('session-deletion-recovery-authority')).toHaveTextContent(
+      'takeover-pending',
+    )
+    expect(screen.getByTestId('session-deletion-unsafe')).toHaveTextContent(
+      'Recovery dispatch has an uncertain external outcome and remains protected.',
+    )
+    expect(screen.queryByRole('button', { name: 'Delete Session' })).not.toBeInTheDocument()
   })
 
   it('offers exact operator retirement for historical operations with unknown outcomes', async () => {

@@ -110,12 +110,6 @@ class SessionAuthority:
             for terminal in self.terminals
         )
 
-    @property
-    def has_recovery_fenced_history(self) -> bool:
-        return any(
-            terminal.get("runtime_lifecycle") == "recovery_fenced" for terminal in self.terminals
-        )
-
 
 def resolve_session_authority(identifier: str, *, require_live: bool = False) -> SessionAuthority:
     """Resolve one stable lifetime and its current tmux authority."""
@@ -385,6 +379,7 @@ def _session_deletion_preflight(
         "live_unsafe_count": 0,
         "plan_limit": 500,
         "reason_codes": [],
+        "blocking_recovery_operations": [],
     }
     if authority.deleted:
         return {
@@ -442,9 +437,7 @@ def _session_deletion_preflight(
         )
 
     authority_reason: str | None = None
-    if authority.has_recovery_fenced_history:
-        authority_reason = "SESSION_RECOVERY_EVIDENCE_PROTECTED"
-    elif authority.runtime_exists is None:
+    if authority.runtime_exists is None:
         authority_reason = "SESSION_RUNTIME_AUTHORITY_UNPROVEN"
     elif authority.runtime_exists and not authority.has_live_runtime_owner:
         authority_reason = "SESSION_RUNTIME_AUTHORITY_UNPROVEN"
@@ -586,6 +579,9 @@ def _session_deletion_preflight(
         "live_unsafe_count": sum(int(item["count"]) for item in unsafe_blockers),
         "plan_limit": int(plan.get("plan_limit") or 500),
         "reason_codes": reason_codes,
+        "blocking_recovery_operations": [
+            dict(item) for item in plan.get("blocking_recovery_operations", [])
+        ],
         "already_deleted": False,
         "requires_dirty_confirmation": (eligible or can_resolve_and_delete) and dirty,
         "modified_files": modified_files,

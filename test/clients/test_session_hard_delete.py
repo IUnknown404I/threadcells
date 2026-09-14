@@ -2180,6 +2180,121 @@ def test_workspace_authority_preserves_foreign_writer_on_target_path(monkeypatch
         assert lease.authority_generation == "foreign-generation"
 
 
+@pytest.mark.parametrize("successor_exited", [False, True])
+def test_completed_takeover_predecessor_delete_preserves_successor_authority(
+    monkeypatch, tmp_path, successor_exited
+):
+    managed, authority = _managed_supervisor_deletion_fixture(monkeypatch, tmp_path)
+    with database.SessionLocal() as db:
+        old = db.get(TerminalModel, "owner")
+        context = db.get(WritableWorkContextModel, "context")
+        old.runtime_lifecycle = "recovery_fenced"
+        old.recovery_takeover_id = "completed-takeover"
+        old.replaced_by_terminal_id = "successor"
+        successor = _terminal(
+            "successor",
+            session_id="successor-session",
+            session_name="cao-successor",
+        )
+        successor.runtime_lifecycle = "running"
+        successor.project_id = old.project_id
+        successor.launch_worktree = old.launch_worktree
+        successor.write_enabled = True
+        successor.writer_authority_generation = "successor-writer"
+        successor.managed_worktree_kind = old.managed_worktree_kind
+        successor.managed_worktree_source = old.managed_worktree_source
+        successor.managed_worktree_branch = old.managed_worktree_branch
+        successor.managed_worktree_commit = old.managed_worktree_commit
+        successor.managed_worktree_origin_terminal_id = old.managed_worktree_origin_terminal_id
+        successor.writable_work_context_id = context.id
+        successor.recovery_takeover_id = "completed-takeover"
+        context.session_id = "successor-session"
+        context.terminal_id = successor.id
+        context.writer_authority_generation = successor.writer_authority_generation
+        db.add(successor)
+        db.add(
+            WorktreeWriterLeaseModel(
+                canonical_worktree=managed.path,
+                terminal_id=successor.id,
+                authority_generation=successor.writer_authority_generation,
+            )
+        )
+        db.add(
+            database.RecoveryTakeoverModel(
+                id="completed-takeover",
+                request_id="completed-request",
+                old_terminal_id=old.id,
+                new_terminal_id=successor.id,
+                old_session_id="session",
+                expected_authority_generation="writer-generation",
+                expected_runtime_generation="old-runtime",
+                new_authority_generation="successor-writer",
+                canonical_worktree=managed.path,
+                project_id="project",
+                agent_profile="critical_sol_xhigh_owner",
+                provider="codex",
+                owner_grant_id="completed-owner-grant",
+                new_session_name="cao-successor",
+                new_session_id="successor-session",
+                new_window_name="successor",
+                new_runtime_generation="successor-runtime",
+                state="completed",
+                fenced_at=datetime(2026, 9, 8, 10, 1, 0),
+                completed_at=datetime(2026, 9, 8, 10, 2, 0),
+            )
+        )
+        db.commit()
+    if successor_exited:
+        assert database.mark_terminal_runtime_exited("successor") is True
+    authority["work_context"] = None
+
+    plan = database.get_session_unresolved_work_plan("session", expected_terminal_ids=["owner"])
+    assert plan["eligible"] is True
+    assert plan["blocking_recovery_operations"] == []
+    started = database.begin_session_hard_deletion(
+        "session",
+        "cao-session",
+        expected_terminal_ids=["owner"],
+        allow_dirty_workspace=False,
+    )
+    assert started["started"] is True
+    bound = database.bind_session_hard_deletion_workspace_authority(
+        "session", "cao-session", workspace_authority=authority
+    )
+    assert bound.get("bound") is True, bound
+    assert bound["workspace_disposition"] == "preserved_foreign"
+    assert database.mark_session_hard_deletion_workspace_preserved(
+        "session",
+        runtime_artifacts={"runtime_artifacts_absent": True, "terminals": ["owner"]},
+    )["marked"]
+
+    completed = database.complete_session_hard_deletion("session", "cao-session")
+    assert completed["completed"] is True
+    assert completed["workspace_disposition"] == "preserved_foreign"
+    replay = database.complete_session_hard_deletion("session", "cao-session")
+    assert replay["completed"] is True
+    assert replay["already_deleted"] is True
+    assert Path(managed.path).is_dir()
+    with database.SessionLocal() as db:
+        assert db.get(TerminalModel, "owner") is None
+        successor = db.get(TerminalModel, "successor")
+        assert successor is not None
+        assert successor.runtime_lifecycle == ("exited" if successor_exited else "running")
+        context = db.get(WritableWorkContextModel, "context")
+        assert context is not None
+        assert context.session_id == "successor-session"
+        assert context.terminal_id == "successor"
+        assert context.state == "admitted"
+        lease = db.get(WorktreeWriterLeaseModel, managed.path)
+        if successor_exited:
+            assert lease is None
+        else:
+            assert lease is not None
+            assert lease.terminal_id == "successor"
+            assert lease.authority_generation == "successor-writer"
+        assert db.get(database.RecoveryTakeoverModel, "completed-takeover") is not None
+
+
 def test_workspace_context_change_after_preflight_cannot_be_bound(monkeypatch):
     _install_database(monkeypatch)
     with database.SessionLocal() as db:

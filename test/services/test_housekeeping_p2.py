@@ -11,6 +11,7 @@ import pytest
 from cli_agent_orchestrator.services.housekeeping import executor as housekeeping_executor
 from cli_agent_orchestrator.services.housekeeping.executor import (
     _execute_resource,
+    _failure_reason_code,
     execute_plan,
 )
 from cli_agent_orchestrator.services.housekeeping.models import (
@@ -69,6 +70,18 @@ def _config(root: Path):
 
 def _age(path: Path, minutes: int):
     os.utime(path, (NOW - minutes * 60, NOW - minutes * 60))
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (RuntimeError("MANAGED_WORKTREE_REMOVE_FAILED"), "MANAGED_WORKTREE_REMOVE_FAILED"),
+        (RuntimeError("remove failed at /private/path"), "RuntimeError"),
+        (ValueError("WORKSPACE_AUTHORITY_CHANGED"), "ValueError"),
+    ],
+)
+def test_executor_failure_reason_preserves_only_bounded_domain_codes(error, expected):
+    assert _failure_reason_code(error) == expected
 
 
 @pytest.mark.parametrize(

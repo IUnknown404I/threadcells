@@ -353,17 +353,20 @@ describe('session creation and canonical ordering', () => {
   it('keeps a stable right-aligned action strip across terminal lifecycle states', async () => {
     const currentSession = session('action-layout', '100')
     const terminals = [
-      { id: 'running-actions', tmux_session: currentSession.name, tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null },
+      { id: 'running-actions', tmux_session: currentSession.name, tmux_window: '0', provider: 'codex', agent_profile: 'developer', project_id: 'project-actions', last_active: null },
       { id: 'exited-actions', tmux_session: currentSession.name, tmux_window: '1', provider: 'codex', agent_profile: 'reviewer', last_active: null },
     ]
     useStore.setState({
       sessions: [currentSession],
       terminalStatuses: {
-        'running-actions': { lifecycle: 'running', activity: 'idle' },
+        'running-actions': { lifecycle: 'running', activity: 'idle', context_role: 'supervisor' },
         'exited-actions': { lifecycle: 'exited', activity: 'exited' },
       } as never,
     })
     vi.spyOn(api, 'getSession').mockResolvedValue({ session: currentSession, terminals } as never)
+    vi.mocked(api.getRecoveryTakeoverCapabilities).mockResolvedValue({
+      capabilities: [{ terminal_id: 'running-actions', eligible: true, reason_code: null }],
+    })
 
     render(<AgentPanel />)
     fireEvent.click(await screen.findByRole('button', { name: 'Expand action-layout' }))
@@ -372,16 +375,28 @@ describe('session creation and canonical ordering', () => {
     const exitedActions = await screen.findByTestId('agent-actions-exited-actions')
     for (const actions of [runningActions, exitedActions]) {
       expect(actions).toHaveClass(
-        'ml-auto', 'grid', 'h-11', 'w-full', 'max-w-[20.75rem]', 'shrink-0', 'grid-cols-7', 'self-end',
+        'agent-action-strip', 'ml-auto', 'grid', 'h-11', 'max-w-full', 'shrink-0', 'self-end',
       )
       expect(actions).toHaveAttribute('role', 'group')
       expect(actions).toHaveAttribute('aria-label', 'Agent actions')
-      expect(within(actions).getByRole('button', { name: 'Open work and interaction history' })).toHaveTextContent('History')
-      expect(within(actions).getByRole('button', { name: 'View inbox' })).toHaveTextContent('Inbox')
-      expect(within(actions).getByRole('button', { name: 'View output' })).toHaveTextContent('Output')
+      expect(within(actions).getAllByRole('button')).toHaveLength(6)
+      for (const [name, text] of [
+        ['Open work and interaction history', 'History'],
+        ['View inbox', 'Inbox'],
+        ['View output', 'Output'],
+      ]) {
+        const label = within(actions).getByRole('button', { name }).querySelector('span')
+        expect(label).toHaveTextContent(text)
+        expect(label).toHaveClass('agent-action-label')
+        expect(label).not.toHaveClass('truncate')
+      }
+      expect(within(actions).queryByRole('button', { name: 'Recover agent' })).not.toBeInTheDocument()
     }
 
     const runningCard = screen.getByTestId('agent-detail-card-running-actions')
+    const recoveryAction = await screen.findByTestId('agent-recovery-action-running-actions')
+    expect(within(recoveryAction).getByRole('button', { name: 'Recover agent' })).toHaveAttribute('title', 'Recover supervisor authority')
+    expect(screen.queryByTestId('agent-recovery-action-exited-actions')).not.toBeInTheDocument()
     const terminalAction = within(runningCard).getByTitle('Open live terminal')
     const exitAction = within(runningCard).getByTitle('Finish terminal')
     const deleteAction = within(runningCard).getByTitle(

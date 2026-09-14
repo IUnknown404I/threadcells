@@ -102,6 +102,7 @@ const labels = {
   en: {
     lang: 'Language', home: 'Home', agents: 'Agents', settings: 'Settings', docs: 'Docs', sessions: 'Sessions',
     create: 'Create Session & Spawn Agent', sessionName: 'Session name', cancel: 'Cancel', inbox: 'Inbox',
+    inboxAction: 'View inbox',
     inboxTitle: 'Agent Inbox', housekeeping: 'Housekeeping', full: 'Delete all system files — Full Cleanup',
     docsTitle: 'Start here: What is ThreadCells?', targetLocale: 'English', graceful: 'Finish',
     deleteDisabled: 'Gracefully exit this terminal before deleting it',
@@ -109,6 +110,7 @@ const labels = {
   ru: {
     lang: 'Язык', home: 'Главная', agents: 'Агенты', settings: 'Настройки', docs: 'Документация', sessions: 'Сессии',
     create: 'Создать сессию и запустить агента', sessionName: 'Название сессии', cancel: 'Отмена', inbox: 'Почта',
+    inboxAction: 'Открыть Почту',
     inboxTitle: 'Почта агента', housekeeping: 'Обслуживание', full: 'Удалить все системные файлы — полная очистка',
     docsTitle: 'Начните здесь: что такое ThreadCells?', targetLocale: 'Русский', graceful: 'Завершить',
     deleteDisabled: 'Корректно завершите терминал перед удалением',
@@ -155,11 +157,32 @@ async function assertSurfaceSet(page, locale, viewport) {
   await page.getByRole('button', { name: new RegExp(`^(Expand|Развернуть) ${session.name}$`) }).click()
   const agentCard = page.getByTestId(`agent-detail-card-${agent.id}`)
   await agentCard.getByRole('button').first().waitFor()
-  const actionLabels = (await agentCard.getByRole('button').allTextContents()).map(value => value.trim()).filter(Boolean)
-  assert.deepEqual(actionLabels.slice(0, 6), locale === 'ru'
-    ? ['История', 'Почта', 'Вывод', 'Терминал', 'Завершить', 'Удалить']
-    : ['History', 'Inbox', 'Output', 'Terminal', 'Finish', 'Delete'], `agent action order in ${locale}`)
-  await page.getByRole('button', { name: copy.inbox, exact: true }).click()
+  const actionLayout = await agentCard.getByTestId(`agent-actions-${agent.id}`).evaluate(element => {
+    const buttons = [...element.querySelectorAll(':scope > button')]
+    const labels = buttons.slice(0, 3).map(button => button.querySelector('span'))
+    return {
+      buttonCount: buttons.length,
+      ariaLabels: buttons.map(button => button.getAttribute('aria-label')),
+      visibleText: buttons.map(button => button.innerText.trim()),
+      labelsVisible: labels.map(label => Boolean(label && getComputedStyle(label).display !== 'none')),
+      labelsClipped: labels.map(label => Boolean(label && label.scrollWidth > label.clientWidth + 1)),
+      cardWidth: element.closest('[data-testid^="agent-detail-card-"]')?.getBoundingClientRect().width || 0,
+    }
+  })
+  assert.equal(actionLayout.buttonCount, 6, `six stable main actions in ${locale}`)
+  assert.equal(actionLayout.ariaLabels.every(Boolean), true, `every icon or text action keeps an accessible name in ${locale}`)
+  assert.deepEqual(actionLayout.visibleText.slice(-3), ['', '', ''], `colored actions remain icon-only in ${locale}`)
+  if (actionLayout.cardWidth >= 480) {
+    assert.deepEqual(actionLayout.visibleText.slice(0, 3), locale === 'ru'
+      ? ['История', 'Почта', 'Вывод']
+      : ['History', 'Inbox', 'Output'], `desktop secondary labels remain complete in ${locale}`)
+    assert.deepEqual(actionLayout.labelsVisible, [true, true, true], `desktop secondary labels remain visible in ${locale}`)
+    assert.deepEqual(actionLayout.labelsClipped, [false, false, false], `desktop secondary labels remain unclipped in ${locale}`)
+  } else {
+    assert.deepEqual(actionLayout.visibleText.slice(0, 3), ['', '', ''], `narrow secondary labels compact together in ${locale}`)
+    assert.deepEqual(actionLayout.labelsVisible, [false, false, false], `narrow secondary labels hide together in ${locale}`)
+  }
+  await page.getByRole('button', { name: copy.inboxAction, exact: true }).click()
   await page.getByRole('heading', { name: copy.inboxTitle, exact: true }).waitFor()
   const inboxPayload = page.getByText(rawMessage, { exact: true })
   await inboxPayload.waitFor()

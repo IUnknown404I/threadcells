@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import pwd
+import re
 import shutil
 import signal
 import stat
@@ -44,6 +45,17 @@ class ExecutionReport:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+_DURABLE_REASON_CODE = re.compile(r"^[A-Z][A-Z0-9_]{1,127}$")
+
+
+def _failure_reason_code(error: Exception) -> str:
+    """Preserve bounded domain reason codes without publishing exception text."""
+    detail = str(error).strip()
+    if isinstance(error, RuntimeError) and _DURABLE_REASON_CODE.fullmatch(detail):
+        return detail
+    return type(error).__name__
 
 
 def _within(path: Path, root: Path) -> bool:
@@ -1332,7 +1344,7 @@ def execute_plan(
                 report.failures.append(
                     {
                         "candidate": candidate.canonical_identity,
-                        "reason_code": type(error).__name__,
+                        "reason_code": _failure_reason_code(error),
                     }
                 )
             finally:

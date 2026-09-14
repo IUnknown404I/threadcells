@@ -8,6 +8,8 @@ terminal report before answering the transport.
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -68,6 +70,51 @@ def _socket_path(config: Mapping[str, Any]) -> Path:
     if not value.is_absolute() or value.name != "full-cleanup.sock":
         raise FullCleanupHelperError("FULL_CLEANUP_HELPER_CONFIG_INVALID")
     return value
+
+
+@contextmanager
+def _exclusive_inventory_lock(config: Mapping[str, Any]):
+    """Serialize bounded root inventory across socket-activated helpers."""
+    parent = _socket_path(config).parent
+    directory_fd = -1
+    lock_fd = -1
+    try:
+        directory_fd = os.open(
+            parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        directory = os.fstat(directory_fd)
+        if directory.st_uid != 0 or directory.st_mode & 0o022:
+            raise FullCleanupHelperError("FULL_CLEANUP_HELPER_CONFIG_INVALID")
+        lock_fd = os.open(
+            "protected-inventory.lock",
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        lock = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock.st_mode) or lock.st_uid != 0 or lock.st_mode & 0o022:
+            raise FullCleanupHelperError("FULL_CLEANUP_HELPER_CONFIG_INVALID")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                raise FullCleanupHelperError("FULL_CLEANUP_INVENTORY_BUSY") from exc
+            raise
+        yield
+    except FullCleanupHelperError:
+        raise
+    except OSError as exc:
+        raise FullCleanupHelperError("FULL_CLEANUP_HELPER_CONFIG_INVALID") from exc
+    finally:
+        if lock_fd >= 0:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(lock_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
 
 
 def inventory_via_privileged_helper(*, config: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -366,7 +413,8 @@ def _handle_request(connection: socket.socket) -> dict[str, Any]:
         root = Path(str(bootstrap.get("root", "")))
         if not root.is_absolute():
             raise FullCleanupHelperError("FULL_CLEANUP_HELPER_CONFIG_INVALID")
-        inventory = collect_protected_inventory_snapshot(root=root, config=bootstrap)
+        with _exclusive_inventory_lock(bootstrap):
+            inventory = collect_protected_inventory_snapshot(root=root, config=bootstrap)
         response = {
             "schema_version": 2,
             "ok": True,
@@ -469,7 +517,14 @@ def _handle_request(connection: socket.socket) -> dict[str, Any]:
                 raise FullCleanupHelperError("HOUSEKEEPING_PLAN_CHANGED")
             settings = get_housekeeping_settings(config)
             summary = HousekeepingSummary(mode="full", full_cleanup=True, idle_gate=idle_gate)
-            summary.started_at = datetime.now(timezone.utc).isoformat()
+            durable_started_at = operation.get("started_at")
+            if not isinstance(durable_started_at, datetime):
+                raise FullCleanupHelperError("FULL_CLEANUP_OPERATION_CORRUPT")
+            if durable_started_at.tzinfo is None:
+                durable_started_at = durable_started_at.replace(tzinfo=timezone.utc)
+            else:
+                durable_started_at = durable_started_at.astimezone(timezone.utc)
+            summary.started_at = durable_started_at.isoformat()
             summary.disk_before = shutil.disk_usage("/").free
             actionable = _prepare_housekeeping_summary(summary, plan)
 

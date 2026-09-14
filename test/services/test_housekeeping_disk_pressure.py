@@ -1051,6 +1051,90 @@ def test_protected_inventory_uses_one_pathless_bounded_measurement_batch(tmp_pat
     }
 
 
+def test_protected_inventory_rejects_snapshot_from_different_config(tmp_path):
+    from cli_agent_orchestrator.services.housekeeping.planner import (
+        _validated_inventory_snapshot,
+        collect_protected_inventory_snapshot,
+    )
+
+    root = tmp_path / "control"
+    first_tools = tmp_path / "tools-a"
+    second_tools = tmp_path / "tools-b"
+    first_tools.mkdir()
+    second_tools.mkdir()
+    first_config = {
+        "protected_inventory_roots": [
+            {
+                "category": "tools",
+                "path": str(first_tools),
+                "reason": "TOOLS_RETENTION_AUTHORITY_UNKNOWN",
+            }
+        ]
+    }
+    second_config = {
+        "protected_inventory_roots": [
+            {
+                "category": "tools",
+                "path": str(second_tools),
+                "reason": "TOOLS_RETENTION_AUTHORITY_UNKNOWN",
+            }
+        ]
+    }
+    snapshot = collect_protected_inventory_snapshot(root=root, config=first_config)
+
+    assert _validated_inventory_snapshot(snapshot, root=root, config=first_config) is not None
+    assert _validated_inventory_snapshot(snapshot, root=root, config=second_config) is None
+
+
+def test_protected_inventory_accepts_valid_negative_filesystem_timestamp(tmp_path):
+    from cli_agent_orchestrator.services.housekeeping.planner import (
+        _validated_inventory_snapshot,
+        collect_protected_inventory_snapshot,
+    )
+
+    root = tmp_path / "control"
+    snapshot = collect_protected_inventory_snapshot(root=root, config={})
+    snapshot["roots"][0].update(
+        {
+            "present": True,
+            "kind": "directory",
+            "size": 0,
+            "size_certain": True,
+            "mtime_ns": -1,
+        }
+    )
+
+    assert _validated_inventory_snapshot(snapshot, root=root, config={}) is not None
+
+
+def test_protected_inventory_bounds_directory_enumeration_before_sorting(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.housekeeping import planner
+
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    yielded = 0
+
+    def bounded_entries():
+        nonlocal yielded
+        for index in range(planner._MAX_INVENTORY_ENTRIES + 1):
+            yielded += 1
+            yield tools / f"candidate-{index:05d}"
+        raise AssertionError("inventory enumerated beyond its configured bound")
+
+    original_iterdir = Path.iterdir
+
+    def iterdir(path):
+        return bounded_entries() if path == tools else original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+
+    prepared = planner._prepare_inventory_root(tools, expand_entries=True)
+
+    assert yielded == planner._MAX_INVENTORY_ENTRIES + 1
+    assert prepared["expanded"] is False
+    assert prepared["result"]["entries_certain"] is False
+
+
 def test_batched_inventory_isolates_a_bound_path_failure(monkeypatch, tmp_path):
     from cli_agent_orchestrator.services.housekeeping.planner import (
         _inventory_tree_sizes,

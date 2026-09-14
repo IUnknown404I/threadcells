@@ -4,12 +4,14 @@ import pwd
 import socket
 import threading
 from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from cli_agent_orchestrator.services.full_cleanup_helper import (
     FullCleanupHelperError,
+    _exclusive_inventory_lock,
     _failure_response,
     _handle_request,
     execute_via_privileged_helper,
@@ -185,6 +187,10 @@ def test_privileged_inventory_handler_reads_only_configured_roots(tmp_path, monk
         "cli_agent_orchestrator.services.operations_service._load_legacy_operations_config",
         lambda: config,
     )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.full_cleanup_helper._exclusive_inventory_lock",
+        lambda _config: nullcontext(),
+    )
     server, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     client.sendall(b'{"schema_version":2,"operation":"protected_inventory"}\n')
     client.shutdown(socket.SHUT_WR)
@@ -198,6 +204,26 @@ def test_privileged_inventory_handler_reads_only_configured_roots(tmp_path, monk
     records = {(item["source"], item["index"]): item for item in response["inventory"]["roots"]}
     assert [item["name"] for item in records[("backups", -1)]["entries"]] == ["daily.sqlite"]
     assert [item["name"] for item in records[("protected", 0)]["entries"]] == ["candidate"]
+
+
+def test_privileged_inventory_lock_rejects_parallel_root_scan(tmp_path, monkeypatch):
+    real_fstat = os.fstat
+
+    def root_owned_fstat(descriptor):
+        metadata = real_fstat(descriptor)
+        return type(
+            "RootOwnedStat",
+            (),
+            {"st_uid": 0, "st_mode": metadata.st_mode},
+        )()
+
+    monkeypatch.setattr(os, "fstat", root_owned_fstat)
+    config = {"full_cleanup_helper_socket": str(tmp_path / "full-cleanup.sock")}
+
+    with _exclusive_inventory_lock(config):
+        with pytest.raises(FullCleanupHelperError, match="FULL_CLEANUP_INVENTORY_BUSY"):
+            with _exclusive_inventory_lock(config):
+                pass
 
 
 def test_privileged_inventory_handler_rejects_caller_selected_path(tmp_path, monkeypatch):
@@ -430,6 +456,7 @@ def test_helper_claims_durable_authority_executes_both_subplans_and_commits_firs
     config = {"runtime_user": runtime_account.pw_name}
     operation_id = "d" * 32
     plan_id = "b" * 64
+    durable_started_at = datetime(2026, 8, 20, 10, 0, tzinfo=timezone.utc)
     events = []
     executed = []
     progresses = []
@@ -493,6 +520,7 @@ def test_helper_claims_durable_authority_executes_both_subplans_and_commits_firs
             "plan_id": plan_id,
             "retire_dirty_worktrees": False,
             "state": "running",
+            "started_at": durable_started_at,
         },
     )
     monkeypatch.setattr(
@@ -579,6 +607,7 @@ def test_helper_claims_durable_authority_executes_both_subplans_and_commits_firs
     assert events[-2:] == ["complete", "status"]
     assert committed["plan_id"] == plan_id
     assert committed["full_cleanup"] is True
+    assert committed["started_at"] == durable_started_at.isoformat()
     assert response == {"schema_version": 2, "ok": True, "operation_id": operation_id}
 
 

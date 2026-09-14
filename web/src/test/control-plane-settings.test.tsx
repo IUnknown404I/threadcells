@@ -415,7 +415,14 @@ describe('Control-plane settings routes', () => {
     vi.spyOn(api, 'getOperatorSession').mockResolvedValue(operatorStatus(false))
     vi.spyOn(api, 'getOrchestrationCapacity').mockResolvedValue(housekeepingCapacity())
     const operationId = 'a'.repeat(32)
-    const report = { ok: true, full_cleanup: true, freed_bytes: 42 }
+    const report = {
+      ok: true,
+      full_cleanup: true,
+      freed_bytes: 42,
+      started_at: '2026-08-20T10:00:01Z',
+      completed_at: '2026-08-20T10:00:01.1Z',
+      duration_seconds: 0.1,
+    }
     const latest = vi.spyOn(api, 'getLatestFullCleanupOperation')
       .mockResolvedValueOnce({
         operation_id: operationId,
@@ -440,6 +447,7 @@ describe('Control-plane settings routes', () => {
     expect(await screen.findByText('completed')).toBeInTheDocument()
     expect(screen.getByText('Processed resources: 4')).toBeInTheDocument()
     expect(screen.getAllByText('2.0 seconds').length).toBeGreaterThan(0)
+    expect(screen.queryByText('0.1 seconds')).not.toBeInTheDocument()
   })
 
   it('shows the authoritative Full Cleanup idle blocker', async () => {

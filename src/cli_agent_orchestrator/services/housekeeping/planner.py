@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import grp
+import hashlib
 import json
 import os
 import pwd
@@ -12,6 +13,7 @@ import stat
 import subprocess
 import zlib
 from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -163,6 +165,38 @@ _MAX_INVENTORY_ENTRIES = 4096
 _INVENTORY_TIMEOUT_SECONDS = 20
 
 
+def _protected_inventory_binding(root: Path, config: Mapping[str, Any]) -> str:
+    """Bind a pathless helper snapshot to the caller's trusted root config."""
+    identities: list[dict[str, Any]] = [
+        {
+            "source": "backups",
+            "index": -1,
+            "path": str(root / "backups"),
+            "category": "backups",
+        }
+    ]
+    values = config.get("protected_inventory_roots", [])
+    if isinstance(values, list):
+        for index, entry in enumerate(values):
+            if not isinstance(entry, Mapping):
+                continue
+            path = Path(str(entry.get("path", "")))
+            if not path.is_absolute():
+                continue
+            identities.append(
+                {
+                    "source": "protected",
+                    "index": index,
+                    "path": str(path),
+                    "category": str(entry.get("category", "protected_storage")),
+                    "reason": str(entry.get("reason", "")),
+                    "purpose": str(entry.get("purpose", "")),
+                }
+            )
+    payload = json.dumps(identities, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _inventory_tree_sizes(paths: list[Path]) -> dict[Path, tuple[int, bool]]:
     """Measure a trusted path set in one bounded ``du`` invocation."""
     unique_paths = list(dict.fromkeys(paths))
@@ -270,8 +304,12 @@ def _prepare_inventory_root(path: Path, *, expand_entries: bool) -> dict[str, An
             "expanded": False,
             "measurement_paths": [path],
         }
+    iterator = path.iterdir()
     try:
-        entries = sorted(path.iterdir(), key=lambda item: item.name)
+        entries = sorted(
+            islice(iterator, _MAX_INVENTORY_ENTRIES + 1),
+            key=lambda item: item.name,
+        )
     except OSError:
         result["entries_certain"] = False
         return {
@@ -283,6 +321,8 @@ def _prepare_inventory_root(path: Path, *, expand_entries: bool) -> dict[str, An
             "expanded": False,
             "measurement_paths": [path],
         }
+    finally:
+        iterator.close()
     if len(entries) > _MAX_INVENTORY_ENTRIES:
         result["entries_certain"] = False
         return {
@@ -446,7 +486,11 @@ def collect_protected_inventory_snapshot(
         }
         for source, index, prepared in prepared_records
     ]
-    return {"schema_version": 1, "roots": records}
+    return {
+        "schema_version": 1,
+        "binding": _protected_inventory_binding(root, config),
+        "roots": records,
+    }
 
 
 def _valid_inventory_measurement(value: Any) -> bool:
@@ -465,7 +509,6 @@ def _valid_inventory_measurement(value: Any) -> bool:
                 and isinstance(value.get("size_certain"), bool)
                 and isinstance(value.get("mtime_ns"), int)
                 and not isinstance(value.get("mtime_ns"), bool)
-                and value.get("mtime_ns", -1) >= 0
             )
         )
     )
@@ -475,7 +518,11 @@ def _validated_inventory_snapshot(
     value: Any, *, root: Path, config: Mapping[str, Any]
 ) -> dict[tuple[str, int], Mapping[str, Any]] | None:
     """Bind a helper response back to configured roots; caller supplies no paths."""
-    if not isinstance(value, Mapping) or value.get("schema_version") != 1:
+    if (
+        not isinstance(value, Mapping)
+        or value.get("schema_version") != 1
+        or value.get("binding") != _protected_inventory_binding(root, config)
+    ):
         return None
     records = value.get("roots")
     if not isinstance(records, list):

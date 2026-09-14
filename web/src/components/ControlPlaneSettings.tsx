@@ -260,10 +260,12 @@ function HousekeepingWarnings({ warnings, className = '' }: { warnings: string[]
 function reportWithOperationTiming(operation: FullCleanupOperation, fallback?: Record<string, any> | null) {
   const report = operation.report || fallback
   if (!report) return null
-  const startedAt = report.started_at || operation.started_at || null
-  const completedAt = report.completed_at || operation.completed_at || null
+  const startedAt = operation.started_at || report.started_at || null
+  const completedAt = operation.completed_at || report.completed_at || null
   let duration = report.duration_seconds
-  if (duration === undefined && startedAt && completedAt) {
+  if (operation.started_at && operation.completed_at) {
+    duration = Math.max(0, (Date.parse(operation.completed_at) - Date.parse(operation.started_at)) / 1000)
+  } else if (duration === undefined && startedAt && completedAt) {
     duration = Math.max(0, (Date.parse(completedAt) - Date.parse(startedAt)) / 1000)
   }
   return { ...report, started_at: startedAt, completed_at: completedAt, duration_seconds: duration }

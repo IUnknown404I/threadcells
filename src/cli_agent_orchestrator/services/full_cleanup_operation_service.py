@@ -110,9 +110,11 @@ def report_from_operation(operation: Mapping[str, Any]):
     from cli_agent_orchestrator.services.housekeeping_service import HousekeepingSummary
 
     report = operation.get("report")
-    if operation.get("state") not in {"completed", "completed_with_issues"} or not isinstance(
-        report, dict
-    ):
+    if operation.get("state") not in {
+        "completed",
+        "completed_with_issues",
+        "failed",
+    } or not isinstance(report, dict):
         return None
     fields = set(HousekeepingSummary.__dataclass_fields__)
     if set(report) - fields:

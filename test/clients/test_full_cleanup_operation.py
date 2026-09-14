@@ -142,6 +142,48 @@ def test_full_cleanup_operation_is_single_claimed_and_terminally_idempotent():
     assert list_active_full_cleanup_operations() == []
 
 
+def test_full_cleanup_operation_preserves_a_determinate_failed_report():
+    operation_id = "9" * 32
+    plan_id = "8" * 64
+    token = "failed-operation-token-with-at-least-thirty-two-bytes"
+    admit_full_cleanup_operation(
+        operation_id,
+        plan_id,
+        retire_dirty_worktrees=False,
+        actor_kind="operator_session",
+        operation_token=token,
+    )
+    assert claim_full_cleanup_operation(
+        operation_id,
+        token,
+        helper_pid=987,
+        helper_process_start_ticks=654,
+    )
+    failed = HousekeepingSummary(
+        ok=False,
+        mode="full",
+        full_cleanup=True,
+        plan_id=plan_id,
+        final_status="failed",
+        execution_failures=[{"reason_code": "FINGERPRINT_CHANGED"}],
+    )
+
+    assert complete_full_cleanup_operation(
+        operation_id,
+        helper_pid=987,
+        helper_process_start_ticks=654,
+        report=failed.as_dict(),
+    )
+    current = get_full_cleanup_operation(operation_id)
+    assert current is not None
+    assert current["state"] == "failed"
+    assert current["reason_code"] == "FULL_CLEANUP_EXECUTION_FAILED"
+    recovered = report_from_operation(current)
+    assert recovered is not None
+    assert recovered.ok is False
+    assert recovered.execution_failures == [{"reason_code": "FINGERPRINT_CHANGED"}]
+
+
 def test_full_cleanup_operation_rejects_wrong_token_generation_and_plan():
     operation_id = "e" * 32
     plan_id = "f" * 64

@@ -8,6 +8,8 @@ terminal report before answering the transport.
 
 from __future__ import annotations
 
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -19,10 +21,12 @@ import socket
 import stat
 import struct
 import sys
+import time
 import traceback
 import uuid
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -66,6 +70,89 @@ def _socket_path(config: Mapping[str, Any]) -> Path:
     if not value.is_absolute() or value.name != "full-cleanup.sock":
         raise FullCleanupHelperError("FULL_CLEANUP_HELPER_CONFIG_INVALID")
     return value
+
+
+@contextmanager
+def _exclusive_inventory_lock(config: Mapping[str, Any]):
+    """Serialize bounded root inventory across socket-activated helpers."""
+    parent = _socket_path(config).parent
+    directory_fd = -1
+    lock_fd = -1
+    try:
+        directory_fd = os.open(
+            parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        directory = os.fstat(directory_fd)
+        if directory.st_uid != 0 or directory.st_mode & 0o022:
+            raise FullCleanupHelperError("FULL_CLEANUP_HELPER_CONFIG_INVALID")
+        lock_fd = os.open(
+            "protected-inventory.lock",
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        lock = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock.st_mode) or lock.st_uid != 0 or lock.st_mode & 0o022:
+            raise FullCleanupHelperError("FULL_CLEANUP_HELPER_CONFIG_INVALID")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in {errno.EACCES, errno.EAGAIN}:
+                raise FullCleanupHelperError("FULL_CLEANUP_INVENTORY_BUSY") from exc
+            raise
+        yield
+    except FullCleanupHelperError:
+        raise
+    except OSError as exc:
+        raise FullCleanupHelperError("FULL_CLEANUP_HELPER_CONFIG_INVALID") from exc
+    finally:
+        if lock_fd >= 0:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(lock_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
+
+
+def inventory_via_privileged_helper(*, config: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Read config-owned protected inventory without granting delete authority."""
+    if not config.get("full_cleanup_helper_socket"):
+        return None
+    request = {"schema_version": 2, "operation": "protected_inventory"}
+    payload = json.dumps(request, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            timeout = min(
+                30.0,
+                float(config.get("full_cleanup_helper_timeout_seconds", 30)),
+            )
+            connection.settimeout(timeout)
+            connection.connect(str(_socket_path(config)))
+            connection.sendall(payload)
+            connection.shutdown(socket.SHUT_WR)
+            response_payload = _receive_line(connection, _MAX_RESPONSE_BYTES)
+        response = json.loads(response_payload.decode("utf-8", "strict"))
+    except (
+        OSError,
+        TimeoutError,
+        UnicodeDecodeError,
+        ValueError,
+        TypeError,
+        FullCleanupHelperError,
+    ):
+        return None
+    if (
+        not isinstance(response, dict)
+        or response.get("schema_version") != 2
+        or response.get("ok") is not True
+        or response.get("operation") != "protected_inventory"
+        or not isinstance(response.get("inventory"), dict)
+    ):
+        return None
+    return dict(response["inventory"])
 
 
 def execute_via_privileged_helper(
@@ -318,6 +405,25 @@ def _handle_request(connection: socket.socket) -> dict[str, Any]:
         request = json.loads(raw.decode("utf-8", "strict"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise FullCleanupHelperError("FULL_CLEANUP_HELPER_PROTOCOL_INVALID") from exc
+    if request == {"schema_version": 2, "operation": "protected_inventory"}:
+        from cli_agent_orchestrator.services.housekeeping.planner import (
+            collect_protected_inventory_snapshot,
+        )
+
+        root = Path(str(bootstrap.get("root", "")))
+        if not root.is_absolute():
+            raise FullCleanupHelperError("FULL_CLEANUP_HELPER_CONFIG_INVALID")
+        with _exclusive_inventory_lock(bootstrap):
+            inventory = collect_protected_inventory_snapshot(root=root, config=bootstrap)
+        response = {
+            "schema_version": 2,
+            "ok": True,
+            "operation": "protected_inventory",
+            "inventory": inventory,
+        }
+        if len(json.dumps(response, separators=(",", ":")).encode("utf-8")) > _MAX_RESPONSE_BYTES:
+            raise FullCleanupHelperError("FULL_CLEANUP_HELPER_MESSAGE_TOO_LARGE")
+        return response
     required_keys = {
         "schema_version",
         "operation",
@@ -411,6 +517,14 @@ def _handle_request(connection: socket.socket) -> dict[str, Any]:
                 raise FullCleanupHelperError("HOUSEKEEPING_PLAN_CHANGED")
             settings = get_housekeeping_settings(config)
             summary = HousekeepingSummary(mode="full", full_cleanup=True, idle_gate=idle_gate)
+            durable_started_at = operation.get("started_at")
+            if not isinstance(durable_started_at, datetime):
+                raise FullCleanupHelperError("FULL_CLEANUP_OPERATION_CORRUPT")
+            if durable_started_at.tzinfo is None:
+                durable_started_at = durable_started_at.replace(tzinfo=timezone.utc)
+            else:
+                durable_started_at = durable_started_at.astimezone(timezone.utc)
+            summary.started_at = durable_started_at.isoformat()
             summary.disk_before = shutil.disk_usage("/").free
             actionable = _prepare_housekeeping_summary(summary, plan)
 
@@ -533,7 +647,7 @@ def _handle_request(connection: socket.socket) -> dict[str, Any]:
                 root=Path(plan.root),
                 config=config,
                 proc_root=Path("/proc"),
-                completed_at=plan.generated_at,
+                completed_at=time.time(),
                 write_status=False,
             )
             if not complete_full_cleanup_operation(

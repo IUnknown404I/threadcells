@@ -67,6 +67,11 @@ class HousekeepingSummary:
     rollback_available: bool | None = None
     idle_gate: dict[str, Any] | None = None
     warnings: list[str] = field(default_factory=list)
+    started_at: str | None = None
+    completed_at: str | None = None
+    duration_seconds: float | None = None
+    final_status: str | None = None
+    post_disk_state: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)
@@ -862,7 +867,10 @@ def _inventory_warnings(
     gib = 1024**3
     if _tree_size(root / "state" / "cao" / "logs") > int(config["log_tree_warning_gib"]) * gib:
         summary.warnings.append("cao_log_tree_over_threshold")
-    if _tree_size(root / "backups") > int(config["backup_tree_warning_gib"]) * gib:
+    backup_size = summary.preserved_bytes_by_class.get("backups")
+    if backup_size is None:
+        backup_size = _tree_size(root / "backups")
+    if backup_size > int(config["backup_tree_warning_gib"]) * gib:
         summary.warnings.append("backups_over_threshold_preserved")
     # Deployment cleanup is intentionally inventory-only until active and rollback
     # identities are represented by explicit metadata. Unknown deployments are recovery assets.
@@ -1341,9 +1349,6 @@ def _apply_execution_report_to_summary(
     summary.completed_with_issues = bool(getattr(report, "skipped", []) or report.failures)
     summary.active_release = getattr(report, "active_release", None)
     summary.rollback_available = getattr(report, "rollback_available", None)
-    summary.warnings.extend(
-        f"{item['reason_code']}:{item['candidate']}" for item in report.failures
-    )
     executed = set(report.executed)
     summary.logs_compressed += sum(
         candidate.canonical_identity in executed
@@ -1426,12 +1431,65 @@ def _finalize_housekeeping_summary(
     _reconcile_provider_executions(summary, proc_root=proc_root)
     _reconcile_legacy_terminal_authority(summary)
     _inventory_warnings(root, config, summary)
-    summary.disk_after = shutil.disk_usage("/").free
-    summary.observed_disk_free_delta = summary.disk_after - summary.disk_before
+    _complete_housekeeping_summary(summary, config=config, completed_at=completed_at)
     if summary.ok and summary.mode in {"frequent", "weekly"}:
         _write_schedule_receipt(root, summary.mode, completed_at)
     if write_status:
         _write_status(root, summary)
+    return summary
+
+
+def _complete_housekeeping_summary(
+    summary: HousekeepingSummary,
+    *,
+    config: Mapping[str, Any],
+    completed_at: float,
+) -> HousekeepingSummary:
+    """Attach immutable timing, outcome, and post-run disk evidence."""
+    disk = shutil.disk_usage("/")
+    summary.disk_after = disk.free
+    summary.observed_disk_free_delta = summary.disk_after - summary.disk_before
+    used_percent = round((disk.used * 100 / disk.total) if disk.total else 100.0, 1)
+    summary.post_disk_state = {
+        "state": (
+            "CRITICAL"
+            if used_percent >= int(config.get("root_used_critical_percent", 92))
+            else (
+                "RED"
+                if used_percent >= int(config.get("root_used_red_percent", 85))
+                else (
+                    "YELLOW"
+                    if used_percent >= int(config.get("root_used_yellow_percent", 70))
+                    else "GREEN"
+                )
+            )
+        ),
+        "used_percent": used_percent,
+        "free_bytes": disk.free,
+        "total_bytes": disk.total,
+    }
+    summary.completed_at = datetime.fromtimestamp(completed_at, timezone.utc).isoformat()
+    if summary.started_at is not None:
+        try:
+            started = datetime.fromisoformat(summary.started_at).timestamp()
+        except ValueError:
+            started = completed_at
+        summary.duration_seconds = round(max(0.0, completed_at - started), 3)
+    summary.completed_with_issues = bool(
+        summary.completed_with_issues
+        or summary.warnings
+        or summary.execution_skips
+        or summary.execution_failures
+    )
+    summary.final_status = (
+        "failed"
+        if not summary.ok
+        else (
+            "preview"
+            if summary.dry_run
+            else "completed_with_issues" if summary.completed_with_issues else "completed"
+        )
+    )
     return summary
 
 
@@ -1475,6 +1533,8 @@ def run_housekeeping(
         full_cleanup=mode == "full",
     )
     current = time.time() if now is None else now
+    summary.started_at = datetime.fromtimestamp(current, timezone.utc).isoformat()
+    started_monotonic = time.monotonic()
     with (
         _housekeeping_execution_lock(lock_dir),
         _full_cleanup_execution_fence(cfg) if mode == "full" else nullcontext(),
@@ -1497,7 +1557,16 @@ def run_housekeeping(
                 summary.warnings.append(schedule_warning)
             if not due:
                 summary.warnings.append("schedule_not_due")
-                return summary
+                summary.disk_before = shutil.disk_usage("/").free
+                return _complete_housekeeping_summary(
+                    summary,
+                    config=cfg,
+                    completed_at=(
+                        time.time()
+                        if now is None
+                        else current + max(0.0, time.monotonic() - started_monotonic)
+                    ),
+                )
         summary.disk_before = shutil.disk_usage("/").free
         from cli_agent_orchestrator.services.housekeeping.executor import (
             execute_plan,
@@ -1507,54 +1576,7 @@ def run_housekeeping(
         if expected_plan_id is not None and plan.plan_id != expected_plan_id:
             raise RuntimeError("HOUSEKEEPING_PLAN_CHANGED")
         actionable = _prepare_housekeeping_summary(summary, plan)
-        if dry_run:
-            summary.freed_bytes += plan.reclaimable_bytes
-            summary.logs_compressed += sum(
-                candidate.category == "logs" and candidate.action == "compress"
-                for candidate in actionable
-            )
-            summary.logs_deleted += sum(
-                candidate.category == "logs" and candidate.action == "delete"
-                for candidate in actionable
-            )
-            summary.attachments_deleted += sum(
-                candidate.category == "attachments" for candidate in actionable
-            )
-            summary.orphan_processes_closed += sum(
-                candidate.resource_kind == "browser_process_group" for candidate in actionable
-            )
-            summary.terminal_runtimes_retired += sum(
-                candidate.resource_kind == "terminal_runtime" for candidate in actionable
-            )
-            summary.retirement_cleanups_reconciled += sum(
-                candidate.resource_kind in {"retirement_cleanup", "workflow_authority"}
-                for candidate in actionable
-            )
-            summary.ephemeral_resources_removed += sum(
-                candidate.category == "ephemeral"
-                and candidate.resource_kind != "browser_process_group"
-                for candidate in actionable
-            )
-            summary.browser_revision_candidates += sum(
-                candidate.category == "browser_cache" for candidate in actionable
-            )
-            summary.browser_revisions_removed += sum(
-                candidate.category == "browser_cache" for candidate in actionable
-            )
-            summary.cache_pruned += sum(
-                candidate.category == "package_cache" for candidate in actionable
-            )
-            summary.worktrees_retired += sum(
-                candidate.resource_kind in {"git_worktree", "session_workspace"}
-                for candidate in actionable
-            )
-            summary.reproducible_caches_removed += sum(
-                candidate.resource_kind == "reproducible_cache" for candidate in actionable
-            )
-            summary.build_artifacts_removed += sum(
-                candidate.category == "build_artifact" for candidate in actionable
-            )
-        else:
+        if not dry_run:
             if mode == "full" and privileged_cleanup_executor is not None:
                 durable_summary = privileged_cleanup_executor(
                     plan=plan,
@@ -1584,12 +1606,34 @@ def run_housekeeping(
                 root=root,
                 config=cfg,
                 proc_root=proc_root,
-                completed_at=current,
+                completed_at=(
+                    time.time()
+                    if now is None
+                    else current + max(0.0, time.monotonic() - started_monotonic)
+                ),
             )
         _inventory_warnings(root, cfg, summary)
-        summary.disk_after = shutil.disk_usage("/").free
-        summary.observed_disk_free_delta = summary.disk_after - summary.disk_before
-        return summary
+        return _complete_housekeeping_summary(
+            summary,
+            config=cfg,
+            completed_at=(
+                time.time()
+                if now is None
+                else current + max(0.0, time.monotonic() - started_monotonic)
+            ),
+        )
+
+
+def _render_cli_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return ",".join(value)
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return str(value)
 
 
 def housekeeping_main(argv: Sequence[str] | None = None) -> int:
@@ -1607,6 +1651,7 @@ def housekeeping_main(argv: Sequence[str] | None = None) -> int:
         help="honour the canonical persisted schedule before running",
     )
     args = parser.parse_args(argv)
+    invoked_at = time.time()
     try:
         summary = run_housekeeping(
             dry_run=args.dry_run,
@@ -1621,7 +1666,14 @@ def housekeeping_main(argv: Sequence[str] | None = None) -> int:
         try:
             config = load_operations_config()
             failed = HousekeepingSummary(ok=False, dry_run=args.dry_run, mode=args.mode)
+            failed.started_at = datetime.fromtimestamp(invoked_at, timezone.utc).isoformat()
+            failed.disk_before = shutil.disk_usage("/").free
             failed.warnings.append(f"{type(exc).__name__}:{exc}")
+            _complete_housekeeping_summary(
+                failed,
+                config=config,
+                completed_at=time.time(),
+            )
             if not args.dry_run and str(exc) not in {
                 "HOUSEKEEPING_PLAN_REQUIRED",
                 "HOUSEKEEPING_PLAN_CHANGED",
@@ -1638,6 +1690,6 @@ def housekeeping_main(argv: Sequence[str] | None = None) -> int:
         print("HOUSEKEEPING_OK" if summary.ok else "HOUSEKEEPING_FAILED")
         for key, value in data.items():
             if key != "ok":
-                rendered = ",".join(value) if isinstance(value, list) else value
+                rendered = _render_cli_value(value)
                 print(f"{key}={rendered}")
     return 0 if summary.ok else 1

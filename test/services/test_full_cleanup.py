@@ -368,7 +368,7 @@ def test_full_cleanup_isolated_end_to_end_and_idempotent(tmp_path, monkeypatch):
     assert active_protection["bytes"] > 0
     assert active_protection["reason"] == "ACTIVE_RELEASE"
     assert {
-        "canonical_identity": f"backups:{backup.parent.resolve()}",
+        "canonical_identity": f"backups:{backup.resolve()}",
         "category": "backups",
         "bytes": len(b"preserve"),
         "reason": "BACKUP_PROTECTED",
@@ -395,7 +395,7 @@ def test_full_cleanup_isolated_end_to_end_and_idempotent(tmp_path, monkeypatch):
     assert second.freed_bytes == 0
     assert second.rollback_available is False
     assert any(
-        item["canonical_identity"] == f"backups:{backup.parent.resolve()}"
+        item["canonical_identity"] == f"backups:{backup.resolve()}"
         and item["reason"] == "BACKUP_PROTECTED"
         for item in second.protected_resources
     )

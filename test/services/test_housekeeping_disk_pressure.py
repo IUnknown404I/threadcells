@@ -902,3 +902,266 @@ def test_dominant_inventory_only_classes_report_protected_bytes(tmp_path, monkey
     assert summary["preserved_bytes"] >= 2 * 1024 * 1024
     assert summary["reclaimable_bytes"] == 0
     assert summary["protection_reasons"] == {"TOOLS_RETENTION_AUTHORITY_UNKNOWN": 1}
+
+
+def test_tools_inventory_is_per_resource_and_preserves_unknown_authority(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    active = tools / "active-runtime"
+    active.mkdir()
+    active.joinpath("executable").write_bytes(b"active")
+    unknown = tools / "unclassified-candidate"
+    unknown.mkdir()
+    unknown.joinpath("payload").write_bytes(b"unknown")
+    config["protected_inventory_roots"] = [
+        {
+            "category": "tools",
+            "path": str(tools),
+            "purpose": "runtime and candidate tools",
+            "reason": "TOOLS_RETENTION_AUTHORITY_UNKNOWN",
+        }
+    ]
+    _authority(monkeypatch)
+
+    plan = _plan(tmp_path, config, mode="frequent", open_paths={active / "executable"})
+    candidates = [item for item in plan.candidates if item.category == "tools"]
+
+    assert [Path(item.path).name for item in candidates] == [
+        "active-runtime",
+        "unclassified-candidate",
+    ]
+    assert all(item.action == "preserve" for item in candidates)
+    assert candidates[0].protection_reason == "OPEN_BY_ACTIVE_PROCESS"
+    assert dict(candidates[0].attributes)["authority"] == "active_runtime"
+    assert candidates[1].protection_reason == "TOOLS_RETENTION_AUTHORITY_UNKNOWN"
+    assert dict(candidates[1].attributes)["authority"] == "unknown"
+    assert plan.class_summaries["tools"]["actionable_count"] == 0
+
+
+def test_partial_tools_measurement_stays_protected_and_reports_specific_warning(
+    tmp_path, monkeypatch
+):
+    config = _config(tmp_path)
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    tools.joinpath("unreadable-candidate").mkdir()
+    config["protected_inventory_roots"] = [
+        {
+            "category": "tools",
+            "path": str(tools),
+            "reason": "TOOLS_RETENTION_AUTHORITY_UNKNOWN",
+        }
+    ]
+    _authority(monkeypatch)
+    from cli_agent_orchestrator.services.housekeeping import planner
+
+    original = planner._inventory_tree_sizes
+
+    def measure(paths):
+        measured = original(paths)
+        return {
+            path: (17, False) if path.name == "unreadable-candidate" else value
+            for path, value in measured.items()
+        }
+
+    monkeypatch.setattr(
+        planner,
+        "_inventory_tree_sizes",
+        measure,
+    )
+
+    plan = _plan(tmp_path, config, mode="frequent")
+    candidate = next(item for item in plan.candidates if item.category == "tools")
+
+    assert candidate.action == "preserve"
+    assert candidate.bytes == 17
+    assert dict(candidate.attributes)["measurement"] == "partial"
+    assert "protected_inventory_incomplete:tools" in plan.warnings
+    assert plan.reclaimable_bytes == 0
+
+
+def test_inventory_marks_a_resource_uncertain_when_it_changes_during_measurement(
+    tmp_path, monkeypatch
+):
+    from cli_agent_orchestrator.services.housekeeping.planner import (
+        _inventory_root_snapshot,
+    )
+
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    candidate = tools / "candidate"
+    candidate.write_bytes(b"before")
+
+    def measure(paths):
+        candidate.write_bytes(b"changed-during-inventory")
+        return {path: (6, True) for path in paths}
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping.planner._inventory_tree_sizes",
+        measure,
+    )
+
+    snapshot = _inventory_root_snapshot(tools, expand_entries=True)
+
+    assert snapshot["entries_certain"] is True
+    assert snapshot["entries"][0]["name"] == "candidate"
+    assert snapshot["entries"][0]["size_certain"] is False
+
+
+def test_protected_inventory_uses_one_pathless_bounded_measurement_batch(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.housekeeping.planner import (
+        collect_protected_inventory_snapshot,
+    )
+
+    root = tmp_path / "control"
+    backup = root / "backups" / "daily.sqlite"
+    backup.parent.mkdir(parents=True)
+    backup.write_bytes(b"backup")
+    tools = tmp_path / "tools"
+    tool = tools / "runtime"
+    tool.mkdir(parents=True)
+    tool.joinpath("payload").write_bytes(b"tool")
+    observed = []
+
+    def measure(command, **kwargs):
+        observed.append((command, kwargs))
+        paths = [path for path in kwargs["input"].split(b"\0") if path]
+        output = b"".join(b"17\t" + path + b"\0" for path in paths)
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr=b"")
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping.planner.subprocess.run", measure
+    )
+
+    snapshot = collect_protected_inventory_snapshot(
+        root=root,
+        config={"protected_inventory_roots": [{"category": "tools", "path": str(tools)}]},
+    )
+
+    assert len(observed) == 1
+    command, kwargs = observed[0]
+    assert "--files0-from=-" in command
+    assert "--one-file-system" in command
+    assert kwargs["timeout"] == 20
+    assert str(root) not in command
+    assert {record["source"] for record in snapshot["roots"]} == {
+        "backups",
+        "protected",
+    }
+
+
+def test_protected_inventory_rejects_snapshot_from_different_config(tmp_path):
+    from cli_agent_orchestrator.services.housekeeping.planner import (
+        _validated_inventory_snapshot,
+        collect_protected_inventory_snapshot,
+    )
+
+    root = tmp_path / "control"
+    first_tools = tmp_path / "tools-a"
+    second_tools = tmp_path / "tools-b"
+    first_tools.mkdir()
+    second_tools.mkdir()
+    first_config = {
+        "protected_inventory_roots": [
+            {
+                "category": "tools",
+                "path": str(first_tools),
+                "reason": "TOOLS_RETENTION_AUTHORITY_UNKNOWN",
+            }
+        ]
+    }
+    second_config = {
+        "protected_inventory_roots": [
+            {
+                "category": "tools",
+                "path": str(second_tools),
+                "reason": "TOOLS_RETENTION_AUTHORITY_UNKNOWN",
+            }
+        ]
+    }
+    snapshot = collect_protected_inventory_snapshot(root=root, config=first_config)
+
+    assert _validated_inventory_snapshot(snapshot, root=root, config=first_config) is not None
+    assert _validated_inventory_snapshot(snapshot, root=root, config=second_config) is None
+
+
+def test_protected_inventory_accepts_valid_negative_filesystem_timestamp(tmp_path):
+    from cli_agent_orchestrator.services.housekeeping.planner import (
+        _validated_inventory_snapshot,
+        collect_protected_inventory_snapshot,
+    )
+
+    root = tmp_path / "control"
+    snapshot = collect_protected_inventory_snapshot(root=root, config={})
+    snapshot["roots"][0].update(
+        {
+            "present": True,
+            "kind": "directory",
+            "size": 0,
+            "size_certain": True,
+            "mtime_ns": -1,
+        }
+    )
+
+    assert _validated_inventory_snapshot(snapshot, root=root, config={}) is not None
+
+
+def test_protected_inventory_bounds_directory_enumeration_before_sorting(tmp_path, monkeypatch):
+    from cli_agent_orchestrator.services.housekeeping import planner
+
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    yielded = 0
+
+    def bounded_entries():
+        nonlocal yielded
+        for index in range(planner._MAX_INVENTORY_ENTRIES + 1):
+            yielded += 1
+            yield tools / f"candidate-{index:05d}"
+        raise AssertionError("inventory enumerated beyond its configured bound")
+
+    original_iterdir = Path.iterdir
+
+    def iterdir(path):
+        return bounded_entries() if path == tools else original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+
+    prepared = planner._prepare_inventory_root(tools, expand_entries=True)
+
+    assert yielded == planner._MAX_INVENTORY_ENTRIES + 1
+    assert prepared["expanded"] is False
+    assert prepared["result"]["entries_certain"] is False
+
+
+def test_batched_inventory_isolates_a_bound_path_failure(monkeypatch, tmp_path):
+    from cli_agent_orchestrator.services.housekeeping.planner import (
+        _inventory_tree_sizes,
+    )
+
+    readable = tmp_path / "readable"
+    unreadable = tmp_path / "unreadable"
+
+    def measure(command, **_kwargs):
+        stdout = (
+            b"11\t"
+            + os.fsencode(str(readable))
+            + b"\0"
+            + b"7\t"
+            + os.fsencode(str(unreadable))
+            + b"\0"
+        )
+        stderr = (
+            b"du: cannot read directory " + os.fsencode(str(unreadable)) + b": Permission denied\n"
+        )
+        return subprocess.CompletedProcess(command, 1, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping.planner.subprocess.run", measure
+    )
+
+    assert _inventory_tree_sizes([readable, unreadable]) == {
+        readable: (11, True),
+        unreadable: (7, False),
+    }

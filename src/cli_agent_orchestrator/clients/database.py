@@ -1651,7 +1651,8 @@ def complete_full_cleanup_operation(
 ) -> bool:
     """Publish the exact terminal report before the helper answers its socket."""
     encoded = _full_cleanup_json(report, limit=_FULL_CLEANUP_REPORT_LIMIT)
-    completed_with_issues = bool(report.get("completed_with_issues")) or not bool(report.get("ok"))
+    failed = report.get("ok") is False or report.get("final_status") == "failed"
+    completed_with_issues = not failed and bool(report.get("completed_with_issues"))
     now = datetime.now()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
@@ -1665,10 +1666,14 @@ def complete_full_cleanup_operation(
         ):
             db.rollback()
             return False
-        operation.state = "completed_with_issues" if completed_with_issues else "completed"
+        operation.state = (
+            "failed"
+            if failed
+            else "completed_with_issues" if completed_with_issues else "completed"
+        )
         operation.active_key = None
         operation.report_json = encoded
-        operation.reason_code = None
+        operation.reason_code = "FULL_CLEANUP_EXECUTION_FAILED" if failed else None
         operation.updated_at = now
         operation.completed_at = now
         db.commit()

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { api } from '../api'
+import { api, type SessionDeletionPreflight } from '../api'
 import { AgentPanel } from '../components/AgentPanel'
 import { DashboardHome } from '../components/DashboardHome'
 import { useStore } from '../store'
@@ -10,6 +10,37 @@ import { installUiReadModelSpies } from './ui-read-model-mocks'
 vi.mock('../components/TerminalView', () => ({ TerminalView: () => null }))
 
 const session = (id: string, created_at: string) => ({ id, name: id, status: 'active', created_at })
+const deletionPreflight = (overrides: Partial<SessionDeletionPreflight> = {}): SessionDeletionPreflight => ({
+  eligible: true,
+  deletion_mode: 'eligible_normal',
+  cancellable: false,
+  can_resolve_and_delete: false,
+  already_deleted: false,
+  requires_cancellation_confirmation: false,
+  requires_historical_indeterminate_confirmation: false,
+  requires_dirty_confirmation: false,
+  modified_files: 0,
+  untracked_files: 0,
+  reason_code: null,
+  reason_codes: [],
+  plan_token: null,
+  current_queue_count: 0,
+  cancellable_count: 0,
+  historical_indeterminate_count: 0,
+  unsafe_count: 0,
+  live_unsafe_count: 0,
+  active_runtime_count: 0,
+  active_execution_count: 0,
+  plan_limit: 500,
+  blockers: [],
+  cancellable_blockers: [],
+  historical_indeterminate_blockers: [],
+  unsafe_blockers: [],
+  blocking_recovery_operations: [],
+  cancellation_plan: { count: 0, categories: [] },
+  historical_indeterminate_plan: { count: 0, categories: [] },
+  ...overrides,
+})
 
 describe('session creation and canonical ordering', () => {
   beforeEach(() => {
@@ -25,7 +56,7 @@ describe('session creation and canonical ordering', () => {
     vi.spyOn(api, 'listProviders').mockResolvedValue([{ name: 'kiro_cli', binary: 'kiro', installed: true }])
     vi.spyOn(api, 'listProfiles').mockResolvedValue([{ name: 'developer', description: '', source: 'built-in' }])
     vi.spyOn(api, 'listProjects').mockResolvedValue([])
-    vi.spyOn(api, 'getSessionDeletionPreflight').mockResolvedValue({ eligible: true, already_deleted: false, requires_dirty_confirmation: false, modified_files: 0, untracked_files: 0, reason_code: null })
+    vi.spyOn(api, 'getSessionDeletionPreflight').mockResolvedValue(deletionPreflight())
     installUiReadModelSpies()
   })
 
@@ -317,6 +348,52 @@ describe('session creation and canonical ordering', () => {
 
     fireEvent.keyDown(screen.getByRole('button', { name: `Collapse ${sessionDisplayName(sessionB.name)}` }), { key: ' ' })
     await waitFor(() => expect(screen.queryByTestId(`agent-session-detail-${sessionB.id}`)).not.toBeInTheDocument())
+  })
+
+  it('keeps a stable right-aligned action strip across terminal lifecycle states', async () => {
+    const currentSession = session('action-layout', '100')
+    const terminals = [
+      { id: 'running-actions', tmux_session: currentSession.name, tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null },
+      { id: 'exited-actions', tmux_session: currentSession.name, tmux_window: '1', provider: 'codex', agent_profile: 'reviewer', last_active: null },
+    ]
+    useStore.setState({
+      sessions: [currentSession],
+      terminalStatuses: {
+        'running-actions': { lifecycle: 'running', activity: 'idle' },
+        'exited-actions': { lifecycle: 'exited', activity: 'exited' },
+      } as never,
+    })
+    vi.spyOn(api, 'getSession').mockResolvedValue({ session: currentSession, terminals } as never)
+
+    render(<AgentPanel />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand action-layout' }))
+
+    const runningActions = await screen.findByTestId('agent-actions-running-actions')
+    const exitedActions = await screen.findByTestId('agent-actions-exited-actions')
+    for (const actions of [runningActions, exitedActions]) {
+      expect(actions).toHaveClass(
+        'ml-auto', 'grid', 'h-11', 'w-full', 'max-w-[20.75rem]', 'shrink-0', 'grid-cols-7', 'self-end',
+      )
+      expect(actions).toHaveAttribute('role', 'group')
+      expect(actions).toHaveAttribute('aria-label', 'Agent actions')
+      expect(within(actions).getByRole('button', { name: 'Open work and interaction history' })).toHaveTextContent('History')
+      expect(within(actions).getByRole('button', { name: 'View inbox' })).toHaveTextContent('Inbox')
+      expect(within(actions).getByRole('button', { name: 'View output' })).toHaveTextContent('Output')
+    }
+
+    const runningCard = screen.getByTestId('agent-detail-card-running-actions')
+    const terminalAction = within(runningCard).getByTitle('Open live terminal')
+    const exitAction = within(runningCard).getByTitle('Finish terminal')
+    const deleteAction = within(runningCard).getByTitle(
+      'Gracefully exit this terminal before deleting it',
+    )
+    expect(terminalAction).toHaveTextContent('')
+    expect(exitAction).toHaveTextContent('')
+    expect(deleteAction).toHaveTextContent('')
+    expect(terminalAction).toHaveAttribute('aria-label', 'Open live terminal')
+    expect(exitAction).toHaveAttribute('aria-label', 'Finish terminal')
+    expect(deleteAction).toHaveAttribute('aria-label', 'Delete Terminal')
+    expect(deleteAction).toBeDisabled()
   })
 
   it('shows each Agents session total next to its status without disturbing row actions', async () => {
@@ -633,7 +710,7 @@ describe('session creation and canonical ordering', () => {
     expect(card).toHaveClass('bg-emerald-900/30', 'border-emerald-700/50')
 
     fireEvent.click(within(header).getByRole('button', { name: 'Delete header' }))
-    expect(await screen.findByRole('heading', { name: 'Delete Session' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Delete Session?' })).toBeInTheDocument()
     expect(card).toHaveClass('bg-emerald-900/30', 'border-emerald-700/50')
 
     expect(screen.getByTestId('session-header-cao-header')).toBe(header)
@@ -686,7 +763,7 @@ describe('session creation and canonical ordering', () => {
       expect(within(card).getByTitle('Inbox')).toBeInTheDocument()
       expect(within(card).getByTitle('Output')).toBeInTheDocument()
       expect(within(card).getByRole('button', { name: 'Terminal' })).toBeInTheDocument()
-      expect(within(card).getByTitle('Graceful Exit')).toBeInTheDocument()
+      expect(within(card).getByTitle('Finish')).toBeInTheDocument()
       expect(within(card).getByTitle('Gracefully exit this terminal before deleting it')).toBeDisabled()
     }
 
@@ -702,7 +779,7 @@ describe('session creation and canonical ordering', () => {
     expect(renderedAgentIds()).toEqual(expectedOrder)
 
     fireEvent.click(within(header).getByRole('button', { name: 'Delete summary' }))
-    expect(await screen.findByRole('heading', { name: 'Delete Session' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Delete Session?' })).toBeInTheDocument()
     expect(within(header).getByRole('button', { name: 'Collapse summary' })).toBeInTheDocument()
   })
 
@@ -967,53 +1044,15 @@ describe('session creation and canonical ordering', () => {
     expect(addAgent).toBeDisabled()
     expect(addAgent).toHaveAttribute('title', 'A retired workspace cannot accept agents, tasks, or terminal input')
     const agent = await screen.findByTestId(`agent-detail-card-${terminal.id}`)
-    expect(within(agent).getByRole('button', { name: 'Open Terminal' })).toBeDisabled()
-    const inbox = within(agent).getByRole('button', { name: 'Inbox' })
+    expect(within(agent).getByRole('button', { name: 'A retired workspace cannot accept agents, tasks, or terminal input' })).toBeDisabled()
+    const inbox = within(agent).getByRole('button', { name: 'View inbox' })
     expect(inbox).not.toBeDisabled()
-    expect(within(agent).getByRole('button', { name: 'Output' })).not.toBeDisabled()
+    expect(within(agent).getByRole('button', { name: 'View output' })).not.toBeDisabled()
     expect(within(agent).getByText('Managed workspace removed')).toBeInTheDocument()
     expect(within(agent).queryByText('Recover')).not.toBeInTheDocument()
     fireEvent.click(inbox)
     expect(await screen.findByText('History, Inbox, results, and Output remain readable. Create a new writable Session to continue work.')).toBeInTheDocument()
     expect(screen.queryByRole('textbox', { name: 'Inbox draft' })).not.toBeInTheDocument()
-  })
-
-  it('keeps icon-only agent actions in one fixed right-aligned strip across lifecycle states', async () => {
-    const currentSession = session('action-layout', '100')
-    const terminals = [
-      { id: 'running-actions', tmux_session: currentSession.name, tmux_window: '0', provider: 'codex', agent_profile: 'developer', last_active: null },
-      { id: 'exited-actions', tmux_session: currentSession.name, tmux_window: '1', provider: 'codex', agent_profile: 'reviewer', last_active: null },
-    ]
-    useStore.setState({
-      sessions: [currentSession],
-      terminalStatuses: {
-        'running-actions': { lifecycle: 'running', activity: 'idle' },
-        'exited-actions': { lifecycle: 'exited', activity: 'exited' },
-      } as never,
-    })
-    vi.spyOn(api, 'getSession').mockResolvedValue({ session: currentSession, terminals } as never)
-
-    render(<AgentPanel />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Expand action-layout' }))
-
-    const runningActions = await screen.findByTestId('agent-actions-running-actions')
-    const exitedActions = await screen.findByTestId('agent-actions-exited-actions')
-    for (const actions of [runningActions, exitedActions]) {
-      expect(actions).toHaveClass('ml-auto', 'grid', 'w-[16.5rem]', 'shrink-0', 'grid-cols-7')
-      expect(actions).toHaveAttribute('role', 'group')
-      expect(actions).toHaveAttribute('aria-label', 'Agent actions')
-    }
-
-    const runningCard = screen.getByTestId('agent-detail-card-running-actions')
-    const terminalAction = within(runningCard).getByRole('button', { name: 'Open Terminal' })
-    const exitAction = within(runningCard).getByRole('button', { name: 'Graceful Exit' })
-    const deleteAction = within(runningCard).getByTitle('Gracefully exit this terminal before deleting it')
-    expect(terminalAction).toHaveTextContent('')
-    expect(exitAction).toHaveTextContent('')
-    expect(deleteAction).toHaveTextContent('')
-    expect(terminalAction).toHaveAttribute('title', 'Open live terminal')
-    expect(exitAction).toHaveAttribute('title', 'Graceful exit')
-    expect(deleteAction).toBeDisabled()
   })
 })
 
@@ -1030,86 +1069,220 @@ describe('session deletion confirmation', () => {
     })
     vi.spyOn(api, 'listProviders').mockResolvedValue([{ name: 'kiro_cli', binary: 'kiro', installed: true }])
     vi.spyOn(api, 'listProfiles').mockResolvedValue([{ name: 'developer', description: '', source: 'built-in' }])
-    vi.spyOn(api, 'getSessionDeletionPreflight').mockResolvedValue({ eligible: true, already_deleted: false, requires_dirty_confirmation: false, modified_files: 0, untracked_files: 0, reason_code: null })
+    vi.spyOn(api, 'getSessionDeletionPreflight').mockResolvedValue(deletionPreflight())
     installUiReadModelSpies()
   })
 
   it('opens without deleting, cancels safely, then deletes once after reopening and confirming', async () => {
-    const remove = vi.spyOn(useStore.getState(), 'deleteSession').mockResolvedValue()
+    const remove = vi.spyOn(useStore.getState(), 'deleteSession').mockResolvedValue(true)
     render(<AgentPanel />)
 
     fireEvent.click(await screen.findByTitle('Delete session'))
-    expect(await screen.findByRole('heading', { name: 'Delete Session' })).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Delete Session?' })).toBeInTheDocument()
+    expect(screen.getByText(/All processes, tasks, results, history, and managed workspace data/))
+      .toBeInTheDocument()
     expect(remove).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
-    expect(screen.queryByRole('heading', { name: 'Delete Session' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Delete Session?' })).not.toBeInTheDocument()
     expect(remove).not.toHaveBeenCalled()
 
     fireEvent.click(screen.getByTitle('Delete session'))
     const reopenedConfirm = await screen.findByRole('button', { name: 'Delete Session' })
     fireEvent.click(reopenedConfirm)
     await waitFor(() => expect(remove).toHaveBeenCalledTimes(1))
-    expect(remove).toHaveBeenCalledWith('lifetime-delete-me', false)
+    expect(remove).toHaveBeenCalledWith('lifetime-delete-me', false, false, null, false)
   })
 
-  it('preserves a Session when canonical preflight reports genuinely queued work', async () => {
-    vi.mocked(api.getSessionDeletionPreflight).mockResolvedValue({
+  it('explains unsafe queued work without offering force delete', async () => {
+    const blocker = { category: 'workflow_effects', count: 1, disposition: 'unsafe' as const, reason_codes: ['INDETERMINATE_EFFECT'] }
+    vi.mocked(api.getSessionDeletionPreflight).mockResolvedValue(deletionPreflight({
       eligible: false,
-      already_deleted: false,
-      requires_dirty_confirmation: false,
-      modified_files: 0,
-      untracked_files: 0,
-      reason_code: 'QUEUED_WORK',
-    })
-    const remove = vi.spyOn(useStore.getState(), 'deleteSession').mockResolvedValue()
+      deletion_mode: 'blocked_live_or_unsafe_authority',
+      reason_code: 'INDETERMINATE_EFFECT',
+      reason_codes: ['INDETERMINATE_EFFECT'],
+      current_queue_count: 1,
+      unsafe_count: 1,
+      blockers: [blocker],
+      unsafe_blockers: [blocker],
+    }))
+    const remove = vi.spyOn(useStore.getState(), 'deleteSession').mockResolvedValue(true)
     render(<AgentPanel />)
 
     fireEvent.click(await screen.findByTitle('Delete session'))
 
-    await waitFor(() => expect(useStore.getState().snackbar).toEqual({
-      type: 'error',
-      message: 'QUEUED_WORK',
-    }))
-    expect(screen.queryByRole('heading', { name: 'Delete Session' })).not.toBeInTheDocument()
+    expect(await screen.findByText('This Session cannot be deleted safely yet.')).toBeInTheDocument()
+    expect(screen.getByTestId('session-deletion-unsafe')).toHaveTextContent(
+      'An operation has an uncertain external outcome and must be reconciled first.',
+    )
+    expect(screen.queryByRole('button', { name: 'Delete Session' })).not.toBeInTheDocument()
     expect(remove).not.toHaveBeenCalled()
   })
 
-  it('shows the exact unfinished recovery authority and disables deletion', async () => {
-    vi.mocked(api.getSessionDeletionPreflight).mockResolvedValue({
+  it('shows exact unresolved recovery authority instead of a historical-data blocker', async () => {
+    const blocker = {
+      category: 'recovery_authority',
+      count: 1,
+      disposition: 'unsafe' as const,
+      reason_codes: ['RECOVERY_DISPATCH_UNCERTAIN'],
+    }
+    vi.mocked(api.getSessionDeletionPreflight).mockResolvedValue(deletionPreflight({
       eligible: false,
-      already_deleted: false,
-      requires_dirty_confirmation: false,
-      modified_files: 0,
-      untracked_files: 0,
-      reason_code: 'SESSION_RECOVERY_AUTHORITY_ACTIVE',
+      deletion_mode: 'blocked_live_or_unsafe_authority',
+      reason_code: 'RECOVERY_DISPATCH_UNCERTAIN',
+      reason_codes: ['RECOVERY_DISPATCH_UNCERTAIN'],
+      unsafe_count: 1,
+      blockers: [blocker],
+      unsafe_blockers: [blocker],
       blocking_recovery_operations: [{
         operation_id: 'takeover-pending',
         terminal_id: 'replaced-terminal',
         kind: 'recovery_takeover',
         state: 'dispatch_uncertain',
-        reason_code: 'RECOVERY_PROVIDER_DISPATCH_UNCERTAIN',
+        reason_code: 'RECOVERY_DISPATCH_UNCERTAIN',
       }],
-    })
-    const remove = vi.spyOn(useStore.getState(), 'deleteSession').mockResolvedValue()
+    }))
+    render(<AgentPanel />)
+
+    fireEvent.click(await screen.findByTitle('Delete session'))
+
+    expect(await screen.findByTestId('session-deletion-recovery-authority')).toHaveTextContent(
+      'This is live recovery authority, not historical evidence.',
+    )
+    expect(screen.getByTestId('session-deletion-recovery-authority')).toHaveTextContent(
+      'dispatch_uncertain',
+    )
+    expect(screen.getByTestId('session-deletion-recovery-authority')).toHaveTextContent(
+      'replaced-terminal',
+    )
+    expect(screen.getByTestId('session-deletion-recovery-authority')).toHaveTextContent(
+      'takeover-pending',
+    )
+    expect(screen.getByTestId('session-deletion-unsafe')).toHaveTextContent(
+      'Recovery dispatch has an uncertain external outcome and remains protected.',
+    )
+    expect(screen.queryByRole('button', { name: 'Delete Session' })).not.toBeInTheDocument()
+  })
+
+  it('offers exact operator retirement for historical operations with unknown outcomes', async () => {
+    const blocker = {
+      category: 'historical_indeterminate_effects',
+      count: 4,
+      disposition: 'historical_indeterminate' as const,
+      reason_codes: ['HISTORICAL_EFFECT_OUTCOME_UNKNOWN'],
+    }
+    vi.mocked(api.getSessionDeletionPreflight).mockResolvedValue(deletionPreflight({
+      eligible: false,
+      deletion_mode: 'eligible_with_historical_indeterminate_retirement',
+      can_resolve_and_delete: true,
+      requires_historical_indeterminate_confirmation: true,
+      reason_code: 'HISTORICAL_EFFECT_OUTCOME_UNKNOWN',
+      reason_codes: ['HISTORICAL_EFFECT_OUTCOME_UNKNOWN'],
+      plan_token: 'b'.repeat(64),
+      current_queue_count: 4,
+      historical_indeterminate_count: 4,
+      blockers: [blocker],
+      historical_indeterminate_blockers: [blocker],
+      historical_indeterminate_plan: { count: 4, categories: [blocker] },
+    }))
+    const remove = vi.spyOn(useStore.getState(), 'deleteSession').mockResolvedValue(true)
     render(<AgentPanel />)
 
     fireEvent.click(await screen.findByTitle('Delete session'))
 
     expect(await screen.findByText(
-      'Deletion is blocked because this Session still owns unresolved recovery authority. An owner must resolve the listed recovery operation before deletion.',
+      'This Session contains historical operations with unknown outcomes.',
     )).toBeInTheDocument()
-    expect(screen.getByText('Blocking recovery operations')).toBeInTheDocument()
-    expect(screen.getByText('dispatch_uncertain (RECOVERY_PROVIDER_DISPATCH_UNCERTAIN)')).toBeInTheDocument()
-    expect(screen.getByText('replaced-terminal')).toBeInTheDocument()
-    expect(screen.getByText('takeover-pending')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Delete Session' })).toBeDisabled()
-    expect(remove).not.toHaveBeenCalled()
+    const warning = screen.getByTestId('session-deletion-historical-indeterminate')
+    expect(warning).toHaveTextContent('ThreadCells can no longer establish the external outcome')
+    expect(warning).toHaveTextContent(
+      'All Session data, including history, results, and audit details, will be permanently deleted.',
+    )
+    expect(screen.getByText('Operations with unknown outcomes')).toBeInTheDocument()
+    expect(screen.getByText('Active agents')).toBeInTheDocument()
+    expect(screen.getByText('Active executions')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', {
+      name: 'Delete Session',
+    }))
+    await waitFor(() => expect(remove).toHaveBeenCalledWith(
+      'lifetime-delete-me', false, false, 'b'.repeat(64), true,
+    ))
+  })
+
+  it('confirms the exact server-authored cancellation plan', async () => {
+    const blocker = { category: 'queued_work', count: 1, disposition: 'cancellable' as const, reason_codes: ['UNADMITTED_WORKFLOW_TURN'] }
+    vi.mocked(api.getSessionDeletionPreflight).mockResolvedValue(deletionPreflight({
+      eligible: false,
+      deletion_mode: 'eligible_with_cancellable_work',
+      cancellable: true,
+      can_resolve_and_delete: true,
+      requires_cancellation_confirmation: true,
+      reason_code: 'QUEUED_WORK',
+      reason_codes: ['UNADMITTED_WORKFLOW_TURN'],
+      plan_token: 'a'.repeat(64),
+      current_queue_count: 1,
+      cancellable_count: 1,
+      blockers: [blocker],
+      cancellable_blockers: [blocker],
+      cancellation_plan: { count: 1, categories: [blocker] },
+    }))
+    const remove = vi.spyOn(useStore.getState(), 'deleteSession').mockResolvedValue(true)
+    render(<AgentPanel />)
+
+    fireEvent.click(await screen.findByTitle('Delete session'))
+    expect(await screen.findByText('This Session has unfinished work.')).toBeInTheDocument()
+    expect(screen.getByText('Current Queue')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel work and delete Session' }))
+    await waitFor(() => expect(remove).toHaveBeenCalledWith(
+      'lifetime-delete-me', false, true, 'a'.repeat(64), false,
+    ))
+  })
+
+  it('keeps the dialog open and reloads blockers when destructive revalidation fails', async () => {
+    const queued = { category: 'queued_work', count: 1, disposition: 'cancellable' as const, reason_codes: ['UNADMITTED_WORKFLOW_TURN'] }
+    const effect = { category: 'workflow_effects', count: 1, disposition: 'unsafe' as const, reason_codes: ['CLAIMED_EFFECT'] }
+    vi.mocked(api.getSessionDeletionPreflight)
+      .mockResolvedValueOnce(deletionPreflight({
+        eligible: false,
+        deletion_mode: 'eligible_with_cancellable_work',
+        cancellable: true,
+        can_resolve_and_delete: true,
+        requires_cancellation_confirmation: true,
+        plan_token: 'a'.repeat(64),
+        current_queue_count: 1,
+        cancellable_count: 1,
+        blockers: [queued],
+        cancellable_blockers: [queued],
+        cancellation_plan: { count: 1, categories: [queued] },
+      }))
+      .mockResolvedValueOnce(deletionPreflight({
+        eligible: false,
+        deletion_mode: 'blocked_live_or_unsafe_authority',
+        reason_code: 'CLAIMED_EFFECT',
+        reason_codes: ['CLAIMED_EFFECT'],
+        current_queue_count: 1,
+        unsafe_count: 1,
+        blockers: [effect],
+        unsafe_blockers: [effect],
+      }))
+    const remove = vi.spyOn(useStore.getState(), 'deleteSession').mockResolvedValue(false)
+    render(<AgentPanel />)
+
+    fireEvent.click(await screen.findByTitle('Delete session'))
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel work and delete Session' }))
+
+    expect(await screen.findByText('This Session cannot be deleted safely yet.')).toBeInTheDocument()
+    expect(screen.getByTestId('session-deletion-unsafe')).toHaveTextContent(
+      'An operation is still claimed and may have an external effect.',
+    )
+    expect(api.getSessionDeletionPreflight).toHaveBeenCalledTimes(2)
+    expect(screen.queryByRole('button', { name: 'Delete Session' })).not.toBeInTheDocument()
   })
 
   it('prevents duplicate delete confirmations while the request is pending', async () => {
-    let resolveDelete!: () => void
-    const remove = vi.spyOn(useStore.getState(), 'deleteSession').mockImplementation(() => new Promise<void>(resolve => { resolveDelete = resolve }))
+    let resolveDelete!: (value: boolean) => void
+    const remove = vi.spyOn(useStore.getState(), 'deleteSession').mockImplementation(() => new Promise<boolean>(resolve => { resolveDelete = resolve }))
     render(<AgentPanel />)
 
     fireEvent.click(await screen.findByTitle('Delete session'))
@@ -1120,32 +1293,27 @@ describe('session deletion confirmation', () => {
     expect(remove).toHaveBeenCalledTimes(1)
     expect(confirm).toBeDisabled()
 
-    resolveDelete()
-    await waitFor(() => expect(screen.queryByRole('heading', { name: 'Delete Session' })).not.toBeInTheDocument())
+    resolveDelete(true)
+    await waitFor(() => expect(screen.queryByRole('heading', { name: 'Delete Session?' })).not.toBeInTheDocument())
   })
 
   it('requires explicit destructive confirmation for a dirty inactive workspace', async () => {
-    vi.mocked(api.getSessionDeletionPreflight).mockResolvedValue({
+    vi.mocked(api.getSessionDeletionPreflight).mockResolvedValue(deletionPreflight({
       eligible: true,
-      already_deleted: false,
       requires_dirty_confirmation: true,
       modified_files: 3,
       untracked_files: 2,
-      reason_code: null,
-    })
-    const remove = vi.spyOn(useStore.getState(), 'deleteSession').mockResolvedValue()
+    }))
+    const remove = vi.spyOn(useStore.getState(), 'deleteSession').mockResolvedValue(true)
     render(<AgentPanel />)
 
     fireEvent.click(await screen.findByTitle('Delete session'))
     expect(await screen.findByText(
-      'The workspace contains unfinished changes. Deleting the Session will permanently delete all unfinished changes in this workspace.',
+      'The workspace contains unfinished changes. Deleting the Session will permanently delete those changes.',
     )).toBeInTheDocument()
-    expect(screen.getByText('Modified files')).toBeInTheDocument()
-    expect(screen.getByText('3')).toBeInTheDocument()
-    expect(screen.getByText('Untracked files')).toBeInTheDocument()
-    expect(screen.getByText('2')).toBeInTheDocument()
+    expect(screen.getByText('Uncommitted workspace changes: 3 modified, 2 untracked.')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Delete Session' }))
-    await waitFor(() => expect(remove).toHaveBeenCalledWith('lifetime-delete-me', true))
+    await waitFor(() => expect(remove).toHaveBeenCalledWith('lifetime-delete-me', true, false, null, false))
   })
 
   it('opens the terminal deletion confirmation only for an exited terminal', async () => {
@@ -1204,11 +1372,11 @@ describe('graceful exit authority feedback', () => {
     render(<AgentPanel />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand exit' }))
-    fireEvent.click(await screen.findByTitle('Graceful exit'))
+    fireEvent.click(await screen.findByTitle('Finish terminal'))
     fireEvent.click(screen.getByRole('button', { name: 'Send Exit' }))
 
     await waitFor(() => expect(useStore.getState().snackbar?.message).toBe(pending.message))
-    expect(screen.getByRole('heading', { name: 'Graceful Exit' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Finish' })).toBeInTheDocument()
   })
 
   it('keeps DashboardHome confirmation open when exit is not confirmed', async () => {
@@ -1216,11 +1384,11 @@ describe('graceful exit authority feedback', () => {
     render(<DashboardHome onNavigate={() => {}} />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand exit' }))
-    fireEvent.click(await screen.findByTitle('Graceful Exit'))
+    fireEvent.click(await screen.findByTitle('Finish'))
     fireEvent.click(screen.getByRole('button', { name: 'Send Exit' }))
 
     await waitFor(() => expect(useStore.getState().snackbar?.message).toBe(pending.message))
-    expect(screen.getByRole('heading', { name: 'Graceful Exit' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Finish' })).toBeInTheDocument()
   })
 
   it('does not offer another exit for recovery-fenced takeover history on Home', async () => {
@@ -1233,7 +1401,7 @@ describe('graceful exit authority feedback', () => {
     render(<DashboardHome onNavigate={() => {}} />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Expand exit' }))
-    const exitAction = await screen.findByTitle('Graceful Exit')
+    const exitAction = await screen.findByTitle('Finish')
 
     expect(exitAction).toBeDisabled()
     expect(screen.getAllByText('Replaced during recovery').length).toBeGreaterThan(0)

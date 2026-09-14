@@ -18,7 +18,7 @@ class TestAssignSenderIdInjection:
         )
         monkeypatch.setattr(
             "cli_agent_orchestrator.mcp_server.server.issue_workflow_input_binding",
-            lambda *_: "binding",
+            lambda *_, **__: "binding",
         )
 
     @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", True)

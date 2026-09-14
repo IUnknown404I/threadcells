@@ -1,7 +1,7 @@
 ---
 slug: workflows-and-results
 source: docs/WORKFLOWS_AND_RESULTS.md
-source_sha256: sha256:2075858d138b70bafe8c6605e1d77b69a0aafee4faaa8042ef3437e6ebae71ff
+source_sha256: sha256:96ac4e69b487f09d35f8aaa05ea5c343a7a6010be84f2f1bc7b8592994c441c0
 ---
 
 # Workflows und dauerhafte Ergebnisse
@@ -81,6 +81,8 @@ Eine neue Nachricht im Workflow Composer ist die Owner-Entscheidung, die einen b
 ## Wiederherstellung
 
 Beim Neustart rekonstruiert ThreadCells die Workflow-Ownership aus dauerhaftem Zustand. Zugestellte, aber nicht bestätigte Ergebnisse bleiben verfügbar. Ein wartender Handoff kann gegen dasselbe Child fortgesetzt werden, statt ein Duplikat zu starten. Sobald ein neuerer logischer Zug für einen offenen Workflow zugelassen wird, wird eine ältere ausstehende Fortsetzung dauerhaft ersetzt und kann nach Kompaktierung oder Unterbrechung nicht später als unabhängige Arbeit wiedergegeben werden.
+
+Wenn ein verwaltetes Child nachweislich beendet wurde, ohne ein Ergebnis zu übermitteln, setzt ThreadCells dasselbe begrenzte Wiederherstellungsbudget fort, auch wenn der zuletzt dargestellte Anbieterstatus veraltet ist. Nach Ausschöpfung wird ein `incomplete`-Lifecycle-Ergebnis gespeichert, einmal für den offenen Parent zum Lesen und Bestätigen eingereiht und jede verspätete Übermittlung abgelehnt; ein erfolgreicher Ausgang wird niemals erfunden.
 
 Die Neustartabstimmung öffnet außerdem den neuesten Workflow im Owner-Gate erneut, wenn sein abgebrochener Transportkopf bereits einen späteren ausdrücklichen Composer-Nachfolger hat. Sie stuft diesen vorhandenen Nachfolger hoch, ohne einen Ersatzzug zu erstellen, und verwendet diese Reparatur nie zur Wiederbelebung von Inbox-Callbacks oder Exited-Terminals.
 

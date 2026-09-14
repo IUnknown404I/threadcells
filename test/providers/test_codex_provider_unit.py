@@ -42,7 +42,7 @@ def _assert_managed_session_hook(command: str) -> list[str]:
         if part == "-c" and parts[index + 1].startswith("hooks.SessionStart=")
     ]
     assert len(hook_values) == 1
-    assert "^(startup|resume)$" in hook_values[0]
+    assert "^(startup|resume|compact)$" in hook_values[0]
     assert (
         shlex.join([sys.executable, "-m", "cli_agent_orchestrator.codex_session_hook"])
         in hook_values[0]

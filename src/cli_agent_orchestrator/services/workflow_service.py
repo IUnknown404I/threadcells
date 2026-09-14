@@ -15,6 +15,7 @@ from cli_agent_orchestrator.clients.database import (
     claim_workflow_provider_reconnect,
     claim_workflow_turn,
     complete_workflow_provider_reconnect,
+    count_stale_provider_runtime_compatibilities,
     fail_workflow_provider_reconnect_attempt,
     get_handoff_child_status,
     get_open_workflow_root_terminal_ids,
@@ -24,6 +25,7 @@ from cli_agent_orchestrator.clients.database import (
     get_queued_workflow_root_terminal_ids,
     get_workflow_provider_outcome_observation,
     mark_workflow_turn_sent,
+    observe_managed_attempt_provider_state,
     observe_workflow_final,
     observe_workflow_processing,
     observe_workflow_provider_outcome,
@@ -31,6 +33,7 @@ from cli_agent_orchestrator.clients.database import (
     prepare_workflow_input,
     renew_workflow_provider_reconnect,
     renew_workflow_turn_claim,
+    request_stale_provider_runtime_reconnects,
     request_workflow_provider_reconnect,
     requeue_expired_workflow_turn_claims,
     requeue_workflow_turn,
@@ -52,6 +55,19 @@ class ProviderResumeIdentityUnavailable(RuntimeError):
     """Reconnect has no launch-bound identity it can safely resume."""
 
     reconnect_outcome_code = "resume_identity_unavailable_or_unproven"
+
+
+def fence_stale_provider_runtime_compatibility(now: datetime | None = None) -> int:
+    """Audit all stale residents and eagerly reconnect eligible executions."""
+    from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
+
+    stale = count_stale_provider_runtime_compatibilities(ACTIVE_RUNTIME_GENERATION)
+    if stale:
+        logger.debug(
+            "Observed %s resident Codex runtimes behind the active compatibility generation",
+            stale,
+        )
+    return request_stale_provider_runtime_reconnects(ACTIVE_RUNTIME_GENERATION, now=now)
 
 
 class _WorkflowTurnClaimHeartbeat:
@@ -258,6 +274,7 @@ def _reconcile_root_workflow_with_admission(
         pending_reconnect = True
     if status == TerminalStatus.PROCESSING.value:
         observe_workflow_processing(root_terminal_id, now=now)
+        observe_managed_attempt_provider_state(root_terminal_id, "provider_running", now=now)
         return False
     if status not in (TerminalStatus.IDLE.value, TerminalStatus.COMPLETED.value):
         return False
@@ -361,12 +378,12 @@ def _reconcile_root_workflow_with_admission(
         return False
 
     outcome_observation = get_workflow_provider_outcome_observation(root_terminal_id)
-    provider_outcome = (
-        terminal_service.provider_turn_outcome(root_terminal_id, outcome_observation["cursor"])
-        if outcome_observation is not None
-        else None
-    )
-    if isinstance(provider_outcome, ProviderTurnOutcome):
+    provider_outcome = None
+    if outcome_observation is not None:
+        provider_outcome = terminal_service.provider_turn_outcome(
+            root_terminal_id, outcome_observation["cursor"]
+        )
+    if outcome_observation is not None and isinstance(provider_outcome, ProviderTurnOutcome):
         persisted = observe_workflow_provider_outcome(
             root_terminal_id,
             outcome_observation["turn_id"],
@@ -450,6 +467,7 @@ def _reconcile_root_workflow_with_admission(
         observe_workflow_final(root_terminal_id, now=now)
     else:
         observe_workflow_ready(root_terminal_id, now=now)
+    observe_managed_attempt_provider_state(root_terminal_id, "waiting_for_result", now=now)
 
     turn = claim_workflow_turn(root_terminal_id, now=now)
     if turn is None:

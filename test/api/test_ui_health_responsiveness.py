@@ -220,6 +220,11 @@ async def test_blocked_restart_recovery_begins_only_after_health_is_available(
     monkeypatch.setattr(api_main, "PollingObserver", lambda **_kwargs: observer)
     monkeypatch.setattr(api_main, "flow_daemon", dormant_flow_daemon)
     monkeypatch.setattr(
+        api_main.workflow_service,
+        "fence_stale_provider_runtime_compatibility",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
         control_plane_registry,
         "initialize_control_plane_registries",
         lambda *_args: None,
@@ -315,6 +320,8 @@ def _install_large_history(monkeypatch, tmp_path, *, terminal_count: int = 2000)
         monkeypatch.setattr(database, name, lambda: None)
     monkeypatch.setattr(database, "_terminal_ui_projection_schema_ready", True)
     monkeypatch.setattr(database, "_terminal_ui_projection_schema_engine_identity", id(engine))
+    database._ensure_session_deletion_receipt_schema()
+    database._ensure_terminal_deletion_receipt_schema()
     return engine
 
 

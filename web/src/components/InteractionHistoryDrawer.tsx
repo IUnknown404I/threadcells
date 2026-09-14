@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { AlertTriangle, ArrowRight, ChevronDown, ChevronUp, CircleCheck, History as HistoryIcon, ListTodo, Loader2, RefreshCw, X } from 'lucide-react'
 import { api, type DelegationResult, type InteractionItem, type InteractionMode } from '../api'
-import { useI18n, type AppLocale, type TranslationKey } from '../i18n'
+import { useI18n, type TranslationKey } from '../i18n'
 import { sessionDisplayName } from '../sessionDisplayName'
+import { formatAbsoluteTimestamp, useTimeZone } from '../timeZone'
 
 type InteractionHistoryDrawerProps = {
   sessionId: string
@@ -35,6 +36,7 @@ const WAIT_KEYS: Record<string, TranslationKey> = {
   current_provider_turn: 'interactions.wait.providerTurn',
   provider_capacity: 'interactions.wait.providerCapacity',
   reconnect: 'interactions.wait.reconnect',
+  recovery: 'interactions.wait.reconnect',
   child_result: 'interactions.wait.childResult',
   owner_gate: 'interactions.wait.ownerGate',
   delivery: 'interactions.wait.delivery',
@@ -48,12 +50,17 @@ const WAIT_KEYS: Record<string, TranslationKey> = {
 }
 
 const DISPOSITION_KEYS: Record<string, TranslationKey> = {
+  processed: 'interactions.disposition.processed',
   completed: 'interactions.disposition.completed',
   delivered: 'interactions.disposition.delivered',
   acknowledged: 'interactions.disposition.acknowledged',
   failed: 'interactions.disposition.failed',
   cancelled: 'interactions.disposition.cancelled',
   superseded: 'interactions.disposition.superseded',
+  rejected: 'interactions.disposition.rejected',
+  wait_slice_expired: 'interactions.disposition.waitSliceExpired',
+  wait_retryable: 'interactions.disposition.waitRetryable',
+  operator_retired_unknown_outcome: 'interactions.disposition.operatorRetiredUnknown',
 }
 
 const STATE_KEYS: Record<string, TranslationKey> = {
@@ -69,6 +76,15 @@ const STATE_KEYS: Record<string, TranslationKey> = {
   admitted: 'interactions.state.admitted',
   dispatching: 'interactions.state.dispatching',
   fenced: 'interactions.state.fenced',
+  assignment_created: 'interactions.state.assignmentCreated',
+  prompt_delivery_scheduled: 'interactions.state.promptDeliveryScheduled',
+  prompt_delivery_acknowledged: 'interactions.state.promptDeliveryAcknowledged',
+  provider_admitted: 'interactions.state.providerAdmitted',
+  provider_running: 'interactions.state.providerRunning',
+  waiting_for_result: 'interactions.state.waitingForResult',
+  recovery_scheduled: 'interactions.state.recoveryScheduled',
+  fence_pending: 'interactions.state.fencePending',
+  fence_claimed: 'interactions.state.fenceClaimed',
   recovery_required: 'interactions.state.recoveryRequired',
   awaiting_result: 'interactions.state.awaitingResult',
   handoff_awaiting_result: 'interactions.state.awaitingResult',
@@ -88,6 +104,7 @@ const STATE_KEYS: Record<string, TranslationKey> = {
   result_acknowledged: 'interactions.state.resultAcknowledged',
   handoff_result_acknowledged: 'interactions.state.resultAcknowledged',
   result_superseded: 'interactions.state.superseded',
+  operator_retired_indeterminate: 'interactions.state.operatorRetiredIndeterminate',
 }
 
 const TASK_KEYS: Record<string, TranslationKey> = {
@@ -104,6 +121,7 @@ const TASK_KEYS: Record<string, TranslationKey> = {
   workflow: 'interactions.task.workflow',
   assign: 'interactions.task.assign',
   handoff: 'interactions.task.handoff',
+  await_handoff: 'interactions.task.awaitHandoff',
   recovery_takeover: 'interactions.task.recoveryTakeover',
   runtime_recovery: 'interactions.task.runtimeRecovery',
   provider_execution: 'interactions.task.providerExecution',
@@ -115,18 +133,11 @@ function translatedValue(value: string | null, keys: Record<string, TranslationK
   return keys[value] ? t(keys[value]) : value.replace(/_/g, ' ')
 }
 
-function formatTimestamp(value: string | null, locale: AppLocale) {
-  if (!value) return '—'
-  const parsed = new Date(value)
-  if (Number.isNaN(parsed.getTime())) return value
-  return new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeStyle: 'short' }).format(parsed)
-}
-
 function itemTone(item: InteractionItem) {
   const state = item.final_disposition || item.queue.state || ''
   if (state.includes('failed') || state === 'cancelled') return 'border-red-800/60 bg-red-950/10'
-  if (state === 'owner_gate' || item.queue.wait_reason === 'owner_gate') return 'border-amber-700/60 bg-amber-950/10'
-  if (state === 'acknowledged' || state === 'completed') return 'border-emerald-800/50 bg-emerald-950/10'
+  if (state === 'owner_gate' || state === 'operator_retired_unknown_outcome' || item.queue.wait_reason === 'owner_gate') return 'border-amber-700/60 bg-amber-950/10'
+  if (state === 'processed' || state === 'acknowledged' || state === 'completed') return 'border-emerald-800/50 bg-emerald-950/10'
   if (state === 'superseded') return 'border-violet-800/50 bg-violet-950/10'
   return 'border-gray-700/60 bg-gray-900/70'
 }
@@ -134,8 +145,8 @@ function itemTone(item: InteractionItem) {
 function statusTone(item: InteractionItem) {
   const state = item.final_disposition || item.queue.state || ''
   if (state.includes('failed') || state === 'cancelled') return 'bg-red-400/10 text-red-300'
-  if (state === 'owner_gate') return 'bg-amber-400/10 text-amber-300'
-  if (state === 'acknowledged' || state === 'completed') return 'bg-emerald-400/10 text-emerald-300'
+  if (state === 'owner_gate' || state === 'operator_retired_unknown_outcome') return 'bg-amber-400/10 text-amber-300'
+  if (state === 'processed' || state === 'acknowledged' || state === 'completed') return 'bg-emerald-400/10 text-emerald-300'
   if (state === 'superseded') return 'bg-violet-400/10 text-violet-300'
   return 'bg-sky-400/10 text-sky-300'
 }
@@ -156,14 +167,25 @@ function InteractionCard({
   onToggle: () => void
 }) {
   const { locale, t } = useI18n()
+  const { timeZone } = useTimeZone()
   const state = item.current
     ? translatedValue(item.queue.state, STATE_KEYS, t)
     : translatedValue(item.final_disposition, DISPOSITION_KEYS, t)
       || translatedValue(item.queue.state, STATE_KEYS, t)
   const source = translatedValue(item.source.kind, SOURCE_KEYS, t)
   const wait = translatedValue(item.queue.wait_reason, WAIT_KEYS, t)
+  const attempt = item.attempt || {
+    state: null,
+    reason_code: null,
+    delivery_attempt_count: 0,
+    recovery_attempt_count: 0,
+    next_retry_at: null,
+    deadline_at: null,
+    prompt_delivery_acknowledged: false,
+    provider_admitted: false,
+  }
   const hasDetails = Boolean(
-    item.input_preview || item.workflow.id || item.result.id || item.delivery.status || item.diagnostics.durable_id,
+    item.input_preview || item.workflow.id || item.result.id || item.delivery.status || attempt.state || item.diagnostics.durable_id,
   )
   const resultState = translatedValue(item.result.status, STATE_KEYS, t) || item.result.status
   const deliveryState = translatedValue(item.delivery.status, STATE_KEYS, t) || item.delivery.status
@@ -175,7 +197,7 @@ function InteractionCard({
           <span className="text-xs font-semibold text-gray-100">{t(TYPE_KEYS[item.interaction_type])}</span>
           <span className="max-w-full truncate text-[11px] text-gray-400">{translatedValue(item.task_type, TASK_KEYS, t)}</span>
         </div>
-        <p className="mt-1 text-[11px] text-gray-500">{formatTimestamp(item.created_at, locale)}</p>
+        <p className="mt-1 text-[11px] text-gray-500">{formatAbsoluteTimestamp(item.created_at, locale, timeZone)}</p>
       </div>
       {state && <span className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-medium ${statusTone(item)}`}>{state}</span>}
     </div>
@@ -200,9 +222,19 @@ function InteractionCard({
           <span>{translatedValue(item.workflow.status, STATE_KEYS, t) || item.workflow.status || t('common.unknown')}</span>
           {item.workflow.turn_state && <><ArrowRight size={12} className="text-gray-600"/><span>{translatedValue(item.workflow.turn_state, STATE_KEYS, t)}</span></>}
           {item.workflow.effect_state && <><ArrowRight size={12} className="text-gray-600"/><span>{item.workflow.effect_kind} · {item.workflow.effect_state}</span></>}
+          {item.workflow.effect_outcome && <><ArrowRight size={12} className="text-gray-600"/><span>{translatedValue(item.workflow.effect_outcome, DISPOSITION_KEYS, t) || item.workflow.effect_outcome}</span></>}
         </div>
+        {item.workflow.effect_reason_code && <p className="mt-1 text-gray-400">{item.workflow.effect_reason_code}</p>}
         {item.workflow.reason && <p className="mt-1 text-amber-200">{item.workflow.reason}</p>}
         {item.workflow.provider_outcome_code && <p className="mt-1 text-gray-400">{t('interactions.providerOutcome')} · {item.workflow.provider_outcome_code}</p>}
+      </div>}
+      {attempt.state && <div>
+        <p className="mb-1 text-[10px] uppercase tracking-wide text-gray-500">{t('interactions.attemptLifecycle')}</p>
+        <p className="text-gray-300">{translatedValue(attempt.state, STATE_KEYS, t)}</p>
+        {attempt.recovery_attempt_count > 0 && <p className="mt-1 text-amber-200">{t('interactions.recoveryAttempt', { count: attempt.recovery_attempt_count })}</p>}
+        {attempt.next_retry_at && <p className="mt-1 text-gray-400">{t('interactions.nextRetry')} · {formatAbsoluteTimestamp(attempt.next_retry_at, locale, timeZone)}</p>}
+        {attempt.deadline_at && <p className="mt-1 text-gray-400">{t('interactions.deadline')} · {formatAbsoluteTimestamp(attempt.deadline_at, locale, timeZone)}</p>}
+        {attempt.reason_code && <p className="mt-1 break-words font-mono text-amber-200">{attempt.reason_code}</p>}
       </div>}
       <div>
         <p className="mb-1 text-[10px] uppercase tracking-wide text-gray-500">{t('interactions.canonicalResult')}</p>

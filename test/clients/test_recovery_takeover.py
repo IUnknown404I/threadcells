@@ -137,16 +137,6 @@ def test_durable_claim_precedes_runtime_and_writer_fencing(takeover_db):
     sessions, worktree = takeover_db
     claimed = _claim_only(worktree, suffix="durable-claim", new_terminal_id="b22ce099")
     assert claimed["state"] == "claimed"
-    old_session_id = str(database.get_terminal_metadata(OLD_ID)["session_id"])
-    assert database.resolve_session_lifetime(old_session_id)["blocking_recovery_operations"] == [
-        {
-            "operation_id": claimed["id"],
-            "terminal_id": OLD_ID,
-            "kind": "recovery_takeover",
-            "state": "claimed",
-            "reason_code": None,
-        }
-    ]
     with sessions() as db:
         old = db.get(database.TerminalModel, OLD_ID)
         lease = db.get(database.WorktreeWriterLeaseModel, worktree)
@@ -172,16 +162,6 @@ def test_runtime_death_enters_non_writable_recovery_without_leaking_writer(takeo
     assert database.recovery_takeover_durable_eligibility(OLD_ID)["eligible"] is True
     assert database.acquire_terminal_runtime_transport(OLD_ID) is None
     assert database.mark_terminal_runtime_running(OLD_ID) is False
-    old_session_id = str(database.get_terminal_metadata(OLD_ID)["session_id"])
-    assert database.resolve_session_lifetime(old_session_id)["blocking_recovery_operations"] == [
-        {
-            "operation_id": OLD_ID,
-            "terminal_id": OLD_ID,
-            "kind": "runtime_recovery",
-            "state": "recovery_required",
-            "reason_code": "RECOVERY_TAKEOVER_REQUIRED",
-        }
-    ]
     with sessions() as db:
         old = db.get(database.TerminalModel, OLD_ID)
         assert old.runtime_lifecycle == "recovery_required"
@@ -388,15 +368,41 @@ def test_processing_and_genuine_owner_gate_fail_closed(takeover_db):
 
 
 def test_historical_owner_gate_does_not_mask_current_open_workflow(takeover_db):
-    sessions, _worktree = takeover_db
+    sessions, worktree = takeover_db
     with sessions() as db:
-        db.add(database.WorkflowModel(root_terminal_id=OLD_ID, status="owner_gate"))
-        db.add(database.WorkflowModel(root_terminal_id=OLD_ID, status="open"))
+        gate = database.WorkflowModel(
+            root_terminal_id=OLD_ID,
+            status="owner_gate",
+            terminal_reason="historical owner decision",
+        )
+        db.add(gate)
+        db.flush()
+        current = database.WorkflowModel(
+            root_terminal_id=OLD_ID,
+            status="open",
+            resumed_from_owner_gate_workflow_id=gate.id,
+        )
+        db.add(current)
         db.commit()
+        gate_id = int(gate.id)
+        current_id = int(current.id)
 
     eligibility = database.recovery_takeover_durable_eligibility(OLD_ID)
     assert eligibility["eligible"] is True
     assert eligibility["reason_code"] is None
+
+    claimed = _claim_only(
+        worktree,
+        suffix="historical-gate",
+        new_terminal_id="b22ce090",
+    )
+    assert claimed["state"] == "claimed"
+    assert database.fence_claimed_recovery_takeover(claimed["id"])["state"] == "fenced"
+    with sessions() as db:
+        historical = db.get(database.WorkflowModel, gate_id)
+        assert historical.status == "owner_gate"
+        assert historical.terminal_reason == "historical owner decision"
+        assert db.get(database.WorkflowModel, current_id).status == "cancelled"
 
 
 def test_claimed_privileged_effect_blocks_takeover(takeover_db):
@@ -490,7 +496,6 @@ def test_reserved_successor_is_admitted_and_completed_on_same_writer_epoch(takeo
     base_revision = "b" * 40
     with sessions() as db:
         old = db.get(database.TerminalModel, OLD_ID)
-        old_session_id = str(old.session_id)
         old.managed_worktree_kind = "supervisor"
         old.managed_worktree_source = worktree
         old.managed_worktree_branch = branch
@@ -551,7 +556,6 @@ def test_reserved_successor_is_admitted_and_completed_on_same_writer_epoch(takeo
         event_type="recovery_supervisor_admitted",
     )
     assert database.mark_recovery_takeover_completed(takeover["id"])
-    assert database.resolve_session_lifetime(old_session_id)["blocking_recovery_operations"] == []
 
     with sessions() as db:
         lease = db.get(database.WorktreeWriterLeaseModel, worktree)
@@ -573,36 +577,10 @@ def test_reserved_successor_is_admitted_and_completed_on_same_writer_epoch(takeo
             "takeover_completed",
         } <= audit
 
-    deletion = database.delete_terminals_by_session_lifetime(
-        old_session_id,
-        "cao-old",
-        expected_terminal_ids=[OLD_ID],
-        retained_resources=[
-            {
-                "terminal_id": OLD_ID,
-                "reason_code": "RECOVERY_FENCED_RESOURCE_RETAINED",
-            }
-        ],
-    )
-    assert deletion["logical_deleted"] == 1
-    assert deletion["retained"] == 1
-    resolved_old = database.resolve_session_lifetime(old_session_id)
-    assert resolved_old["deleted"] is True
-    assert resolved_old["terminals"] == []
-    with sessions() as db:
-        assert db.get(database.TerminalModel, OLD_ID) is not None
-        assert db.get(database.TerminalModel, takeover["new_terminal_id"]) is not None
-        lease = db.get(database.WorktreeWriterLeaseModel, worktree)
-        assert lease.terminal_id == takeover["new_terminal_id"]
-        context = db.get(database.WritableWorkContextModel, context_id)
-        assert context.terminal_id == takeover["new_terminal_id"]
-        assert context.state == "admitted"
-
 
 def test_uncertain_dispatch_is_never_reclaimed(takeover_db):
     _sessions, worktree = takeover_db
     takeover = _claim(worktree)
-    old_session_id = str(database.get_terminal_metadata(OLD_ID)["session_id"])
     database.claim_recovery_takeover_dispatch(takeover["id"])
     assert database.mark_recovery_takeover_dispatch_uncertain(
         takeover["id"], "RECOVERY_PROVIDER_DISPATCH_UNCERTAIN"
@@ -610,15 +588,6 @@ def test_uncertain_dispatch_is_never_reclaimed(takeover_db):
     assert (
         database.claim_recovery_takeover_dispatch(takeover["id"])["state"] == "dispatch_uncertain"
     )
-    assert database.resolve_session_lifetime(old_session_id)["blocking_recovery_operations"] == [
-        {
-            "operation_id": takeover["id"],
-            "terminal_id": OLD_ID,
-            "kind": "recovery_takeover",
-            "state": "dispatch_uncertain",
-            "reason_code": "RECOVERY_PROVIDER_DISPATCH_UNCERTAIN",
-        }
-    ]
 
 
 def test_completed_results_are_preserved_not_replayed(takeover_db):

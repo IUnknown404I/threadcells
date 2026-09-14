@@ -16,6 +16,7 @@ from cli_agent_orchestrator.services.housekeeping_service import (
     _open_paths,
     _open_paths_inventory,
     _reconcile_legacy_terminal_authority,
+    _reconcile_provider_executions,
     _reconcile_supervisor_context_roles,
     _reconcile_writer_leases,
     _runtime_open_paths_inventory,
@@ -83,6 +84,21 @@ def test_housekeeping_reuses_canonical_supervisor_role_reconciliation(monkeypatc
 
     assert calls == [True]
     assert summary.supervisor_roles_reconciled == 2
+
+
+def test_housekeeping_reuses_canonical_provider_execution_reconciliation(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.terminal_service."
+        "reconcile_exited_terminal_provider_execution_authorities",
+        lambda *, proc_root: calls.append(proc_root) or 2,
+    )
+    summary = HousekeepingSummary()
+
+    _reconcile_provider_executions(summary, proc_root=tmp_path / "proc")
+
+    assert calls == [tmp_path / "proc"]
+    assert summary.provider_executions_reconciled == 2
 
 
 def test_logs_use_exact_ttl_and_preserve_open_files(tmp_path):

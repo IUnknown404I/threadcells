@@ -59,6 +59,7 @@ describe('Control-plane settings routes', () => {
 
   const fullCleanupPlan = () => ({
     schema_version: 1,
+    operation_id: 'e'.repeat(32),
     plan_id: 'f'.repeat(64),
     generated_at: 100,
     mode: 'full' as const,
@@ -338,8 +339,11 @@ describe('Control-plane settings routes', () => {
     vi.spyOn(api, 'getOperatorSession').mockResolvedValue(operatorStatus(true))
     vi.spyOn(api, 'getOrchestrationCapacity').mockResolvedValue(housekeepingCapacity())
     const planId = 'f'.repeat(64)
+    const operationId = 'd'.repeat(32)
+    vi.spyOn(api, 'getLatestFullCleanupOperation').mockResolvedValue({ status: 'never_run' })
     const preview = vi.spyOn(api, 'getFullCleanupPlan').mockResolvedValue({
       schema_version: 1,
+      operation_id: operationId,
       plan_id: planId,
       generated_at: 100,
       mode: 'full',
@@ -358,7 +362,7 @@ describe('Control-plane settings routes', () => {
       idle_gate: { eligible: true, reason_code: null, blockers: [], ready_agents: 2, exited_agents: 1 },
       release_state: { metadata_certain: true, active_release: '/releases/active', active_release_candidates: ['/releases/active'], protected_non_active_releases: 0, active_only_expected: true, releases_to_delete: 1, rollback_releases_to_delete: 1, rollback_available: true },
     })
-    const run = vi.spyOn(api, 'runFullCleanup').mockResolvedValue({
+    const runResult = {
       ok: true, full_cleanup: true, reclaimable_bytes: 4096, planned_candidates: 2,
       freed_bytes: 4096, disk_before: 8192, disk_after: 12288,
       observed_disk_free_delta: 4096, rollback_available: false,
@@ -369,6 +373,13 @@ describe('Control-plane settings routes', () => {
       protected_resources: [{ canonical_identity: 'backups:/fixture/backups', category: 'backups', bytes: 8192, reason: 'BACKUP_PROTECTED' }],
       execution_skips: [{ candidate: 'release:raced', reason_code: 'CANDIDATE_CHANGED' }],
       execution_failures: [], warnings: [], completed_with_issues: true,
+    }
+    const run = vi.spyOn(api, 'runFullCleanup').mockResolvedValue(runResult)
+    vi.spyOn(api, 'getFullCleanupOperation').mockResolvedValue({
+      operation_id: operationId,
+      plan_id: planId,
+      state: 'completed_with_issues',
+      report: runResult,
     })
 
     render(<ControlPlaneSettings section="housekeeping" navigate={() => {}} />)
@@ -391,11 +402,41 @@ describe('Control-plane settings routes', () => {
     expect(dialog).toHaveTextContent('Ready agents keep the state they need to continue')
     expect(within(dialog).queryByLabelText(/secret|password/i)).not.toBeInTheDocument()
     fireEvent.click(within(dialog).getByRole('button', { name: 'Run permanent Full Cleanup' }))
-    await waitFor(() => expect(run).toHaveBeenCalledWith(planId, true))
+    await waitFor(() => expect(run).toHaveBeenCalledWith(operationId, planId, true))
     expect(await screen.findByText('/releases/active')).toBeInTheDocument()
     expect(screen.getByText('Rollback: none')).toBeInTheDocument()
     expect(screen.getByText(/backups:\/fixture\/backups: BACKUP_PROTECTED · backups · 8.0 KiB/)).toBeInTheDocument()
     expect(screen.getByText(/release:raced: CANDIDATE_CHANGED/)).toBeInTheDocument()
+  })
+
+  it('restores and completes a durable Full Cleanup observation after reload', async () => {
+    vi.spyOn(api, 'getHousekeepingSettings').mockResolvedValue(housekeepingSettings())
+    vi.spyOn(api, 'getHousekeepingReport').mockResolvedValue({ status: 'never_run' })
+    vi.spyOn(api, 'getOperatorSession').mockResolvedValue(operatorStatus(false))
+    vi.spyOn(api, 'getOrchestrationCapacity').mockResolvedValue(housekeepingCapacity())
+    const operationId = 'a'.repeat(32)
+    const report = { ok: true, full_cleanup: true, freed_bytes: 42 }
+    const latest = vi.spyOn(api, 'getLatestFullCleanupOperation')
+      .mockResolvedValueOnce({
+        operation_id: operationId,
+        plan_id: 'b'.repeat(64),
+        state: 'running',
+        progress: { sequence: 3, processed_candidates: 3 },
+      })
+      .mockResolvedValue({
+        operation_id: operationId,
+        plan_id: 'b'.repeat(64),
+        state: 'completed',
+        progress: { sequence: 4, processed_candidates: 4 },
+        report,
+      })
+
+    render(<ControlPlaneSettings section="housekeeping" navigate={() => {}} />)
+
+    expect(await screen.findByText(operationId)).toBeInTheDocument()
+    await waitFor(() => expect(latest).toHaveBeenCalledTimes(2))
+    expect(await screen.findByText('completed')).toBeInTheDocument()
+    expect(screen.getByText('Processed resources: 4')).toBeInTheDocument()
   })
 
   it('shows the authoritative Full Cleanup idle blocker', async () => {
@@ -404,7 +445,7 @@ describe('Control-plane settings routes', () => {
     vi.spyOn(api, 'getOperatorSession').mockResolvedValue(operatorStatus(true))
     vi.spyOn(api, 'getOrchestrationCapacity').mockResolvedValue(housekeepingCapacity())
     vi.spyOn(api, 'getFullCleanupPlan').mockResolvedValue({
-      schema_version: 1, plan_id: 'e'.repeat(64), generated_at: 100, mode: 'full', root: '/fixture', reclaimable_bytes: 100,
+      schema_version: 1, operation_id: 'c'.repeat(32), plan_id: 'e'.repeat(64), generated_at: 100, mode: 'full', root: '/fixture', reclaimable_bytes: 100,
       class_summaries: {}, warnings: [],
       candidates: [{ canonical_identity: 'log:old', category: 'logs', action: 'delete', bytes: 100, estimated_reclaim_bytes: 100, retention_reason: 'full_cleanup_closed_log', protection_reason: null }],
       idle_gate: { eligible: false, reason_code: 'FULL_CLEANUP_NOT_IDLE', blockers: [{ terminal_id: 'agent-working', reason_code: 'AGENT_EXECUTION_NOT_IDLE' }], ready_agents: 0, exited_agents: 0 },

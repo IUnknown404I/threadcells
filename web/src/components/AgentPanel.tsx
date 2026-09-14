@@ -20,6 +20,7 @@ import { RecoveryTakeoverAction } from './RecoveryTakeoverAction'
 import { WorkflowRecoveryNotice } from './WorkflowRecoveryNotice'
 import { useRecoveryTakeoverCapabilities } from '../recoveryCapabilities'
 import { InteractionHistoryDrawer } from './InteractionHistoryDrawer'
+import { SessionDeletionDialog } from './SessionDeletionDialog'
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })))
 
@@ -38,13 +39,6 @@ const UNAVAILABLE_PROVIDER_FALLBACK = FALLBACK_PROVIDERS.map(name => ({
   available: false,
   availability: 'UNKNOWN' as const,
 }))
-
-const AGENT_ACTION_BUTTON = 'inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-white transition-colors focus-visible:outline-none focus-visible:ring-2 disabled:cursor-not-allowed disabled:opacity-40'
-const AGENT_SECONDARY_ACTION = `${AGENT_ACTION_BUTTON} bg-gray-700 hover:bg-gray-600 focus-visible:ring-gray-400`
-const AGENT_TERMINAL_ACTION = `${AGENT_ACTION_BUTTON} bg-emerald-600 hover:bg-emerald-500 focus-visible:ring-emerald-300 disabled:hover:bg-emerald-600`
-const AGENT_RECOVERY_ACTION = `${AGENT_ACTION_BUTTON} bg-indigo-700 hover:bg-indigo-600 focus-visible:ring-indigo-300`
-const AGENT_EXIT_ACTION = `${AGENT_ACTION_BUTTON} bg-amber-600 hover:bg-amber-500 focus-visible:ring-amber-300 disabled:hover:bg-amber-600`
-const AGENT_DELETE_ACTION = `${AGENT_ACTION_BUTTON} bg-red-600 hover:bg-red-500 focus-visible:ring-red-300 disabled:hover:bg-red-600`
 
 const SOURCE_LABELS: Record<string, TranslationKey> = {
   'built-in': 'profiles.source.builtIn',
@@ -244,15 +238,24 @@ export function AgentPanel({
   }
 
   const handleDeleteSession = async () => {
-    if (!pendingDeleteSession || !deletePreflight?.eligible || deletingSessionRef.current) return
+    if (!pendingDeleteSession || !deletePreflight || deletingSessionRef.current) return
+    if (!deletePreflight.eligible && !deletePreflight.can_resolve_and_delete) return
     deletingSessionRef.current = true
     const id = pendingDeleteSession.id
     setDeletingSession(id)
     try {
-      await deleteSession(
+      const deleted = await deleteSession(
         pendingDeleteSession.id,
         deletePreflight.requires_dirty_confirmation,
+        deletePreflight.requires_cancellation_confirmation,
+        deletePreflight.plan_token,
+        deletePreflight.requires_historical_indeterminate_confirmation,
       )
+      if (!deleted) {
+        const refreshed = await api.getSessionDeletionPreflight(pendingDeleteSession.id)
+        setDeletePreflight(refreshed)
+        return
+      }
       if (activeSession === id) setActiveSession(null)
       sessionFeed.reload()
       filteredAgentFeed.reload()
@@ -267,10 +270,6 @@ export function AgentPanel({
   const openDeleteSession = async (session: Session) => {
     try {
       const preflight = await api.getSessionDeletionPreflight(session.id)
-      if (!preflight.eligible && !preflight.blocking_recovery_operations?.length) {
-        showSnackbar({ type: 'error', message: preflight.reason_code || t('store.deleteFailed') })
-        return
-      }
       setDeletePreflight(preflight)
       setPendingDeleteSession(session)
     } catch (reason: any) {
@@ -501,8 +500,8 @@ export function AgentPanel({
     const workspaceUnavailable = terminal.workspace_state === 'retired' || terminal.workspace_state === 'retiring'
     return (
     <div key={terminal.id} data-testid={`agent-detail-card-${terminal.id}`} className="bg-gray-900/50 border border-gray-700/30 rounded-lg p-3 space-y-2">
-      <div className={`flex flex-col justify-between gap-3 ${grid ? '' : 'sm:flex-row sm:items-center'}`}>
-        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-3 gap-y-1">
+      <div className={`flex flex-col justify-between gap-3 ${grid ? '' : 'xl:flex-row xl:items-center'}`}>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 min-w-0">
           <TermIcon size={14} className="text-gray-400" />
           <span className="text-sm font-mono text-gray-300 truncate min-w-0 max-w-full" title={terminal.id}>{terminal.id}</span>
           <StatusBadge status={terminalBadgeStatus(terminal)} />
@@ -510,16 +509,14 @@ export function AgentPanel({
           {terminal.agent_profile && <span className="text-xs text-emerald-400 truncate max-w-full" title={terminal.agent_profile}>{terminal.agent_profile}</span>}
           {sessionName && <span className="text-xs text-gray-600 truncate max-w-full" title={sessionDisplayName(sessionName)}>{t('agents.sessionLabel', { name: sessionDisplayName(sessionName) })}</span>}
         </div>
-        <div data-testid={`agent-actions-${terminal.id}`} className="ml-auto grid w-[16.5rem] max-w-full shrink-0 grid-cols-7 gap-0.5 self-end" role="group" aria-label={t('agents.actions')}>
-          <button type="button" onClick={() => setInteractionTarget({ sessionId: terminal.session_id, sessionName: terminal.session_name, terminalId: terminal.id })} className={AGENT_SECONDARY_ACTION} title={t('interactions.action')} aria-label={t('interactions.action')}><History size={14}/></button>
-          <button type="button" onClick={() => setInboxTerminal({ id: terminal.id, readOnly: workspaceUnavailable })} className={AGENT_SECONDARY_ACTION} title={t('agents.viewInbox')} aria-label={t('agents.inbox')}><Mail size={14}/></button>
-          <button type="button" onClick={() => openTerminal(terminal.id, terminal.provider, terminal.agent_profile)} disabled={workspaceUnavailable} className={AGENT_TERMINAL_ACTION} title={workspaceUnavailable ? t('agents.openComposerUnavailable') : t('agents.openLiveTerminal')} aria-label={t('agents.openTerminal')}><Monitor size={14}/></button>
-          <button type="button" onClick={() => setOutputTerminalId(terminal.id)} className={AGENT_SECONDARY_ACTION} title={t('agents.viewOutput')} aria-label={t('agents.output')}><FileText size={14}/></button>
-          <span className="inline-flex h-9 w-9 items-center justify-center">
-            {!workspaceUnavailable && <RecoveryTakeoverAction agent={terminal} capability={recoveryCapabilities[terminal.id]} onCompleted={() => { setRecoveryRefreshKey(value => value + 1); activeSessionFeed.reload(); filteredAgentFeed.reload(); sessionFeed.reload() }} className={AGENT_RECOVERY_ACTION} iconOnly/>}
-          </span>
-          <button type="button" onClick={() => setPendingExit(toTerminalMeta(terminal))} disabled={exitingTerminal === terminal.id || terminal.lifecycle === 'exited' || terminal.lifecycle === 'recovery_fenced'} className={AGENT_EXIT_ACTION} title={exitingTerminal === terminal.id ? t('agents.exiting') : t('agents.gracefulExitTitle')} aria-label={exitingTerminal === terminal.id ? t('agents.exiting') : t('agents.gracefulExit')}><LogOut size={14}/></button>
-          <button type="button" onClick={() => setPendingClose(toTerminalMeta(terminal))} disabled={closingTerminal === terminal.id || terminal.lifecycle !== 'exited'} className={AGENT_DELETE_ACTION} title={closingTerminal === terminal.id ? t('agents.deleting') : terminal.lifecycle === 'exited' ? t('home.deleteExited') : t('home.exitBeforeDelete')} aria-label={closingTerminal === terminal.id ? t('agents.deleting') : terminal.lifecycle === 'exited' ? t('home.deleteExited') : t('home.exitBeforeDelete')}><Trash2 size={14}/></button>
+        <div role="group" aria-label={t('agents.actions')} data-testid={`agent-actions-${terminal.id}`} className="ml-auto grid h-11 w-full max-w-[20.75rem] shrink-0 grid-cols-7 gap-1 self-end lg:w-[27.5rem] lg:max-w-none lg:grid-cols-[repeat(3,minmax(0,5rem))_repeat(4,2.75rem)]">
+          <button type="button" aria-label={t('interactions.action')} onClick={() => setInteractionTarget({ sessionId: terminal.session_id, sessionName: terminal.session_name, terminalId: terminal.id })} className="flex h-11 min-w-0 items-center justify-center gap-2 rounded-lg bg-gray-700 px-0 text-xs font-medium text-white transition-colors hover:bg-gray-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-300 lg:px-2" title={t('interactions.action')}><History size={14} className="shrink-0"/><span className="hidden truncate lg:inline">{t('interactions.history')}</span></button>
+          <button type="button" aria-label={t('agents.viewInbox')} onClick={() => setInboxTerminal({ id: terminal.id, readOnly: workspaceUnavailable })} className="flex h-11 min-w-0 items-center justify-center gap-2 rounded-lg bg-gray-700 px-0 text-xs font-medium text-white transition-colors hover:bg-gray-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-300 lg:px-2" title={t('agents.viewInbox')}><Mail size={14} className="shrink-0"/><span className="hidden truncate lg:inline">{t('agents.inbox')}</span></button>
+          <button type="button" aria-label={t('agents.viewOutput')} onClick={() => setOutputTerminalId(terminal.id)} className="flex h-11 min-w-0 items-center justify-center gap-2 rounded-lg bg-gray-700 px-0 text-xs font-medium text-white transition-colors hover:bg-gray-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-gray-300 lg:px-2" title={t('agents.viewOutput')}><FileText size={14} className="shrink-0"/><span className="hidden truncate lg:inline">{t('agents.output')}</span></button>
+          <button type="button" aria-label={workspaceUnavailable ? t('agents.openComposerUnavailable') : t('agents.openLiveTerminal')} onClick={() => openTerminal(terminal.id, terminal.provider, terminal.agent_profile)} disabled={workspaceUnavailable} className="flex h-11 min-w-0 items-center justify-center rounded-lg bg-emerald-600 text-white transition-colors hover:bg-emerald-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-300 disabled:cursor-not-allowed disabled:bg-gray-800 disabled:text-gray-500 disabled:opacity-60" title={workspaceUnavailable ? t('agents.openComposerUnavailable') : t('agents.openLiveTerminal')}><Monitor size={14}/></button>
+          <div className="h-11 min-w-0">{!workspaceUnavailable && <RecoveryTakeoverAction agent={terminal} capability={recoveryCapabilities[terminal.id]} onCompleted={() => { setRecoveryRefreshKey(value => value + 1); activeSessionFeed.reload(); filteredAgentFeed.reload(); sessionFeed.reload() }} iconOnly className="flex h-11 w-full items-center justify-center rounded-lg bg-indigo-700 text-white transition-colors hover:bg-indigo-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-300"/>}</div>
+          <button type="button" aria-label={exitingTerminal === terminal.id ? t('agents.exiting') : t('agents.gracefulExitTitle')} onClick={() => setPendingExit(toTerminalMeta(terminal))} disabled={exitingTerminal === terminal.id || terminal.lifecycle === 'exited' || terminal.lifecycle === 'recovery_fenced'} className="flex h-11 min-w-0 items-center justify-center rounded-lg bg-amber-600 text-white transition-colors hover:bg-amber-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 disabled:cursor-not-allowed disabled:bg-gray-800 disabled:text-gray-500 disabled:opacity-60" title={t('agents.gracefulExitTitle')}><LogOut size={14}/></button>
+          <button type="button" aria-label={closingTerminal === terminal.id ? t('agents.deleting') : t('agents.deleteTerminal')} onClick={() => setPendingClose(toTerminalMeta(terminal))} disabled={closingTerminal === terminal.id || terminal.lifecycle !== 'exited'} className="flex h-11 min-w-0 items-center justify-center rounded-lg bg-red-600 text-white transition-colors hover:bg-red-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300 disabled:cursor-not-allowed disabled:bg-gray-800 disabled:text-gray-500 disabled:opacity-60" title={terminal.lifecycle === 'exited' ? t('home.deleteExited') : t('home.exitBeforeDelete')}><Trash2 size={14}/></button>
         </div>
       </div>
       <ProviderOutcomeNotice code={terminal.provider_outcome_code} />
@@ -697,14 +694,14 @@ export function AgentPanel({
                           toggleSession()
                         }
                       }}
-                      className="flex min-w-0 w-full cursor-pointer items-center gap-2 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 sm:gap-3"
+                      className="flex min-w-0 w-full cursor-pointer flex-wrap items-center gap-2 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 sm:gap-3"
                     >
                       <Bot size={16} className="shrink-0 text-emerald-400" />
-                      <span className="min-w-0 flex-1 truncate font-mono text-sm text-gray-200" title={displayName}>{displayName}</span>
+                      <span className="min-w-0 flex-1 basis-[calc(100%-2rem)] truncate font-mono text-sm text-gray-200 sm:basis-auto" title={displayName}>{displayName}</span>
                       <span data-testid={`agent-session-count-${s.id}`} className="shrink-0 text-xs text-gray-500">
                         {t('agents.count', { count: s.agent_count })}
                       </span>
-                      {Boolean(s.current_queue_count) && <span data-testid={`agent-session-queue-count-${s.id}`} className="shrink-0 text-[11px] font-medium text-sky-300">{t('interactions.queueCount', { count: s.current_queue_count || 0 })}</span>}
+                      {Boolean(s.current_queue_count) && <span data-testid={`agent-session-queue-count-${s.id}`} className="max-w-full break-words text-[11px] font-medium text-sky-300">{t('interactions.queueCount', { count: s.current_queue_count || 0 })}</span>}
                       <span className={`shrink-0 rounded-full px-2 py-0.5 text-xs ${s.status === 'active' ? 'bg-emerald-900/50 text-emerald-400' : 'bg-gray-700 text-gray-400'}`}>
                         {t(sessionStatusTranslationKey(s.status))}
                       </span>
@@ -724,7 +721,6 @@ export function AgentPanel({
                         onClick={event => { event.stopPropagation(); void openDeleteSession(s) }}
                         className="min-w-11 min-h-11 inline-flex items-center justify-center text-gray-500 hover:text-red-400 transition-colors rounded-lg hover:bg-gray-800"
                         title={t('agents.deleteSession')}
-                        aria-label={t('agents.deleteSession')}
                       >
                         <Trash2 size={14} />
                       </button>
@@ -855,33 +851,17 @@ export function AgentPanel({
         onCancel={() => setPendingClose(null)}
       />
 
-      <ConfirmModal
+      <SessionDeletionDialog
         open={!!pendingDeleteSession}
-        title={t('agents.deleteSessionTitle')}
-        message={t(deletePreflight?.blocking_recovery_operations?.length ? 'agents.deleteSessionRecoveryBlocked' : deletePreflight?.requires_dirty_confirmation ? 'agents.deleteSessionDirty' : 'agents.deleteSessionMessage')}
-        details={pendingDeleteSession ? [
-          { label: t('statistics.session'), value: sessionDisplayName(pendingDeleteSession.name) },
-          { label: t('agents.status'), value: t(sessionStatusTranslationKey(pendingDeleteSession.status)) },
-          ...(deletePreflight?.blocking_recovery_operations?.length ? [
-            { label: t('agents.recoveryOperations'), value: String(deletePreflight.blocking_recovery_operations.length) },
-            { label: t('agents.recoveryStates'), value: Array.from(new Set(deletePreflight.blocking_recovery_operations.map(operation => operation.reason_code ? `${operation.state} (${operation.reason_code})` : operation.state))).join(', ') },
-            { label: t('agents.recoveryTerminals'), value: Array.from(new Set(deletePreflight.blocking_recovery_operations.map(operation => operation.terminal_id))).join(', ') },
-            { label: t('agents.recoveryOperationIds'), value: deletePreflight.blocking_recovery_operations.map(operation => operation.operation_id).join(', ') },
-          ] : []),
-          ...(deletePreflight?.requires_dirty_confirmation ? [
-            { label: t('agents.modifiedFiles'), value: String(deletePreflight.modified_files) },
-            { label: t('agents.untrackedFiles'), value: String(deletePreflight.untracked_files) },
-          ] : []),
-        ] : []}
-        confirmLabel={t('agents.deleteSessionTitle')}
-        variant="danger"
+        sessionName={pendingDeleteSession ? sessionDisplayName(pendingDeleteSession.name) : ''}
+        statusLabel={pendingDeleteSession ? t(sessionStatusTranslationKey(pendingDeleteSession.status)) : ''}
+        preflight={deletePreflight}
         loading={!!deletingSession}
-        confirmDisabled={Boolean(deletePreflight?.blocking_recovery_operations?.length)}
         onConfirm={handleDeleteSession}
         onCancel={() => { setPendingDeleteSession(null); setDeletePreflight(null) }}
       />
 
-      {/* Graceful Exit Confirmation Modal */}
+      {/* Finish confirmation modal */}
       <ConfirmModal
         open={!!pendingExit}
         title={t('agents.gracefulExit')}

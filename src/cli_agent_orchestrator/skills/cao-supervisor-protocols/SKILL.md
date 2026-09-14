@@ -96,11 +96,14 @@ Use `handoff` when the next step is blocked on the worker result. The orchestrat
 ### Resumable Handoff Waits
 
 A handoff wait is a bounded slice, not evidence that its worker stopped. If it
-returns `state: waiting`, retain the returned `terminal_id` and later call
-`await_handoff(terminal_id, timeout)` for that same child. Do not create a
-replacement worker or resend the task. Only `state: completed` is a successful
-handoff: CAO validates stable, non-progress final output before it sends `/exit`.
-An `exited` provider lifecycle is terminal even if the tmux shell remains.
+returns `state: waiting`, retain both the returned `terminal_id` and
+`next_wait_slice_id`. Later call
+`await_handoff(terminal_id, timeout, wait_slice_id=next_wait_slice_id)` for that
+same child. Replaying the old slice only reports its already-recorded outcome;
+it does not wait again. Do not create a replacement worker or resend the task.
+Only `state: completed` is a successful handoff: CAO validates stable,
+non-progress final output before it sends `/exit`. An `exited` provider
+lifecycle is terminal even if the tmux shell remains.
 
 ### Handoff result safe boundary
 

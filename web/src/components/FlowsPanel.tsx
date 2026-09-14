@@ -8,6 +8,7 @@ import { ProfilePicker } from './ProfilePicker'
 import { ProjectPicker } from './ProjectPicker'
 import { providerSelectOption } from '../providerAvailability'
 import { useI18n, type TranslationKey } from '../i18n'
+import { formatAbsoluteTimestamp, useTimeZone } from '../timeZone'
 
 const SCHEDULE_PRESETS = [
   { labelKey: 'flows.every5' as TranslationKey, cron: '*/5 * * * *' },
@@ -29,6 +30,7 @@ function cronToLabel(cron: string, t: (key: TranslationKey) => string): string {
 
 export function FlowsPanel() {
   const { locale, t } = useI18n()
+  const { timeZone } = useTimeZone()
   const { showSnackbar } = useStore()
 
   // Flow list state
@@ -343,8 +345,8 @@ export function FlowsPanel() {
                       <div>{t('common.profile')}: <span className="text-gray-300">{f.agent_profile}</span></div>
                       {f.project_name && <div>{t('common.project')}: <span className="text-gray-300">{f.project_name}</span></div>}
                       {f.project_path && <div className="break-all sm:col-span-2">{t('flows.projectPath')} <span className="text-gray-300 font-mono">{f.project_path}</span></div>}
-                      <div>{t('flows.lastRun')} <span className="text-gray-300">{f.last_run ? new Date(f.last_run).toLocaleString(locale) : t('flows.never')}</span></div>
-                      <div>{t('flows.nextRun')} <span className="text-gray-300">{f.next_run ? new Date(f.next_run).toLocaleString(locale) : t('flows.notApplicable')}</span></div>
+                      <div>{t('flows.lastRun')} <span className="text-gray-300">{f.last_run ? formatAbsoluteTimestamp(f.last_run, locale, timeZone) : t('flows.never')}</span></div>
+                      <div>{t('flows.nextRun')} <span className="text-gray-300">{f.next_run ? formatAbsoluteTimestamp(f.next_run, locale, timeZone) : t('flows.notApplicable')}</span></div>
                       {f.file_path && (
                         <div className="break-all sm:col-span-2">{t('flows.file')} <span className="text-gray-300 font-mono">{f.file_path}</span></div>
                       )}

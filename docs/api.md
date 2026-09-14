@@ -49,6 +49,9 @@ Built-ins are immutable. `duplicate_builtin` creates a custom ID rather than sha
 - `PUT /api/v1/housekeeping` validates and persists an audited configuration (operator-authenticated).
 - `GET /api/v1/housekeeping/plan?mode=frequent` returns an immutable dry-run plan.
 - `POST /api/v1/housekeeping/run` requires the inspected dry-run `expected_plan_id`, rebuilds the plan under the housekeeping lock, and fails closed if the candidate set changed before execution (operator-authenticated).
+- `GET /api/v1/housekeeping/full-cleanup/plan` returns the protected Full Cleanup preview plus a server-generated operation ID.
+- `POST /api/v1/housekeeping/full-cleanup/run` admits that exact operation/plan once; its progress and terminal report remain durable after browser or service disconnects (operator-authenticated).
+- `GET /api/v1/housekeeping/full-cleanup/operations/latest` and `GET /api/v1/housekeeping/full-cleanup/operations/{operation_id}` return bounded, non-secret operation state for reconnecting clients.
 - `GET /api/v1/telegram` returns installation-global enabled/destination and safe token/configuration states, never the bot token.
 - `PUT /api/v1/telegram` replaces non-secret settings and optionally the write-only bot token (operator-authenticated).
 - `POST /api/v1/telegram/check` validates the configured bot credential without sending a message (operator-authenticated).

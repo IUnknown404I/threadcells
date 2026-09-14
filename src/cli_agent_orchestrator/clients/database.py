@@ -1,5 +1,6 @@
 """Minimal database client with only terminal metadata."""
 
+import base64
 import hashlib
 import hmac
 import json
@@ -25,7 +26,9 @@ from sqlalchemy import (
     UniqueConstraint,
     and_,
     create_engine,
+    exists,
     func,
+    insert,
     inspect,
     or_,
     text,
@@ -56,6 +59,15 @@ Base: Any = declarative_base()
 
 class AmbiguousSessionIdentity(RuntimeError):
     """A reusable session name identifies more than one durable lifetime."""
+
+
+class SessionLifetimeAuthorityError(RuntimeError):
+    """An undeleted Session exists, but its durable lifetime proof is unusable."""
+
+    def __init__(self, reason_code: str, identifier: str):
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+        self.identifier = identifier
 
 
 class AmbiguousTerminalIdentity(RuntimeError):
@@ -132,6 +144,12 @@ class TerminalModel(Base):
     # replace it from provider-global state.
     provider_resume_identity = Column(String, nullable=True)
     provider_resume_runtime_generation = Column(String, nullable=True)
+    # Compatibility identity of the code/config that launched the resident
+    # provider process. Unlike ``runtime_generation`` (the physical pane
+    # epoch), this changes when a promoted ThreadCells runtime changes the
+    # Codex hook or MCP protocol. NULL is deliberately legacy/unknown and
+    # therefore requires a provider reconnect before compact continuation.
+    provider_runtime_compatibility_generation = Column(String, nullable=True)
     # Bounded provider-native response cache. It is readable only through an
     # exact provider/session binding and cannot be replaced by terminal-tail
     # inference from a newer in-progress turn.
@@ -164,14 +182,119 @@ class TerminalModel(Base):
 
 
 class SessionDeletionReceiptModel(Base):
-    """Durable idempotency receipt for one retired session lifetime."""
+    """Minimal durable tombstone for one permanently deleted Session."""
 
     __tablename__ = "session_deletion_receipts"
 
     session_id = Column(String, primary_key=True)
     session_name = Column(String, nullable=False, index=True)
     retained_resources_json = Column(Text, nullable=False, default="[]", server_default="[]")
+    deletion_reason = Column(
+        String,
+        nullable=False,
+        default="operator_session_delete",
+        server_default="operator_session_delete",
+    )
+    authority_fingerprint = Column(String, nullable=True)
+    # The final Session tombstone owns only the bounded identities needed to
+    # reject stale terminal callbacks. Transitional per-terminal receipts and
+    # their workspace/history metadata are purged with the Session graph.
+    terminal_fences_json = Column(Text, nullable=False, default="[]", server_default="[]")
+    # Machine-readable proof of whether this Session's physical workspace was
+    # retired or deliberately preserved because another durable authority had
+    # acquired the same path/ref.  The latter must survive operation-row purge.
+    workspace_disposition = Column(
+        String, nullable=False, default="retired", server_default="retired"
+    )
+    workspace_evidence_json = Column(Text, nullable=False, default="[]", server_default="[]")
+    receipt_version = Column(Integer, nullable=False, default=2, server_default=text("2"))
     deleted_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class SessionDeletedTerminalFenceModel(Base):
+    """Indexed terminal identity owned by one final Session tombstone.
+
+    This is deliberately a minimal lookup relation, not retained Session
+    history.  The parent Session deletion receipt remains the tombstone; this
+    row makes its permanent terminal fences authoritative without scanning
+    JSON payloads on every authority-creation path.
+    """
+
+    __tablename__ = "session_deleted_terminal_fences"
+
+    terminal_id = Column(String, primary_key=True)
+    session_id = Column(String, nullable=False, index=True)
+    auth_token_sha256 = Column(String, nullable=True, index=True)
+    deleted_at = Column(DateTime, nullable=False)
+
+
+class SessionDeletionOperationModel(Base):
+    """Transient crash-resumable fence while hard deletion crosses filesystem I/O."""
+
+    __tablename__ = "session_deletion_operations"
+
+    session_id = Column(String, primary_key=True)
+    session_name = Column(String, nullable=False, unique=True, index=True)
+    state = Column(String, nullable=False, default="fenced", index=True)
+    terminal_ids_json = Column(Text, nullable=False)
+    allow_dirty_workspace = Column(Boolean, nullable=False, default=False, server_default=text("0"))
+    authority_fingerprint = Column(String, nullable=False)
+    # Exact current (not launch-time) Git/worktree authority captured before
+    # the first destructive cleanup boundary. Legacy in-progress operations
+    # bind this once on their first safe retry.
+    workspace_authority_json = Column(Text, nullable=True)
+    workspace_authority_sha256 = Column(String, nullable=True)
+    workspace_disposition = Column(String, nullable=True)
+    workspace_evidence_json = Column(Text, nullable=True)
+    workspace_evidence_sha256 = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class FullCleanupOperationModel(Base):
+    """One operator-admitted Full Cleanup crossing HTTP and helper lifetimes."""
+
+    __tablename__ = "full_cleanup_operations"
+
+    operation_id = Column(String, primary_key=True)
+    plan_id = Column(String, nullable=False, index=True)
+    retire_dirty_worktrees = Column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    actor_kind = Column(String, nullable=False)
+    state = Column(String, nullable=False, default="admitted", index=True)
+    # Exactly one admitted/running operation may own the destructive boundary.
+    # NULL terminal rows do not conflict under SQLite UNIQUE semantics.
+    active_key = Column(Integer, nullable=True, unique=True)
+    operation_token_sha256 = Column(String, nullable=True)
+    token_consumed_at = Column(DateTime, nullable=True)
+    helper_pid = Column(Integer, nullable=True)
+    helper_process_start_ticks = Column(Integer, nullable=True)
+    progress_json = Column(Text, nullable=False, default="{}", server_default="{}")
+    report_json = Column(Text, nullable=True)
+    reason_code = Column(String, nullable=True)
+    diagnostic_id = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    started_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now)
+    completed_at = Column(DateTime, nullable=True)
+
+
+class SessionDeletionCancellationAuditModel(Base):
+    """Append-only evidence for work resolved by an operator Session deletion."""
+
+    __tablename__ = "session_deletion_cancellation_audit"
+    __table_args__ = (UniqueConstraint("event_key", name="uq_session_delete_cancel_event"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    event_key = Column(String, nullable=False)
+    session_id = Column(String, nullable=False, index=True)
+    item_kind = Column(String, nullable=False)
+    item_id = Column(String, nullable=False)
+    previous_state = Column(String, nullable=False)
+    final_state = Column(String, nullable=False)
+    reason_code = Column(String, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
 class TerminalDeletionReceiptModel(Base):
@@ -183,6 +306,25 @@ class TerminalDeletionReceiptModel(Base):
     session_id = Column(String, nullable=True, index=True)
     session_name = Column(String, nullable=False, index=True)
     window_name = Column(String, nullable=False)
+    # Digest-only terminal capability retained solely to turn a late callback
+    # into an explicit SESSION_DELETED rejection.  The bearer secret itself is
+    # never persisted here.
+    auth_token_sha256 = Column(String, nullable=True, index=True)
+    # Version 1 proves that this receipt was written (or explicitly upgraded)
+    # while an exact current Terminal still bound the stable Session lifetime.
+    # Schema presence alone never upgrades legacy receipt authority.
+    session_lifetime_authority_version = Column(Integer, nullable=True)
+    # Individually retired terminals may have already removed their physical
+    # worktree while deliberately preserving the private task branch. Retain
+    # the exact, bounded cleanup authority until the owning Session is hard
+    # deleted; the final purge clears these transitional fields.
+    workspace_cleanup_authority_version = Column(Integer, nullable=True)
+    managed_worktree_kind = Column(String, nullable=True)
+    managed_worktree_source = Column(String, nullable=True)
+    managed_worktree_path = Column(String, nullable=True)
+    managed_worktree_branch = Column(String, nullable=True)
+    managed_worktree_branch_object_id = Column(String, nullable=True)
+    managed_worktree_identity = Column(String, nullable=True)
     deleted_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
@@ -667,6 +809,60 @@ class ChildAssignmentModel(Base):
     updated_at = Column(DateTime, default=datetime.now)
 
 
+class ManagedAttemptLifecycleModel(Base):
+    """Truthful delivery/admission and fencing state for one child attempt."""
+
+    __tablename__ = "managed_attempt_lifecycle"
+
+    assignment_id = Column(Integer, primary_key=True)
+    attempt_id = Column(String, nullable=False, unique=True, index=True)
+    parent_terminal_id = Column(String, nullable=False, index=True)
+    child_terminal_id = Column(String, nullable=False, index=True)
+    request_workflow_effect_id = Column(Integer, nullable=True, unique=True)
+    child_workflow_id = Column(Integer, nullable=True, unique=True)
+    child_workflow_turn_id = Column(Integer, nullable=True, unique=True)
+    state = Column(String, nullable=False, default="assignment_created", index=True)
+    reason_code = Column(String, nullable=True)
+    delivery_attempt_count = Column(Integer, nullable=False, default=0)
+    recovery_attempt_count = Column(Integer, nullable=False, default=0)
+    prompt_delivery_scheduled_at = Column(DateTime, nullable=True)
+    prompt_delivery_acknowledged_at = Column(DateTime, nullable=True)
+    provider_admitted_at = Column(DateTime, nullable=True)
+    provider_running_at = Column(DateTime, nullable=True)
+    waiting_result_at = Column(DateTime, nullable=True)
+    recovery_scheduled_at = Column(DateTime, nullable=True)
+    recovery_next_retry_at = Column(DateTime, nullable=True)
+    recovery_deadline_at = Column(DateTime, nullable=True)
+    fence_claim_token = Column(String, nullable=True, unique=True)
+    fence_claimed_at = Column(DateTime, nullable=True)
+    fenced_at = Column(DateTime, nullable=True)
+    failed_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    expected_runtime_generation = Column(String, nullable=True)
+    expected_writer_authority_generation = Column(String, nullable=True)
+    parent_wake_message_id = Column(Integer, nullable=True, unique=True)
+    replacement_assignment_id = Column(Integer, nullable=True, unique=True)
+    replacement_effect_id = Column(Integer, nullable=True, unique=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class ManagedAttemptLifecycleEventModel(Base):
+    """Append-only machine-readable evidence for managed-attempt transitions."""
+
+    __tablename__ = "managed_attempt_lifecycle_events"
+    __table_args__ = (UniqueConstraint("event_key", name="uq_managed_attempt_event_key"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    assignment_id = Column(Integer, nullable=False, index=True)
+    event_key = Column(String, nullable=False)
+    event_type = Column(String, nullable=False)
+    state = Column(String, nullable=False)
+    reason_code = Column(String, nullable=True)
+    detail_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
 class DelegationResultModel(Base):
     """One immutable semantic result for one durable child assignment."""
 
@@ -866,7 +1062,7 @@ class WorkflowModel(Base):
     # A deliberate owner input may reopen a prior owner gate.  Retain that
     # provenance so the resident recovery turn can be distinguished from
     # autonomous continuation when disk pressure is RED.
-    resumed_from_owner_gate_workflow_id = Column(Integer, nullable=True)
+    resumed_from_owner_gate_workflow_id = Column(Integer, nullable=True, index=True)
     terminal_reason = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.now)
     updated_at = Column(DateTime, default=datetime.now)
@@ -990,6 +1186,17 @@ class WorkflowProviderReconnectAttemptModel(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
+class ProviderRuntimeCompatibilityScanModel(Base):
+    """Singleton cursor for bounded, restart-safe rolling-upgrade sweeps."""
+
+    __tablename__ = "provider_runtime_compatibility_scan"
+
+    id = Column(Integer, primary_key=True)
+    active_runtime_generation = Column(String, nullable=False)
+    after_terminal_id = Column(String, nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
 class WorkflowTurnReceiptModel(Base):
     """One irreversible receiver-side admission for a stable logical turn.
 
@@ -1011,8 +1218,11 @@ class WorkflowTurnReceiptModel(Base):
     receiver_terminal_id = Column(String, nullable=False)
     # Only the model execution that received this opaque capability may
     # transfer an interrupted turn to a fresh admitted continuation. Store
-    # only its digest and consume it exactly once.
+    # only its digest. Managed runtimes additionally retain a random nonce;
+    # the raw capability can then be re-derived only with that terminal's
+    # separately protected bearer after a proven Codex compaction boundary.
     resume_token_sha256 = Column(String, nullable=True)
+    resume_token_nonce = Column(String, nullable=True)
     resumed_by_turn_id = Column(Integer, nullable=True)
     resumed_at = Column(DateTime, nullable=True)
     consumed_at = Column(DateTime, nullable=False, default=datetime.now)
@@ -1029,6 +1239,8 @@ class WorkflowEffectModel(Base):
     ``indeterminate`` rather than replayed blindly. ``not_admitted`` is
     different: it records a proven pre-effect rejection and is the only state
     that may be claimed again after the transient admission condition changes.
+    Bounded observation operations may also seal a known retryable result such
+    as ``wait_timeout`` without changing the observed child lifecycle.
     """
 
     __tablename__ = "workflow_effects"
@@ -1049,7 +1261,50 @@ class WorkflowEffectModel(Base):
     effect_key = Column(String, nullable=False)
     state = Column(String, nullable=False, default="claimed")
     claim_token = Column(String, nullable=False)
+    # Recovery copies are durable replay fences, not new product operations.
+    # New copies point at the first physical effect; legacy repair may point
+    # at a proven predecessor in the same recovery lineage. Any non-null link
+    # lets History collapse only proven mirrors while preserving independently
+    # admitted same-key effects from other logical turns.
+    mirrored_from_effect_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.now)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class WorkflowEffectResolutionModel(Base):
+    """Append-only semantic resolution for an uncertain privileged transport.
+
+    ``workflow_effects.state`` remains the transport observation made by the
+    process that owned the non-transactional boundary.  Later durable facts
+    may prove the logical operation's outcome without proving that process's
+    response path.  This one-row ledger records that exact evidence while
+    preserving the original claimed/indeterminate history.
+    """
+
+    __tablename__ = "workflow_effect_resolutions"
+    __table_args__ = (UniqueConstraint("workflow_effect_id", name="uq_workflow_effect_resolution"),)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    workflow_effect_id = Column(Integer, nullable=False, index=True)
+    outcome = Column(String, nullable=False)
+    reason_code = Column(String, nullable=False)
+    evidence_effect_id = Column(Integer, nullable=True)
+    evidence_workflow_turn_id = Column(Integer, nullable=True)
+    evidence_assignment_id = Column(Integer, nullable=True)
+    evidence_result_id = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class WorkflowEffectReconciliationCursorModel(Base):
+    """Persistent fair-scan position for unresolved privileged effects."""
+
+    __tablename__ = "workflow_effect_reconciliation_cursor"
+
+    id = Column(Integer, primary_key=True)
+    last_workflow_effect_id = Column(Integer, nullable=False, default=0)
+    last_fence_effect_id = Column(Integer, nullable=False, default=0)
+    fence_probe_effect_id = Column(Integer, nullable=True)
+    last_fence_assignment_id = Column(Integer, nullable=False, default=0)
     updated_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
@@ -1059,6 +1314,8 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 _child_assignment_schema_lock = threading.Lock()
 _child_assignment_schema_ready = False
+_managed_attempt_lifecycle_schema_lock = threading.Lock()
+_managed_attempt_lifecycle_schema_ready = False
 _delegation_result_schema_lock = threading.Lock()
 _delegation_result_schema_ready = False
 _terminal_authority_schema_lock = threading.Lock()
@@ -1078,10 +1335,25 @@ _terminal_ui_projection_schema_lock = threading.Lock()
 _terminal_ui_projection_schema_ready = False
 _terminal_ui_projection_schema_engine_identity: Optional[int] = None
 _session_deletion_receipt_schema_lock = threading.Lock()
+_session_deletion_receipt_schema_ready = False
+_session_deletion_receipt_schema_engine_identity: Optional[int] = None
+_terminal_deletion_receipt_schema_lock = threading.Lock()
+_terminal_deletion_receipt_schema_ready = False
+_terminal_deletion_receipt_schema_engine_identity: Optional[int] = None
 
 CONTROL_PLANE_SCHEMA_VERSION = 1
 # Durable compatibility identifier: deployed databases already use this key.
 CONTROL_PLANE_MIGRATION_RECEIPT = "threadmesh-control-plane-schema-v1"
+WORKFLOW_EFFECT_LINEAGE_SCHEMA_VERSION = 1
+WORKFLOW_EFFECT_LINEAGE_MIGRATION_RECEIPT = "workflow-effect-mirror-lineage-v1"
+WORKFLOW_EFFECT_LINEAGE_BACKFILL_BATCH_SIZE = 500
+STALE_PROVIDER_RUNTIME_RECONNECT_BATCH_SIZE = 100
+SESSION_LIFETIME_RECEIPT_SCHEMA_VERSION = 1
+SESSION_LIFETIME_RECEIPT_MIGRATION = "terminal-deletion-session-lifetime-authority-v1"
+SESSION_LIFETIME_RECEIPT_BACKFILL_BATCH_SIZE = 500
+SESSION_DELETED_TERMINAL_FENCE_SCHEMA_VERSION = 1
+SESSION_DELETED_TERMINAL_FENCE_MIGRATION = "session-deleted-terminal-fence-index-v1"
+SESSION_DELETED_TERMINAL_FENCE_BACKFILL_BATCH_SIZE = 100
 
 
 def init_db() -> None:
@@ -1089,12 +1361,15 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     _migrate_add_allowed_tools()
     _ensure_terminal_worktree_authority_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     _ensure_provider_execution_schema()
     # Backfills below load the complete ChildAssignment ORM row.  SQLite's
     # create_all does not add columns to an existing table, so finish and
     # verify every additive assignment migration before any such query.
     _ensure_child_assignment_schema()
     _ensure_delegation_result_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     _ensure_project_schema()
     _ensure_runtime_branding_schema()
     _ensure_usage_schema()
@@ -1104,6 +1379,343 @@ def init_db() -> None:
     from cli_agent_orchestrator.services.operations_service import _load_legacy_operations_config
 
     ensure_capacity_settings(_load_legacy_operations_config())
+
+
+_FULL_CLEANUP_OPERATION_ID = re.compile(r"[0-9a-f]{32}")
+_FULL_CLEANUP_PLAN_ID = re.compile(r"[0-9a-f]{64}")
+_FULL_CLEANUP_REASON = re.compile(r"[A-Z0-9_]{3,96}")
+_FULL_CLEANUP_REPORT_LIMIT = 8 * 1024 * 1024
+_FULL_CLEANUP_PROGRESS_LIMIT = 64 * 1024
+
+
+def _full_cleanup_json(value: Mapping[str, Any], *, limit: int) -> str:
+    encoded = json.dumps(dict(value), sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > limit:
+        raise ValueError("full cleanup operation document is too large")
+    return encoded
+
+
+def _full_cleanup_operation_dict(operation: FullCleanupOperationModel) -> Dict[str, Any]:
+    try:
+        progress = json.loads(str(operation.progress_json))
+        report = json.loads(operation.report_json) if operation.report_json is not None else None
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("FULL_CLEANUP_OPERATION_CORRUPT") from exc
+    if not isinstance(progress, dict) or (report is not None and not isinstance(report, dict)):
+        raise RuntimeError("FULL_CLEANUP_OPERATION_CORRUPT")
+    return {
+        "operation_id": str(operation.operation_id),
+        "plan_id": str(operation.plan_id),
+        "retire_dirty_worktrees": bool(operation.retire_dirty_worktrees),
+        "actor_kind": str(operation.actor_kind),
+        "state": str(operation.state),
+        "helper_pid": operation.helper_pid,
+        "helper_process_start_ticks": operation.helper_process_start_ticks,
+        "progress": progress,
+        "report": report,
+        "reason_code": operation.reason_code,
+        "diagnostic_id": operation.diagnostic_id,
+        "created_at": operation.created_at,
+        "started_at": operation.started_at,
+        "updated_at": operation.updated_at,
+        "completed_at": operation.completed_at,
+    }
+
+
+def get_full_cleanup_operation(operation_id: str) -> Optional[Dict[str, Any]]:
+    """Return one non-secret operation projection without consuming authority."""
+    if not isinstance(operation_id, str) or not _FULL_CLEANUP_OPERATION_ID.fullmatch(operation_id):
+        return None
+    with SessionLocal() as db:
+        operation = db.get(FullCleanupOperationModel, operation_id)
+        return _full_cleanup_operation_dict(operation) if operation is not None else None
+
+
+def get_latest_full_cleanup_operation() -> Optional[Dict[str, Any]]:
+    """Return the newest durable Full Cleanup observation."""
+    with SessionLocal() as db:
+        operation = (
+            db.query(FullCleanupOperationModel)
+            .order_by(
+                FullCleanupOperationModel.created_at.desc(),
+                FullCleanupOperationModel.operation_id.desc(),
+            )
+            .first()
+        )
+        return _full_cleanup_operation_dict(operation) if operation is not None else None
+
+
+def list_active_full_cleanup_operations() -> List[Dict[str, Any]]:
+    """Return the bounded singleton destructive authority, if present."""
+    with SessionLocal() as db:
+        operations = (
+            db.query(FullCleanupOperationModel)
+            .filter(FullCleanupOperationModel.active_key == 1)
+            .limit(2)
+            .all()
+        )
+        if len(operations) > 1:
+            raise RuntimeError("FULL_CLEANUP_OPERATION_AUTHORITY_AMBIGUOUS")
+        return [_full_cleanup_operation_dict(operation) for operation in operations]
+
+
+def admit_full_cleanup_operation(
+    operation_id: str,
+    plan_id: str,
+    *,
+    retire_dirty_worktrees: bool,
+    actor_kind: str,
+    operation_token: str,
+) -> Dict[str, Any]:
+    """Atomically bind one authenticated request before the helper can mutate."""
+    if (
+        not isinstance(operation_id, str)
+        or not _FULL_CLEANUP_OPERATION_ID.fullmatch(operation_id)
+        or not isinstance(plan_id, str)
+        or not _FULL_CLEANUP_PLAN_ID.fullmatch(plan_id)
+        or type(retire_dirty_worktrees) is not bool
+        or actor_kind not in {"operator_session", "operator_bearer"}
+        or not isinstance(operation_token, str)
+        or not 32 <= len(operation_token) <= 128
+    ):
+        raise ValueError("invalid Full Cleanup operation authority")
+    digest = hashlib.sha256(operation_token.encode("utf-8")).hexdigest()
+    now = datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        existing = db.get(FullCleanupOperationModel, operation_id)
+        if existing is not None:
+            if (
+                str(existing.plan_id) != plan_id
+                or bool(existing.retire_dirty_worktrees) != retire_dirty_worktrees
+            ):
+                db.rollback()
+                raise RuntimeError("FULL_CLEANUP_OPERATION_AUTHORITY_CHANGED")
+            result = _full_cleanup_operation_dict(existing)
+            result["created"] = False
+            db.rollback()
+            return result
+        active = (
+            db.query(FullCleanupOperationModel.operation_id)
+            .filter(FullCleanupOperationModel.active_key == 1)
+            .first()
+        )
+        if active is not None:
+            db.rollback()
+            raise RuntimeError("FULL_CLEANUP_OPERATION_ACTIVE")
+        operation = FullCleanupOperationModel(
+            operation_id=operation_id,
+            plan_id=plan_id,
+            retire_dirty_worktrees=retire_dirty_worktrees,
+            actor_kind=actor_kind,
+            state="admitted",
+            active_key=1,
+            operation_token_sha256=digest,
+            progress_json="{}",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(operation)
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            raise RuntimeError("FULL_CLEANUP_OPERATION_ACTIVE") from exc
+        result = _full_cleanup_operation_dict(operation)
+        result["created"] = True
+        return result
+
+
+def claim_full_cleanup_operation(
+    operation_id: str,
+    operation_token: str,
+    *,
+    helper_pid: int,
+    helper_process_start_ticks: int,
+) -> bool:
+    """Consume the helper token once and install exact physical run authority."""
+    if not isinstance(operation_token, str) or helper_pid <= 1 or helper_process_start_ticks <= 0:
+        return False
+    digest = hashlib.sha256(operation_token.encode("utf-8")).hexdigest()
+    now = datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        operation = db.get(FullCleanupOperationModel, operation_id)
+        if (
+            operation is None
+            or operation.state != "admitted"
+            or operation.active_key != 1
+            or not isinstance(operation.operation_token_sha256, str)
+            or not hmac.compare_digest(operation.operation_token_sha256, digest)
+        ):
+            db.rollback()
+            return False
+        operation.state = "running"
+        operation.operation_token_sha256 = None
+        operation.token_consumed_at = now
+        operation.helper_pid = helper_pid
+        operation.helper_process_start_ticks = helper_process_start_ticks
+        operation.started_at = now
+        operation.updated_at = now
+        db.commit()
+        return True
+
+
+def update_full_cleanup_operation_progress(
+    operation_id: str,
+    *,
+    helper_pid: int,
+    helper_process_start_ticks: int,
+    progress: Mapping[str, Any],
+) -> bool:
+    """Persist one bounded monotonic observation from the exact running helper."""
+    required_integer_fields = {
+        "schema_version",
+        "sequence",
+        "processed_candidates",
+        "executed_candidates",
+        "skipped_candidates",
+        "failed_candidates",
+        "freed_bytes",
+    }
+    if (
+        set(progress)
+        != required_integer_fields | {"phase", "last_candidate_sha256", "last_outcome"}
+        or type(progress.get("schema_version")) is not int
+        or progress.get("schema_version") != 1
+        or progress.get("phase") not in {"privileged", "runtime"}
+        or not isinstance(progress.get("last_candidate_sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", str(progress["last_candidate_sha256"]))
+        or progress.get("last_outcome") not in {"executed", "skipped", "failed", "observed"}
+        or any(
+            isinstance(progress.get(field), bool)
+            or not isinstance(progress.get(field), int)
+            or int(progress[field]) < (1 if field == "sequence" else 0)
+            for field in required_integer_fields - {"schema_version"}
+        )
+    ):
+        raise ValueError("invalid Full Cleanup operation progress")
+    if int(progress["processed_candidates"]) != sum(
+        int(progress[field])
+        for field in ("executed_candidates", "skipped_candidates", "failed_candidates")
+    ):
+        raise ValueError("invalid Full Cleanup operation progress")
+    encoded = _full_cleanup_json(progress, limit=_FULL_CLEANUP_PROGRESS_LIMIT)
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        operation = db.get(FullCleanupOperationModel, operation_id)
+        if (
+            operation is None
+            or operation.state != "running"
+            or operation.active_key != 1
+            or operation.helper_pid != helper_pid
+            or operation.helper_process_start_ticks != helper_process_start_ticks
+        ):
+            db.rollback()
+            return False
+        try:
+            current_progress = json.loads(str(operation.progress_json))
+            current_sequence = int(current_progress.get("sequence", 0))
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+            db.rollback()
+            raise RuntimeError("FULL_CLEANUP_OPERATION_CORRUPT")
+        if int(progress["sequence"]) <= current_sequence:
+            db.rollback()
+            return False
+        for field in (
+            "processed_candidates",
+            "executed_candidates",
+            "skipped_candidates",
+            "failed_candidates",
+            "freed_bytes",
+        ):
+            previous = current_progress.get(field, 0)
+            if isinstance(previous, bool) or not isinstance(previous, int):
+                db.rollback()
+                raise RuntimeError("FULL_CLEANUP_OPERATION_CORRUPT")
+            if int(progress[field]) < previous:
+                db.rollback()
+                return False
+        operation.progress_json = encoded
+        operation.updated_at = datetime.now()
+        db.commit()
+        return True
+
+
+def complete_full_cleanup_operation(
+    operation_id: str,
+    *,
+    helper_pid: int,
+    helper_process_start_ticks: int,
+    report: Mapping[str, Any],
+) -> bool:
+    """Publish the exact terminal report before the helper answers its socket."""
+    encoded = _full_cleanup_json(report, limit=_FULL_CLEANUP_REPORT_LIMIT)
+    completed_with_issues = bool(report.get("completed_with_issues")) or not bool(report.get("ok"))
+    now = datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        operation = db.get(FullCleanupOperationModel, operation_id)
+        if (
+            operation is None
+            or operation.state != "running"
+            or operation.active_key != 1
+            or operation.helper_pid != helper_pid
+            or operation.helper_process_start_ticks != helper_process_start_ticks
+        ):
+            db.rollback()
+            return False
+        operation.state = "completed_with_issues" if completed_with_issues else "completed"
+        operation.active_key = None
+        operation.report_json = encoded
+        operation.reason_code = None
+        operation.updated_at = now
+        operation.completed_at = now
+        db.commit()
+        return True
+
+
+def terminalize_full_cleanup_operation(
+    operation_id: str,
+    *,
+    reason_code: str,
+    indeterminate: bool,
+    helper_pid: Optional[int] = None,
+    helper_process_start_ticks: Optional[int] = None,
+    diagnostic_id: Optional[str] = None,
+) -> bool:
+    """End one exact active authority without fabricating a cleanup outcome."""
+    if not _FULL_CLEANUP_REASON.fullmatch(reason_code):
+        reason_code = "FULL_CLEANUP_EXECUTION_FAILED"
+    if diagnostic_id is not None and not re.fullmatch(r"[0-9a-f]{32}", diagnostic_id):
+        diagnostic_id = None
+    now = datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        operation = db.get(FullCleanupOperationModel, operation_id)
+        if operation is None or operation.active_key != 1:
+            db.rollback()
+            return False
+        if helper_pid is None:
+            if operation.state != "admitted":
+                db.rollback()
+                return False
+        elif (
+            operation.state != "running"
+            or operation.helper_pid != helper_pid
+            or operation.helper_process_start_ticks != helper_process_start_ticks
+        ):
+            db.rollback()
+            return False
+        operation.state = "indeterminate" if indeterminate else "failed"
+        operation.active_key = None
+        operation.operation_token_sha256 = None
+        operation.reason_code = reason_code
+        operation.diagnostic_id = diagnostic_id
+        operation.updated_at = now
+        operation.completed_at = now
+        db.commit()
+        return True
 
 
 def _ensure_control_plane_schema() -> None:
@@ -1597,8 +2209,14 @@ def claim_telegram_delivery(
     if not event_key or len(event_key) > 240:
         raise ValueError("Invalid Telegram event key")
     _ensure_telegram_settings_schema()
+    _ensure_session_deletion_receipt_schema()
+    _ensure_terminal_deletion_receipt_schema()
     try:
         with SessionLocal() as db:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            if not _workspace_accepts_new_work(db, root_terminal_id):
+                db.rollback()
+                return False
             db.add(
                 TelegramDeliveryModel(
                     event_key=event_key,
@@ -1965,7 +2583,19 @@ def record_usage_observation(
     """
     try:
         _ensure_usage_schema()
+        _ensure_session_deletion_receipt_schema()
+        _ensure_terminal_deletion_receipt_schema()
         with SessionLocal() as db:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            if (terminal_id is not None and not _workspace_accepts_new_work(db, terminal_id)) or (
+                session_id is not None
+                and (
+                    db.get(SessionDeletionOperationModel, session_id) is not None
+                    or db.get(SessionDeletionReceiptModel, session_id) is not None
+                )
+            ):
+                db.rollback()
+                return False
             db.add(
                 UsageRecordModel(
                     source_run_identity=observation.source_run_identity,
@@ -2013,7 +2643,13 @@ def bind_provider_usage_session(
     ):
         return False
     _ensure_usage_schema()
+    _ensure_session_deletion_receipt_schema()
+    _ensure_terminal_deletion_receipt_schema()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        if not _workspace_accepts_new_work(db, terminal_id):
+            db.rollback()
+            return False
         existing = (
             db.query(ProviderUsageBindingModel)
             .filter(
@@ -2054,6 +2690,8 @@ def list_provider_usage_bindings(
 ) -> List[Dict[str, Any]]:
     """Return private provider bindings for usage ingestion, never for the API."""
     _ensure_usage_schema()
+    _ensure_session_deletion_receipt_schema()
+    _ensure_terminal_deletion_receipt_schema()
     with SessionLocal() as db:
         query = db.query(ProviderUsageBindingModel)
         if terminal_id is not None:
@@ -2104,6 +2742,10 @@ def record_provider_usage_checkpoint(
     )
     for attempt in range(2):
         with SessionLocal() as db:
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            if not _workspace_accepts_new_work(db, terminal_id):
+                db.rollback()
+                return "session_deleted"
             binding = (
                 db.query(ProviderUsageBindingModel)
                 .filter(
@@ -2431,9 +3073,68 @@ def _ensure_workflow_schema() -> None:
     WorkflowModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowTurnModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowProviderReconnectAttemptModel.__table__.create(bind=engine, checkfirst=True)
+    ProviderRuntimeCompatibilityScanModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowTurnReceiptModel.__table__.create(bind=engine, checkfirst=True)
     WorkflowEffectModel.__table__.create(bind=engine, checkfirst=True)
+    WorkflowEffectResolutionModel.__table__.create(bind=engine, checkfirst=True)
+    WorkflowEffectReconciliationCursorModel.__table__.create(bind=engine, checkfirst=True)
     _migrate_workflow_turn_columns()
+
+
+def _backfill_workflow_effect_mirror_lineage(conn: Any) -> None:
+    """Repair only proven legacy recovery mirrors in bounded ID pages."""
+    last_effect_id = 0
+    while True:
+        page = conn.execute(
+            "SELECT id FROM workflow_effects WHERE id > ? ORDER BY id " "LIMIT ?",
+            (last_effect_id, WORKFLOW_EFFECT_LINEAGE_BACKFILL_BATCH_SIZE),
+        ).fetchall()
+        if not page:
+            return
+        page_end = int(page[-1][0])
+        # Releases predating explicit effect lineage still have durable turn
+        # resume/supersession evidence. Backfill only exact same-key effects
+        # copied onto such a successor; unrelated admitted turns remain
+        # independent even when they target the same child and slice number.
+        conn.execute(
+            """
+            WITH mirror_lineage AS (
+                SELECT mirror.id AS mirror_id, MIN(source.id) AS source_id
+                FROM workflow_effects mirror
+                JOIN workflow_turns mirror_turn
+                  ON mirror_turn.id = mirror.workflow_turn_id
+                 AND mirror_turn.workflow_id = mirror.workflow_id
+                JOIN workflow_effects source
+                  ON source.workflow_id = mirror.workflow_id
+                 AND source.effect_kind = mirror.effect_kind
+                 AND source.effect_key = mirror.effect_key
+                 AND source.id < mirror.id
+                 AND source.workflow_turn_id != mirror.workflow_turn_id
+                JOIN workflow_turns source_turn
+                  ON source_turn.id = source.workflow_turn_id
+                 AND source_turn.workflow_id = source.workflow_id
+                LEFT JOIN workflow_turn_receipts source_receipt
+                  ON source_receipt.workflow_turn_id = source_turn.id
+                WHERE mirror.id > ? AND mirror.id <= ?
+                  AND mirror.mirrored_from_effect_id IS NULL
+                  AND (
+                    mirror_turn.resume_parent_turn_id = source_turn.id
+                    OR source_turn.superseded_by_turn_id = mirror_turn.id
+                    OR source_receipt.resumed_by_turn_id = mirror_turn.id
+                  )
+                GROUP BY mirror.id
+            )
+            UPDATE workflow_effects
+            SET mirrored_from_effect_id = (
+                SELECT source_id FROM mirror_lineage
+                WHERE mirror_id = workflow_effects.id
+            )
+            WHERE mirrored_from_effect_id IS NULL
+              AND id IN (SELECT mirror_id FROM mirror_lineage)
+            """,
+            (last_effect_id, page_end),
+        )
+        last_effect_id = page_end
 
 
 def _migrate_workflow_turn_columns() -> None:
@@ -2442,6 +3143,7 @@ def _migrate_workflow_turn_columns() -> None:
 
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
+    conn = None
     try:
         conn = sqlite3.connect(str(DATABASE_FILE))
         workflow_columns = {row[1] for row in conn.execute("PRAGMA table_info(workflows)")}
@@ -2515,19 +3217,88 @@ def _migrate_workflow_turn_columns() -> None:
             "CREATE INDEX IF NOT EXISTS ix_workflow_turns_superseded_by_turn_id "
             "ON workflow_turns(superseded_by_turn_id)"
         )
+        if {"root_terminal_id", "status", "id"}.issubset(workflow_columns):
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_workflows_root_status_id "
+                "ON workflows(root_terminal_id, status, id)"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS "
+            "ix_workflows_resumed_from_owner_gate_workflow_id "
+            "ON workflows(resumed_from_owner_gate_workflow_id)"
+        )
         receipt_columns = {
             row[1] for row in conn.execute("PRAGMA table_info(workflow_turn_receipts)")
         }
         if "resume_token_sha256" not in receipt_columns:
             conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resume_token_sha256 TEXT")
+        if "resume_token_nonce" not in receipt_columns:
+            conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resume_token_nonce TEXT")
         if "resumed_by_turn_id" not in receipt_columns:
             conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resumed_by_turn_id INTEGER")
         if "resumed_at" not in receipt_columns:
             conn.execute("ALTER TABLE workflow_turn_receipts ADD COLUMN resumed_at DATETIME")
+        effect_columns = {row[1] for row in conn.execute("PRAGMA table_info(workflow_effects)")}
+        if "mirrored_from_effect_id" not in effect_columns:
+            conn.execute("ALTER TABLE workflow_effects ADD COLUMN mirrored_from_effect_id INTEGER")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_workflow_effects_workflow_kind_key_id "
+            "ON workflow_effects(workflow_id, effect_kind, effect_key, id)"
+        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS migration_receipts (
+                name VARCHAR NOT NULL PRIMARY KEY,
+                schema_version INTEGER NOT NULL,
+                detail_json TEXT NOT NULL,
+                created_at DATETIME NOT NULL
+            )
+            """)
+        lineage_receipt = conn.execute(
+            "SELECT 1 FROM migration_receipts WHERE name = ?",
+            (WORKFLOW_EFFECT_LINEAGE_MIGRATION_RECEIPT,),
+        ).fetchone()
+        if lineage_receipt is None:
+            # SQLite can durably commit ALTER TABLE independently. The
+            # receipt, rather than column presence, is therefore the sole
+            # backfill-complete authority. Acquire a write fence only while
+            # repair is missing, then recheck after the fence serializes a
+            # concurrent startup. Any failure before the receipt remains
+            # retryable on the next call.
+            if conn.in_transaction:
+                conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            lineage_receipt = conn.execute(
+                "SELECT 1 FROM migration_receipts WHERE name = ?",
+                (WORKFLOW_EFFECT_LINEAGE_MIGRATION_RECEIPT,),
+            ).fetchone()
+            if lineage_receipt is None:
+                _backfill_workflow_effect_mirror_lineage(conn)
+                conn.execute(
+                    "INSERT INTO migration_receipts("
+                    "name, schema_version, detail_json, created_at"
+                    ") VALUES (?, ?, ?, ?)",
+                    (
+                        WORKFLOW_EFFECT_LINEAGE_MIGRATION_RECEIPT,
+                        WORKFLOW_EFFECT_LINEAGE_SCHEMA_VERSION,
+                        json.dumps(
+                            {
+                                "batch_size": WORKFLOW_EFFECT_LINEAGE_BACKFILL_BATCH_SIZE,
+                                "schema_version": WORKFLOW_EFFECT_LINEAGE_SCHEMA_VERSION,
+                            },
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        datetime.now().isoformat(sep=" ", timespec="microseconds"),
+                    ),
+                )
         conn.commit()
-        conn.close()
     except Exception as exc:
+        if conn is not None:
+            conn.rollback()
         logger.warning("Workflow-turn schema migration failed: %s", exc)
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _ensure_child_assignment_schema() -> None:
@@ -2541,6 +3312,161 @@ def _ensure_child_assignment_schema() -> None:
             if not _migrate_child_assignment_columns():
                 raise RuntimeError("Child-assignment schema migration is incomplete")
             _child_assignment_schema_ready = True
+
+
+def _managed_attempt_event(
+    db: Any,
+    lifecycle: ManagedAttemptLifecycleModel,
+    event_key: str,
+    event_type: str,
+    *,
+    reason_code: Optional[str] = None,
+    detail: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Append one idempotent lifecycle event inside the caller transaction."""
+    if db.query(ManagedAttemptLifecycleEventModel.id).filter_by(event_key=event_key).first():
+        return
+    db.add(
+        ManagedAttemptLifecycleEventModel(
+            assignment_id=lifecycle.assignment_id,
+            event_key=event_key,
+            event_type=event_type,
+            state=lifecycle.state,
+            reason_code=reason_code,
+            detail_json=(
+                json.dumps(dict(detail), sort_keys=True, separators=(",", ":"))
+                if detail is not None
+                else None
+            ),
+        )
+    )
+
+
+def _backfill_managed_attempt_lifecycle() -> None:
+    """Create conservative truthful rows for attempts written by older releases."""
+    now = datetime.now()
+    with SessionLocal() as db:
+        assignments = db.query(ChildAssignmentModel).order_by(ChildAssignmentModel.id).all()
+        changed = False
+        for assignment in assignments:
+            if db.get(ManagedAttemptLifecycleModel, assignment.id) is not None:
+                continue
+            terminal = db.get(TerminalModel, assignment.child_terminal_id)
+            completed = assignment.status in {
+                ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
+                ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value,
+            }
+            failed = assignment.status in {
+                ChildAssignmentStatus.CANCELLED.value,
+                ChildAssignmentStatus.FENCED.value,
+            }
+            receipt = (
+                db.query(WorkflowTurnReceiptModel)
+                .filter(
+                    WorkflowTurnReceiptModel.workflow_turn_id == assignment.child_workflow_turn_id,
+                    WorkflowTurnReceiptModel.receiver_terminal_id == assignment.child_terminal_id,
+                )
+                .first()
+                if assignment.child_workflow_turn_id is not None
+                else None
+            )
+            exact_recovery_authority = bool(
+                assignment.request_workflow_effect_id is not None
+                and assignment.child_workflow_id is not None
+                and assignment.child_workflow_turn_id is not None
+                and terminal is not None
+                and terminal.runtime_generation
+                and terminal.writer_authority_generation
+            )
+            if completed:
+                state = "completed"
+                reason_code = None
+            elif failed:
+                state = "failed"
+                reason_code = "LEGACY_ASSIGNMENT_CANCELLED"
+            elif receipt is not None:
+                # A durable receiver receipt proves both delivery and provider
+                # admission.  Do not put an already-running legacy child under
+                # the absent-admission watchdog merely because older releases
+                # had no lifecycle ledger.
+                state = "waiting_for_result"
+                reason_code = None
+            elif exact_recovery_authority:
+                # Missing delivery/admission remains unknown, but it is never
+                # allowed to wait forever.  Give the upgraded process one
+                # bounded interval before the ordinary exactly-once recovery
+                # path purchases its single same-child retry.
+                state = "prompt_delivery_scheduled"
+                reason_code = "LEGACY_PROMPT_ADMISSION_UNCONFIRMED"
+            else:
+                state = "failed"
+                reason_code = "MANAGED_ATTEMPT_AUTHORITY_MISSING"
+            receipt_time = (
+                receipt.consumed_at if receipt is not None and receipt.consumed_at else now
+            )
+            lifecycle = ManagedAttemptLifecycleModel(
+                assignment_id=assignment.id,
+                attempt_id=assignment.attempt_id,
+                parent_terminal_id=assignment.parent_terminal_id,
+                child_terminal_id=assignment.child_terminal_id,
+                request_workflow_effect_id=assignment.request_workflow_effect_id,
+                child_workflow_id=assignment.child_workflow_id,
+                child_workflow_turn_id=assignment.child_workflow_turn_id,
+                state=state,
+                reason_code=reason_code,
+                expected_runtime_generation=(terminal.runtime_generation if terminal else None),
+                expected_writer_authority_generation=(
+                    terminal.writer_authority_generation if terminal else None
+                ),
+                prompt_delivery_scheduled_at=(
+                    receipt_time
+                    if receipt is not None
+                    else now if state == "prompt_delivery_scheduled" else None
+                ),
+                prompt_delivery_acknowledged_at=(receipt_time if receipt is not None else None),
+                provider_admitted_at=(receipt_time if receipt is not None else None),
+                waiting_result_at=(receipt_time if receipt is not None else None),
+                recovery_deadline_at=(
+                    now + timedelta(seconds=_MANAGED_ATTEMPT_ADMISSION_DEADLINE_SECONDS)
+                    if state == "prompt_delivery_scheduled"
+                    else None
+                ),
+                failed_at=(now if state == "failed" else None),
+                completed_at=(now if completed else None),
+                created_at=assignment.created_at or now,
+                updated_at=now,
+            )
+            db.add(lifecycle)
+            db.flush()
+            _managed_attempt_event(
+                db,
+                lifecycle,
+                f"managed-attempt-backfill:{assignment.id}",
+                "backfilled",
+                reason_code=lifecycle.reason_code,
+                detail={
+                    "provider_admission_proven": receipt is not None,
+                    "bounded_recovery_scheduled": state == "prompt_delivery_scheduled",
+                },
+            )
+            changed = True
+        if changed:
+            db.commit()
+
+
+def _ensure_managed_attempt_lifecycle_schema() -> None:
+    """Create the additive lifecycle ledger and backfill once per engine."""
+    global _managed_attempt_lifecycle_schema_ready
+    if _managed_attempt_lifecycle_schema_ready:
+        return
+    with _managed_attempt_lifecycle_schema_lock:
+        if _managed_attempt_lifecycle_schema_ready:
+            return
+        _ensure_child_assignment_schema()
+        ManagedAttemptLifecycleModel.__table__.create(bind=engine, checkfirst=True)
+        ManagedAttemptLifecycleEventModel.__table__.create(bind=engine, checkfirst=True)
+        _backfill_managed_attempt_lifecycle()
+        _managed_attempt_lifecycle_schema_ready = True
 
 
 def _ensure_delegation_result_schema() -> None:
@@ -3088,17 +4014,39 @@ def _migrate_child_assignment_columns() -> bool:
             reviewer_predicates.append(
                 "(agent_profile = 'reviewer' OR agent_profile LIKE 'reviewer\\_%' ESCAPE '\\')"
             )
-        if "launch_snapshot_json" in terminal_columns:
-            reviewer_predicates.append(
-                "(launch_snapshot_json LIKE '%\"execution_mode\"%' "
-                "AND launch_snapshot_json LIKE '%reviewer%')"
-            )
         if reviewer_predicates:
             conn.execute(
                 "UPDATE child_assignments SET review_subject_kind = 'legacy_unscoped' "
                 "WHERE review_subject_kind IS NULL AND child_terminal_id IN ("
                 "SELECT id FROM terminals WHERE " + " OR ".join(reviewer_predicates) + ")"
             )
+            # Pre-fix code searched arbitrary launch prose for ``reviewer``.
+            # Developer profiles describe review policy too, so that heuristic
+            # could silently turn an ordinary child into a reviewer and block
+            # its first prompt. Correct only rows that have no review subject
+            # and whose structured terminal classification is non-review.
+            nonreview_predicates = []
+            if "managed_worktree_kind" in terminal_columns:
+                nonreview_predicates.append("COALESCE(managed_worktree_kind, '') != 'reviewer'")
+            if "agent_profile" in terminal_columns:
+                nonreview_predicates.extend(
+                    (
+                        "COALESCE(agent_profile, '') != 'reviewer'",
+                        "COALESCE(agent_profile, '') NOT LIKE 'reviewer\\_%' ESCAPE '\\'",
+                    )
+                )
+            if nonreview_predicates:
+                conn.execute(
+                    "UPDATE child_assignments SET review_subject_kind = NULL "
+                    "WHERE review_subject_kind = 'legacy_unscoped' "
+                    "AND review_scope_sha256 IS NULL AND review_subject_id IS NULL "
+                    "AND review_subject_revision IS NULL "
+                    "AND review_subject_revision_source IS NULL "
+                    "AND review_subject_worktree IS NULL "
+                    "AND child_terminal_id IN (SELECT id FROM terminals WHERE "
+                    + " AND ".join(nonreview_predicates)
+                    + ")"
+                )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_child_assignments_child_terminal_id "
             "ON child_assignments(child_terminal_id)"
@@ -3211,6 +4159,7 @@ def _migrate_terminal_worktree_authority_columns() -> bool:
             "runtime_operation_token",
             "provider_resume_identity",
             "provider_resume_runtime_generation",
+            "provider_runtime_compatibility_generation",
             "provider_last_response_identity",
             "recovery_fenced_reason",
             "recovery_takeover_id",
@@ -3398,6 +4347,8 @@ def reserve_writable_work_context(
 ) -> Dict[str, Any]:
     """Acquire or replay one exact per-Session work-context reservation."""
     _ensure_terminal_worktree_authority_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     expected = {
         "id": context_id,
         "request_id": request_id,
@@ -3411,6 +4362,38 @@ def reserve_writable_work_context(
     }
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.get(TerminalModel, terminal_id)
+        terminal_session_id = (
+            str(terminal.session_id or f"legacy:{terminal.tmux_session}")
+            if terminal is not None
+            else None
+        )
+        if terminal_session_id is not None and terminal_session_id != session_id:
+            db.rollback()
+            raise WritableWorkContextConflict("WORK_CONTEXT_AUTHORITY_CONFLICT")
+        authority_session_ids = {session_id}
+        if terminal_session_id is not None:
+            authority_session_ids.add(terminal_session_id)
+        deletion_in_progress = (
+            db.query(SessionDeletionOperationModel.session_id)
+            .filter(SessionDeletionOperationModel.session_id.in_(authority_session_ids))
+            .first()
+            is not None
+        )
+        session_deleted = (
+            db.query(SessionDeletionReceiptModel.session_id)
+            .filter(SessionDeletionReceiptModel.session_id.in_(authority_session_ids))
+            .first()
+            is not None
+        )
+        terminal_deleted = _terminal_deletion_fence_exists_in_transaction(db, terminal_id)
+        if deletion_in_progress or session_deleted or terminal_deleted:
+            db.rollback()
+            raise WritableWorkContextConflict(
+                "SESSION_DELETED"
+                if session_deleted or terminal_deleted
+                else "SESSION_DELETION_IN_PROGRESS"
+            )
         existing = (
             db.query(WritableWorkContextModel)
             .filter(WritableWorkContextModel.request_id == request_id)
@@ -3549,6 +4532,755 @@ _WORKSPACE_RETIREMENT_ACTIVE_ASSIGNMENT_STATES = (
 )
 
 _WORKSPACE_RETIREMENT_TERMINAL_WORKFLOW_STATES = ("terminal", "cancelled")
+_SESSION_DELETION_PLAN_LIMIT = 500
+_OPERATOR_RETIRED_INDETERMINATE_EFFECT = "operator_retired_indeterminate"
+PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED = "PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED"
+PROVIDER_EXECUTION_RECONCILIATION_OPERATION = "provider_execution_reconciliation"
+PROVIDER_EXECUTION_RECONCILIATION_LEASE_SECONDS = 30
+
+
+def _workflow_effect_retirement_authority(
+    effect: WorkflowEffectModel,
+    workflow: WorkflowModel | None,
+    turn: WorkflowTurnModel | None,
+) -> Dict[str, str]:
+    """Return the exact durable chain that can authorize effect retirement."""
+    link_matches = (
+        workflow is not None
+        and turn is not None
+        and int(turn.workflow_id) == int(effect.workflow_id)
+    )
+    return {
+        "effect_workflow_id": str(effect.workflow_id),
+        "workflow_exists": "1" if workflow is not None else "0",
+        "workflow_status": str(workflow.status) if workflow is not None else "missing",
+        "workflow_active_turn_id": str(workflow.active_turn_id or "") if workflow else "",
+        "workflow_updated_at": str(workflow.updated_at or "") if workflow else "",
+        "turn_exists": "1" if turn is not None else "0",
+        "turn_workflow_id": str(turn.workflow_id) if turn is not None else "",
+        "workflow_link_matches_turn": "1" if link_matches else "0",
+        "turn_state": str(turn.state) if turn is not None else "missing",
+        "turn_updated_at": str(turn.updated_at or "") if turn is not None else "",
+        "turn_provider_processing_observed_at": (
+            str(turn.provider_processing_observed_at or "") if turn is not None else ""
+        ),
+        "turn_provider_ready_observed_at": (
+            str(turn.provider_ready_observed_at or "") if turn is not None else ""
+        ),
+        "turn_provider_reconnect_requested_at": (
+            str(turn.provider_reconnect_requested_at or "") if turn is not None else ""
+        ),
+        "turn_superseded_by_turn_id": (
+            str(turn.superseded_by_turn_id or "") if turn is not None else ""
+        ),
+        "effect_updated_at": str(effect.updated_at or ""),
+    }
+
+
+def _workflow_effect_retirement_classification(
+    effect: WorkflowEffectModel,
+    workflow: WorkflowModel | None,
+    turn: WorkflowTurnModel | None,
+) -> tuple[str, str, str]:
+    """Classify one unknown effect without borrowing authority across links."""
+    if workflow is None:
+        return "unsafe", "workflow_effects", "EFFECT_WORKFLOW_LINK_MISSING"
+    if turn is None:
+        return "unsafe", "workflow_effects", "EFFECT_TURN_LINK_MISSING"
+    if int(turn.workflow_id) != int(effect.workflow_id):
+        return "unsafe", "workflow_effects", "EFFECT_WORKFLOW_LINK_MISMATCH"
+
+    is_active_turn = workflow.active_turn_id == turn.id
+    processing_unsettled = turn.provider_processing_observed_at is not None and (
+        turn.provider_ready_observed_at is None
+        or turn.provider_ready_observed_at < turn.provider_processing_observed_at
+    )
+    if is_active_turn and turn.provider_reconnect_requested_at is not None:
+        return "unsafe", "recovery_authority", "PROVIDER_RECONNECT_ACTIVE"
+    runtime_exit_reconciled = (
+        is_active_turn
+        and workflow.status in _WORKSPACE_RETIREMENT_TERMINAL_WORKFLOW_STATES
+        and turn.state in ("finished", "cancelled")
+        and turn.queue_reason == PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED
+    )
+    if is_active_turn and processing_unsettled and not runtime_exit_reconciled:
+        return "unsafe", "provider_execution", "PROVIDER_EXECUTION_STATE_UNSETTLED"
+
+    historical = (
+        workflow.status in _WORKSPACE_RETIREMENT_TERMINAL_WORKFLOW_STATES
+        or turn.superseded_by_turn_id is not None
+    )
+    if historical:
+        return (
+            "historical_indeterminate",
+            "historical_indeterminate_effects",
+            "HISTORICAL_EFFECT_OUTCOME_UNKNOWN",
+        )
+    return (
+        "unsafe",
+        "workflow_effects",
+        "INDETERMINATE_EFFECT" if effect.state == "indeterminate" else "CLAIMED_EFFECT",
+    )
+
+
+def _session_unresolved_work_plan_in_transaction(
+    db: Any,
+    *,
+    session_id: str,
+    terminals: Sequence[TerminalModel],
+) -> Dict[str, Any]:
+    """Classify one bounded, exact Session-owned deletion cancellation plan.
+
+    This is the queue/authority half of both workspace retirement and Session
+    deletion. Claimed/indeterminate effects become operator-retirable only
+    when their exact workflow/turn linkage is intact, the workflow or turn is
+    historical, and no resumable provider authority remains. Every live
+    runtime/writer/recovery authority stays unsafe. Historical received,
+    superseded, completed, and acknowledged rows are absent by construction.
+    """
+    historical_terminal_receipts = _session_historical_terminal_receipts(db, session_id)
+    terminal_ids = sorted(
+        {str(terminal.id) for terminal in terminals}
+        | {str(receipt.terminal_id) for receipt in historical_terminal_receipts}
+    )
+    terminal_scope_overflow = (
+        len(historical_terminal_receipts) > _SESSION_DELETION_PLAN_LIMIT
+        or len(terminal_ids) > _SESSION_DELETION_PLAN_LIMIT
+    )
+    terminal_id_set = set(terminal_ids)
+    cancellable_items: list[dict[str, Any]] = []
+    retirement_items: list[dict[str, Any]] = []
+    unsafe_items: list[dict[str, Any]] = []
+    blocking_recovery_operations: list[dict[str, Any]] = []
+    category_counts: dict[tuple[str, str], dict[str, Any]] = {}
+    overflow = terminal_scope_overflow
+
+    def record(
+        disposition: str,
+        category: str,
+        reason_code: str,
+        item_kind: str,
+        item_id: Any,
+        state: Any,
+        *,
+        authority: Mapping[str, Any] | None = None,
+    ) -> None:
+        targets = {
+            "cancellable": cancellable_items,
+            "historical_indeterminate": retirement_items,
+            "unsafe": unsafe_items,
+        }
+        target = targets[disposition]
+        item = {
+            "item_kind": item_kind,
+            "item_id": str(item_id),
+            "state": str(state),
+            "category": category,
+            "reason_code": reason_code,
+        }
+        if authority is not None:
+            item["authority"] = dict(authority)
+        target.append(item)
+        key = (disposition, category)
+        summary = category_counts.setdefault(
+            key,
+            {
+                "category": category,
+                "count": 0,
+                "disposition": disposition,
+                "reason_codes": [],
+            },
+        )
+        summary["count"] += 1
+        if reason_code not in summary["reason_codes"]:
+            summary["reason_codes"].append(reason_code)
+
+    def bounded(query: Any) -> list[Any]:
+        nonlocal overflow
+        rows = cast(list[Any], query.limit(_SESSION_DELETION_PLAN_LIMIT + 1).all())
+        if len(rows) > _SESSION_DELETION_PLAN_LIMIT:
+            overflow = True
+            return rows[:_SESSION_DELETION_PLAN_LIMIT]
+        return rows
+
+    def finish() -> Dict[str, Any]:
+        nonlocal overflow
+        if (
+            len(cancellable_items) + len(retirement_items) + len(unsafe_items)
+            > _SESSION_DELETION_PLAN_LIMIT
+        ):
+            overflow = True
+        if overflow and not any(item["item_kind"] == "plan" for item in unsafe_items):
+            record(
+                "unsafe",
+                "plan_limit",
+                "CANCELLATION_PLAN_TOO_LARGE",
+                "plan",
+                session_id,
+                "overflow",
+            )
+
+        fingerprint_document = {
+            "version": 5,
+            "session_id": session_id,
+            "terminal_authority": sorted(
+                (
+                    str(terminal.id),
+                    str(terminal.runtime_lifecycle or "unknown"),
+                    str(terminal.runtime_generation or ""),
+                    str(terminal.writer_authority_generation or ""),
+                    str(terminal.runtime_operation_kind or ""),
+                    str(terminal.runtime_operation_token or ""),
+                    str(terminal.runtime_operation_claimed_at or ""),
+                    str(terminal.runtime_operation_expires_at or ""),
+                    str(terminal.provider_resume_identity or ""),
+                    str(terminal.provider_resume_runtime_generation or ""),
+                    str(terminal.recovery_takeover_id or ""),
+                    str(terminal.replaced_by_terminal_id or ""),
+                )
+                for terminal in terminals
+            ),
+            "retired_terminal_authority": sorted(
+                (
+                    str(receipt.terminal_id),
+                    str(receipt.session_id or ""),
+                    str(receipt.session_name),
+                    str(receipt.window_name),
+                    str(receipt.auth_token_sha256 or ""),
+                    str(receipt.session_lifetime_authority_version or ""),
+                    str(receipt.workspace_cleanup_authority_version or ""),
+                    str(receipt.managed_worktree_kind or ""),
+                    str(receipt.managed_worktree_source or ""),
+                    str(receipt.managed_worktree_path or ""),
+                    str(receipt.managed_worktree_branch or ""),
+                    str(receipt.managed_worktree_branch_object_id or ""),
+                    str(receipt.managed_worktree_identity or ""),
+                    str(receipt.deleted_at or ""),
+                )
+                for receipt in historical_terminal_receipts
+            ),
+            "cancellable": sorted(
+                (
+                    item["item_kind"],
+                    item["item_id"],
+                    item["state"],
+                    item["category"],
+                    item["reason_code"],
+                )
+                for item in cancellable_items
+            ),
+            "historical_indeterminate": sorted(
+                (
+                    item["item_kind"],
+                    item["item_id"],
+                    item["state"],
+                    item["category"],
+                    item["reason_code"],
+                    json.dumps(item.get("authority", {}), sort_keys=True, separators=(",", ":")),
+                )
+                for item in retirement_items
+            ),
+            "unsafe": sorted(
+                (item["item_kind"], item["item_id"], item["state"], item["reason_code"])
+                for item in unsafe_items
+            ),
+            "blocking_recovery_operations": sorted(
+                (
+                    str(item.get("operation_id") or ""),
+                    str(item.get("terminal_id") or ""),
+                    str(item["kind"]),
+                    str(item["state"]),
+                    str(item["reason_code"]),
+                )
+                for item in blocking_recovery_operations
+            ),
+        }
+        plan_token = hashlib.sha256(
+            json.dumps(fingerprint_document, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        summaries = sorted(
+            category_counts.values(),
+            key=lambda item: (item["disposition"], item["category"]),
+        )
+        if unsafe_items:
+            deletion_mode = "blocked_live_or_unsafe_authority"
+        elif retirement_items:
+            deletion_mode = "eligible_with_historical_indeterminate_retirement"
+        elif cancellable_items:
+            deletion_mode = "eligible_with_cancellable_work"
+        else:
+            deletion_mode = "eligible_normal"
+        resolvable = bool(cancellable_items or retirement_items) and not unsafe_items
+        return {
+            "eligible": deletion_mode == "eligible_normal",
+            "deletion_mode": deletion_mode,
+            "cancellable": bool(cancellable_items) and not unsafe_items,
+            "can_resolve_and_delete": resolvable,
+            "requires_cancellation_confirmation": bool(cancellable_items) and not unsafe_items,
+            "requires_historical_indeterminate_confirmation": (
+                bool(retirement_items) and not unsafe_items
+            ),
+            "plan_token": plan_token if resolvable else None,
+            "blockers": summaries,
+            "cancellable_count": len(cancellable_items),
+            "historical_indeterminate_count": len(retirement_items),
+            "unsafe_count": len(unsafe_items),
+            "live_unsafe_count": len(unsafe_items),
+            "plan_limit": _SESSION_DELETION_PLAN_LIMIT,
+            "reason_codes": sorted(
+                {
+                    item["reason_code"]
+                    for item in unsafe_items + retirement_items + cancellable_items
+                }
+            ),
+            "blocking_recovery_operations": blocking_recovery_operations,
+            "_cancellable_items": cancellable_items,
+            "_retirement_items": retirement_items,
+            "_unsafe_items": unsafe_items,
+        }
+
+    if terminal_scope_overflow:
+        return finish()
+
+    recovery_terminal_ids: set[str] = set()
+    if terminal_ids:
+        recoveries = bounded(
+            db.query(RecoveryTakeoverModel)
+            .filter(
+                or_(
+                    RecoveryTakeoverModel.old_session_id == session_id,
+                    RecoveryTakeoverModel.new_session_id == session_id,
+                    RecoveryTakeoverModel.old_terminal_id.in_(terminal_ids),
+                    RecoveryTakeoverModel.new_terminal_id.in_(terminal_ids),
+                ),
+                or_(
+                    RecoveryTakeoverModel.state.notin_(("completed", "failed")),
+                    and_(
+                        RecoveryTakeoverModel.state == "failed",
+                        RecoveryTakeoverModel.fenced_at.is_not(None),
+                    ),
+                ),
+            )
+            .order_by(RecoveryTakeoverModel.id.asc())
+        )
+        for recovery in recoveries:
+            if str(recovery.old_session_id) == session_id:
+                recovery_terminal_id = str(recovery.old_terminal_id)
+            elif str(recovery.new_session_id) == session_id:
+                recovery_terminal_id = str(recovery.new_terminal_id)
+            elif str(recovery.old_terminal_id) in terminal_id_set:
+                recovery_terminal_id = str(recovery.old_terminal_id)
+            else:
+                recovery_terminal_id = str(recovery.new_terminal_id)
+            recovery_terminal_ids.update(
+                {
+                    value
+                    for value in (
+                        str(recovery.old_terminal_id),
+                        str(recovery.new_terminal_id),
+                    )
+                    if value in terminal_id_set
+                }
+            )
+            reason_code = (
+                "RECOVERY_DISPATCH_UNCERTAIN"
+                if recovery.state == "dispatch_uncertain"
+                else (
+                    "RECOVERY_TAKEOVER_FAILED_AFTER_FENCE"
+                    if recovery.state == "failed"
+                    else "RECOVERY_TAKEOVER_ACTIVE"
+                )
+            )
+            blocking_recovery_operations.append(
+                {
+                    "operation_id": str(recovery.id),
+                    "terminal_id": recovery_terminal_id,
+                    "kind": "recovery_takeover",
+                    "state": str(recovery.state),
+                    "reason_code": reason_code,
+                }
+            )
+            record(
+                "unsafe",
+                "recovery_authority",
+                reason_code,
+                "recovery_takeover",
+                recovery.id,
+                recovery.state,
+            )
+
+    for terminal in terminals:
+        lifecycle = str(terminal.runtime_lifecycle or "unknown")
+        runtime_operation_active = any(
+            value is not None
+            for value in (
+                terminal.runtime_operation_kind,
+                terminal.runtime_operation_token,
+                terminal.runtime_operation_claimed_at,
+                terminal.runtime_operation_expires_at,
+            )
+        )
+        terminal_id = str(terminal.id)
+        if lifecycle == "recovery_required" and terminal_id not in recovery_terminal_ids:
+            blocking_recovery_operations.append(
+                {
+                    "operation_id": None,
+                    "terminal_id": terminal_id,
+                    "kind": "terminal_runtime",
+                    "state": lifecycle,
+                    "reason_code": "RECOVERY_RECONCILIATION_REQUIRED",
+                }
+            )
+            record(
+                "unsafe",
+                "recovery_authority",
+                "RECOVERY_RECONCILIATION_REQUIRED",
+                "terminal",
+                terminal.id,
+                lifecycle,
+            )
+        elif runtime_operation_active and not (
+            lifecycle in {"recovery_fenced", "recovery_required"}
+            and terminal_id in recovery_terminal_ids
+        ):
+            if lifecycle in {"recovery_fenced", "recovery_required"}:
+                category = "recovery_authority"
+                reason = "RUNTIME_RECOVERY_OPERATION_ACTIVE"
+                if terminal_id not in recovery_terminal_ids:
+                    blocking_recovery_operations.append(
+                        {
+                            "operation_id": None,
+                            "terminal_id": terminal_id,
+                            "kind": str(terminal.runtime_operation_kind or "runtime_recovery"),
+                            "state": "runtime_operation_claim",
+                            "reason_code": reason,
+                        }
+                    )
+            else:
+                category = "runtime_authority"
+                reason = (
+                    "RUNTIME_DEATH_UNCONFIRMED"
+                    if lifecycle != "exited"
+                    else "RUNTIME_RECOVERY_OPERATION_ACTIVE"
+                )
+            record(
+                "unsafe",
+                category,
+                reason,
+                "terminal",
+                terminal.id,
+                terminal.runtime_operation_kind
+                or ("runtime_operation_claim" if runtime_operation_active else lifecycle),
+            )
+        elif lifecycle not in {"exited", "recovery_fenced"}:
+            record(
+                "unsafe",
+                "runtime_authority",
+                "RUNTIME_DEATH_UNCONFIRMED",
+                "terminal",
+                terminal.id,
+                lifecycle,
+            )
+
+    for receipt in historical_terminal_receipts:
+        if _terminal_receipt_workspace_cleanup_authority(receipt) is None:
+            record(
+                "unsafe",
+                "workspace_authority",
+                "TERMINAL_WORKSPACE_CLEANUP_AUTHORITY_MISSING",
+                "terminal_deletion_receipt",
+                receipt.terminal_id,
+                "legacy_or_invalid_cleanup_authority",
+            )
+
+    if terminal_ids:
+        workflows = bounded(
+            db.query(WorkflowModel)
+            .filter(
+                WorkflowModel.root_terminal_id.in_(terminal_ids),
+                workflow_current_execution_authority_predicate(WorkflowModel),
+            )
+            .order_by(WorkflowModel.id.asc())
+        )
+        for workflow in workflows:
+            record(
+                "cancellable",
+                "unfinished_workflows",
+                "OWNER_GATE" if workflow.status == WORKFLOW_OWNER_GATE else "WORKFLOW_OPEN",
+                "workflow",
+                workflow.id,
+                workflow.status,
+            )
+
+        receipt = aliased(WorkflowTurnReceiptModel)
+        turns = bounded(
+            db.query(WorkflowTurnModel)
+            .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+            .outerjoin(
+                receipt,
+                and_(
+                    receipt.workflow_turn_id == WorkflowTurnModel.id,
+                    receipt.receiver_terminal_id == WorkflowModel.root_terminal_id,
+                ),
+            )
+            .filter(
+                WorkflowModel.root_terminal_id.in_(terminal_ids),
+                workflow_current_execution_authority_predicate(WorkflowModel),
+                WorkflowTurnModel.superseded_by_turn_id.is_(None),
+                or_(
+                    WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+                    and_(WorkflowTurnModel.state == TURN_SENT, receipt.id.is_(None)),
+                ),
+            )
+            .order_by(WorkflowTurnModel.id.asc())
+        )
+        for turn in turns:
+            record(
+                "cancellable",
+                "queued_work",
+                "UNADMITTED_WORKFLOW_TURN",
+                "workflow_turn",
+                turn.id,
+                turn.state,
+            )
+
+        inbox_rows = bounded(
+            db.query(InboxModel)
+            .filter(
+                InboxModel.status == MessageStatus.PENDING.value,
+                or_(
+                    InboxModel.sender_id.in_(terminal_ids),
+                    InboxModel.receiver_id.in_(terminal_ids),
+                ),
+            )
+            .order_by(InboxModel.id.asc())
+        )
+        for inbox in inbox_rows:
+            owned = inbox.receiver_id in terminal_id_set and (
+                inbox.sender_id == "ui" or inbox.sender_id in terminal_id_set
+            )
+            record(
+                "cancellable" if owned else "unsafe",
+                "pending_delivery" if owned else "external_delivery",
+                "PENDING_SESSION_DELIVERY" if owned else "CROSS_SESSION_DELIVERY",
+                "inbox",
+                inbox.id,
+                inbox.status,
+            )
+
+        assignments = bounded(
+            db.query(ChildAssignmentModel)
+            .filter(
+                or_(
+                    ChildAssignmentModel.parent_terminal_id.in_(terminal_ids),
+                    ChildAssignmentModel.child_terminal_id.in_(terminal_ids),
+                ),
+                ChildAssignmentModel.status.in_(_WORKSPACE_RETIREMENT_ACTIVE_ASSIGNMENT_STATES),
+                ChildAssignmentModel.review_superseded_at.is_(None),
+            )
+            .order_by(ChildAssignmentModel.id.asc())
+        )
+        for assignment in assignments:
+            owned = (
+                assignment.parent_terminal_id in terminal_id_set
+                and assignment.child_terminal_id in terminal_id_set
+            )
+            direct_claimed = (
+                assignment.status == ChildAssignmentStatus.HANDOFF_DIRECT_RESULT_CLAIMED.value
+            )
+            safe = owned and not direct_claimed
+            reason = (
+                "PENDING_CHILD_ASSIGNMENT"
+                if safe
+                else (
+                    "DIRECT_RESULT_ALREADY_CLAIMED"
+                    if direct_claimed
+                    else "CROSS_SESSION_ASSIGNMENT"
+                )
+            )
+            record(
+                "cancellable" if safe else "unsafe",
+                "child_assignments" if safe else "external_assignments",
+                reason,
+                "child_assignment",
+                assignment.id,
+                assignment.status,
+            )
+
+        effect_workflow = aliased(WorkflowModel)
+        effect_turn = aliased(WorkflowTurnModel)
+        turn_workflow = aliased(WorkflowModel)
+        effect_resolution = aliased(WorkflowEffectResolutionModel)
+        effects = bounded(
+            db.query(WorkflowEffectModel, effect_workflow, effect_turn)
+            .outerjoin(
+                effect_workflow,
+                effect_workflow.id == WorkflowEffectModel.workflow_id,
+            )
+            .outerjoin(
+                effect_turn,
+                effect_turn.id == WorkflowEffectModel.workflow_turn_id,
+            )
+            .outerjoin(turn_workflow, turn_workflow.id == effect_turn.workflow_id)
+            .outerjoin(
+                effect_resolution,
+                effect_resolution.workflow_effect_id == WorkflowEffectModel.id,
+            )
+            .filter(
+                or_(
+                    effect_workflow.root_terminal_id.in_(terminal_ids),
+                    turn_workflow.root_terminal_id.in_(terminal_ids),
+                ),
+                WorkflowEffectModel.state.in_(("claimed", "indeterminate")),
+                effect_resolution.id.is_(None),
+            )
+            .order_by(WorkflowEffectModel.id.asc())
+        )
+        for effect, workflow, turn in effects:
+            disposition, category, reason_code = _workflow_effect_retirement_classification(
+                effect, workflow, turn
+            )
+            record(
+                disposition,
+                category,
+                reason_code,
+                "workflow_effect",
+                effect.id,
+                effect.state,
+                authority=_workflow_effect_retirement_authority(effect, workflow, turn),
+            )
+
+        notification_workflow = aliased(WorkflowModel)
+        notification_rows = bounded(
+            db.query(TelegramDeliveryModel, notification_workflow)
+            .outerjoin(
+                notification_workflow,
+                notification_workflow.id == TelegramDeliveryModel.workflow_id,
+            )
+            .filter(
+                TelegramDeliveryModel.root_terminal_id.in_(terminal_ids),
+                TelegramDeliveryModel.state == "claimed",
+            )
+            .order_by(TelegramDeliveryModel.event_key.asc())
+        )
+        for notification, workflow in notification_rows:
+            linked = bool(
+                workflow is not None
+                and str(workflow.root_terminal_id) == str(notification.root_terminal_id)
+            )
+            record(
+                "historical_indeterminate" if linked else "unsafe",
+                ("historical_indeterminate_effects" if linked else "external_notifications"),
+                (
+                    "HISTORICAL_NOTIFICATION_OUTCOME_UNKNOWN"
+                    if linked
+                    else "NOTIFICATION_WORKFLOW_LINK_MISMATCH"
+                ),
+                "telegram_delivery",
+                notification.event_key,
+                notification.state,
+                authority={
+                    "workflow_id": int(notification.workflow_id),
+                    "root_terminal_id": str(notification.root_terminal_id),
+                    "event_kind": str(notification.event_kind),
+                    "updated_at": str(notification.updated_at or ""),
+                },
+            )
+
+        live_turns = bounded(
+            db.query(WorkflowTurnModel, WorkflowModel)
+            .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+            .outerjoin(
+                ProviderExecutionLeaseModel,
+                ProviderExecutionLeaseModel.workflow_turn_id == WorkflowTurnModel.id,
+            )
+            .filter(
+                WorkflowModel.root_terminal_id.in_(terminal_ids),
+                workflow_current_execution_authority_predicate(WorkflowModel),
+                WorkflowModel.active_turn_id == WorkflowTurnModel.id,
+                ProviderExecutionLeaseModel.workflow_turn_id.is_(None),
+                or_(
+                    WorkflowTurnModel.provider_reconnect_requested_at.is_not(None),
+                    and_(
+                        WorkflowTurnModel.provider_processing_observed_at.is_not(None),
+                        or_(
+                            WorkflowTurnModel.provider_ready_observed_at.is_(None),
+                            WorkflowTurnModel.provider_ready_observed_at
+                            < WorkflowTurnModel.provider_processing_observed_at,
+                        ),
+                    ),
+                ),
+            )
+            .order_by(WorkflowTurnModel.id.asc())
+        )
+        for turn, _workflow in live_turns:
+            reconnecting = turn.provider_reconnect_requested_at is not None
+            record(
+                "unsafe",
+                "recovery_authority" if reconnecting else "provider_execution",
+                (
+                    "PROVIDER_RECONNECT_ACTIVE"
+                    if reconnecting
+                    else "PROVIDER_EXECUTION_STATE_UNSETTLED"
+                ),
+                "workflow_turn_authority",
+                turn.id,
+                "reconnect" if reconnecting else "processing",
+            )
+
+        for lease in bounded(
+            db.query(ProviderExecutionLeaseModel)
+            .filter(ProviderExecutionLeaseModel.terminal_id.in_(terminal_ids))
+            .order_by(ProviderExecutionLeaseModel.terminal_id.asc())
+        ):
+            record(
+                "unsafe",
+                "provider_execution",
+                "PROVIDER_EXECUTION_ACTIVE",
+                "provider_execution",
+                lease.terminal_id,
+                "active",
+            )
+
+        reconnect_attempts = bounded(
+            db.query(WorkflowProviderReconnectAttemptModel)
+            .filter(
+                WorkflowProviderReconnectAttemptModel.root_terminal_id.in_(terminal_ids),
+                WorkflowProviderReconnectAttemptModel.state.in_(
+                    ("reserved", "launch_dispatched", "runtime_ready")
+                ),
+            )
+            .order_by(WorkflowProviderReconnectAttemptModel.id.asc())
+        )
+        for attempt in reconnect_attempts:
+            record(
+                "unsafe",
+                "recovery_authority",
+                "PROVIDER_RECONNECT_ATTEMPT_ACTIVE",
+                "provider_reconnect_attempt",
+                attempt.id,
+                attempt.state,
+            )
+
+        for lease in bounded(
+            db.query(WorktreeWriterLeaseModel)
+            .filter(WorktreeWriterLeaseModel.terminal_id.in_(terminal_ids))
+            .order_by(WorktreeWriterLeaseModel.terminal_id.asc())
+        ):
+            record(
+                "unsafe",
+                "writer_authority",
+                "WRITER_LEASE_ACTIVE",
+                "writer_lease",
+                lease.terminal_id,
+                "active",
+            )
+
+    return finish()
+
+
+def _public_session_unresolved_work_plan(plan: Mapping[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in plan.items() if not key.startswith("_")}
 
 
 def _session_workspace_snapshot_in_transaction(
@@ -3559,9 +5291,15 @@ def _session_workspace_snapshot_in_transaction(
         db.query(TerminalModel)
         .filter(TerminalModel.session_id == context.session_id)
         .order_by(TerminalModel.creation_order.asc(), TerminalModel.id.asc())
+        .limit(_SESSION_DELETION_PLAN_LIMIT + 1)
         .all()
     )
     terminal_ids = [str(terminal.id) for terminal in terminals]
+    unresolved_plan = _session_unresolved_work_plan_in_transaction(
+        db,
+        session_id=str(context.session_id),
+        terminals=terminals,
+    )
     reason_code: str | None = None
     if context.state == "retired":
         reason_code = "WORKSPACE_ALREADY_RETIRED"
@@ -3569,114 +5307,49 @@ def _session_workspace_snapshot_in_transaction(
         reason_code = "WORKSPACE_STATE_NOT_RETIRABLE"
     elif not terminals:
         reason_code = "WORKSPACE_HISTORY_MISSING"
-    elif any(
-        terminal.runtime_lifecycle in {"recovery_fenced", "recovery_required"}
-        for terminal in terminals
-    ):
+    elif any(terminal.runtime_lifecycle == "recovery_required" for terminal in terminals):
         reason_code = "RECOVERY_PROTECTED"
-    elif any(terminal.runtime_lifecycle != "exited" for terminal in terminals):
+    elif any(
+        terminal.runtime_lifecycle not in {"exited", "recovery_fenced"} for terminal in terminals
+    ):
         reason_code = "WORKTREE_ACTIVE"
     elif any(terminal.runtime_operation_kind is not None for terminal in terminals):
         reason_code = "RECOVERY_PROTECTED"
     elif terminal_ids:
-        owner_gate = (
-            db.query(WorkflowModel.id)
-            .filter(
-                WorkflowModel.root_terminal_id.in_(terminal_ids),
-                WorkflowModel.status == "owner_gate",
-            )
-            .first()
-        )
-        open_workflow = (
-            db.query(WorkflowModel.id)
-            .filter(
-                WorkflowModel.root_terminal_id.in_(terminal_ids),
-                WorkflowModel.status == "open",
-            )
-            .first()
-        )
-        queued_turn = (
-            db.query(WorkflowTurnModel.id)
-            .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
-            .filter(
-                WorkflowModel.root_terminal_id.in_(terminal_ids),
-                # Turn rows are immutable delivery history. Once their owning
-                # workflow is terminal they cannot be claimed or transported,
-                # even when an old row still says queued/claimed/sent.
-                WorkflowModel.status.notin_(_WORKSPACE_RETIREMENT_TERMINAL_WORKFLOW_STATES),
-                WorkflowTurnModel.state.in_(("queued", "claimed", "sent")),
-                WorkflowTurnModel.superseded_by_turn_id.is_(None),
-            )
-            .first()
-        )
-        pending_inbox = (
-            db.query(InboxModel.id)
-            .filter(
-                InboxModel.status == MessageStatus.PENDING.value,
-                or_(
-                    InboxModel.sender_id.in_(terminal_ids), InboxModel.receiver_id.in_(terminal_ids)
-                ),
-            )
-            .first()
-        )
-        active_assignment = (
-            db.query(ChildAssignmentModel.id)
-            .filter(
-                or_(
-                    ChildAssignmentModel.parent_terminal_id.in_(terminal_ids),
-                    ChildAssignmentModel.child_terminal_id.in_(terminal_ids),
-                ),
-                ChildAssignmentModel.status.in_(_WORKSPACE_RETIREMENT_ACTIVE_ASSIGNMENT_STATES),
-                ChildAssignmentModel.review_superseded_at.is_(None),
-            )
-            .first()
-        )
-        active_effect = (
-            db.query(WorkflowEffectModel.id)
-            .join(WorkflowModel, WorkflowModel.id == WorkflowEffectModel.workflow_id)
-            .filter(
-                WorkflowModel.root_terminal_id.in_(terminal_ids),
-                WorkflowEffectModel.state.in_(("claimed", "indeterminate")),
-            )
-            .first()
-        )
-        provider_execution = (
-            db.query(ProviderExecutionLeaseModel.terminal_id)
-            .filter(ProviderExecutionLeaseModel.terminal_id.in_(terminal_ids))
-            .first()
-        )
-        writer_lease = (
-            db.query(WorktreeWriterLeaseModel.terminal_id)
-            .filter(WorktreeWriterLeaseModel.terminal_id.in_(terminal_ids))
-            .first()
-        )
-        recovery = (
-            db.query(RecoveryTakeoverModel.id)
-            .filter(
-                or_(
-                    RecoveryTakeoverModel.old_terminal_id.in_(terminal_ids),
-                    RecoveryTakeoverModel.new_terminal_id.in_(terminal_ids),
-                ),
-                RecoveryTakeoverModel.state.in_(("claimed", "fenced", "dispatching", "admitted")),
-            )
-            .first()
-        )
-        if owner_gate is not None:
+        categories = {
+            str(item["category"]): item
+            for item in unresolved_plan["blockers"]
+            if int(item["count"]) > 0
+        }
+        workflow_reasons = {
+            str(reason)
+            for item in unresolved_plan["blockers"]
+            if item["category"] == "unfinished_workflows"
+            for reason in item["reason_codes"]
+        }
+        if "OWNER_GATE" in workflow_reasons:
             reason_code = "OWNER_GATE"
-        elif open_workflow is not None:
+        elif "WORKFLOW_OPEN" in workflow_reasons:
             reason_code = "WORKFLOW_OPEN"
-        elif (
-            queued_turn is not None
-            or pending_inbox is not None
-            or active_assignment is not None
-            or active_effect is not None
+        elif any(
+            category in categories
+            for category in (
+                "queued_work",
+                "pending_delivery",
+                "external_delivery",
+                "child_assignments",
+                "external_assignments",
+                "workflow_effects",
+                "historical_indeterminate_effects",
+                "plan_limit",
+            )
         ):
             reason_code = "QUEUED_WORK"
-        elif provider_execution is not None:
+        elif "provider_execution" in categories:
             reason_code = "PROVIDER_EXECUTION_ACTIVE"
-        elif writer_lease is not None:
+        elif "writer_authority" in categories:
             reason_code = "WRITER_LEASE_ACTIVE"
-        elif recovery is not None:
+        elif "recovery_authority" in categories:
             reason_code = "RECOVERY_PROTECTED"
 
     terminal_documents = [
@@ -3713,12 +5386,14 @@ def _session_workspace_snapshot_in_transaction(
         "base_revision": context.base_revision,
         "writer_authority_generation": context.writer_authority_generation,
         "reason_code": reason_code,
+        "unresolved_plan_token": unresolved_plan["plan_token"],
         "terminals": terminal_documents,
     }
     return {
         "context": _work_context_dict(context),
         "terminals": terminal_documents,
         "reason_code": reason_code,
+        "unresolved_work": _public_session_unresolved_work_plan(unresolved_plan),
         "authority_fingerprint": hashlib.sha256(
             json.dumps(fingerprint_document, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest(),
@@ -3751,6 +5426,516 @@ def get_session_workspace_retirement_snapshot(context_id: str) -> Optional[Dict[
         return (
             _session_workspace_snapshot_in_transaction(db, context) if context is not None else None
         )
+
+
+def _session_identity_changed_plan() -> Dict[str, Any]:
+    blocker = {
+        "category": "session_identity",
+        "count": 1,
+        "disposition": "unsafe",
+        "reason_codes": ["SESSION_IDENTITY_CHANGED"],
+    }
+    return {
+        "eligible": False,
+        "deletion_mode": "blocked_live_or_unsafe_authority",
+        "cancellable": False,
+        "can_resolve_and_delete": False,
+        "requires_cancellation_confirmation": False,
+        "requires_historical_indeterminate_confirmation": False,
+        "plan_token": None,
+        "blockers": [blocker],
+        "cancellable_count": 0,
+        "historical_indeterminate_count": 0,
+        "unsafe_count": 1,
+        "live_unsafe_count": 1,
+        "plan_limit": _SESSION_DELETION_PLAN_LIMIT,
+        "reason_codes": ["SESSION_IDENTITY_CHANGED"],
+        "blocking_recovery_operations": [],
+    }
+
+
+def _session_plan_terminals(
+    db: Any,
+    session_id: str,
+    expected_terminal_ids: Sequence[str] | None,
+) -> Optional[List[TerminalModel]]:
+    expected = list(dict.fromkeys(str(value) for value in expected_terminal_ids or () if value))
+    terminals = cast(
+        List[TerminalModel],
+        db.query(TerminalModel)
+        .filter(
+            or_(
+                TerminalModel.session_id == session_id,
+                and_(
+                    TerminalModel.session_id.is_(None),
+                    ("legacy:" + TerminalModel.tmux_session) == session_id,
+                ),
+            )
+        )
+        .order_by(TerminalModel.creation_order.asc(), TerminalModel.id.asc())
+        .limit(_SESSION_DELETION_PLAN_LIMIT + 1)
+        .all(),
+    )
+    if (
+        len(terminals) <= _SESSION_DELETION_PLAN_LIMIT
+        and expected_terminal_ids is not None
+        and {str(terminal.id) for terminal in terminals} != set(expected)
+    ):
+        return None
+    return terminals
+
+
+def get_session_unresolved_work_plan(
+    session_id: str,
+    *,
+    expected_terminal_ids: Sequence[str] | None = None,
+) -> Dict[str, Any]:
+    """Return a bounded public deletion plan for one stable Session lifetime."""
+    # Reuse the interaction projection's additive indexes so the shared
+    # unresolved-work predicates remain bounded on rolling-upgrade databases.
+    _ensure_terminal_ui_projection_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_workflow_schema()
+    _ensure_child_assignment_schema()
+    _ensure_provider_execution_schema()
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        terminals = _session_plan_terminals(db, session_id, expected_terminal_ids)
+        if terminals is None:
+            return _session_identity_changed_plan()
+        if not terminals:
+            receipts = _session_historical_terminal_receipts(db, session_id)
+            names = {str(receipt.session_name) for receipt in receipts}
+            if len(names) != 1:
+                reason_code = (
+                    "SESSION_LIFETIME_AUTHORITY_INCOMPLETE"
+                    if not receipts
+                    else "SESSION_LIFETIME_RECEIPT_CONFLICT"
+                )
+            else:
+                _receipts, reason_code = _validate_session_terminal_receipt_authority(
+                    db,
+                    session_id,
+                    names.pop(),
+                    require_complete=True,
+                )
+            if reason_code is not None:
+                plan = _session_identity_changed_plan()
+                plan["reason_codes"] = [reason_code]
+                plan["blockers"][0]["reason_codes"] = [reason_code]
+                return plan
+        return _public_session_unresolved_work_plan(
+            _session_unresolved_work_plan_in_transaction(
+                db,
+                session_id=session_id,
+                terminals=terminals,
+            )
+        )
+
+
+def cancel_session_work_for_deletion(
+    session_id: str,
+    *,
+    expected_plan_token: str,
+    expected_terminal_ids: Sequence[str] | None = None,
+    cancel_unresolved_work: bool = True,
+    retire_historical_indeterminate: bool = False,
+) -> Dict[str, Any]:
+    """Apply one exact deletion plan and retain append-only lifecycle evidence.
+
+    Ordinary Session-owned work is cancelled only when ``cancel_unresolved_work``
+    is explicit. Historical effects with an unknowable external outcome require
+    the separate retirement intent and retain that uncertainty permanently.
+    """
+    if not isinstance(expected_plan_token, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", expected_plan_token
+    ):
+        return {"cancelled": False, "reason_code": "SESSION_DELETE_INTENT_INVALID"}
+    _ensure_terminal_ui_projection_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_workflow_schema()
+    _ensure_child_assignment_schema()
+    _ensure_managed_attempt_lifecycle_schema()
+    _ensure_delegation_result_schema()
+    _ensure_provider_execution_schema()
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminals = _session_plan_terminals(db, session_id, expected_terminal_ids)
+        if terminals is None:
+            receipt = db.get(SessionDeletionReceiptModel, session_id)
+            db.rollback()
+            if receipt is not None:
+                return {"cancelled": True, "already_deleted": True, "residual": None}
+            return {"cancelled": False, "reason_code": "SESSION_IDENTITY_CHANGED"}
+        if not terminals:
+            receipts = _session_historical_terminal_receipts(db, session_id)
+            names = {str(receipt.session_name) for receipt in receipts}
+            if len(names) != 1:
+                db.rollback()
+                return {
+                    "cancelled": False,
+                    "reason_code": (
+                        "SESSION_LIFETIME_AUTHORITY_INCOMPLETE"
+                        if not receipts
+                        else "SESSION_LIFETIME_RECEIPT_CONFLICT"
+                    ),
+                }
+            _receipts, authority_error = _validate_session_terminal_receipt_authority(
+                db,
+                session_id,
+                names.pop(),
+                require_complete=True,
+            )
+            if authority_error is not None:
+                db.rollback()
+                return {"cancelled": False, "reason_code": authority_error}
+        terminal_ids = _session_graph_terminal_ids(
+            db,
+            session_id,
+            [str(terminal.id) for terminal in terminals],
+        )
+        if terminal_ids is None:
+            db.rollback()
+            return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_TOO_LARGE"}
+        plan = _session_unresolved_work_plan_in_transaction(
+            db,
+            session_id=session_id,
+            terminals=terminals,
+        )
+        if plan["eligible"]:
+            db.rollback()
+            return {
+                "cancelled": True,
+                "already_cancelled": True,
+                "residual": _public_session_unresolved_work_plan(plan),
+            }
+        if plan["plan_token"] != expected_plan_token:
+            db.rollback()
+            return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
+        if plan["_unsafe_items"]:
+            db.rollback()
+            return {"cancelled": False, "reason_code": "SESSION_DELETE_AUTHORITY_UNSAFE"}
+        if plan["_cancellable_items"] and not cancel_unresolved_work:
+            db.rollback()
+            return {
+                "cancelled": False,
+                "reason_code": "SESSION_CANCELLATION_CONFIRMATION_REQUIRED",
+            }
+        if plan["_retirement_items"] and not retire_historical_indeterminate:
+            db.rollback()
+            return {
+                "cancelled": False,
+                "reason_code": "SESSION_HISTORICAL_INDETERMINATE_CONFIRMATION_REQUIRED",
+            }
+        if not plan["_cancellable_items"] and not plan["_retirement_items"]:
+            db.rollback()
+            return {"cancelled": False, "reason_code": "SESSION_DELETE_AUTHORITY_UNSAFE"}
+
+        now = datetime.now()
+        items = list(plan["_cancellable_items"])
+        retirement_items = list(plan["_retirement_items"])
+
+        def ids(kind: str) -> list[Any]:
+            values = [item["item_id"] for item in items if item["item_kind"] == kind]
+            if kind in {"workflow", "workflow_turn", "inbox", "child_assignment"}:
+                return [int(value) for value in values]
+            return values
+
+        workflow_ids = ids("workflow")
+        turn_ids = ids("workflow_turn")
+        inbox_ids = ids("inbox")
+        assignment_ids = ids("child_assignment")
+        effect_ids = [
+            int(item["item_id"])
+            for item in retirement_items
+            if item["item_kind"] == "workflow_effect"
+        ]
+        notification_items = [
+            item for item in retirement_items if item["item_kind"] == "telegram_delivery"
+        ]
+        notification_ids = [str(item["item_id"]) for item in notification_items]
+
+        effect_rows = (
+            db.query(WorkflowEffectModel, WorkflowModel, WorkflowTurnModel)
+            .join(WorkflowModel, WorkflowModel.id == WorkflowEffectModel.workflow_id)
+            .join(
+                WorkflowTurnModel,
+                and_(
+                    WorkflowTurnModel.id == WorkflowEffectModel.workflow_turn_id,
+                    WorkflowTurnModel.workflow_id == WorkflowEffectModel.workflow_id,
+                ),
+            )
+            .filter(
+                WorkflowEffectModel.id.in_(effect_ids),
+                WorkflowEffectModel.state.in_(("claimed", "indeterminate")),
+                WorkflowModel.root_terminal_id.in_(terminal_ids),
+            )
+            .all()
+            if effect_ids
+            else []
+        )
+        expected_effect_states = {
+            int(item["item_id"]): str(item["state"])
+            for item in retirement_items
+            if item["item_kind"] == "workflow_effect"
+        }
+        expected_effect_authority = {
+            int(item["item_id"]): dict(item.get("authority", {}))
+            for item in retirement_items
+            if item["item_kind"] == "workflow_effect"
+        }
+        if {int(effect.id) for effect, _workflow, _turn in effect_rows} != set(effect_ids) or any(
+            str(effect.state) != expected_effect_states[int(effect.id)]
+            or _workflow_effect_retirement_classification(effect, workflow, turn)[0]
+            != "historical_indeterminate"
+            or _workflow_effect_retirement_authority(effect, workflow, turn)
+            != expected_effect_authority[int(effect.id)]
+            for effect, workflow, turn in effect_rows
+        ):
+            db.rollback()
+            return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
+        for effect, _workflow, _turn in effect_rows:
+            effect.state = _OPERATOR_RETIRED_INDETERMINATE_EFFECT
+            effect.updated_at = now
+
+        notification_rows = (
+            db.query(TelegramDeliveryModel, WorkflowModel)
+            .join(
+                WorkflowModel,
+                and_(
+                    WorkflowModel.id == TelegramDeliveryModel.workflow_id,
+                    WorkflowModel.root_terminal_id == TelegramDeliveryModel.root_terminal_id,
+                ),
+            )
+            .filter(
+                TelegramDeliveryModel.event_key.in_(notification_ids),
+                TelegramDeliveryModel.root_terminal_id.in_(terminal_ids),
+                TelegramDeliveryModel.state == "claimed",
+            )
+            .all()
+            if notification_ids
+            else []
+        )
+        expected_notification_authority = {
+            str(item["item_id"]): dict(item.get("authority", {})) for item in notification_items
+        }
+        if {str(notification.event_key) for notification, _workflow in notification_rows} != set(
+            notification_ids
+        ) or any(
+            {
+                "workflow_id": int(notification.workflow_id),
+                "root_terminal_id": str(notification.root_terminal_id),
+                "event_kind": str(notification.event_kind),
+                "updated_at": str(notification.updated_at or ""),
+            }
+            != expected_notification_authority[str(notification.event_key)]
+            for notification, _workflow in notification_rows
+        ):
+            db.rollback()
+            return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
+        for notification, _workflow in notification_rows:
+            notification.state = _OPERATOR_RETIRED_INDETERMINATE_EFFECT
+            notification.error_code = "operator_session_deletion_unknown_outcome"
+            notification.updated_at = now
+
+        if turn_ids:
+            transitioned_turns = (
+                db.query(WorkflowTurnModel)
+                .filter(
+                    WorkflowTurnModel.id.in_(turn_ids),
+                    WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED, TURN_SENT)),
+                    WorkflowTurnModel.superseded_by_turn_id.is_(None),
+                )
+                .update(
+                    {
+                        WorkflowTurnModel.state: TURN_CANCELLED,
+                        WorkflowTurnModel.claim_token: None,
+                        WorkflowTurnModel.claim_expires_at: None,
+                        WorkflowTurnModel.updated_at: now,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if transitioned_turns != len(turn_ids):
+                db.rollback()
+                return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
+        if inbox_ids:
+            transitioned_inbox = (
+                db.query(InboxModel)
+                .filter(
+                    InboxModel.id.in_(inbox_ids),
+                    InboxModel.status == MessageStatus.PENDING.value,
+                )
+                .update(
+                    {
+                        InboxModel.status: MessageStatus.SUPERSEDED.value,
+                        InboxModel.superseded_at: now,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if transitioned_inbox != len(inbox_ids):
+                db.rollback()
+                return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
+
+        workflows = (
+            db.query(WorkflowModel)
+            .filter(
+                WorkflowModel.id.in_(workflow_ids),
+                workflow_current_execution_authority_predicate(WorkflowModel),
+            )
+            .all()
+            if workflow_ids
+            else []
+        )
+        if {int(workflow.id) for workflow in workflows} != set(workflow_ids):
+            db.rollback()
+            return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
+        for workflow in workflows:
+            workflow.status = WORKFLOW_CANCELLED
+            workflow.terminal_reason = "operator deleted Session"
+            workflow.updated_at = now
+
+        assignments = (
+            db.query(ChildAssignmentModel)
+            .filter(
+                ChildAssignmentModel.id.in_(assignment_ids),
+                ChildAssignmentModel.status.in_(_WORKSPACE_RETIREMENT_ACTIVE_ASSIGNMENT_STATES),
+                ChildAssignmentModel.review_superseded_at.is_(None),
+            )
+            .all()
+            if assignment_ids
+            else []
+        )
+        if {int(assignment.id) for assignment in assignments} != set(assignment_ids):
+            db.rollback()
+            return {"cancelled": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
+        for assignment in assignments:
+            kind = "handoff" if assignment.status.startswith("handoff_") else "assign"
+            assignment.status = ChildAssignmentStatus.CANCELLED.value
+            assignment.updated_at = now
+            result = _create_result_for_assignment(
+                db,
+                assignment,
+                kind,
+                _open_workflow(db, assignment.parent_terminal_id, create=False),
+            )
+            if result.status == DelegationResultStatus.AWAITING.value:
+                result.status = DelegationResultStatus.CANCELLED.value
+                result.reason_code = "operator_session_deletion"
+                result.finalized_at = result.updated_at = now
+                _record_result_event(
+                    db,
+                    result.id,
+                    f"result-cancelled:{assignment.id}:session-delete",
+                    "cancelled",
+                    "cao_lifecycle",
+                    assignment.parent_terminal_id,
+                )
+                _purge_staged_handoff_submission(db, result.id)
+
+        final_states = {
+            "workflow": WORKFLOW_CANCELLED,
+            "workflow_turn": TURN_CANCELLED,
+            "inbox": MessageStatus.SUPERSEDED.value,
+            "child_assignment": ChildAssignmentStatus.CANCELLED.value,
+            "workflow_effect": _OPERATOR_RETIRED_INDETERMINATE_EFFECT,
+            "telegram_delivery": _OPERATOR_RETIRED_INDETERMINATE_EFFECT,
+        }
+        audit_items = [
+            (
+                item,
+                (
+                    f"session-delete-retire:{session_id}:"
+                    if item["item_kind"] in {"workflow_effect", "telegram_delivery"}
+                    else f"session-delete-cancel:{session_id}:"
+                )
+                + f"{item['item_kind']}:{item['item_id']}",
+            )
+            for item in items + retirement_items
+        ]
+        existing_event_keys = {
+            str(row[0])
+            for row in db.query(SessionDeletionCancellationAuditModel.event_key)
+            .filter(
+                SessionDeletionCancellationAuditModel.event_key.in_(
+                    [event_key for _item, event_key in audit_items]
+                )
+            )
+            .all()
+        }
+        for item, event_key in audit_items:
+            if event_key not in existing_event_keys:
+                db.add(
+                    SessionDeletionCancellationAuditModel(
+                        event_key=event_key,
+                        session_id=session_id,
+                        item_kind=item["item_kind"],
+                        item_id=item["item_id"],
+                        previous_state=item["state"],
+                        final_state=final_states[item["item_kind"]],
+                        reason_code=(
+                            "OPERATOR_RETIRED_UNKNOWN_OUTCOME"
+                            if item["item_kind"] in {"workflow_effect", "telegram_delivery"}
+                            else "OPERATOR_SESSION_DELETION"
+                        ),
+                        created_at=now,
+                    )
+                )
+        db.flush()
+        residual = _session_unresolved_work_plan_in_transaction(
+            db,
+            session_id=session_id,
+            terminals=terminals,
+        )
+        if not residual["eligible"]:
+            db.rollback()
+            return {
+                "cancelled": False,
+                "reason_code": "SESSION_DELETE_CANCELLATION_INCOMPLETE",
+                "residual": _public_session_unresolved_work_plan(residual),
+            }
+        db.commit()
+        return {
+            "cancelled": True,
+            "already_cancelled": False,
+            "cancelled_count": len(items),
+            "retired_indeterminate_count": len(retirement_items),
+            "residual": _public_session_unresolved_work_plan(residual),
+        }
+
+
+def list_session_deletion_cancellation_audit(
+    session_id: str,
+    *,
+    limit: int = _SESSION_DELETION_PLAN_LIMIT,
+) -> List[Dict[str, Any]]:
+    """Return durable cancellation evidence for diagnostics and regression tests."""
+    if isinstance(limit, bool) or not 1 <= limit <= _SESSION_DELETION_PLAN_LIMIT:
+        raise ValueError(f"limit must be between 1 and {_SESSION_DELETION_PLAN_LIMIT}")
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        rows = (
+            db.query(SessionDeletionCancellationAuditModel)
+            .filter(SessionDeletionCancellationAuditModel.session_id == session_id)
+            .order_by(SessionDeletionCancellationAuditModel.id.asc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "item_kind": row.item_kind,
+                "item_id": row.item_id,
+                "previous_state": row.previous_state,
+                "final_state": row.final_state,
+                "reason_code": row.reason_code,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ]
 
 
 def claim_session_workspace_retirement(
@@ -3852,12 +6037,15 @@ def create_terminal(
     runtime_process_start_ticks: Optional[int] = None,
     runtime_process_group_id: Optional[int] = None,
     runtime_process_session_id: Optional[int] = None,
+    provider_runtime_compatibility_generation: Optional[str] = None,
     recovery_takeover_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create metadata and atomically acquire any required writer lease."""
     import json as _json
 
     _ensure_terminal_worktree_authority_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     _ensure_control_plane_schema()
     # Session identity is a launch-time fact and must exist before this row is
     # ever used to record provider completion.
@@ -3868,12 +6056,18 @@ def create_terminal(
         raise ValueError("terminal context_role must be supervisor or work")
     if managed_worktree_kind not in {None, "supervisor", "task", "reviewer"}:
         raise ValueError("managed_worktree_kind must be supervisor, task, or reviewer")
+    if provider_runtime_compatibility_generation is not None and (
+        provider != "codex"
+        or re.fullmatch(r"[0-9a-f]{64}", provider_runtime_compatibility_generation) is None
+    ):
+        raise ValueError("provider runtime compatibility generation is invalid")
     if workspace_classification not in {None, "managed_isolated", "legacy_shared_root"}:
         raise ValueError("workspace_classification is invalid")
     with SessionLocal() as db:
-        if privileged_launch or recovery_takeover_id is not None or context_role == "supervisor":
-            # Serialize validation, one-use consumption, and terminal metadata.
-            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        # Every terminal materialization is Session-lifecycle authority.  The
+        # writer transaction makes the hard-delete fence and terminal insert
+        # mutually exclusive even for non-privileged child creation.
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         existing_session = (
             db.query(TerminalModel.session_id)
             .filter(
@@ -3890,6 +6084,55 @@ def create_terminal(
             if session_lifetime_id
             else str(existing_session[0]) if existing_session else str(uuid.uuid4())
         )
+        deletion_operation = db.get(SessionDeletionOperationModel, session_id)
+        deletion_receipt = db.get(SessionDeletionReceiptModel, session_id)
+        deleted_terminal = _terminal_deletion_fence_exists_in_transaction(db, terminal_id)
+        operation_for_name = (
+            db.query(SessionDeletionOperationModel.session_id)
+            .filter(SessionDeletionOperationModel.session_name == tmux_session)
+            .first()
+        )
+        receipt_for_name = (
+            db.query(SessionDeletionReceiptModel.session_id)
+            .filter(SessionDeletionReceiptModel.session_name == tmux_session)
+            .first()
+        )
+        transitional_lifetime_rows_for_name = (
+            db.query(TerminalDeletionReceiptModel.session_id)
+            .filter(
+                TerminalDeletionReceiptModel.session_name == tmux_session,
+                TerminalDeletionReceiptModel.session_lifetime_authority_version == 1,
+            )
+            .distinct()
+            .limit(2)
+            .all()
+        )
+        transitional_lifetime_ids_for_name = {
+            str(row[0]) for row in transitional_lifetime_rows_for_name if row[0] is not None
+        }
+        transitional_lifetime_conflict = bool(transitional_lifetime_rows_for_name) and (
+            any(row[0] is None for row in transitional_lifetime_rows_for_name)
+            or existing_session is None
+            or transitional_lifetime_ids_for_name != {session_id}
+        )
+        if (
+            deletion_operation is not None
+            or deletion_receipt is not None
+            or deleted_terminal
+            or operation_for_name is not None
+            or receipt_for_name is not None
+            or transitional_lifetime_conflict
+        ):
+            db.rollback()
+            raise WritableWorkContextConflict(
+                "SESSION_DELETION_IN_PROGRESS"
+                if deletion_operation is not None or operation_for_name is not None
+                else (
+                    "SESSION_HISTORY_INELIGIBLE"
+                    if transitional_lifetime_conflict and receipt_for_name is None
+                    else "SESSION_DELETED"
+                )
+            )
         session_context = (
             db.query(WritableWorkContextModel)
             .filter(WritableWorkContextModel.session_id == session_id)
@@ -4106,6 +6349,7 @@ def create_terminal(
             runtime_process_start_ticks=runtime_process_start_ticks,
             runtime_process_group_id=runtime_process_group_id,
             runtime_process_session_id=runtime_process_session_id,
+            provider_runtime_compatibility_generation=(provider_runtime_compatibility_generation),
             recovery_takeover_id=recovery_takeover_id,
         )
         db.add(terminal)
@@ -4217,6 +6461,9 @@ def create_terminal(
             "runtime_process_start_ticks": terminal.runtime_process_start_ticks,
             "runtime_process_group_id": terminal.runtime_process_group_id,
             "runtime_process_session_id": terminal.runtime_process_session_id,
+            "provider_runtime_compatibility_generation": (
+                terminal.provider_runtime_compatibility_generation
+            ),
             "recovery_fenced_at": terminal.recovery_fenced_at,
             "recovery_fenced_reason": terminal.recovery_fenced_reason,
             "recovery_takeover_id": terminal.recovery_takeover_id,
@@ -4292,6 +6539,9 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "runtime_process_session_id": terminal.runtime_process_session_id,
             "provider_resume_identity": terminal.provider_resume_identity,
             "provider_resume_runtime_generation": terminal.provider_resume_runtime_generation,
+            "provider_runtime_compatibility_generation": (
+                terminal.provider_runtime_compatibility_generation
+            ),
             "runtime_operation_kind": terminal.runtime_operation_kind,
             "runtime_operation_token": terminal.runtime_operation_token,
             "runtime_operation_claimed_at": terminal.runtime_operation_claimed_at,
@@ -4314,28 +6564,88 @@ def terminal_auth_token_matches(terminal_id: str, token: str) -> bool:
         )
 
 
-def _session_terminal_dict(terminal: TerminalModel) -> Dict[str, Any]:
+def terminal_has_critical_owner_authority(terminal_id: str) -> bool:
+    """Verify the immutable owner-executor launch receipt without exposing it."""
+    if not isinstance(terminal_id, str) or not terminal_id:
+        return False
+    with SessionLocal() as db:
+        authority = (
+            db.query(TerminalModel.agent_profile, TerminalModel.owner_grant_id)
+            .filter(TerminalModel.id == terminal_id)
+            .one_or_none()
+        )
+        return bool(
+            authority is not None
+            and authority.agent_profile == "critical_sol_xhigh_owner"
+            and authority.owner_grant_id
+        )
+
+
+def terminal_deletion_auth_token_matches(terminal_id: str, token: str) -> bool:
+    """Recognize one deleted terminal capability without reviving live authority."""
+    if not isinstance(token, str) or not token:
+        return False
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
+    token_digest = hashlib.sha256(token.encode("utf-8", "strict")).hexdigest()
+    with SessionLocal() as db:
+        receipt = db.get(TerminalDeletionReceiptModel, terminal_id)
+        session_receipt = (
+            db.get(SessionDeletionReceiptModel, receipt.session_id)
+            if receipt is not None and receipt.session_id
+            else None
+        )
+        legacy_match = bool(
+            receipt is not None
+            and session_receipt is not None
+            and int(session_receipt.receipt_version or 1) >= 2
+            and receipt.auth_token_sha256
+            and hmac.compare_digest(str(receipt.auth_token_sha256), token_digest)
+        )
+        if legacy_match:
+            return True
+        fenced, digest = _hard_deleted_terminal_fence_in_transaction(db, terminal_id)
+        return bool(fenced and digest and hmac.compare_digest(digest, token_digest))
+
+
+_SESSION_WORKSPACE_RETIREMENT_TERMINAL_FIELDS = (
+    "id",
+    "session_id",
+    "project_id",
+    "launch_worktree",
+    "managed_worktree_kind",
+    "managed_worktree_source",
+    "managed_worktree_branch",
+    "managed_worktree_commit",
+    "managed_worktree_origin_terminal_id",
+    "writable_work_context_id",
+    "writer_authority_generation",
+)
+
+
+def _session_workspace_retirement_terminal_dict(
+    terminal: TerminalModel,
+) -> Dict[str, Any]:
+    """Project every durable field consumed by managed-worktree retirement."""
     return {
-        "id": terminal.id,
+        field: getattr(terminal, field) for field in _SESSION_WORKSPACE_RETIREMENT_TERMINAL_FIELDS
+    }
+
+
+def _session_terminal_dict(terminal: TerminalModel) -> Dict[str, Any]:
+    workspace_retirement = _session_workspace_retirement_terminal_dict(terminal)
+    return {
+        **workspace_retirement,
         "tmux_session": terminal.tmux_session,
-        "session_id": terminal.session_id,
         "tmux_window": terminal.tmux_window,
         "provider": terminal.provider,
         "agent_profile": terminal.agent_profile,
         "profile_revision_id": terminal.profile_revision_id,
         "provider_config_revision_id": terminal.provider_config_revision_id,
         "launch_snapshot_status": terminal.launch_snapshot_status,
-        "launch_worktree": terminal.launch_worktree,
         "write_enabled": terminal.write_enabled,
         "context_role": terminal.context_role,
-        "managed_worktree_kind": terminal.managed_worktree_kind,
-        "managed_worktree_source": terminal.managed_worktree_source,
-        "managed_worktree_branch": terminal.managed_worktree_branch,
-        "managed_worktree_commit": terminal.managed_worktree_commit,
-        "managed_worktree_origin_terminal_id": terminal.managed_worktree_origin_terminal_id,
-        "writable_work_context_id": terminal.writable_work_context_id,
         "workspace_classification": terminal.workspace_classification,
-        "project_id": terminal.project_id,
         "project_name": terminal.project_name,
         "project_path": terminal.project_path,
         "project_description": terminal.project_description,
@@ -4354,9 +6664,41 @@ def _session_terminal_dict(terminal: TerminalModel) -> Dict[str, Any]:
 
 
 def _ensure_session_deletion_receipt_schema() -> None:
+    global _session_deletion_receipt_schema_engine_identity
+    global _session_deletion_receipt_schema_ready
+    engine_identity = id(engine)
+    if (
+        _session_deletion_receipt_schema_ready
+        and _session_deletion_receipt_schema_engine_identity == engine_identity
+    ):
+        return
     with _session_deletion_receipt_schema_lock:
+        if (
+            _session_deletion_receipt_schema_ready
+            and _session_deletion_receipt_schema_engine_identity == engine_identity
+        ):
+            return
+        # A cached completion belongs only to the engine that established it.
+        # Keep the new engine unready until its durable migration receipt has
+        # been verified or its crash-resumable backfill has completed.
+        _session_deletion_receipt_schema_ready = False
+        _session_deletion_receipt_schema_engine_identity = None
         SessionDeletionReceiptModel.__table__.create(bind=engine, checkfirst=True)
+        SessionDeletedTerminalFenceModel.__table__.create(bind=engine, checkfirst=True)
+        SessionDeletionOperationModel.__table__.create(bind=engine, checkfirst=True)
+        SessionDeletionCancellationAuditModel.__table__.create(bind=engine, checkfirst=True)
+        MigrationReceiptModel.__table__.create(bind=engine, checkfirst=True)
         with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_session_deleted_terminal_fences_session_id "
+                "ON session_deleted_terminal_fences (session_id)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_session_deleted_terminal_fences_auth_token_sha256 "
+                "ON session_deleted_terminal_fences (auth_token_sha256)"
+            )
             columns = {
                 row[1]
                 for row in connection.exec_driver_sql(
@@ -4368,6 +6710,71 @@ def _ensure_session_deletion_receipt_schema() -> None:
                     "ALTER TABLE session_deletion_receipts "
                     "ADD COLUMN retained_resources_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            if "deletion_reason" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_receipts "
+                    "ADD COLUMN deletion_reason VARCHAR NOT NULL "
+                    "DEFAULT 'operator_session_delete'"
+                )
+            if "authority_fingerprint" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_receipts "
+                    "ADD COLUMN authority_fingerprint VARCHAR"
+                )
+            if "terminal_fences_json" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_receipts "
+                    "ADD COLUMN terminal_fences_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "receipt_version" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_receipts "
+                    "ADD COLUMN receipt_version INTEGER NOT NULL DEFAULT 1"
+                )
+            if "workspace_disposition" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_receipts "
+                    "ADD COLUMN workspace_disposition VARCHAR NOT NULL DEFAULT 'retired'"
+                )
+            if "workspace_evidence_json" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_receipts "
+                    "ADD COLUMN workspace_evidence_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            operation_columns = {
+                row[1]
+                for row in connection.exec_driver_sql(
+                    "PRAGMA table_info(session_deletion_operations)"
+                ).fetchall()
+            }
+            if "workspace_authority_json" not in operation_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_operations "
+                    "ADD COLUMN workspace_authority_json TEXT"
+                )
+            if "workspace_authority_sha256" not in operation_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_operations "
+                    "ADD COLUMN workspace_authority_sha256 VARCHAR"
+                )
+            if "workspace_disposition" not in operation_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_operations "
+                    "ADD COLUMN workspace_disposition VARCHAR"
+                )
+            if "workspace_evidence_json" not in operation_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_operations "
+                    "ADD COLUMN workspace_evidence_json TEXT"
+                )
+            if "workspace_evidence_sha256" not in operation_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_operations "
+                    "ADD COLUMN workspace_evidence_sha256 VARCHAR"
+                )
+        _ensure_session_deleted_terminal_fence_backfill()
+        _session_deletion_receipt_schema_engine_identity = engine_identity
+        _session_deletion_receipt_schema_ready = True
 
 
 def _normalize_session_retained_resources(
@@ -4407,63 +6814,1361 @@ def _session_receipt_retained_resources(
         raise AmbiguousSessionIdentity(str(receipt.session_id)) from exc
 
 
-def _ensure_terminal_deletion_receipt_schema() -> None:
-    TerminalDeletionReceiptModel.__table__.create(bind=engine, checkfirst=True)
-
-
-def _session_recovery_authorities(
-    db: Any, session_id: str, terminals: Sequence[TerminalModel]
-) -> list[dict[str, Any]]:
-    """Project only recovery state that still owns unfinished authority.
-
-    ``recovery_fenced`` is durable history after a successful takeover, not by
-    itself an unfinished operation.  A takeover remains authoritative until it
-    completes, while a pre-fence terminal failure releases the claim.  A
-    ``recovery_required`` terminal without such a claim is its own explicit
-    recovery opportunity and must still fence destructive Session deletion.
-    """
-    takeover_rows = (
-        db.query(RecoveryTakeoverModel)
-        .filter(
-            RecoveryTakeoverModel.old_session_id == session_id,
-            or_(
-                RecoveryTakeoverModel.state.notin_(("completed", "failed")),
-                and_(
-                    RecoveryTakeoverModel.state == "failed",
-                    RecoveryTakeoverModel.fenced_at.is_not(None),
-                ),
-            ),
+def _session_receipt_workspace_projection(
+    receipt: SessionDeletionReceiptModel,
+) -> tuple[str, str]:
+    disposition = str(receipt.workspace_disposition or _SESSION_WORKSPACE_DISPOSITION_RETIRED)
+    if disposition not in {
+        _SESSION_WORKSPACE_DISPOSITION_RETIRED,
+        _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN,
+    }:
+        raise AmbiguousSessionIdentity(str(receipt.session_id))
+    try:
+        _evidence, _encoded, digest = _canonical_session_workspace_evidence(
+            json.loads(str(receipt.workspace_evidence_json or "[]"))
         )
-        .order_by(RecoveryTakeoverModel.created_at.asc(), RecoveryTakeoverModel.id.asc())
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AmbiguousSessionIdentity(str(receipt.session_id)) from exc
+    return disposition, digest
+
+
+def _normalize_session_terminal_fences(value: Any) -> list[dict[str, str | None]]:
+    """Validate the minimal, bounded late-callback fence in a Session tombstone."""
+    if not isinstance(value, list) or len(value) > _SESSION_DELETION_PLAN_LIMIT:
+        raise ValueError("terminal fences must be a bounded list")
+    normalized: list[dict[str, str | None]] = []
+    terminal_ids: set[str] = set()
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != {
+            "terminal_id",
+            "auth_token_sha256",
+        }:
+            raise ValueError("terminal fence identity is invalid")
+        terminal_id = item.get("terminal_id")
+        digest = item.get("auth_token_sha256")
+        if (
+            not isinstance(terminal_id, str)
+            or not terminal_id
+            or terminal_id in terminal_ids
+            or (
+                digest is not None
+                and not (isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest))
+            )
+        ):
+            raise ValueError("terminal fence identity is invalid")
+        terminal_ids.add(terminal_id)
+        normalized.append({"terminal_id": terminal_id, "auth_token_sha256": digest})
+    return sorted(normalized, key=lambda item: str(item["terminal_id"]))
+
+
+def _session_receipt_terminal_fences(
+    receipt: SessionDeletionReceiptModel,
+) -> list[dict[str, str | None]]:
+    if int(receipt.receipt_version or 1) < 3:
+        return []
+    try:
+        return _normalize_session_terminal_fences(
+            json.loads(str(receipt.terminal_fences_json or "[]"))
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise AmbiguousSessionIdentity(str(receipt.session_id)) from exc
+
+
+def _backfill_session_deleted_terminal_fences(connection: Any) -> dict[str, int]:
+    """Index exact v3 tombstone fences in deterministic bounded pages."""
+    last_session_id = ""
+    inspected_receipts = 0
+    indexed_fences = 0
+    while True:
+        page = connection.exec_driver_sql(
+            "SELECT session_id, terminal_fences_json, deleted_at "
+            "FROM session_deletion_receipts "
+            "WHERE COALESCE(receipt_version, 1) >= 3 AND session_id > ? "
+            "ORDER BY session_id LIMIT ?",
+            (last_session_id, SESSION_DELETED_TERMINAL_FENCE_BACKFILL_BATCH_SIZE),
+        ).fetchall()
+        if not page:
+            break
+        for session_id_value, fences_json, deleted_at in page:
+            session_id = str(session_id_value)
+            try:
+                raw_fences = json.loads(str(fences_json or "[]"))
+                fences = _normalize_session_terminal_fences(raw_fences)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise AmbiguousSessionIdentity(session_id) from exc
+            inspected_receipts += 1
+            if fences:
+                values = [
+                    (
+                        str(fence["terminal_id"]),
+                        session_id,
+                        fence["auth_token_sha256"],
+                        deleted_at,
+                    )
+                    for fence in fences
+                ]
+                connection.exec_driver_sql(
+                    "INSERT OR IGNORE INTO session_deleted_terminal_fences"
+                    "(terminal_id, session_id, auth_token_sha256, deleted_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    values,
+                )
+                terminal_ids = [value[0] for value in values]
+                placeholders = ",".join("?" for _value in terminal_ids)
+                indexed = connection.exec_driver_sql(
+                    "SELECT terminal_id, session_id, auth_token_sha256 "
+                    "FROM session_deleted_terminal_fences "
+                    f"WHERE terminal_id IN ({placeholders})",
+                    tuple(terminal_ids),
+                ).fetchall()
+                actual = {
+                    str(terminal_id): (str(owner_session_id), digest)
+                    for terminal_id, owner_session_id, digest in indexed
+                }
+                expected = {
+                    terminal_id: (session_id, digest)
+                    for terminal_id, _session_id, digest, _deleted_at in values
+                }
+                if actual != expected:
+                    conflict = next(
+                        (
+                            terminal_id
+                            for terminal_id, authority in expected.items()
+                            if actual.get(terminal_id) != authority
+                        ),
+                        session_id,
+                    )
+                    raise AmbiguousTerminalIdentity(conflict)
+                indexed_fences += len(fences)
+            last_session_id = session_id
+    return {
+        "inspected_receipts": inspected_receipts,
+        "indexed_fences": indexed_fences,
+    }
+
+
+def _ensure_session_deleted_terminal_fence_backfill() -> None:
+    """Finish the tombstone index migration before accepting new authority."""
+    with engine.connect() as connection:
+        receipt = connection.exec_driver_sql(
+            "SELECT 1 FROM migration_receipts WHERE name = ?",
+            (SESSION_DELETED_TERMINAL_FENCE_MIGRATION,),
+        ).first()
+        connection.rollback()
+        if receipt is not None:
+            return
+        # The table may already exist after a process crash. Only this durable
+        # receipt proves that every exact v3 tombstone was indexed.
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        receipt = connection.exec_driver_sql(
+            "SELECT 1 FROM migration_receipts WHERE name = ?",
+            (SESSION_DELETED_TERMINAL_FENCE_MIGRATION,),
+        ).first()
+        if receipt is None:
+            outcome = _backfill_session_deleted_terminal_fences(connection)
+            connection.exec_driver_sql(
+                "INSERT INTO migration_receipts"
+                "(name, schema_version, detail_json, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    SESSION_DELETED_TERMINAL_FENCE_MIGRATION,
+                    SESSION_DELETED_TERMINAL_FENCE_SCHEMA_VERSION,
+                    json.dumps(
+                        {
+                            "batch_size": SESSION_DELETED_TERMINAL_FENCE_BACKFILL_BATCH_SIZE,
+                            **outcome,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    datetime.now(),
+                ),
+            )
+        connection.commit()
+
+
+def _hard_deleted_terminal_fence_in_transaction(
+    db: Any, terminal_id: str
+) -> tuple[bool, str | None]:
+    """Resolve one terminal identity through the indexed final tombstone."""
+    row = db.get(SessionDeletedTerminalFenceModel, terminal_id)
+    if row is None:
+        return False, None
+    receipt = db.get(SessionDeletionReceiptModel, row.session_id)
+    if receipt is None or int(receipt.receipt_version or 1) < 3:
+        raise AmbiguousTerminalIdentity(terminal_id)
+    digest = row.auth_token_sha256
+    if digest is not None and not (
+        isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
+    ):
+        raise AmbiguousTerminalIdentity(terminal_id)
+    return True, cast(str | None, digest)
+
+
+def _terminal_deletion_fence_exists_in_transaction(db: Any, terminal_id: str) -> bool:
+    return db.get(TerminalDeletionReceiptModel, terminal_id) is not None or (
+        _hard_deleted_terminal_fence_in_transaction(db, terminal_id)[0]
+    )
+
+
+def _hard_deleted_terminal_digest_exists_in_transaction(db: Any, token_digest: str) -> bool:
+    row = (
+        db.query(SessionDeletedTerminalFenceModel.terminal_id)
+        .join(
+            SessionDeletionReceiptModel,
+            SessionDeletionReceiptModel.session_id == SessionDeletedTerminalFenceModel.session_id,
+        )
+        .filter(
+            SessionDeletedTerminalFenceModel.auth_token_sha256 == token_digest,
+            SessionDeletionReceiptModel.receipt_version >= 3,
+        )
+        .first()
+    )
+    return row is not None
+
+
+def _normalize_session_workspace_authority(
+    value: Mapping[str, Any],
+    *,
+    expected_session_id: str,
+    expected_terminal_ids: Sequence[str],
+) -> tuple[Dict[str, Any], str, str]:
+    """Validate and canonically encode one bounded current-workspace plan."""
+    if not isinstance(value, Mapping) or set(value) != {
+        "version",
+        "work_context",
+        "worktrees",
+    }:
+        raise ValueError("workspace authority is invalid")
+    worktrees = value.get("worktrees")
+    if (
+        value.get("version") != 1
+        or not isinstance(worktrees, list)
+        or len(worktrees) > (_SESSION_DELETION_PLAN_LIMIT)
+    ):
+        raise ValueError("workspace authority is invalid")
+    unmanaged_keys = {"version", "terminal_id", "session_id", "managed"}
+    managed_keys = unmanaged_keys | {
+        "project_id",
+        "kind",
+        "identity",
+        "source",
+        "source_identity",
+        "git_common_dir",
+        "git_common_dir_identity",
+        "path",
+        "present",
+        "registered",
+        "path_identity",
+        "git_dir",
+        "git_dir_identity",
+        "head",
+        "branch",
+        "head_ref",
+        "detached",
+        "clean",
+        "modified_files",
+        "untracked_files",
+        "content_fingerprint",
+        "writer_authority_generation",
+        "writable_work_context_id",
+        "owned_ref",
+        "owned_ref_object_id",
+    }
+    context_keys = {
+        "id",
+        "session_id",
+        "terminal_id",
+        "project_id",
+        "canonical_source",
+        "canonical_worktree",
+        "branch",
+        "base_revision",
+        "state",
+        "writer_authority_generation",
+        "retirement_allow_dirty",
+        "retirement_authority_fingerprint",
+    }
+    work_context = value.get("work_context")
+    if work_context is not None:
+        if not isinstance(work_context, Mapping) or set(work_context) != context_keys:
+            raise ValueError("workspace authority is invalid")
+        context = dict(work_context)
+        if (
+            context.get("session_id") != expected_session_id
+            or context.get("state") not in {"admitted", "retiring", "retired"}
+            or not isinstance(context.get("retirement_allow_dirty"), bool)
+            or any(
+                not isinstance(context.get(key), str) or not context.get(key)
+                for key in (
+                    "id",
+                    "terminal_id",
+                    "project_id",
+                    "canonical_source",
+                    "canonical_worktree",
+                    "branch",
+                    "base_revision",
+                )
+            )
+            or not Path(str(context["canonical_source"])).is_absolute()
+            or not Path(str(context["canonical_worktree"])).is_absolute()
+            or not (
+                context.get("writer_authority_generation") is None
+                or isinstance(context.get("writer_authority_generation"), str)
+            )
+            or not (
+                context.get("retirement_authority_fingerprint") is None
+                or (
+                    isinstance(context.get("retirement_authority_fingerprint"), str)
+                    and re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        str(context["retirement_authority_fingerprint"]),
+                    )
+                )
+            )
+        ):
+            raise ValueError("workspace authority is invalid")
+
+    def valid_identity(identity: Any) -> bool:
+        return bool(
+            isinstance(identity, Mapping)
+            and set(identity) == {"device", "inode"}
+            and all(
+                isinstance(identity[key], int)
+                and not isinstance(identity[key], bool)
+                and identity[key] >= 0
+                for key in ("device", "inode")
+            )
+        )
+
+    normalized_rows: list[Dict[str, Any]] = []
+    terminal_ids: set[str] = set()
+    for raw in worktrees:
+        if not isinstance(raw, Mapping):
+            raise ValueError("workspace authority is invalid")
+        row = dict(raw)
+        managed = row.get("managed")
+        expected_keys = managed_keys if managed is True else unmanaged_keys
+        terminal_id = row.get("terminal_id")
+        if (
+            set(row) != expected_keys
+            or not isinstance(managed, bool)
+            or not isinstance(terminal_id, str)
+            or not terminal_id
+            or terminal_id in terminal_ids
+            or row.get("version") != 1
+            or row.get("session_id") != expected_session_id
+        ):
+            raise ValueError("workspace authority is invalid")
+        terminal_ids.add(terminal_id)
+        if managed:
+            kind = row.get("kind")
+            identity = row.get("identity")
+            source = row.get("source")
+            common_dir = row.get("git_common_dir")
+            path = row.get("path")
+            present = row.get("present")
+            registered = row.get("registered")
+            head = row.get("head")
+            branch = row.get("branch")
+            head_ref = row.get("head_ref")
+            detached = row.get("detached")
+            owned_ref = row.get("owned_ref")
+            owned_object = row.get("owned_ref_object_id")
+            fingerprint = row.get("content_fingerprint")
+            if (
+                kind not in {"supervisor", "task", "reviewer"}
+                or not isinstance(identity, str)
+                or not identity
+                or not all(
+                    isinstance(item, str) and Path(item).is_absolute()
+                    for item in (source, common_dir, path)
+                )
+                or not valid_identity(row.get("source_identity"))
+                or not valid_identity(row.get("git_common_dir_identity"))
+                or not isinstance(present, bool)
+                or not isinstance(registered, bool)
+                or not isinstance(row.get("clean"), bool)
+                or any(
+                    not isinstance(row.get(key), int)
+                    or isinstance(row.get(key), bool)
+                    or int(row[key]) < 0
+                    for key in ("modified_files", "untracked_files")
+                )
+                or not (row.get("project_id") is None or isinstance(row.get("project_id"), str))
+                or not (
+                    row.get("writer_authority_generation") is None
+                    or isinstance(row.get("writer_authority_generation"), str)
+                )
+                or not (
+                    row.get("writable_work_context_id") is None
+                    or isinstance(row.get("writable_work_context_id"), str)
+                )
+            ):
+                raise ValueError("workspace authority is invalid")
+            expected_ref = (
+                None
+                if kind == "reviewer"
+                else f"refs/heads/cao/{'session' if kind == 'supervisor' else 'task'}/{identity}"
+            )
+            if owned_ref != expected_ref or not (
+                owned_object is None
+                or (
+                    isinstance(owned_object, str) and re.fullmatch(r"[0-9a-f]{40,64}", owned_object)
+                )
+            ):
+                raise ValueError("workspace authority is invalid")
+            if present:
+                if (
+                    not registered
+                    or not valid_identity(row.get("path_identity"))
+                    or not isinstance(row.get("git_dir"), str)
+                    or not Path(str(row["git_dir"])).is_absolute()
+                    or not valid_identity(row.get("git_dir_identity"))
+                    or not isinstance(head, str)
+                    or re.fullmatch(r"[0-9a-f]{40,64}", head) is None
+                    or not isinstance(detached, bool)
+                    or not isinstance(fingerprint, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+                    or not (branch is None or isinstance(branch, str))
+                    or not (head_ref is None or isinstance(head_ref, str))
+                    or bool(branch is None) != detached
+                    or bool(head_ref is None) != detached
+                ):
+                    raise ValueError("workspace authority is invalid")
+            elif (
+                registered
+                or row.get("path_identity") is not None
+                or row.get("git_dir") is not None
+                or row.get("git_dir_identity") is not None
+                or head is not None
+                or branch is not None
+                or head_ref is not None
+                or detached is not None
+                or fingerprint is not None
+                or row.get("clean") is not True
+                or row.get("modified_files") != 0
+                or row.get("untracked_files") != 0
+            ):
+                raise ValueError("workspace authority is invalid")
+        normalized_rows.append(row)
+    if terminal_ids != {str(value) for value in expected_terminal_ids}:
+        raise ValueError("workspace authority terminal identity changed")
+    normalized = {
+        "version": 1,
+        "work_context": dict(work_context) if work_context is not None else None,
+        "worktrees": sorted(normalized_rows, key=lambda item: str(item["terminal_id"])),
+    }
+    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return normalized, encoded, hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _session_workspace_context_authority_in_transaction(
+    db: Any,
+    session_id: str,
+) -> Dict[str, Any] | None:
+    contexts = (
+        db.query(WritableWorkContextModel)
+        .filter(WritableWorkContextModel.session_id == session_id)
+        .limit(2)
         .all()
     )
-    operations = [
-        {
-            "operation_id": str(row.id),
-            "terminal_id": str(row.old_terminal_id),
-            "kind": "recovery_takeover",
-            "state": str(row.state),
-            "reason_code": str(row.failure_reason) if row.failure_reason else None,
-        }
-        for row in takeover_rows
+    if len(contexts) > 1:
+        raise ValueError("workspace authority is ambiguous")
+    if not contexts:
+        return None
+    return _workspace_context_authority_document(contexts[0])
+
+
+def _workspace_context_authority_document(
+    context: WritableWorkContextModel,
+) -> Dict[str, Any]:
+    """Serialize one already-selected writable-context authority row."""
+    return {
+        "id": context.id,
+        "session_id": context.session_id,
+        "terminal_id": context.terminal_id,
+        "project_id": context.project_id,
+        "canonical_source": context.canonical_source,
+        "canonical_worktree": context.canonical_worktree,
+        "branch": context.branch,
+        "base_revision": context.base_revision,
+        "state": context.state,
+        "writer_authority_generation": context.writer_authority_generation,
+        "retirement_allow_dirty": bool(context.retirement_allow_dirty),
+        "retirement_authority_fingerprint": context.retirement_authority_fingerprint,
+    }
+
+
+def _session_workspace_context_progress_is_valid(
+    db: Any,
+    expected: Mapping[str, Any] | None,
+    current: WritableWorkContextModel | None,
+    *,
+    allow_dirty_workspace: bool,
+    require_exact: bool,
+) -> bool:
+    current_authority = (
+        _workspace_context_authority_document(current) if current is not None else None
+    )
+    if require_exact:
+        return expected == current_authority
+    if expected is None:
+        return current is None
+    if current is None or current_authority is None:
+        return False
+    immutable_keys = {
+        "id",
+        "session_id",
+        "terminal_id",
+        "project_id",
+        "canonical_source",
+        "canonical_worktree",
+        "branch",
+        "base_revision",
+        "writer_authority_generation",
+    }
+    if any(expected.get(key) != current_authority.get(key) for key in immutable_keys):
+        return False
+    expected_state = str(expected.get("state"))
+    current_state = str(current_authority.get("state"))
+    allowed_progress = {
+        "admitted": {"admitted", "retiring", "retired"},
+        "retiring": {"retiring", "retired"},
+        "retired": {"retired"},
+    }
+    if current_state not in allowed_progress.get(expected_state, set()):
+        return False
+    if current_state == expected_state:
+        return all(
+            expected.get(key) == current_authority.get(key)
+            for key in ("retirement_allow_dirty", "retirement_authority_fingerprint")
+        )
+    if current_state == "retired":
+        return True
+    if current_state != "retiring" or bool(current.retirement_allow_dirty) != bool(
+        allow_dirty_workspace
+    ):
+        return False
+    snapshot = _session_workspace_snapshot_in_transaction(db, current)
+    return bool(
+        snapshot.get("reason_code") is None
+        and isinstance(current.retirement_authority_fingerprint, str)
+        and hmac.compare_digest(
+            current.retirement_authority_fingerprint,
+            str(snapshot.get("authority_fingerprint") or ""),
+        )
+    )
+
+
+def _completed_takeover_foreign_workspace_is_valid(
+    db: Any,
+    *,
+    session_id: str,
+    terminal_by_id: Mapping[str, TerminalModel],
+    supervisor_rows: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Prove that every former supervisor workspace now has one live successor owner."""
+    if not supervisor_rows:
+        return False
+    local_terminal_ids = set(terminal_by_id)
+    for row in supervisor_rows:
+        old_terminal = terminal_by_id.get(str(row.get("terminal_id") or ""))
+        context_id = row.get("writable_work_context_id")
+        if old_terminal is None or not isinstance(context_id, str):
+            return False
+        context = db.get(WritableWorkContextModel, context_id)
+        if not (
+            context is not None
+            and str(context.session_id) != session_id
+            and str(context.terminal_id) not in local_terminal_ids
+            and context.state == "admitted"
+            and context.project_id == row.get("project_id")
+            and context.canonical_source == row.get("source")
+            and context.canonical_worktree == row.get("path")
+            and context.branch == str(row.get("owned_ref") or "").removeprefix("refs/heads/")
+            and context.base_revision == old_terminal.managed_worktree_commit
+        ):
+            return False
+        successor = db.get(TerminalModel, context.terminal_id)
+        takeover = (
+            db.get(RecoveryTakeoverModel, old_terminal.recovery_takeover_id)
+            if old_terminal.recovery_takeover_id is not None
+            else None
+        )
+        lease = db.get(WorktreeWriterLeaseModel, context.canonical_worktree)
+        if not (
+            old_terminal.runtime_lifecycle == "recovery_fenced"
+            and old_terminal.replaced_by_terminal_id == context.terminal_id
+            and takeover is not None
+            and takeover.state == "completed"
+            and takeover.old_terminal_id == old_terminal.id
+            and takeover.old_session_id == session_id
+            and takeover.new_terminal_id == context.terminal_id
+            and takeover.new_session_id == context.session_id
+            and takeover.canonical_worktree == context.canonical_worktree
+            and takeover.project_id == context.project_id
+            and successor is not None
+            and successor.session_id == context.session_id
+            and successor.writable_work_context_id == context.id
+            and successor.launch_worktree == context.canonical_worktree
+            and successor.writer_authority_generation == context.writer_authority_generation
+            and successor.runtime_lifecycle
+            not in {"exited", "recovery_fenced", "recovery_required"}
+            and lease is not None
+            and lease.terminal_id == successor.id
+            and lease.authority_generation == context.writer_authority_generation
+        ):
+            return False
+    return True
+
+
+def _validate_session_workspace_relational_authority_in_transaction(
+    db: Any,
+    *,
+    session_id: str,
+    terminal_ids: Sequence[str],
+    workspace_authority: Mapping[str, Any],
+    allow_dirty_workspace: bool,
+    require_exact_context: bool,
+    allow_foreign_workspace: bool = False,
+) -> str | None:
+    """Prove every destructive target belongs only to this Session."""
+    terminals = _session_plan_terminals(db, session_id, terminal_ids)
+    if terminals is None:
+        return "SESSION_IDENTITY_CHANGED"
+    rows = {
+        str(row["terminal_id"]): row
+        for row in workspace_authority.get("worktrees", ())
+        if isinstance(row, Mapping) and isinstance(row.get("terminal_id"), str)
+    }
+    if set(rows) != {str(terminal.id) for terminal in terminals}:
+        return "WORKSPACE_AUTHORITY_CHANGED"
+    terminal_by_id = {str(terminal.id): terminal for terminal in terminals}
+    managed_rows: list[Mapping[str, Any]] = []
+    for terminal_id, terminal in terminal_by_id.items():
+        row = rows[terminal_id]
+        kind = terminal.managed_worktree_kind
+        if kind not in {"supervisor", "task", "reviewer"}:
+            if row.get("managed") is not False:
+                return "WORKSPACE_AUTHORITY_CHANGED"
+            continue
+        identity = (
+            terminal.writable_work_context_id
+            or terminal.managed_worktree_origin_terminal_id
+            or terminal.id
+        )
+        owned_ref = (
+            None
+            if kind == "reviewer"
+            else f"refs/heads/cao/{'session' if kind == 'supervisor' else 'task'}/{identity}"
+        )
+        if any(
+            (
+                row.get("managed") is not True,
+                row.get("session_id") != session_id,
+                row.get("project_id") != terminal.project_id,
+                row.get("kind") != kind,
+                row.get("identity") != identity,
+                row.get("source") != terminal.managed_worktree_source,
+                row.get("path") != terminal.launch_worktree,
+                row.get("writer_authority_generation") != terminal.writer_authority_generation,
+                row.get("writable_work_context_id") != terminal.writable_work_context_id,
+                row.get("owned_ref") != owned_ref,
+                terminal.managed_worktree_branch
+                != (owned_ref.removeprefix("refs/heads/") if owned_ref else None),
+            )
+        ):
+            return "WORKSPACE_AUTHORITY_CHANGED"
+        managed_rows.append(row)
+
+    contexts = (
+        db.query(WritableWorkContextModel)
+        .filter(WritableWorkContextModel.session_id == session_id)
+        .limit(2)
+        .all()
+    )
+    if len(contexts) > 1:
+        return "WORKSPACE_AUTHORITY_CHANGED"
+    context = contexts[0] if contexts else None
+    expected_context = workspace_authority.get("work_context")
+    if not _session_workspace_context_progress_is_valid(
+        db,
+        expected_context if isinstance(expected_context, Mapping) else None,
+        context,
+        allow_dirty_workspace=allow_dirty_workspace,
+        require_exact=require_exact_context,
+    ):
+        return "WRITABLE_WORKTREE_AUTHORITY_CHANGED"
+    supervisor_rows = [row for row in managed_rows if row.get("kind") == "supervisor"]
+    if context is None:
+        if supervisor_rows or any(row.get("writable_work_context_id") for row in managed_rows):
+            if any(
+                row.get("kind") != "supervisor" and row.get("writable_work_context_id")
+                for row in managed_rows
+            ):
+                return "WORKSPACE_AUTHORITY_CHANGED"
+            completed_takeover = _completed_takeover_foreign_workspace_is_valid(
+                db,
+                session_id=session_id,
+                terminal_by_id=terminal_by_id,
+                supervisor_rows=supervisor_rows,
+            )
+            if not completed_takeover:
+                return "WORKSPACE_AUTHORITY_CHANGED"
+            if not allow_foreign_workspace:
+                return "WORKSPACE_FOREIGN_OWNER"
+    elif not supervisor_rows and context.state == "retired":
+        # Receipt-only legacy Sessions may retain an already-retired context
+        # after its physical supervisor worktree authority was retired.  Other
+        # independent task/reviewer targets still receive their exact checks.
+        if any(row.get("writable_work_context_id") is not None for row in managed_rows):
+            return "WORKSPACE_AUTHORITY_CHANGED"
+    else:
+        current_supervisor = terminal_by_id.get(str(context.terminal_id))
+        if (
+            current_supervisor is None
+            or current_supervisor.managed_worktree_kind != "supervisor"
+            or current_supervisor.writable_work_context_id != context.id
+            or current_supervisor.project_id != context.project_id
+            or current_supervisor.managed_worktree_source != context.canonical_source
+            or current_supervisor.launch_worktree != context.canonical_worktree
+            or current_supervisor.managed_worktree_branch != context.branch
+            or current_supervisor.managed_worktree_commit != context.base_revision
+            or current_supervisor.writer_authority_generation != context.writer_authority_generation
+        ):
+            return "WORKSPACE_AUTHORITY_CHANGED"
+        if any(
+            row.get("writable_work_context_id") != context.id
+            or row.get("project_id") != context.project_id
+            or row.get("source") != context.canonical_source
+            or row.get("path") != context.canonical_worktree
+            or row.get("owned_ref") != f"refs/heads/{context.branch}"
+            for row in supervisor_rows
+        ):
+            return "WORKSPACE_AUTHORITY_CHANGED"
+        if any(
+            row.get("kind") != "supervisor" and row.get("writable_work_context_id") is not None
+            for row in managed_rows
+        ):
+            return "WORKSPACE_AUTHORITY_CHANGED"
+
+    target_paths = tuple(sorted({str(row["path"]) for row in managed_rows}))
+    target_sources = tuple(sorted({str(row["source"]) for row in managed_rows}))
+    target_branches = tuple(
+        sorted(
+            {
+                str(row["owned_ref"]).removeprefix("refs/heads/")
+                for row in managed_rows
+                if isinstance(row.get("owned_ref"), str)
+            }
+        )
+    )
+    if target_paths:
+        foreign_terminal_filters = [TerminalModel.launch_worktree.in_(target_paths)]
+        if target_sources and target_branches:
+            foreign_terminal_filters.append(
+                and_(
+                    TerminalModel.managed_worktree_source.in_(target_sources),
+                    TerminalModel.managed_worktree_branch.in_(target_branches),
+                )
+            )
+        if (
+            db.query(TerminalModel.id)
+            .filter(
+                TerminalModel.id.notin_(tuple(terminal_by_id)),
+                or_(*foreign_terminal_filters),
+            )
+            .first()
+            is not None
+            and not allow_foreign_workspace
+        ):
+            return "WORKSPACE_FOREIGN_OWNER"
+        receipt_filters = [TerminalDeletionReceiptModel.managed_worktree_path.in_(target_paths)]
+        if target_sources and target_branches:
+            receipt_filters.append(
+                and_(
+                    TerminalDeletionReceiptModel.managed_worktree_source.in_(target_sources),
+                    TerminalDeletionReceiptModel.managed_worktree_branch.in_(target_branches),
+                )
+            )
+        if (
+            db.query(TerminalDeletionReceiptModel.terminal_id)
+            .filter(
+                or_(
+                    TerminalDeletionReceiptModel.session_id != session_id,
+                    TerminalDeletionReceiptModel.session_id.is_(None),
+                ),
+                or_(*receipt_filters),
+            )
+            .first()
+            is not None
+            and not allow_foreign_workspace
+        ):
+            return "WORKSPACE_FOREIGN_OWNER"
+        foreign_context_filters = [WritableWorkContextModel.canonical_worktree.in_(target_paths)]
+        if target_sources and target_branches:
+            foreign_context_filters.append(
+                and_(
+                    WritableWorkContextModel.canonical_source.in_(target_sources),
+                    WritableWorkContextModel.branch.in_(target_branches),
+                )
+            )
+        if (
+            db.query(WritableWorkContextModel.id)
+            .filter(
+                or_(
+                    WritableWorkContextModel.session_id != session_id,
+                    WritableWorkContextModel.session_id.is_(None),
+                ),
+                or_(*foreign_context_filters),
+            )
+            .first()
+            is not None
+            and not allow_foreign_workspace
+        ):
+            return "WORKSPACE_FOREIGN_OWNER"
+        writer_leases = (
+            db.query(WorktreeWriterLeaseModel.terminal_id)
+            .filter(WorktreeWriterLeaseModel.canonical_worktree.in_(target_paths))
+            .all()
+        )
+        if any(str(row[0]) in terminal_by_id for row in writer_leases):
+            return "WRITER_LEASE_ACTIVE"
+        if writer_leases and not allow_foreign_workspace:
+            return "WORKSPACE_FOREIGN_OWNER"
+    return None
+
+
+def _session_foreign_workspace_evidence_in_transaction(
+    db: Any,
+    *,
+    session_id: str,
+    terminal_ids: Sequence[str],
+    workspace_authority: Mapping[str, Any],
+) -> Dict[str, Any] | None:
+    """Capture bounded foreign ownership that requires non-destructive preservation."""
+    local_terminal_ids = tuple(sorted(str(value) for value in terminal_ids))
+    managed_rows = [
+        row
+        for row in workspace_authority.get("worktrees", ())
+        if isinstance(row, Mapping) and row.get("managed") is True
     ]
-    claimed_terminal_ids = {str(row.old_terminal_id) for row in takeover_rows}
-    operations.extend(
-        {
-            "operation_id": str(terminal.id),
-            "terminal_id": str(terminal.id),
-            "kind": "runtime_recovery",
-            "state": "recovery_required",
-            "reason_code": "RECOVERY_TAKEOVER_REQUIRED",
+    target_paths = tuple(sorted({str(row["path"]) for row in managed_rows}))
+    target_sources = tuple(sorted({str(row["source"]) for row in managed_rows}))
+    target_branches = tuple(
+        sorted(
+            {
+                str(row["owned_ref"]).removeprefix("refs/heads/")
+                for row in managed_rows
+                if isinstance(row.get("owned_ref"), str)
+            }
+        )
+    )
+    if not target_paths:
+        return None
+
+    terminal_filters = [TerminalModel.launch_worktree.in_(target_paths)]
+    receipt_filters = [TerminalDeletionReceiptModel.managed_worktree_path.in_(target_paths)]
+    context_filters = [WritableWorkContextModel.canonical_worktree.in_(target_paths)]
+    if target_sources and target_branches:
+        source_branch = and_(
+            TerminalModel.managed_worktree_source.in_(target_sources),
+            TerminalModel.managed_worktree_branch.in_(target_branches),
+        )
+        terminal_filters.append(source_branch)
+        receipt_filters.append(
+            and_(
+                TerminalDeletionReceiptModel.managed_worktree_source.in_(target_sources),
+                TerminalDeletionReceiptModel.managed_worktree_branch.in_(target_branches),
+            )
+        )
+        context_filters.append(
+            and_(
+                WritableWorkContextModel.canonical_source.in_(target_sources),
+                WritableWorkContextModel.branch.in_(target_branches),
+            )
+        )
+
+    terminals = (
+        db.query(TerminalModel)
+        .filter(TerminalModel.id.notin_(local_terminal_ids), or_(*terminal_filters))
+        .order_by(TerminalModel.id.asc())
+        .limit(_SESSION_DELETION_PLAN_LIMIT + 1)
+        .all()
+    )
+    receipts = (
+        db.query(TerminalDeletionReceiptModel)
+        .filter(
+            or_(
+                TerminalDeletionReceiptModel.session_id != session_id,
+                TerminalDeletionReceiptModel.session_id.is_(None),
+            ),
+            or_(*receipt_filters),
+        )
+        .order_by(TerminalDeletionReceiptModel.terminal_id.asc())
+        .limit(_SESSION_DELETION_PLAN_LIMIT + 1)
+        .all()
+    )
+    contexts = (
+        db.query(WritableWorkContextModel)
+        .filter(
+            or_(
+                WritableWorkContextModel.session_id != session_id,
+                WritableWorkContextModel.session_id.is_(None),
+            ),
+            or_(*context_filters),
+        )
+        .order_by(WritableWorkContextModel.id.asc())
+        .limit(_SESSION_DELETION_PLAN_LIMIT + 1)
+        .all()
+    )
+    writer_leases = (
+        db.query(WorktreeWriterLeaseModel)
+        .filter(
+            WorktreeWriterLeaseModel.canonical_worktree.in_(target_paths),
+            WorktreeWriterLeaseModel.terminal_id.notin_(local_terminal_ids),
+        )
+        .order_by(WorktreeWriterLeaseModel.canonical_worktree.asc())
+        .limit(_SESSION_DELETION_PLAN_LIMIT + 1)
+        .all()
+    )
+    if any(
+        len(rows) > _SESSION_DELETION_PLAN_LIMIT
+        for rows in (terminals, receipts, contexts, writer_leases)
+    ):
+        raise AmbiguousSessionIdentity(session_id)
+    if not any((terminals, receipts, contexts, writer_leases)):
+        return None
+    return {
+        "version": 1,
+        "terminals": [
+            {
+                "terminal_id": str(row.id),
+                "session_id": row.session_id,
+                "launch_worktree": row.launch_worktree,
+                "runtime_generation": row.runtime_generation,
+                "writer_authority_generation": row.writer_authority_generation,
+            }
+            for row in terminals
+        ],
+        "terminal_receipts": [
+            {
+                "terminal_id": str(row.terminal_id),
+                "session_id": row.session_id,
+                "managed_worktree_path": row.managed_worktree_path,
+                "managed_worktree_source": row.managed_worktree_source,
+                "managed_worktree_branch": row.managed_worktree_branch,
+            }
+            for row in receipts
+        ],
+        "work_contexts": [
+            {
+                "id": str(row.id),
+                "session_id": row.session_id,
+                "terminal_id": str(row.terminal_id),
+                "canonical_worktree": row.canonical_worktree,
+                "state": str(row.state),
+                "writer_authority_generation": row.writer_authority_generation,
+            }
+            for row in contexts
+        ],
+        "writer_leases": [
+            {
+                "canonical_worktree": str(row.canonical_worktree),
+                "terminal_id": str(row.terminal_id),
+                "authority_generation": str(row.authority_generation),
+            }
+            for row in writer_leases
+        ],
+    }
+
+
+def _canonical_session_workspace_evidence(value: Any) -> tuple[Any, str, str]:
+    if not isinstance(value, (list, dict)):
+        raise ValueError("workspace evidence is invalid")
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode()) > 1_000_000:
+        raise ValueError("workspace evidence is too large")
+    return value, encoded, hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _session_deletion_operation_dict(
+    operation: SessionDeletionOperationModel,
+) -> Dict[str, Any]:
+    try:
+        terminal_ids = json.loads(str(operation.terminal_ids_json))
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise AmbiguousSessionIdentity(str(operation.session_id)) from exc
+    if (
+        not isinstance(terminal_ids, list)
+        or len(terminal_ids) > _SESSION_DELETION_PLAN_LIMIT
+        or any(not isinstance(value, str) or not value for value in terminal_ids)
+        or len(set(terminal_ids)) != len(terminal_ids)
+    ):
+        raise AmbiguousSessionIdentity(str(operation.session_id))
+    workspace_authority = None
+    workspace_authority_sha256 = operation.workspace_authority_sha256
+    if operation.workspace_authority_json is not None or workspace_authority_sha256 is not None:
+        if not (
+            isinstance(operation.workspace_authority_json, str)
+            and isinstance(workspace_authority_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", workspace_authority_sha256)
+        ):
+            raise AmbiguousSessionIdentity(str(operation.session_id))
+        try:
+            decoded = json.loads(operation.workspace_authority_json)
+            workspace_authority, encoded, digest = _normalize_session_workspace_authority(
+                decoded,
+                expected_session_id=str(operation.session_id),
+                expected_terminal_ids=terminal_ids,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AmbiguousSessionIdentity(str(operation.session_id)) from exc
+        if operation.workspace_authority_json != encoded or not hmac.compare_digest(
+            workspace_authority_sha256, digest
+        ):
+            raise AmbiguousSessionIdentity(str(operation.session_id))
+    disposition = operation.workspace_disposition
+    if disposition is None and operation.state == _SESSION_HARD_DELETE_WORKSPACE_RETIRED:
+        disposition = _SESSION_WORKSPACE_DISPOSITION_RETIRED
+    if disposition not in {
+        None,
+        _SESSION_WORKSPACE_DISPOSITION_RETIRED,
+        _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN,
+    }:
+        raise AmbiguousSessionIdentity(str(operation.session_id))
+    workspace_evidence = None
+    if operation.workspace_evidence_json is not None:
+        if not (
+            isinstance(operation.workspace_evidence_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", operation.workspace_evidence_sha256)
+        ):
+            raise AmbiguousSessionIdentity(str(operation.session_id))
+        try:
+            decoded_evidence = json.loads(operation.workspace_evidence_json)
+            workspace_evidence, evidence_json, evidence_sha256 = (
+                _canonical_session_workspace_evidence(decoded_evidence)
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise AmbiguousSessionIdentity(str(operation.session_id)) from exc
+        if operation.workspace_evidence_json != evidence_json or not hmac.compare_digest(
+            operation.workspace_evidence_sha256, evidence_sha256
+        ):
+            raise AmbiguousSessionIdentity(str(operation.session_id))
+    elif (
+        disposition == _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN
+        or operation.state == _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN
+    ):
+        raise AmbiguousSessionIdentity(str(operation.session_id))
+    return {
+        "session_id": str(operation.session_id),
+        "session_name": str(operation.session_name),
+        "state": str(operation.state),
+        "terminal_ids": terminal_ids,
+        "allow_dirty_workspace": bool(operation.allow_dirty_workspace),
+        "authority_fingerprint": str(operation.authority_fingerprint),
+        "workspace_authority": workspace_authority,
+        "workspace_authority_sha256": workspace_authority_sha256,
+        "workspace_disposition": disposition,
+        "workspace_evidence": workspace_evidence,
+        "workspace_evidence_sha256": operation.workspace_evidence_sha256,
+        "created_at": operation.created_at,
+        "updated_at": operation.updated_at,
+    }
+
+
+def _session_historical_terminal_receipts(
+    db: Any,
+    session_id: str,
+) -> List[TerminalDeletionReceiptModel]:
+    """Return the bounded terminal tombstones owned by one Session lifetime."""
+    query = db.query(TerminalDeletionReceiptModel).filter(
+        or_(
+            TerminalDeletionReceiptModel.session_id == session_id,
+            and_(
+                TerminalDeletionReceiptModel.session_id.is_(None),
+                session_id.startswith("legacy:"),
+                TerminalDeletionReceiptModel.session_name == session_id.removeprefix("legacy:"),
+            ),
+        )
+    )
+    return cast(
+        List[TerminalDeletionReceiptModel],
+        query.order_by(TerminalDeletionReceiptModel.terminal_id.asc())
+        .limit(_SESSION_DELETION_PLAN_LIMIT + 1)
+        .all(),
+    )
+
+
+def _terminal_receipt_session_identity(receipt: TerminalDeletionReceiptModel) -> str | None:
+    if isinstance(receipt.session_id, str) and receipt.session_id:
+        return str(receipt.session_id)
+    return None
+
+
+def _validate_session_terminal_receipt_authority(
+    db: Any,
+    session_id: str,
+    session_name: str,
+    *,
+    require_complete: bool,
+) -> tuple[List[TerminalDeletionReceiptModel], str | None]:
+    """Validate exact transitional ownership for one undeleted Session lifetime."""
+    receipts = _session_historical_terminal_receipts(db, session_id)
+    if len(receipts) > _SESSION_DELETION_PLAN_LIMIT:
+        return receipts, "SESSION_DELETE_PLAN_TOO_LARGE"
+    if require_complete and not receipts:
+        return receipts, "SESSION_LIFETIME_AUTHORITY_INCOMPLETE"
+    for receipt in receipts:
+        receipt_identity = _terminal_receipt_session_identity(receipt)
+        if str(receipt.session_name) != session_name or (
+            receipt_identity is not None and receipt_identity != session_id
+        ):
+            return receipts, "SESSION_LIFETIME_RECEIPT_CONFLICT"
+        if require_complete and (
+            receipt.session_lifetime_authority_version != 1 or receipt_identity != session_id
+        ):
+            return receipts, "SESSION_LIFETIME_AUTHORITY_INCOMPLETE"
+    return receipts, None
+
+
+def _terminal_receipt_workspace_cleanup_authority(
+    receipt: TerminalDeletionReceiptModel,
+) -> Dict[str, Any] | None:
+    if receipt.workspace_cleanup_authority_version != 1:
+        return None
+    managed = receipt.managed_worktree_kind is not None
+    if not managed:
+        return {
+            "terminal_id": str(receipt.terminal_id),
+            "managed": False,
+            "workspace_cleanup_authority_version": 1,
         }
-        for terminal in terminals
-        if terminal.runtime_lifecycle == "recovery_required"
-        and str(terminal.id) not in claimed_terminal_ids
+    required = (
+        receipt.managed_worktree_source,
+        receipt.managed_worktree_path,
+        receipt.managed_worktree_identity,
     )
-    return sorted(
-        operations,
-        key=lambda item: (str(item["terminal_id"]), str(item["operation_id"])),
+    if not all(isinstance(value, str) and value for value in required):
+        return None
+    if receipt.managed_worktree_branch is not None and not (
+        isinstance(receipt.managed_worktree_branch_object_id, str)
+        and receipt.managed_worktree_branch_object_id
+    ):
+        return None
+    return {
+        "id": str(receipt.terminal_id),
+        "terminal_id": str(receipt.terminal_id),
+        "managed": True,
+        "workspace_cleanup_authority_version": 1,
+        "managed_worktree_kind": str(receipt.managed_worktree_kind),
+        "managed_worktree_source": str(receipt.managed_worktree_source),
+        "launch_worktree": str(receipt.managed_worktree_path),
+        "managed_worktree_branch": receipt.managed_worktree_branch,
+        "managed_worktree_branch_object_id": receipt.managed_worktree_branch_object_id,
+        "managed_worktree_identity": str(receipt.managed_worktree_identity),
+    }
+
+
+def list_session_historical_terminal_cleanup_authorities(
+    session_id: str,
+) -> List[Dict[str, Any]]:
+    """Return exact bounded physical-cleanup authority for retired terminals."""
+    _ensure_terminal_deletion_receipt_schema()
+    with SessionLocal() as db:
+        receipts = _session_historical_terminal_receipts(db, session_id)
+        if len(receipts) > _SESSION_DELETION_PLAN_LIMIT:
+            raise AmbiguousSessionIdentity(session_id)
+        authorities = []
+        for receipt in receipts:
+            authority = _terminal_receipt_workspace_cleanup_authority(receipt)
+            if authority is None:
+                raise AmbiguousTerminalIdentity(str(receipt.terminal_id))
+            authorities.append(authority)
+        return authorities
+
+
+def _session_graph_terminal_ids(
+    db: Any,
+    session_id: str,
+    current_terminal_ids: Sequence[str],
+) -> List[str] | None:
+    receipts = _session_historical_terminal_receipts(db, session_id)
+    terminal_ids = sorted(
+        set(str(value) for value in current_terminal_ids)
+        | {str(receipt.terminal_id) for receipt in receipts}
     )
+    return terminal_ids if len(terminal_ids) <= _SESSION_DELETION_PLAN_LIMIT else None
+
+
+def _session_deletion_operation_with_graph(
+    db: Any,
+    operation: SessionDeletionOperationModel,
+) -> Dict[str, Any]:
+    parsed = _session_deletion_operation_dict(operation)
+    graph_terminal_ids = _session_graph_terminal_ids(
+        db,
+        parsed["session_id"],
+        parsed["terminal_ids"],
+    )
+    if graph_terminal_ids is None:
+        raise AmbiguousSessionIdentity(parsed["session_id"])
+    parsed["graph_terminal_ids"] = graph_terminal_ids
+    return parsed
+
+
+def get_session_hard_deletion_operation(session_id: str) -> Optional[Dict[str, Any]]:
+    """Return one bounded in-progress hard-delete fence."""
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        operation = db.get(SessionDeletionOperationModel, session_id)
+        return (
+            _session_deletion_operation_with_graph(db, operation) if operation is not None else None
+        )
+
+
+def _backfill_terminal_deletion_session_lifetime_authority(connection: Any) -> dict[str, int]:
+    """Upgrade only legacy receipts with explicit, non-conflicting Session IDs."""
+    last_terminal_id = ""
+    inspected = 0
+    upgraded = 0
+    while True:
+        page = connection.exec_driver_sql(
+            "SELECT terminal_id FROM terminal_deletion_receipts "
+            "WHERE terminal_id > ? ORDER BY terminal_id LIMIT ?",
+            (last_terminal_id, SESSION_LIFETIME_RECEIPT_BACKFILL_BATCH_SIZE),
+        ).fetchall()
+        if not page:
+            break
+        terminal_ids = [str(row[0]) for row in page]
+        inspected += len(terminal_ids)
+        placeholders = ",".join("?" for _value in terminal_ids)
+        updated = connection.exec_driver_sql(
+            f"""
+            UPDATE terminal_deletion_receipts
+            SET session_lifetime_authority_version = ?
+            WHERE terminal_id IN ({placeholders})
+              AND session_lifetime_authority_version IS NULL
+              AND session_id IS NOT NULL
+              AND session_id != ''
+              AND session_name != ''
+              AND NOT EXISTS (
+                SELECT 1 FROM terminal_deletion_receipts AS peer
+                WHERE peer.session_id = terminal_deletion_receipts.session_id
+                  AND peer.session_name != terminal_deletion_receipts.session_name
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM terminals AS terminal
+                WHERE COALESCE(
+                        terminal.session_id,
+                        'legacy:' || terminal.tmux_session
+                      ) = terminal_deletion_receipts.session_id
+                  AND terminal.tmux_session != terminal_deletion_receipts.session_name
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM session_deletion_receipts AS deleted
+                WHERE deleted.session_id = terminal_deletion_receipts.session_id
+              )
+            """,
+            (SESSION_LIFETIME_RECEIPT_SCHEMA_VERSION, *terminal_ids),
+        )
+        upgraded += max(int(updated.rowcount or 0), 0)
+        last_terminal_id = terminal_ids[-1]
+    return {"inspected": inspected, "upgraded": upgraded}
+
+
+def _ensure_terminal_deletion_receipt_schema() -> None:
+    global _terminal_deletion_receipt_schema_ready
+    global _terminal_deletion_receipt_schema_engine_identity
+    if (
+        _terminal_deletion_receipt_schema_ready
+        and _terminal_deletion_receipt_schema_engine_identity == id(engine)
+    ):
+        return
+    with _terminal_deletion_receipt_schema_lock:
+        if (
+            _terminal_deletion_receipt_schema_ready
+            and _terminal_deletion_receipt_schema_engine_identity == id(engine)
+        ):
+            return
+        _terminal_deletion_receipt_schema_ready = False
+        _terminal_deletion_receipt_schema_engine_identity = None
+        TerminalDeletionReceiptModel.__table__.create(bind=engine, checkfirst=True)
+        MigrationReceiptModel.__table__.create(bind=engine, checkfirst=True)
+        with engine.begin() as connection:
+            columns = {
+                str(row[1])
+                for row in connection.exec_driver_sql(
+                    "PRAGMA table_info(terminal_deletion_receipts)"
+                ).fetchall()
+            }
+            if "auth_token_sha256" not in columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE terminal_deletion_receipts " "ADD COLUMN auth_token_sha256 VARCHAR"
+                )
+            additions = {
+                "session_lifetime_authority_version": "INTEGER",
+                "workspace_cleanup_authority_version": "INTEGER",
+                "managed_worktree_kind": "VARCHAR",
+                "managed_worktree_source": "VARCHAR",
+                "managed_worktree_path": "VARCHAR",
+                "managed_worktree_branch": "VARCHAR",
+                "managed_worktree_branch_object_id": "VARCHAR",
+                "managed_worktree_identity": "VARCHAR",
+            }
+            columns = {
+                str(row[1])
+                for row in connection.exec_driver_sql(
+                    "PRAGMA table_info(terminal_deletion_receipts)"
+                ).fetchall()
+            }
+            for name, sql_type in additions.items():
+                if name not in columns:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE terminal_deletion_receipts ADD COLUMN {name} {sql_type}"
+                    )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_terminal_deletion_receipts_auth_token_sha256 "
+                "ON terminal_deletion_receipts (auth_token_sha256)"
+            )
+        with engine.connect() as connection:
+            receipt = connection.exec_driver_sql(
+                "SELECT 1 FROM migration_receipts WHERE name = ?",
+                (SESSION_LIFETIME_RECEIPT_MIGRATION,),
+            ).first()
+            connection.rollback()
+            if receipt is None:
+                # Column DDL may already be durable after a prior crash. The
+                # completion receipt, not schema presence, is the sole authority
+                # that the exact-only backfill finished.
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                receipt = connection.exec_driver_sql(
+                    "SELECT 1 FROM migration_receipts WHERE name = ?",
+                    (SESSION_LIFETIME_RECEIPT_MIGRATION,),
+                ).first()
+                if receipt is None:
+                    outcome = _backfill_terminal_deletion_session_lifetime_authority(connection)
+                    connection.exec_driver_sql(
+                        "INSERT INTO migration_receipts"
+                        "(name, schema_version, detail_json, created_at) VALUES (?, ?, ?, ?)",
+                        (
+                            SESSION_LIFETIME_RECEIPT_MIGRATION,
+                            SESSION_LIFETIME_RECEIPT_SCHEMA_VERSION,
+                            json.dumps(
+                                {
+                                    "batch_size": SESSION_LIFETIME_RECEIPT_BACKFILL_BATCH_SIZE,
+                                    **outcome,
+                                },
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
+                            datetime.now(),
+                        ),
+                    )
+                connection.commit()
+        _terminal_deletion_receipt_schema_ready = True
+        _terminal_deletion_receipt_schema_engine_identity = id(engine)
 
 
 def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
@@ -4476,21 +8181,21 @@ def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
     _ensure_terminal_worktree_authority_schema()
     _ensure_usage_schema()
     _ensure_session_deletion_receipt_schema()
+    _ensure_terminal_deletion_receipt_schema()
     with SessionLocal() as db:
-        exact_receipt = (
-            db.query(SessionDeletionReceiptModel)
-            .filter(SessionDeletionReceiptModel.session_id == identifier)
-            .first()
-        )
+        exact_receipt = db.get(SessionDeletionReceiptModel, identifier)
         if exact_receipt is not None:
+            disposition, evidence_sha256 = _session_receipt_workspace_projection(exact_receipt)
             return {
                 "session_id": str(exact_receipt.session_id),
                 "session_name": str(exact_receipt.session_name),
                 "deleted": True,
                 "terminals": [],
                 "retained_resources": _session_receipt_retained_resources(exact_receipt),
-                "blocking_recovery_operations": [],
+                "workspace_disposition": disposition,
+                "workspace_evidence_sha256": evidence_sha256,
             }
+
         terminals = (
             db.query(TerminalModel)
             .filter(TerminalModel.session_id == identifier)
@@ -4508,42 +8213,6 @@ def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
                 .order_by(TerminalModel.creation_order.asc(), TerminalModel.id.asc())
                 .all()
             )
-        if not terminals:
-            tombstone_exists = (
-                db.query(SessionDeletionReceiptModel.session_id)
-                .filter(
-                    SessionDeletionReceiptModel.session_id
-                    == func.coalesce(
-                        TerminalModel.session_id,
-                        "legacy:" + TerminalModel.tmux_session,
-                    )
-                )
-                .exists()
-            )
-            named = (
-                db.query(TerminalModel)
-                .filter(
-                    TerminalModel.tmux_session == identifier,
-                    ~tombstone_exists,
-                )
-                .order_by(TerminalModel.creation_order.asc(), TerminalModel.id.asc())
-                .all()
-            )
-            identities = {
-                str(row.session_id) if row.session_id else f"legacy:{row.tmux_session}"
-                for row in named
-            }
-            if len(identities) > 1:
-                raise AmbiguousSessionIdentity(identifier)
-            if named:
-                prior_lifetime = (
-                    db.query(SessionDeletionReceiptModel.session_id)
-                    .filter(SessionDeletionReceiptModel.session_name == identifier)
-                    .first()
-                )
-                if prior_lifetime is not None:
-                    raise AmbiguousSessionIdentity(identifier)
-            terminals = named
         if terminals:
             names = {str(row.tmux_session) for row in terminals}
             identities = {
@@ -4552,42 +8221,175 @@ def resolve_session_lifetime(identifier: str) -> Optional[Dict[str, Any]]:
             }
             if len(names) != 1 or len(identities) != 1:
                 raise AmbiguousSessionIdentity(identifier)
-            session_id = identities.pop()
+            resolved_session_id = identities.pop()
+            resolved_session_name = names.pop()
+            _receipts, authority_error = _validate_session_terminal_receipt_authority(
+                db,
+                resolved_session_id,
+                resolved_session_name,
+                require_complete=False,
+            )
+            if authority_error is not None:
+                raise SessionLifetimeAuthorityError(authority_error, identifier)
+            deletion_operation = db.get(SessionDeletionOperationModel, resolved_session_id)
             return {
-                "session_id": session_id,
-                "session_name": names.pop(),
+                "session_id": resolved_session_id,
+                "session_name": resolved_session_name,
                 "deleted": False,
                 "terminals": [_session_terminal_dict(row) for row in terminals],
                 "retained_resources": [],
-                "blocking_recovery_operations": _session_recovery_authorities(
-                    db, session_id, terminals
-                ),
+                "deletion_in_progress": deletion_operation is not None,
+                "lifetime_authority": "current_terminals",
             }
 
-        receipt = (
-            db.query(SessionDeletionReceiptModel)
-            .filter(SessionDeletionReceiptModel.session_id == identifier)
-            .first()
-        )
-        if receipt is None:
-            receipts = (
-                db.query(SessionDeletionReceiptModel)
-                .filter(SessionDeletionReceiptModel.session_name == identifier)
-                .order_by(SessionDeletionReceiptModel.deleted_at.desc())
-                .all()
+        exact_terminal_receipts = _session_historical_terminal_receipts(db, identifier)
+        if exact_terminal_receipts:
+            names = {str(row.session_name) for row in exact_terminal_receipts}
+            if len(names) != 1:
+                raise SessionLifetimeAuthorityError("SESSION_LIFETIME_RECEIPT_CONFLICT", identifier)
+            session_name = names.pop()
+            _receipts, authority_error = _validate_session_terminal_receipt_authority(
+                db,
+                identifier,
+                session_name,
+                require_complete=True,
             )
-            if len(receipts) > 1:
-                raise AmbiguousSessionIdentity(identifier)
-            receipt = receipts[0] if receipts else None
-        if receipt is None:
+            if authority_error is not None:
+                raise SessionLifetimeAuthorityError(authority_error, identifier)
+            return {
+                "session_id": identifier,
+                "session_name": session_name,
+                "deleted": False,
+                "terminals": [],
+                "retained_resources": [],
+                "deletion_in_progress": (
+                    db.get(SessionDeletionOperationModel, identifier) is not None
+                ),
+                "lifetime_authority": "terminal_deletion_receipts",
+                "receipt_terminal_ids": [str(row.terminal_id) for row in exact_terminal_receipts],
+            }
+
+        tombstone_exists = (
+            db.query(SessionDeletionReceiptModel.session_id)
+            .filter(
+                SessionDeletionReceiptModel.session_id
+                == func.coalesce(
+                    TerminalModel.session_id,
+                    "legacy:" + TerminalModel.tmux_session,
+                )
+            )
+            .exists()
+        )
+        named_terminals = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.tmux_session == identifier, ~tombstone_exists)
+            .order_by(TerminalModel.creation_order.asc(), TerminalModel.id.asc())
+            .all()
+        )
+        named_terminal_receipts = cast(
+            List[TerminalDeletionReceiptModel],
+            db.query(TerminalDeletionReceiptModel)
+            .filter(TerminalDeletionReceiptModel.session_name == identifier)
+            .order_by(TerminalDeletionReceiptModel.terminal_id.asc())
+            .limit(_SESSION_DELETION_PLAN_LIMIT + 1)
+            .all(),
+        )
+        if len(named_terminal_receipts) > _SESSION_DELETION_PLAN_LIMIT:
+            raise SessionLifetimeAuthorityError("SESSION_DELETE_PLAN_TOO_LARGE", identifier)
+        identities = {
+            str(row.session_id) if row.session_id else f"legacy:{row.tmux_session}"
+            for row in named_terminals
+        }
+        receipt_identities = {
+            identity
+            for row in named_terminal_receipts
+            if (identity := _terminal_receipt_session_identity(row)) is not None
+        }
+        incomplete_named_receipt = any(
+            row.session_lifetime_authority_version != 1
+            or _terminal_receipt_session_identity(row) is None
+            for row in named_terminal_receipts
+        )
+        candidate_identities = identities | receipt_identities
+        final_receipts = (
+            db.query(SessionDeletionReceiptModel)
+            .filter(SessionDeletionReceiptModel.session_name == identifier)
+            .order_by(SessionDeletionReceiptModel.deleted_at.desc())
+            .all()
+        )
+        if len(candidate_identities) > 1 or (candidate_identities and final_receipts):
+            raise AmbiguousSessionIdentity(identifier)
+        if candidate_identities:
+            resolved_session_id = candidate_identities.pop()
+            current = [
+                row
+                for row in named_terminals
+                if str(row.session_id or f"legacy:{row.tmux_session}") == resolved_session_id
+            ]
+            if current:
+                if incomplete_named_receipt:
+                    raise SessionLifetimeAuthorityError(
+                        "SESSION_LIFETIME_AUTHORITY_INCOMPLETE", identifier
+                    )
+                _receipts, authority_error = _validate_session_terminal_receipt_authority(
+                    db,
+                    resolved_session_id,
+                    identifier,
+                    require_complete=False,
+                )
+                if authority_error is not None:
+                    raise SessionLifetimeAuthorityError(authority_error, identifier)
+                return {
+                    "session_id": resolved_session_id,
+                    "session_name": identifier,
+                    "deleted": False,
+                    "terminals": [_session_terminal_dict(row) for row in current],
+                    "retained_resources": [],
+                    "deletion_in_progress": (
+                        db.get(SessionDeletionOperationModel, resolved_session_id) is not None
+                    ),
+                    "lifetime_authority": "current_terminals",
+                }
+            if incomplete_named_receipt:
+                raise SessionLifetimeAuthorityError(
+                    "SESSION_LIFETIME_AUTHORITY_INCOMPLETE", identifier
+                )
+            _receipts, authority_error = _validate_session_terminal_receipt_authority(
+                db,
+                resolved_session_id,
+                identifier,
+                require_complete=True,
+            )
+            if authority_error is not None:
+                raise SessionLifetimeAuthorityError(authority_error, identifier)
+            return {
+                "session_id": resolved_session_id,
+                "session_name": identifier,
+                "deleted": False,
+                "terminals": [],
+                "retained_resources": [],
+                "deletion_in_progress": (
+                    db.get(SessionDeletionOperationModel, resolved_session_id) is not None
+                ),
+                "lifetime_authority": "terminal_deletion_receipts",
+                "receipt_terminal_ids": [str(row.terminal_id) for row in named_terminal_receipts],
+            }
+        if named_terminal_receipts:
+            raise SessionLifetimeAuthorityError("SESSION_LIFETIME_AUTHORITY_INCOMPLETE", identifier)
+        if len(final_receipts) > 1:
+            raise AmbiguousSessionIdentity(identifier)
+        if not final_receipts:
             return None
+        final_receipt = final_receipts[0]
+        disposition, evidence_sha256 = _session_receipt_workspace_projection(final_receipt)
         return {
-            "session_id": str(receipt.session_id),
-            "session_name": str(receipt.session_name),
+            "session_id": str(final_receipt.session_id),
+            "session_name": str(final_receipt.session_name),
             "deleted": True,
             "terminals": [],
-            "retained_resources": _session_receipt_retained_resources(receipt),
-            "blocking_recovery_operations": [],
+            "retained_resources": _session_receipt_retained_resources(final_receipt),
+            "workspace_disposition": disposition,
+            "workspace_evidence_sha256": evidence_sha256,
         }
 
 
@@ -4902,6 +8704,7 @@ def _ensure_terminal_ui_projection_schema() -> None:
     _ensure_provider_execution_schema()
     _ensure_workflow_schema()
     _ensure_child_assignment_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     _ensure_delegation_result_schema()
     _ensure_session_deletion_receipt_schema()
     engine_identity = id(engine)
@@ -4930,8 +8733,16 @@ def _ensure_terminal_ui_projection_schema() -> None:
                 "ON workflows (root_terminal_id)"
             )
             connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_workflows_root_status_id "
+                "ON workflows (root_terminal_id, status, id)"
+            )
+            connection.exec_driver_sql(
                 "CREATE INDEX IF NOT EXISTS ix_workflow_turns_workflow_state "
                 "ON workflow_turns (workflow_id, state)"
+            )
+            connection.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_workflow_turns_workflow_state_superseded "
+                "ON workflow_turns (workflow_id, state, superseded_by_turn_id, id)"
             )
             connection.exec_driver_sql(
                 "CREATE INDEX IF NOT EXISTS ix_workflow_turns_workflow_created "
@@ -5091,9 +8902,36 @@ def list_terminal_ui_summary_page(
 def get_terminal_ui_overview_counts() -> Dict[str, int]:
     """Aggregate Home counters and durable session lifetimes in SQLite."""
     _ensure_terminal_ui_projection_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     projection_cte, parameters = _terminal_ui_projection_cte()
-    sql = projection_cte + f"""
-        SELECT COUNT(DISTINCT session_id) AS sessions, COUNT(*) AS agents,
+    sql = projection_cte + f""", receipt_only_sessions AS MATERIALIZED (
+        SELECT COALESCE(receipt.session_id, 'legacy:' || receipt.session_name) AS session_id
+        FROM terminal_deletion_receipts receipt
+        WHERE receipt.session_lifetime_authority_version = 1
+          AND NOT EXISTS (
+            SELECT 1 FROM terminals terminal
+            WHERE COALESCE(terminal.session_id, 'legacy:' || terminal.tmux_session)
+                  = COALESCE(receipt.session_id, 'legacy:' || receipt.session_name)
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM session_deletion_receipts deleted
+            WHERE deleted.session_id = COALESCE(
+              receipt.session_id, 'legacy:' || receipt.session_name
+            )
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM session_deletion_operations operation
+            WHERE operation.session_id = COALESCE(
+              receipt.session_id, 'legacy:' || receipt.session_name
+            )
+          )
+        GROUP BY COALESCE(receipt.session_id, 'legacy:' || receipt.session_name)
+        HAVING COUNT(DISTINCT receipt.session_name) = 1
+    )
+        SELECT COUNT(DISTINCT session_id)
+                 + (SELECT COUNT(*) FROM receipt_only_sessions) AS sessions,
+               COUNT(*) AS agents,
                SUM(CASE WHEN lifecycle NOT IN ('exited', 'recovery_fenced')
                         THEN 1 ELSE 0 END) AS active,
                SUM(CASE WHEN {_UI_READY_WAITING_ACTIVITY_PREDICATE}
@@ -5111,6 +8949,8 @@ def get_terminal_ui_overview_counts() -> Dict[str, int]:
 def list_terminal_ui_session_page(*, limit: int, offset: int, query: str = "") -> Dict[str, Any]:
     """Page stable session lifetimes; runtime retirement cannot erase them."""
     _ensure_terminal_ui_projection_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     projection_cte, parameters = _terminal_ui_projection_cte()
     normalized = query.strip().lower()
     search = ""
@@ -5123,7 +8963,7 @@ def list_terminal_ui_session_page(*, limit: int, offset: int, query: str = "") -
     parameters.update({"limit": limit, "offset": offset})
     sql = (
         projection_cte
-        + """, aggregates AS MATERIALIZED (
+        + """, terminal_aggregates AS MATERIALIZED (
       SELECT session_id AS id, MAX(session_name) AS name,
              CASE WHEN SUM(CASE WHEN lifecycle NOT IN ('exited', 'recovery_fenced')
                                 THEN 1 ELSE 0 END) > 0
@@ -5139,6 +8979,41 @@ def list_terminal_ui_session_page(*, limit: int, offset: int, query: str = "") -
              MAX(last_active) AS last_active
              , MAX(workspace_state) AS workspace_state
       FROM projected GROUP BY session_id
+    ), receipt_only_aggregates AS MATERIALIZED (
+      SELECT COALESCE(receipt.session_id, 'legacy:' || receipt.session_name) AS id,
+             MAX(receipt.session_name) AS name, 'history' AS status,
+             MIN(receipt.deleted_at) AS created_at, 0 AS agent_count,
+             0 AS active_agent_count, NULL AS project_name,
+             MAX(receipt.deleted_at) AS last_active,
+             (SELECT MAX(context.state) FROM writable_work_contexts context
+              WHERE context.session_id = COALESCE(
+                receipt.session_id, 'legacy:' || receipt.session_name
+              )) AS workspace_state
+      FROM terminal_deletion_receipts receipt
+      WHERE receipt.session_lifetime_authority_version = 1
+        AND NOT EXISTS (
+          SELECT 1 FROM terminals terminal
+          WHERE COALESCE(terminal.session_id, 'legacy:' || terminal.tmux_session)
+                = COALESCE(receipt.session_id, 'legacy:' || receipt.session_name)
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM session_deletion_receipts deleted
+          WHERE deleted.session_id = COALESCE(
+            receipt.session_id, 'legacy:' || receipt.session_name
+          )
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM session_deletion_operations operation
+          WHERE operation.session_id = COALESCE(
+            receipt.session_id, 'legacy:' || receipt.session_name
+          )
+        )
+      GROUP BY COALESCE(receipt.session_id, 'legacy:' || receipt.session_name)
+      HAVING COUNT(DISTINCT receipt.session_name) = 1
+    ), aggregates AS MATERIALIZED (
+      SELECT * FROM terminal_aggregates
+      UNION ALL
+      SELECT * FROM receipt_only_aggregates
     ), filtered AS MATERIALIZED (SELECT * FROM aggregates"""
         + search
         + """),
@@ -5227,7 +9102,21 @@ def delete_terminal(terminal_id: str) -> bool:
     transaction narrow prevents an uncertain process/tmux cleanup from
     accidentally reopening the canonical worktree to another writer.
     """
+    _ensure_session_deletion_receipt_schema()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.get(TerminalModel, terminal_id)
+        if terminal is not None:
+            session_id = str(terminal.session_id or f"legacy:{terminal.tmux_session}")
+            if (
+                db.get(SessionDeletionOperationModel, session_id) is not None
+                or db.query(SessionDeletionOperationModel.session_id)
+                .filter(SessionDeletionOperationModel.session_name == terminal.tmux_session)
+                .first()
+                is not None
+            ):
+                db.rollback()
+                raise AmbiguousTerminalIdentity(terminal_id)
         _cancel_protected_workflows_in_transaction(
             db,
             [terminal_id],
@@ -5251,6 +9140,7 @@ _TERMINAL_DELETION_IDENTITY_FIELDS = (
     "managed_worktree_source",
     "managed_worktree_branch",
     "managed_worktree_commit",
+    "managed_worktree_origin_terminal_id",
     "writable_work_context_id",
     "writer_authority_generation",
     "runtime_pane_id",
@@ -5261,15 +9151,70 @@ _TERMINAL_DELETION_IDENTITY_FIELDS = (
 )
 
 
+def _terminal_workspace_cleanup_receipt_fields(
+    terminal: TerminalModel,
+    authority: Mapping[str, Any] | None,
+) -> Dict[str, Any]:
+    """Validate physical cleanup evidence before deleting terminal metadata."""
+    if terminal.managed_worktree_kind is None:
+        return {
+            "workspace_cleanup_authority_version": 1,
+            "managed_worktree_kind": None,
+            "managed_worktree_source": None,
+            "managed_worktree_path": None,
+            "managed_worktree_branch": None,
+            "managed_worktree_branch_object_id": None,
+            "managed_worktree_identity": None,
+        }
+    identity = (
+        terminal.writable_work_context_id
+        or terminal.managed_worktree_origin_terminal_id
+        or terminal.id
+    )
+    expected = {
+        "version": 1,
+        "managed": True,
+        "kind": terminal.managed_worktree_kind,
+        "source": terminal.managed_worktree_source,
+        "path": terminal.launch_worktree,
+        "branch": terminal.managed_worktree_branch,
+        "identity": identity,
+        "path_absent": True,
+        "git_unregistered": True,
+    }
+    if authority is None or any(authority.get(key) != value for key, value in expected.items()):
+        raise AmbiguousTerminalIdentity(str(terminal.id))
+    branch_object_id = authority.get("branch_object_id")
+    if expected["branch"] is not None and not (
+        isinstance(branch_object_id, str) and branch_object_id
+    ):
+        raise AmbiguousTerminalIdentity(str(terminal.id))
+    if expected["branch"] is None and branch_object_id is not None:
+        raise AmbiguousTerminalIdentity(str(terminal.id))
+    return {
+        "workspace_cleanup_authority_version": 1,
+        "managed_worktree_kind": str(expected["kind"]),
+        "managed_worktree_source": str(expected["source"]),
+        "managed_worktree_path": str(expected["path"]),
+        "managed_worktree_branch": expected["branch"],
+        "managed_worktree_branch_object_id": branch_object_id,
+        "managed_worktree_identity": str(identity),
+    }
+
+
 def terminal_deletion_receipt_exists(terminal_id: str) -> bool:
     """Return whether one exact terminal was already deleted successfully."""
     _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     with SessionLocal() as db:
-        return db.get(TerminalDeletionReceiptModel, terminal_id) is not None
+        return _terminal_deletion_fence_exists_in_transaction(db, terminal_id)
 
 
 def delete_exited_terminal(
-    terminal_id: str, *, expected_identity: Mapping[str, Any]
+    terminal_id: str,
+    *,
+    expected_identity: Mapping[str, Any],
+    workspace_cleanup_authority: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Delete one unchanged exited terminal and persist an idempotency receipt.
 
@@ -5279,20 +9224,37 @@ def delete_exited_terminal(
     metadata. A concurrent identity change therefore fails closed.
     """
     _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         terminal = db.get(TerminalModel, terminal_id)
         receipt = db.get(TerminalDeletionReceiptModel, terminal_id)
-        if terminal is None and receipt is not None:
+        hard_deleted_terminal, _digest = _hard_deleted_terminal_fence_in_transaction(
+            db, terminal_id
+        )
+        if terminal is None and (receipt is not None or hard_deleted_terminal):
             db.rollback()
             return {"deleted": 0, "already_deleted": True, "missing": False}
         if terminal is None:
             db.rollback()
             return {"deleted": 0, "already_deleted": False, "missing": True}
-        if receipt is not None:
+        if receipt is not None or hard_deleted_terminal:
             # Terminal IDs are intended to be durable identities. If an old ID
             # was nevertheless reused, its prior receipt cannot authorize
             # deletion of the replacement row.
+            db.rollback()
+            raise AmbiguousTerminalIdentity(terminal_id)
+        session_id = str(terminal.session_id or f"legacy:{terminal.tmux_session}")
+        if (
+            db.get(SessionDeletionOperationModel, session_id) is not None
+            or db.query(SessionDeletionOperationModel.session_id)
+            .filter(SessionDeletionOperationModel.session_name == terminal.tmux_session)
+            .first()
+            is not None
+        ):
+            # A Session hard-delete fence binds the complete current and
+            # already-retired terminal identity set.  Per-terminal deletion
+            # must not change that set after the durable fence exists.
             db.rollback()
             raise AmbiguousTerminalIdentity(terminal_id)
         if terminal.runtime_lifecycle != "exited" or any(
@@ -5302,10 +9264,32 @@ def delete_exited_terminal(
             db.rollback()
             raise AmbiguousTerminalIdentity(terminal_id)
         receipt_identity = {
-            "session_id": terminal.session_id,
+            # Persist the canonical lifetime identity even for legacy rows,
+            # whose TerminalModel.session_id was historically nullable. A
+            # receipt with only a reusable tmux name is never sufficient
+            # authority for a future hard delete.
+            "session_id": session_id,
             "session_name": terminal.tmux_session,
             "window_name": terminal.tmux_window,
         }
+        prior_receipts = _session_historical_terminal_receipts(db, session_id)
+        if len(prior_receipts) > _SESSION_DELETION_PLAN_LIMIT or any(
+            str(prior.session_name) != str(terminal.tmux_session)
+            or not isinstance(prior.session_id, str)
+            or str(prior.session_id) != session_id
+            for prior in prior_receipts
+        ):
+            db.rollback()
+            raise AmbiguousTerminalIdentity(terminal_id)
+        # The current Terminal is exact independent proof of the Session
+        # lifetime. Upgrade only its already-owned receipts, inside the same
+        # transaction that may remove the final current Terminal.
+        for prior in prior_receipts:
+            prior.session_lifetime_authority_version = 1
+        cleanup_receipt_fields = _terminal_workspace_cleanup_receipt_fields(
+            terminal,
+            workspace_cleanup_authority,
+        )
 
         writable_context = None
         if terminal.writable_work_context_id is not None:
@@ -5366,6 +9350,9 @@ def delete_exited_terminal(
                 session_id=receipt_identity["session_id"],
                 session_name=receipt_identity["session_name"],
                 window_name=receipt_identity["window_name"],
+                auth_token_sha256=terminal.auth_token_sha256,
+                session_lifetime_authority_version=1,
+                **cleanup_receipt_fields,
                 deleted_at=datetime.now(),
             )
         )
@@ -5375,7 +9362,17 @@ def delete_exited_terminal(
 
 def delete_terminals_by_session(tmux_session: str) -> int:
     """Delete dead-session metadata and release its writer leases atomically."""
+    _ensure_session_deletion_receipt_schema()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        if (
+            db.query(SessionDeletionOperationModel.session_id)
+            .filter(SessionDeletionOperationModel.session_name == tmux_session)
+            .first()
+            is not None
+        ):
+            db.rollback()
+            raise AmbiguousSessionIdentity(tmux_session)
         terminal_ids = [
             row[0]
             for row in db.query(TerminalModel.id)
@@ -5398,6 +9395,1238 @@ def delete_terminals_by_session(tmux_session: str) -> int:
         )
         db.commit()
         return deleted
+
+
+_SESSION_HARD_DELETE_FENCED = "fenced"
+_SESSION_HARD_DELETE_WORKSPACE_RETIRED = "workspace_retired"
+_SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN = "workspace_preserved_foreign"
+_SESSION_WORKSPACE_DISPOSITION_RETIRED = "retired"
+_SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN = "preserved_foreign"
+
+
+def _session_terminal_scope(db: Any, session_id: str) -> Any:
+    return db.query(TerminalModel.id).filter(
+        or_(
+            TerminalModel.session_id == session_id,
+            and_(
+                TerminalModel.session_id.is_(None),
+                ("legacy:" + TerminalModel.tmux_session) == session_id,
+            ),
+        )
+    )
+
+
+def _session_owned_graph_queries(
+    db: Any, session_id: str, terminal_ids: Sequence[str]
+) -> Dict[str, Any]:
+    """Build fixed-shape ownership queries while terminal/workflow roots still exist."""
+    terminal_values = tuple(str(value) for value in terminal_ids)
+    workflow_ids = db.query(WorkflowModel.id).filter(
+        WorkflowModel.root_terminal_id.in_(terminal_values)
+    )
+    turn_ids = db.query(WorkflowTurnModel.id).filter(
+        WorkflowTurnModel.workflow_id.in_(workflow_ids)
+    )
+    effect_ids = db.query(WorkflowEffectModel.id).filter(
+        WorkflowEffectModel.workflow_id.in_(workflow_ids)
+    )
+    effect_resolution_ids = db.query(WorkflowEffectResolutionModel.id).filter(
+        WorkflowEffectResolutionModel.workflow_effect_id.in_(effect_ids)
+    )
+    assignment_ids = db.query(ChildAssignmentModel.id).filter(
+        ChildAssignmentModel.parent_terminal_id.in_(terminal_values),
+        ChildAssignmentModel.child_terminal_id.in_(terminal_values),
+    )
+    managed_attempt_ids = db.query(ManagedAttemptLifecycleModel.assignment_id).filter(
+        ManagedAttemptLifecycleModel.assignment_id.in_(assignment_ids)
+    )
+    result_ids = db.query(DelegationResultModel.id).filter(
+        DelegationResultModel.child_assignment_id.in_(assignment_ids),
+        DelegationResultModel.parent_terminal_id.in_(terminal_values),
+        DelegationResultModel.child_terminal_id.in_(terminal_values),
+    )
+    context_ids = db.query(WritableWorkContextModel.id).filter(
+        WritableWorkContextModel.session_id == session_id
+    )
+    takeover_ids = db.query(RecoveryTakeoverModel.id).filter(
+        RecoveryTakeoverModel.old_terminal_id.in_(terminal_values),
+        RecoveryTakeoverModel.new_terminal_id.in_(terminal_values),
+    )
+    return {
+        "terminal_ids": terminal_values,
+        "workflow_ids": workflow_ids,
+        "turn_ids": turn_ids,
+        "effect_ids": effect_ids,
+        "effect_resolution_ids": effect_resolution_ids,
+        "assignment_ids": assignment_ids,
+        "managed_attempt_ids": managed_attempt_ids,
+        "result_ids": result_ids,
+        "context_ids": context_ids,
+        "takeover_ids": takeover_ids,
+    }
+
+
+def _session_owned_row_counts_in_transaction(
+    db: Any, session_id: str, terminal_ids: Sequence[str]
+) -> Dict[str, int]:
+    owned = _session_owned_graph_queries(db, session_id, terminal_ids)
+    terminal_values = owned["terminal_ids"]
+    return {
+        "terminals": int(_session_terminal_scope(db, session_id).count()),
+        "workflows": int(
+            db.query(WorkflowModel.id).filter(WorkflowModel.id.in_(owned["workflow_ids"])).count()
+        ),
+        "workflow_turns": int(
+            db.query(WorkflowTurnModel.id)
+            .filter(WorkflowTurnModel.id.in_(owned["turn_ids"]))
+            .count()
+        ),
+        "workflow_turn_receipts": int(
+            db.query(WorkflowTurnReceiptModel.id)
+            .filter(WorkflowTurnReceiptModel.workflow_turn_id.in_(owned["turn_ids"]))
+            .count()
+        ),
+        "workflow_effects": int(
+            db.query(WorkflowEffectModel.id)
+            .filter(WorkflowEffectModel.id.in_(owned["effect_ids"]))
+            .count()
+        ),
+        "workflow_effect_resolutions": int(
+            db.query(WorkflowEffectResolutionModel.id)
+            .filter(WorkflowEffectResolutionModel.id.in_(owned["effect_resolution_ids"]))
+            .count()
+        ),
+        "workflow_provider_reconnect_attempts": int(
+            db.query(WorkflowProviderReconnectAttemptModel.id)
+            .filter(WorkflowProviderReconnectAttemptModel.workflow_id.in_(owned["workflow_ids"]))
+            .count()
+        ),
+        "provider_execution_leases": int(
+            db.query(ProviderExecutionLeaseModel.terminal_id)
+            .filter(ProviderExecutionLeaseModel.terminal_id.in_(terminal_values))
+            .count()
+        ),
+        "worktree_writer_leases": int(
+            db.query(WorktreeWriterLeaseModel.terminal_id)
+            .filter(WorktreeWriterLeaseModel.terminal_id.in_(terminal_values))
+            .count()
+        ),
+        "child_assignments": int(
+            db.query(ChildAssignmentModel.id)
+            .filter(ChildAssignmentModel.id.in_(owned["assignment_ids"]))
+            .count()
+        ),
+        "managed_attempt_lifecycle": int(
+            db.query(ManagedAttemptLifecycleModel.assignment_id)
+            .filter(ManagedAttemptLifecycleModel.assignment_id.in_(owned["managed_attempt_ids"]))
+            .count()
+        ),
+        "managed_attempt_lifecycle_events": int(
+            db.query(ManagedAttemptLifecycleEventModel.id)
+            .filter(
+                ManagedAttemptLifecycleEventModel.assignment_id.in_(owned["managed_attempt_ids"])
+            )
+            .count()
+        ),
+        "delegation_results": int(
+            db.query(DelegationResultModel.id)
+            .filter(DelegationResultModel.id.in_(owned["result_ids"]))
+            .count()
+        ),
+        "delegation_result_submissions": int(
+            db.query(DelegationResultSubmissionModel.result_id)
+            .filter(DelegationResultSubmissionModel.result_id.in_(owned["result_ids"]))
+            .count()
+        ),
+        "delegation_result_events": int(
+            db.query(DelegationResultEventModel.id)
+            .filter(DelegationResultEventModel.result_id.in_(owned["result_ids"]))
+            .count()
+        ),
+        "inbox": int(
+            db.query(InboxModel.id).filter(InboxModel.receiver_id.in_(terminal_values)).count()
+        ),
+        "provider_usage_bindings": int(
+            db.query(ProviderUsageBindingModel.id)
+            .filter(ProviderUsageBindingModel.terminal_id.in_(terminal_values))
+            .count()
+        ),
+        "usage_records": int(
+            db.query(UsageRecordModel.id)
+            .filter(
+                or_(
+                    UsageRecordModel.session_id == session_id,
+                    UsageRecordModel.terminal_id.in_(terminal_values),
+                )
+            )
+            .count()
+        ),
+        "owner_launch_grants": int(
+            db.query(OwnerLaunchGrantModel.id)
+            .filter(OwnerLaunchGrantModel.consumed_terminal_id.in_(terminal_values))
+            .count()
+        ),
+        "recovery_takeovers": int(
+            db.query(RecoveryTakeoverModel.id)
+            .filter(RecoveryTakeoverModel.id.in_(owned["takeover_ids"]))
+            .count()
+        ),
+        "recovery_takeover_audit": int(
+            db.query(RecoveryTakeoverAuditModel.id)
+            .filter(RecoveryTakeoverAuditModel.takeover_id.in_(owned["takeover_ids"]))
+            .count()
+        ),
+        "telegram_notification_deliveries": int(
+            db.query(TelegramDeliveryModel.event_key)
+            .filter(TelegramDeliveryModel.workflow_id.in_(owned["workflow_ids"]))
+            .count()
+        ),
+        "writable_work_contexts": int(
+            db.query(WritableWorkContextModel.id)
+            .filter(WritableWorkContextModel.id.in_(owned["context_ids"]))
+            .count()
+        ),
+        "writable_work_context_audit": int(
+            db.query(WritableWorkContextAuditModel.id)
+            .filter(WritableWorkContextAuditModel.work_context_id.in_(owned["context_ids"]))
+            .count()
+        ),
+        "session_deletion_cancellation_audit": int(
+            db.query(SessionDeletionCancellationAuditModel.id)
+            .filter(SessionDeletionCancellationAuditModel.session_id == session_id)
+            .count()
+        ),
+        "terminal_deletion_receipts": int(
+            db.query(TerminalDeletionReceiptModel.terminal_id)
+            .filter(TerminalDeletionReceiptModel.terminal_id.in_(terminal_values))
+            .count()
+        ),
+    }
+
+
+def _session_hard_delete_authority_fingerprint(
+    db: Any,
+    session_id: str,
+    session_name: str,
+    terminals: Sequence[TerminalModel],
+) -> str:
+    contexts = (
+        db.query(WritableWorkContextModel)
+        .filter(WritableWorkContextModel.session_id == session_id)
+        .order_by(WritableWorkContextModel.id.asc())
+        .all()
+    )
+    terminal_receipts = _session_historical_terminal_receipts(db, session_id)
+    if len(terminal_receipts) > _SESSION_DELETION_PLAN_LIMIT:
+        raise AmbiguousSessionIdentity(session_id)
+    document = {
+        "version": 4,
+        "session_id": session_id,
+        "session_name": session_name,
+        "terminals": sorted(
+            (
+                str(terminal.id),
+                str(terminal.tmux_session),
+                str(terminal.runtime_lifecycle or ""),
+                str(terminal.runtime_generation or ""),
+                str(terminal.writer_authority_generation or ""),
+                str(terminal.runtime_operation_kind or ""),
+                str(terminal.runtime_operation_token or ""),
+                str(terminal.recovery_takeover_id or ""),
+                str(terminal.replaced_by_terminal_id or ""),
+                str(terminal.launch_worktree or ""),
+                str(terminal.write_enabled if terminal.write_enabled is not None else ""),
+                str(terminal.managed_worktree_kind or ""),
+                str(terminal.managed_worktree_source or ""),
+                str(terminal.managed_worktree_branch or ""),
+                str(terminal.managed_worktree_commit or ""),
+                str(terminal.managed_worktree_origin_terminal_id or ""),
+                str(terminal.writable_work_context_id or ""),
+                str(terminal.workspace_classification or ""),
+                str(terminal.project_id or ""),
+                str(terminal.runtime_pane_id or ""),
+                str(terminal.runtime_pane_pid or ""),
+                str(terminal.runtime_process_start_ticks or ""),
+                str(terminal.runtime_process_group_id or ""),
+                str(terminal.runtime_process_session_id or ""),
+            )
+            for terminal in terminals
+        ),
+        "work_contexts": [
+            (
+                str(context.id),
+                str(context.session_id),
+                str(context.terminal_id),
+                str(context.project_id),
+                str(context.canonical_source),
+                str(context.canonical_worktree),
+                str(context.branch),
+                str(context.base_revision),
+                str(context.writer_authority_generation or ""),
+            )
+            for context in contexts
+        ],
+        "terminal_receipts": [
+            (
+                str(receipt.terminal_id),
+                str(receipt.session_id or ""),
+                str(receipt.session_name),
+                str(receipt.window_name),
+                str(receipt.auth_token_sha256 or ""),
+                str(receipt.session_lifetime_authority_version or ""),
+                str(receipt.workspace_cleanup_authority_version or ""),
+                str(receipt.managed_worktree_kind or ""),
+                str(receipt.managed_worktree_source or ""),
+                str(receipt.managed_worktree_path or ""),
+                str(receipt.managed_worktree_branch or ""),
+                str(receipt.managed_worktree_branch_object_id or ""),
+                str(receipt.managed_worktree_identity or ""),
+                receipt.deleted_at.isoformat() if receipt.deleted_at else "",
+            )
+            for receipt in terminal_receipts
+        ],
+    }
+    return hashlib.sha256(
+        json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _revalidate_session_hard_deletion_in_transaction(
+    db: Any,
+    operation: SessionDeletionOperationModel,
+    *,
+    require_workspace_retired: bool,
+) -> tuple[List[TerminalModel] | None, str | None]:
+    """Recheck the exact live-authority boundary for one durable delete fence."""
+    parsed = _session_deletion_operation_dict(operation)
+    terminals = _session_plan_terminals(db, parsed["session_id"], parsed["terminal_ids"])
+    if terminals is None or {str(row.id) for row in terminals} != set(parsed["terminal_ids"]):
+        return None, "SESSION_IDENTITY_CHANGED"
+    _receipts, lifetime_error = _validate_session_terminal_receipt_authority(
+        db,
+        parsed["session_id"],
+        parsed["session_name"],
+        require_complete=not terminals,
+    )
+    if lifetime_error is not None:
+        return None, lifetime_error
+    if any(
+        str(row.tmux_session) != parsed["session_name"]
+        or str(row.runtime_lifecycle or "") not in {"exited", "recovery_fenced"}
+        or row.runtime_operation_kind is not None
+        or row.runtime_operation_token is not None
+        for row in terminals
+    ):
+        return None, "SESSION_RUNTIME_AUTHORITY_UNPROVEN"
+    plan = _session_unresolved_work_plan_in_transaction(
+        db,
+        session_id=parsed["session_id"],
+        terminals=terminals,
+    )
+    if not plan["eligible"]:
+        return None, "SESSION_DELETE_PLAN_CHANGED"
+    contexts = (
+        db.query(WritableWorkContextModel)
+        .filter(WritableWorkContextModel.session_id == parsed["session_id"])
+        .limit(2)
+        .all()
+    )
+    if len(contexts) > 1:
+        return None, "WORKSPACE_AUTHORITY_CHANGED"
+    if require_workspace_retired:
+        if any(context.state != "retired" for context in contexts):
+            return None, "WORKSPACE_STILL_ACTIVE"
+    elif any(context.state not in {"admitted", "retiring", "retired"} for context in contexts):
+        return None, "WORKSPACE_STATE_NOT_RETIRABLE"
+    if (
+        _session_graph_terminal_ids(
+            db,
+            parsed["session_id"],
+            [str(terminal.id) for terminal in terminals],
+        )
+        is None
+    ):
+        return None, "SESSION_DELETE_PLAN_TOO_LARGE"
+    current_fingerprint = _session_hard_delete_authority_fingerprint(
+        db,
+        parsed["session_id"],
+        parsed["session_name"],
+        terminals,
+    )
+    if not hmac.compare_digest(str(operation.authority_fingerprint), current_fingerprint):
+        return None, "SESSION_DELETE_PLAN_CHANGED"
+    workspace_authority = parsed.get("workspace_authority")
+    if workspace_authority is not None:
+        relational_error = _validate_session_workspace_relational_authority_in_transaction(
+            db,
+            session_id=parsed["session_id"],
+            terminal_ids=parsed["terminal_ids"],
+            workspace_authority=workspace_authority,
+            allow_dirty_workspace=bool(parsed["allow_dirty_workspace"]),
+            require_exact_context=False,
+            allow_foreign_workspace=(
+                parsed.get("workspace_disposition")
+                == _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN
+            ),
+        )
+        if relational_error is not None:
+            return None, relational_error
+    return terminals, None
+
+
+def revalidate_session_hard_deletion(
+    session_id: str,
+    session_name: str,
+) -> Dict[str, Any]:
+    """Prove a fenced Session remains safe before physical destructive I/O."""
+    _ensure_terminal_ui_projection_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        receipt = db.get(SessionDeletionReceiptModel, session_id)
+        if receipt is not None:
+            matched = str(receipt.session_name) == session_name
+            db.rollback()
+            if not matched:
+                raise AmbiguousSessionIdentity(session_id)
+            return {"valid": True, "already_deleted": True, "terminal_ids": []}
+        operation = db.get(SessionDeletionOperationModel, session_id)
+        if operation is None or str(operation.session_name) != session_name:
+            db.rollback()
+            return {"valid": False, "reason_code": "SESSION_DELETE_FENCE_MISSING"}
+        terminals, reason_code = _revalidate_session_hard_deletion_in_transaction(
+            db,
+            operation,
+            require_workspace_retired=False,
+        )
+        terminal_ids = [str(row.id) for row in terminals or ()]
+        graph_terminal_ids = (
+            _session_graph_terminal_ids(db, session_id, terminal_ids)
+            if terminals is not None
+            else None
+        )
+        db.rollback()
+        return (
+            {
+                "valid": False,
+                "reason_code": reason_code or "SESSION_DELETE_PLAN_TOO_LARGE",
+            }
+            if reason_code is not None or graph_terminal_ids is None
+            else {
+                "valid": True,
+                "terminal_ids": terminal_ids,
+                "graph_terminal_ids": graph_terminal_ids,
+                "workspace_disposition": (
+                    _session_deletion_operation_dict(operation).get("workspace_disposition")
+                ),
+            }
+        )
+
+
+def begin_session_hard_deletion(
+    session_id: str,
+    session_name: str,
+    *,
+    expected_terminal_ids: Sequence[str],
+    allow_dirty_workspace: bool,
+) -> Dict[str, Any]:
+    """Fence one proven-dead Session before crossing filesystem boundaries."""
+    _ensure_terminal_ui_projection_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
+    _ensure_managed_attempt_lifecycle_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        receipt = db.get(SessionDeletionReceiptModel, session_id)
+        if receipt is not None:
+            if str(receipt.session_name) != session_name:
+                db.rollback()
+                raise AmbiguousSessionIdentity(session_id)
+            db.rollback()
+            return {"started": True, "already_deleted": True}
+        existing = db.get(SessionDeletionOperationModel, session_id)
+        if existing is not None:
+            operation = _session_deletion_operation_with_graph(db, existing)
+            if operation["session_name"] != session_name or set(operation["terminal_ids"]) != set(
+                expected_terminal_ids
+            ):
+                db.rollback()
+                raise AmbiguousSessionIdentity(session_id)
+            _terminals, reason_code = _revalidate_session_hard_deletion_in_transaction(
+                db,
+                existing,
+                require_workspace_retired=False,
+            )
+            db.rollback()
+            if reason_code is not None:
+                return {"started": False, "reason_code": reason_code}
+            return {"started": True, "already_started": True, **operation}
+        terminals = _session_plan_terminals(db, session_id, expected_terminal_ids)
+        if terminals is None or len(terminals) > _SESSION_DELETION_PLAN_LIMIT:
+            db.rollback()
+            raise AmbiguousSessionIdentity(session_id)
+        _receipts, lifetime_error = _validate_session_terminal_receipt_authority(
+            db,
+            session_id,
+            session_name,
+            require_complete=not terminals,
+        )
+        if lifetime_error is not None:
+            db.rollback()
+            return {"started": False, "reason_code": lifetime_error}
+        if any(
+            str(terminal.tmux_session) != session_name
+            or str(terminal.runtime_lifecycle or "") not in {"exited", "recovery_fenced"}
+            or terminal.runtime_operation_kind is not None
+            or terminal.runtime_operation_token is not None
+            for terminal in terminals
+        ):
+            db.rollback()
+            return {"started": False, "reason_code": "SESSION_RUNTIME_AUTHORITY_UNPROVEN"}
+        plan = _session_unresolved_work_plan_in_transaction(
+            db, session_id=session_id, terminals=terminals
+        )
+        if not plan["eligible"]:
+            db.rollback()
+            reason_codes = plan.get("reason_codes") or ["SESSION_DELETE_PLAN_CHANGED"]
+            return {"started": False, "reason_code": str(reason_codes[0])}
+        contexts = (
+            db.query(WritableWorkContextModel)
+            .filter(WritableWorkContextModel.session_id == session_id)
+            .limit(2)
+            .all()
+        )
+        if len(contexts) > 1 or any(
+            context.state not in {"admitted", "retiring", "retired"} for context in contexts
+        ):
+            db.rollback()
+            return {"started": False, "reason_code": "WORKSPACE_STATE_NOT_RETIRABLE"}
+        effective_allow_dirty_workspace = bool(allow_dirty_workspace)
+        if contexts and contexts[0].state == "retiring":
+            # A prior retirement claim is already the durable destructive
+            # authority for this physical workspace. Browser/service retries
+            # must resume that exact decision rather than recording the
+            # caller's potentially stale confirmation flag and permanently
+            # stranding the hard-delete fence on the next cleanup step.
+            effective_allow_dirty_workspace = bool(contexts[0].retirement_allow_dirty)
+        graph_terminal_ids = _session_graph_terminal_ids(
+            db,
+            session_id,
+            [str(terminal.id) for terminal in terminals],
+        )
+        if graph_terminal_ids is None:
+            db.rollback()
+            return {"started": False, "reason_code": "SESSION_DELETE_PLAN_TOO_LARGE"}
+        fingerprint = _session_hard_delete_authority_fingerprint(
+            db, session_id, session_name, terminals
+        )
+        now = datetime.now()
+        operation = SessionDeletionOperationModel(
+            session_id=session_id,
+            session_name=session_name,
+            state=_SESSION_HARD_DELETE_FENCED,
+            terminal_ids_json=json.dumps(
+                sorted(str(terminal.id) for terminal in terminals), separators=(",", ":")
+            ),
+            allow_dirty_workspace=effective_allow_dirty_workspace,
+            authority_fingerprint=fingerprint,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(operation)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            with SessionLocal() as raced_db:
+                raced = raced_db.get(SessionDeletionOperationModel, session_id)
+                if raced is None:
+                    raise AmbiguousSessionIdentity(session_id)
+                raced_operation = _session_deletion_operation_with_graph(raced_db, raced)
+                if raced_operation["session_name"] != session_name or set(
+                    raced_operation["terminal_ids"]
+                ) != set(expected_terminal_ids):
+                    raise AmbiguousSessionIdentity(session_id)
+                return {"started": True, "already_started": True, **raced_operation}
+        parsed_operation = _session_deletion_operation_dict(operation)
+        parsed_operation["graph_terminal_ids"] = graph_terminal_ids
+        return {"started": True, **parsed_operation}
+
+
+def _session_foreign_workspace_preservation_document(
+    *,
+    workspace_authority_sha256: str,
+    graph_terminal_ids: Sequence[str],
+    foreign_authority: Mapping[str, Any],
+    runtime_artifacts: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "disposition": _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN,
+        "reason_code": "WORKSPACE_FOREIGN_OWNER",
+        "workspace_authority_sha256": workspace_authority_sha256,
+        "graph_terminal_ids": sorted(str(value) for value in graph_terminal_ids),
+        "foreign_authority": dict(foreign_authority),
+        "runtime_artifacts": dict(runtime_artifacts) if runtime_artifacts is not None else None,
+    }
+
+
+def bind_session_hard_deletion_workspace_authority(
+    session_id: str,
+    session_name: str,
+    *,
+    workspace_authority: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Bind one exact current Git/worktree plan to a fenced Session delete."""
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        receipt = db.get(SessionDeletionReceiptModel, session_id)
+        if receipt is not None:
+            matched = str(receipt.session_name) == session_name
+            db.rollback()
+            if not matched:
+                raise AmbiguousSessionIdentity(session_id)
+            return {"bound": True, "already_deleted": True}
+        operation = db.get(SessionDeletionOperationModel, session_id)
+        if operation is None or str(operation.session_name) != session_name:
+            db.rollback()
+            return {"bound": False, "reason_code": "SESSION_DELETE_FENCE_MISSING"}
+        parsed = _session_deletion_operation_dict(operation)
+        try:
+            normalized, encoded, digest = _normalize_session_workspace_authority(
+                workspace_authority,
+                expected_session_id=session_id,
+                expected_terminal_ids=parsed["terminal_ids"],
+            )
+        except ValueError:
+            db.rollback()
+            return {"bound": False, "reason_code": "WORKSPACE_AUTHORITY_CHANGED"}
+        _terminals, reason_code = _revalidate_session_hard_deletion_in_transaction(
+            db,
+            operation,
+            require_workspace_retired=False,
+        )
+        if reason_code is not None:
+            db.rollback()
+            return {"bound": False, "reason_code": reason_code}
+        relational_error = _validate_session_workspace_relational_authority_in_transaction(
+            db,
+            session_id=session_id,
+            terminal_ids=parsed["terminal_ids"],
+            workspace_authority=normalized,
+            allow_dirty_workspace=bool(parsed["allow_dirty_workspace"]),
+            require_exact_context=True,
+        )
+        foreign_authority = None
+        if relational_error == "WORKSPACE_FOREIGN_OWNER":
+            foreign_authority = _session_foreign_workspace_evidence_in_transaction(
+                db,
+                session_id=session_id,
+                terminal_ids=parsed["terminal_ids"],
+                workspace_authority=normalized,
+            )
+        if relational_error is not None and foreign_authority is None:
+            db.rollback()
+            return {"bound": False, "reason_code": relational_error}
+        if parsed["workspace_authority"] is not None:
+            matched = (
+                hmac.compare_digest(str(parsed["workspace_authority_sha256"]), digest)
+                and parsed["workspace_authority"] == normalized
+            )
+            db.rollback()
+            return (
+                {"bound": True, "already_bound": True, "workspace_authority_sha256": digest}
+                if matched
+                else {
+                    "bound": False,
+                    "reason_code": "WRITABLE_WORKTREE_AUTHORITY_CHANGED",
+                }
+            )
+        if operation.state != _SESSION_HARD_DELETE_FENCED:
+            db.rollback()
+            return {"bound": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
+        operation.workspace_authority_json = encoded
+        operation.workspace_authority_sha256 = digest
+        operation.workspace_disposition = (
+            _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN
+            if foreign_authority is not None
+            else _SESSION_WORKSPACE_DISPOSITION_RETIRED
+        )
+        if foreign_authority is not None:
+            graph_terminal_ids = _session_graph_terminal_ids(db, session_id, parsed["terminal_ids"])
+            if graph_terminal_ids is None:
+                db.rollback()
+                return {"bound": False, "reason_code": "SESSION_DELETE_PLAN_TOO_LARGE"}
+            evidence, evidence_json, evidence_sha256 = _canonical_session_workspace_evidence(
+                _session_foreign_workspace_preservation_document(
+                    workspace_authority_sha256=digest,
+                    graph_terminal_ids=graph_terminal_ids,
+                    foreign_authority=foreign_authority,
+                )
+            )
+            operation.workspace_evidence_json = evidence_json
+            operation.workspace_evidence_sha256 = evidence_sha256
+        operation.updated_at = datetime.now()
+        db.commit()
+        return {
+            "bound": True,
+            "workspace_authority_sha256": digest,
+            "workspace_disposition": operation.workspace_disposition,
+        }
+
+
+def admit_session_foreign_workspace_preservation(
+    session_id: str,
+    session_name: str,
+) -> Dict[str, Any]:
+    """Atomically replace destructive cleanup with foreign-authority preservation."""
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        operation = db.get(SessionDeletionOperationModel, session_id)
+        if operation is None or str(operation.session_name) != session_name:
+            db.rollback()
+            return {"admitted": False, "reason_code": "SESSION_DELETE_FENCE_MISSING"}
+        parsed = _session_deletion_operation_dict(operation)
+        if parsed["workspace_authority"] is None:
+            db.rollback()
+            return {"admitted": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
+        if parsed["workspace_disposition"] == _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN:
+            db.rollback()
+            return {
+                "admitted": True,
+                "already_admitted": True,
+                "workspace_evidence_sha256": parsed["workspace_evidence_sha256"],
+            }
+        if operation.state != _SESSION_HARD_DELETE_FENCED:
+            db.rollback()
+            return {"admitted": False, "reason_code": "SESSION_DELETE_STATE_INVALID"}
+        terminals, reason_code = _revalidate_session_hard_deletion_in_transaction(
+            db,
+            operation,
+            require_workspace_retired=False,
+        )
+        if reason_code != "WORKSPACE_FOREIGN_OWNER":
+            db.rollback()
+            return {
+                "admitted": False,
+                "reason_code": reason_code or "WORKSPACE_FOREIGN_OWNER_UNPROVEN",
+            }
+        terminals = _session_plan_terminals(db, session_id, parsed["terminal_ids"])
+        if terminals is None:
+            db.rollback()
+            return {"admitted": False, "reason_code": "SESSION_IDENTITY_CHANGED"}
+        base_error = _validate_session_workspace_relational_authority_in_transaction(
+            db,
+            session_id=session_id,
+            terminal_ids=parsed["terminal_ids"],
+            workspace_authority=parsed["workspace_authority"],
+            allow_dirty_workspace=bool(parsed["allow_dirty_workspace"]),
+            require_exact_context=False,
+            allow_foreign_workspace=True,
+        )
+        if base_error is not None:
+            db.rollback()
+            return {"admitted": False, "reason_code": base_error}
+        foreign_authority = _session_foreign_workspace_evidence_in_transaction(
+            db,
+            session_id=session_id,
+            terminal_ids=parsed["terminal_ids"],
+            workspace_authority=parsed["workspace_authority"],
+        )
+        graph_terminal_ids = _session_graph_terminal_ids(db, session_id, parsed["terminal_ids"])
+        if foreign_authority is None or graph_terminal_ids is None:
+            db.rollback()
+            return {
+                "admitted": False,
+                "reason_code": (
+                    "WORKSPACE_FOREIGN_OWNER_UNPROVEN"
+                    if foreign_authority is None
+                    else "SESSION_DELETE_PLAN_TOO_LARGE"
+                ),
+            }
+        _evidence, evidence_json, evidence_sha256 = _canonical_session_workspace_evidence(
+            _session_foreign_workspace_preservation_document(
+                workspace_authority_sha256=str(parsed["workspace_authority_sha256"]),
+                graph_terminal_ids=graph_terminal_ids,
+                foreign_authority=foreign_authority,
+            )
+        )
+        operation.workspace_disposition = _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN
+        operation.workspace_evidence_json = evidence_json
+        operation.workspace_evidence_sha256 = evidence_sha256
+        operation.updated_at = datetime.now()
+        db.commit()
+        return {
+            "admitted": True,
+            "workspace_evidence_sha256": evidence_sha256,
+        }
+
+
+def mark_session_hard_deletion_workspace_retired(
+    session_id: str,
+    *,
+    workspace_evidence: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Persist the successful physical/Git cleanup stage for crash-safe retry."""
+    _ensure_session_deletion_receipt_schema()
+    evidence = [dict(item) for item in workspace_evidence]
+    if any(
+        set(item)
+        != {
+            "terminal_id",
+            "managed",
+            "path_absent",
+            "git_unregistered",
+            "branch_absent",
+            "runtime_artifacts_absent",
+        }
+        or not isinstance(item["terminal_id"], str)
+        or not all(
+            isinstance(item[key], bool)
+            for key in (
+                "managed",
+                "path_absent",
+                "git_unregistered",
+                "branch_absent",
+                "runtime_artifacts_absent",
+            )
+        )
+        or not item["runtime_artifacts_absent"]
+        or (
+            item["managed"]
+            and not all(item[key] for key in ("path_absent", "git_unregistered", "branch_absent"))
+        )
+        for item in evidence
+    ):
+        return {"marked": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
+    evidence.sort(key=lambda item: item["terminal_id"])
+    _normalized_evidence, evidence_json, evidence_sha256 = _canonical_session_workspace_evidence(
+        evidence
+    )
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        operation = db.get(SessionDeletionOperationModel, session_id)
+        if operation is None:
+            receipt = db.get(SessionDeletionReceiptModel, session_id)
+            db.rollback()
+            return (
+                {"marked": True, "already_deleted": True}
+                if receipt is not None
+                else {"marked": False, "reason_code": "SESSION_DELETE_FENCE_MISSING"}
+            )
+        parsed = _session_deletion_operation_dict(operation)
+        if parsed["workspace_authority"] is None:
+            db.rollback()
+            return {"marked": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
+        graph_terminal_ids = _session_graph_terminal_ids(
+            db,
+            parsed["session_id"],
+            parsed["terminal_ids"],
+        )
+        if (
+            graph_terminal_ids is None
+            or sorted(item["terminal_id"] for item in evidence) != graph_terminal_ids
+        ):
+            db.rollback()
+            return {"marked": False, "reason_code": "SESSION_IDENTITY_CHANGED"}
+        _terminals, reason_code = _revalidate_session_hard_deletion_in_transaction(
+            db,
+            operation,
+            require_workspace_retired=True,
+        )
+        if reason_code is not None:
+            db.rollback()
+            return {"marked": False, "reason_code": reason_code}
+        if operation.state == _SESSION_HARD_DELETE_WORKSPACE_RETIRED:
+            if operation.workspace_evidence_sha256 != evidence_sha256:
+                db.rollback()
+                return {"marked": False, "reason_code": "WORKSPACE_AUTHORITY_CHANGED"}
+            db.rollback()
+            return {"marked": True, "already_marked": True}
+        if operation.state != _SESSION_HARD_DELETE_FENCED:
+            db.rollback()
+            return {"marked": False, "reason_code": "SESSION_DELETE_STATE_INVALID"}
+        operation.state = _SESSION_HARD_DELETE_WORKSPACE_RETIRED
+        operation.workspace_disposition = _SESSION_WORKSPACE_DISPOSITION_RETIRED
+        operation.workspace_evidence_json = evidence_json
+        operation.workspace_evidence_sha256 = evidence_sha256
+        operation.updated_at = datetime.now()
+        db.commit()
+        return {"marked": True, "workspace_evidence_sha256": evidence_sha256}
+
+
+def mark_session_hard_deletion_workspace_preserved(
+    session_id: str,
+    *,
+    runtime_artifacts: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Record that foreign workspace authority was preserved and only artifacts retired."""
+    if runtime_artifacts.get("runtime_artifacts_absent") is not True:
+        return {"marked": False, "reason_code": "TERMINAL_ARTIFACT_CLEANUP_UNPROVEN"}
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        operation = db.get(SessionDeletionOperationModel, session_id)
+        if operation is None:
+            receipt = db.get(SessionDeletionReceiptModel, session_id)
+            db.rollback()
+            return (
+                {"marked": True, "already_deleted": True}
+                if receipt is not None
+                else {"marked": False, "reason_code": "SESSION_DELETE_FENCE_MISSING"}
+            )
+        parsed = _session_deletion_operation_dict(operation)
+        if parsed[
+            "workspace_disposition"
+        ] != _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN or not isinstance(
+            parsed["workspace_evidence"], Mapping
+        ):
+            db.rollback()
+            return {"marked": False, "reason_code": "WORKSPACE_FOREIGN_OWNER_UNPROVEN"}
+        if operation.state == _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN:
+            recorded = parsed["workspace_evidence"].get("runtime_artifacts")
+            matched = recorded == dict(runtime_artifacts)
+            db.rollback()
+            return (
+                {"marked": True, "already_marked": True}
+                if matched
+                else {"marked": False, "reason_code": "WORKSPACE_AUTHORITY_CHANGED"}
+            )
+        if operation.state != _SESSION_HARD_DELETE_FENCED:
+            db.rollback()
+            return {"marked": False, "reason_code": "SESSION_DELETE_STATE_INVALID"}
+        terminals, reason_code = _revalidate_session_hard_deletion_in_transaction(
+            db,
+            operation,
+            require_workspace_retired=False,
+        )
+        if reason_code is not None or terminals is None:
+            db.rollback()
+            return {"marked": False, "reason_code": reason_code}
+        draft = parsed["workspace_evidence"]
+        final_document = _session_foreign_workspace_preservation_document(
+            workspace_authority_sha256=str(parsed["workspace_authority_sha256"]),
+            graph_terminal_ids=draft.get("graph_terminal_ids", ()),
+            foreign_authority=draft.get("foreign_authority", {}),
+            runtime_artifacts=runtime_artifacts,
+        )
+        _evidence, evidence_json, evidence_sha256 = _canonical_session_workspace_evidence(
+            final_document
+        )
+        operation.state = _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN
+        operation.workspace_evidence_json = evidence_json
+        operation.workspace_evidence_sha256 = evidence_sha256
+        operation.updated_at = datetime.now()
+        db.commit()
+        return {"marked": True, "workspace_evidence_sha256": evidence_sha256}
+
+
+def _delete_query(query: Any) -> int:
+    return int(query.delete(synchronize_session=False))
+
+
+def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[str, Any]:
+    """Atomically purge one fenced Session graph and leave only replay tombstones."""
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
+    _ensure_managed_attempt_lifecycle_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        receipt = db.get(SessionDeletionReceiptModel, session_id)
+        if receipt is not None:
+            if str(receipt.session_name) != session_name:
+                db.rollback()
+                raise AmbiguousSessionIdentity(session_id)
+            disposition, evidence_sha256 = _session_receipt_workspace_projection(receipt)
+            db.rollback()
+            return {
+                "completed": True,
+                "already_deleted": True,
+                "before_counts": {},
+                "after_counts": {},
+                "tombstone_count": 1,
+                "workspace_disposition": disposition,
+                "workspace_evidence_sha256": evidence_sha256,
+            }
+        operation = db.get(SessionDeletionOperationModel, session_id)
+        if operation is None or str(operation.session_name) != session_name:
+            db.rollback()
+            return {"completed": False, "reason_code": "SESSION_DELETE_FENCE_MISSING"}
+        if operation.state not in {
+            _SESSION_HARD_DELETE_WORKSPACE_RETIRED,
+            _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN,
+        }:
+            db.rollback()
+            return {"completed": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
+        parsed = _session_deletion_operation_dict(operation)
+        preserved_foreign = (
+            parsed["workspace_disposition"] == _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN
+        )
+        terminals, reason_code = _revalidate_session_hard_deletion_in_transaction(
+            db,
+            operation,
+            require_workspace_retired=not preserved_foreign,
+        )
+        if reason_code is not None or terminals is None:
+            db.rollback()
+            return {"completed": False, "reason_code": reason_code}
+        current_terminal_ids = sorted(parsed["terminal_ids"])
+        terminal_ids = _session_graph_terminal_ids(db, session_id, current_terminal_ids)
+        if terminal_ids is None:
+            db.rollback()
+            return {"completed": False, "reason_code": "SESSION_DELETE_PLAN_TOO_LARGE"}
+        before_counts = _session_owned_row_counts_in_transaction(db, session_id, terminal_ids)
+
+        owned = _session_owned_graph_queries(db, session_id, terminal_ids)
+        terminal_values = owned["terminal_ids"]
+        terminal_auth_digests: dict[str, str | None] = {
+            str(row.id): (str(row.auth_token_sha256) if row.auth_token_sha256 else None)
+            for row in terminals
+        }
+        historical_terminal_receipts = _session_historical_terminal_receipts(db, session_id)
+        if len(historical_terminal_receipts) > _SESSION_DELETION_PLAN_LIMIT:
+            db.rollback()
+            return {"completed": False, "reason_code": "SESSION_DELETE_PLAN_TOO_LARGE"}
+        for terminal_receipt in historical_terminal_receipts:
+            terminal_id = str(terminal_receipt.terminal_id)
+            digest = (
+                str(terminal_receipt.auth_token_sha256)
+                if terminal_receipt.auth_token_sha256
+                else None
+            )
+            if (
+                terminal_id in terminal_auth_digests
+                and terminal_auth_digests[terminal_id] != digest
+            ):
+                db.rollback()
+                return {
+                    "completed": False,
+                    "reason_code": "SESSION_LIFETIME_RECEIPT_CONFLICT",
+                }
+            terminal_auth_digests[terminal_id] = digest
+        if set(terminal_auth_digests) != set(terminal_ids):
+            db.rollback()
+            return {"completed": False, "reason_code": "SESSION_IDENTITY_CHANGED"}
+        terminal_fences = _normalize_session_terminal_fences(
+            [
+                {
+                    "terminal_id": terminal_id,
+                    "auth_token_sha256": terminal_auth_digests[terminal_id],
+                }
+                for terminal_id in terminal_ids
+            ]
+        )
+        now = datetime.now()
+        existing_final_fences = (
+            db.query(SessionDeletedTerminalFenceModel)
+            .filter(SessionDeletedTerminalFenceModel.terminal_id.in_(terminal_values))
+            .all()
+        )
+        if existing_final_fences:
+            db.rollback()
+            return {"completed": False, "reason_code": "SESSION_IDENTITY_CHANGED"}
+        for fence in terminal_fences:
+            terminal_id = str(fence["terminal_id"])
+            digest = cast(str | None, fence["auth_token_sha256"])
+            db.add(
+                SessionDeletedTerminalFenceModel(
+                    terminal_id=terminal_id,
+                    session_id=session_id,
+                    auth_token_sha256=digest,
+                    deleted_at=now,
+                )
+            )
+        # Final indexed fences and the tombstone are committed atomically with
+        # transitional-receipt removal. A reservation serialized before this
+        # transaction remains visible to the deletion authority recheck; one
+        # serialized after it observes the permanent fence.
+        db.flush()
+
+        _delete_query(
+            db.query(DelegationResultEventModel).filter(
+                DelegationResultEventModel.result_id.in_(owned["result_ids"])
+            )
+        )
+        _delete_query(
+            db.query(DelegationResultSubmissionModel).filter(
+                DelegationResultSubmissionModel.result_id.in_(owned["result_ids"])
+            )
+        )
+        _delete_query(db.query(InboxModel).filter(InboxModel.receiver_id.in_(terminal_values)))
+        _delete_query(
+            db.query(DelegationResultModel).filter(
+                DelegationResultModel.id.in_(owned["result_ids"])
+            )
+        )
+        _delete_query(
+            db.query(ManagedAttemptLifecycleEventModel).filter(
+                ManagedAttemptLifecycleEventModel.assignment_id.in_(owned["managed_attempt_ids"])
+            )
+        )
+        _delete_query(
+            db.query(ManagedAttemptLifecycleModel).filter(
+                ManagedAttemptLifecycleModel.assignment_id.in_(owned["managed_attempt_ids"])
+            )
+        )
+        _delete_query(
+            db.query(ChildAssignmentModel).filter(
+                ChildAssignmentModel.id.in_(owned["assignment_ids"])
+            )
+        )
+        _delete_query(
+            db.query(WorkflowProviderReconnectAttemptModel).filter(
+                WorkflowProviderReconnectAttemptModel.workflow_id.in_(owned["workflow_ids"])
+            )
+        )
+        _delete_query(
+            db.query(WorkflowTurnReceiptModel).filter(
+                WorkflowTurnReceiptModel.workflow_turn_id.in_(owned["turn_ids"])
+            )
+        )
+        deleted_effect_resolutions = _delete_query(
+            db.query(WorkflowEffectResolutionModel).filter(
+                WorkflowEffectResolutionModel.workflow_effect_id.in_(owned["effect_ids"])
+            )
+        )
+        remaining_effect_resolutions = int(
+            db.query(WorkflowEffectResolutionModel.id)
+            .filter(WorkflowEffectResolutionModel.workflow_effect_id.in_(owned["effect_ids"]))
+            .count()
+        )
+        if (
+            deleted_effect_resolutions != before_counts["workflow_effect_resolutions"]
+            or remaining_effect_resolutions != 0
+        ):
+            db.rollback()
+            return {"completed": False, "reason_code": "SESSION_PURGE_INCOMPLETE"}
+        _delete_query(
+            db.query(WorkflowEffectModel).filter(WorkflowEffectModel.id.in_(owned["effect_ids"]))
+        )
+        _delete_query(
+            db.query(WorkflowTurnModel).filter(WorkflowTurnModel.id.in_(owned["turn_ids"]))
+        )
+        _delete_query(
+            db.query(TelegramDeliveryModel).filter(
+                TelegramDeliveryModel.workflow_id.in_(owned["workflow_ids"])
+            )
+        )
+        _delete_query(db.query(WorkflowModel).filter(WorkflowModel.id.in_(owned["workflow_ids"])))
+        _delete_query(
+            db.query(ProviderUsageBindingModel).filter(
+                ProviderUsageBindingModel.terminal_id.in_(terminal_values)
+            )
+        )
+        _delete_query(
+            db.query(UsageRecordModel).filter(
+                or_(
+                    UsageRecordModel.session_id == session_id,
+                    UsageRecordModel.terminal_id.in_(terminal_values),
+                )
+            )
+        )
+        _delete_query(
+            db.query(OwnerLaunchGrantModel).filter(
+                OwnerLaunchGrantModel.consumed_terminal_id.in_(terminal_values)
+            )
+        )
+        _delete_query(
+            db.query(RecoveryTakeoverAuditModel).filter(
+                RecoveryTakeoverAuditModel.takeover_id.in_(owned["takeover_ids"])
+            )
+        )
+        _delete_query(
+            db.query(RecoveryTakeoverModel).filter(
+                RecoveryTakeoverModel.id.in_(owned["takeover_ids"])
+            )
+        )
+        _delete_query(
+            db.query(WritableWorkContextAuditModel).filter(
+                WritableWorkContextAuditModel.work_context_id.in_(owned["context_ids"])
+            )
+        )
+        _delete_query(
+            db.query(WritableWorkContextModel).filter(
+                WritableWorkContextModel.id.in_(owned["context_ids"])
+            )
+        )
+        _delete_query(
+            db.query(SessionDeletionCancellationAuditModel).filter(
+                SessionDeletionCancellationAuditModel.session_id == session_id
+            )
+        )
+        _delete_query(
+            db.query(ProviderExecutionLeaseModel).filter(
+                ProviderExecutionLeaseModel.terminal_id.in_(terminal_values)
+            )
+        )
+        _delete_query(
+            db.query(WorktreeWriterLeaseModel).filter(
+                WorktreeWriterLeaseModel.terminal_id.in_(terminal_values)
+            )
+        )
+        _delete_query(
+            db.query(TerminalModel).filter(
+                or_(
+                    TerminalModel.session_id == session_id,
+                    and_(
+                        TerminalModel.session_id.is_(None),
+                        ("legacy:" + TerminalModel.tmux_session) == session_id,
+                    ),
+                )
+            )
+        )
+        _delete_query(
+            db.query(TerminalDeletionReceiptModel).filter(
+                TerminalDeletionReceiptModel.terminal_id.in_(terminal_values)
+            )
+        )
+
+        db.add(
+            SessionDeletionReceiptModel(
+                session_id=session_id,
+                session_name=session_name,
+                retained_resources_json="[]",
+                deletion_reason="operator_session_hard_delete",
+                authority_fingerprint=hashlib.sha256(
+                    (
+                        str(operation.authority_fingerprint)
+                        + ":"
+                        + str(operation.workspace_authority_sha256)
+                        + ":"
+                        + str(operation.workspace_evidence_sha256)
+                    ).encode()
+                ).hexdigest(),
+                terminal_fences_json=json.dumps(
+                    terminal_fences, sort_keys=True, separators=(",", ":")
+                ),
+                workspace_disposition=str(
+                    parsed["workspace_disposition"] or _SESSION_WORKSPACE_DISPOSITION_RETIRED
+                ),
+                workspace_evidence_json=str(operation.workspace_evidence_json or "[]"),
+                receipt_version=4,
+                deleted_at=now,
+            )
+        )
+        db.delete(operation)
+        db.flush()
+        after_counts = _session_owned_row_counts_in_transaction(db, session_id, terminal_ids)
+        if any(after_counts.values()):
+            db.rollback()
+            return {"completed": False, "reason_code": "SESSION_PURGE_INCOMPLETE"}
+        db.commit()
+        return {
+            "completed": True,
+            "already_deleted": False,
+            "before_counts": before_counts,
+            "after_counts": after_counts,
+            "tombstone_count": 1,
+            "terminal_fence_count": len(terminal_fences),
+            "workspace_disposition": parsed["workspace_disposition"],
+            "workspace_evidence_sha256": parsed["workspace_evidence_sha256"],
+        }
 
 
 def delete_terminals_by_session_lifetime(
@@ -5488,6 +10717,8 @@ def delete_terminals_by_session_lifetime(
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
+                deletion_reason="legacy_logical_delete",
+                receipt_version=1,
                 deleted_at=datetime.now(),
             )
         )
@@ -5609,6 +10840,8 @@ def acquire_provider_execution_decision(
     as capacity exhaustion based on an earlier status projection.
     """
     _ensure_provider_execution_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         canonical = db.get(CapacitySettingsModel, 1)
@@ -5629,6 +10862,33 @@ def acquire_provider_execution_decision(
                 "certain": True,
             }
 
+        if _terminal_deletion_fence_exists_in_transaction(db, terminal_id):
+            db.rollback()
+            return decision(False, "TERMINAL_DELETED")
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal is None:
+            db.commit()
+            return decision(False, "TERMINAL_NOT_FOUND")
+        if terminal.runtime_lifecycle in (
+            "recovery_required",
+            "exit_pending",
+            "exited",
+            "recovery_fenced",
+        ):
+            db.commit()
+            return decision(False, "TERMINAL_RUNTIME_NOT_WRITABLE")
+        if _terminal_requires_provider_runtime_compatibility_reconnect(terminal):
+            # The same writer transaction which rejects provider admission
+            # installs reconnect authority whenever this exact turn can own
+            # it. Even if another caller prepared an old-style SENT row, no
+            # bytes can reach the incompatible process through this lease.
+            _request_workflow_provider_reconnect_in_transaction(
+                db,
+                terminal_id,
+                datetime.now(),
+            )
+            db.commit()
+            return decision(False, "TERMINAL_RUNTIME_RECONNECT_PENDING")
         existing = (
             db.query(ProviderExecutionLeaseModel)
             .filter(ProviderExecutionLeaseModel.terminal_id == terminal_id)
@@ -5652,18 +10912,6 @@ def acquire_provider_execution_decision(
         if active >= effective_limit:
             db.commit()
             return decision(False, "PROVIDER_EXECUTION_CAPACITY_EXHAUSTED")
-        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
-        if terminal is None:
-            db.commit()
-            return decision(False, "TERMINAL_NOT_FOUND")
-        if terminal.runtime_lifecycle in (
-            "recovery_required",
-            "exit_pending",
-            "exited",
-            "recovery_fenced",
-        ):
-            db.commit()
-            return decision(False, "TERMINAL_RUNTIME_NOT_WRITABLE")
         if _terminal_has_pending_provider_reconnect(db, terminal_id):
             db.commit()
             return decision(False, "TERMINAL_RUNTIME_RECONNECT_PENDING")
@@ -5673,8 +10921,18 @@ def acquire_provider_execution_decision(
             or terminal.runtime_operation_expires_at > now
         )
         if operation_live:
-            db.commit()
-            return decision(False, "TERMINAL_RUNTIME_OPERATION_BUSY")
+            review_preparation_owns_turn = False
+            if terminal.runtime_operation_kind == REVIEW_WORKTREE_PREPARATION_OPERATION:
+                try:
+                    review_preparation_owns_turn = (
+                        _review_input_authority_in_transaction(db, terminal_id, workflow_turn_id)
+                        is not None
+                    )
+                except ValueError:
+                    review_preparation_owns_turn = False
+            if not review_preparation_owns_turn:
+                db.commit()
+                return decision(False, "TERMINAL_RUNTIME_OPERATION_BUSY")
         workflow_exists = (
             db.query(WorkflowModel.id).filter(WorkflowModel.root_terminal_id == terminal_id).first()
             is not None
@@ -6336,6 +11594,19 @@ def claim_terminal_runtime_exit(terminal_id: str) -> str:
 
 
 RUNTIME_OPERATION_LEASE_SECONDS = 30
+REVIEW_WORKTREE_PREPARATION_OPERATION = "review_worktree_prepare"
+REVIEW_WORKTREE_PREPARATION_LEASE_SECONDS = 60
+
+
+def _terminal_runtime_operation_live(terminal: Optional[TerminalModel], now: datetime) -> bool:
+    return bool(
+        terminal is not None
+        and terminal.runtime_operation_token is not None
+        and (
+            terminal.runtime_operation_expires_at is None
+            or terminal.runtime_operation_expires_at > now
+        )
+    )
 
 
 def _terminal_has_pending_provider_reconnect(db, terminal_id: str) -> bool:
@@ -6352,6 +11623,33 @@ def _terminal_has_pending_provider_reconnect(db, terminal_id: str) -> bool:
     )
 
 
+def _terminal_requires_provider_runtime_compatibility_reconnect(
+    terminal: Optional[TerminalModel],
+) -> bool:
+    """Treat every resident Codex runtime not proven current as stale.
+
+    Workflow state is deliberately absent from this authority decision. A
+    terminal can retain the same physical provider process after its prior
+    workflow closes, and NULL is a legacy unknown rather than compatibility
+    proof. Known recovery/exit lifecycles are owned by their canonical sagas;
+    NULL lifecycle remains a legacy unknown because transport still permits it.
+    """
+    from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
+
+    return bool(
+        terminal is not None
+        and terminal.provider == "codex"
+        and terminal.runtime_lifecycle in (None, "running")
+        and (
+            not terminal.provider_runtime_compatibility_generation
+            or not hmac.compare_digest(
+                str(terminal.provider_runtime_compatibility_generation),
+                ACTIVE_RUNTIME_GENERATION,
+            )
+        )
+    )
+
+
 def _terminal_runtime_mutation_blocked(db, terminal_id: str, now: datetime) -> bool:
     terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
     if terminal is None:
@@ -6362,6 +11660,8 @@ def _terminal_runtime_mutation_blocked(db, terminal_id: str, now: datetime) -> b
         "exited",
         "recovery_fenced",
     ):
+        return True
+    if _terminal_requires_provider_runtime_compatibility_reconnect(terminal):
         return True
     if _terminal_has_pending_provider_reconnect(db, terminal_id):
         return True
@@ -6392,16 +11692,16 @@ def acquire_terminal_runtime_transport(
         if terminal is None or terminal.runtime_lifecycle not in (None, "running"):
             db.commit()
             return None
+        if _terminal_requires_provider_runtime_compatibility_reconnect(terminal):
+            db.commit()
+            return None
         if not _workspace_accepts_new_work(db, terminal_id):
             db.commit()
             return None
         if _terminal_has_pending_provider_reconnect(db, terminal_id):
             db.commit()
             return None
-        operation_live = terminal.runtime_operation_token is not None and (
-            terminal.runtime_operation_expires_at is None
-            or terminal.runtime_operation_expires_at > now
-        )
+        operation_live = _terminal_runtime_operation_live(terminal, now)
         if operation_live:
             db.commit()
             return None
@@ -6591,8 +11891,13 @@ def mark_terminal_runtime_exited_with_workflow_ids(
                 # never terminalize the newer authority.
                 db.rollback()
                 return False, []
+        now = datetime.now()
+        provider_lease = db.get(ProviderExecutionLeaseModel, terminal_id)
+        provider_lease_turn_ids = (
+            (int(provider_lease.workflow_turn_id),) if provider_lease is not None else ()
+        )
         terminal.runtime_lifecycle = "exited"
-        terminal.runtime_exited_at = terminal.runtime_exited_at or datetime.now()
+        terminal.runtime_exited_at = terminal.runtime_exited_at or now
         terminal.runtime_operation_kind = None
         terminal.runtime_operation_token = None
         terminal.runtime_operation_claimed_at = None
@@ -6603,6 +11908,13 @@ def mark_terminal_runtime_exited_with_workflow_ids(
             reason="root terminal exited or deleted",
         )
         _release_or_transfer_worktree_writer_lease(db, terminal_id)
+        db.flush()
+        _reconcile_exited_provider_execution_in_transaction(
+            db,
+            terminal,
+            now=now,
+            additional_turn_ids=provider_lease_turn_ids,
+        )
         db.commit()
         return True, cancelled_workflow_ids
 
@@ -6672,6 +11984,7 @@ def mark_terminal_runtime_recovery_required_with_workflow_ids(
             .filter(
                 WorkflowModel.root_terminal_id == terminal_id,
                 WorkflowModel.status == WORKFLOW_OWNER_GATE,
+                workflow_current_execution_authority_predicate(WorkflowModel),
             )
             .first()
             is not None
@@ -6779,8 +12092,19 @@ def abandon_terminal_runtime_recovery(terminal_id: str) -> tuple[str, List[int]]
         now = datetime.now()
         terminal.runtime_lifecycle = "exited"
         terminal.runtime_exited_at = terminal.runtime_exited_at or now
+        provider_lease = db.get(ProviderExecutionLeaseModel, terminal_id)
+        provider_lease_turn_ids = (
+            (int(provider_lease.workflow_turn_id),) if provider_lease is not None else ()
+        )
         cancelled_workflow_ids = _cancel_protected_workflows_in_transaction(
             db, [terminal_id], reason="runtime recovery was explicitly abandoned"
+        )
+        db.flush()
+        _reconcile_exited_provider_execution_in_transaction(
+            db,
+            terminal,
+            now=now,
+            additional_turn_ids=provider_lease_turn_ids,
         )
         event_key = f"runtime-recovery-abandoned:{terminal_id}:{terminal.runtime_generation}"
         if (
@@ -6926,16 +12250,14 @@ def recovery_takeover_durable_eligibility(
     _ensure_provider_execution_schema()
     _ensure_child_assignment_schema()
     _ensure_workflow_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     with SessionLocal() as db:
         terminal = db.get(TerminalModel, old_terminal_id)
-        current_workflow = (
-            db.query(WorkflowModel)
-            .filter(WorkflowModel.root_terminal_id == old_terminal_id)
-            .order_by(WorkflowModel.id.desc())
-            .first()
-        )
         reason = None
-        if terminal is None:
+        if _terminal_deletion_fence_exists_in_transaction(db, old_terminal_id):
+            reason = "RECOVERY_TARGET_DELETED"
+        elif terminal is None:
             reason = "RECOVERY_TARGET_NOT_FOUND"
         elif (
             db.query(RecoveryTakeoverModel.id)
@@ -6973,7 +12295,16 @@ def recovery_takeover_durable_eligibility(
             reason = "RECOVERY_RUNTIME_OPERATION_ACTIVE"
         elif db.get(ProviderExecutionLeaseModel, old_terminal_id) is not None:
             reason = "RECOVERY_PROVIDER_EXECUTION_ACTIVE"
-        elif current_workflow is not None and current_workflow.status == WORKFLOW_OWNER_GATE:
+        elif (
+            db.query(WorkflowModel.id)
+            .filter(
+                WorkflowModel.root_terminal_id == old_terminal_id,
+                WorkflowModel.status == WORKFLOW_OWNER_GATE,
+                workflow_current_execution_authority_predicate(WorkflowModel),
+            )
+            .first()
+            is not None
+        ):
             reason = "RECOVERY_GENUINE_OWNER_GATE"
         elif (
             db.query(WorkflowEffectModel.id)
@@ -7080,8 +12411,16 @@ def claim_recovery_takeover(
     _ensure_provider_execution_schema()
     _ensure_child_assignment_schema()
     _ensure_workflow_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        if _terminal_deletion_fence_exists_in_transaction(db, old_terminal_id):
+            db.rollback()
+            raise RecoveryTakeoverRejected("RECOVERY_TARGET_DELETED")
+        if _terminal_deletion_fence_exists_in_transaction(db, new_terminal_id):
+            db.rollback()
+            raise RecoveryTakeoverRejected("RECOVERY_REPLACEMENT_TERMINAL_DELETED")
         duplicate = (
             db.query(RecoveryTakeoverModel)
             .filter(RecoveryTakeoverModel.request_id == request_id)
@@ -7134,6 +12473,7 @@ def claim_recovery_takeover(
             .filter(
                 WorkflowModel.root_terminal_id == old_terminal_id,
                 WorkflowModel.status == WORKFLOW_OWNER_GATE,
+                workflow_current_execution_authority_predicate(WorkflowModel),
             )
             .first()
             is not None
@@ -7283,6 +12623,8 @@ def fence_claimed_recovery_takeover(takeover_id: str) -> Optional[Dict[str, Any]
     _ensure_provider_execution_schema()
     _ensure_child_assignment_schema()
     _ensure_workflow_schema()
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         row = db.get(RecoveryTakeoverModel, takeover_id)
@@ -7294,9 +12636,13 @@ def fence_claimed_recovery_takeover(takeover_id: str) -> Optional[Dict[str, Any]
             return _recovery_takeover_dict(row)
         terminal = db.get(TerminalModel, row.old_terminal_id)
         blockers = []
-        if terminal is None:
+        if _terminal_deletion_fence_exists_in_transaction(db, row.old_terminal_id):
+            blockers.append("RECOVERY_TARGET_DELETED")
+        if _terminal_deletion_fence_exists_in_transaction(db, row.new_terminal_id):
+            blockers.append("RECOVERY_REPLACEMENT_TERMINAL_DELETED")
+        if terminal is None and not blockers:
             blockers.append("RECOVERY_TARGET_NOT_FOUND")
-        else:
+        elif terminal is not None:
             if terminal.context_role != "supervisor" or terminal.project_id != row.project_id:
                 blockers.append("RECOVERY_TARGET_IDENTITY_MISMATCH")
             if (
@@ -7327,6 +12673,7 @@ def fence_claimed_recovery_takeover(takeover_id: str) -> Optional[Dict[str, Any]
                 .filter(
                     WorkflowModel.root_terminal_id == row.old_terminal_id,
                     WorkflowModel.status == WORKFLOW_OWNER_GATE,
+                    workflow_current_execution_authority_predicate(WorkflowModel),
                 )
                 .first()
                 is not None
@@ -7770,6 +13117,7 @@ def schedule_managed_handoff_continuation(
     """
     _ensure_child_assignment_schema()
     _ensure_delegation_result_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
         assignment = (
@@ -7878,7 +13226,32 @@ def schedule_managed_handoff_continuation(
             # schedulers before either can append recovery evidence.
             db.flush()
             assignment.status = ChildAssignmentStatus.HANDOFF_RECOVERY_AWAITING_RESULT.value
-            assignment.updated_at = datetime.now()
+            now = datetime.now()
+            assignment.updated_at = now
+            lifecycle = db.get(ManagedAttemptLifecycleModel, assignment.id)
+            if lifecycle is not None and lifecycle.state not in _MANAGED_ATTEMPT_TERMINAL_STATES:
+                lifecycle.child_workflow_id = child_workflow.id
+                lifecycle.child_workflow_turn_id = successor.id
+                lifecycle.state = "prompt_delivery_scheduled"
+                lifecycle.reason_code = None
+                lifecycle.prompt_delivery_scheduled_at = now
+                lifecycle.prompt_delivery_acknowledged_at = None
+                lifecycle.provider_admitted_at = None
+                lifecycle.provider_running_at = None
+                lifecycle.waiting_result_at = None
+                lifecycle.recovery_attempt_count = 0
+                lifecycle.recovery_scheduled_at = None
+                lifecycle.recovery_next_retry_at = None
+                lifecycle.recovery_deadline_at = now + timedelta(
+                    seconds=_MANAGED_ATTEMPT_ADMISSION_DEADLINE_SECONDS
+                )
+                lifecycle.updated_at = now
+                _managed_attempt_event(
+                    db,
+                    lifecycle,
+                    f"prompt-delivery-scheduled:{assignment.id}:{successor.id}",
+                    "prompt_delivery_scheduled",
+                )
             _record_result_event(
                 db,
                 result.id,
@@ -8152,6 +13525,64 @@ WORKFLOW_OPEN = "open"
 WORKFLOW_TERMINAL = "terminal"
 WORKFLOW_OWNER_GATE = "owner_gate"
 WORKFLOW_CANCELLED = "cancelled"
+
+# An OWNER_GATE row is immutable audit of the pause.  The owner's durable
+# decision is represented by a newer same-terminal workflow which points back
+# to that row.  Once that exact edge exists the old gate can no longer advance
+# execution itself, even though its historical status remains ``owner_gate``.
+# Keep the raw-SQL read model and ORM safety plans on this one authority rule.
+WORKFLOW_CURRENT_EXECUTION_AUTHORITY_SQL = """(
+    w.status = 'open'
+    OR (
+      w.status = 'owner_gate'
+      AND NOT EXISTS (
+        SELECT 1 FROM workflows owner_gate_successor
+        WHERE owner_gate_successor.resumed_from_owner_gate_workflow_id = w.id
+          AND owner_gate_successor.root_terminal_id = w.root_terminal_id
+          AND owner_gate_successor.id > w.id
+          AND owner_gate_successor.status IN ('open', 'owner_gate', 'terminal', 'cancelled')
+      )
+    )
+)"""
+
+
+def workflow_current_execution_authority_predicate(workflow_model: Any = WorkflowModel) -> Any:
+    """Return the canonical OPEN/genuinely-owner-gated authority predicate."""
+    successor = aliased(WorkflowModel)
+    resumed = exists().where(
+        and_(
+            successor.resumed_from_owner_gate_workflow_id == workflow_model.id,
+            successor.root_terminal_id == workflow_model.root_terminal_id,
+            successor.id > workflow_model.id,
+            successor.status.in_(
+                (WORKFLOW_OPEN, WORKFLOW_OWNER_GATE, WORKFLOW_TERMINAL, WORKFLOW_CANCELLED)
+            ),
+        )
+    )
+    return or_(
+        workflow_model.status == WORKFLOW_OPEN,
+        and_(workflow_model.status == WORKFLOW_OWNER_GATE, ~resumed),
+    )
+
+
+def workflow_provider_execution_terminalization_predicate(
+    workflow_model: Any = WorkflowModel,
+) -> Any:
+    """Select workflow history whose dead provider turn can be settled.
+
+    A resumed OWNER_GATE stays immutable audit rather than being rewritten to
+    CANCELLED. Its exact provider turn can still be terminalized once physical
+    runtime death proves that no provider outcome can arrive.
+    """
+    return or_(
+        workflow_model.status.in_((WORKFLOW_TERMINAL, WORKFLOW_CANCELLED)),
+        and_(
+            workflow_model.status == WORKFLOW_OWNER_GATE,
+            ~workflow_current_execution_authority_predicate(workflow_model),
+        ),
+    )
+
+
 TURN_QUEUED = "queued"
 TURN_CLAIMED = "claimed"
 TURN_SENT = "sent"
@@ -8159,6 +13590,7 @@ TURN_FINISHED = "finished"
 TURN_CANCELLED = "cancelled"
 PROVIDER_CONTENT_UNAVAILABLE = "PROVIDER_CONTENT_UNAVAILABLE"
 WORKFLOW_EXECUTION_RESUME_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{40,64}$")
+WORKFLOW_EXECUTION_RESUME_NONCE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{40,64}$")
 # A provider-final observation for a turn whose receiver never admitted the
 # envelope is not progress.  Keep this distinct from ``None`` (no workflow or
 # no sendable turn) so callers and deterministic tests can prove that the
@@ -8199,6 +13631,68 @@ OPEN_FINAL_CIRCUIT_BREAKER_REASON = (
     "Automatic continuation paused when 65 consecutive provider finals produced no "
     "durable workflow progress. Review the provider/runtime before resuming."
 )
+
+
+class WorkflowContinuationAuthorityConflict(RuntimeError):
+    """The compacting provider cannot prove one current admitted execution."""
+
+
+def _derive_workflow_execution_resume_token(
+    receiver_terminal_id: str,
+    logical_turn_id: int,
+    nonce: str,
+    terminal_auth_token: str,
+) -> str:
+    """Derive one bearer without retaining it in durable control-plane state."""
+    message = (
+        b"threadcells-workflow-execution-resume-v1\0"
+        + receiver_terminal_id.encode("utf-8", "strict")
+        + b"\0"
+        + str(logical_turn_id).encode("ascii", "strict")
+        + b"\0"
+        + nonce.encode("ascii", "strict")
+    )
+    digest = hmac.new(
+        terminal_auth_token.encode("utf-8", "strict"), message, hashlib.sha256
+    ).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _mint_workflow_execution_resume_token(
+    db: Any,
+    receiver_terminal_id: str,
+    logical_turn_id: int,
+    terminal_auth_token: Optional[str],
+) -> tuple[str, Optional[str]]:
+    """Mint restorable authority only for an exact terminal bearer.
+
+    Direct database callers retained for compatibility do not own a terminal
+    bearer. They still receive the established random capability, but it is
+    intentionally not restorable by a provider hook.
+    """
+    terminal = db.get(TerminalModel, receiver_terminal_id)
+    token_digest = (
+        hashlib.sha256(terminal_auth_token.encode("utf-8", "strict")).hexdigest()
+        if terminal_auth_token
+        else None
+    )
+    if (
+        terminal is not None
+        and terminal.auth_token_sha256
+        and token_digest
+        and hmac.compare_digest(str(terminal.auth_token_sha256), token_digest)
+    ):
+        nonce = secrets.token_urlsafe(32)
+        return (
+            _derive_workflow_execution_resume_token(
+                receiver_terminal_id,
+                logical_turn_id,
+                nonce,
+                terminal_auth_token,
+            ),
+            nonce,
+        )
+    return secrets.token_urlsafe(32), None
 
 
 def _dispatch_workflow_notification_fail_open(
@@ -8348,6 +13842,7 @@ def _cancel_parent_assignments(db, parent_terminal_id: str, now: datetime) -> in
         .filter(
             ChildAssignmentModel.parent_terminal_id == parent_terminal_id,
             ChildAssignmentModel.status.in_(_active_child_assignment_statuses()),
+            ChildAssignmentModel.review_superseded_at.is_(None),
         )
         .all()
     )
@@ -8361,9 +13856,8 @@ def _cancel_parent_assignments(db, parent_terminal_id: str, now: datetime) -> in
         kind = "handoff" if assignment.status.startswith("handoff_") else "assign"
         assignment.status = ChildAssignmentStatus.CANCELLED.value
         assignment.updated_at = now
-        result = _create_result_for_assignment(
-            db, assignment, kind, _open_workflow(db, parent_terminal_id, create=False)
-        )
+        parent_workflow = _open_workflow(db, parent_terminal_id, create=False)
+        result = _create_result_for_assignment(db, assignment, kind, parent_workflow)
         if result.status == DelegationResultStatus.AWAITING.value:
             result.status = DelegationResultStatus.CANCELLED.value
             result.reason_code = "parent_cancelled"
@@ -8377,6 +13871,28 @@ def _cancel_parent_assignments(db, parent_terminal_id: str, now: datetime) -> in
                 parent_terminal_id,
             )
             _purge_staged_handoff_submission(db, result.id)
+        lifecycle = db.get(ManagedAttemptLifecycleModel, assignment.id)
+        if lifecycle is not None and lifecycle.state not in (
+            _MANAGED_ATTEMPT_TERMINAL_STATES | {"fence_claimed"}
+        ):
+            parent_state = (
+                str(parent_workflow.status).upper()
+                if parent_workflow is not None
+                else "UNAVAILABLE"
+            )
+            lifecycle.state = "failed"
+            lifecycle.reason_code = f"PARENT_WORKFLOW_{parent_state}"
+            lifecycle.failed_at = lifecycle.failed_at or now
+            lifecycle.recovery_next_retry_at = None
+            lifecycle.recovery_deadline_at = None
+            lifecycle.updated_at = now
+            _managed_attempt_event(
+                db,
+                lifecycle,
+                f"managed-attempt-parent-cancelled:{assignment.id}",
+                "failed",
+                reason_code=lifecycle.reason_code,
+            )
     return len(assignments)
 
 
@@ -8387,7 +13903,7 @@ def _open_workflow(db, root_terminal_id: str, create: bool) -> Optional[Workflow
         .order_by(WorkflowModel.id.desc())
         .first()
     )
-    if workflow is None and create:
+    if workflow is None and create and _workspace_accepts_new_work(db, root_terminal_id):
         workflow = WorkflowModel(root_terminal_id=root_terminal_id, status=WORKFLOW_OPEN)
         db.add(workflow)
         db.flush()
@@ -8401,8 +13917,13 @@ def _workspace_accepts_new_work(db: Any, terminal_id: str) -> bool:
         # authority before a terminal row is materialized. Retirement is an
         # explicit state on a present Session workspace, never an inference
         # from missing historical metadata.
-        return True
+        return not _terminal_deletion_fence_exists_in_transaction(db, terminal_id)
     session_id = terminal.session_id or f"legacy:{terminal.tmux_session}"
+    if (
+        db.get(SessionDeletionOperationModel, session_id) is not None
+        or db.get(SessionDeletionReceiptModel, session_id) is not None
+    ):
+        return False
     context = (
         db.query(WritableWorkContextModel)
         .filter(WritableWorkContextModel.session_id == session_id)
@@ -8528,6 +14049,7 @@ def _prepare_workflow_input(
     defer_while_runtime_owned: bool = False,
     request_id: Optional[str] = None,
     require_live_terminal: bool = False,
+    child_assignment_workflow_effect_id: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Persist one input without overtaking existing provider work.
 
@@ -8542,17 +14064,29 @@ def _prepare_workflow_input(
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         terminal = db.get(TerminalModel, root_terminal_id)
+        if not _workspace_accepts_new_work(db, root_terminal_id):
+            lifetime = (
+                str(terminal.session_id or f"legacy:{terminal.tmux_session}")
+                if terminal is not None
+                else None
+            )
+            deletion_in_progress = bool(
+                lifetime and db.get(SessionDeletionOperationModel, lifetime) is not None
+            )
+            db.rollback()
+            return {
+                "accepted": False,
+                "reason_code": (
+                    "SESSION_DELETION_IN_PROGRESS"
+                    if deletion_in_progress
+                    else "SESSION_DELETED" if terminal is None else "WORKSPACE_RETIRED"
+                ),
+            }
         if require_live_terminal and terminal is None:
             db.rollback()
             return {
                 "accepted": False,
                 "reason_code": "TERMINAL_NOT_FOUND",
-            }
-        if terminal is not None and not _workspace_accepts_new_work(db, root_terminal_id):
-            db.rollback()
-            return {
-                "accepted": False,
-                "reason_code": "WORKSPACE_RETIRED",
             }
         if terminal is not None and terminal.runtime_lifecycle in (
             "recovery_required",
@@ -8565,6 +14099,9 @@ def _prepare_workflow_input(
                 "accepted": False,
                 "reason_code": "TERMINAL_RUNTIME_NOT_WRITABLE",
             }
+        runtime_compatibility_recovery = (
+            _terminal_requires_provider_runtime_compatibility_reconnect(terminal)
+        )
         if not _retirement_quiescence_allows_commit(db, root_terminal_id):
             return None
         # Terminal workflow turns can leave their ordinary Inbox transport
@@ -8663,10 +14200,24 @@ def _prepare_workflow_input(
                         "accepted": False,
                         "reason_code": "WORKFLOW_INPUT_NO_LONGER_EXECUTABLE",
                     }
+                if (
+                    runtime_compatibility_recovery
+                    and existing_workflow is not None
+                    and existing_workflow.active_turn_id == effective_turn.id
+                    and effective_turn.state == TURN_QUEUED
+                    and not _request_workflow_provider_reconnect_in_transaction(
+                        db,
+                        root_terminal_id,
+                        datetime.now(),
+                    )
+                ):
+                    db.rollback()
+                    return None
                 runtime_recovery = bool(
                     terminal
                     and (
-                        terminal.runtime_operation_kind in ("reconnect", "retire")
+                        runtime_compatibility_recovery
+                        or _terminal_runtime_operation_live(terminal, datetime.now())
                         or _terminal_has_pending_provider_reconnect(db, root_terminal_id)
                     )
                 )
@@ -8713,14 +14264,17 @@ def _prepare_workflow_input(
                 )
                 db.add(workflow)
                 db.flush()
-        runtime_owned = False
+        runtime_owned = runtime_compatibility_recovery
         workflow_predecessor = False
         if defer_while_runtime_owned:
             runtime_owned = bool(
-                terminal
-                and (
-                    terminal.runtime_operation_kind in ("reconnect", "retire")
-                    or _terminal_has_pending_provider_reconnect(db, root_terminal_id)
+                runtime_owned
+                or (
+                    terminal
+                    and (
+                        _terminal_runtime_operation_live(terminal, datetime.now())
+                        or _terminal_has_pending_provider_reconnect(db, root_terminal_id)
+                    )
                 )
             )
             workflow_predecessor = bool(
@@ -8758,12 +14312,49 @@ def _prepare_workflow_input(
         )
         db.add(turn)
         db.flush()
+        if child_assignment_workflow_effect_id is not None:
+            # Exact assign/review/handoff input becomes visible to reconnect
+            # only together with its owning attempt.  A second transaction
+            # would let the queue claim a payload whose revision/attempt
+            # authority had not yet been linked to this child turn.
+            assignment = (
+                db.query(ChildAssignmentModel)
+                .filter(
+                    ChildAssignmentModel.child_terminal_id == root_terminal_id,
+                    ChildAssignmentModel.request_workflow_effect_id
+                    == child_assignment_workflow_effect_id,
+                    ChildAssignmentModel.status.in_(
+                        (
+                            ChildAssignmentStatus.AWAITING_RESULT.value,
+                            ChildAssignmentStatus.HANDOFF_AWAITING_RESULT.value,
+                        )
+                    ),
+                )
+                .first()
+            )
+            if assignment is None or (
+                assignment.child_workflow_id is not None
+                or assignment.child_workflow_turn_id is not None
+            ):
+                db.rollback()
+                return None
+            assignment.child_workflow_id = turn.workflow_id
+            assignment.child_workflow_turn_id = turn.id
+            assignment.updated_at = datetime.now()
         _cancel_superseded_open_final_turns(db, int(workflow.id), datetime.now())
         # The direct input about to reach the provider is the only turn whose
         # public MCP calls may be admitted.  A later input replaces this
         # binding, so an old prompt cannot borrow its retained receipt.
-        if not queued:
+        compatibility_head = bool(runtime_compatibility_recovery and not workflow_predecessor)
+        if not queued or compatibility_head:
             workflow.active_turn_id = turn.id
+        if compatibility_head and not _request_workflow_provider_reconnect_in_transaction(
+            db,
+            root_terminal_id,
+            datetime.now(),
+        ):
+            db.rollback()
+            return None
         # A direct owner/user input is genuine progress and re-arms the bounded
         # automatic continuation path for this still-open mission.
         workflow.no_progress_count = 0
@@ -8834,7 +14425,12 @@ def queue_workflow_input_for_provider(
 ) -> bool:
     """Retain an unsent direct input in the existing workflow-turn queue."""
     _ensure_workflow_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        if not _workspace_accepts_new_work(db, root_terminal_id):
+            db.rollback()
+            return False
         workflow = _open_workflow(db, root_terminal_id, create=False)
         if (
             workflow is None
@@ -8842,37 +14438,191 @@ def queue_workflow_input_for_provider(
             or workflow.active_turn_id != logical_turn_id
         ):
             return False
-        changed = (
-            db.query(WorkflowTurnModel)
-            .filter(
-                WorkflowTurnModel.id == logical_turn_id,
-                WorkflowTurnModel.workflow_id == workflow.id,
-                WorkflowTurnModel.state == TURN_SENT,
+        turn = db.get(WorkflowTurnModel, logical_turn_id)
+        if turn is None or turn.workflow_id != workflow.id or turn.state != TURN_SENT:
+            db.rollback()
+            return False
+        now = datetime.now()
+        lifecycle = _managed_attempt_for_turn(db, root_terminal_id, logical_turn_id)
+        if lifecycle is not None:
+            turn.payload = payload
+            turn.provider_outcome_cursor = None
+            turn.provider_outcome_cursor_bootstrap_generation = None
+            resulting = _schedule_managed_attempt_recovery_in_transaction(
+                db,
+                lifecycle,
+                turn,
+                reason_code or "MANAGED_ATTEMPT_INITIAL_DELIVERY_FAILED",
+                now,
             )
-            .update(
-                {
-                    WorkflowTurnModel.payload: payload,
-                    WorkflowTurnModel.state: TURN_QUEUED,
-                    WorkflowTurnModel.queue_reason: reason_code,
-                    WorkflowTurnModel.claim_token: None,
-                    WorkflowTurnModel.claim_expires_at: None,
-                    WorkflowTurnModel.provider_outcome_cursor: None,
-                    WorkflowTurnModel.provider_outcome_cursor_bootstrap_generation: None,
-                    WorkflowTurnModel.updated_at: datetime.now(),
-                },
-                synchronize_session=False,
+            changed = int(resulting in {"recovery_scheduled", "fence_pending"})
+        else:
+            changed = (
+                db.query(WorkflowTurnModel)
+                .filter(
+                    WorkflowTurnModel.id == logical_turn_id,
+                    WorkflowTurnModel.workflow_id == workflow.id,
+                    WorkflowTurnModel.state == TURN_SENT,
+                )
+                .update(
+                    {
+                        WorkflowTurnModel.payload: payload,
+                        WorkflowTurnModel.state: TURN_QUEUED,
+                        WorkflowTurnModel.queue_reason: reason_code,
+                        WorkflowTurnModel.claim_token: None,
+                        WorkflowTurnModel.claim_expires_at: None,
+                        WorkflowTurnModel.provider_outcome_cursor: None,
+                        WorkflowTurnModel.provider_outcome_cursor_bootstrap_generation: None,
+                        WorkflowTurnModel.updated_at: now,
+                    },
+                    synchronize_session=False,
+                )
             )
-        )
         db.commit()
         return changed == 1
 
 
-def issue_workflow_input_binding(root_terminal_id: str) -> Optional[str]:
-    """Issue an opaque binding for one direct CAO assign/handoff delivery."""
+def issue_workflow_input_binding(
+    root_terminal_id: str,
+    payload: str,
+    *,
+    child_assignment_workflow_effect_id: Optional[int] = None,
+) -> Optional[str]:
+    """Atomically bind one exact CAO payload before recovery can claim it."""
+    if not isinstance(payload, str) or not payload:
+        raise ValueError("workflow input binding payload is required")
     binding = secrets.token_urlsafe(32)
-    if _start_workflow_input(root_terminal_id, transport_binding=binding) is None:
+    prepared = _prepare_workflow_input(
+        root_terminal_id,
+        payload=payload,
+        transport_binding=binding,
+        child_assignment_workflow_effect_id=child_assignment_workflow_effect_id,
+    )
+    if prepared is None or prepared.get("accepted") is False:
         return None
     return binding
+
+
+def get_workflow_input_binding_delivery(
+    root_terminal_id: str,
+    binding: str,
+    *,
+    expected_payload: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Describe accepted delivery authority for one exact internal input.
+
+    A server-bound input can be durably queued before the internal HTTP call
+    reaches provider transport (notably while a resident runtime reconnects
+    across a rolling upgrade).  Callers use this protected control-plane view
+    to preserve that exact turn instead of mistaking the expected queue state
+    for a pre-delivery failure.
+    """
+    _ensure_workflow_schema()
+    _ensure_provider_execution_schema()
+    with SessionLocal() as db:
+        turn = (
+            db.query(WorkflowTurnModel)
+            .join(WorkflowModel, WorkflowTurnModel.workflow_id == WorkflowModel.id)
+            .filter(
+                WorkflowModel.root_terminal_id == root_terminal_id,
+                WorkflowModel.status == WORKFLOW_OPEN,
+                WorkflowModel.active_turn_id == WorkflowTurnModel.id,
+                WorkflowTurnModel.transport_binding == binding,
+            )
+            .first()
+        )
+        if turn is None:
+            return None
+        provider_lease = db.get(ProviderExecutionLeaseModel, root_terminal_id)
+        provider_admitted = bool(
+            provider_lease is not None and provider_lease.workflow_turn_id == turn.id
+        )
+        receipted = (
+            db.query(WorkflowTurnReceiptModel.id)
+            .filter(
+                WorkflowTurnReceiptModel.workflow_turn_id == turn.id,
+                WorkflowTurnReceiptModel.receiver_terminal_id == root_terminal_id,
+            )
+            .first()
+            is not None
+        )
+        payload_matches = turn.payload is not None and (
+            expected_payload is None or turn.payload == expected_payload
+        )
+        queued = turn.state in (TURN_QUEUED, TURN_CLAIMED) and payload_matches
+        accepted = payload_matches and (queued or provider_admitted or receipted)
+        return {
+            "turn_id": cast(int, turn.id),
+            "state": cast(str, turn.state),
+            "queue_reason": turn.queue_reason,
+            "reconnect_pending": turn.provider_reconnect_requested_at is not None,
+            "accepted": accepted,
+            "queued": queued and not provider_admitted and not receipted,
+            "provider_admitted": provider_admitted,
+            "receipted": receipted,
+            "payload_matches": payload_matches,
+        }
+
+
+def retain_queued_workflow_input_binding(
+    root_terminal_id: str, binding: str, payload: str
+) -> Optional[Dict[str, Any]]:
+    """Observe an exact binding already owned by recovery or provider send.
+
+    The binding and payload were committed atomically before reconnect could
+    claim the turn. A different or missing payload is therefore an authority
+    conflict. Claimed/provider-owned turns stay with their existing owner.
+    """
+    _ensure_workflow_schema()
+    _ensure_provider_execution_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        turn = (
+            db.query(WorkflowTurnModel)
+            .join(WorkflowModel, WorkflowTurnModel.workflow_id == WorkflowModel.id)
+            .filter(
+                WorkflowModel.root_terminal_id == root_terminal_id,
+                WorkflowModel.status == WORKFLOW_OPEN,
+                WorkflowModel.active_turn_id == WorkflowTurnModel.id,
+                WorkflowTurnModel.transport_binding == binding,
+            )
+            .first()
+        )
+        if turn is None:
+            db.rollback()
+            return None
+        if turn.payload != payload:
+            db.rollback()
+            raise ValueError("input binding payload changed")
+        provider_lease = db.get(ProviderExecutionLeaseModel, root_terminal_id)
+        provider_admitted = bool(
+            provider_lease is not None and provider_lease.workflow_turn_id == turn.id
+        )
+        receipted = (
+            db.query(WorkflowTurnReceiptModel.id)
+            .filter(
+                WorkflowTurnReceiptModel.workflow_turn_id == turn.id,
+                WorkflowTurnReceiptModel.receiver_terminal_id == root_terminal_id,
+            )
+            .first()
+            is not None
+        )
+        queue_owned = turn.state in (TURN_QUEUED, TURN_CLAIMED)
+        if not queue_owned and not provider_admitted and not receipted:
+            db.rollback()
+            return None
+        result = {
+            "turn_id": cast(int, turn.id),
+            "state": cast(str, turn.state),
+            "queue_reason": turn.queue_reason,
+            "reconnect_pending": turn.provider_reconnect_requested_at is not None,
+            "accepted": True,
+            "queued": queue_owned and not provider_admitted and not receipted,
+            "provider_admitted": provider_admitted,
+            "receipted": receipted,
+        }
+        db.rollback()
+        return result
 
 
 def resolve_workflow_input_binding(root_terminal_id: str, binding: str) -> Optional[int]:
@@ -9220,7 +14970,13 @@ def reconcile_owner_gated_workflow_successors(now: Optional[datetime] = None) ->
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         workflows = (
             db.query(WorkflowModel)
-            .filter(WorkflowModel.status == WORKFLOW_OWNER_GATE)
+            .filter(
+                WorkflowModel.status == WORKFLOW_OWNER_GATE,
+                or_(
+                    workflow_current_execution_authority_predicate(WorkflowModel),
+                    WorkflowModel.terminal_reason == BOUNDED_TRANSPORT_RETRY_GUARD_REASON,
+                ),
+            )
             .order_by(WorkflowModel.id.asc())
             .all()
         )
@@ -9484,7 +15240,8 @@ def get_protected_workflow_root_terminal_ids() -> List[str]:
         return [
             row[0]
             for row in db.query(WorkflowModel.root_terminal_id)
-            .filter(WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)))
+            .filter(workflow_current_execution_authority_predicate(WorkflowModel))
+            .distinct()
             .all()
         ]
 
@@ -9808,6 +15565,10 @@ def queue_workflow_turn(
     """Atomically retain one logical continuation; duplicate retries are inert."""
     _ensure_workflow_schema()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        if not _workspace_accepts_new_work(db, root_terminal_id):
+            db.rollback()
+            return None, True
         workflow = _open_workflow(db, root_terminal_id, create=False)
         if workflow is None or workflow.status != WORKFLOW_OPEN:
             return None, True
@@ -10111,6 +15872,11 @@ def _mirror_workflow_effect_ledger(
         .all()
     )
     for prior in prior_effects:
+        prior_resolution = (
+            db.query(WorkflowEffectResolutionModel)
+            .filter_by(workflow_effect_id=prior.id)
+            .one_or_none()
+        )
         state = "indeterminate" if prior.state == "claimed" else prior.state
         if (
             state == "rejected"
@@ -10139,26 +15905,60 @@ def _mirror_workflow_effect_ledger(
             states = {str(existing.state), state}
             if "completed" in states:
                 existing.state = "completed"
+            elif _OPERATOR_RETIRED_INDETERMINATE_EFFECT in states:
+                # An operator-retired unknown outcome is a permanent replay
+                # fence. Recovery may copy that truth, never reopen it as a
+                # safely claimable pre-effect state.
+                existing.state = _OPERATOR_RETIRED_INDETERMINATE_EFFECT
             elif "indeterminate" in states or "claimed" in states:
                 existing.state = "indeterminate"
+            elif "wait_retryable" in states:
+                existing.state = "wait_retryable"
+            elif "wait_timeout" in states:
+                existing.state = "wait_timeout"
             elif "rejected" in states:
                 existing.state = "rejected"
             else:
                 existing.state = "not_admitted"
             existing.updated_at = now
+            if prior_resolution is not None:
+                _append_workflow_effect_resolution(
+                    db,
+                    existing,
+                    str(prior_resolution.outcome),
+                    "EFFECT_RESOLUTION_MIRRORED",
+                    now,
+                    evidence_effect_id=prior.id,
+                    evidence_turn_id=source_turn_id,
+                )
             continue
-        db.add(
-            WorkflowEffectModel(
-                workflow_id=workflow_id,
-                workflow_turn_id=target_turn_id,
-                effect_kind=prior.effect_kind,
-                effect_key=prior.effect_key,
-                state=state,
-                claim_token=uuid.uuid4().hex,
-                created_at=now,
-                updated_at=now,
-            )
+        mirrored = WorkflowEffectModel(
+            workflow_id=workflow_id,
+            workflow_turn_id=target_turn_id,
+            effect_kind=prior.effect_kind,
+            effect_key=prior.effect_key,
+            state=state,
+            claim_token=uuid.uuid4().hex,
+            mirrored_from_effect_id=(
+                prior.mirrored_from_effect_id
+                if prior.mirrored_from_effect_id is not None
+                else prior.id
+            ),
+            created_at=now,
+            updated_at=now,
         )
+        db.add(mirrored)
+        db.flush()
+        if prior_resolution is not None:
+            _append_workflow_effect_resolution(
+                db,
+                mirrored,
+                str(prior_resolution.outcome),
+                "EFFECT_RESOLUTION_MIRRORED",
+                now,
+                evidence_effect_id=prior.id,
+                evidence_turn_id=source_turn_id,
+            )
 
 
 def _bind_receipted_provider_execution(
@@ -10274,6 +16074,8 @@ def claim_or_resume_workflow_turn_receipt(
     logical_turn_id: int,
     resume_token: Optional[str] = None,
     now: Optional[datetime] = None,
+    *,
+    terminal_auth_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Admit a new turn or transfer an interrupted admitted execution.
 
@@ -10291,9 +16093,13 @@ def claim_or_resume_workflow_turn_receipt(
     """
     _ensure_workflow_schema()
     _ensure_provider_execution_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     now = now or datetime.now()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        if not _workspace_accepts_new_work(db, receiver_terminal_id):
+            db.rollback()
+            return {"accepted": False, "reason": "session_deleted"}
         existing = (
             db.query(WorkflowTurnReceiptModel)
             .filter(
@@ -10386,7 +16192,12 @@ def claim_or_resume_workflow_turn_receipt(
                 db, int(workflow.id), logical_turn_id, int(resumed.id), now
             )
 
-            next_resume_token = secrets.token_urlsafe(32)
+            next_resume_token, next_resume_nonce = _mint_workflow_execution_resume_token(
+                db,
+                receiver_terminal_id,
+                int(resumed.id),
+                terminal_auth_token,
+            )
             db.add(
                 WorkflowTurnReceiptModel(
                     workflow_turn_id=resumed.id,
@@ -10394,6 +16205,7 @@ def claim_or_resume_workflow_turn_receipt(
                     resume_token_sha256=hashlib.sha256(
                         next_resume_token.encode("utf-8", "strict")
                     ).hexdigest(),
+                    resume_token_nonce=next_resume_nonce,
                     consumed_at=now,
                 )
             )
@@ -10401,6 +16213,7 @@ def claim_or_resume_workflow_turn_receipt(
             interrupted.updated_at = now
             existing.resumed_by_turn_id = resumed.id
             existing.resumed_at = now
+            existing.resume_token_nonce = None
             workflow.active_turn_id = resumed.id
             workflow.updated_at = now
             try:
@@ -10484,7 +16297,15 @@ def claim_or_resume_workflow_turn_receipt(
         if execution_conflict is not None:
             db.rollback()
             return {"accepted": False, "reason": execution_conflict}
-        next_resume_token = secrets.token_urlsafe(32)
+        _mark_managed_attempt_provider_admitted_in_transaction(
+            db, receiver_terminal_id, logical_turn_id, now
+        )
+        next_resume_token, next_resume_nonce = _mint_workflow_execution_resume_token(
+            db,
+            receiver_terminal_id,
+            logical_turn_id,
+            terminal_auth_token,
+        )
         db.add(
             WorkflowTurnReceiptModel(
                 workflow_turn_id=logical_turn_id,
@@ -10492,12 +16313,14 @@ def claim_or_resume_workflow_turn_receipt(
                 resume_token_sha256=hashlib.sha256(
                     next_resume_token.encode("utf-8", "strict")
                 ).hexdigest(),
+                resume_token_nonce=next_resume_nonce,
                 consumed_at=now,
             )
         )
         if reconnect_parent_receipt is not None:
             reconnect_parent_receipt.resumed_by_turn_id = logical_turn_id
             reconnect_parent_receipt.resumed_at = now
+            reconnect_parent_receipt.resume_token_nonce = None
         try:
             db.commit()
         except IntegrityError:
@@ -10549,6 +16372,131 @@ def has_admitted_workflow_turn(receiver_terminal_id: str, logical_turn_id: int) 
         )
 
 
+def get_workflow_compaction_continuation_authority(
+    receiver_terminal_id: str,
+    *,
+    terminal_auth_token: str,
+    runtime_generation: str,
+    provider_resume_identity: str,
+) -> Optional[Dict[str, Any]]:
+    """Re-derive the exact current admitted pair for a proven Codex compact.
+
+    This is a read-only restoration of existing authority, not a receipt,
+    resume, or privileged effect. A current OPEN turn without a receipt is an
+    ordinary not-yet-admitted input and has nothing to restore. Once a receipt
+    exists, every runtime, provider, lease, recovery, and token axis must agree
+    or compaction fails closed.
+    """
+    from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
+
+    _ensure_workflow_schema()
+    _ensure_provider_execution_schema()
+    if not terminal_auth_token or not runtime_generation or not provider_resume_identity:
+        raise WorkflowContinuationAuthorityConflict("continuation_identity_not_proven")
+    terminal_auth_digest = hashlib.sha256(terminal_auth_token.encode("utf-8", "strict")).hexdigest()
+    with SessionLocal() as db:
+        terminal = db.get(TerminalModel, receiver_terminal_id)
+        if (
+            terminal is None
+            or not _workspace_accepts_new_work(db, receiver_terminal_id)
+            or terminal.provider != "codex"
+            or terminal.runtime_lifecycle != "running"
+            or not terminal.provider_runtime_compatibility_generation
+            or not hmac.compare_digest(
+                str(terminal.provider_runtime_compatibility_generation),
+                ACTIVE_RUNTIME_GENERATION,
+            )
+            or not terminal.auth_token_sha256
+            or not hmac.compare_digest(str(terminal.auth_token_sha256), terminal_auth_digest)
+            or not terminal.runtime_generation
+            or not hmac.compare_digest(str(terminal.runtime_generation), runtime_generation)
+            or not terminal.provider_resume_identity
+            or not hmac.compare_digest(
+                str(terminal.provider_resume_identity), provider_resume_identity
+            )
+            or not terminal.provider_resume_runtime_generation
+            or not hmac.compare_digest(
+                str(terminal.provider_resume_runtime_generation), runtime_generation
+            )
+        ):
+            raise WorkflowContinuationAuthorityConflict("continuation_identity_not_proven")
+        workflow = _open_workflow(db, receiver_terminal_id, create=False)
+        if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
+            return None
+        logical_turn_id = int(workflow.active_turn_id)
+        turn = db.get(WorkflowTurnModel, logical_turn_id)
+        receipt = (
+            db.query(WorkflowTurnReceiptModel)
+            .filter_by(
+                workflow_turn_id=logical_turn_id,
+                receiver_terminal_id=receiver_terminal_id,
+            )
+            .one_or_none()
+        )
+        if receipt is None:
+            return None
+        lease = db.get(ProviderExecutionLeaseModel, receiver_terminal_id)
+        foreign_turn_lease = (
+            db.query(ProviderExecutionLeaseModel.terminal_id)
+            .filter(
+                ProviderExecutionLeaseModel.workflow_turn_id == logical_turn_id,
+                ProviderExecutionLeaseModel.terminal_id != receiver_terminal_id,
+            )
+            .first()
+        )
+        recovery = (
+            db.query(RecoveryTakeoverModel.id)
+            .filter(
+                or_(
+                    RecoveryTakeoverModel.old_terminal_id == receiver_terminal_id,
+                    RecoveryTakeoverModel.new_terminal_id == receiver_terminal_id,
+                ),
+                RecoveryTakeoverModel.state.notin_(("failed", "completed")),
+            )
+            .first()
+        )
+        nonce = str(receipt.resume_token_nonce or "")
+        if (
+            turn is None
+            or turn.workflow_id != workflow.id
+            or turn.state != TURN_SENT
+            or turn.superseded_by_turn_id is not None
+            or turn.superseded_at is not None
+            or turn.provider_ready_observed_at is not None
+            or turn.provider_outcome_code is not None
+            or turn.provider_outcome_observed_at is not None
+            or turn.provider_reconnect_requested_at is not None
+            or receipt.resumed_by_turn_id is not None
+            or receipt.resumed_at is not None
+            or not receipt.resume_token_sha256
+            or WORKFLOW_EXECUTION_RESUME_NONCE_PATTERN.fullmatch(nonce) is None
+            or lease is None
+            or lease.workflow_turn_id != logical_turn_id
+            or foreign_turn_lease is not None
+            or recovery is not None
+            or terminal.runtime_operation_kind is not None
+            or terminal.runtime_operation_token is not None
+        ):
+            raise WorkflowContinuationAuthorityConflict("continuation_authority_not_proven")
+        resume_token = _derive_workflow_execution_resume_token(
+            receiver_terminal_id,
+            logical_turn_id,
+            nonce,
+            terminal_auth_token,
+        )
+        resume_token_digest = hashlib.sha256(resume_token.encode("utf-8", "strict")).hexdigest()
+        if not hmac.compare_digest(str(receipt.resume_token_sha256), resume_token_digest):
+            raise WorkflowContinuationAuthorityConflict("continuation_token_not_proven")
+        return {
+            "authority_version": 1,
+            "workflow_id": int(workflow.id),
+            "logical_turn_id": logical_turn_id,
+            "resume_token": resume_token,
+            "receiver_terminal_id": receiver_terminal_id,
+            "runtime_generation": runtime_generation,
+        }
+
+
 def claim_workflow_effect(
     receiver_terminal_id: str,
     logical_turn_id: int,
@@ -10568,6 +16516,10 @@ def claim_workflow_effect(
     _ensure_workflow_schema()
     now = now or datetime.now()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        if not _workspace_accepts_new_work(db, receiver_terminal_id):
+            db.rollback()
+            return None
         workflow = _open_workflow(db, receiver_terminal_id, create=False)
         if (
             workflow is None
@@ -10665,11 +16617,20 @@ def finish_workflow_effect(
 ) -> bool:
     """Seal a claimed effect without permitting a duplicate future entry.
 
-    ``completed`` and ``indeterminate`` are terminal ledger states.  The
-    latter is used for exceptions after an external boundary has been entered;
-    it preserves truthfulness over an unsafe replay.
+    All accepted outcomes seal the claimed row. ``wait_timeout`` and
+    ``wait_retryable`` describe known bounded-observation results without
+    making any claim about the independently owned child lifecycle.
+    ``indeterminate`` is reserved for exceptions after an external boundary
+    has been entered; it preserves truthfulness over an unsafe replay.
     """
-    if outcome not in {"completed", "indeterminate", "rejected", "not_admitted"}:
+    if outcome not in {
+        "completed",
+        "indeterminate",
+        "rejected",
+        "not_admitted",
+        "wait_timeout",
+        "wait_retryable",
+    }:
         raise ValueError(f"Invalid workflow effect outcome: {outcome}")
     _ensure_workflow_schema()
     now = now or datetime.now()
@@ -10696,6 +16657,600 @@ def finish_workflow_effect(
             return False
         db.commit()
         return True
+
+
+def _durable_workflow_effect_key(kind: str, *parts: object) -> str:
+    """Build the MCP ledger key without importing the MCP server."""
+    digest = hashlib.sha256("\x1f".join(map(str, parts)).encode()).hexdigest()
+    return f"{kind}:{digest}"
+
+
+def _append_workflow_effect_resolution(
+    db: Any,
+    effect: WorkflowEffectModel,
+    outcome: str,
+    reason_code: str,
+    now: datetime,
+    *,
+    evidence_effect_id: Optional[int] = None,
+    evidence_turn_id: Optional[int] = None,
+    assignment_id: Optional[int] = None,
+    result_id: Optional[str] = None,
+) -> bool:
+    """Append one exact semantic outcome without rewriting transport history."""
+    if (
+        db.query(WorkflowEffectResolutionModel.id)
+        .filter_by(workflow_effect_id=effect.id)
+        .one_or_none()
+        is not None
+    ):
+        return False
+    db.add(
+        WorkflowEffectResolutionModel(
+            workflow_effect_id=effect.id,
+            outcome=outcome,
+            reason_code=reason_code,
+            evidence_effect_id=evidence_effect_id,
+            evidence_workflow_turn_id=evidence_turn_id,
+            evidence_assignment_id=assignment_id,
+            evidence_result_id=result_id,
+            created_at=now,
+        )
+    )
+    db.flush()
+    return True
+
+
+def _workflow_effect_semantic_outcome(db: Any, effect: WorkflowEffectModel) -> str:
+    """Return canonical logical truth while retaining the raw transport state."""
+    resolution = (
+        db.query(WorkflowEffectResolutionModel.outcome)
+        .filter_by(workflow_effect_id=effect.id)
+        .one_or_none()
+    )
+    return str(resolution[0]) if resolution is not None else str(effect.state)
+
+
+def _terminal_session_identity_in_transaction(db: Any, terminal_id: str) -> Optional[str]:
+    terminal = db.get(TerminalModel, terminal_id)
+    if terminal is not None:
+        return str(terminal.session_id or f"legacy:{terminal.tmux_session}")
+    receipt = db.get(TerminalDeletionReceiptModel, terminal_id)
+    return _terminal_receipt_session_identity(receipt) if receipt is not None else None
+
+
+def _assignment_effect_resolution_evidence(
+    db: Any,
+    effect: WorkflowEffectModel,
+    workflow: WorkflowModel,
+    turn: WorkflowTurnModel,
+) -> Optional[tuple[str, str, int, Optional[str]]]:
+    """Prove the exact delegation target and a durable delivery or failure boundary."""
+    assignment = (
+        db.query(ChildAssignmentModel).filter_by(request_workflow_effect_id=effect.id).one_or_none()
+    )
+    if assignment is None or assignment.child_workflow_id is None:
+        return None
+    child_workflow = db.get(WorkflowModel, assignment.child_workflow_id)
+    child_turn = (
+        db.get(WorkflowTurnModel, assignment.child_workflow_turn_id)
+        if assignment.child_workflow_turn_id is not None
+        else None
+    )
+    parent_session = _terminal_session_identity_in_transaction(
+        db, str(assignment.parent_terminal_id)
+    )
+    child_session = _terminal_session_identity_in_transaction(db, str(assignment.child_terminal_id))
+    if (
+        assignment.request_workflow_id != workflow.id
+        or assignment.request_workflow_turn_id != turn.id
+        or assignment.parent_terminal_id != workflow.root_terminal_id
+        or child_workflow is None
+        or child_workflow.root_terminal_id != assignment.child_terminal_id
+        or child_turn is None
+        or child_turn.workflow_id != child_workflow.id
+        or child_turn.transport_binding is None
+        or parent_session is None
+        or child_session is None
+        or parent_session != child_session
+    ):
+        return None
+    child_receipt = (
+        db.query(WorkflowTurnReceiptModel.id)
+        .filter_by(
+            workflow_turn_id=child_turn.id,
+            receiver_terminal_id=assignment.child_terminal_id,
+        )
+        .one_or_none()
+    )
+    lifecycle = db.get(ManagedAttemptLifecycleModel, assignment.id)
+    lifecycle_matches = bool(
+        lifecycle is not None
+        and lifecycle.attempt_id == assignment.attempt_id
+        and lifecycle.parent_terminal_id == assignment.parent_terminal_id
+        and lifecycle.child_terminal_id == assignment.child_terminal_id
+        and lifecycle.request_workflow_effect_id == effect.id
+        and lifecycle.child_workflow_id == child_workflow.id
+        and lifecycle.child_workflow_turn_id == child_turn.id
+    )
+    result = (
+        db.query(DelegationResultModel).filter_by(child_assignment_id=assignment.id).one_or_none()
+    )
+    result_matches = bool(
+        result is not None
+        and result.parent_terminal_id == assignment.parent_terminal_id
+        and result.child_terminal_id == assignment.child_terminal_id
+        and result.parent_workflow_id == workflow.id
+        and result.delegation_kind == effect.effect_kind
+    )
+    delivered = bool(
+        child_receipt is not None
+        or (
+            lifecycle_matches
+            and (
+                lifecycle.prompt_delivery_acknowledged_at is not None
+                or lifecycle.provider_admitted_at is not None
+            )
+        )
+        or (effect.effect_kind == "handoff" and assignment.handoff_input_received)
+        or (result_matches and result.status == DelegationResultStatus.COMPLETE.value)
+    )
+    result_id = str(result.id) if result_matches and result is not None else None
+    if delivered:
+        return "completed", "DELEGATION_ATTEMPT_DELIVERED", int(assignment.id), result_id
+    terminal_failure = bool(
+        (lifecycle_matches and lifecycle.state in {"failed", "fenced"})
+        or assignment.status
+        in {
+            ChildAssignmentStatus.FENCED.value,
+            ChildAssignmentStatus.CANCELLED.value,
+        }
+        or (
+            result_matches
+            and result is not None
+            and result.status
+            in {
+                DelegationResultStatus.INCOMPLETE.value,
+                DelegationResultStatus.CANCELLED.value,
+            }
+            and result.finalized_at is not None
+        )
+    )
+    if terminal_failure:
+        return "rejected", "DELEGATION_ATTEMPT_TERMINALIZED", int(assignment.id), result_id
+    return None
+
+
+def _fence_effect_matches_lifecycle(
+    db: Any,
+    effect: WorkflowEffectModel,
+    workflow: WorkflowModel,
+    lifecycle: ManagedAttemptLifecycleModel,
+) -> bool:
+    """Match an owner fence only to its complete immutable lifecycle identity."""
+    identity = (
+        lifecycle.assignment_id,
+        lifecycle.attempt_id,
+        lifecycle.parent_terminal_id,
+        lifecycle.child_terminal_id,
+        lifecycle.request_workflow_effect_id,
+        lifecycle.child_workflow_turn_id,
+        lifecycle.reason_code,
+        lifecycle.expected_runtime_generation,
+        lifecycle.expected_writer_authority_generation,
+    )
+    if lifecycle.state != "fenced" or any(value is None for value in identity):
+        return False
+    if not _critical_owner_recovery_scope_matches_in_transaction(
+        db,
+        str(workflow.root_terminal_id),
+        str(lifecycle.parent_terminal_id),
+        reason_code=str(lifecycle.reason_code),
+    ):
+        return False
+    return effect.effect_key == _durable_workflow_effect_key("fence_managed_attempt", *identity)
+
+
+def _resumed_effect_descends_from(
+    db: Any, workflow_id: int, descendant_turn_id: int, ancestor_turn_id: int
+) -> bool:
+    """Prove one same-workflow replay chain through turns and receipts."""
+    workflow = db.get(WorkflowModel, workflow_id)
+    if workflow is None:
+        return False
+    current_id = descendant_turn_id
+    visited: set[int] = set()
+    while current_id not in visited:
+        if current_id == ancestor_turn_id:
+            return True
+        visited.add(current_id)
+        turn = db.get(WorkflowTurnModel, current_id)
+        if turn is None or turn.workflow_id != workflow_id or turn.resume_parent_turn_id is None:
+            return False
+        parent_id = int(turn.resume_parent_turn_id)
+        receipt = (
+            db.query(WorkflowTurnReceiptModel)
+            .filter_by(
+                workflow_turn_id=parent_id,
+                receiver_terminal_id=workflow.root_terminal_id,
+            )
+            .one_or_none()
+        )
+        if (
+            receipt is None
+            or receipt.resumed_by_turn_id != current_id
+            or receipt.resumed_at is None
+        ):
+            return False
+        current_id = parent_id
+    return False
+
+
+def reconcile_workflow_effect_resolutions(
+    *, limit: int = 200, now: Optional[datetime] = None
+) -> int:
+    """Persist bounded exact outcomes for formerly uncertain effects.
+
+    This never rewrites the transport observation in ``workflow_effects``.
+    It records a semantic resolution only when an immutable relation proves
+    the exact workflow, logical turn, effect, and target/result identity.  A
+    same-key effect may resolve an ancestor only across a fully receipted
+    resume chain; unrelated workflows and turns are never considered.
+    """
+    if isinstance(limit, bool) or limit < 1 or limit > 1000:
+        raise ValueError("limit must be between 1 and 1000")
+    _ensure_workflow_schema()
+    _ensure_child_assignment_schema()
+    _ensure_managed_attempt_lifecycle_schema()
+    _ensure_delegation_result_schema()
+    now = now or datetime.now()
+    resolved = 0
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        cursor = db.get(WorkflowEffectReconciliationCursorModel, 1)
+        if cursor is None:
+            cursor = WorkflowEffectReconciliationCursorModel(id=1, updated_at=now)
+            db.add(cursor)
+            db.flush()
+
+        def unresolved_effect_page(after_id: int) -> List[WorkflowEffectModel]:
+            return cast(
+                List[WorkflowEffectModel],
+                db.query(WorkflowEffectModel)
+                .outerjoin(
+                    WorkflowEffectResolutionModel,
+                    WorkflowEffectResolutionModel.workflow_effect_id == WorkflowEffectModel.id,
+                )
+                .filter(
+                    WorkflowEffectModel.id > after_id,
+                    WorkflowEffectModel.state.in_(("claimed", "indeterminate")),
+                    WorkflowEffectModel.effect_kind != "fence_managed_attempt",
+                    WorkflowEffectResolutionModel.id.is_(None),
+                )
+                .order_by(WorkflowEffectModel.id.asc())
+                .limit(limit)
+                .all(),
+            )
+
+        effects = unresolved_effect_page(int(cursor.last_workflow_effect_id))
+        if not effects and cursor.last_workflow_effect_id:
+            cursor.last_workflow_effect_id = 0
+            effects = unresolved_effect_page(0)
+        if effects:
+            cursor.last_workflow_effect_id = int(effects[-1].id)
+        cursor.updated_at = now
+
+        def record(
+            effect: WorkflowEffectModel,
+            outcome: str,
+            reason_code: str,
+            *,
+            evidence_effect_id: Optional[int] = None,
+            evidence_turn_id: Optional[int] = None,
+            assignment_id: Optional[int] = None,
+            result_id: Optional[str] = None,
+        ) -> None:
+            nonlocal resolved
+            resolved += int(
+                _append_workflow_effect_resolution(
+                    db,
+                    effect,
+                    outcome,
+                    reason_code,
+                    now,
+                    evidence_effect_id=evidence_effect_id,
+                    evidence_turn_id=evidence_turn_id,
+                    assignment_id=assignment_id,
+                    result_id=result_id,
+                )
+            )
+
+        # Strong direct evidence first. This also creates the replay anchors
+        # used by the second pass in the same transaction.
+        for effect in effects:
+            workflow = db.get(WorkflowModel, effect.workflow_id)
+            turn = db.get(WorkflowTurnModel, effect.workflow_turn_id)
+            if workflow is None or turn is None or turn.workflow_id != workflow.id:
+                continue
+            receipt = (
+                db.query(WorkflowTurnReceiptModel.id)
+                .filter_by(
+                    workflow_turn_id=turn.id,
+                    receiver_terminal_id=workflow.root_terminal_id,
+                )
+                .one_or_none()
+            )
+            if receipt is None:
+                continue
+
+            if effect.effect_kind in {"assign", "handoff"}:
+                delegation = _assignment_effect_resolution_evidence(db, effect, workflow, turn)
+                if delegation is not None:
+                    outcome, reason_code, assignment_id, result_id = delegation
+                    record(
+                        effect,
+                        outcome,
+                        reason_code,
+                        evidence_turn_id=turn.id,
+                        assignment_id=assignment_id,
+                        result_id=result_id,
+                    )
+                    continue
+
+            result = (
+                db.query(DelegationResultModel)
+                .filter_by(workflow_effect_id=effect.id)
+                .one_or_none()
+            )
+            if result is not None:
+                assignment = db.get(ChildAssignmentModel, result.child_assignment_id)
+                if (
+                    result.status == DelegationResultStatus.COMPLETE.value
+                    and result.finalized_at is not None
+                    and isinstance(result.content_sha256, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", result.content_sha256) is not None
+                    and isinstance(result.content_bytes, int)
+                    and result.content_bytes > 0
+                    and assignment is not None
+                    and result.child_terminal_id == workflow.root_terminal_id
+                    and assignment.child_terminal_id == workflow.root_terminal_id
+                    and assignment.child_workflow_id == workflow.id
+                    and result.parent_workflow_id == assignment.request_workflow_id
+                    and result.workflow_turn_id == turn.id
+                    and effect.effect_kind
+                    in {"send_message", "complete_workflow", "submit_handoff_result_v1"}
+                    and assignment.child_workflow_turn_id is not None
+                    and _child_workflow_authority_descends_from_assignment(
+                        db,
+                        workflow,
+                        int(assignment.child_workflow_turn_id),
+                        str(assignment.child_terminal_id),
+                        authority_turn_id=int(turn.id),
+                    )
+                ):
+                    record(
+                        effect,
+                        "completed",
+                        "MANAGED_RESULT_FINALIZED",
+                        evidence_turn_id=turn.id,
+                        assignment_id=assignment.id,
+                        result_id=result.id,
+                    )
+                    continue
+
+            if effect.effect_kind == "acknowledge_assignment":
+                matched = None
+                candidates = (
+                    db.query(DelegationResultModel)
+                    .join(
+                        ChildAssignmentModel,
+                        ChildAssignmentModel.id == DelegationResultModel.child_assignment_id,
+                    )
+                    .filter(
+                        ChildAssignmentModel.parent_terminal_id == workflow.root_terminal_id,
+                        ChildAssignmentModel.request_workflow_id == workflow.id,
+                    )
+                    .order_by(DelegationResultModel.created_at.desc())
+                    .limit(1000)
+                    .all()
+                )
+                for candidate in candidates:
+                    if effect.effect_key == _durable_workflow_effect_key(
+                        "acknowledge_assignment", candidate.id
+                    ):
+                        matched = candidate
+                        break
+                if matched is not None:
+                    assignment = db.get(ChildAssignmentModel, matched.child_assignment_id)
+                    if (
+                        assignment is not None
+                        and assignment.parent_terminal_id == workflow.root_terminal_id
+                        and assignment.request_workflow_id == workflow.id
+                    ):
+                        if assignment.status in {
+                            ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
+                            ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value,
+                        }:
+                            record(
+                                effect,
+                                "completed",
+                                "RESULT_ACKNOWLEDGED",
+                                evidence_turn_id=turn.id,
+                                assignment_id=assignment.id,
+                                result_id=matched.id,
+                            )
+                            continue
+                        if (
+                            assignment.review_superseded_at is not None
+                            and assignment.status == ChildAssignmentStatus.RESULT_SUPERSEDED.value
+                        ):
+                            record(
+                                effect,
+                                "rejected",
+                                "RESULT_REVIEW_ATTEMPT_SUPERSEDED",
+                                evidence_turn_id=turn.id,
+                                assignment_id=assignment.id,
+                                result_id=matched.id,
+                            )
+                            continue
+
+            if (
+                effect.effect_kind == "complete_workflow"
+                and workflow.status == WORKFLOW_TERMINAL
+                and workflow.active_turn_id == turn.id
+                and effect.effect_key
+                == _durable_workflow_effect_key("complete_workflow", workflow.terminal_reason or "")
+            ):
+                record(
+                    effect,
+                    "completed",
+                    "WORKFLOW_TERMINALIZED",
+                    evidence_turn_id=turn.id,
+                )
+
+        # A later exact same-key attempt resolves only ancestors in its
+        # receipted resume chain. The original transport remains indeterminate.
+        db.flush()
+        for effect in effects:
+            if (
+                db.query(WorkflowEffectResolutionModel.id)
+                .filter_by(workflow_effect_id=effect.id)
+                .one_or_none()
+                is not None
+            ):
+                continue
+            evidence = (
+                db.query(WorkflowEffectModel, WorkflowEffectResolutionModel)
+                .join(
+                    WorkflowEffectResolutionModel,
+                    WorkflowEffectResolutionModel.workflow_effect_id == WorkflowEffectModel.id,
+                    isouter=True,
+                )
+                .filter(
+                    WorkflowEffectModel.workflow_id == effect.workflow_id,
+                    WorkflowEffectModel.effect_kind == effect.effect_kind,
+                    WorkflowEffectModel.effect_key == effect.effect_key,
+                    WorkflowEffectModel.workflow_turn_id != effect.workflow_turn_id,
+                    or_(
+                        WorkflowEffectModel.state == "completed",
+                        WorkflowEffectResolutionModel.outcome == "completed",
+                    ),
+                )
+                .order_by(WorkflowEffectModel.id.desc())
+                .all()
+            )
+            for evidence_effect, _resolution in evidence:
+                if _resumed_effect_descends_from(
+                    db,
+                    int(effect.workflow_id),
+                    int(evidence_effect.workflow_turn_id),
+                    int(effect.workflow_turn_id),
+                ):
+                    record(
+                        effect,
+                        "completed",
+                        "EFFECT_COMPLETED_BY_REPLAY",
+                        evidence_effect_id=evidence_effect.id,
+                        evidence_turn_id=evidence_effect.workflow_turn_id,
+                    )
+                    break
+
+        # Fence identities are intentionally opaque hashes. Probe one effect
+        # against one bounded, persistent lifecycle page per tick so old exact
+        # matches are eventually found without an unbounded cross-product.
+        fence_effect = None
+        if cursor.fence_probe_effect_id is not None:
+            fence_effect = db.get(WorkflowEffectModel, cursor.fence_probe_effect_id)
+            fence_resolution = (
+                db.query(WorkflowEffectResolutionModel.id)
+                .filter_by(workflow_effect_id=cursor.fence_probe_effect_id)
+                .one_or_none()
+            )
+            if (
+                fence_effect is None
+                or fence_effect.effect_kind != "fence_managed_attempt"
+                or fence_effect.state not in {"claimed", "indeterminate"}
+                or fence_resolution is not None
+            ):
+                fence_effect = None
+                cursor.fence_probe_effect_id = None
+                cursor.last_fence_assignment_id = 0
+        if fence_effect is None:
+
+            def next_fence_effect(after_id: int) -> Optional[WorkflowEffectModel]:
+                return cast(
+                    Optional[WorkflowEffectModel],
+                    db.query(WorkflowEffectModel)
+                    .outerjoin(
+                        WorkflowEffectResolutionModel,
+                        WorkflowEffectResolutionModel.workflow_effect_id == WorkflowEffectModel.id,
+                    )
+                    .filter(
+                        WorkflowEffectModel.id > after_id,
+                        WorkflowEffectModel.effect_kind == "fence_managed_attempt",
+                        WorkflowEffectModel.state.in_(("claimed", "indeterminate")),
+                        WorkflowEffectResolutionModel.id.is_(None),
+                    )
+                    .order_by(WorkflowEffectModel.id.asc())
+                    .first(),
+                )
+
+            fence_effect = next_fence_effect(int(cursor.last_fence_effect_id))
+            if fence_effect is None and cursor.last_fence_effect_id:
+                cursor.last_fence_effect_id = 0
+                fence_effect = next_fence_effect(0)
+            if fence_effect is not None:
+                cursor.fence_probe_effect_id = int(fence_effect.id)
+                cursor.last_fence_assignment_id = 0
+        if fence_effect is not None:
+            lifecycle_page = (
+                db.query(ManagedAttemptLifecycleModel)
+                .filter(
+                    ManagedAttemptLifecycleModel.assignment_id > cursor.last_fence_assignment_id,
+                    ManagedAttemptLifecycleModel.state == "fenced",
+                )
+                .order_by(ManagedAttemptLifecycleModel.assignment_id.asc())
+                .limit(limit)
+                .all()
+            )
+            matched_fence = False
+            fence_workflow = db.get(WorkflowModel, fence_effect.workflow_id)
+            fence_turn = db.get(WorkflowTurnModel, fence_effect.workflow_turn_id)
+            fence_receipt = (
+                db.query(WorkflowTurnReceiptModel.id)
+                .filter_by(
+                    workflow_turn_id=fence_effect.workflow_turn_id,
+                    receiver_terminal_id=(
+                        fence_workflow.root_terminal_id if fence_workflow is not None else ""
+                    ),
+                )
+                .one_or_none()
+            )
+            if (
+                fence_workflow is not None
+                and fence_turn is not None
+                and fence_turn.workflow_id == fence_workflow.id
+                and fence_receipt is not None
+            ):
+                for lifecycle in lifecycle_page:
+                    if _fence_effect_matches_lifecycle(db, fence_effect, fence_workflow, lifecycle):
+                        record(
+                            fence_effect,
+                            "completed",
+                            "MANAGED_ATTEMPT_FENCED",
+                            evidence_turn_id=fence_turn.id,
+                            assignment_id=lifecycle.assignment_id,
+                        )
+                        matched_fence = True
+                        break
+            if lifecycle_page:
+                cursor.last_fence_assignment_id = int(lifecycle_page[-1].assignment_id)
+            if matched_fence or len(lifecycle_page) < limit:
+                cursor.last_fence_effect_id = int(fence_effect.id)
+                cursor.fence_probe_effect_id = None
+                cursor.last_fence_assignment_id = 0
+        db.commit()
+    return resolved
 
 
 def describe_workflow_effect_rejection(
@@ -10750,6 +17305,7 @@ def describe_workflow_effect_rejection(
             return {
                 "reason_code": "DUPLICATE_EFFECT",
                 "workflow_state": workflow.status,
+                "effect_state": str(existing.state),
                 "explanation": "This logical effect was already claimed.",
             }
         return {
@@ -10757,6 +17313,31 @@ def describe_workflow_effect_rejection(
             "workflow_state": workflow.status,
             "explanation": "The logical turn is not the current admitted turn.",
         }
+
+
+def get_workflow_effect_state(
+    receiver_terminal_id: str,
+    logical_turn_id: int,
+    effect_kind: str,
+    effect_key: str,
+) -> Optional[str]:
+    """Return an exact active-turn effect state for a resumable-operation fence."""
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        row = (
+            db.query(WorkflowEffectModel.state)
+            .join(WorkflowModel, WorkflowModel.id == WorkflowEffectModel.workflow_id)
+            .filter(
+                WorkflowModel.root_terminal_id == receiver_terminal_id,
+                WorkflowModel.status == WORKFLOW_OPEN,
+                WorkflowModel.active_turn_id == logical_turn_id,
+                WorkflowEffectModel.workflow_turn_id == logical_turn_id,
+                WorkflowEffectModel.effect_kind == effect_kind,
+                WorkflowEffectModel.effect_key == effect_key,
+            )
+            .one_or_none()
+        )
+        return str(row[0]) if row is not None else None
 
 
 def mark_workflow_turn_sent_for_inbox(message_id: int) -> bool:
@@ -10974,7 +17555,13 @@ def _validated_result_callback_transport(
             or request_effect.workflow_id != workflow.id
             or request_effect.workflow_turn_id != assignment.request_workflow_turn_id
             or request_effect.effect_kind != effect_kind
-            or request_effect.state not in {"claimed", "completed", "indeterminate"}
+            or not (
+                request_effect.state in {"claimed", "completed", "indeterminate"}
+                or (
+                    effect_kind == "handoff"
+                    and request_effect.state in {"wait_timeout", "wait_retryable"}
+                )
+            )
             or inbox.kind != "delegation_result_notice"
             or inbox.receiver_id != root_terminal_id
             or inbox.sender_id != assignment.child_terminal_id
@@ -11094,13 +17681,24 @@ def _reconcile_proven_result_effect_authority(
         )
         if result is None or request_effect is None:
             continue
-        if request_effect.state in {"claimed", "indeterminate"}:
+        if request_effect.state in {
+            "claimed",
+            "indeterminate",
+        } and _workflow_effect_semantic_outcome(db, request_effect) in {"claimed", "indeterminate"}:
             # The exact finalized result/assignment join was validated by the
             # caller. It is positive evidence that the request effect created
-            # this child and ran to completion, not an assumption that an
-            # uncertain external operation may be replayed.
-            request_effect.state = "completed"
-            request_effect.updated_at = now
+            # this child and ran to completion. Preserve the original
+            # transport observation and append the later semantic proof.
+            _append_workflow_effect_resolution(
+                db,
+                request_effect,
+                "completed",
+                "MANAGED_RESULT_FINALIZED",
+                now,
+                evidence_turn_id=source_turn.id,
+                assignment_id=assignment.id,
+                result_id=str(result.id),
+            )
         if _review_acknowledgement_reason(db, assignment, workflow, result) is not None:
             continue
         effect_key = _canonical_acknowledgement_effect_key(str(result.id))
@@ -11382,6 +17980,31 @@ def _provider_reconnect_authority_turn(
         if turn.resume_parent_turn_id is None:
             turn.resume_parent_turn_id = predecessor.id
         candidate = predecessor
+    elif (
+        turn.state == TURN_QUEUED
+        and turn.kind == "external_input"
+        and turn.inbox_message_id is None
+        and workflow.status == WORKFLOW_OPEN
+        and workflow.root_terminal_id == root_terminal_id
+        and workflow.active_turn_id == turn.id
+        and turn.workflow_id == workflow.id
+        and turn.claim_token is None
+        and turn.claim_expires_at is None
+        and turn.superseded_by_turn_id is None
+        and turn.superseded_at is None
+        and db.query(WorkflowTurnReceiptModel.id)
+        .filter_by(
+            workflow_turn_id=turn.id,
+            receiver_terminal_id=root_terminal_id,
+        )
+        .first()
+        is None
+    ):
+        # An accepted external input is durable transport authority even
+        # before provider admission. It may own a compatibility reconnect so
+        # the exact same turn remains queued while the resident process is
+        # replaced, then becomes sendable once the new runtime is proven.
+        return turn
     elif _queued_result_turn_authorizes_provider_reconnect(db, workflow, turn, root_terminal_id):
         return turn
     elif turn.state not in (TURN_SENT, TURN_FINISHED):
@@ -11397,8 +18020,49 @@ def _provider_reconnect_authority_turn(
     return candidate if admitted is not None else None
 
 
+def _request_workflow_provider_reconnect_in_transaction(
+    db: Any,
+    root_terminal_id: str,
+    now: datetime,
+    *,
+    incompatible_with_runtime_generation: Optional[str] = None,
+) -> bool:
+    """Install one reconnect marker while retaining the caller's writer lock."""
+    if not _workspace_accepts_new_work(db, root_terminal_id):
+        return False
+    workflow = _open_workflow(db, root_terminal_id, create=False)
+    if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
+        return False
+    if incompatible_with_runtime_generation is not None:
+        terminal = db.get(TerminalModel, root_terminal_id)
+        if (
+            terminal is None
+            or terminal.provider != "codex"
+            or terminal.runtime_lifecycle != "running"
+            or terminal.provider_runtime_compatibility_generation
+            == incompatible_with_runtime_generation
+        ):
+            return False
+    turn = db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
+    if turn is None or turn.workflow_id != workflow.id:
+        return False
+    if _provider_reconnect_authority_turn(db, workflow, turn, root_terminal_id) is None:
+        return False
+    if turn.provider_reconnect_requested_at is None:
+        turn.provider_reconnect_requested_at = now
+        turn.provider_reconnect_claim_token = None
+        if turn.state == TURN_QUEUED:
+            turn.queue_reason = "TERMINAL_RUNTIME_RECONNECT_PENDING"
+        turn.updated_at = now
+        workflow.updated_at = now
+    return True
+
+
 def request_workflow_provider_reconnect(
-    root_terminal_id: str, now: Optional[datetime] = None
+    root_terminal_id: str,
+    now: Optional[datetime] = None,
+    *,
+    incompatible_with_runtime_generation: Optional[str] = None,
 ) -> bool:
     """Persist a stale-sidecar observation before any replacement transport.
 
@@ -11409,29 +18073,180 @@ def request_workflow_provider_reconnect(
     supplies provenance. No provider launch occurs here.
     """
     _ensure_workflow_schema()
+    if (
+        incompatible_with_runtime_generation is not None
+        and re.fullmatch(r"[0-9a-f]{64}", incompatible_with_runtime_generation) is None
+    ):
+        raise ValueError("incompatible runtime generation is invalid")
     now = now or datetime.now()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
-        workflow = _open_workflow(db, root_terminal_id, create=False)
-        if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
+        requested = _request_workflow_provider_reconnect_in_transaction(
+            db,
+            root_terminal_id,
+            now,
+            incompatible_with_runtime_generation=incompatible_with_runtime_generation,
+        )
+        if not requested:
             db.rollback()
             return False
-        turn = db.get(WorkflowTurnModel, cast(int, workflow.active_turn_id))
-        if turn is None or turn.workflow_id != workflow.id:
-            db.rollback()
-            return False
-        if _provider_reconnect_authority_turn(db, workflow, turn, root_terminal_id) is None:
-            db.rollback()
-            return False
-        if turn.provider_reconnect_requested_at is None:
-            turn.provider_reconnect_requested_at = now
-            turn.provider_reconnect_claim_token = None
-            if turn.state == TURN_QUEUED:
-                turn.queue_reason = "TERMINAL_RUNTIME_RECONNECT_PENDING"
-            turn.updated_at = now
-            workflow.updated_at = now
         db.commit()
         return True
+
+
+def request_stale_provider_runtime_reconnects(
+    active_runtime_generation: str,
+    *,
+    now: Optional[datetime] = None,
+    limit: int = STALE_PROVIDER_RUNTIME_RECONNECT_BATCH_SIZE,
+) -> int:
+    """Fence admitted Codex executions launched by older control-plane code.
+
+    Codex parses its SessionStart matcher once at launch, so a deployment
+    cannot retrofit the compact hook into a resident process. The terminal's
+    compatibility generation distinguishes that launch authority from the
+    current service. Persisting the ordinary provider-reconnect barrier before
+    queue observation prevents new transport and lets its existing recovery
+    saga resume the exact provider session after the active execution settles.
+
+    Candidate selection includes only turn shapes which can carry reconnect
+    authority. A durable singleton keyset cursor advances across every selected
+    page even when its exact writer transactions all fail, so a deletion fence
+    or concurrently changed claimant cannot make the first page starve another
+    Session. The cursor resets after the end of each finite sweep and when the
+    active release generation changes. Terminal-level transport checks
+    independently fence every stale resident, including terminals with no OPEN
+    workflow.
+    """
+    _ensure_workflow_schema()
+    if re.fullmatch(r"[0-9a-f]{64}", active_runtime_generation) is None:
+        raise ValueError("active runtime generation is invalid")
+    bounded_limit = min(max(int(limit), 1), STALE_PROVIDER_RUNTIME_RECONNECT_BATCH_SIZE)
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        scan = db.get(ProviderRuntimeCompatibilityScanModel, 1)
+        if scan is None:
+            scan = ProviderRuntimeCompatibilityScanModel(
+                id=1,
+                active_runtime_generation=active_runtime_generation,
+            )
+            db.add(scan)
+            db.flush()
+        elif not hmac.compare_digest(
+            str(scan.active_runtime_generation), active_runtime_generation
+        ):
+            scan.active_runtime_generation = active_runtime_generation
+            scan.after_terminal_id = None
+        after_terminal_id = (
+            str(scan.after_terminal_id) if scan.after_terminal_id is not None else None
+        )
+        direct_receipt_exists = (
+            db.query(WorkflowTurnReceiptModel.id)
+            .filter(
+                WorkflowTurnReceiptModel.workflow_turn_id == WorkflowTurnModel.id,
+                WorkflowTurnReceiptModel.receiver_terminal_id == WorkflowModel.root_terminal_id,
+            )
+            .exists()
+        )
+        predecessor_receipt_exists = (
+            db.query(WorkflowTurnReceiptModel.id)
+            .filter(
+                WorkflowTurnReceiptModel.workflow_turn_id
+                == WorkflowTurnModel.resume_parent_turn_id,
+                WorkflowTurnReceiptModel.receiver_terminal_id == WorkflowModel.root_terminal_id,
+            )
+            .exists()
+        )
+        candidates = [
+            str(root_terminal_id)
+            for (root_terminal_id,) in (
+                db.query(WorkflowModel.root_terminal_id)
+                .distinct()
+                .join(TerminalModel, TerminalModel.id == WorkflowModel.root_terminal_id)
+                .join(
+                    WorkflowTurnModel,
+                    WorkflowTurnModel.id == WorkflowModel.active_turn_id,
+                )
+                .filter(
+                    WorkflowModel.status == WORKFLOW_OPEN,
+                    TerminalModel.provider == "codex",
+                    TerminalModel.runtime_lifecycle == "running",
+                    or_(
+                        TerminalModel.provider_runtime_compatibility_generation.is_(None),
+                        TerminalModel.provider_runtime_compatibility_generation
+                        != active_runtime_generation,
+                    ),
+                    WorkflowTurnModel.provider_reconnect_requested_at.is_(None),
+                    *(
+                        (WorkflowModel.root_terminal_id > after_terminal_id,)
+                        if after_terminal_id is not None
+                        else ()
+                    ),
+                    or_(
+                        and_(
+                            WorkflowTurnModel.state.in_((TURN_SENT, TURN_FINISHED)),
+                            direct_receipt_exists,
+                        ),
+                        and_(
+                            WorkflowTurnModel.state == TURN_QUEUED,
+                            WorkflowTurnModel.kind == "open_final",
+                            WorkflowTurnModel.resume_parent_turn_id.is_not(None),
+                            predecessor_receipt_exists,
+                        ),
+                        and_(
+                            WorkflowTurnModel.state == TURN_QUEUED,
+                            WorkflowTurnModel.kind == "external_input",
+                            WorkflowTurnModel.inbox_message_id.is_(None),
+                            WorkflowTurnModel.claim_token.is_(None),
+                            WorkflowTurnModel.claim_expires_at.is_(None),
+                            WorkflowTurnModel.superseded_by_turn_id.is_(None),
+                            WorkflowTurnModel.superseded_at.is_(None),
+                        ),
+                    ),
+                )
+                .order_by(WorkflowModel.root_terminal_id.asc())
+                .limit(bounded_limit)
+                .all()
+            )
+        ]
+        scan.after_terminal_id = candidates[-1] if len(candidates) == bounded_limit else None
+        scan.updated_at = now or datetime.now()
+        db.commit()
+    return sum(
+        int(
+            request_workflow_provider_reconnect(
+                terminal_id,
+                now=now,
+                incompatible_with_runtime_generation=active_runtime_generation,
+            )
+        )
+        for terminal_id in candidates
+    )
+
+
+def count_stale_provider_runtime_compatibilities(active_runtime_generation: str) -> int:
+    """Count every resident Codex runtime not proven compatible with this release."""
+    _ensure_workflow_schema()
+    if re.fullmatch(r"[0-9a-f]{64}", active_runtime_generation) is None:
+        raise ValueError("active runtime generation is invalid")
+    with SessionLocal() as db:
+        return int(
+            db.query(func.count(TerminalModel.id))
+            .filter(
+                TerminalModel.provider == "codex",
+                or_(
+                    TerminalModel.runtime_lifecycle.is_(None),
+                    TerminalModel.runtime_lifecycle == "running",
+                ),
+                or_(
+                    TerminalModel.provider_runtime_compatibility_generation.is_(None),
+                    TerminalModel.provider_runtime_compatibility_generation
+                    != active_runtime_generation,
+                ),
+            )
+            .scalar()
+            or 0
+        )
 
 
 def claim_workflow_provider_reconnect(
@@ -11447,6 +18262,9 @@ def claim_workflow_provider_reconnect(
     exhausted_workflow_id: Optional[int] = None
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        if not _workspace_accepts_new_work(db, root_terminal_id):
+            db.rollback()
+            return None
         workflow = _open_workflow(db, root_terminal_id, create=False)
         if workflow is None or workflow.status != WORKFLOW_OPEN or workflow.active_turn_id is None:
             db.rollback()
@@ -12004,6 +18822,8 @@ def complete_workflow_provider_reconnect(
     attempt_token: str,
 ) -> bool:
     """Close the durable reconnect episode after the resumed TUI is ready."""
+    from cli_agent_orchestrator.runtime_generation import ACTIVE_RUNTIME_GENERATION
+
     _ensure_workflow_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
@@ -12034,6 +18854,8 @@ def complete_workflow_provider_reconnect(
             or attempt.output_log_inode is None
             or attempt.output_log_offset is None
             or attempt.output_boundary_at is None
+            or not attempt.runtime_generation
+            or not hmac.compare_digest(str(attempt.runtime_generation), ACTIVE_RUNTIME_GENERATION)
         ):
             db.rollback()
             return False
@@ -12249,6 +19071,11 @@ def complete_workflow_provider_reconnect(
         terminal.runtime_operation_token = None
         terminal.runtime_operation_claimed_at = None
         terminal.runtime_operation_expires_at = None
+        # Readiness was registered by the newly initialized, nonce-bound MCP
+        # sidecar and its output boundary was proven before this transaction.
+        # Publish the resident Codex launch compatibility only at that final
+        # reconnect commit, never merely because a new service was deployed.
+        terminal.provider_runtime_compatibility_generation = attempt.runtime_generation
         attempt.state = PROVIDER_RECONNECT_SUCCEEDED
         attempt.outcome_code = (
             "runtime_ready_authority_gate" if continuation_unsafe else "runtime_ready"
@@ -12981,6 +19808,7 @@ def claim_workflow_turn(
     bypassing the other's claim and acknowledgement boundaries.
     """
     _ensure_workflow_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     now = now or datetime.now()
     with SessionLocal() as db:
         workflow = _open_workflow(db, root_terminal_id, create=False)
@@ -13005,6 +19833,10 @@ def claim_workflow_turn(
                     WorkflowTurnModel.id == workflow.active_turn_id,
                     WorkflowTurnModel.workflow_id == workflow.id,
                     WorkflowTurnModel.state == TURN_QUEUED,
+                    or_(
+                        WorkflowTurnModel.transport_binding.is_(None),
+                        WorkflowTurnModel.payload.is_not(None),
+                    ),
                     WorkflowTurnModel.provider_reconnect_requested_at.is_(None),
                     inbox_predicate,
                     (WorkflowTurnModel.not_before.is_(None))
@@ -13016,6 +19848,10 @@ def claim_workflow_turn(
             query = db.query(WorkflowTurnModel).filter(
                 WorkflowTurnModel.workflow_id == workflow.id,
                 WorkflowTurnModel.state == TURN_QUEUED,
+                or_(
+                    WorkflowTurnModel.transport_binding.is_(None),
+                    WorkflowTurnModel.payload.is_not(None),
+                ),
                 WorkflowTurnModel.provider_reconnect_requested_at.is_(None),
                 inbox_predicate,
                 (WorkflowTurnModel.not_before.is_(None)) | (WorkflowTurnModel.not_before <= now),
@@ -13027,6 +19863,26 @@ def claim_workflow_turn(
             turn = query.order_by(WorkflowTurnModel.id.asc()).first()
         if turn is None:
             return None
+        lifecycle = _managed_attempt_for_turn(db, root_terminal_id, int(turn.id))
+        if lifecycle is not None:
+            assignment = db.get(ChildAssignmentModel, lifecycle.assignment_id)
+            if (
+                assignment is None
+                or assignment.status
+                in {ChildAssignmentStatus.CANCELLED.value, ChildAssignmentStatus.FENCED.value}
+                or lifecycle.state
+                in _MANAGED_ATTEMPT_TERMINAL_STATES | {"fence_claimed", "fence_pending"}
+            ):
+                turn.state = TURN_CANCELLED
+                turn.queue_reason = lifecycle.reason_code or "MANAGED_ATTEMPT_NOT_EXECUTABLE"
+                turn.claim_token = None
+                turn.claim_expires_at = None
+                turn.updated_at = now
+                workflow.status = WORKFLOW_CANCELLED
+                workflow.terminal_reason = turn.queue_reason
+                workflow.updated_at = now
+                db.commit()
+                return None
         # Do not rely on the ORM identity-map assignment as a claim. Two
         # reconciler threads can read the same QUEUED row; the compare-and-set
         # update makes exactly one of them its transport owner.
@@ -13116,6 +19972,8 @@ def workflow_turn_transport_fence(
     claim_token: str,
     claim_generation: int,
     runtime_operation_token: str,
+    runtime_operation_kind: str = "transport",
+    expected_review_revision: Optional[str] = None,
     now: Optional[datetime] = None,
 ):
     """Serialize the final retry-send boundary against receiver admission.
@@ -13144,6 +20002,42 @@ def workflow_turn_transport_fence(
             .first()
             is not None
         )
+        runtime_operation_matches = bool(
+            terminal is not None
+            and terminal.runtime_operation_kind == runtime_operation_kind
+            and terminal.runtime_operation_token == runtime_operation_token
+        )
+        if (
+            runtime_operation_matches
+            and runtime_operation_kind == REVIEW_WORKTREE_PREPARATION_OPERATION
+        ):
+            try:
+                review_authority = _review_input_authority_in_transaction(
+                    db, root_terminal_id, turn_id
+                )
+            except ValueError:
+                review_authority = None
+            runtime_operation_matches = bool(
+                review_authority is not None
+                and isinstance(expected_review_revision, str)
+                and review_authority[0].review_subject_revision == expected_review_revision
+                and terminal is review_authority[3]
+                and terminal.runtime_lifecycle == "running"
+                and terminal.runtime_operation_expires_at is not None
+                and terminal.runtime_operation_expires_at > now
+                and not _terminal_requires_provider_runtime_compatibility_reconnect(terminal)
+                and not _terminal_has_pending_provider_reconnect(db, root_terminal_id)
+                and not _review_worktree_writer_authority_conflicts(
+                    db,
+                    terminal,
+                    root_terminal_id,
+                    cast(str, terminal.launch_worktree),
+                )
+                and _workspace_accepts_new_work(db, root_terminal_id)
+                and _retirement_quiescence_allows_commit(db, root_terminal_id)
+            )
+        elif runtime_operation_kind != "transport":
+            runtime_operation_matches = False
         permitted = bool(
             turn is not None
             and _claim_matches(turn, claim_token, claim_generation, now)
@@ -13151,9 +20045,7 @@ def workflow_turn_transport_fence(
             and workflow.status == WORKFLOW_OPEN
             and workflow.root_terminal_id == root_terminal_id
             and workflow.active_turn_id == turn_id
-            and terminal is not None
-            and terminal.runtime_operation_kind == "transport"
-            and terminal.runtime_operation_token == runtime_operation_token
+            and runtime_operation_matches
             and lease is not None
             and lease.workflow_turn_id == turn_id
             and not receipted
@@ -13264,6 +20156,7 @@ def requeue_workflow_turn(
     stranding it beneath an owner gate.
     """
     _ensure_workflow_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     now = now or datetime.now()
     with SessionLocal() as db:
         turn = db.query(WorkflowTurnModel).filter(WorkflowTurnModel.id == turn_id).first()
@@ -13272,6 +20165,19 @@ def requeue_workflow_turn(
         workflow = db.query(WorkflowModel).filter(WorkflowModel.id == turn.workflow_id).first()
         if workflow is None or workflow.status != WORKFLOW_OPEN:
             return False
+        lifecycle = _managed_attempt_for_turn(
+            db, cast(str, workflow.root_terminal_id), int(turn.id)
+        )
+        if lifecycle is not None and lifecycle.provider_admitted_at is None:
+            resulting = _schedule_managed_attempt_recovery_in_transaction(
+                db,
+                lifecycle,
+                turn,
+                admission_reason_code or "MANAGED_ATTEMPT_PROVIDER_TRANSPORT_FAILED",
+                now,
+            )
+            db.commit()
+            return resulting in {"recovery_scheduled", "fence_pending"}
         values: Dict[Any, Any] = {
             WorkflowTurnModel.claim_token: None,
             WorkflowTurnModel.claim_expires_at: None,
@@ -13567,7 +20473,14 @@ def _restore_unreceipted_inbox_transport_for_replay(
                     or request_effect.workflow_id != request_workflow.id
                     or request_effect.workflow_turn_id != assignment.request_workflow_turn_id
                     or request_effect.effect_kind != "handoff"
-                    or request_effect.state not in {"claimed", "completed", "indeterminate"}
+                    or request_effect.state
+                    not in {
+                        "claimed",
+                        "completed",
+                        "indeterminate",
+                        "wait_timeout",
+                        "wait_retryable",
+                    }
                     or db.query(WorkflowTurnReceiptModel.id)
                     .filter_by(
                         workflow_turn_id=assignment.request_workflow_turn_id,
@@ -13832,12 +20745,12 @@ def reconcile_receipted_callback_after_reconnect_promotion(
 def reconcile_result_callbacks_superseded_by_resume(
     now: Optional[datetime] = None,
 ) -> int:
-    """Replace stale callback transports with one current FIFO generation.
+    """Replace stale Inbox transports with one current FIFO generation.
 
     An interrupted admitted execution can resume under a fresh logical turn
-    after result callbacks were already queued.  The newer resume capability
-    must never move backward to those old turn IDs.  This transaction makes
-    each old envelope historical and materializes a fresh generation for all
+    after Inbox work was already queued.  The newer resume capability must
+    never move backward to those old turn IDs.  This transaction makes each
+    old envelope historical and materializes a fresh generation for all
     still-executable queued work in that workflow.
 
     Rebuilding the complete suffix is essential: a Composer turn which was
@@ -13877,6 +20790,115 @@ def reconcile_result_callbacks_superseded_by_resume(
             )
             if active is None or resume_turn is None or int(active.id) < int(resume_turn.id):
                 continue
+
+            active_receipt = (
+                db.query(WorkflowTurnReceiptModel)
+                .filter_by(
+                    workflow_turn_id=active.id,
+                    receiver_terminal_id=workflow.root_terminal_id,
+                )
+                .one_or_none()
+            )
+            # A reconnect-authored resume can itself be resumed one or more
+            # times after compaction. Prove that ancestry through the exact
+            # receipt transfer chain instead of trusting a generic
+            # ``execution-resume:*`` row to assert reconnect provenance.
+            reconnect_resume_ancestor = None
+            lineage = active
+            lineage_receipt = active_receipt
+            lineage_seen: set[int] = set()
+            while lineage is not None and lineage_receipt is not None:
+                lineage_id = int(lineage.id)
+                if lineage_id in lineage_seen or lineage.workflow_id != workflow.id:
+                    break
+                lineage_seen.add(lineage_id)
+                if (
+                    lineage.kind == "execution_resume"
+                    and lineage.resume_parent_turn_id is not None
+                    and lineage.dedupe_key
+                    == f"provider-reconnect-execution:{int(lineage.resume_parent_turn_id)}"
+                ):
+                    reconnect_resume_ancestor = lineage
+                    break
+                parent_id = lineage.resume_parent_turn_id
+                if (
+                    lineage.kind != "execution_resume"
+                    or parent_id is None
+                    or int(parent_id) >= lineage_id
+                    or lineage.dedupe_key != f"execution-resume:{int(parent_id)}"
+                ):
+                    break
+                parent = db.get(WorkflowTurnModel, int(parent_id))
+                parent_receipt = (
+                    db.query(WorkflowTurnReceiptModel)
+                    .filter_by(
+                        workflow_turn_id=parent_id,
+                        receiver_terminal_id=workflow.root_terminal_id,
+                    )
+                    .one_or_none()
+                )
+                if (
+                    parent is None
+                    or parent.workflow_id != workflow.id
+                    or parent.state != TURN_FINISHED
+                    or parent_receipt is None
+                    or parent_receipt.resumed_by_turn_id != lineage_id
+                    or parent_receipt.resumed_at is None
+                ):
+                    break
+                lineage = parent
+                lineage_receipt = parent_receipt
+
+            settled_reconnect_attempt = None
+            if (
+                reconnect_resume_ancestor is not None
+                and reconnect_resume_ancestor.resume_parent_turn_id is not None
+            ):
+                settled_reconnect_attempt = (
+                    db.query(WorkflowProviderReconnectAttemptModel.id)
+                    .filter(
+                        WorkflowProviderReconnectAttemptModel.workflow_id == workflow.id,
+                        WorkflowProviderReconnectAttemptModel.root_terminal_id
+                        == workflow.root_terminal_id,
+                        WorkflowProviderReconnectAttemptModel.workflow_turn_id
+                        == reconnect_resume_ancestor.resume_parent_turn_id,
+                        WorkflowProviderReconnectAttemptModel.state == PROVIDER_RECONNECT_SUCCEEDED,
+                        WorkflowProviderReconnectAttemptModel.outcome_code == "runtime_ready",
+                        WorkflowProviderReconnectAttemptModel.finished_at.is_not(None),
+                    )
+                    .first()
+                )
+            active_recovery = (
+                db.query(RecoveryTakeoverModel.id)
+                .filter(
+                    or_(
+                        RecoveryTakeoverModel.old_terminal_id == workflow.root_terminal_id,
+                        RecoveryTakeoverModel.new_terminal_id == workflow.root_terminal_id,
+                    ),
+                    RecoveryTakeoverModel.state.notin_(("failed", "completed")),
+                )
+                .first()
+            )
+            settled_reconnect_resume = bool(
+                int(active.id) == int(resume_turn.id)
+                and active.kind == "execution_resume"
+                and active.state == TURN_SENT
+                and active.resume_parent_turn_id is not None
+                and active.provider_processing_observed_at is not None
+                and active.provider_ready_observed_at is None
+                and active.provider_outcome_code is None
+                and active.provider_outcome_observed_at is None
+                and active.provider_reconnect_requested_at is None
+                and active_receipt is not None
+                and active_receipt.resumed_by_turn_id is None
+                and active_receipt.resumed_at is None
+                and settled_reconnect_attempt is not None
+                and db.get(ProviderExecutionLeaseModel, workflow.root_terminal_id) is None
+                and active_recovery is None
+                and not _terminal_runtime_mutation_blocked(
+                    db, cast(str, workflow.root_terminal_id), now
+                )
+            )
 
             resume_ancestry = {int(resume_turn.id)}
             ancestor = resume_turn
@@ -13951,10 +20973,32 @@ def reconcile_result_callbacks_superseded_by_resume(
             )
             stale_indexes = []
             for index, turn in enumerate(queued):
-                if turn.id >= resume_turn.id or turn.kind not in {
-                    "assigned_result",
-                    "handoff_result",
-                }:
+                if turn.id >= resume_turn.id:
+                    continue
+                if (
+                    settled_reconnect_resume
+                    and turn.kind == "inbox_message"
+                    and turn.state == TURN_QUEUED
+                    and turn.inbox_message_id is not None
+                    and db.query(InboxModel.id)
+                    .filter(
+                        InboxModel.id == turn.inbox_message_id,
+                        InboxModel.receiver_id == workflow.root_terminal_id,
+                        InboxModel.kind == "message",
+                        InboxModel.status == MessageStatus.PENDING.value,
+                    )
+                    .one_or_none()
+                    is not None
+                ):
+                    # A reconnect-resume receipt intentionally moved active
+                    # authority past this ordinary FIFO item. Once that exact
+                    # resumed provider execution has settled, the old turn ID
+                    # can never activate again. Rebuild the same pending Inbox
+                    # transport with the complete suffix instead of looping on
+                    # a permanently stale FIFO head.
+                    stale_indexes.append(index)
+                    continue
+                if turn.kind not in {"assigned_result", "handoff_result"}:
                     continue
                 # Handoff batching can attach several durable results to one
                 # transport.  Detect any pending member, not only the anchor,
@@ -14468,7 +21512,7 @@ def _cancel_protected_workflows_in_transaction(
         db.query(WorkflowModel)
         .filter(
             WorkflowModel.root_terminal_id.in_(normalized),
-            WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+            workflow_current_execution_authority_predicate(WorkflowModel),
         )
         .all()
     )
@@ -14514,6 +21558,542 @@ def _cancel_protected_workflows_in_transaction(
     return workflow_ids
 
 
+def _provider_execution_continuation_authority_exists_in_transaction(
+    db: Any, terminal: TerminalModel
+) -> bool:
+    """Return whether durable recovery may still continue this provider runtime."""
+    if terminal.replaced_by_terminal_id is not None or (
+        terminal.provider_resume_identity is not None
+        and terminal.provider_resume_runtime_generation != terminal.runtime_generation
+    ):
+        return True
+    if (
+        db.query(RecoveryTakeoverModel.id)
+        .filter(
+            or_(
+                RecoveryTakeoverModel.old_terminal_id == terminal.id,
+                RecoveryTakeoverModel.new_terminal_id == terminal.id,
+            ),
+            RecoveryTakeoverModel.state.notin_(("failed", "completed")),
+        )
+        .first()
+        is not None
+    ):
+        return True
+    return (
+        db.query(WorkflowProviderReconnectAttemptModel.id)
+        .filter(
+            WorkflowProviderReconnectAttemptModel.root_terminal_id == terminal.id,
+            WorkflowProviderReconnectAttemptModel.state.in_(
+                (
+                    PROVIDER_RECONNECT_RESERVED,
+                    PROVIDER_RECONNECT_LAUNCHED,
+                    PROVIDER_RECONNECT_READY,
+                )
+            ),
+        )
+        .first()
+        is not None
+    )
+
+
+def _reconcile_exited_provider_execution_in_transaction(
+    db: Any,
+    terminal: TerminalModel,
+    *,
+    now: datetime,
+    additional_turn_ids: Sequence[int] = (),
+) -> bool:
+    """Terminalize provider-turn facts after authoritative runtime exit.
+
+    This does not invent a model/tool outcome.  A claimed external effect is
+    preserved as indeterminate, while the exact provider-execution axis is
+    terminalized because the exited runtime can no longer produce output.
+    """
+    if _provider_execution_continuation_authority_exists_in_transaction(db, terminal):
+        return False
+    target_turn_ids = {int(value) for value in additional_turn_ids}
+    rows = (
+        db.query(WorkflowTurnModel, WorkflowModel)
+        .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+        .filter(
+            WorkflowModel.root_terminal_id == terminal.id,
+            workflow_provider_execution_terminalization_predicate(WorkflowModel),
+            WorkflowModel.active_turn_id == WorkflowTurnModel.id,
+            and_(
+                or_(
+                    WorkflowTurnModel.queue_reason.is_(None),
+                    WorkflowTurnModel.queue_reason != PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED,
+                ),
+                or_(
+                    WorkflowTurnModel.provider_reconnect_requested_at.is_not(None),
+                    and_(
+                        WorkflowTurnModel.provider_processing_observed_at.is_not(None),
+                        or_(
+                            WorkflowTurnModel.provider_ready_observed_at.is_(None),
+                            WorkflowTurnModel.provider_ready_observed_at
+                            < WorkflowTurnModel.provider_processing_observed_at,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        .all()
+    )
+    target_turn_ids.update(int(turn.id) for turn, _workflow in rows)
+    if not target_turn_ids:
+        return False
+
+    targets = (
+        db.query(WorkflowTurnModel, WorkflowModel)
+        .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+        .filter(
+            WorkflowTurnModel.id.in_(sorted(target_turn_ids)),
+            WorkflowModel.root_terminal_id == terminal.id,
+            workflow_provider_execution_terminalization_predicate(WorkflowModel),
+        )
+        .all()
+    )
+    if {int(turn.id) for turn, _workflow in targets} != target_turn_ids:
+        return False
+    for turn, _workflow in targets:
+        bootstrap_generation = turn.provider_outcome_cursor_bootstrap_generation
+        if bootstrap_generation is not None and bootstrap_generation != terminal.runtime_generation:
+            return False
+
+    changed = False
+    for turn, workflow in targets:
+        turn_changed = False
+        if turn.state in (TURN_CLAIMED, TURN_SENT):
+            turn.state = TURN_FINISHED if workflow.status == WORKFLOW_TERMINAL else TURN_CANCELLED
+            turn.claim_token = None
+            turn.claim_expires_at = None
+            turn_changed = True
+        if turn.provider_reconnect_requested_at is not None:
+            turn.provider_reconnect_requested_at = None
+            turn.provider_reconnect_claim_token = None
+            turn.provider_reconnect_resume_identity = None
+            turn_changed = True
+        if turn.queue_reason != PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED:
+            turn.queue_reason = PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED
+            turn_changed = True
+        if turn_changed:
+            turn.updated_at = now
+            changed = True
+        claimed_effects = (
+            db.query(WorkflowEffectModel)
+            .filter(
+                WorkflowEffectModel.workflow_id == turn.workflow_id,
+                WorkflowEffectModel.workflow_turn_id == turn.id,
+                WorkflowEffectModel.state == "claimed",
+            )
+            .all()
+        )
+        for effect in claimed_effects:
+            effect.state = "indeterminate"
+            effect.updated_at = now
+            changed = True
+    return changed
+
+
+def list_exited_terminal_provider_execution_candidates(
+    limit: int = 100, *, after_terminal_id: Optional[str] = None
+) -> List[str]:
+    """List exited terminals whose provider/workflow authority has not converged."""
+    if isinstance(limit, bool) or limit < 1:
+        raise ValueError("limit must be a positive integer")
+    if after_terminal_id is not None and not after_terminal_id:
+        raise ValueError("after_terminal_id must be a non-empty string")
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_provider_execution_schema()
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        workflow_roots = {
+            str(row[0])
+            for row in (
+                db.query(WorkflowModel.root_terminal_id)
+                .join(TerminalModel, TerminalModel.id == WorkflowModel.root_terminal_id)
+                .outerjoin(
+                    WorkflowTurnModel,
+                    WorkflowTurnModel.id == WorkflowModel.active_turn_id,
+                )
+                .filter(
+                    TerminalModel.runtime_lifecycle == "exited",
+                    *(
+                        (WorkflowModel.root_terminal_id > after_terminal_id,)
+                        if after_terminal_id is not None
+                        else ()
+                    ),
+                    WorkflowModel.status.in_(
+                        (
+                            WORKFLOW_OPEN,
+                            WORKFLOW_OWNER_GATE,
+                            WORKFLOW_TERMINAL,
+                            WORKFLOW_CANCELLED,
+                        )
+                    ),
+                    or_(
+                        workflow_current_execution_authority_predicate(WorkflowModel),
+                        and_(
+                            or_(
+                                WorkflowTurnModel.queue_reason.is_(None),
+                                WorkflowTurnModel.queue_reason
+                                != PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED,
+                            ),
+                            or_(
+                                WorkflowTurnModel.provider_reconnect_requested_at.is_not(None),
+                                and_(
+                                    WorkflowTurnModel.provider_processing_observed_at.is_not(None),
+                                    or_(
+                                        WorkflowTurnModel.provider_ready_observed_at.is_(None),
+                                        WorkflowTurnModel.provider_ready_observed_at
+                                        < WorkflowTurnModel.provider_processing_observed_at,
+                                    ),
+                                ),
+                            ),
+                        ),
+                    ),
+                )
+                .distinct()
+                .order_by(WorkflowModel.root_terminal_id.asc())
+                .limit(limit)
+                .all()
+            )
+        }
+        inbox_roots = {
+            str(row[0])
+            for row in (
+                db.query(InboxModel.receiver_id)
+                .join(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
+                .filter(
+                    TerminalModel.runtime_lifecycle == "exited",
+                    *(
+                        (InboxModel.receiver_id > after_terminal_id,)
+                        if after_terminal_id is not None
+                        else ()
+                    ),
+                    InboxModel.status == MessageStatus.PENDING.value,
+                )
+                .distinct()
+                .order_by(InboxModel.receiver_id.asc())
+                .limit(limit)
+                .all()
+            )
+        }
+        lease_roots = {
+            str(row[0])
+            for row in (
+                db.query(ProviderExecutionLeaseModel.terminal_id)
+                .join(TerminalModel, TerminalModel.id == ProviderExecutionLeaseModel.terminal_id)
+                .filter(
+                    TerminalModel.runtime_lifecycle == "exited",
+                    *(
+                        (ProviderExecutionLeaseModel.terminal_id > after_terminal_id,)
+                        if after_terminal_id is not None
+                        else ()
+                    ),
+                )
+                .order_by(ProviderExecutionLeaseModel.terminal_id.asc())
+                .limit(limit)
+                .all()
+            )
+        }
+        return sorted(workflow_roots | inbox_roots | lease_roots)[:limit]
+
+
+def _exited_provider_execution_reconciliation_targets_in_transaction(
+    db: Any, terminal: TerminalModel
+) -> Optional[tuple[Optional[ProviderExecutionLeaseModel], List[WorkflowTurnModel]]]:
+    """Validate every durable continuation axis and return exact target rows."""
+    reconnect_requested = (
+        db.query(WorkflowTurnModel.id)
+        .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+        .filter(
+            WorkflowModel.root_terminal_id == terminal.id,
+            WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+            WorkflowModel.active_turn_id == WorkflowTurnModel.id,
+            WorkflowTurnModel.provider_reconnect_requested_at.is_not(None),
+        )
+        .first()
+    )
+    if (
+        _provider_execution_continuation_authority_exists_in_transaction(db, terminal)
+        or reconnect_requested
+    ):
+        return None
+
+    lease = db.get(ProviderExecutionLeaseModel, terminal.id)
+    lease_turn_ids: tuple[int, ...] = ()
+    if lease is not None:
+        lease_turn = db.get(WorkflowTurnModel, lease.workflow_turn_id)
+        lease_workflow = (
+            db.get(WorkflowModel, lease_turn.workflow_id) if lease_turn is not None else None
+        )
+        if (
+            lease_turn is None
+            or lease_workflow is None
+            or lease_workflow.root_terminal_id != terminal.id
+            or lease_workflow.status
+            not in (
+                WORKFLOW_OPEN,
+                WORKFLOW_OWNER_GATE,
+                WORKFLOW_TERMINAL,
+                WORKFLOW_CANCELLED,
+            )
+        ):
+            return None
+        lease_turn_ids = (int(lease.workflow_turn_id),)
+
+    provider_turns = (
+        db.query(WorkflowTurnModel)
+        .join(WorkflowModel, WorkflowModel.id == WorkflowTurnModel.workflow_id)
+        .filter(
+            WorkflowModel.root_terminal_id == terminal.id,
+            WorkflowModel.status.in_(
+                (
+                    WORKFLOW_OPEN,
+                    WORKFLOW_OWNER_GATE,
+                    WORKFLOW_TERMINAL,
+                    WORKFLOW_CANCELLED,
+                )
+            ),
+            or_(
+                WorkflowTurnModel.id.in_(lease_turn_ids),
+                and_(
+                    WorkflowModel.active_turn_id == WorkflowTurnModel.id,
+                    and_(
+                        or_(
+                            WorkflowTurnModel.queue_reason.is_(None),
+                            WorkflowTurnModel.queue_reason
+                            != PROVIDER_EXECUTION_RUNTIME_EXIT_RECONCILED,
+                        ),
+                        or_(
+                            WorkflowTurnModel.provider_reconnect_requested_at.is_not(None),
+                            and_(
+                                WorkflowTurnModel.provider_processing_observed_at.is_not(None),
+                                or_(
+                                    WorkflowTurnModel.provider_ready_observed_at.is_(None),
+                                    WorkflowTurnModel.provider_ready_observed_at
+                                    < WorkflowTurnModel.provider_processing_observed_at,
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        .all()
+    )
+    if any(
+        turn.provider_outcome_cursor_bootstrap_generation is not None
+        and turn.provider_outcome_cursor_bootstrap_generation != terminal.runtime_generation
+        for turn in provider_turns
+    ):
+        return None
+
+    had_candidate = bool(
+        lease is not None
+        or db.query(WorkflowModel.id)
+        .filter(
+            WorkflowModel.root_terminal_id == terminal.id,
+            workflow_current_execution_authority_predicate(WorkflowModel),
+        )
+        .first()
+        is not None
+        or db.query(InboxModel.id)
+        .filter(
+            InboxModel.receiver_id == terminal.id,
+            InboxModel.status == MessageStatus.PENDING.value,
+        )
+        .first()
+        is not None
+        or provider_turns
+    )
+    return (lease, provider_turns) if had_candidate else None
+
+
+def claim_exited_terminal_provider_execution_reconciliation(
+    terminal_id: str,
+    *,
+    expected_runtime_authority: Mapping[str, Any],
+    now: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """Fence continuation claimants before exact physical runtime retirement.
+
+    The short durable operation claim makes pane retirement mutually exclusive
+    with writer, reconnect, recovery, and transport authority. A process crash
+    is recoverable: only this reconciler may replace its own expired claim.
+    """
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_provider_execution_schema()
+    _ensure_child_assignment_schema()
+    _ensure_workflow_schema()
+    now = now or datetime.now()
+    claim_token = uuid.uuid4().hex
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.get(TerminalModel, terminal_id)
+        if terminal is None or any(
+            field not in expected_runtime_authority
+            or getattr(terminal, field) != expected_runtime_authority[field]
+            for field in TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
+        ):
+            db.rollback()
+            return None
+        operation_empty = all(
+            value is None
+            for value in (
+                terminal.runtime_operation_kind,
+                terminal.runtime_operation_token,
+                terminal.runtime_operation_claimed_at,
+                terminal.runtime_operation_expires_at,
+            )
+        )
+        expired_reconciliation = bool(
+            terminal.runtime_operation_kind == PROVIDER_EXECUTION_RECONCILIATION_OPERATION
+            and terminal.runtime_operation_token
+            and terminal.runtime_operation_claimed_at
+            and terminal.runtime_operation_expires_at
+            and terminal.runtime_operation_expires_at <= now
+        )
+        if (
+            terminal.runtime_lifecycle != "exited"
+            or terminal.runtime_exited_at is None
+            or not (operation_empty or expired_reconciliation)
+            or db.query(WorktreeWriterLeaseModel.canonical_worktree)
+            .filter(WorktreeWriterLeaseModel.terminal_id == terminal_id)
+            .first()
+            is not None
+            or _exited_provider_execution_reconciliation_targets_in_transaction(db, terminal)
+            is None
+        ):
+            db.rollback()
+            return None
+        terminal.runtime_operation_kind = PROVIDER_EXECUTION_RECONCILIATION_OPERATION
+        terminal.runtime_operation_token = claim_token
+        terminal.runtime_operation_claimed_at = now
+        terminal.runtime_operation_expires_at = now + timedelta(
+            seconds=PROVIDER_EXECUTION_RECONCILIATION_LEASE_SECONDS
+        )
+        db.commit()
+        return {
+            "claim_token": claim_token,
+            "runtime_authority": {
+                field: getattr(terminal, field) for field in TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
+            },
+        }
+
+
+def release_exited_terminal_provider_execution_reconciliation_claim(
+    terminal_id: str, claim_token: str
+) -> bool:
+    """Release only the exact provider-execution reconciliation claim."""
+    _ensure_terminal_worktree_authority_schema()
+    with SessionLocal() as db:
+        released = (
+            db.query(TerminalModel)
+            .filter(
+                TerminalModel.id == terminal_id,
+                TerminalModel.runtime_operation_kind == PROVIDER_EXECUTION_RECONCILIATION_OPERATION,
+                TerminalModel.runtime_operation_token == claim_token,
+            )
+            .update(
+                {
+                    TerminalModel.runtime_operation_kind: None,
+                    TerminalModel.runtime_operation_token: None,
+                    TerminalModel.runtime_operation_claimed_at: None,
+                    TerminalModel.runtime_operation_expires_at: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return released == 1
+
+
+def reconcile_exited_terminal_provider_execution_authority(
+    terminal_id: str,
+    *,
+    expected_runtime_authority: Mapping[str, Any],
+    claim_token: str,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Converge one positively-dead runtime without crossing recovery authority.
+
+    The external caller must first own the durable reconciliation claim, then
+    prove exact tmux/process death. Every continuation axis and the same claim
+    are rechecked under the SQLite writer fence. Unknown effect outcomes remain
+    indeterminate; only provider execution and transport authority are closed.
+    """
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_provider_execution_schema()
+    _ensure_child_assignment_schema()
+    _ensure_workflow_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        terminal = db.get(TerminalModel, terminal_id)
+        if terminal is None or any(
+            field not in expected_runtime_authority
+            or getattr(terminal, field) != expected_runtime_authority[field]
+            for field in TERMINAL_RUNTIME_DEATH_AUTHORITY_FIELDS
+        ):
+            db.rollback()
+            return False
+        if (
+            terminal.runtime_lifecycle != "exited"
+            or terminal.runtime_exited_at is None
+            or terminal.runtime_operation_kind != PROVIDER_EXECUTION_RECONCILIATION_OPERATION
+            or terminal.runtime_operation_token != claim_token
+            or db.query(WorktreeWriterLeaseModel.canonical_worktree)
+            .filter(WorktreeWriterLeaseModel.terminal_id == terminal_id)
+            .first()
+            is not None
+        ):
+            db.rollback()
+            return False
+        targets = _exited_provider_execution_reconciliation_targets_in_transaction(db, terminal)
+        if targets is None:
+            db.rollback()
+            return False
+        lease, provider_turns = targets
+
+        _cancel_protected_workflows_in_transaction(
+            db,
+            [terminal_id],
+            reason="root terminal exited or deleted",
+        )
+        db.flush()
+        _reconcile_exited_provider_execution_in_transaction(
+            db,
+            terminal,
+            now=now,
+            additional_turn_ids=[int(turn.id) for turn in provider_turns],
+        )
+        if lease is not None:
+            # The cancellation helper normally deleted this exact row. Keep
+            # an explicit exact fallback for historical terminal workflows.
+            db.query(ProviderExecutionLeaseModel).filter(
+                ProviderExecutionLeaseModel.terminal_id == terminal_id,
+                ProviderExecutionLeaseModel.workflow_turn_id == lease.workflow_turn_id,
+            ).delete(synchronize_session=False)
+        terminal.runtime_operation_kind = None
+        terminal.runtime_operation_token = None
+        terminal.runtime_operation_claimed_at = None
+        terminal.runtime_operation_expires_at = None
+        db.commit()
+        return True
+
+
+def reconcile_exited_terminal_workflow_authorities() -> int:
+    """Compatibility entry point using canonical physical-runtime reconciliation."""
+    from cli_agent_orchestrator.services.terminal_service import (
+        reconcile_exited_terminal_provider_execution_authorities,
+    )
+
+    return reconcile_exited_terminal_provider_execution_authorities()
+
+
 def cancel_workflows_for_terminal_with_ids(terminal_id: str) -> List[int]:
     """Cancel resumable workflows and return the exact transition-winning IDs."""
     _ensure_workflow_schema()
@@ -14535,48 +22115,6 @@ def cancel_workflows_for_terminal(terminal_id: str) -> int:
     return len(cancel_workflows_for_terminal_with_ids(terminal_id))
 
 
-def reconcile_exited_terminal_workflow_authorities() -> int:
-    """Cancel historical workflow/Inbox authority rooted at exited terminals.
-
-    Runtime exit now performs this transition atomically. This reconciliation
-    is the bounded rolling-upgrade repair for rows created by an older Inbox
-    wake after its separate exit transaction had already committed.
-    """
-    _ensure_terminal_worktree_authority_schema()
-    _ensure_child_assignment_schema()
-    _ensure_workflow_schema()
-    with SessionLocal() as db:
-        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
-        workflow_roots = {
-            str(row[0])
-            for row in db.query(WorkflowModel.root_terminal_id)
-            .join(TerminalModel, TerminalModel.id == WorkflowModel.root_terminal_id)
-            .filter(
-                TerminalModel.runtime_lifecycle == "exited",
-                WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
-            )
-            .all()
-        }
-        inbox_roots = {
-            str(row[0])
-            for row in db.query(InboxModel.receiver_id)
-            .join(TerminalModel, TerminalModel.id == InboxModel.receiver_id)
-            .filter(
-                TerminalModel.runtime_lifecycle == "exited",
-                InboxModel.status == MessageStatus.PENDING.value,
-            )
-            .all()
-        }
-        roots = sorted(workflow_roots | inbox_roots)
-        _cancel_protected_workflows_in_transaction(
-            db,
-            roots,
-            reason="root terminal exited or deleted",
-        )
-        db.commit()
-        return len(roots)
-
-
 def _orphaned_protected_workflow_authority_snapshot(
     db: Any,
     root_terminal_id: str,
@@ -14588,7 +22126,7 @@ def _orphaned_protected_workflow_authority_snapshot(
         db.query(WorkflowModel)
         .filter(
             WorkflowModel.root_terminal_id == root_terminal_id,
-            WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+            workflow_current_execution_authority_predicate(WorkflowModel),
         )
         .order_by(WorkflowModel.id.asc())
         .all()
@@ -14684,7 +22222,7 @@ def list_orphaned_protected_workflow_authorities() -> List[Dict[str, Any]]:
             .outerjoin(TerminalModel, TerminalModel.id == WorkflowModel.root_terminal_id)
             .filter(
                 TerminalModel.id.is_(None),
-                WorkflowModel.status.in_((WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)),
+                workflow_current_execution_authority_predicate(WorkflowModel),
             )
             .order_by(WorkflowModel.root_terminal_id.asc(), WorkflowModel.id.asc())
             .all()
@@ -14738,7 +22276,16 @@ def reconcile_orphaned_protected_workflow_authority(
                     "already_reconciled": False,
                     "reason": "identity_changed",
                 }
-            if any(row.status in (WORKFLOW_OPEN, WORKFLOW_OWNER_GATE) for row in rows):
+            if (
+                db.query(WorkflowModel.id)
+                .filter(
+                    WorkflowModel.id.in_(expected),
+                    WorkflowModel.root_terminal_id == root_terminal_id,
+                    workflow_current_execution_authority_predicate(WorkflowModel),
+                )
+                .first()
+                is not None
+            ):
                 db.rollback()
                 return {
                     "reconciled": 0,
@@ -14811,7 +22358,14 @@ def reconcile_orphaned_protected_workflow_authority(
             db.rollback()
             return {"reconciled": 0, "already_reconciled": False, "reason": "identity_changed"}
         protected = sorted(
-            int(row.id) for row in rows if row.status in (WORKFLOW_OPEN, WORKFLOW_OWNER_GATE)
+            int(row[0])
+            for row in db.query(WorkflowModel.id)
+            .filter(
+                WorkflowModel.id.in_(expected),
+                WorkflowModel.root_terminal_id == root_terminal_id,
+                workflow_current_execution_authority_predicate(WorkflowModel),
+            )
+            .all()
         )
         if not protected:
             db.rollback()
@@ -16112,6 +23666,8 @@ def submit_handoff_result_v1(
     auth_token: str, logical_turn_id: int, document: HandoffResultDocumentV1
 ) -> Dict[str, Any]:
     """Atomically finalize one authenticated strict V1 managed handoff."""
+    _ensure_terminal_deletion_receipt_schema()
+    _ensure_session_deletion_receipt_schema()
     token_digest = hashlib.sha256(auth_token.encode("utf-8", "strict")).hexdigest()
     document_bytes = canonical_handoff_result_v1_bytes(document)
     problem = managed_final_problem(document.body_markdown)
@@ -16166,10 +23722,29 @@ def _terminal_for_handoff_submission(db: Any, token_digest: str) -> TerminalMode
         .limit(2)
         .all()
     )
-    if len(terminals) != 1 or not hmac.compare_digest(
-        cast(str, terminals[0].auth_token_sha256), token_digest
-    ):
+    if len(terminals) != 1:
+        deleted = (
+            db.query(TerminalDeletionReceiptModel.auth_token_sha256)
+            .join(
+                SessionDeletionReceiptModel,
+                SessionDeletionReceiptModel.session_id == TerminalDeletionReceiptModel.session_id,
+            )
+            .filter(
+                TerminalDeletionReceiptModel.auth_token_sha256 == token_digest,
+                SessionDeletionReceiptModel.receipt_version >= 2,
+            )
+            .limit(2)
+            .all()
+        )
+        if len(deleted) == 1 and hmac.compare_digest(str(deleted[0][0]), token_digest):
+            raise HandoffResultSubmissionError(409, "session_deleted")
+        if _hard_deleted_terminal_digest_exists_in_transaction(db, token_digest):
+            raise HandoffResultSubmissionError(409, "session_deleted")
         raise HandoffResultSubmissionError(401, "invalid_terminal_auth")
+    if not hmac.compare_digest(cast(str, terminals[0].auth_token_sha256), token_digest):
+        raise HandoffResultSubmissionError(401, "invalid_terminal_auth")
+    if not _workspace_accepts_new_work(db, str(terminals[0].id)):
+        raise HandoffResultSubmissionError(409, "session_deleted")
     return cast(TerminalModel, terminals[0])
 
 
@@ -16250,6 +23825,7 @@ def _submit_handoff_result_v1_once(
     _ensure_delegation_result_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         terminal = _terminal_for_handoff_submission(db, token_digest)
         child_terminal_id = cast(str, terminal.id)
         existing_assignment = _latest_child_assignment(db, child_terminal_id)
@@ -16618,7 +24194,6 @@ def _terminalize_handoff_recovery_exhausted(
     terminal_id: str,
 ) -> None:
     """Terminalize one exhausted managed handoff without changing its identity."""
-    assignment.status = ChildAssignmentStatus.HANDOFF_RESULT_FAILED.value
     assignment.updated_at = datetime.now()
     if result.status != DelegationResultStatus.AWAITING.value:
         return
@@ -16642,6 +24217,18 @@ def _terminalize_handoff_recovery_exhausted(
         terminal_id,
         detail={"reason_code": "handoff_recovery_exhausted"},
     )
+    _purge_staged_handoff_submission(db, result.id)
+    notice = _queue_delegation_result_notice(
+        db,
+        assignment,
+        result,
+        blocker,
+        delegation_kind="handoff",
+    )
+    if notice is None:
+        # A terminal parent cannot consume a callback.  Retain the exact
+        # lifecycle result as history without creating resurrection authority.
+        assignment.status = ChildAssignmentStatus.HANDOFF_RESULT_FAILED.value
 
 
 def managed_final_problem(body: object) -> Optional[str]:
@@ -16667,6 +24254,90 @@ def managed_final_problem(body: object) -> Optional[str]:
     if normalized.endswith(("...", "…")):
         return "INTERRUPTED_FINAL"
     return None
+
+
+def _queue_delegation_result_notice(
+    db: Any,
+    assignment: ChildAssignmentModel,
+    result: DelegationResultModel,
+    body: str,
+    *,
+    delegation_kind: str,
+) -> Optional[InboxModel]:
+    """Queue one exact terminal result for its still-open parent.
+
+    Both authoritative child submissions and lifecycle-generated INCOMPLETE
+    outcomes use the same parent callback boundary.  The result status and
+    authorship remain independent: this helper only makes an already durable
+    outcome observable and acknowledgeable by its owning parent.
+    """
+    if assignment.result_message_id is not None:
+        return db.query(InboxModel).filter_by(id=assignment.result_message_id).first()
+    parent_workflow = _open_workflow(db, assignment.parent_terminal_id, create=False)
+    if parent_workflow is None or parent_workflow.status != WORKFLOW_OPEN:
+        return None
+
+    now = datetime.now()
+    inbox = InboxModel(
+        sender_id=assignment.child_terminal_id,
+        receiver_id=assignment.parent_terminal_id,
+        message=body,
+        status=MessageStatus.PENDING.value,
+        result_id=result.id,
+        kind="delegation_result_notice",
+        superseded_at=now,
+    )
+    db.add(inbox)
+    db.flush()
+    assignment.result_message_id = inbox.id
+    assignment.status = (
+        ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value
+        if delegation_kind == "handoff"
+        else ChildAssignmentStatus.RESULT_QUEUED.value
+    )
+    assignment.updated_at = now
+
+    # Results that become ready during one parent turn share its one safe
+    # boundary callback.  A result that arrives while another callback is
+    # unadmitted remains turn-less until the ordinary materializer can bind
+    # it without rolling the workflow authority backwards.
+    turn = None
+    boundary_key: Optional[str] = None
+    defer_handoff_turn = delegation_kind == "handoff" and (
+        _workflow_has_unadmitted_active_continuation(db, parent_workflow)
+    )
+    if delegation_kind == "handoff" and not defer_handoff_turn:
+        boundary_key = f"handoff-result-boundary:{parent_workflow.active_turn_id}"
+        turn = (
+            db.query(WorkflowTurnModel)
+            .filter(
+                WorkflowTurnModel.workflow_id == parent_workflow.id,
+                WorkflowTurnModel.kind == "handoff_result",
+                WorkflowTurnModel.dedupe_key == boundary_key,
+                WorkflowTurnModel.state == TURN_QUEUED,
+            )
+            .order_by(WorkflowTurnModel.id.asc())
+            .first()
+        )
+    if turn is None and not defer_handoff_turn:
+        turn = WorkflowTurnModel(
+            workflow_id=parent_workflow.id,
+            kind="handoff_result" if delegation_kind == "handoff" else "assigned_result",
+            dedupe_key=(
+                cast(str, boundary_key)
+                if delegation_kind == "handoff"
+                else f"assigned-result:{assignment.attempt_id}"
+            ),
+            payload=body,
+            inbox_message_id=inbox.id,
+            state=TURN_QUEUED,
+        )
+        db.add(turn)
+        db.flush()
+    result.workflow_turn_id = turn.id if turn is not None else None
+    parent_workflow.no_progress_count = 0
+    parent_workflow.updated_at = now
+    return inbox
 
 
 def _finalize_managed_delegation_result(
@@ -16700,6 +24371,19 @@ def _finalize_managed_delegation_result(
             _terminalize_child_after_authoritative_result(
                 db, assignment.child_terminal_id, "repaired authoritative delegated result"
             )
+            lifecycle = db.get(ManagedAttemptLifecycleModel, assignment.id)
+            if lifecycle is not None and lifecycle.state not in {"fenced", "completed"}:
+                now = datetime.now()
+                lifecycle.state = "completed"
+                lifecycle.completed_at = now
+                lifecycle.reason_code = None
+                lifecycle.updated_at = now
+                _managed_attempt_event(
+                    db,
+                    lifecycle,
+                    f"managed-attempt-completed:{assignment.id}",
+                    "completed",
+                )
         return (
             _inbox_model_to_message(inbox) if inbox is not None else None,
             True,
@@ -16723,76 +24407,37 @@ def _finalize_managed_delegation_result(
     ):
         return None, False, "CHILD_WORKFLOW_NOT_ELIGIBLE"
 
+    lifecycle = db.get(ManagedAttemptLifecycleModel, assignment.id)
+    if lifecycle is not None and lifecycle.state not in {"fenced", "completed"}:
+        now = datetime.now()
+        lifecycle.state = "completed"
+        lifecycle.completed_at = now
+        lifecycle.reason_code = None
+        lifecycle.recovery_next_retry_at = None
+        lifecycle.recovery_deadline_at = None
+        lifecycle.updated_at = now
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"managed-attempt-completed:{assignment.id}",
+            "completed",
+        )
+
     parent_workflow = _open_workflow(db, assignment.parent_terminal_id, create=False)
     if parent_workflow is None or parent_workflow.status != WORKFLOW_OPEN:
         # Retain the accepted child artifact and its terminal state, but never
         # resurrect a parent that an owner/cancellation transition fenced.
         return None, False, "PARENT_NOT_ELIGIBLE"
 
-    inbox = InboxModel(
-        sender_id=assignment.child_terminal_id,
-        receiver_id=assignment.parent_terminal_id,
-        message=result_body,
-        status=MessageStatus.PENDING.value,
-        result_id=result.id,
-        kind="delegation_result_notice",
-        superseded_at=datetime.now(),
+    inbox = _queue_delegation_result_notice(
+        db,
+        assignment,
+        result,
+        result_body,
+        delegation_kind=kind,
     )
-    db.add(inbox)
-    db.flush()
-    assignment.result_message_id = inbox.id
-    assignment.status = (
-        ChildAssignmentStatus.HANDOFF_RESULT_QUEUED.value
-        if kind == "handoff"
-        else ChildAssignmentStatus.RESULT_QUEUED.value
-    )
-    assignment.updated_at = datetime.now()
-    # Results that become ready during one parent turn share its one safe
-    # boundary callback. A result that arrives while another callback is
-    # unadmitted must not mint a successor yet: retain its immutable Inbox
-    # notice unbound until the active receiver admission clears that fence.
-    turn = None
-    boundary_key: Optional[str] = None
-    defer_handoff_turn = kind == "handoff" and _workflow_has_unadmitted_active_continuation(
-        db, parent_workflow
-    )
-    if kind == "handoff" and not defer_handoff_turn:
-        boundary_key = f"handoff-result-boundary:{parent_workflow.active_turn_id}"
-        turn = (
-            db.query(WorkflowTurnModel)
-            .filter(
-                WorkflowTurnModel.workflow_id == parent_workflow.id,
-                WorkflowTurnModel.kind == "handoff_result",
-                WorkflowTurnModel.dedupe_key == boundary_key,
-                WorkflowTurnModel.state == TURN_QUEUED,
-            )
-            .order_by(WorkflowTurnModel.id.asc())
-            .first()
-        )
-    if turn is None and not defer_handoff_turn:
-        turn = WorkflowTurnModel(
-            workflow_id=parent_workflow.id,
-            kind="handoff_result" if kind == "handoff" else "assigned_result",
-            dedupe_key=(
-                cast(str, boundary_key)
-                if kind == "handoff"
-                else f"assigned-result:{assignment.attempt_id}"
-            ),
-            payload=result_body,
-            inbox_message_id=inbox.id,
-            state=TURN_QUEUED,
-        )
-        db.add(turn)
-        db.flush()
-    if turn is not None:
-        result.workflow_turn_id = turn.id
-    elif defer_handoff_turn:
-        # _finalize_result records the parent active turn for provenance by
-        # default. A deferred callback must not retain that value as delivery
-        # membership: it is intentionally turn-less until materialization.
-        result.workflow_turn_id = None
-    parent_workflow.no_progress_count = 0
-    parent_workflow.updated_at = datetime.now()
+    if inbox is None:
+        return None, False, "PARENT_NOT_ELIGIBLE"
     return _inbox_model_to_message(inbox), False, "ACCEPTED"
 
 
@@ -16838,6 +24483,7 @@ def terminal_requires_result_snapshot(terminal_id: str) -> bool:
             db.query(ChildAssignmentModel)
             .filter(
                 ChildAssignmentModel.child_terminal_id == terminal_id,
+                ChildAssignmentModel.review_superseded_at.is_(None),
                 ChildAssignmentModel.status.in_(
                     (
                         ChildAssignmentStatus.AWAITING_RESULT.value,
@@ -16867,6 +24513,7 @@ def persist_terminal_result_snapshot(terminal_id: str, partial: str) -> bool:
             db.query(ChildAssignmentModel)
             .filter(
                 ChildAssignmentModel.child_terminal_id == terminal_id,
+                ChildAssignmentModel.review_superseded_at.is_(None),
                 ChildAssignmentModel.status.in_(
                     (
                         ChildAssignmentStatus.AWAITING_RESULT.value,
@@ -17248,10 +24895,12 @@ def _register_child_attempt(
     request_message: Optional[str] = None,
     require_existing_reviewer_attempt: bool = False,
     requested_review_revision: Optional[str] = None,
+    replaces_assignment_id: Optional[int] = None,
 ) -> bool:
     """Persist one immutable callback attempt and its exact review subject."""
     _ensure_child_assignment_schema()
     _ensure_delegation_result_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
@@ -17285,6 +24934,25 @@ def _register_child_attempt(
             workflow_turn_id,
             workflow_effect_id,
         )
+        replaced_assignment = None
+        replaced_lifecycle = None
+        if replaces_assignment_id is not None:
+            if delegation_kind != "handoff" or effect is None:
+                db.rollback()
+                return False
+            replaced_assignment = db.get(ChildAssignmentModel, replaces_assignment_id)
+            replaced_lifecycle = db.get(ManagedAttemptLifecycleModel, replaces_assignment_id)
+            if (
+                replaced_assignment is None
+                or replaced_lifecycle is None
+                or replaced_assignment.parent_terminal_id != parent_terminal_id
+                or replaced_assignment.status != ChildAssignmentStatus.FENCED.value
+                or replaced_lifecycle.state != "fenced"
+                or replaced_lifecycle.replacement_assignment_id is not None
+                or replaced_lifecycle.replacement_effect_id is not None
+            ):
+                db.rollback()
+                return False
         child = db.query(TerminalModel).filter_by(id=child_terminal_id).first()
         prior = _latest_child_assignment(db, child_terminal_id)
         reused_review_child = False
@@ -17420,6 +25088,42 @@ def _register_child_attempt(
                         notice.status = MessageStatus.SUPERSEDED.value
         db.add(assignment)
         db.flush()
+        lifecycle = ManagedAttemptLifecycleModel(
+            assignment_id=assignment.id,
+            attempt_id=assignment.attempt_id,
+            parent_terminal_id=parent_terminal_id,
+            child_terminal_id=child_terminal_id,
+            request_workflow_effect_id=assignment.request_workflow_effect_id,
+            state="assignment_created",
+            expected_runtime_generation=(child.runtime_generation if child else None),
+            expected_writer_authority_generation=(
+                child.writer_authority_generation if child else None
+            ),
+            created_at=assignment.created_at or datetime.now(),
+            updated_at=datetime.now(),
+        )
+        db.add(lifecycle)
+        db.flush()
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"managed-attempt-created:{assignment.id}",
+            "assignment_created",
+        )
+        if replaced_lifecycle is not None and effect is not None:
+            replaced_lifecycle.replacement_assignment_id = assignment.id
+            replaced_lifecycle.replacement_effect_id = effect.id
+            replaced_lifecycle.updated_at = datetime.now()
+            _managed_attempt_event(
+                db,
+                replaced_lifecycle,
+                f"managed-attempt-replaced:{replaced_lifecycle.assignment_id}",
+                "replacement_created",
+                detail={
+                    "replacement_assignment_id": assignment.id,
+                    "replacement_effect_id": effect.id,
+                },
+            )
         _create_result_for_assignment(db, assignment, delegation_kind, workflow)
         if not _retirement_quiescence_allows_commit(db, parent_terminal_id):
             db.rollback()
@@ -17496,6 +25200,7 @@ def register_handoff_child(
     workflow_turn_id: Optional[int] = None,
     workflow_effect_id: Optional[int] = None,
     request_message: Optional[str] = None,
+    replaces_assignment_id: Optional[int] = None,
 ) -> bool:
     """Persist a blocking handoff before its task can produce a result.
 
@@ -17509,6 +25214,7 @@ def register_handoff_child(
         workflow_turn_id=workflow_turn_id,
         workflow_effect_id=workflow_effect_id,
         request_message=request_message,
+        replaces_assignment_id=replaces_assignment_id,
     )
 
 
@@ -17521,6 +25227,7 @@ def bind_child_assignment_input_turn(child_terminal_id: str, transport_binding: 
     later review request.
     """
     _ensure_child_assignment_schema()
+    _ensure_managed_attempt_lifecycle_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
@@ -17549,6 +25256,23 @@ def bind_child_assignment_input_turn(child_terminal_id: str, transport_binding: 
                 and int(assignment.child_workflow_id) == int(turn.workflow_id)
                 and int(assignment.child_workflow_turn_id) == int(turn.id)
             )
+            lifecycle = db.get(ManagedAttemptLifecycleModel, assignment.id)
+            if matches and lifecycle is not None and lifecycle.child_workflow_turn_id is None:
+                now = datetime.now()
+                lifecycle.child_workflow_id = turn.workflow_id
+                lifecycle.child_workflow_turn_id = turn.id
+                lifecycle.state = "prompt_delivery_scheduled"
+                lifecycle.prompt_delivery_scheduled_at = now
+                lifecycle.recovery_deadline_at = now + timedelta(seconds=30)
+                lifecycle.updated_at = now
+                _managed_attempt_event(
+                    db,
+                    lifecycle,
+                    f"prompt-delivery-scheduled:{assignment.id}:{turn.id}",
+                    "prompt_delivery_scheduled",
+                )
+                db.commit()
+                return True
             db.rollback()
             return matches
         changed = (
@@ -17570,8 +25294,1089 @@ def bind_child_assignment_input_turn(child_terminal_id: str, transport_binding: 
         if changed != 1:
             db.rollback()
             return False
+        lifecycle = db.get(ManagedAttemptLifecycleModel, assignment.id)
+        if lifecycle is None:
+            db.rollback()
+            return False
+        now = datetime.now()
+        lifecycle.child_workflow_id = turn.workflow_id
+        lifecycle.child_workflow_turn_id = turn.id
+        lifecycle.state = "prompt_delivery_scheduled"
+        lifecycle.prompt_delivery_scheduled_at = now
+        lifecycle.recovery_deadline_at = now + timedelta(seconds=30)
+        lifecycle.updated_at = now
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"prompt-delivery-scheduled:{assignment.id}:{turn.id}",
+            "prompt_delivery_scheduled",
+        )
         db.commit()
         return True
+
+
+_MANAGED_ATTEMPT_RECOVERY_DELAY_SECONDS = 2
+_MANAGED_ATTEMPT_ADMISSION_DEADLINE_SECONDS = 30
+_MANAGED_ATTEMPT_TERMINAL_STATES = {"fenced", "failed", "completed"}
+
+
+def _managed_attempt_for_turn(
+    db: Any, child_terminal_id: str, workflow_turn_id: int
+) -> Optional[ManagedAttemptLifecycleModel]:
+    return (
+        db.query(ManagedAttemptLifecycleModel)
+        .filter(
+            ManagedAttemptLifecycleModel.child_terminal_id == child_terminal_id,
+            ManagedAttemptLifecycleModel.child_workflow_turn_id == workflow_turn_id,
+        )
+        .one_or_none()
+    )
+
+
+def _managed_attempt_dict(lifecycle: ManagedAttemptLifecycleModel) -> Dict[str, Any]:
+    return {
+        "assignment_id": int(lifecycle.assignment_id),
+        "attempt_id": str(lifecycle.attempt_id),
+        "parent_terminal_id": str(lifecycle.parent_terminal_id),
+        "child_terminal_id": str(lifecycle.child_terminal_id),
+        "request_workflow_effect_id": lifecycle.request_workflow_effect_id,
+        "child_workflow_id": lifecycle.child_workflow_id,
+        "child_workflow_turn_id": lifecycle.child_workflow_turn_id,
+        "state": str(lifecycle.state),
+        "reason_code": lifecycle.reason_code,
+        "delivery_attempt_count": int(lifecycle.delivery_attempt_count),
+        "recovery_attempt_count": int(lifecycle.recovery_attempt_count),
+        "prompt_delivery_scheduled_at": lifecycle.prompt_delivery_scheduled_at,
+        "prompt_delivery_acknowledged_at": lifecycle.prompt_delivery_acknowledged_at,
+        "provider_admitted_at": lifecycle.provider_admitted_at,
+        "provider_running_at": lifecycle.provider_running_at,
+        "waiting_result_at": lifecycle.waiting_result_at,
+        "recovery_scheduled_at": lifecycle.recovery_scheduled_at,
+        "recovery_next_retry_at": lifecycle.recovery_next_retry_at,
+        "recovery_deadline_at": lifecycle.recovery_deadline_at,
+        "fence_claimed_at": lifecycle.fence_claimed_at,
+        "fenced_at": lifecycle.fenced_at,
+        "failed_at": lifecycle.failed_at,
+        "completed_at": lifecycle.completed_at,
+        "expected_runtime_generation": lifecycle.expected_runtime_generation,
+        "expected_writer_authority_generation": (lifecycle.expected_writer_authority_generation),
+        "parent_wake_message_id": lifecycle.parent_wake_message_id,
+        "replacement_assignment_id": lifecycle.replacement_assignment_id,
+        "replacement_effect_id": lifecycle.replacement_effect_id,
+        "created_at": lifecycle.created_at,
+        "updated_at": lifecycle.updated_at,
+    }
+
+
+def get_managed_attempt_lifecycle(
+    *,
+    assignment_id: Optional[int] = None,
+    child_terminal_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return the non-secret lifecycle projection for one exact attempt."""
+    if assignment_id is None and not child_terminal_id:
+        raise ValueError("assignment_id or child_terminal_id is required")
+    _ensure_managed_attempt_lifecycle_schema()
+    with SessionLocal() as db:
+        query = db.query(ManagedAttemptLifecycleModel)
+        if assignment_id is not None:
+            query = query.filter(ManagedAttemptLifecycleModel.assignment_id == assignment_id)
+        if child_terminal_id:
+            query = query.filter(
+                ManagedAttemptLifecycleModel.child_terminal_id == child_terminal_id
+            )
+        lifecycle = query.order_by(ManagedAttemptLifecycleModel.assignment_id.desc()).first()
+        return _managed_attempt_dict(lifecycle) if lifecycle is not None else None
+
+
+def mark_managed_attempt_prompt_delivered(
+    child_terminal_id: str, workflow_turn_id: int, now: Optional[datetime] = None
+) -> bool:
+    """Durably acknowledge that the exact prompt crossed provider transport."""
+    _ensure_managed_attempt_lifecycle_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        lifecycle = _managed_attempt_for_turn(db, child_terminal_id, workflow_turn_id)
+        if lifecycle is None or lifecycle.state in _MANAGED_ATTEMPT_TERMINAL_STATES | {
+            "fence_claimed"
+        }:
+            db.rollback()
+            return False
+        if lifecycle.prompt_delivery_acknowledged_at is None:
+            lifecycle.prompt_delivery_acknowledged_at = now
+            lifecycle.delivery_attempt_count = int(lifecycle.delivery_attempt_count) + 1
+        lifecycle.state = "prompt_delivery_acknowledged"
+        lifecycle.reason_code = None
+        lifecycle.recovery_next_retry_at = None
+        lifecycle.recovery_deadline_at = now + timedelta(
+            seconds=_MANAGED_ATTEMPT_ADMISSION_DEADLINE_SECONDS
+        )
+        lifecycle.updated_at = now
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"prompt-delivery-acknowledged:{lifecycle.assignment_id}:"
+            f"{lifecycle.delivery_attempt_count}",
+            "prompt_delivery_acknowledged",
+        )
+        db.commit()
+        return True
+
+
+def _mark_managed_attempt_provider_admitted_in_transaction(
+    db: Any, child_terminal_id: str, workflow_turn_id: int, now: datetime
+) -> None:
+    lifecycle = _managed_attempt_for_turn(db, child_terminal_id, workflow_turn_id)
+    if lifecycle is None or lifecycle.state in _MANAGED_ATTEMPT_TERMINAL_STATES | {"fence_claimed"}:
+        return
+    if lifecycle.provider_admitted_at is None:
+        lifecycle.provider_admitted_at = now
+    lifecycle.state = "provider_admitted"
+    lifecycle.reason_code = None
+    lifecycle.recovery_next_retry_at = None
+    lifecycle.recovery_deadline_at = None
+    lifecycle.updated_at = now
+    _managed_attempt_event(
+        db,
+        lifecycle,
+        f"provider-admitted:{lifecycle.assignment_id}:{workflow_turn_id}",
+        "provider_admitted",
+    )
+
+
+def observe_managed_attempt_provider_state(
+    child_terminal_id: str,
+    state: str,
+    *,
+    workflow_turn_id: Optional[int] = None,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Record running/waiting-result truth without manufacturing admission."""
+    if state not in {"provider_running", "waiting_for_result"}:
+        raise ValueError("managed attempt provider state is invalid")
+    _ensure_managed_attempt_lifecycle_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        query = db.query(ManagedAttemptLifecycleModel).filter(
+            ManagedAttemptLifecycleModel.child_terminal_id == child_terminal_id
+        )
+        if workflow_turn_id is not None:
+            query = query.filter(
+                ManagedAttemptLifecycleModel.child_workflow_turn_id == workflow_turn_id
+            )
+        lifecycle = query.order_by(ManagedAttemptLifecycleModel.assignment_id.desc()).first()
+        if (
+            lifecycle is None
+            or lifecycle.provider_admitted_at is None
+            or lifecycle.state in _MANAGED_ATTEMPT_TERMINAL_STATES | {"fence_claimed"}
+        ):
+            return False
+        if state == "provider_running":
+            lifecycle.provider_running_at = lifecycle.provider_running_at or now
+        else:
+            lifecycle.waiting_result_at = lifecycle.waiting_result_at or now
+        lifecycle.state = state
+        lifecycle.updated_at = now
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"{state}:{lifecycle.assignment_id}:{lifecycle.child_workflow_turn_id}",
+            state,
+        )
+        db.commit()
+        return True
+
+
+def _schedule_managed_attempt_recovery_in_transaction(
+    db: Any,
+    lifecycle: ManagedAttemptLifecycleModel,
+    turn: WorkflowTurnModel,
+    reason_code: str,
+    now: datetime,
+) -> str:
+    """Purchase the single same-child retry or make its failure explicit."""
+    if lifecycle.state in _MANAGED_ATTEMPT_TERMINAL_STATES | {"fence_claimed"}:
+        return lifecycle.state
+    if lifecycle.provider_admitted_at is not None:
+        return lifecycle.state
+    if int(lifecycle.recovery_attempt_count) == 0:
+        lifecycle.recovery_attempt_count = 1
+        lifecycle.state = "recovery_scheduled"
+        lifecycle.reason_code = reason_code
+        # This timestamp describes acknowledgement of the *current* scheduled
+        # delivery. Historical acknowledgements remain in the event ledger.
+        lifecycle.prompt_delivery_acknowledged_at = None
+        lifecycle.recovery_scheduled_at = now
+        lifecycle.recovery_next_retry_at = now + timedelta(
+            seconds=_MANAGED_ATTEMPT_RECOVERY_DELAY_SECONDS
+        )
+        lifecycle.recovery_deadline_at = now + timedelta(
+            seconds=_MANAGED_ATTEMPT_ADMISSION_DEADLINE_SECONDS
+        )
+        turn.state = TURN_QUEUED
+        turn.queue_reason = "MANAGED_ATTEMPT_RECOVERY_SCHEDULED"
+        turn.not_before = lifecycle.recovery_next_retry_at
+        turn.claim_token = None
+        turn.claim_expires_at = None
+        turn.updated_at = now
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"same-child-recovery:{lifecycle.assignment_id}:1",
+            "recovery_scheduled",
+            reason_code=reason_code,
+            detail={"attempt": 1},
+        )
+    else:
+        lifecycle.state = "fence_pending"
+        lifecycle.reason_code = reason_code
+        lifecycle.failed_at = now
+        lifecycle.recovery_next_retry_at = None
+        lifecycle.recovery_deadline_at = None
+        turn.state = TURN_CANCELLED
+        turn.queue_reason = reason_code
+        turn.not_before = None
+        turn.claim_token = None
+        turn.claim_expires_at = None
+        turn.updated_at = now
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"managed-attempt-recovery-failed:{lifecycle.assignment_id}",
+            "recovery_failed",
+            reason_code=reason_code,
+        )
+    lifecycle.updated_at = now
+    return lifecycle.state
+
+
+def reconcile_managed_attempt_timeouts(now: Optional[datetime] = None) -> Dict[str, int]:
+    """Bound absent admission to one same-child retry and then explicit fencing."""
+    _ensure_managed_attempt_lifecycle_schema()
+    _ensure_provider_execution_schema()
+    now = now or datetime.now()
+    scheduled = 0
+    fence_pending = 0
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        candidates = (
+            db.query(ManagedAttemptLifecycleModel)
+            .filter(
+                ManagedAttemptLifecycleModel.state.in_(
+                    (
+                        "prompt_delivery_scheduled",
+                        "prompt_delivery_acknowledged",
+                        "recovery_scheduled",
+                    )
+                ),
+                ManagedAttemptLifecycleModel.provider_admitted_at.is_(None),
+                ManagedAttemptLifecycleModel.recovery_deadline_at.is_not(None),
+                ManagedAttemptLifecycleModel.recovery_deadline_at <= now,
+            )
+            .all()
+        )
+        for lifecycle in candidates:
+            assignment = db.get(ChildAssignmentModel, lifecycle.assignment_id)
+            parent_workflow = _open_workflow(db, lifecycle.parent_terminal_id, create=False)
+            turn = (
+                db.get(WorkflowTurnModel, lifecycle.child_workflow_turn_id)
+                if lifecycle.child_workflow_turn_id is not None
+                else None
+            )
+            if assignment is not None and (
+                assignment.status not in _active_child_assignment_statuses()
+                or parent_workflow is None
+                or parent_workflow.status != WORKFLOW_OPEN
+            ):
+                lifecycle.state = "failed"
+                if assignment.status not in _active_child_assignment_statuses():
+                    lifecycle.reason_code = (
+                        f"MANAGED_ATTEMPT_ASSIGNMENT_{str(assignment.status).upper()}"
+                    )
+                elif parent_workflow is None:
+                    lifecycle.reason_code = "PARENT_WORKFLOW_NOT_OPEN"
+                else:
+                    lifecycle.reason_code = f"PARENT_WORKFLOW_{str(parent_workflow.status).upper()}"
+                lifecycle.failed_at = lifecycle.failed_at or now
+                lifecycle.recovery_next_retry_at = None
+                lifecycle.recovery_deadline_at = None
+                lifecycle.updated_at = now
+                if turn is not None and turn.state in (TURN_QUEUED, TURN_CLAIMED):
+                    turn.state = TURN_CANCELLED
+                    turn.queue_reason = lifecycle.reason_code
+                    turn.not_before = None
+                    turn.claim_token = None
+                    turn.claim_expires_at = None
+                    turn.updated_at = now
+                _managed_attempt_event(
+                    db,
+                    lifecycle,
+                    f"managed-attempt-parent-not-open:{lifecycle.assignment_id}",
+                    "failed",
+                    reason_code=lifecycle.reason_code,
+                )
+                continue
+            if assignment is None or turn is None:
+                lifecycle.state = "fence_pending"
+                lifecycle.reason_code = "MANAGED_ATTEMPT_AUTHORITY_MISSING"
+                lifecycle.failed_at = now
+                lifecycle.updated_at = now
+                fence_pending += 1
+                continue
+            lease = db.get(ProviderExecutionLeaseModel, lifecycle.child_terminal_id)
+            if lease is not None and lease.workflow_turn_id == turn.id:
+                db.delete(lease)
+            resulting = _schedule_managed_attempt_recovery_in_transaction(
+                db,
+                lifecycle,
+                turn,
+                "PROVIDER_TURN_NOT_ADMITTED_BEFORE_DEADLINE",
+                now,
+            )
+            if resulting == "recovery_scheduled":
+                scheduled += 1
+            elif resulting == "fence_pending":
+                fence_pending += 1
+        if candidates:
+            db.commit()
+        else:
+            db.rollback()
+    return {"recovery_scheduled": scheduled, "fence_pending": fence_pending}
+
+
+class ManagedAttemptFenceError(RuntimeError):
+    """Stable machine-readable rejection from exact managed-attempt fencing."""
+
+    def __init__(self, reason_code: str):
+        self.reason_code = reason_code
+        super().__init__(reason_code)
+
+
+def managed_attempt_fence_identity_matches(
+    lifecycle: Mapping[str, Any],
+    *,
+    assignment_id: int,
+    attempt_id: str,
+    parent_terminal_id: str,
+    child_terminal_id: str,
+    request_workflow_effect_id: int,
+    child_workflow_turn_id: int,
+    reason_code: str,
+    expected_runtime_generation: str,
+    expected_writer_authority_generation: str,
+) -> bool:
+    """Compare every immutable field required for an exact fence replay."""
+    return bool(
+        lifecycle.get("assignment_id") == assignment_id
+        and lifecycle.get("attempt_id") == attempt_id
+        and lifecycle.get("parent_terminal_id") == parent_terminal_id
+        and lifecycle.get("child_terminal_id") == child_terminal_id
+        and lifecycle.get("request_workflow_effect_id") == request_workflow_effect_id
+        and lifecycle.get("child_workflow_turn_id") == child_workflow_turn_id
+        and lifecycle.get("reason_code") == reason_code
+        and lifecycle.get("expected_runtime_generation") == expected_runtime_generation
+        and lifecycle.get("expected_writer_authority_generation")
+        == expected_writer_authority_generation
+    )
+
+
+def _critical_owner_recovery_scope_matches_in_transaction(
+    db: Any,
+    caller_terminal_id: str,
+    parent_terminal_id: str,
+    *,
+    reason_code: Optional[str] = None,
+) -> bool:
+    """Bind cross-terminal owner recovery to one gated parent and project grant.
+
+    An owner-executor may always fence its own exact child relation.  Crossing
+    a terminal boundary additionally requires the target parent to be at a
+    genuine owner gate whose reason matches the requested fence.  The consumed
+    owner grant must name the same canonical project authority, so an owner in
+    another project or an ordinary privileged-looking terminal cannot inspect
+    or mutate this attempt.
+    """
+    caller = db.get(TerminalModel, caller_terminal_id)
+    parent = db.get(TerminalModel, parent_terminal_id)
+    grant = (
+        db.get(OwnerLaunchGrantModel, caller.owner_grant_id)
+        if caller is not None and caller.owner_grant_id
+        else None
+    )
+    if (
+        caller is None
+        or parent is None
+        or grant is None
+        or caller.agent_profile != "critical_sol_xhigh_owner"
+        or grant.agent_profile != caller.agent_profile
+        or grant.provider != caller.provider
+        or grant.consumed_terminal_id != caller_terminal_id
+        or grant.consumed_at is None
+        or not caller.project_id
+        or caller.project_id != parent.project_id
+        or not caller.profile_revision_id
+        or not caller.provider_config_revision_id
+    ):
+        return False
+    try:
+        scope = json.loads(str(grant.scope_json or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    canonical_parent = parent.managed_worktree_source or parent.project_path
+    if (
+        not isinstance(scope, dict)
+        or scope.get("project_id") != parent.project_id
+        or grant.canonical_worktree != canonical_parent
+        or scope.get("profile_revision_id") != caller.profile_revision_id
+        or scope.get("provider_config_revision_id") != caller.provider_config_revision_id
+    ):
+        return False
+    if caller_terminal_id == parent_terminal_id:
+        return True
+    parent_workflow = _open_workflow(db, parent_terminal_id, create=False)
+    if parent_workflow is None or parent_workflow.status != WORKFLOW_OWNER_GATE:
+        return False
+    if reason_code is None:
+        return True
+    parent_reason = str(parent_workflow.terminal_reason or "")
+    return parent_reason == reason_code or parent_reason.startswith(reason_code + ":")
+
+
+def managed_attempt_fence_caller_is_authorized(
+    caller_terminal_id: str,
+    *,
+    assignment_id: int,
+    parent_terminal_id: str,
+    reason_code: str,
+) -> bool:
+    """Preflight the exact owner/parent scope; the claim repeats it atomically."""
+    _ensure_managed_attempt_lifecycle_schema()
+    with SessionLocal() as db:
+        assignment = db.get(ChildAssignmentModel, assignment_id)
+        lifecycle = db.get(ManagedAttemptLifecycleModel, assignment_id)
+        return bool(
+            assignment is not None
+            and lifecycle is not None
+            and assignment.parent_terminal_id == parent_terminal_id
+            and lifecycle.parent_terminal_id == parent_terminal_id
+            and _critical_owner_recovery_scope_matches_in_transaction(
+                db,
+                caller_terminal_id,
+                parent_terminal_id,
+                reason_code=reason_code,
+            )
+        )
+
+
+def managed_attempt_lifecycle_caller_is_authorized(
+    caller_terminal_id: str, assignment_id: int
+) -> bool:
+    """Allow lifecycle reads only to the relation or its scoped recovery owner."""
+    _ensure_managed_attempt_lifecycle_schema()
+    with SessionLocal() as db:
+        lifecycle = db.get(ManagedAttemptLifecycleModel, assignment_id)
+        if lifecycle is None:
+            return False
+        if caller_terminal_id in {
+            lifecycle.parent_terminal_id,
+            lifecycle.child_terminal_id,
+        }:
+            return True
+        return _critical_owner_recovery_scope_matches_in_transaction(
+            db,
+            caller_terminal_id,
+            str(lifecycle.parent_terminal_id),
+        )
+
+
+def claim_managed_attempt_fence(
+    *,
+    caller_terminal_id: Optional[str] = None,
+    assignment_id: int,
+    attempt_id: str,
+    parent_terminal_id: str,
+    child_terminal_id: str,
+    request_workflow_effect_id: int,
+    child_workflow_turn_id: int,
+    reason_code: str,
+    expected_runtime_generation: str,
+    expected_writer_authority_generation: str,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Atomically fence all logical authority and reserve exact runtime retirement."""
+    if not re.fullmatch(r"[A-Z0-9_]{3,128}", reason_code or ""):
+        raise ManagedAttemptFenceError("MANAGED_ATTEMPT_FENCE_REASON_INVALID")
+    _ensure_managed_attempt_lifecycle_schema()
+    _ensure_delegation_result_schema()
+    _ensure_workflow_schema()
+    _ensure_provider_execution_schema()
+    _ensure_terminal_worktree_authority_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        assignment = db.get(ChildAssignmentModel, assignment_id)
+        lifecycle = db.get(ManagedAttemptLifecycleModel, assignment_id)
+        terminal = db.get(TerminalModel, child_terminal_id)
+        identity_matches = bool(
+            assignment is not None
+            and lifecycle is not None
+            and terminal is not None
+            and assignment.attempt_id == attempt_id
+            and lifecycle.attempt_id == attempt_id
+            and assignment.parent_terminal_id == parent_terminal_id
+            and lifecycle.parent_terminal_id == parent_terminal_id
+            and assignment.child_terminal_id == child_terminal_id
+            and lifecycle.child_terminal_id == child_terminal_id
+            and assignment.request_workflow_effect_id == request_workflow_effect_id
+            and lifecycle.request_workflow_effect_id == request_workflow_effect_id
+            and assignment.child_workflow_id == lifecycle.child_workflow_id
+            and lifecycle.child_workflow_turn_id == child_workflow_turn_id
+            and terminal.runtime_generation == expected_runtime_generation
+            and terminal.writer_authority_generation == expected_writer_authority_generation
+            and isinstance(terminal.launch_worktree, str)
+            and bool(terminal.launch_worktree)
+            and lifecycle.expected_runtime_generation == expected_runtime_generation
+            and lifecycle.expected_writer_authority_generation
+            == expected_writer_authority_generation
+        )
+        if not identity_matches:
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_IDENTITY_MISMATCH")
+        assert assignment is not None and lifecycle is not None and terminal is not None
+        if caller_terminal_id is not None:
+            caller_authorized = _critical_owner_recovery_scope_matches_in_transaction(
+                db,
+                caller_terminal_id,
+                parent_terminal_id,
+                reason_code=reason_code,
+            )
+        else:
+            parent_workflow = _open_workflow(db, parent_terminal_id, create=False)
+            caller_authorized = bool(
+                lifecycle.state == "fence_claimed"
+                or (
+                    lifecycle.state == "fence_pending"
+                    and assignment.status in _active_child_assignment_statuses()
+                    and parent_workflow is not None
+                    and parent_workflow.status == WORKFLOW_OPEN
+                )
+            )
+        if not caller_authorized:
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_FENCE_CALLER_SCOPE_MISMATCH")
+        if lifecycle.state == "fenced":
+            result = _managed_attempt_dict(lifecycle)
+            result.update({"accepted": True, "duplicate": True})
+            db.rollback()
+            return result
+        if lifecycle.state == "completed":
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_ALREADY_COMPLETED")
+        if terminal.runtime_operation_kind not in {None, "managed_attempt_fence"}:
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_RUNTIME_OPERATION_CONFLICT")
+        if (
+            terminal.runtime_operation_kind == "managed_attempt_fence"
+            and lifecycle.fence_claim_token
+            and terminal.runtime_operation_token != lifecycle.fence_claim_token
+        ):
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_FENCE_CLAIM_CONFLICT")
+        writer = db.get(WorktreeWriterLeaseModel, terminal.launch_worktree)
+        if writer is not None and (
+            writer.terminal_id != child_terminal_id
+            or writer.authority_generation != expected_writer_authority_generation
+        ):
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_FOREIGN_WRITER_AUTHORITY")
+        provider_lease = db.get(ProviderExecutionLeaseModel, child_terminal_id)
+        if provider_lease is not None and provider_lease.workflow_turn_id != child_workflow_turn_id:
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_PROVIDER_AUTHORITY_CONFLICT")
+        claim_token = lifecycle.fence_claim_token or secrets.token_urlsafe(32)
+        lifecycle.fence_claim_token = claim_token
+        lifecycle.fence_claimed_at = lifecycle.fence_claimed_at or now
+        lifecycle.state = "fence_claimed"
+        lifecycle.reason_code = reason_code
+        lifecycle.failed_at = lifecycle.failed_at or now
+        lifecycle.recovery_next_retry_at = None
+        lifecycle.recovery_deadline_at = None
+        lifecycle.updated_at = now
+        assignment.status = ChildAssignmentStatus.FENCED.value
+        assignment.updated_at = now
+        # The logical CAS is the authority boundary. Revoke the exact writer
+        # here, before attempting non-transactional provider retirement, so a
+        # crash can never leave the orphan advertised as a writable owner.
+        if writer is not None:
+            db.delete(writer)
+        terminal.write_enabled = False
+        terminal.runtime_operation_kind = "managed_attempt_fence"
+        terminal.runtime_operation_token = claim_token
+        terminal.runtime_operation_claimed_at = now
+        terminal.runtime_operation_expires_at = None
+        # Clear the child bearer at the same logical fence. A late callback can
+        # no longer authenticate even if the provider process has not exited.
+        terminal.auth_token_sha256 = None
+        if provider_lease is not None:
+            db.delete(provider_lease)
+        child_workflow = db.get(WorkflowModel, assignment.child_workflow_id)
+        if child_workflow is not None:
+            child_workflow.status = WORKFLOW_CANCELLED
+            child_workflow.terminal_reason = reason_code
+            child_workflow.updated_at = now
+            pending_child_inbox_ids = [
+                row[0]
+                for row in db.query(WorkflowTurnModel.inbox_message_id)
+                .filter(
+                    WorkflowTurnModel.workflow_id == child_workflow.id,
+                    WorkflowTurnModel.inbox_message_id.is_not(None),
+                    WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED, TURN_SENT)),
+                )
+                .all()
+            ]
+            db.query(WorkflowTurnModel).filter(
+                WorkflowTurnModel.workflow_id == child_workflow.id,
+                WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED, TURN_SENT)),
+            ).update(
+                {
+                    WorkflowTurnModel.state: TURN_CANCELLED,
+                    WorkflowTurnModel.queue_reason: reason_code,
+                    WorkflowTurnModel.claim_token: None,
+                    WorkflowTurnModel.claim_expires_at: None,
+                    WorkflowTurnModel.updated_at: now,
+                },
+                synchronize_session=False,
+            )
+            if pending_child_inbox_ids:
+                db.query(InboxModel).filter(
+                    InboxModel.id.in_(pending_child_inbox_ids),
+                    InboxModel.status == MessageStatus.PENDING.value,
+                ).update(
+                    {InboxModel.status: MessageStatus.FAILED.value},
+                    synchronize_session=False,
+                )
+        result_row = (
+            db.query(DelegationResultModel)
+            .filter_by(child_assignment_id=assignment.id)
+            .one_or_none()
+        )
+        if result_row is not None and result_row.status != DelegationResultStatus.COMPLETE.value:
+            result_row.status = DelegationResultStatus.INCOMPLETE.value
+            result_row.reason_code = reason_code
+            result_row.finalized_at = result_row.finalized_at or now
+            result_row.updated_at = now
+            _purge_staged_handoff_submission(db, result_row.id)
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"managed-attempt-fence-claimed:{assignment.id}",
+            "fence_claimed",
+            reason_code=reason_code,
+        )
+        db.commit()
+        return {
+            **_managed_attempt_dict(lifecycle),
+            "accepted": True,
+            "duplicate": False,
+            "fence_claim_token": claim_token,
+            "terminal": {
+                "id": child_terminal_id,
+                "tmux_session": terminal.tmux_session,
+                "tmux_window": terminal.tmux_window,
+                "runtime_pane_id": terminal.runtime_pane_id,
+                "runtime_pane_pid": terminal.runtime_pane_pid,
+                "runtime_generation": terminal.runtime_generation,
+                "runtime_generation_origin": terminal.runtime_generation_origin,
+                "runtime_process_start_ticks": terminal.runtime_process_start_ticks,
+                "runtime_process_group_id": terminal.runtime_process_group_id,
+                "runtime_process_session_id": terminal.runtime_process_session_id,
+                "provider": terminal.provider,
+            },
+        }
+
+
+def complete_managed_attempt_fence(
+    assignment_id: int,
+    claim_token: str,
+    *,
+    reason_code: str,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Publish physical retirement, revoke the exact writer, and wake once."""
+    _ensure_managed_attempt_lifecycle_schema()
+    _ensure_delegation_result_schema()
+    _ensure_workflow_schema()
+    _ensure_terminal_worktree_authority_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        lifecycle = db.get(ManagedAttemptLifecycleModel, assignment_id)
+        assignment = db.get(ChildAssignmentModel, assignment_id)
+        if lifecycle is None or assignment is None:
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_NOT_FOUND")
+        if lifecycle.state == "fenced":
+            result = _managed_attempt_dict(lifecycle)
+            result.update({"accepted": True, "duplicate": True})
+            db.rollback()
+            return result
+        terminal = db.get(TerminalModel, lifecycle.child_terminal_id)
+        if (
+            lifecycle.state != "fence_claimed"
+            or lifecycle.fence_claim_token != claim_token
+            or lifecycle.reason_code != reason_code
+            or terminal is None
+            or terminal.runtime_operation_kind != "managed_attempt_fence"
+            or terminal.runtime_operation_token != claim_token
+            or terminal.runtime_generation != lifecycle.expected_runtime_generation
+            or terminal.writer_authority_generation
+            != lifecycle.expected_writer_authority_generation
+        ):
+            db.rollback()
+            raise ManagedAttemptFenceError("MANAGED_ATTEMPT_FENCE_CLAIM_STALE")
+        writer = db.get(WorktreeWriterLeaseModel, terminal.launch_worktree)
+        if writer is not None:
+            if (
+                writer.terminal_id != lifecycle.child_terminal_id
+                or writer.authority_generation != lifecycle.expected_writer_authority_generation
+            ):
+                db.rollback()
+                raise ManagedAttemptFenceError("MANAGED_ATTEMPT_FOREIGN_WRITER_AUTHORITY")
+            # A matching row can only be a conservative rolling-upgrade
+            # remainder: normal fence claims revoke it atomically.
+            db.delete(writer)
+        terminal.runtime_lifecycle = "recovery_fenced"
+        terminal.recovery_fenced_at = now
+        terminal.recovery_fenced_reason = reason_code
+        terminal.write_enabled = False
+        terminal.runtime_operation_kind = None
+        terminal.runtime_operation_token = None
+        terminal.runtime_operation_claimed_at = None
+        terminal.runtime_operation_expires_at = None
+        lifecycle.state = "fenced"
+        lifecycle.fenced_at = lifecycle.fenced_at or now
+        lifecycle.updated_at = now
+        if lifecycle.parent_wake_message_id is None:
+            parent_workflow = _open_workflow(db, lifecycle.parent_terminal_id, create=False)
+            if parent_workflow is not None and parent_workflow.status == WORKFLOW_OPEN:
+                message = InboxModel(
+                    sender_id=lifecycle.child_terminal_id,
+                    receiver_id=lifecycle.parent_terminal_id,
+                    message=(
+                        "Managed child attempt failed explicitly. "
+                        f"assignment_id={assignment.id}; attempt_id={assignment.attempt_id}; "
+                        f"reason_code={reason_code}. The old attempt is fenced; one replacement "
+                        "may be created with replaces_assignment_id="
+                        f"{assignment.id}."
+                    ),
+                    status=MessageStatus.PENDING.value,
+                    kind="managed_attempt_failure",
+                    created_at=now,
+                )
+                db.add(message)
+                db.flush()
+                wake_turn = _materialize_pending_inbox_turn_in_transaction(
+                    db, message, parent_workflow, now
+                )
+                if parent_workflow.active_turn_id is None:
+                    parent_workflow.active_turn_id = wake_turn.id
+                lifecycle.parent_wake_message_id = message.id
+            else:
+                # Terminal/owner-gated parents are explicit execution fences.
+                # Physical orphan retirement may finish, but it must not mint
+                # a successor, wake the parent, or implicitly authorize a
+                # replacement. A later owner input can resume the parent and
+                # deliberately create the replacement from this fenced row.
+                _managed_attempt_event(
+                    db,
+                    lifecycle,
+                    f"managed-attempt-parent-wake-suppressed:{assignment.id}",
+                    "parent_wake_suppressed",
+                    reason_code=(
+                        "PARENT_WORKFLOW_NOT_OPEN"
+                        if parent_workflow is None
+                        else f"PARENT_WORKFLOW_{str(parent_workflow.status).upper()}"
+                    ),
+                )
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"managed-attempt-fenced:{assignment.id}",
+            "fenced",
+            reason_code=reason_code,
+            detail={"parent_wake_message_id": lifecycle.parent_wake_message_id},
+        )
+        db.commit()
+        return {**_managed_attempt_dict(lifecycle), "accepted": True, "duplicate": False}
+
+
+def list_managed_attempt_fence_candidates(limit: int = 20) -> List[Dict[str, Any]]:
+    """Return exact authority for pending or interrupted fencing sagas."""
+    if isinstance(limit, bool) or not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100")
+    _ensure_managed_attempt_lifecycle_schema()
+    with SessionLocal() as db:
+        rows = (
+            db.query(ManagedAttemptLifecycleModel)
+            .filter(ManagedAttemptLifecycleModel.state.in_(("fence_pending", "fence_claimed")))
+            .order_by(ManagedAttemptLifecycleModel.updated_at.asc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "assignment_id": int(row.assignment_id),
+                "attempt_id": str(row.attempt_id),
+                "parent_terminal_id": str(row.parent_terminal_id),
+                "child_terminal_id": str(row.child_terminal_id),
+                "request_workflow_effect_id": int(row.request_workflow_effect_id),
+                "child_workflow_turn_id": int(row.child_workflow_turn_id),
+                "reason_code": str(row.reason_code or "MANAGED_ATTEMPT_RECOVERY_FAILED"),
+                "expected_runtime_generation": str(row.expected_runtime_generation),
+                "expected_writer_authority_generation": str(
+                    row.expected_writer_authority_generation
+                ),
+            }
+            for row in rows
+            if row.request_workflow_effect_id is not None
+            and row.child_workflow_turn_id is not None
+            and row.expected_runtime_generation
+            and row.expected_writer_authority_generation
+        ]
+
+
+def _review_input_authority_in_transaction(
+    db: Any, child_terminal_id: str, workflow_turn_id: int
+) -> tuple[ChildAssignmentModel, WorkflowModel, WorkflowTurnModel, TerminalModel] | None:
+    """Resolve the one exact review attempt authorized for provider transport."""
+    turn = db.get(WorkflowTurnModel, workflow_turn_id)
+    workflow = db.get(WorkflowModel, turn.workflow_id) if turn is not None else None
+    assignment = (
+        db.query(ChildAssignmentModel)
+        .filter(
+            ChildAssignmentModel.child_terminal_id == child_terminal_id,
+            ChildAssignmentModel.child_workflow_id == (workflow.id if workflow else None),
+            ChildAssignmentModel.child_workflow_turn_id == workflow_turn_id,
+        )
+        .first()
+    )
+    if assignment is None or assignment.review_subject_kind is None:
+        return None
+    terminal = db.get(TerminalModel, child_terminal_id)
+    source = terminal.managed_worktree_source if terminal is not None else None
+    revision = assignment.review_subject_revision
+    valid = bool(
+        terminal is not None
+        and _terminal_is_reviewer(terminal)
+        and terminal.managed_worktree_kind == "reviewer"
+        and terminal.managed_worktree_origin_terminal_id == child_terminal_id
+        and terminal.managed_worktree_branch is None
+        and isinstance(terminal.launch_worktree, str)
+        and terminal.launch_worktree.startswith("/")
+        and isinstance(source, str)
+        and source.startswith("/")
+        and assignment.status == ChildAssignmentStatus.AWAITING_RESULT.value
+        and assignment.review_superseded_at is None
+        and assignment.review_subject_kind == "git_commit"
+        and isinstance(assignment.attempt_id, str)
+        and bool(assignment.attempt_id)
+        and isinstance(revision, str)
+        and _REVIEW_REVISION_PATTERN.fullmatch(revision) is not None
+        and assignment.review_subject_worktree == source
+        and assignment.review_scope_sha256
+        == hashlib.sha256(source.encode("utf-8", "strict")).hexdigest()
+        and workflow is not None
+        and workflow.root_terminal_id == child_terminal_id
+        and workflow.status == WORKFLOW_OPEN
+        and workflow.active_turn_id == workflow_turn_id
+        and turn is not None
+        and turn.workflow_id == workflow.id
+        and turn.state in (TURN_SENT, TURN_CLAIMED)
+        and turn.transport_binding is not None
+    )
+    if not valid:
+        raise ValueError("review input authority is not exact")
+    return (
+        cast(ChildAssignmentModel, assignment),
+        cast(WorkflowModel, workflow),
+        cast(WorkflowTurnModel, turn),
+        cast(TerminalModel, terminal),
+    )
+
+
+def _review_worktree_writer_authority_conflicts(
+    db,
+    terminal: TerminalModel,
+    child_terminal_id: str,
+    path: str,
+) -> bool:
+    """Return whether a writer lease is foreign to this exact reviewer.
+
+    A managed reviewer is itself the durable writer owner of its isolated
+    worktree. That lifetime lease is not concurrent provider work while the
+    runtime-operation and provider-execution axes are otherwise clear. The
+    lease is required for checkout mutation; absence or a different terminal,
+    path, or generation remains ambiguous and blocks.
+    """
+    leases = (
+        db.query(WorktreeWriterLeaseModel)
+        .filter(
+            or_(
+                WorktreeWriterLeaseModel.terminal_id == child_terminal_id,
+                WorktreeWriterLeaseModel.canonical_worktree == path,
+            )
+        )
+        .limit(2)
+        .all()
+    )
+    expected_generation = terminal.writer_authority_generation
+    return len(leases) != 1 or any(
+        lease.terminal_id != child_terminal_id
+        or lease.canonical_worktree != path
+        or not isinstance(expected_generation, str)
+        or not expected_generation
+        or lease.authority_generation != expected_generation
+        for lease in leases
+    )
+
+
+def claim_review_worktree_preparation(
+    child_terminal_id: str,
+    workflow_turn_id: int,
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Fence one exact reviewer checkout from preparation through transport.
+
+    The review attempt and workflow input are already durable at this point.
+    This claim prevents terminal transport, reconnect, recovery, and retirement
+    from racing the isolated Git checkout before the bound input is pasted.
+    """
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_child_assignment_schema()
+    _ensure_workflow_schema()
+    _ensure_provider_execution_schema()
+    now = now or datetime.now()
+    claim_token = uuid.uuid4().hex
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        try:
+            authority = _review_input_authority_in_transaction(
+                db, child_terminal_id, workflow_turn_id
+            )
+        except ValueError:
+            db.rollback()
+            return {
+                "required": True,
+                "claimed": False,
+                "reason_code": "REVIEW_WORKTREE_AUTHORITY_CHANGED",
+            }
+        if authority is None:
+            db.rollback()
+            return {"required": False, "claimed": False}
+        assignment, _workflow, _turn, terminal = authority
+        path = cast(str, terminal.launch_worktree)
+        blocked = bool(
+            terminal.runtime_lifecycle != "running"
+            or not terminal.runtime_generation
+            or _terminal_requires_provider_runtime_compatibility_reconnect(terminal)
+            or _terminal_has_pending_provider_reconnect(db, child_terminal_id)
+            or _terminal_runtime_operation_live(terminal, now)
+            or db.get(ProviderExecutionLeaseModel, child_terminal_id) is not None
+            or _review_worktree_writer_authority_conflicts(
+                db,
+                terminal,
+                child_terminal_id,
+                path,
+            )
+            or not _workspace_accepts_new_work(db, child_terminal_id)
+            or not _retirement_quiescence_allows_commit(db, child_terminal_id)
+        )
+        if blocked:
+            db.rollback()
+            return {
+                "required": True,
+                "claimed": False,
+                "reason_code": "REVIEW_WORKTREE_PREPARATION_BUSY",
+            }
+        terminal.runtime_operation_kind = REVIEW_WORKTREE_PREPARATION_OPERATION
+        terminal.runtime_operation_token = claim_token
+        terminal.runtime_operation_claimed_at = now
+        terminal.runtime_operation_expires_at = now + timedelta(
+            seconds=REVIEW_WORKTREE_PREPARATION_LEASE_SECONDS
+        )
+        db.commit()
+        return {
+            "required": True,
+            "claimed": True,
+            "claim_token": claim_token,
+            "attempt_id": cast(str, assignment.attempt_id),
+            "revision": cast(str, assignment.review_subject_revision),
+            "worktree": path,
+            "source": cast(str, terminal.managed_worktree_source),
+            "runtime_generation": cast(str, terminal.runtime_generation),
+        }
+
+
+def review_worktree_preparation_owned(
+    child_terminal_id: str,
+    workflow_turn_id: int,
+    claim_token: str,
+    revision: str,
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    """Revalidate the exact live preparation capability before provider send."""
+    _ensure_terminal_worktree_authority_schema()
+    _ensure_child_assignment_schema()
+    _ensure_workflow_schema()
+    now = now or datetime.now()
+    with SessionLocal() as db:
+        try:
+            authority = _review_input_authority_in_transaction(
+                db, child_terminal_id, workflow_turn_id
+            )
+        except ValueError:
+            return False
+        if authority is None:
+            return False
+        assignment, _workflow, _turn, terminal = authority
+        return bool(
+            terminal.runtime_lifecycle == "running"
+            and terminal.runtime_operation_kind == REVIEW_WORKTREE_PREPARATION_OPERATION
+            and terminal.runtime_operation_token == claim_token
+            and terminal.runtime_operation_expires_at is not None
+            and terminal.runtime_operation_expires_at > now
+            and assignment.review_subject_revision == revision
+            and not _terminal_requires_provider_runtime_compatibility_reconnect(terminal)
+            and not _terminal_has_pending_provider_reconnect(db, child_terminal_id)
+        )
+
+
+def release_review_worktree_preparation(child_terminal_id: str, claim_token: str) -> bool:
+    """Release only the exact review-checkout claim, including failed preparation."""
+    _ensure_terminal_worktree_authority_schema()
+    with SessionLocal() as db:
+        released = (
+            db.query(TerminalModel)
+            .filter(
+                TerminalModel.id == child_terminal_id,
+                TerminalModel.runtime_operation_kind == REVIEW_WORKTREE_PREPARATION_OPERATION,
+                TerminalModel.runtime_operation_token == claim_token,
+            )
+            .update(
+                {
+                    TerminalModel.runtime_operation_kind: None,
+                    TerminalModel.runtime_operation_token: None,
+                    TerminalModel.runtime_operation_claimed_at: None,
+                    TerminalModel.runtime_operation_expires_at: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return released == 1
 
 
 def cancel_child_assignment_attempt(
@@ -17589,6 +26394,8 @@ def cancel_child_assignment_attempt(
     """
     _ensure_child_assignment_schema()
     _ensure_delegation_result_schema()
+    _ensure_workflow_schema()
+    _ensure_provider_execution_schema()
     with SessionLocal() as db:
         db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         assignment = (
@@ -17612,6 +26419,39 @@ def cancel_child_assignment_attempt(
         ):
             db.rollback()
             return False
+        if assignment.child_workflow_turn_id is not None:
+            child_turn = db.get(WorkflowTurnModel, cast(int, assignment.child_workflow_turn_id))
+            provider_lease = db.get(ProviderExecutionLeaseModel, child_terminal_id)
+            provider_admitted = bool(
+                child_turn is not None
+                and provider_lease is not None
+                and provider_lease.workflow_turn_id == child_turn.id
+            )
+            receipted = bool(
+                child_turn is not None
+                and db.query(WorkflowTurnReceiptModel.id)
+                .filter(
+                    WorkflowTurnReceiptModel.workflow_turn_id == child_turn.id,
+                    WorkflowTurnReceiptModel.receiver_terminal_id == child_terminal_id,
+                )
+                .first()
+                is not None
+            )
+            if (
+                (
+                    child_turn is not None
+                    and child_turn.state in (TURN_QUEUED, TURN_CLAIMED)
+                    and child_turn.payload is not None
+                )
+                or provider_admitted
+                or receipted
+            ):
+                # The input has an independent durable delivery owner.  This
+                # writer transaction is the cancellation-vs-queue/provider
+                # fence: never invalidate the assignment that the same turn
+                # will later deliver or has already admitted.
+                db.rollback()
+                return False
         delegation_kind = "handoff" if assignment.status.startswith("handoff_") else "assign"
         now = datetime.now()
         assignment.status = ChildAssignmentStatus.CANCELLED.value
@@ -17757,6 +26597,12 @@ def create_child_assignment_result_message(
     _ensure_delegation_result_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        if not _workspace_accepts_new_work(db, sender_id) or not _workspace_accepts_new_work(
+            db, receiver_id
+        ):
+            db.rollback()
+            return None, True
         workflow = _open_workflow(db, receiver_id, create=False)
         if workflow is None or workflow.status != WORKFLOW_OPEN:
             # A terminal/owner/cancel transition fences all parent edges in
@@ -18078,7 +26924,13 @@ def _review_acknowledgement_reason(
         request_effect is None
         or request_effect.workflow_id != parent_workflow.id
         or request_effect.workflow_turn_id != assignment.request_workflow_turn_id
-        or request_effect.state != "completed"
+        or (
+            _workflow_effect_semantic_outcome(db, request_effect) != "completed"
+            and not (
+                request_effect.effect_kind == "handoff"
+                and request_effect.state in {"wait_timeout", "wait_retryable"}
+            )
+        )
         or result is None
         or request_effect.effect_kind not in {"assign", "handoff"}
         or request_effect.effect_kind != result.delegation_kind

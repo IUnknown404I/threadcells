@@ -72,9 +72,13 @@ than directly to worker terminals. Bypassing the conductor leaves it without sta
 what was asked or answered, which causes confusion. Two exceptions: unblocking a stuck
 worker, and follow-up questions to a persistent async worker (see below).
 
-**handoff** (blocking) — conductor sends task and waits for the worker to reach
-`COMPLETED` status, then reads the output. If it times out, the worker is still
-running — the conductor just stopped waiting.
+**handoff** (blocking) — conductor sends task and waits for a validated worker
+result. A `state: waiting` response means the child remains live and only the
+bounded wait slice ended. Retain its `terminal_id` and `next_wait_slice_id`,
+then resume that exact child with
+`await_handoff(terminal_id, timeout, wait_slice_id=next_wait_slice_id)`. Reusing
+an old slice only reports its recorded outcome and does not wait again. Do not
+resend the task or create a replacement worker.
 
 **assign** (non-blocking) — conductor sends task and returns immediately. The worker
 is expected to call `send_message` back to the conductor's terminal ID when done.

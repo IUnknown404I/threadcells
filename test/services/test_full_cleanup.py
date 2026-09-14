@@ -2,8 +2,8 @@ import grp
 import json
 import os
 import pwd
+import shutil
 import threading
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,7 +11,11 @@ import pytest
 from cli_agent_orchestrator.services.housekeeping.executor import execute_plan
 from cli_agent_orchestrator.services.housekeeping.models import default_settings
 from cli_agent_orchestrator.services.housekeeping_service import (
+    HousekeepingSummary,
+    _apply_execution_report_to_summary,
+    _finalize_housekeeping_summary,
     _full_cleanup_execution_fence,
+    _prepare_housekeeping_summary,
     full_cleanup_idle_gate,
     plan_full_cleanup,
     run_full_cleanup,
@@ -321,26 +325,25 @@ def test_full_cleanup_isolated_end_to_end_and_idempotent(tmp_path, monkeypatch):
     )
 
     def privileged_cleanup_executor(*, plan, config, settings, proc_root):
-        from cli_agent_orchestrator.services.housekeeping.executor import (
-            privileged_full_cleanup_candidate,
-        )
-
-        privileged_plan = replace(
+        summary = HousekeepingSummary(mode="full", full_cleanup=True)
+        summary.disk_before = shutil.disk_usage("/").free
+        actionable = _prepare_housekeeping_summary(summary, plan)
+        report = execute_plan(
             plan,
-            candidates=tuple(
-                candidate
-                for candidate in plan.candidates
-                if privileged_full_cleanup_candidate(candidate)
-            ),
-        )
-        return execute_plan(
-            privileged_plan,
             config=config,
             settings=settings,
             open_inventory=lambda: (set(), True),
             proc_root=proc_root,
             full_cleanup=True,
             lifecycle_fence_held=True,
+        )
+        _apply_execution_report_to_summary(summary, report, actionable)
+        return _finalize_housekeeping_summary(
+            summary,
+            root=Path(plan.root),
+            config=config,
+            proc_root=proc_root,
+            completed_at=plan.generated_at,
         )
 
     first = run_full_cleanup(

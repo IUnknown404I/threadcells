@@ -1,7 +1,7 @@
 ---
 slug: projects-and-worktrees
 source: docs/PROJECTS_AND_WORKTREES.md
-source_sha256: sha256:c296e8fec6654451a29dbef47bde79d19fda28f7bbfdf926c857e2cc8508ad3a
+source_sha256: sha256:b59a766757b888181ab6f564f9f3994953943a50ff2d15a820edd33e02d7ae6e
 ---
 
 # Projekte und verwaltete Worktrees
@@ -43,6 +43,8 @@ Aktive Legacy-Sitzungen, die diesem Vertrag vorausgehen, bleiben in ihrem besteh
 ## Schreibberechtigung
 
 Nur der Kontext mit Schreibberechtigung sollte einen verwalteten Worktree verändern. Reviewer können Diffs prüfen und sichere Checks ausführen, ohne zu einem nicht nachverfolgten zweiten Schreiber zu werden.
+
+Ein Review einer exakten Revision bindet sowohl den dauerhaften Review-Versuch als auch den physischen Checkout des Reviewers. Vor der Zustellung der Review-Aufgabe sperrt ThreadCells die Terminaleingabe, prüft einen sauberen, der Sitzung gehörenden Reviewer-Worktree, wechselt ihn im Detached-Modus auf den angeforderten Commit und prüft die Revision beim Provider-Transport erneut. Wird ein Reviewer für eine gezielte Korrektur wiederverwendet, entstehen ein neuer Versuch und eine Vorbereitung der neuen Revision; das frühere Ergebnis bleibt Historie und kann die Korrektur nicht freigeben.
 
 Bearbeite einen verwalteten Worktree nicht manuell, während sein Agent aktiv ist. Falls ein Notfalleingriff nötig ist, stoppe oder koordiniere den Schreiber zuerst und dokumentiere, was sich geändert hat.
 

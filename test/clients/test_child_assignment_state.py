@@ -64,7 +64,7 @@ def _authorized_callback(child_id: str):
 def _legacy_handoff_snapshot_with_admitted_child_input(parent_id: str, child_id: str) -> int:
     """Build the exact pre-marker state accepted by the compatibility read."""
     assert register_handoff_child(parent_id, child_id) is True
-    binding = issue_workflow_input_binding(child_id)
+    binding = issue_workflow_input_binding(child_id, "legacy handoff input")
     assert binding is not None
     turn_id = resolve_workflow_input_binding(child_id, binding)
     assert turn_id is not None
@@ -231,7 +231,7 @@ def test_legacy_handoff_snapshot_recovers_only_the_exact_admitted_relation(child
 
 def test_legacy_handoff_snapshot_without_child_receipt_is_not_recovered(child_assignment_db):
     assert register_handoff_child("parent-no-receipt", "child-no-receipt") is True
-    binding = issue_workflow_input_binding("child-no-receipt")
+    binding = issue_workflow_input_binding("child-no-receipt", "undelivered handoff input")
     assert binding is not None
 
     assert handoff_child_input_received("child-no-receipt") is False

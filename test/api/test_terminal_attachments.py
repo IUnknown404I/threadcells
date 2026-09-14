@@ -39,6 +39,49 @@ def test_image_attachment_returns_404_for_unknown_terminal(client):
     assert response.status_code == 404
 
 
+def test_image_attachment_rejects_deleted_terminal_with_durable_reason(client):
+    with (
+        patch("cli_agent_orchestrator.api.main.get_terminal_metadata", return_value=None),
+        patch(
+            "cli_agent_orchestrator.api.main.terminal_deletion_receipt_exists",
+            return_value=True,
+        ),
+    ):
+        response = client.post(
+            "/terminals/abcd1234/attachments/image",
+            content=PNG,
+            headers={"content-type": "image/png"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "session_deleted"
+
+
+def test_attachment_write_is_fenced_after_session_deletion_starts(client):
+    metadata = {
+        "id": "abcd1234",
+        "session_id": "session-id",
+        "tmux_session": "cao-session",
+    }
+    with (
+        patch("cli_agent_orchestrator.api.main.get_terminal_metadata", return_value=metadata),
+        patch(
+            "cli_agent_orchestrator.api.main.get_session_hard_deletion_operation",
+            return_value={"session_id": "session-id", "state": "fenced"},
+        ),
+        patch("cli_agent_orchestrator.api.main.terminal_attachments.store_terminal_image") as store,
+    ):
+        response = client.post(
+            "/terminals/abcd1234/attachments/image",
+            content=PNG,
+            headers={"content-type": "image/png"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "session_deletion_in_progress"
+    store.assert_not_called()
+
+
 def test_image_attachment_rejects_unsupported_mime_before_reading(client):
     with patch(
         "cli_agent_orchestrator.api.main.get_terminal_metadata", return_value={"id": "abcd1234"}

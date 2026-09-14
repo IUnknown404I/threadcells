@@ -1,7 +1,7 @@
 ---
 slug: web-ui
 source: docs/WEB_UI.md
-source_sha256: sha256:dc45952406ae34d9be16d78c4e5b4a6f73d8862fe8b5fe6a557528cecaf45928
+source_sha256: sha256:44f2268614b3be15c7e01062819795ffcd7f44e5793dbd28a4739f4c876c17da
 ---
 # 使用 Web UI
 
@@ -21,6 +21,8 @@ Web UI 是操作员查看 ThreadCells 实时状态的界面。它面向 loopback
 - **Add Agent** 在精确选定的会话生命周期内启动另一个终端；它不会加入一个仅因同名而出现的不同历史会话。
 
 支持直接 URL。浏览器历史应保留选定的 Settings 和 Docs 页面。
+
+Settings → General 允许每个浏览器使用检测到的时区或手动选择的 IANA 时区显示绝对服务器时间戳。该偏好仅保存在浏览器存储中，并非服务器设置。只有带有明确 UTC 或数字偏移量的时间戳会被转换。时长、仅含日历日期的值和含义不明确的时间戳保持不变。
 
 ## 常规运行循环
 

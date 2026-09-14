@@ -36,3 +36,34 @@ button, input, select, textarea {
   outline: 2px solid #059669;
   outline-offset: 2px;
 }
+
+.agent-detail-card {
+  container-type: inline-size;
+}
+
+.agent-action-strip {
+  width: 17.4375rem;
+  grid-template-columns: repeat(6, 2.75rem);
+  gap: 3px;
+}
+
+.agent-action-label {
+  display: none;
+  white-space: nowrap;
+}
+
+@container (min-width: 30rem) {
+  .agent-action-strip {
+    width: 25.5rem;
+    grid-template-columns: 6rem 5rem 5rem repeat(3, 2.75rem);
+    gap: .25rem;
+  }
+
+  .agent-action-secondary {
+    padding-inline: .5rem;
+  }
+
+  .agent-action-label {
+    display: inline;
+  }
+}

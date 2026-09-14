@@ -7367,7 +7367,7 @@ def _completed_takeover_foreign_workspace_is_valid(
     terminal_by_id: Mapping[str, TerminalModel],
     supervisor_rows: Sequence[Mapping[str, Any]],
 ) -> bool:
-    """Prove that every former supervisor workspace now has one live successor owner."""
+    """Prove that every former supervisor workspace has one exact successor owner."""
     if not supervisor_rows:
         return False
     local_terminal_ids = set(terminal_by_id)
@@ -7412,9 +7412,15 @@ def _completed_takeover_foreign_workspace_is_valid(
             and successor.writable_work_context_id == context.id
             and successor.launch_worktree == context.canonical_worktree
             and successor.writer_authority_generation == context.writer_authority_generation
-            and successor.runtime_lifecycle
-            not in {"exited", "recovery_fenced", "recovery_required"}
-            and lease is not None
+        ):
+            return False
+        if successor.runtime_lifecycle == "exited":
+            if lease is not None:
+                return False
+        elif successor.runtime_lifecycle in {"recovery_fenced", "recovery_required"}:
+            return False
+        elif not (
+            lease is not None
             and lease.terminal_id == successor.id
             and lease.authority_generation == context.writer_authority_generation
         ):

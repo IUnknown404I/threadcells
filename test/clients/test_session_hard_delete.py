@@ -2180,7 +2180,10 @@ def test_workspace_authority_preserves_foreign_writer_on_target_path(monkeypatch
         assert lease.authority_generation == "foreign-generation"
 
 
-def test_completed_takeover_predecessor_delete_preserves_successor_authority(monkeypatch, tmp_path):
+@pytest.mark.parametrize("successor_exited", [False, True])
+def test_completed_takeover_predecessor_delete_preserves_successor_authority(
+    monkeypatch, tmp_path, successor_exited
+):
     managed, authority = _managed_supervisor_deletion_fixture(monkeypatch, tmp_path)
     with database.SessionLocal() as db:
         old = db.get(TerminalModel, "owner")
@@ -2241,6 +2244,8 @@ def test_completed_takeover_predecessor_delete_preserves_successor_authority(mon
             )
         )
         db.commit()
+    if successor_exited:
+        assert database.mark_terminal_runtime_exited("successor") is True
     authority["work_context"] = None
 
     plan = database.get_session_unresolved_work_plan("session", expected_terminal_ids=["owner"])
@@ -2274,16 +2279,19 @@ def test_completed_takeover_predecessor_delete_preserves_successor_authority(mon
         assert db.get(TerminalModel, "owner") is None
         successor = db.get(TerminalModel, "successor")
         assert successor is not None
-        assert successor.runtime_lifecycle == "running"
+        assert successor.runtime_lifecycle == ("exited" if successor_exited else "running")
         context = db.get(WritableWorkContextModel, "context")
         assert context is not None
         assert context.session_id == "successor-session"
         assert context.terminal_id == "successor"
         assert context.state == "admitted"
         lease = db.get(WorktreeWriterLeaseModel, managed.path)
-        assert lease is not None
-        assert lease.terminal_id == "successor"
-        assert lease.authority_generation == "successor-writer"
+        if successor_exited:
+            assert lease is None
+        else:
+            assert lease is not None
+            assert lease.terminal_id == "successor"
+            assert lease.authority_generation == "successor-writer"
         assert db.get(database.RecoveryTakeoverModel, "completed-takeover") is not None
 
 

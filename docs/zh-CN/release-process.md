@@ -1,7 +1,7 @@
 ---
 slug: release-process
 source: docs/RELEASE_PROCESS.md
-source_sha256: sha256:66966038765eab40e9e11f4cbd81cc126fc199a63e95390194c3d88dbdd598b6
+source_sha256: sha256:94e2111e40b5d9a5fe29571af6adba03ef88decf06f66b66a16b3563c3d43237
 ---
 # 发布流程
 
@@ -38,6 +38,7 @@ ThreadCells 遵循标准 SemVer 预发布排序。在 alpha 预览期间，每�
 - `v0.3.0-alpha.1` 增加生命周期一致性、持久创建顺序、Full Cleanup 和系统化路由策略。
 - `v0.3.0-alpha.2` 修复 Workflow Composer 投递，并阻止已退出终端重新获得可执行工作流权限。
 - `v0.3.3-alpha` 为已认证界面增加英语和俄语本地化，并让应用与公共网站共用按语言归属的单一规范 Docs 语料库。
+- `v0.4.0-alpha` 让工作流、恢复、删除和 Housekeeping 的持久状态与已认证界面、公共文档及发布媒体保持一致。
 - 后续 alpha 发布会审慎地递增语义版本，并保留不带数字后缀的 `alpha` 阶段。
 
 绝不可移动现有标签。仅仓库治理变更不会触发版本递增或发布。只有当下一个有意义的实现轮廓已准备好发布时，才同时更新所有规范版本承载表面。

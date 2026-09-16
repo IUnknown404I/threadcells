@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0-alpha] - 2026-09-16
+
+### Added
+
+- Add durable task-interaction history and a readable current/history view for accepted inputs, results, delivery, and acknowledgement.
+- Add restart-safe Full Cleanup operation receipts, progress, exact-plan recovery, and truthful completed, failed, or indeterminate outcomes.
+- Add public-site guidance for the intended operator, supported host baseline, provider compatibility, and alpha trust boundaries.
+
+### Changed
+
+- Keep queued workflow input, provider reconnect, compaction continuation, exact-revision review, result delivery, and parent continuation bound to durable turn/effect authority.
+- Make Home, Agents, Current, History, Full Output, timezone presentation, and responsive action controls follow the same backend lifecycle truth.
+- Refresh the public landing structure, release copy, dependency baselines, and real-product media for the current UI.
+
+### Fixed
+
+- Allow eligible completed/replaced recovery Sessions to be deleted idempotently while preserving successor worktrees, writer leases, and continuation context; unresolved recovery authority still blocks deletion.
+- Keep the six primary Agents actions in one stable right-aligned row, with History, Inbox, and Output readable on desktop and Terminal, Finish, and Delete consistently icon-only.
+- Preserve historical indeterminate effect and handoff residue behind an explicit owner gate without replaying sends or inventing acknowledgements.
+- Inventory protected backups and tool roots without treating unknown ownership as reclaimable; report estimates, actual outcomes, skips, failures, timing, and post-run disk state separately ([#83](https://github.com/IUnknown404I/threadcells/issues/83), [#84](https://github.com/IUnknown404I/threadcells/issues/84), [#109](https://github.com/IUnknown404I/threadcells/issues/109)).
+- Prevent protected-inventory formatter failures on structured details and bind bounded privileged snapshots to exact trusted configuration.
+
+### Safety
+
+- Preserve exactly-once workflow/effect fences across restart and reconnect, including explicit owner-gate and indeterminate-delivery states.
+- Keep destructive cleanup plan-first, all-idle, root-helper bounded, and fail-closed for active, unreadable, changed, or ambiguous resources.
+- Update affected Web and public-site dependencies to versions that clear the release-time npm advisories.
+
 ## [0.3.4-alpha] - 2026-09-02
 
 ### Added

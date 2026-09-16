@@ -17,7 +17,7 @@ function collectCalls(node) {
   ts.forEachChild(node, collectCalls)
 }
 collectCalls(page)
-assert.equal(expected.size, 96, 'canonical landing key count changed; update every locale deliberately')
+assert.equal(expected.size, 119, 'canonical landing key count changed; update every locale deliberately')
 
 const localeModules = [
   { locale: 'zh-CN', exportName: 'zhCNLanding' },

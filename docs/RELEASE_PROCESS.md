@@ -33,6 +33,7 @@ ThreadCells follows normal SemVer prerelease ordering. During the alpha preview,
 - `v0.3.0-alpha.1` adds lifecycle consistency, durable creation order, Full Cleanup, and systemic routing policy.
 - `v0.3.0-alpha.2` corrects Workflow Composer delivery and makes terminal exit final for executable workflow authority.
 - `v0.3.3-alpha` adds English/Russian authenticated UI localization and one canonical locale-owned Docs corpus for both the app and public site.
+- `v0.4.0-alpha` aligns durable workflow, recovery, deletion, and Housekeeping truth with the authenticated UI, public Docs, and release media.
 - A later alpha publication increments the semantic version deliberately and keeps the unsuffixed `alpha` stage.
 
 Never move an existing tag. Repository-governance changes alone do not trigger a version bump or release. Update all canonical version-bearing surfaces together only when the next meaningful implementation contour is ready for publication.

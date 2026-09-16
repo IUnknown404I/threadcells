@@ -131,7 +131,7 @@ export function LandingPage({ locale = 'en' }: { locale?: Locale }) {
           </div>
           <ProductShot
             src="/media/screenshots/threadcells-home.webp"
-            alt={t('ThreadCells Home showing 21 real sessions, 166 agents, aggregate lifecycle counts, and dense session status summaries', 'Главная ThreadCells: 21 реальная сессия, 166 агентов, суммарные состояния жизненного цикла и компактные сводки по статусам сессий')}
+            alt={t('ThreadCells Home showing 30 real sessions, 218 agents, aggregate lifecycle counts, and dense session status summaries', 'Главная ThreadCells: 30 реальных сессий, 218 агентов, суммарные состояния жизненного цикла и компактные сводки по статусам сессий')}
             label={t('HOME / EXECUTION OVERVIEW', 'ГЛАВНАЯ / ОБЗОР ВЫПОЛНЕНИЯ')}
             detail={t('Real release system · sensitive material excluded', 'Действующая система релизов · конфиденциальные данные не показаны')}
             stateLabel={t('LIVE RELEASE SYSTEM', 'ДЕЙСТВУЮЩАЯ СИСТЕМА РЕЛИЗОВ')}
@@ -180,11 +180,11 @@ export function LandingPage({ locale = 'en' }: { locale?: Locale }) {
           <div className="demo-copy">
             <p className="eyebrow">{t('LIVE RELEASE TOUR', 'ПРОДУКТ В ДЕЙСТВИИ')}</p>
             <h2 id="demo-title">{t('See the control plane in motion.', 'Панель управления в действии.')}</h2>
-            <p>{t('A short tour through the real release system: dense Home state, an expanded multi-agent session, protected Housekeeping, and independent capacity.', 'Короткий обзор действующей системы релизов: насыщенная сводка статусов на главной, развёрнутая многоагентная сессия, защищённое обслуживание и независимые лимиты ёмкости.')}</p>
+            <p>{t('A tour of the real release system: Home, multi-agent work, Agents, provider-reported Statistics, Housekeeping, capacity, and redacted notification settings. Operational values and lifecycle states are real; Session and Project labels are anonymized.', 'Обзор действующей системы релизов: Home, многоагентная работа, Agents, переданная провайдером статистика, Housekeeping, ёмкость и настройки уведомлений со скрытыми данными. Рабочие значения и состояния жизненного цикла реальны; названия Session и Project обезличены.')}</p>
           </div>
           <div className="demo-frame">
-            <div className="shot-chrome" aria-hidden="true"><span className="window-dots"><i /><i /><i /></span><span>{t('THREADCELLS / LIVE RELEASE SYSTEM', 'THREADCELLS / ДЕЙСТВУЮЩАЯ СИСТЕМА РЕЛИЗОВ')}</span><span>00:14</span></div>
-            <video autoPlay controls loop muted playsInline preload="metadata" poster={assetPath('/media/screenshots/threadcells-home.webp')} aria-label={t('Live ThreadCells release-system tour', 'Обзор действующей системы релизов ThreadCells')}>
+            <div className="shot-chrome" aria-hidden="true"><span className="window-dots"><i /><i /><i /></span><span>{t('THREADCELLS / LIVE DATA · IDENTITIES ANONYMIZED', 'THREADCELLS / РЕАЛЬНЫЕ ДАННЫЕ · НАЗВАНИЯ ОБЕЗЛИЧЕНЫ')}</span><span>ALPHA</span></div>
+            <video controls loop muted playsInline preload="metadata" poster={assetPath('/media/screenshots/threadcells-home.webp')} aria-label={t('Live ThreadCells release-system tour', 'Обзор действующей системы релизов ThreadCells')}>
               <source src={assetPath('/media/demo/threadcells-demo.webm')} type="video/webm" />
               <source src={assetPath('/media/demo/threadcells-demo.mp4')} type="video/mp4" />
               {t('The demo video is unavailable in this browser.', 'Демонстрационное видео недоступно в этом браузере.')}
@@ -198,8 +198,11 @@ export function LandingPage({ locale = 'en' }: { locale?: Locale }) {
             <p>{t('Open the real session behind the summary, keep the runtime healthy, and route high-signal owner attention without losing durable context.', 'Открывайте сессию прямо из сводки, поддерживайте среду выполнения в рабочем состоянии и выносите на решение владельца только действительно важное, не теряя сохранённый контекст.')}</p>
           </div>
           <div className="shot-gallery">
-            <ProductShot src="/media/screenshots/threadcells-session-workflow.webp" alt={t('Expanded live ThreadCells session with one active owner and two completed reviewers', 'Развёрнутая сессия ThreadCells с одним активным владельцем и двумя ревьюерами, завершившими работу')} label={t('SESSION / MULTI-AGENT WORKFLOW', 'СЕССИЯ / МНОГОАГЕНТНЫЙ WORKFLOW')} detail={t('Real profiles, lifecycle, and durable completion', 'Реальные профили, жизненный цикл и зафиксированное завершение')} stateLabel={t('LIVE RELEASE SYSTEM', 'ДЕЙСТВУЮЩАЯ СИСТЕМА РЕЛИЗОВ')} locale={locale} />
-            <ProductShot src="/media/screenshots/threadcells-housekeeping.webp" alt={t('ThreadCells Housekeeping showing disk health, protected backups, schedule, and cleanup policy', 'Раздел обслуживания ThreadCells: состояние диска, защищённые резервные копии, расписание и политика очистки')} label={t('HOUSEKEEPING / SERVER CARE', 'ОБСЛУЖИВАНИЕ / СОСТОЯНИЕ СЕРВЕРА')} detail={t('Plan, revalidate, protect active work', 'Планировать, перепроверять, защищать активную работу')} stateLabel={t('LIVE RELEASE SYSTEM', 'ДЕЙСТВУЮЩАЯ СИСТЕМА РЕЛИЗОВ')} locale={locale} />
+            <ProductShot src="/media/screenshots/threadcells-session-workflow.webp" alt={t('Expanded live ThreadCells session with processing and recovery-replaced agents', 'Развёрнутая живая сессия ThreadCells с работающим агентом и агентом, заменённым при восстановлении')} label={t('SESSION / MULTI-AGENT WORKFLOW', 'СЕССИЯ / МНОГОАГЕНТНЫЙ WORKFLOW')} detail={t('Real lifecycle state and durable recovery evidence', 'Реальные состояния жизненного цикла и сохранённые данные восстановления')} stateLabel={t('LIVE RELEASE SYSTEM · IDENTITIES ANONYMIZED', 'ДЕЙСТВУЮЩАЯ СИСТЕМА · НАЗВАНИЯ ОБЕЗЛИЧЕНЫ')} locale={locale} />
+            <ProductShot src="/media/screenshots/threadcells-agents.webp" alt={t('ThreadCells Agents showing mixed lifecycle states and a stable action row', 'Раздел Agents в ThreadCells с разными состояниями жизненного цикла и стабильным рядом действий')} label={t('AGENTS / LIFECYCLE CONTROL', 'АГЕНТЫ / УПРАВЛЕНИЕ ЖИЗНЕННЫМ ЦИКЛОМ')} detail={t('Status, profile, workflow, and actions stay aligned', 'Статус, профиль, workflow и действия остаются согласованными')} stateLabel={t('LIVE RELEASE SYSTEM · IDENTITIES ANONYMIZED', 'ДЕЙСТВУЮЩАЯ СИСТЕМА · НАЗВАНИЯ ОБЕЗЛИЧЕНЫ')} locale={locale} />
+            <ProductShot src="/media/screenshots/threadcells-housekeeping.webp" alt={t('ThreadCells Housekeeping showing disk health, protected backups, schedule, and cleanup policy', 'Раздел обслуживания ThreadCells: состояние диска, защищённые резервные копии, расписание и политика очистки')} label={t('HOUSEKEEPING / SERVER CARE', 'ОБСЛУЖИВАНИЕ / СОСТОЯНИЕ СЕРВЕРА')} detail={t('Plan, revalidate, protect active work', 'Планировать, перепроверять, защищать активную работу')} stateLabel={t('LIVE RELEASE SYSTEM · IDENTITIES ANONYMIZED', 'ДЕЙСТВУЮЩАЯ СИСТЕМА · НАЗВАНИЯ ОБЕЗЛИЧЕНЫ')} locale={locale} />
+            <ProductShot src="/media/screenshots/threadcells-capacity.webp" alt={t('ThreadCells Orchestration Capacity showing independent execution limits and host pressure', 'Оркестрационная ёмкость ThreadCells с независимыми лимитами выполнения и нагрузкой хоста')} label={t('CAPACITY / HOST ADMISSION', 'ЁМКОСТЬ / ДОПУСК НА ХОСТЕ')} detail={t('Resident, provider, work, and heavy limits stay independent', 'Лимиты resident, provider, work и heavy остаются независимыми')} stateLabel={t('LIVE RELEASE SYSTEM · IDENTITIES ANONYMIZED', 'ДЕЙСТВУЮЩАЯ СИСТЕМА · НАЗВАНИЯ ОБЕЗЛИЧЕНЫ')} locale={locale} />
+            <ProductShot src="/media/screenshots/threadcells-statistics.webp" alt={t('ThreadCells Statistics showing provider-reported token usage by session and profile', 'Статистика ThreadCells с данными провайдера об использовании токенов по сессиям и профилям')} label={t('STATISTICS / PROVIDER TELEMETRY', 'СТАТИСТИКА / ТЕЛЕМЕТРИЯ ПРОВАЙДЕРА')} detail={t('Reported values stay separate from unknown data', 'Переданные значения отделены от неизвестных данных')} stateLabel={t('LIVE RELEASE SYSTEM · IDENTITIES ANONYMIZED', 'ДЕЙСТВУЮЩАЯ СИСТЕМА · НАЗВАНИЯ ОБЕЗЛИЧЕНЫ')} locale={locale} />
             <ProductShot src="/media/screenshots/threadcells-telegram.webp" alt={t('ThreadCells Telegram notification settings with destination and credential fields visibly redacted', 'Настройки уведомлений Telegram в ThreadCells: получатель и учётные данные скрыты')} label={t('TELEGRAM / OWNER ATTENTION', 'TELEGRAM / ВНИМАНИЕ ВЛАДЕЛЬЦА')} detail={t('One low-noise installation-global route', 'Один тихий канал уведомлений для всей установки')} stateLabel={t('LIVE SYSTEM · SENSITIVE FIELDS REDACTED', 'ДЕЙСТВУЮЩАЯ СИСТЕМА · КОНФИДЕНЦИАЛЬНЫЕ ПОЛЯ СКРЫТЫ')} locale={locale} />
           </div>
         </section>
@@ -221,9 +224,37 @@ export function LandingPage({ locale = 'en' }: { locale?: Locale }) {
           </div>
         </section>
 
+        <section id="get-started" className="preview section-shell" aria-labelledby="preview-title">
+          <div className="preview-heading">
+            <p className="eyebrow">{t('TECHNICAL PREVIEW', 'ТЕХНИЧЕСКАЯ ПРЕДВАРИТЕЛЬНАЯ ВЕРСИЯ')} / 08</p>
+            <h2 id="preview-title">{t('A practical first run.', 'Понятный первый запуск.')}<br /><span>{t('Honest alpha boundaries.', 'Честные границы alpha-версии.')}</span></h2>
+            <p>{t('ThreadCells is for individual developers and trusted small teams that operate several coding agents on one Linux host and want durable workflow state instead of a pile of terminal tabs.', 'ThreadCells предназначен для разработчиков и небольших доверенных команд, которые запускают несколько кодовых агентов на одном Linux-хосте и хотят видеть устойчивое состояние процессов, а не набор вкладок терминала.')}</p>
+          </div>
+          <div className="preview-grid">
+            <article>
+              <span>01</span>
+              <h3>{t('Start on a trusted Linux host', 'Начните на доверенном Linux-хосте')}</h3>
+              <p>{t('The supported baseline is Ubuntu or Debian with Python 3, Git, tmux, Node.js/npm for the Web build, and at least one provider CLI you have authenticated.', 'Поддерживаемая базовая среда — Ubuntu или Debian с Python 3, Git, tmux, Node.js/npm для сборки Web UI и хотя бы одним CLI провайдера, в котором вы авторизовались.')}</p>
+              <a href={assetPath(docsPath(locale, 'getting-started'))}>{t('Open the installation guide', 'Открыть руководство по установке')} <ArrowRight /></a>
+            </article>
+            <article>
+              <span>02</span>
+              <h3>{t('Provider support stays explicit', 'Поддержка провайдеров остаётся явной')}</h3>
+              <p>{t('Eight built-in adapters normalize launch and lifecycle. Codex is the release-acceptance reference; readiness, resume, usage, and model controls still depend on the installed provider CLI.', 'Восемь встроенных адаптеров приводят запуск и жизненный цикл к общей модели. Codex служит эталоном релизной приёмки; готовность, возобновление, usage и управление моделью всё равно зависят от установленного CLI провайдера.')}</p>
+              <a href={assetPath(docsPath(locale, 'providers'))}>{t('Check provider compatibility', 'Проверить совместимость провайдеров')} <ArrowRight /></a>
+            </article>
+            <article>
+              <span>03</span>
+              <h3>{t('Know where trust stops', 'Понимайте границы доверия')}</h3>
+              <p>{t('This alpha targets one trusted operator and one host. It is loopback-first, supports remote use through an SSH tunnel, and does not treat worktrees as security sandboxes or isolate hostile tenants.', 'Эта alpha-версия рассчитана на одного доверенного оператора и один хост. По умолчанию используется loopback, удалённый доступ поддерживается через SSH-туннель, а worktree не считаются песочницами и не изолируют недоверенных пользователей.')}</p>
+              <a href={assetPath(docsPath(locale, 'limitations'))}>{t('Read the alpha limitations', 'Прочитать об ограничениях alpha-версии')} <ArrowRight /></a>
+            </article>
+          </div>
+        </section>
+
         <section id="open-source" className="ownership section-shell" aria-labelledby="ownership-title">
           <div className="ownership-copy">
-            <p className="eyebrow">{t('MACHINE OWNERSHIP', 'ВЛАДЕНИЕ МАШИНОЙ')} / 08</p>
+            <p className="eyebrow">{t('MACHINE OWNERSHIP', 'ВЛАДЕНИЕ МАШИНОЙ')} / 09</p>
             <h2 id="ownership-title">{t('Your host.', 'Ваш хост.')}<br />{t('Your terminals.', 'Ваши терминалы.')}<br /><span>{t('Your control.', 'Ваш контроль.')}</span></h2>
             <p>{t('ThreadCells is self-hosted and loopback-first. It coordinates powerful local tools; it does not pretend a worktree is a security sandbox or promise hostile multi-tenancy.', 'ThreadCells развёрнут на вашем хосте и по умолчанию доступен только через loopback. Он координирует мощные локальные инструменты, но не выдаёт Git worktree за безопасную песочницу и не обещает безопасную изоляцию недоверенных пользователей.')}</p>
             <div className="ownership-points">
@@ -240,7 +271,7 @@ export function LandingPage({ locale = 'en' }: { locale?: Locale }) {
         <section className="final-cta section-shell" aria-labelledby="cta-title">
           <div className="cta-grid" aria-hidden="true" />
           <img src={assetPath('/threadcells-symbol.webp')} alt="" width="512" height="512" />
-          <p className="eyebrow">{t('READY', 'ГОТОВО')} / 09</p>
+          <p className="eyebrow">{t('READY', 'ГОТОВО')} / 10</p>
           <h2 id="cta-title">{t('Stop guessing what the agents are doing.', 'Перестаньте гадать, что делают агенты.')}</h2>
           <p>{t('Run the work. See the machine. Keep the result.', 'Запускайте работу. Держите хост в поле зрения. Сохраняйте результат.')}</p>
           <div className="hero-actions">

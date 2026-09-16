@@ -1,14 +1,14 @@
 ---
 slug: workflows-and-results
 source: docs/WORKFLOWS_AND_RESULTS.md
-source_sha256: sha256:96ac4e69b487f09d35f8aaa05ea5c343a7a6010be84f2f1bc7b8592994c441c0
+source_sha256: sha256:cca4aa78d9406e06aecd234b9a46197381b3792de57a47da035ca0ca075922ae
 ---
 
 # Flujos de trabajo y resultados duraderos
 
 Un flujo de trabajo representa trabajo que debe permanecer coherente a través de varios turnos de modelo, terminales o agentes delegados. Impide que el mensaje final de un proveedor se confunda con la finalización de la misión más amplia.
 
-![Sesión activa expandida de ThreadCells que muestra participantes del flujo de trabajo activos y completados](/media/screenshots/threadcells-session-workflow.webp)
+![Sesión activa expandida de ThreadCells que muestra participantes en proceso y reemplazados durante la recuperación](/media/screenshots/threadcells-session-workflow.webp)
 
 ## Trabajo de nivel superior y delegado
 

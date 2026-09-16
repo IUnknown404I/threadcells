@@ -1,13 +1,13 @@
 ---
 slug: workflows-and-results
 source: docs/WORKFLOWS_AND_RESULTS.md
-source_sha256: sha256:96ac4e69b487f09d35f8aaa05ea5c343a7a6010be84f2f1bc7b8592994c441c0
+source_sha256: sha256:cca4aa78d9406e06aecd234b9a46197381b3792de57a47da035ca0ca075922ae
 ---
 # ワークフローと永続的な結果
 
 ワークフローは、複数のモデルターン、ターミナル、または委任されたエージェントにまたがって一貫性を保つ必要がある作業を表します。これにより、プロバイダーの最終メッセージがより大きなミッションの完了と誤認されるのを防ぎます。
 
-![アクティブおよび完了済みのワークフロー参加者を示す、展開されたライブ ThreadCells セッション](/media/screenshots/threadcells-session-workflow.webp)
+![処理中および復旧時に置き換えられたワークフロー参加者を示す、展開されたライブ ThreadCells セッション](/media/screenshots/threadcells-session-workflow.webp)
 
 ## トップレベルと委任された作業
 

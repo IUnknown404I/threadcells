@@ -36,7 +36,7 @@ O ThreadCells mantém ativamente a saúde do próprio ambiente de agentes, mas n
 
 | Fluxo de trabalho durável com vários agentes | Housekeeping protegido |
 | --- | --- |
-| ![Sessão ativa expandida do ThreadCells com um proprietário ativo e dois revisores concluídos](../../launch-media/output/screenshots/threadcells-session-workflow.png) | ![Housekeeping do ThreadCells mostrando integridade do disco, backups protegidos, agendas e política de limpeza](../../launch-media/output/screenshots/threadcells-housekeeping.png) |
+| ![Sessão ativa expandida do ThreadCells com um agente em processamento e outro substituído durante a recuperação](../../launch-media/output/screenshots/threadcells-session-workflow.png) | ![Housekeeping do ThreadCells mostrando integridade do disco, backups protegidos, agendas e política de limpeza](../../launch-media/output/screenshots/threadcells-housekeeping.png) |
 
 As notificações do Telegram oferecem uma única rota global e de baixo ruído para conclusão, falha e atenção do proprietário no nível superior. Os campos sensíveis de destino e credenciais são intencionalmente ocultados na [captura pública do Telegram](../../launch-media/output/screenshots/threadcells-telegram.png).
 
@@ -59,7 +59,7 @@ flowchart LR
 
 ## Segurança e status da versão de prévia
 
-A prévia técnica `0.3.4-alpha` oferece suporte a um único host Linux Ubuntu/Debian, acesso por loopback como padrão e uma configuração voltada primeiro ao Codex. Agentes nativos podem executar comandos poderosos; worktrees não são um sandbox de segurança. Consulte as [limitações](../LIMITATIONS.md) antes de avaliar.
+A prévia técnica `0.4.0-alpha` oferece suporte a um único host Linux Ubuntu/Debian, acesso por loopback como padrão e uma configuração voltada primeiro ao Codex. Agentes nativos podem executar comandos poderosos; worktrees não são um sandbox de segurança. Consulte as [limitações](../LIMITATIONS.md) antes de avaliar.
 
 O pacote OCI público `ghcr.io/iunknown404i/threadcells-release-bundle` contém arquivos de lançamento verificados e suas evidências. Ele é um artefato de distribuição, não uma imagem Docker nem um modo de implantação em contêiner compatível; consulte o [processo de lançamento](../RELEASE_PROCESS.md).
 

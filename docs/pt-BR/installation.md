@@ -1,7 +1,7 @@
 ---
 slug: installation
 source: docs/INSTALLATION.md
-source_sha256: sha256:d5c33606b8b96ba951a941945b5ddc516900ef968a4b15e4e0d40ca40df19fd3
+source_sha256: sha256:39f7b5b745a164524a96fc9dbd62423d2546416477714ed4e6bc203b6e4eb508
 ---
 
 # Instalação
@@ -65,7 +65,7 @@ Na raiz do repositório:
 
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
-candidate="$PWD/threadcells-candidate/threadcells-0.3.4a0-local"
+candidate="$PWD/threadcells-candidate/threadcells-0.4.0a0-local"
 python3 scripts/verify_local_candidate.py --candidate "$candidate"
 ```
 

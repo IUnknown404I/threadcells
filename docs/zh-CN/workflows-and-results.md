@@ -1,13 +1,13 @@
 ---
 slug: workflows-and-results
 source: docs/WORKFLOWS_AND_RESULTS.md
-source_sha256: sha256:96ac4e69b487f09d35f8aaa05ea5c343a7a6010be84f2f1bc7b8592994c441c0
+source_sha256: sha256:cca4aa78d9406e06aecd234b9a46197381b3792de57a47da035ca0ca075922ae
 ---
 # 工作流和持久结果
 
 工作流表示必须跨越多个模型回合、终端或委派代理保持一致的工作。它防止将提供商的最终消息误认为更大任务已经完成。
 
-![显示活动和已完成工作流参与者的展开式实时 ThreadCells 会话](/media/screenshots/threadcells-session-workflow.webp)
+![显示正在处理和恢复时被替换的工作流参与者的展开式实时 ThreadCells 会话](/media/screenshots/threadcells-session-workflow.webp)
 
 ## 顶层和委派工作
 

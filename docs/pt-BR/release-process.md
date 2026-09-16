@@ -1,7 +1,7 @@
 ---
 slug: release-process
 source: docs/RELEASE_PROCESS.md
-source_sha256: sha256:66966038765eab40e9e11f4cbd81cc126fc199a63e95390194c3d88dbdd598b6
+source_sha256: sha256:94e2111e40b5d9a5fe29571af6adba03ef88decf06f66b66a16b3563c3d43237
 ---
 
 # Processo de lançamento
@@ -39,6 +39,7 @@ O ThreadCells segue a ordenação normal de prereleases do SemVer. Durante a pr�
 - `v0.3.0-alpha.1` adiciona consistência de ciclo de vida, ordem de criação durável, Full Cleanup e política sistêmica de roteamento.
 - `v0.3.0-alpha.2` corrige a entrega do Workflow Composer e torna a saída do terminal definitiva para a autoridade de workflow executável.
 - `v0.3.3-alpha` adiciona localização em inglês e russo à interface autenticada e um único corpus canônico de Docs por idioma para o aplicativo e o site público.
+- `v0.4.0-alpha` alinha o estado durável de workflows, recuperação, exclusão e Housekeeping com a interface autenticada, a documentação pública e a mídia do lançamento.
 - Uma publicação alpha posterior incrementa deliberadamente a versão semântica e mantém o estágio `alpha` sem sufixo numérico.
 
 Nunca mova uma tag existente. Mudanças apenas de governança do repositório não acionam aumento de versão nem lançamento. Atualize todas as superfícies canônicas que carregam versão juntas somente quando o próximo contorno significativo de implementação estiver pronto para publicação.

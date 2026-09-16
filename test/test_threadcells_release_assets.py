@@ -330,6 +330,7 @@ def test_public_media_inventory_is_live_bounded_and_shared_by_docs() -> None:
         "threadcells-home",
         "threadcells-session-workflow",
         "threadcells-agents",
+        "threadcells-statistics",
         "threadcells-housekeeping",
         "threadcells-telegram",
         "threadcells-capacity",
@@ -348,6 +349,9 @@ def test_public_media_inventory_is_live_bounded_and_shared_by_docs() -> None:
         assert master.stat().st_size < 300_000
         assert website.stat().st_size < 150_000
         assert website.read_bytes() == runtime.read_bytes()
+
+    statistics_docs = (ROOT / "docs" / "STATISTICS.md").read_text(encoding="utf-8")
+    assert "/media/screenshots/threadcells-statistics.webp" in statistics_docs
 
     demo_master = ROOT / "launch-media" / "output" / "demo" / "threadcells-demo.webm"
     website_demo = ROOT / "website" / "public" / "media" / "demo"

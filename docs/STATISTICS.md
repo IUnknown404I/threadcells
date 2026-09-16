@@ -2,6 +2,8 @@
 
 Statistics summarizes usage that supported provider CLIs actually emit. It helps answer which sessions, profiles, projects, and providers consumed model tokens; it is not a billing ledger and does not invent missing values.
 
+![Live ThreadCells Statistics with provider-reported usage grouped by operational identity](/media/screenshots/threadcells-statistics.webp)
+
 ## What the numbers mean
 
 For Codex, ThreadCells records the cumulative provider-native counters available in rollout telemetry:

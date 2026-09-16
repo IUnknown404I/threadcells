@@ -76,8 +76,8 @@ try {
     }))
     assert.deepEqual(
       { autoplay: demoState.autoplay, muted: demoState.muted, loop: demoState.loop, playsInline: demoState.playsInline },
-      { autoplay: true, muted: true, loop: true, playsInline: true },
-      `${viewport.name} live tour uses native autoplay, muted, loop, and playsinline behavior`,
+      { autoplay: false, muted: true, loop: true, playsInline: true },
+      `${viewport.name} live tour stays user-initiated, muted, looped, and playsinline`,
     )
     assert.equal(demoState.sources.length, 2, `${viewport.name} live tour has WebM and MP4 sources`)
     assert.equal(await page.getByRole('link', { name: 'ThreadCells — GitHub' }).getAttribute('href'), 'https://github.com/IUnknown404I/threadcells', `${viewport.name} uses the official repository`)
@@ -124,6 +124,7 @@ try {
   await reducedPage.waitForTimeout(2100)
   assert.equal(await reducedPage.locator('.mesh-stage').getAttribute('data-phase'), initialPhase, 'reduced motion keeps a stable mesh frame')
   assert.equal(await reducedPage.evaluate(() => getComputedStyle(document.documentElement).scrollBehavior), 'auto', 'reduced motion disables smooth scroll')
+  assert.equal(await reducedPage.getByLabel('Live ThreadCells release-system tour').evaluate(video => video.autoplay), false, 'reduced motion never starts the product tour automatically')
   await reduced.close()
 
   const analyticsOrigin = server.origin.replace('127.0.0.1', 'iunknown404i.github.io')

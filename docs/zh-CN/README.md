@@ -36,7 +36,7 @@ ThreadCells 会主动维护自身智能体环境的健康状态，但无法保�
 
 | 持久化的多智能体工作流 | 受保护的 Housekeeping |
 | --- | --- |
-| ![展开的实时 ThreadCells 会话，其中一位所有者处于活跃状态，两位审查者已经完成](../../launch-media/output/screenshots/threadcells-session-workflow.png) | ![ThreadCells Housekeeping 展示磁盘健康、受保护备份、计划任务和清理策略](../../launch-media/output/screenshots/threadcells-housekeeping.png) |
+| ![展开的实时 ThreadCells 会话，显示正在处理的智能体和恢复时被替换的智能体](../../launch-media/output/screenshots/threadcells-session-workflow.png) | ![ThreadCells Housekeeping 展示磁盘健康、受保护备份、计划任务和清理策略](../../launch-media/output/screenshots/threadcells-housekeeping.png) |
 
 Telegram 通知为顶层完成、失败和需要所有者关注的情况提供一个低干扰、全安装共用的通道。[公开的 Telegram 截图](../../launch-media/output/screenshots/threadcells-telegram.png)已特意隐去敏感的目标地址和凭据字段。
 
@@ -59,7 +59,7 @@ flowchart LR
 
 ## 安全与预览版本状态
 
-`0.3.4-alpha` 技术预览版支持单台 Ubuntu/Debian Linux 主机，默认采用 loopback 访问，并以 Codex 为首要配置。原生智能体可以执行高权限命令；worktree 不是安全沙箱。评估前请阅读[当前限制](../LIMITATIONS.md)。
+`0.4.0-alpha` 技术预览版支持单台 Ubuntu/Debian Linux 主机，默认采用 loopback 访问，并以 Codex 为首要配置。原生智能体可以执行高权限命令；worktree 不是安全沙箱。评估前请阅读[当前限制](../LIMITATIONS.md)。
 
 公开 OCI 包 `ghcr.io/iunknown404i/threadcells-release-bundle` 携带经过验证的发布归档和证据。它是分发制品，不是 Docker 镜像，也不是受支持的容器部署方式；请参阅[发布流程](../RELEASE_PROCESS.md)。
 

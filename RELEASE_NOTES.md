@@ -1,50 +1,52 @@
-# ThreadCells v0.3.4-alpha
+# ThreadCells v0.4.0-alpha
 
-ThreadCells `v0.3.4-alpha` adds safe supervisor recovery takeover and isolated writable supervisor Sessions within the same Project. It also includes the workflow, provider-safety, and child-lifecycle reliability work accepted since `v0.3.3-alpha`. This remains an alpha technical preview for trusted operators on Linux hosts.
+ThreadCells `v0.4.0-alpha` is a reliability and product-completion release. It makes workflow continuation, exact review, Session deletion, recovery, and Housekeeping agree on durable lifecycle truth, then brings the Web UI, public documentation, landing page, and real-product media to that same state. It remains a technical preview for trusted operators on one Linux host.
 
 ## Highlights
 
-### Safe supervisor recovery takeover
+### Durable work from admission to acknowledgement
 
-An owner-authorized recovery action can now replace an unusable supervisor without creating a second valid writer for the same work context. The durable takeover saga fences the old supervisor and writer generation before admitting its successor, preserves the existing managed worktree—including dirty state—and resumes safely across service restarts. The old terminal remains visible as `recovery_fenced` for audit instead of being erased. See [#95](https://github.com/IUnknown404I/threadcells/issues/95).
+Accepted workflow input now remains tied to an exact durable turn and effect through queueing, provider-capacity waits, reconnects, service restarts, and model compaction. Exact-revision review keeps its inspected commit identity, durable result, delivery/read/ack state, and parent continuation. ThreadCells does not interpret a silent provider or an uncertain transport as successful completion, and it does not replay an indeterminate send.
 
-### Multiple isolated supervisors per Project
+Current and History expose this lineage without relying on terminal output as the source of truth. Results can be delivered, read, incorporated, and acknowledged before child resources retire; a provider final alone still does not close an open top-level workflow.
 
-Independent Sessions in one Project can now run separate supervisors subject to normal capacity. Every new Project-backed writable supervisor, including the first, receives a unique managed Git worktree, branch, work context, and writer lease. The registered Project root is canonical Git/source authority rather than the normal writable agent directory. Same-context replacement still uses recovery takeover; ordinary admission cannot acquire another context's writer lease. See [#97](https://github.com/IUnknown404I/threadcells/issues/97).
+### Recovery and deletion tell the same story
 
-## Reliability
+Recovery replacement continues to fence the predecessor writer before a successor becomes writable. Once takeover is durably complete, historical `recovery_fenced` metadata no longer blocks deletion of an otherwise eligible predecessor Session. Deletion remains idempotent and preserves the successor worktree, writer lease, and writable context. A genuinely unresolved or indeterminate recovery authority remains protected and is reported as the concrete blocker.
 
-- Canonical session identity now survives child admission, so name collisions cannot silently join the wrong historical Session ([#85](https://github.com/IUnknown404I/threadcells/issues/85)).
-- Assigned child agents retire through durable, restart-safe reconciliation only after their results are finalized and acknowledged; quiescent completed provider states no longer strand them ([#82](https://github.com/IUnknown404I/threadcells/issues/82)).
-- Provider content-unavailable outcomes are structured and generation-fenced. ThreadCells preserves lifecycle evidence without retaining, reconstructing, or automatically retrying blocked provider content ([#89](https://github.com/IUnknown404I/threadcells/issues/89)).
-- Queued Workflow Composer input is durable scheduling authority: ThreadCells autonomously wakes or reconnects an eligible provider, injects FIFO input exactly once into an existing execution when possible, and recovers rolling-upgrade and false-Ready boundaries without Raw Terminal intervention ([#92](https://github.com/IUnknown404I/threadcells/issues/92)).
+### Housekeeping with explainable evidence
 
-## Workspace and Git authority
+Housekeeping now inventories protected backup and tool roots without converting unknown ownership or partial measurements into reclaimable bytes. Dry runs distinguish estimates from actual reclaimed space. Reports separate protected resources, execution-time safety skips, diagnostic warnings, failures, start/completion time, duration, and post-run disk state.
 
-- One writable work context maps to one managed worktree and at most one active writer lease.
-- Independent Project Sessions use distinct checkouts and branches while sharing canonical repository object authority.
-- Recovery takeover preserves the original work context and worktree, rotates writer authority, and permanently fences the replaced supervisor generation.
-- Read-only review does not require an unnecessary writable worktree, and operation-level locks continue to protect exclusive deployment and destructive actions.
+The privileged protected-inventory request is pathless, bounded, serialized, and bound to the exact trusted root configuration. Full Cleanup retains its exact-plan, all-idle, permanent-confirmation, and execute-time revalidation gates. A disconnect or restart recovers the one durable operation result rather than starting another destructive pass.
+
+### A steadier operating surface
+
+- Agents keeps History, Inbox, and Output readable on desktop while Terminal, Finish, and Delete use equal icon-only controls. The six primary actions stay in one stable right-aligned row without an empty Recovery slot.
+- Home, Agents, Current, History, Full Output, status badges, and Session actions use consistent lifecycle projections.
+- Absolute timestamps support browser Auto or a selected IANA time zone without changing durable server values.
+- Mobile and intermediate-width layouts preserve usable labels, touch targets, and page bounds.
+
+## Public experience
+
+The landing page now states who ThreadCells is for, the supported Ubuntu/Debian baseline, how the eight built-in provider adapters are qualified, and where the single-host trusted-operator boundary stops. Installation, provider compatibility, limitations, release identity, and documentation are linked directly rather than hidden behind product slogans.
+
+Public screenshots and the release tour are recaptured from the real release system after deployment. Private paths, destinations, credentials, and workflow content are excluded or irreversibly redacted; operational counts and lifecycle states remain real.
 
 ## Upgrade and compatibility
 
-Existing active legacy Sessions that use a shared or Project-root workspace remain in place. ThreadCells does not automatically move, copy, reset, clean, or stash their state during upgrade. New Project-backed writable supervisor Sessions receive isolated managed worktrees automatically.
+For a new installation, follow [Quick Setup](QUICK_SETUP.md). Existing operators should follow [Upgrading](docs/UPGRADING.md): build and verify the exact candidate, create and integrity-check a SQLite backup, preserve rollback during acceptance, and activate only after health and workflow checks pass.
 
-For a new installation, follow [Quick Setup](QUICK_SETUP.md). Existing operators should follow [Upgrading](docs/UPGRADING.md): verify the exact tagged candidate, create and integrity-check a SQLite backup, preserve rollback during deployment acceptance, and activate only after health and workflow checks pass.
-
-## Operational notes
-
-- Recovery takeover is an explicit owner action and fails closed for healthy or actively Processing supervisors.
-- Global Resident, Provider, and Work capacity limits still apply even though multiple independent Sessions may belong to one Project.
-- Workflow owner gates remain distinct from queued-input liveness, provider reconnect, and dispatcher failure states.
+Existing active legacy Sessions are preserved rather than moved, reset, cleaned, or stashed. New Project-backed writable supervisor Sessions continue to use isolated managed worktrees. Existing durable workflow, result, recovery, and deletion records are reconciled through product lifecycle mechanisms; do not edit the database to clear a fence.
 
 ## Known limitations
 
-- ThreadCells remains a single-host technical preview for trusted operators; managed worktrees isolate Git checkouts, not operating-system, filesystem, or network access.
-- Existing legacy shared-root Sessions are preserved rather than migrated automatically.
-- Native provider capability and authentication reporting vary by installed CLI.
-- The authenticated UI supports English and opt-in Russian. Public Docs remain available in all seven supported locales.
+- ThreadCells remains a single-host technical preview for a trusted operator. Worktrees isolate Git checkouts, not operating-system, filesystem, or network access.
+- Provider readiness, resume, usage, authentication, and model controls depend on the installed native CLI. Codex is the release-acceptance reference; other adapters are conditional where documented.
+- Full Cleanup requires authoritative all-idle state and may correctly preserve backups, tools, dirty/unpublished worktrees, or other ambiguous resources.
+- A historical workflow with an indeterminate external send still needs evidence or a supported owner-resolution path; this release does not invent its outcome.
+- The authenticated UI supports English and opt-in Russian. Public documentation remains available in all seven supported locales.
 
-The OCI artifact at `ghcr.io/iunknown404i/threadcells-release-bundle:v0.3.4-alpha` is a distribution bundle, not a runtime container image. Verify `BUNDLE-SHA256SUMS` and the archive checksum before using its contents. `latest-alpha` may point to this exact artifact; the unqualified stable `latest` tag is not published.
+The OCI artifact at `ghcr.io/iunknown404i/threadcells-release-bundle:v0.4.0-alpha` is a distribution bundle, not a runtime container image. Verify `BUNDLE-SHA256SUMS` and the archive checksum before using its contents. `latest-alpha` may point to this exact artifact; the unqualified stable `latest` tag is not published.
 
 All previous tags and immutable release artifacts remain unchanged. See the [public documentation](https://iunknown404i.github.io/threadcells/docs/) and [release process](docs/RELEASE_PROCESS.md) for the complete operating and distribution model.

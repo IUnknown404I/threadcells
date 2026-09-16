@@ -291,6 +291,21 @@ img { display: block; max-width: 100%; }
 .native-copy li { display: flex; gap: 10px; align-items: flex-start; }
 .native-copy li svg { flex: 0 0 auto; margin-top: 2px; color: var(--green); }
 
+.preview { padding-block: 150px; border-top: 1px solid var(--line); }
+.preview-heading { display: grid; grid-template-columns: 1fr .75fr; column-gap: 80px; align-items: end; }
+.preview-heading .eyebrow { grid-column: 1 / -1; margin-bottom: 28px; }
+.preview-heading h2 { margin: 0; font-size: clamp(44px, 4.8vw, 68px); font-weight: 510; line-height: 1.02; letter-spacing: -.058em; }
+.preview-heading h2 span { color: #758178; }
+.preview-heading > p:last-child { max-width: 520px; margin: 0 0 6px; color: var(--muted); font-size: 16px; line-height: 1.7; }
+.preview-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; margin-top: 76px; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; background: var(--line); }
+.preview-grid article { display: flex; min-height: 360px; flex-direction: column; padding: 32px; background: linear-gradient(145deg, rgba(14,21,16,.98), rgba(7,10,8,.98)); }
+.preview-grid article > span { color: var(--green); font: 600 10px/1 var(--mono); letter-spacing: .12em; }
+.preview-grid h3 { margin: 46px 0 18px; font-size: 25px; font-weight: 530; line-height: 1.12; letter-spacing: -.035em; }
+.preview-grid p { margin: 0; color: #919d94; font-size: 14px; line-height: 1.7; }
+.preview-grid a { display: inline-flex; align-items: center; gap: 8px; margin-top: auto; padding-top: 30px; color: var(--green); font: 600 11px/1.4 var(--mono); }
+.preview-grid a svg { width: 15px; height: 15px; transition: transform 180ms var(--ease); }
+.preview-grid a:hover svg { transform: translateX(3px); }
+
 .ownership { display: grid; grid-template-columns: .95fr 1.05fr; gap: 100px; padding-block: 150px; border-top: 1px solid var(--line); }
 .ownership-copy > p:not(.eyebrow) { max-width: 570px; margin: 28px 0 38px; color: var(--muted); font-size: 16px; line-height: 1.7; }
 .ownership-points { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
@@ -471,6 +486,10 @@ img { display: block; max-width: 100%; }
   .shot-gallery .product-shot:first-child .shot-media { min-height: 0; height: auto; aspect-ratio: 3 / 2; }
   .native { grid-template-columns: 1fr; padding-block: 110px; }
   .native-terminal { order: 2; transform: none; }
+  .preview { padding-block: 110px; }
+  .preview-heading { grid-template-columns: 1fr; gap: 25px; }
+  .preview-grid { grid-template-columns: 1fr; margin-top: 56px; }
+  .preview-grid article { min-height: 290px; }
   .ownership { grid-template-columns: 1fr; padding-block: 110px; }
   .license-panel { min-height: 420px; }
   .footer-top { grid-template-columns: 1fr 1fr; gap: 30px; padding-block: 42px; }
@@ -518,7 +537,7 @@ img { display: block; max-width: 100%; }
   .mesh-capacity > span:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
   .signal-strip span { min-height: 64px; padding: 0 8px; font-size: 7px; }
   .problem { padding-block: 90px; }
-  .section-heading h2, .how-heading h2, .native-copy h2, .ownership-copy h2, .final-cta h2 { font-size: 42px; }
+  .section-heading h2, .how-heading h2, .native-copy h2, .preview-heading h2, .ownership-copy h2, .final-cta h2 { font-size: 42px; }
   .problem-lede { font-size: 17px; }
   .truth-ledger > div { grid-template-columns: 66px 1fr auto; gap: 7px; }
   .truth-ledger small { display: none; }
@@ -526,7 +545,7 @@ img { display: block; max-width: 100%; }
   .product-shot { border-radius: 9px; }
   .shot-chrome > span:last-child { display: none; }
   .product-shot figcaption { flex-direction: column; gap: 5px; }
-  .capabilities, .how, .experience, .native, .ownership { padding-block: 90px; }
+  .capabilities, .how, .experience, .native, .preview, .ownership { padding-block: 90px; }
   .demo { padding-bottom: 90px; }
   .capability-row { grid-template-columns: 34px 42px 1fr; gap: 12px; }
   .capability-icon { width: 38px; height: 38px; }
@@ -535,6 +554,10 @@ img { display: block; max-width: 100%; }
   .workflow-steps li { grid-template-columns: 32px 1px 1fr; gap: 17px; }
   .workflow-steps h3 { font-size: 22px; }
   .native-terminal pre { min-height: 380px; padding: 25px 20px; font-size: 10px; line-height: 1.85; }
+  .preview-grid { margin-top: 42px; }
+  .preview-grid article { min-height: 0; padding: 25px 22px; }
+  .preview-grid h3 { margin-top: 34px; font-size: 23px; }
+  .preview-grid a { margin-top: 28px; }
   .ownership-points { grid-template-columns: 1fr; }
   .license-panel { grid-template-columns: 1fr; min-height: 500px; align-content: end; gap: 50px; padding: 28px; }
   .license-code { font-size: 44px; }

@@ -36,7 +36,7 @@ ThreadCells mantiene activamente la salud de su propio entorno de agentes, pero 
 
 | Flujo de trabajo multiagente duradero | Housekeeping protegido |
 | --- | --- |
-| ![Sesión activa de ThreadCells desplegada, con un propietario activo y dos revisores que han terminado](../../launch-media/output/screenshots/threadcells-session-workflow.png) | ![Housekeeping de ThreadCells con salud del disco, backups protegidos, programaciones y política de limpieza](../../launch-media/output/screenshots/threadcells-housekeeping.png) |
+| ![Sesión activa de ThreadCells desplegada con un agente en proceso y otro reemplazado durante la recuperación](../../launch-media/output/screenshots/threadcells-session-workflow.png) | ![Housekeeping de ThreadCells con salud del disco, backups protegidos, programaciones y política de limpieza](../../launch-media/output/screenshots/threadcells-housekeeping.png) |
 
 Las notificaciones de Telegram proporcionan una única vía global y de bajo ruido para finalizaciones, fallos y atención del propietario en el nivel superior. Los campos sensibles de destino y credenciales se ocultan intencionadamente en [la captura pública de Telegram](../../launch-media/output/screenshots/threadcells-telegram.png).
 
@@ -59,7 +59,7 @@ flowchart LR
 
 ## Seguridad y estado de la versión preliminar
 
-La versión preliminar técnica `0.3.4-alpha` admite un único host Ubuntu/Debian Linux, acceso loopback por defecto y una configuración centrada en Codex. Los agentes nativos pueden ejecutar comandos potentes; los worktrees no son un sandbox de seguridad. Consulta las [limitaciones](../LIMITATIONS.md) antes de evaluarlo.
+La versión preliminar técnica `0.4.0-alpha` admite un único host Ubuntu/Debian Linux, acceso loopback por defecto y una configuración centrada en Codex. Los agentes nativos pueden ejecutar comandos potentes; los worktrees no son un sandbox de seguridad. Consulta las [limitaciones](../LIMITATIONS.md) antes de evaluarlo.
 
 El paquete OCI público `ghcr.io/iunknown404i/threadcells-release-bundle` contiene archivos de publicación verificados y sus evidencias. Es un artefacto de distribución, no una imagen Docker ni un modo de despliegue en contenedores admitido; consulta el [proceso de publicación](../RELEASE_PROCESS.md).
 

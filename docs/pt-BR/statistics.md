@@ -1,12 +1,14 @@
 ---
 slug: statistics
 source: docs/STATISTICS.md
-source_sha256: sha256:ca9ce387ff845fb61aba3bc22c45084a825764e2ce7e156d6963e152e490de2b
+source_sha256: sha256:4b8facbc779d119e0db62e2c3664eb538ad9fc4f6b0f841ef45f3576f62a17c6
 ---
 
 # Estatísticas e uso do provedor
 
 Statistics resume o uso que as CLIs de provedores compatíveis realmente emitem. Ele ajuda a responder quais sessões, perfis, projetos e provedores consumiram tokens de modelo; não é um livro-razão de cobrança e não inventa valores ausentes.
+
+![Estatísticas ativas do ThreadCells com o uso informado pelo provedor agrupado por identidade operacional](/media/screenshots/threadcells-statistics.webp)
 
 ## O que os números significam
 

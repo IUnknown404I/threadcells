@@ -1,11 +1,13 @@
 ---
 slug: statistics
 source: docs/STATISTICS.md
-source_sha256: sha256:ca9ce387ff845fb61aba3bc22c45084a825764e2ce7e156d6963e152e490de2b
+source_sha256: sha256:4b8facbc779d119e0db62e2c3664eb538ad9fc4f6b0f841ef45f3576f62a17c6
 ---
 # 统计和提供商用量
 
 Statistics 汇总受支持的提供商 CLI 实际发出的用量数据。它帮助回答哪些会话、配置文件、项目和提供商消耗了模型 token；它不是计费账本，也不会虚构缺失值。
+
+![ThreadCells 实时统计页面，按运维身份汇总提供商报告的用量](/media/screenshots/threadcells-statistics.webp)
 
 ## 数字的含义
 

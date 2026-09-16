@@ -28,7 +28,7 @@ const productRevision = execFileSync('git', ['rev-parse', 'HEAD'], {
   encoding: 'utf8',
 }).trim()
 const captureSelection = new Set(
-  (process.env.THREADCELLS_CAPTURE_SET || 'home,session,agents,housekeeping,telegram,capacity,demo')
+  (process.env.THREADCELLS_CAPTURE_SET || 'home,session,agents,statistics,housekeeping,telegram,capacity,demo')
     .split(',')
     .map((value) => value.trim())
     .filter(Boolean),
@@ -41,6 +41,97 @@ const privatePatterns = [
   /\bsk-[A-Za-z0-9_-]{16,}\b/i,
   /\b\d{8,10}:[A-Za-z0-9_-]{20,}\b/,
 ]
+
+async function anonymizePublicIdentities(page) {
+  await page.evaluate(() => {
+    const replacePublicText = (root, original, replacement) => {
+      if (!original || original === replacement) return
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+      const nodes = []
+      while (walker.nextNode()) nodes.push(walker.currentNode)
+      for (const node of nodes) node.nodeValue = (node.nodeValue || '').replaceAll(original, replacement)
+      for (const element of root.querySelectorAll('[title], [aria-label], [value]')) {
+        for (const attribute of ['title', 'aria-label', 'value']) {
+          if (!element.hasAttribute(attribute)) continue
+          element.setAttribute(attribute, (element.getAttribute(attribute) || '').replaceAll(original, replacement))
+        }
+      }
+    }
+
+    let sessionIndex = 0
+    for (const row of document.querySelectorAll('[data-testid^="session-title-row-"]')) {
+      const label = row.querySelector('span[title]')
+      if (!label) continue
+      sessionIndex += 1
+      const replacement = `Release workflow ${String(sessionIndex).padStart(2, '0')}`
+      label.textContent = replacement
+      label.setAttribute('title', replacement)
+      row.setAttribute('aria-label', `${row.getAttribute('aria-expanded') === 'true' ? 'Collapse' : 'Expand'} ${replacement}`)
+    }
+    for (const card of document.querySelectorAll('[data-testid^="agent-session-"]')) {
+      const label = card.querySelector(':scope > div [role="button"] span[title]')
+      if (!label) continue
+      sessionIndex += 1
+      const replacement = `Release workflow ${String(sessionIndex).padStart(2, '0')}`
+      label.textContent = replacement
+      label.setAttribute('title', replacement)
+    }
+    for (const section of document.querySelectorAll('section')) {
+      const cards = section.querySelectorAll('[data-testid^="agent-detail-card-"]')
+      const heading = section.querySelector(':scope > h4[title]')
+      if (!cards.length || !heading) continue
+      sessionIndex += 1
+      const replacement = `Release workflow ${String(sessionIndex).padStart(2, '0')}`
+      const original = heading.getAttribute('title') || heading.textContent || ''
+      replacePublicText(section, original.trim(), replacement)
+    }
+
+    const profileReplacements = new Map()
+    let agentIndex = 0
+    for (const card of document.querySelectorAll('[data-testid^="agent-detail-card-"]')) {
+      agentIndex += 1
+      const terminalId = card.getAttribute('data-testid')?.replace('agent-detail-card-', '') || ''
+      replacePublicText(card, terminalId, `example-agent-${String(agentIndex).padStart(2, '0')}`)
+      const profile = card.querySelector('span[class*="text-emerald-400"][title], span[class*="font-medium"][title]')
+      const profileName = profile?.getAttribute('title') || ''
+      if (profileName && !profileReplacements.has(profileName)) {
+        profileReplacements.set(profileName, `Example profile ${String(profileReplacements.size + 1).padStart(2, '0')}`)
+      }
+      if (profileName) replacePublicText(card, profileName, profileReplacements.get(profileName))
+      for (const node of card.querySelectorAll('div')) {
+        if ((node.textContent || '').trim().startsWith('Work context ·')) {
+          node.textContent = 'Work context · writable authority retained'
+          node.removeAttribute('title')
+        }
+      }
+    }
+    for (const badge of document.querySelectorAll('[data-testid^="session-metadata-"] span')) {
+      if ((badge.textContent || '').trim().startsWith('Project:')) badge.textContent = 'Project: Example project'
+    }
+    for (const label of document.querySelectorAll('[data-testid^="agent-detail-card-"] [class*="text-[10px]"]:not([title])')) {
+      label.textContent = 'Example project'
+    }
+    const statisticSections = [...document.querySelectorAll('section')]
+    for (const section of statisticSections) {
+      const heading = section.querySelector('h3')?.textContent?.trim()
+      if (!['By terminal', 'By session', 'By project', 'By profile'].includes(heading || '')) continue
+      const prefix = heading === 'By terminal'
+        ? 'Example agent'
+        : heading === 'By session'
+          ? 'Release workflow'
+          : heading === 'By project'
+            ? 'Example project'
+            : 'Example profile'
+      let rowIndex = 0
+      for (const cell of section.querySelectorAll('tbody tr td:first-child')) {
+        rowIndex += 1
+        const labels = cell.querySelectorAll('div')
+        if (labels[0]) labels[0].textContent = `${prefix} ${String(rowIndex).padStart(2, '0')}`
+        if (labels[1]) labels[1].textContent = heading === 'By project' ? `project-${String(rowIndex).padStart(2, '0')}` : ''
+      }
+    }
+  })
+}
 
 async function redactPrivatePaths(page) {
   await page.evaluate(() => {
@@ -99,6 +190,7 @@ async function assertPublicDom(page, surface) {
 }
 
 async function writeScreenshot(page, name) {
+  await anonymizePublicIdentities(page)
   await redactPrivatePaths(page)
   await assertPublicDom(page, name)
   const png = path.join(screenshotRoot, name + '.png')
@@ -145,6 +237,13 @@ async function captureScreenshots(browser) {
     captured.push('threadcells-agents')
   }
 
+  if (captureSelection.has('statistics')) {
+    await page.goto(new URL('/?tab=statistics', liveOrigin).href, { waitUntil: 'networkidle' })
+    await page.getByRole('heading', { name: 'Statistics', exact: true }).waitFor()
+    await writeScreenshot(page, 'threadcells-statistics')
+    captured.push('threadcells-statistics')
+  }
+
   if (captureSelection.has('housekeeping')) {
     await page.goto(new URL('/settings/housekeeping', liveOrigin).href, { waitUntil: 'networkidle' })
     await page.getByRole('heading', { name: 'Housekeeping', exact: true }).waitFor()
@@ -181,34 +280,84 @@ async function captureDemo(browser) {
     reducedMotion: 'reduce',
   })
   try {
+    await context.addInitScript(() => {
+      const hide = () => {
+        if (!document.documentElement) return false
+        document.documentElement.style.visibility = 'hidden'
+        return true
+      }
+      if (!hide()) {
+        const observer = new MutationObserver(() => {
+          if (hide()) observer.disconnect()
+        })
+        observer.observe(document, { childList: true })
+      }
+    })
     const page = await context.newPage()
     const pageErrors = []
     page.on('pageerror', (error) => pageErrors.push(error.message))
     const video = page.video()
 
     await page.goto(liveOrigin.href, { waitUntil: 'networkidle' })
-    await page.getByText('Sessions', { exact: true }).first().waitFor()
+    await page.getByText('Sessions', { exact: true }).first().waitFor({ state: 'attached' })
+    await anonymizePublicIdentities(page)
     await redactPrivatePaths(page)
     await assertPublicDom(page, 'demo home')
-    await page.waitForTimeout(2200)
+    await page.evaluate(() => { document.documentElement.style.visibility = 'visible' })
+    await page.waitForTimeout(4200)
 
-    await page.locator('[data-testid^="session-title-row-"]').first().click()
-    await page.locator('[data-testid^="agent-detail-card-"]').first().waitFor()
+    await page.evaluate(() => { document.documentElement.style.visibility = 'hidden' })
+    await page.locator('[data-testid^="session-title-row-"]').first().evaluate((element) => element.click())
+    await page.locator('[data-testid^="agent-detail-card-"]').first().waitFor({ state: 'attached' })
+    await anonymizePublicIdentities(page)
     await redactPrivatePaths(page)
     await assertPublicDom(page, 'demo workflow')
-    await page.waitForTimeout(2600)
+    await page.evaluate(() => { document.documentElement.style.visibility = 'visible' })
+    await page.waitForTimeout(4800)
+
+    await page.goto(new URL('/?tab=agents&agentView=statuses', liveOrigin).href, { waitUntil: 'networkidle' })
+    // Role selectors intentionally exclude the page while the privacy curtain
+    // is active. Text locators can observe the attached DOM without exposing a
+    // frame before redaction and still prove that the requested surface loaded.
+    await page.getByText(/Matching agents/).first().waitFor({ state: 'attached' })
+    await anonymizePublicIdentities(page)
+    await redactPrivatePaths(page)
+    await assertPublicDom(page, 'demo agents')
+    await page.evaluate(() => { document.documentElement.style.visibility = 'visible' })
+    await page.waitForTimeout(4200)
+
+    await page.goto(new URL('/?tab=statistics', liveOrigin).href, { waitUntil: 'networkidle' })
+    await page.getByText('Statistics', { exact: true }).first().waitFor({ state: 'attached' })
+    await anonymizePublicIdentities(page)
+    await redactPrivatePaths(page)
+    await assertPublicDom(page, 'demo statistics')
+    await page.evaluate(() => { document.documentElement.style.visibility = 'visible' })
+    await page.waitForTimeout(4200)
 
     await page.goto(new URL('/settings/housekeeping', liveOrigin).href, { waitUntil: 'networkidle' })
-    await page.getByRole('heading', { name: 'Housekeeping', exact: true }).waitFor()
+    await page.getByText('Housekeeping', { exact: true }).first().waitFor({ state: 'attached' })
+    await anonymizePublicIdentities(page)
     await redactPrivatePaths(page)
     await assertPublicDom(page, 'demo housekeeping')
-    await page.waitForTimeout(2600)
+    await page.evaluate(() => { document.documentElement.style.visibility = 'visible' })
+    await page.waitForTimeout(4800)
 
     await page.goto(new URL('/settings', liveOrigin).href, { waitUntil: 'networkidle' })
-    await page.getByText('Orchestration Capacity', { exact: true }).waitFor()
+    await page.getByText('Orchestration Capacity', { exact: true }).waitFor({ state: 'attached' })
+    await anonymizePublicIdentities(page)
     await redactPrivatePaths(page)
     await assertPublicDom(page, 'demo capacity')
-    await page.waitForTimeout(2600)
+    await page.evaluate(() => { document.documentElement.style.visibility = 'visible' })
+    await page.waitForTimeout(4200)
+
+    await page.goto(new URL('/settings/telegram', liveOrigin).href, { waitUntil: 'networkidle' })
+    await page.getByText('Telegram notifications', { exact: true }).first().waitFor({ state: 'attached' })
+    await redactTelegramDestination(page)
+    await anonymizePublicIdentities(page)
+    await redactPrivatePaths(page)
+    await assertPublicDom(page, 'demo telegram')
+    await page.evaluate(() => { document.documentElement.style.visibility = 'visible' })
+    await page.waitForTimeout(4200)
 
     assert.deepEqual(pageErrors, [], 'Product demo page errors: ' + pageErrors.join('; '))
     await context.close()

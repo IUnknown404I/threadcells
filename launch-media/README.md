@@ -1,14 +1,16 @@
 # ThreadCells release media
 
 The canonical public capture set comes from the real loopback production
-instance. It preserves authentic session, agent, workflow, capacity, and host
-scale while the capture tool removes local filesystem paths and replaces
-Telegram destination and credential fields with explicit public-redaction
-labels.
+instance. It preserves authentic lifecycle, capacity, usage, and host-scale
+values while the capture tool anonymizes Session/Project labels, removes local
+filesystem paths, and replaces Telegram destination and credential fields with
+explicit public-redaction labels.
 
 The capture tool refuses non-loopback origins and fails if the rendered DOM
 contains credential-shaped values, private workflow/Inbox copy, or common
-private host paths.
+private host paths. Recorded pages stay hidden until identity/path redaction and
+the privacy assertion have completed, so navigation frames follow the same
+boundary as still images.
 
 Generate the complete screenshot set and WebM tour:
 
@@ -25,8 +27,8 @@ cao-heavy-run node launch-media/capture-product.mjs
 ~~~
 
 To refresh only selected surfaces, set a comma-separated capture set. Valid
-values are `home`, `session`, `agents`, `housekeeping`, `telegram`, `capacity`,
-and `demo`.
+values are `home`, `session`, `agents`, `statistics`, `housekeeping`, `telegram`,
+`capacity`, and `demo`.
 
 ~~~bash
 THREADCELLS_CAPTURE_SET=home,session,housekeeping \

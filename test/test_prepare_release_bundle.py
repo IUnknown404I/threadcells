@@ -95,7 +95,7 @@ def test_prepare_release_bundle_is_deterministic_and_self_describing(tmp_path: P
 
 @pytest.mark.parametrize(
     ("release_tag", "version"),
-    (("v0.3.3-alpha", "0.3.3a1"), ("v0.3.4-alpha", "0.3.3a0")),
+    (("v0.3.3-alpha", "0.3.3a1"), ("v0.4.0-alpha", "0.3.3a0")),
 )
 def test_prepare_release_bundle_rejects_tag_version_mismatch(
     tmp_path: Path, release_tag: str, version: str
@@ -130,7 +130,7 @@ def test_expected_python_version_preserves_all_alpha_release_lines(
 
 @pytest.mark.parametrize(
     ("release_tag", "version"),
-    (("v0.3.3-alpha", "0.3.3a0"), ("v0.3.4-alpha", "0.3.4a0")),
+    (("v0.3.3-alpha", "0.3.3a0"), ("v0.4.0-alpha", "0.4.0a0")),
 )
 def test_expected_python_version_uses_semantic_release_with_alpha_stage(
     release_tag: str, version: str

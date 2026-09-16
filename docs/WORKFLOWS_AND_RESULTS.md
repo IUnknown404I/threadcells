@@ -2,7 +2,7 @@
 
 A workflow represents work that must remain coherent across several model turns, terminals, or delegated agents. It prevents a provider's final message from being mistaken for completion of the larger mission.
 
-![Expanded live ThreadCells session showing active and completed workflow participants](/media/screenshots/threadcells-session-workflow.webp)
+![Expanded live ThreadCells session showing processing and recovery-replaced workflow participants](/media/screenshots/threadcells-session-workflow.webp)
 
 ## Top-level and delegated work
 

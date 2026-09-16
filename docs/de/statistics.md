@@ -1,12 +1,14 @@
 ---
 slug: statistics
 source: docs/STATISTICS.md
-source_sha256: sha256:ca9ce387ff845fb61aba3bc22c45084a825764e2ce7e156d6963e152e490de2b
+source_sha256: sha256:4b8facbc779d119e0db62e2c3664eb538ad9fc4f6b0f841ef45f3576f62a17c6
 ---
 
 # Statistiken und Anbieternutzung
 
 Statistics fasst die Nutzung zusammen, die unterstützte Anbieter-CLIs tatsächlich ausgeben. Sie hilft zu beantworten, welche Sitzungen, Profile, Projekte und Anbieter Modell-Token verbraucht haben; sie ist kein Abrechnungsbuch und erfindet keine fehlenden Werte.
+
+![Live-ThreadCells-Statistik mit nach Betriebsidentität gruppierter, vom Anbieter gemeldeter Nutzung](/media/screenshots/threadcells-statistics.webp)
 
 ## Bedeutung der Zahlen
 

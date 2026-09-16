@@ -1,14 +1,14 @@
 ---
 slug: workflows-and-results
 source: docs/WORKFLOWS_AND_RESULTS.md
-source_sha256: sha256:96ac4e69b487f09d35f8aaa05ea5c343a7a6010be84f2f1bc7b8592994c441c0
+source_sha256: sha256:cca4aa78d9406e06aecd234b9a46197381b3792de57a47da035ca0ca075922ae
 ---
 
 # Workflows und dauerhafte Ergebnisse
 
 Ein Workflow steht für Arbeit, die über mehrere Modellzüge, Terminals oder delegierte Agenten hinweg kohärent bleiben muss. Er verhindert, dass die Abschlussmeldung eines Anbieters mit der Erledigung der größeren Mission verwechselt wird.
 
-![Erweiterte Live-ThreadCells-Sitzung mit aktiven und abgeschlossenen Workflow-Teilnehmern](/media/screenshots/threadcells-session-workflow.webp)
+![Erweiterte Live-ThreadCells-Sitzung mit einem laufenden und einem bei der Wiederherstellung ersetzten Workflow-Teilnehmer](/media/screenshots/threadcells-session-workflow.webp)
 
 ## Top-Level- und delegierte Arbeit
 

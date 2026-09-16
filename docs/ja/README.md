@@ -36,7 +36,7 @@ ThreadCells は自身のエージェント環境を健全に保つよう積極�
 
 | 永続的なマルチエージェントワークフロー | 保護された Housekeeping |
 | --- | --- |
-| ![1 人のアクティブなオーナーと 2 人の完了したレビュアーを含む、展開されたライブ ThreadCells セッション](../../launch-media/output/screenshots/threadcells-session-workflow.png) | ![ディスクの健全性、保護されたバックアップ、スケジュール、クリーンアップポリシーを示す ThreadCells Housekeeping](../../launch-media/output/screenshots/threadcells-housekeeping.png) |
+| ![処理中のエージェントと復旧時に置き換えられたエージェントを示す、展開されたライブ ThreadCells セッション](../../launch-media/output/screenshots/threadcells-session-workflow.png) | ![ディスクの健全性、保護されたバックアップ、スケジュール、クリーンアップポリシーを示す ThreadCells Housekeeping](../../launch-media/output/screenshots/threadcells-housekeeping.png) |
 
 Telegram 通知は、最上位の完了、失敗、オーナーの注意に対して、ノイズの少ないインストール全体の経路を一つ提供します。機密性の高い宛先と認証情報のフィールドは、意図的に[公開 Telegram キャプチャ](../../launch-media/output/screenshots/threadcells-telegram.png)で編集されています。
 
@@ -59,7 +59,7 @@ flowchart LR
 
 ## 安全性とプレビューの状態
 
-`0.3.4-alpha` 技術プレビューは、単一の Ubuntu/Debian Linux ホスト、ループバック優先のアクセス、Codex を中心としたセットアップをサポートします。ネイティブエージェントは強力なコマンドを実行できます。worktree はセキュリティサンドボックスではありません。評価前に[制限事項](../LIMITATIONS.md)を確認してください。
+`0.4.0-alpha` 技術プレビューは、単一の Ubuntu/Debian Linux ホスト、ループバック優先のアクセス、Codex を中心としたセットアップをサポートします。ネイティブエージェントは強力なコマンドを実行できます。worktree はセキュリティサンドボックスではありません。評価前に[制限事項](../LIMITATIONS.md)を確認してください。
 
 公開の `ghcr.io/iunknown404i/threadcells-release-bundle` OCI パッケージには、検証済みのリリースアーカイブと証跡が含まれます。これは配布成果物であり、Docker イメージやサポート対象のコンテナデプロイモードではありません。[リリースプロセス](../RELEASE_PROCESS.md)を参照してください。
 

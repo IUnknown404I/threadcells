@@ -1,11 +1,13 @@
 ---
 slug: statistics
 source: docs/STATISTICS.md
-source_sha256: sha256:ca9ce387ff845fb61aba3bc22c45084a825764e2ce7e156d6963e152e490de2b
+source_sha256: sha256:4b8facbc779d119e0db62e2c3664eb538ad9fc4f6b0f841ef45f3576f62a17c6
 ---
 # 統計とプロバイダー使用量
 
 Statistics は、サポート対象のプロバイダー CLI が実際に出力する使用量を要約します。どのセッション、プロファイル、プロジェクト、プロバイダーがモデルトークンを消費したかを把握する助けになります。これは請求台帳ではなく、欠けている値を作り出しません。
+
+![プロバイダーが報告した使用量を運用上の識別子別にまとめた ThreadCells Statistics のライブ画面](/media/screenshots/threadcells-statistics.webp)
 
 ## 数値の意味
 

@@ -158,7 +158,7 @@ try {
         const buttonBounds = buttons.map(button => button.getBoundingClientRect())
         const labels = buttons.slice(0, 3).map(button => button.querySelector('span'))
         return {
-          columns: getComputedStyle(element).gridTemplateColumns.split(' ').length,
+          buttonCount: buttons.length,
           rightGap: cardBounds ? Math.round(cardBounds.right - 12 - bounds.right) : null,
           rows: new Set(buttonBounds.map(button => Math.round(button.top))).size,
           text: buttons.map(button => button.innerText.trim()),
@@ -175,8 +175,8 @@ try {
       }))
     }
     for (const actionLayout of layouts) {
-      assert.equal(actionLayout.columns, 6, `agent actions must contain exactly six main columns at ${width}px`)
-      assert.equal(Math.abs(actionLayout.rightGap) <= 1, true, `agent actions must remain flush right at ${width}px`)
+      assert.equal(actionLayout.buttonCount, 6, `agent actions must contain all six main actions at ${width}px`)
+      assert.equal(Math.abs(actionLayout.rightGap) <= 1, true, `agent actions must remain flush right at ${width}px (gap ${actionLayout.rightGap}px)`)
       assert.equal(actionLayout.rows, 1, `agent actions must remain on one row at ${width}px`)
       assert.equal(actionLayout.contained, true, `agent actions must remain inside the card at ${width}px`)
       assert.equal(actionLayout.minButtonWidth >= 44, true, `agent action touch targets must remain at least 44px at ${width}px`)
@@ -206,11 +206,11 @@ try {
   await b.getByRole('button', { name: 'Сетка', exact: true }).click()
   const gridLayout = await bDetail.getByTestId(`agent-actions-${sessions[1].id}-terminal`).evaluate(element => ({
     cardWidth: element.closest('[data-testid^="agent-detail-card-"]')?.getBoundingClientRect().width || 0,
-    columns: getComputedStyle(element).gridTemplateColumns.split(' ').length,
+    buttonCount: element.querySelectorAll(':scope > button').length,
     visibleText: [...element.querySelectorAll(':scope > button')].map(button => button.innerText.trim()),
   }))
   assert.equal(gridLayout.cardWidth < 480, true, 'grid card must exercise the compact container-width mode')
-  assert.equal(gridLayout.columns, 6, 'grid card must retain all six main actions')
+  assert.equal(gridLayout.buttonCount, 6, 'grid card must retain all six main actions')
   assert.deepEqual(gridLayout.visibleText, ['', '', '', '', '', ''], 'grid card must compact all labels together based on card width')
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth), 0, 'grid mode must not create page overflow at 834px')
   await b.screenshot({ path: `${evidenceDir}/834-b-grid.png` })

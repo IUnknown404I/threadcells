@@ -6,6 +6,7 @@ describe('API wrapper', () => {
   const mockFetch = vi.fn()
 
   beforeEach(() => {
+    mockFetch.mockReset()
     vi.stubGlobal('fetch', mockFetch)
   })
 
@@ -242,15 +243,23 @@ describe('API wrapper', () => {
 
   it('requests only bounded terminal identities for recovery action capabilities', async () => {
     const controller = new AbortController()
-    mockResponse({ capabilities: [{ terminal_id: 'a11ce001', eligible: false, reason_code: 'RECOVERY_HEALTHY_RUNTIME_ACTIVE' }] })
-    await api.getRecoveryTakeoverCapabilities(['a11ce001'], controller.signal)
+    mockFetch.mockImplementationOnce((_url: string, options: RequestInit) => new Promise((_resolve, reject) => {
+      options.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+    }))
+    const request = api.getRecoveryTakeoverCapabilities(['a11ce001'], controller.signal)
 
-    expect(mockFetch).toHaveBeenCalledWith('/recovery-takeovers/capabilities', expect.objectContaining({
+    const [url, options] = mockFetch.mock.calls[0]
+    expect(url).toBe('/recovery-takeovers/capabilities')
+    expect(options).toMatchObject({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ terminal_ids: ['a11ce001'] }),
-      signal: controller.signal,
-    }))
+    })
+    expect(options.signal).toBeInstanceOf(AbortSignal)
+    expect(options.signal.aborted).toBe(false)
+    controller.abort()
+    expect(options.signal.aborted).toBe(true)
+    await expect(request).rejects.toMatchObject({ name: 'AbortError' })
   })
 
   it('uses versioned control-plane API paths distinct from Settings page routes', async () => {
@@ -417,15 +426,20 @@ describe('API wrapper', () => {
   })
 
   it('getTerminalOutput sends an opaque cursor and caller cancellation signal', async () => {
-    mockResponse({ output: 'older output', mode: 'full', has_older: false })
     const controller = new AbortController()
+    mockFetch.mockImplementationOnce((_url: string, options: RequestInit) => new Promise((_resolve, reject) => {
+      options.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true })
+    }))
 
-    await api.getTerminalOutput('t1', 'full', 'opaque+/cursor=', controller.signal)
+    const request = api.getTerminalOutput('t1', 'full', 'opaque+/cursor=', controller.signal)
 
-    expect(mockFetch).toHaveBeenCalledWith(
-      expect.stringContaining('/terminals/t1/output?mode=full&cursor=opaque%2B%2Fcursor%3D'),
-      expect.objectContaining({ signal: controller.signal }),
-    )
+    const [url, options] = mockFetch.mock.calls[0]
+    expect(url).toBe('/terminals/t1/output?mode=full&cursor=opaque%2B%2Fcursor%3D')
+    expect(options.signal).toBeInstanceOf(AbortSignal)
+    expect(options.signal.aborted).toBe(false)
+    controller.abort()
+    expect(options.signal.aborted).toBe(true)
+    await expect(request).rejects.toMatchObject({ name: 'AbortError' })
   })
 
   it('listFlows fetches /flows', async () => {

@@ -36,7 +36,7 @@ ThreadCells hält seine eigene Agentenumgebung aktiv gesund; es kann nicht garan
 
 | Dauerhafter Multi-Agent-Workflow | Geschütztes Housekeeping |
 | --- | --- |
-| ![Erweiterte Live-ThreadCells-Sitzung mit einem aktiven Eigentümer und zwei abgeschlossenen Reviewern](../../launch-media/output/screenshots/threadcells-session-workflow.png) | ![ThreadCells-Housekeeping mit Plattengesundheit, geschützten Backups, Zeitplänen und Bereinigungsrichtlinie](../../launch-media/output/screenshots/threadcells-housekeeping.png) |
+| ![Erweiterte Live-ThreadCells-Sitzung mit einem aktiven und einem bei der Wiederherstellung ersetzten Agenten](../../launch-media/output/screenshots/threadcells-session-workflow.png) | ![ThreadCells-Housekeeping mit Plattengesundheit, geschützten Backups, Zeitplänen und Bereinigungsrichtlinie](../../launch-media/output/screenshots/threadcells-housekeeping.png) |
 
 Telegram-Benachrichtigungen bieten einen geräuscharmen, installationsweiten Weg für Abschlüsse der obersten Ebene, Fehler und erforderliche Eigentümeraufmerksamkeit. Sensible Ziel- und Zugangsdatenfelder sind in [der öffentlichen Telegram-Aufnahme](../../launch-media/output/screenshots/threadcells-telegram.png) bewusst geschwärzt.
 
@@ -59,7 +59,7 @@ flowchart LR
 
 ## Sicherheits- und Preview-Status
 
-Die technische Vorschau `0.3.4-alpha` unterstützt einen einzelnen Ubuntu/Debian-Linux-Host, Loopback-first-Zugriff und ein Codex-first-Setup. Native Agenten können mächtige Befehle ausführen; Worktrees sind keine Sicherheits-Sandbox. Siehe vor der Bewertung die [Einschränkungen](../LIMITATIONS.md).
+Die technische Vorschau `0.4.0-alpha` unterstützt einen einzelnen Ubuntu/Debian-Linux-Host, Loopback-first-Zugriff und ein Codex-first-Setup. Native Agenten können mächtige Befehle ausführen; Worktrees sind keine Sicherheits-Sandbox. Siehe vor der Bewertung die [Einschränkungen](../LIMITATIONS.md).
 
 Das öffentliche OCI-Paket `ghcr.io/iunknown404i/threadcells-release-bundle` enthält verifizierte Release-Archive und Nachweise. Es ist ein Distributionsartefakt, kein Docker-Image und kein unterstützter Container-Bereitstellungsmodus; siehe den [Release-Prozess](../RELEASE_PROCESS.md).
 

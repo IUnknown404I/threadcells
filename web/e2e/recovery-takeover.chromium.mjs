@@ -57,7 +57,7 @@ const vite = await createViteServer({
   root: webRoot,
   configFile: false,
   plugins: [(await import('@vitejs/plugin-react')).default()],
-  define: { __THREADCELLS_REVISION__: JSON.stringify('recovery-evidence'), __THREADCELLS_VERSION__: JSON.stringify('0.3.4-alpha') },
+  define: { __THREADCELLS_REVISION__: JSON.stringify('recovery-evidence'), __THREADCELLS_VERSION__: JSON.stringify('0.4.0-alpha') },
   appType: 'spa',
   server: { middlewareMode: true, hmr: false },
 })

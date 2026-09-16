@@ -34,7 +34,7 @@ export const jaLanding: LandingLocaleData = {
     'One place to see the work,': '作業、ホスト、引き継ぎを',
     'the host, and the handoff.': 'ひとつの画面で把握。',
     'ThreadCells wraps native agent execution in an operational surface: sessions, projects, terminals, profiles, capacity, workflows, documentation, optional global Telegram lifecycle alerts, and current build identity.': 'ThreadCells はネイティブなエージェント実行を、セッション、プロジェクト、ターミナル、プロファイル、容量、ワークフロー、ドキュメント、任意のインストール全体 Telegram ライフサイクル通知、現在のビルド識別子を含む運用画面にまとめます。',
-    'ThreadCells Home showing 21 real sessions, 166 agents, aggregate lifecycle counts, and dense session status summaries': '21 の実セッション、166 のエージェント、ライフサイクル集計、詳細なセッション状態を表示する ThreadCells ホーム',
+    'ThreadCells Home showing 30 real sessions, 218 agents, aggregate lifecycle counts, and dense session status summaries': '30 の実セッション、218 のエージェント、ライフサイクル集計、詳細なセッション状態を表示する ThreadCells ホーム',
     'HOME / EXECUTION OVERVIEW': 'ホーム / 実行概要',
     'Real release system · sensitive material excluded': '実際のリリースシステム · 機密情報は除外',
     'LIVE RELEASE SYSTEM': '稼働中のリリースシステム',

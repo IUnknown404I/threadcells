@@ -34,7 +34,7 @@ export const zhCNLanding: LandingLocaleData = {
     'One place to see the work,': '在一个界面中查看工作、',
     'the host, and the handoff.': '主机与交接。',
     'ThreadCells wraps native agent execution in an operational surface: sessions, projects, terminals, profiles, capacity, workflows, documentation, optional global Telegram lifecycle alerts, and current build identity.': 'ThreadCells 为原生智能体执行提供统一运维界面：会话、项目、终端、配置文件、容量、工作流、文档、可选的全局 Telegram 生命周期通知，以及当前构建标识。',
-    'ThreadCells Home showing 21 real sessions, 166 agents, aggregate lifecycle counts, and dense session status summaries': 'ThreadCells 首页显示 21 个真实会话、166 个智能体、生命周期汇总计数和紧凑的会话状态摘要',
+    'ThreadCells Home showing 30 real sessions, 218 agents, aggregate lifecycle counts, and dense session status summaries': 'ThreadCells 首页显示 30 个真实会话、218 个智能体、生命周期汇总计数和紧凑的会话状态摘要',
     'HOME / EXECUTION OVERVIEW': '首页 / 执行概览',
     'Real release system · sensitive material excluded': '真实发布系统 · 已排除敏感内容',
     'LIVE RELEASE SYSTEM': '实时发布系统',

@@ -34,7 +34,7 @@ export const deLanding: LandingLocaleData = {
     'One place to see the work,': 'Arbeit, Host und Übergabe',
     'the host, and the handoff.': 'an einem Ort.',
     'ThreadCells wraps native agent execution in an operational surface: sessions, projects, terminals, profiles, capacity, workflows, documentation, optional global Telegram lifecycle alerts, and current build identity.': 'ThreadCells bündelt native Agentenausführung in einer Betriebsoberfläche: Sitzungen, Projekte, Terminals, Profile, Kapazitäten, Workflows, Dokumentation, optionale installationsweite Telegram-Lebenszyklusmeldungen und die Identität des aktuellen Builds.',
-    'ThreadCells Home showing 21 real sessions, 166 agents, aggregate lifecycle counts, and dense session status summaries': 'ThreadCells-Startseite mit 21 realen Sitzungen, 166 Agenten, zusammengefassten Lebenszykluszahlen und kompakten Sitzungsstatusübersichten',
+    'ThreadCells Home showing 30 real sessions, 218 agents, aggregate lifecycle counts, and dense session status summaries': 'ThreadCells-Startseite mit 30 realen Sitzungen, 218 Agenten, zusammengefassten Lebenszykluszahlen und kompakten Sitzungsstatusübersichten',
     'HOME / EXECUTION OVERVIEW': 'START / AUSFÜHRUNGSÜBERSICHT',
     'Real release system · sensitive material excluded': 'Reales Release-System · sensible Inhalte ausgeschlossen',
     'LIVE RELEASE SYSTEM': 'AKTIVES RELEASE-SYSTEM',

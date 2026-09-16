@@ -131,7 +131,7 @@ export function LandingPage({ locale = 'en' }: { locale?: Locale }) {
           </div>
           <ProductShot
             src="/media/screenshots/threadcells-home.webp"
-            alt={t('ThreadCells Home showing 21 real sessions, 166 agents, aggregate lifecycle counts, and dense session status summaries', 'Главная ThreadCells: 21 реальная сессия, 166 агентов, суммарные состояния жизненного цикла и компактные сводки по статусам сессий')}
+            alt={t('ThreadCells Home showing 30 real sessions, 218 agents, aggregate lifecycle counts, and dense session status summaries', 'Главная ThreadCells: 30 реальных сессий, 218 агентов, суммарные состояния жизненного цикла и компактные сводки по статусам сессий')}
             label={t('HOME / EXECUTION OVERVIEW', 'ГЛАВНАЯ / ОБЗОР ВЫПОЛНЕНИЯ')}
             detail={t('Real release system · sensitive material excluded', 'Действующая система релизов · конфиденциальные данные не показаны')}
             stateLabel={t('LIVE RELEASE SYSTEM', 'ДЕЙСТВУЮЩАЯ СИСТЕМА РЕЛИЗОВ')}

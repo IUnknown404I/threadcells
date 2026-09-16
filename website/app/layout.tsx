@@ -3,6 +3,7 @@ import { GeistMono } from 'geist/font/mono'
 import { GeistSans } from 'geist/font/sans'
 import { absoluteAssetUrl, assetPath, googleSiteVerification, site } from '@/lib/site'
 import { AnalyticsConsent } from '@/components/AnalyticsConsent'
+import { DocumentLanguage } from '@/components/DocumentLanguage'
 import './globals.css'
 
 const socialImage = absoluteAssetUrl('/media/threadcells-social.png')
@@ -65,7 +66,7 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en" className={`${GeistSans.variable} ${GeistMono.variable}`}>
-      <body>{children}<AnalyticsConsent /></body>
+      <body><DocumentLanguage />{children}<AnalyticsConsent /></body>
     </html>
   )
 }

@@ -1,6 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { usePathname } from 'next/navigation'
 import { analyticsCopy } from '@/components/analytics-copy'
 import { locales, type Locale } from '@/lib/locales'
 
@@ -71,10 +72,6 @@ function subscribeToConsent(onChange: () => void) {
   return () => window.removeEventListener('storage', onChange)
 }
 
-function subscribeToLocation() {
-  return () => undefined
-}
-
 function startAnalytics(consent: Consent) {
   if (!analyticsIsAllowedHere() || window.__threadcellsAnalyticsStarted) return
   window.__threadcellsAnalyticsStarted = true
@@ -113,18 +110,8 @@ export function AnalyticsConsent() {
     return readConsent()
   }, [consentVersion])
   const consent = useSyncExternalStore(subscribeToConsent, currentConsent, () => null)
-  const locale = useSyncExternalStore(
-    subscribeToLocation,
-    () => localeForPathname(window.location.pathname),
-    () => 'en' as Locale,
-  )
+  const locale = localeForPathname(usePathname())
   const copy = analyticsCopy[locale]
-
-  useEffect(() => {
-    // Static localized HTML is post-processed after export. Keep React's root
-    // document authority aligned after hydration as well.
-    document.documentElement.lang = locale
-  }, [locale])
 
   useEffect(() => {
     // The server snapshot is deliberately null. Re-read the client authority

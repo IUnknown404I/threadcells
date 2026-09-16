@@ -47,6 +47,7 @@ async function assertLocalizedPage(page, route, lang, label) {
   page.on('pageerror', error => errors.push(error.message))
   const response = await page.goto(`${server.origin}${route}`, { waitUntil: 'networkidle' })
   assert(response?.ok(), `${label} returned ${response?.status()}`)
+  await page.waitForFunction(expected => document.documentElement.dataset.threadcellsDocumentLanguage === expected, lang)
   assert.equal(await page.locator('html').getAttribute('lang'), lang, `${label} html lang`)
   assert.equal(await page.getByRole('heading', { level: 1 }).count(), 1, `${label} has one h1`)
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth), 0, `${label} has no horizontal overflow`)

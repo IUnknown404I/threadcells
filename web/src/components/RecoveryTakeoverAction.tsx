@@ -8,6 +8,7 @@ import { useStore } from '../store'
 import { lifecycleBadgeStatus, statusTranslationKey } from './StatusBadge'
 import { CustomSelect } from './CustomSelect'
 import { ProfilePicker } from './ProfilePicker'
+import { useOperatorAccess } from './OperatorAccess'
 
 const FALLBACK_PROVIDERS = ['kiro_cli', 'claude_code', 'q_cli', 'codex', 'gemini_cli', 'kimi_cli', 'copilot_cli']
 const UNAVAILABLE_PROVIDER_FALLBACK = FALLBACK_PROVIDERS.map(name => ({
@@ -39,9 +40,9 @@ export function RecoveryTakeoverAction({
 }) {
   const { t } = useI18n()
   const { showSnackbar } = useStore()
+  const operatorAccess = useOperatorAccess()
   const [open, setOpen] = useState(false)
   const [preview, setPreview] = useState<RecoveryTakeoverPreview | null>(null)
-  const [operatorSecret, setOperatorSecret] = useState('')
   const [profiles, setProfiles] = useState<AgentProfileInfo[]>([])
   const [providers, setProviders] = useState<ProviderInfo[]>([])
   const [profile, setProfile] = useState('critical_sol_xhigh_owner')
@@ -75,7 +76,6 @@ export function RecoveryTakeoverAction({
     // eligible generation cannot revive stale authority in the UI.
     setOpen(false)
     setPreview(null)
-    setOperatorSecret('')
     setConfirmed(false)
     setError(null)
   }, [capability?.eligible])
@@ -86,14 +86,12 @@ export function RecoveryTakeoverAction({
     if (submitting) return
     setOpen(false)
     setPreview(null)
-    setOperatorSecret('')
     setConfirmed(false)
     setError(null)
   }
 
   const openDialog = () => {
     setPreview(null)
-    setOperatorSecret('')
     setProfile('critical_sol_xhigh_owner')
     setProvider(defaultProvider(providers))
     setConfirmed(false)
@@ -102,16 +100,14 @@ export function RecoveryTakeoverAction({
   }
 
   const inspect = async () => {
-    if (!operatorSecret || inspecting) return
+    if (!operatorAccess.status?.authenticated || inspecting) return
     setInspecting(true)
     setError(null)
     try {
-      await api.createOperatorSession(operatorSecret)
       setPreview(await api.getRecoveryTakeoverPreview(agent.id))
     } catch (reason: any) {
       setError(reason.message || t('agents.recoverFailed'))
     } finally {
-      setOperatorSecret('')
       setInspecting(false)
     }
   }
@@ -173,8 +169,8 @@ export function RecoveryTakeoverAction({
           </dl>
 
           {!preview && <div className="rounded-xl border border-amber-700/50 bg-amber-950/20 p-3">
-            <label className="block text-xs text-amber-200/80">{t('agents.operatorSecret')}<input type="password" autoComplete="current-password" value={operatorSecret} onChange={event => setOperatorSecret(event.target.value)} className="mt-1 min-h-11 w-full rounded-lg border border-amber-700/60 bg-gray-950 px-3 text-sm text-gray-100 focus:border-amber-400 focus:outline-none"/></label>
-            <button type="button" onClick={inspect} disabled={!operatorSecret || inspecting} className="mt-3 min-h-11 w-full rounded-lg bg-indigo-700 px-4 text-sm font-medium text-white hover:bg-indigo-600 disabled:opacity-40">{inspecting ? t('common.loading') : t('agents.recoverInspect')}</button>
+            {!operatorAccess.loading && !operatorAccess.status?.authenticated && <p className="text-sm leading-5 text-amber-100">{t('agents.recoverOperatorLogin')} <a className="font-medium underline underline-offset-2" href="/settings">{t('nav.settings')}</a></p>}
+            <button type="button" onClick={inspect} disabled={!operatorAccess.status?.authenticated || inspecting || operatorAccess.loading} className="mt-3 min-h-11 w-full rounded-lg bg-indigo-700 px-4 text-sm font-medium text-white hover:bg-indigo-600 disabled:opacity-40">{inspecting || operatorAccess.loading ? t('common.loading') : t('agents.recoverInspect')}</button>
           </div>}
 
           {preview && <>

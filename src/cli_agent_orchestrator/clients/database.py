@@ -20,6 +20,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Float,
     Integer,
     String,
     Text,
@@ -238,6 +239,13 @@ class SessionDeletionOperationModel(Base):
     state = Column(String, nullable=False, default="fenced", index=True)
     terminal_ids_json = Column(Text, nullable=False)
     allow_dirty_workspace = Column(Boolean, nullable=False, default=False, server_default=text("0"))
+    # Explicit non-destructive authority for legacy receipt-only Sessions whose
+    # physical workspace cannot be proven.  This never authorizes cleanup: it
+    # permits only preserving the protected resource identity in the final
+    # Session tombstone while the known runtime/artifact graph is retired.
+    preserve_protected_workspace = Column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
     authority_fingerprint = Column(String, nullable=False)
     # Exact current (not launch-time) Git/worktree authority captured before
     # the first destructive cleanup boundary. Legacy in-progress operations
@@ -498,6 +506,21 @@ class HousekeepingSettingsAuditModel(Base):
     previous_json = Column(Text, nullable=True)
     settings_json = Column(Text, nullable=False)
     created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class HousekeepingRunModel(Base):
+    """Bounded durable history of completed non-preview maintenance runs."""
+
+    __tablename__ = "housekeeping_runs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    started_at = Column(DateTime, nullable=False, index=True)
+    completed_at = Column(DateTime, nullable=False)
+    mode = Column(String, nullable=False)
+    outcome = Column(String, nullable=False, index=True)
+    duration_seconds = Column(Float, nullable=False, default=0.0)
+    freed_bytes = Column(Integer, nullable=False, default=0)
+    report_json = Column(Text, nullable=False)
 
 
 class TelegramSettingsModel(Base):
@@ -2041,6 +2064,111 @@ def get_housekeeping_settings() -> Dict[str, Any]:
         if row is None:
             raise RuntimeError("housekeeping settings are not initialized")
         return _housekeeping_settings_dict(row)
+
+
+_HOUSEKEEPING_HISTORY_RETENTION = 50
+_HOUSEKEEPING_HISTORY_REPORT_BYTES = 131_072
+
+
+def _bounded_housekeeping_report(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 5:
+        return "[truncated]"
+    if isinstance(value, Mapping):
+        return {
+            str(key)[:128]: _bounded_housekeeping_report(item, depth=depth + 1)
+            for key, item in list(value.items())[:100]
+        }
+    if isinstance(value, (list, tuple)):
+        result = [_bounded_housekeeping_report(item, depth=depth + 1) for item in value[:100]]
+        if len(value) > 100:
+            result.append({"truncated_items": len(value) - 100})
+        return result
+    if isinstance(value, str):
+        return value[:2048]
+    return value if value is None or isinstance(value, (bool, int, float)) else str(value)[:2048]
+
+
+def record_housekeeping_run(report: Mapping[str, Any]) -> Dict[str, Any]:
+    """Append one bounded non-preview run and prune by indexed primary-key range."""
+    if report.get("dry_run") is not False:
+        raise ValueError("preview runs are not persisted in housekeeping history")
+    bounded = _bounded_housekeeping_report(report)
+    encoded = json.dumps(bounded, sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode()) > _HOUSEKEEPING_HISTORY_REPORT_BYTES:
+        bounded = {
+            "history_truncated": True,
+            **{
+                key: report.get(key)
+                for key in (
+                    "ok",
+                    "dry_run",
+                    "mode",
+                    "full_cleanup",
+                    "started_at",
+                    "completed_at",
+                    "duration_seconds",
+                    "final_status",
+                    "freed_bytes",
+                    "completed_with_issues",
+                )
+            },
+            "warnings": _bounded_housekeeping_report(report.get("warnings", [])[:25]),
+            "execution_failures": _bounded_housekeeping_report(
+                report.get("execution_failures", [])[:25]
+            ),
+        }
+        encoded = json.dumps(bounded, sort_keys=True, separators=(",", ":"))
+    started = datetime.fromisoformat(str(report["started_at"])).replace(tzinfo=None)
+    completed = datetime.fromisoformat(str(report["completed_at"])).replace(tzinfo=None)
+    HousekeepingRunModel.__table__.create(bind=engine, checkfirst=True)
+    with SessionLocal() as db:
+        row = HousekeepingRunModel(
+            started_at=started,
+            completed_at=completed,
+            mode=str(report.get("mode") or "unknown")[:32],
+            outcome=str(report.get("final_status") or "failed")[:64],
+            duration_seconds=max(0.0, float(report.get("duration_seconds") or 0.0)),
+            freed_bytes=max(0, int(report.get("freed_bytes") or 0)),
+            report_json=encoded,
+        )
+        db.add(row)
+        db.flush()
+        cutoff = int(row.id) - _HOUSEKEEPING_HISTORY_RETENTION
+        if cutoff > 0:
+            db.query(HousekeepingRunModel).filter(HousekeepingRunModel.id <= cutoff).delete(
+                synchronize_session=False
+            )
+        db.commit()
+        return {"id": int(row.id), "report": bounded}
+
+
+def list_housekeeping_runs(*, limit: int = 10, before_id: int | None = None) -> Dict[str, Any]:
+    if isinstance(limit, bool) or not 1 <= limit <= 20:
+        raise ValueError("history limit must be between 1 and 20")
+    HousekeepingRunModel.__table__.create(bind=engine, checkfirst=True)
+    with SessionLocal() as db:
+        query = db.query(HousekeepingRunModel)
+        if before_id is not None:
+            query = query.filter(HousekeepingRunModel.id < before_id)
+        rows = query.order_by(HousekeepingRunModel.id.desc()).limit(limit + 1).all()
+        has_more = len(rows) > limit
+        selected = rows[:limit]
+        return {
+            "items": [
+                {
+                    "id": int(row.id),
+                    "started_at": row.started_at.isoformat(),
+                    "completed_at": row.completed_at.isoformat(),
+                    "mode": str(row.mode),
+                    "outcome": str(row.outcome),
+                    "duration_seconds": float(row.duration_seconds),
+                    "freed_bytes": int(row.freed_bytes),
+                    "report": json.loads(str(row.report_json)),
+                }
+                for row in selected
+            ],
+            "next_before_id": int(selected[-1].id) if has_more and selected else None,
+        }
 
 
 def update_housekeeping_settings(
@@ -4815,6 +4943,16 @@ def _session_unresolved_work_plan_in_transaction(
             deletion_mode = "eligible_with_cancellable_work"
         else:
             deletion_mode = "eligible_normal"
+        preservable_protected_workspace = (
+            bool(unsafe_items)
+            and all(
+                item["item_kind"] == "terminal_deletion_receipt"
+                and item["reason_code"] == "TERMINAL_WORKSPACE_CLEANUP_AUTHORITY_MISSING"
+                for item in unsafe_items
+            )
+            and not cancellable_items
+            and not retirement_items
+        )
         resolvable = bool(cancellable_items or retirement_items) and not unsafe_items
         return {
             "eligible": deletion_mode == "eligible_normal",
@@ -4825,7 +4963,8 @@ def _session_unresolved_work_plan_in_transaction(
             "requires_historical_indeterminate_confirmation": (
                 bool(retirement_items) and not unsafe_items
             ),
-            "plan_token": plan_token if resolvable else None,
+            "plan_token": plan_token if (resolvable or preservable_protected_workspace) else None,
+            "can_preserve_protected_workspace": preservable_protected_workspace,
             "blockers": summaries,
             "cancellable_count": len(cancellable_items),
             "historical_indeterminate_count": len(retirement_items),
@@ -6777,6 +6916,11 @@ def _ensure_session_deletion_receipt_schema() -> None:
                     "ALTER TABLE session_deletion_operations "
                     "ADD COLUMN workspace_evidence_sha256 VARCHAR"
                 )
+            if "preserve_protected_workspace" not in operation_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE session_deletion_operations "
+                    "ADD COLUMN preserve_protected_workspace BOOLEAN NOT NULL DEFAULT 0"
+                )
         _ensure_session_deleted_terminal_fence_backfill()
         _session_deletion_receipt_schema_engine_identity = engine_identity
         _session_deletion_receipt_schema_ready = True
@@ -6826,6 +6970,7 @@ def _session_receipt_workspace_projection(
     if disposition not in {
         _SESSION_WORKSPACE_DISPOSITION_RETIRED,
         _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN,
+        _SESSION_WORKSPACE_DISPOSITION_PRESERVED_PROTECTED,
     }:
         raise AmbiguousSessionIdentity(str(receipt.session_id))
     try:
@@ -7382,11 +7527,44 @@ def _completed_takeover_foreign_workspace_is_valid(
         if old_terminal is None or not isinstance(context_id, str):
             return False
         context = db.get(WritableWorkContextModel, context_id)
+        takeover = (
+            db.get(RecoveryTakeoverModel, old_terminal.recovery_takeover_id)
+            if old_terminal.recovery_takeover_id is not None
+            else None
+        )
+        if context is None:
+            successor_receipt = (
+                db.get(SessionDeletionReceiptModel, takeover.new_session_id)
+                if takeover is not None
+                else None
+            )
+            successor_fences = (
+                _session_receipt_terminal_fences(successor_receipt)
+                if successor_receipt is not None
+                else []
+            )
+            if not (
+                takeover is not None
+                and takeover.state == "completed"
+                and takeover.old_terminal_id == old_terminal.id
+                and takeover.old_session_id == session_id
+                and takeover.canonical_worktree == row.get("path")
+                and takeover.project_id == row.get("project_id")
+                and successor_receipt is not None
+                and any(
+                    fence["terminal_id"] == takeover.new_terminal_id for fence in successor_fences
+                )
+                and row.get("present") is False
+                and row.get("registered") is False
+                and db.get(WorktreeWriterLeaseModel, str(row.get("path"))) is None
+            ):
+                return False
+            continue
         if not (
             context is not None
             and str(context.session_id) != session_id
             and str(context.terminal_id) not in local_terminal_ids
-            and context.state == "admitted"
+            and context.state in {"admitted", "retired"}
             and context.project_id == row.get("project_id")
             and context.canonical_source == row.get("source")
             and context.canonical_worktree == row.get("path")
@@ -7395,11 +7573,6 @@ def _completed_takeover_foreign_workspace_is_valid(
         ):
             return False
         successor = db.get(TerminalModel, context.terminal_id)
-        takeover = (
-            db.get(RecoveryTakeoverModel, old_terminal.recovery_takeover_id)
-            if old_terminal.recovery_takeover_id is not None
-            else None
-        )
         lease = db.get(WorktreeWriterLeaseModel, context.canonical_worktree)
         if not (
             old_terminal.runtime_lifecycle == "recovery_fenced"
@@ -7421,6 +7594,10 @@ def _completed_takeover_foreign_workspace_is_valid(
             return False
         if successor.runtime_lifecycle == "exited":
             if lease is not None:
+                return False
+            if context.state == "retired" and (
+                row.get("present") is not False or row.get("registered") is not False
+            ):
                 return False
         elif successor.runtime_lifecycle in {"recovery_fenced", "recovery_required"}:
             return False
@@ -7748,8 +7925,41 @@ def _session_foreign_workspace_evidence_in_transaction(
         for rows in (terminals, receipts, contexts, writer_leases)
     ):
         raise AmbiguousSessionIdentity(session_id)
+    recovery_successors: list[dict[str, Any]] = []
     if not any((terminals, receipts, contexts, writer_leases)):
-        return None
+        local_terminals = _session_plan_terminals(db, session_id, terminal_ids) or []
+        for terminal in local_terminals:
+            takeover = (
+                db.get(RecoveryTakeoverModel, terminal.recovery_takeover_id)
+                if terminal.recovery_takeover_id is not None
+                else None
+            )
+            successor_receipt = (
+                db.get(SessionDeletionReceiptModel, takeover.new_session_id)
+                if takeover is not None
+                else None
+            )
+            if (
+                takeover is not None
+                and takeover.state == "completed"
+                and takeover.old_session_id == session_id
+                and takeover.canonical_worktree in target_paths
+                and successor_receipt is not None
+                and any(
+                    fence["terminal_id"] == takeover.new_terminal_id
+                    for fence in _session_receipt_terminal_fences(successor_receipt)
+                )
+            ):
+                recovery_successors.append(
+                    {
+                        "takeover_id": str(takeover.id),
+                        "successor_session_id": str(takeover.new_session_id),
+                        "successor_terminal_id": str(takeover.new_terminal_id),
+                        "workspace_disposition": str(successor_receipt.workspace_disposition),
+                    }
+                )
+        if not recovery_successors:
+            return None
     return {
         "version": 1,
         "terminals": [
@@ -7791,6 +8001,7 @@ def _session_foreign_workspace_evidence_in_transaction(
             }
             for row in writer_leases
         ],
+        "recovery_successors": recovery_successors,
     }
 
 
@@ -7846,6 +8057,7 @@ def _session_deletion_operation_dict(
         None,
         _SESSION_WORKSPACE_DISPOSITION_RETIRED,
         _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN,
+        _SESSION_WORKSPACE_DISPOSITION_PRESERVED_PROTECTED,
     }:
         raise AmbiguousSessionIdentity(str(operation.session_id))
     workspace_evidence = None
@@ -7866,10 +8078,13 @@ def _session_deletion_operation_dict(
             operation.workspace_evidence_sha256, evidence_sha256
         ):
             raise AmbiguousSessionIdentity(str(operation.session_id))
-    elif (
-        disposition == _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN
-        or operation.state == _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN
-    ):
+    elif disposition in {
+        _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN,
+        _SESSION_WORKSPACE_DISPOSITION_PRESERVED_PROTECTED,
+    } or operation.state in {
+        _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN,
+        _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_PROTECTED,
+    }:
         raise AmbiguousSessionIdentity(str(operation.session_id))
     return {
         "session_id": str(operation.session_id),
@@ -7877,6 +8092,7 @@ def _session_deletion_operation_dict(
         "state": str(operation.state),
         "terminal_ids": terminal_ids,
         "allow_dirty_workspace": bool(operation.allow_dirty_workspace),
+        "preserve_protected_workspace": bool(operation.preserve_protected_workspace),
         "authority_fingerprint": str(operation.authority_fingerprint),
         "workspace_authority": workspace_authority,
         "workspace_authority_sha256": workspace_authority_sha256,
@@ -9411,8 +9627,10 @@ def delete_terminals_by_session(tmux_session: str) -> int:
 _SESSION_HARD_DELETE_FENCED = "fenced"
 _SESSION_HARD_DELETE_WORKSPACE_RETIRED = "workspace_retired"
 _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN = "workspace_preserved_foreign"
+_SESSION_HARD_DELETE_WORKSPACE_PRESERVED_PROTECTED = "workspace_preserved_protected"
 _SESSION_WORKSPACE_DISPOSITION_RETIRED = "retired"
 _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN = "preserved_foreign"
+_SESSION_WORKSPACE_DISPOSITION_PRESERVED_PROTECTED = "preserved_protected"
 
 
 def _session_terminal_scope(db: Any, session_id: str) -> Any:
@@ -9459,9 +9677,14 @@ def _session_owned_graph_queries(
     context_ids = db.query(WritableWorkContextModel.id).filter(
         WritableWorkContextModel.session_id == session_id
     )
+    # A recovery takeover spans two Session lifetimes. It is not exclusively
+    # owned by either graph and must survive deletion of one side so the other
+    # can still prove the completed transfer without reconstructing authority.
     takeover_ids = db.query(RecoveryTakeoverModel.id).filter(
         RecoveryTakeoverModel.old_terminal_id.in_(terminal_values),
         RecoveryTakeoverModel.new_terminal_id.in_(terminal_values),
+        RecoveryTakeoverModel.old_session_id == session_id,
+        RecoveryTakeoverModel.new_session_id == session_id,
     )
     return {
         "terminal_ids": terminal_values,
@@ -9734,7 +9957,9 @@ def _revalidate_session_hard_deletion_in_transaction(
         session_id=parsed["session_id"],
         terminals=terminals,
     )
-    if not plan["eligible"]:
+    if not plan["eligible"] and not (
+        parsed["preserve_protected_workspace"] and plan.get("can_preserve_protected_workspace")
+    ):
         return None, "SESSION_DELETE_PLAN_CHANGED"
     contexts = (
         db.query(WritableWorkContextModel)
@@ -9841,6 +10066,7 @@ def begin_session_hard_deletion(
     *,
     expected_terminal_ids: Sequence[str],
     allow_dirty_workspace: bool,
+    preserve_protected_workspace: bool = False,
 ) -> Dict[str, Any]:
     """Fence one proven-dead Session before crossing filesystem boundaries."""
     _ensure_terminal_ui_projection_schema()
@@ -9898,7 +10124,10 @@ def begin_session_hard_deletion(
         plan = _session_unresolved_work_plan_in_transaction(
             db, session_id=session_id, terminals=terminals
         )
-        if not plan["eligible"]:
+        preservation_admitted = bool(
+            preserve_protected_workspace and plan.get("can_preserve_protected_workspace")
+        )
+        if not plan["eligible"] and not preservation_admitted:
             db.rollback()
             reason_codes = plan.get("reason_codes") or ["SESSION_DELETE_PLAN_CHANGED"]
             return {"started": False, "reason_code": str(reason_codes[0])}
@@ -9941,6 +10170,7 @@ def begin_session_hard_deletion(
                 sorted(str(terminal.id) for terminal in terminals), separators=(",", ":")
             ),
             allow_dirty_workspace=effective_allow_dirty_workspace,
+            preserve_protected_workspace=preservation_admitted,
             authority_fingerprint=fingerprint,
             created_at=now,
             updated_at=now,
@@ -9979,6 +10209,22 @@ def _session_foreign_workspace_preservation_document(
         "workspace_authority_sha256": workspace_authority_sha256,
         "graph_terminal_ids": sorted(str(value) for value in graph_terminal_ids),
         "foreign_authority": dict(foreign_authority),
+        "runtime_artifacts": dict(runtime_artifacts) if runtime_artifacts is not None else None,
+    }
+
+
+def _session_protected_workspace_preservation_document(
+    *,
+    workspace_authority_sha256: str,
+    retained_resources: Sequence[Mapping[str, str]],
+    runtime_artifacts: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "disposition": _SESSION_WORKSPACE_DISPOSITION_PRESERVED_PROTECTED,
+        "reason_code": "TERMINAL_WORKSPACE_CLEANUP_AUTHORITY_MISSING",
+        "workspace_authority_sha256": workspace_authority_sha256,
+        "retained_resources": _normalize_session_retained_resources(retained_resources),
         "runtime_artifacts": dict(runtime_artifacts) if runtime_artifacts is not None else None,
     }
 
@@ -10088,6 +10334,42 @@ def bind_session_hard_deletion_workspace_authority(
         }
 
 
+def session_workspace_is_proven_foreign_successor(
+    session_id: str,
+    *,
+    expected_terminal_ids: Sequence[str],
+    workspace_authority: Mapping[str, Any],
+) -> bool:
+    """Return true only for an exact completed-takeover successor ownership proof."""
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        try:
+            normalized, _encoded, _digest = _normalize_session_workspace_authority(
+                workspace_authority,
+                expected_session_id=session_id,
+                expected_terminal_ids=expected_terminal_ids,
+            )
+        except ValueError:
+            return False
+        reason = _validate_session_workspace_relational_authority_in_transaction(
+            db,
+            session_id=session_id,
+            terminal_ids=expected_terminal_ids,
+            workspace_authority=normalized,
+            allow_dirty_workspace=False,
+            require_exact_context=True,
+        )
+        return reason == "WORKSPACE_FOREIGN_OWNER" and (
+            _session_foreign_workspace_evidence_in_transaction(
+                db,
+                session_id=session_id,
+                terminal_ids=expected_terminal_ids,
+                workspace_authority=normalized,
+            )
+            is not None
+        )
+
+
 def admit_session_foreign_workspace_preservation(
     session_id: str,
     session_name: str,
@@ -10174,6 +10456,62 @@ def admit_session_foreign_workspace_preservation(
             "admitted": True,
             "workspace_evidence_sha256": evidence_sha256,
         }
+
+
+def admit_session_protected_workspace_preservation(
+    session_id: str,
+    session_name: str,
+) -> Dict[str, Any]:
+    """Admit receipt-only deletion while preserving unproven physical resources."""
+    _ensure_session_deletion_receipt_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        operation = db.get(SessionDeletionOperationModel, session_id)
+        if operation is None or str(operation.session_name) != session_name:
+            db.rollback()
+            return {"admitted": False, "reason_code": "SESSION_DELETE_FENCE_MISSING"}
+        parsed = _session_deletion_operation_dict(operation)
+        if not parsed["preserve_protected_workspace"]:
+            db.rollback()
+            return {"admitted": False, "reason_code": "PROTECTED_WORKSPACE_CONFIRMATION_REQUIRED"}
+        if parsed["workspace_authority"] is None:
+            db.rollback()
+            return {"admitted": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
+        if parsed["workspace_disposition"] == _SESSION_WORKSPACE_DISPOSITION_PRESERVED_PROTECTED:
+            db.rollback()
+            return {"admitted": True, "already_admitted": True}
+        if operation.state != _SESSION_HARD_DELETE_FENCED:
+            db.rollback()
+            return {"admitted": False, "reason_code": "SESSION_DELETE_STATE_INVALID"}
+        terminals = _session_plan_terminals(db, session_id, parsed["terminal_ids"])
+        if terminals is None:
+            db.rollback()
+            return {"admitted": False, "reason_code": "SESSION_IDENTITY_CHANGED"}
+        plan = _session_unresolved_work_plan_in_transaction(
+            db, session_id=session_id, terminals=terminals
+        )
+        if not plan.get("can_preserve_protected_workspace"):
+            db.rollback()
+            return {"admitted": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
+        retained = [
+            {
+                "terminal_id": str(item["item_id"]),
+                "reason_code": "TERMINAL_WORKSPACE_CLEANUP_AUTHORITY_MISSING",
+            }
+            for item in plan.get("_unsafe_items", [])
+        ]
+        _evidence, evidence_json, evidence_sha256 = _canonical_session_workspace_evidence(
+            _session_protected_workspace_preservation_document(
+                workspace_authority_sha256=str(parsed["workspace_authority_sha256"]),
+                retained_resources=retained,
+            )
+        )
+        operation.workspace_disposition = _SESSION_WORKSPACE_DISPOSITION_PRESERVED_PROTECTED
+        operation.workspace_evidence_json = evidence_json
+        operation.workspace_evidence_sha256 = evidence_sha256
+        operation.updated_at = datetime.now()
+        db.commit()
+        return {"admitted": True, "workspace_evidence_sha256": evidence_sha256}
 
 
 def mark_session_hard_deletion_workspace_retired(
@@ -10290,14 +10628,19 @@ def mark_session_hard_deletion_workspace_preserved(
                 else {"marked": False, "reason_code": "SESSION_DELETE_FENCE_MISSING"}
             )
         parsed = _session_deletion_operation_dict(operation)
-        if parsed[
-            "workspace_disposition"
-        ] != _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN or not isinstance(
-            parsed["workspace_evidence"], Mapping
-        ):
+        disposition = parsed["workspace_disposition"]
+        if disposition not in {
+            _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN,
+            _SESSION_WORKSPACE_DISPOSITION_PRESERVED_PROTECTED,
+        } or not isinstance(parsed["workspace_evidence"], Mapping):
             db.rollback()
             return {"marked": False, "reason_code": "WORKSPACE_FOREIGN_OWNER_UNPROVEN"}
-        if operation.state == _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN:
+        expected_state = (
+            _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_PROTECTED
+            if disposition == _SESSION_WORKSPACE_DISPOSITION_PRESERVED_PROTECTED
+            else _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN
+        )
+        if operation.state == expected_state:
             recorded = parsed["workspace_evidence"].get("runtime_artifacts")
             matched = recorded == dict(runtime_artifacts)
             db.rollback()
@@ -10318,16 +10661,23 @@ def mark_session_hard_deletion_workspace_preserved(
             db.rollback()
             return {"marked": False, "reason_code": reason_code}
         draft = parsed["workspace_evidence"]
-        final_document = _session_foreign_workspace_preservation_document(
-            workspace_authority_sha256=str(parsed["workspace_authority_sha256"]),
-            graph_terminal_ids=draft.get("graph_terminal_ids", ()),
-            foreign_authority=draft.get("foreign_authority", {}),
-            runtime_artifacts=runtime_artifacts,
-        )
+        if disposition == _SESSION_WORKSPACE_DISPOSITION_PRESERVED_PROTECTED:
+            final_document = _session_protected_workspace_preservation_document(
+                workspace_authority_sha256=str(parsed["workspace_authority_sha256"]),
+                retained_resources=draft.get("retained_resources", ()),
+                runtime_artifacts=runtime_artifacts,
+            )
+        else:
+            final_document = _session_foreign_workspace_preservation_document(
+                workspace_authority_sha256=str(parsed["workspace_authority_sha256"]),
+                graph_terminal_ids=draft.get("graph_terminal_ids", ()),
+                foreign_authority=draft.get("foreign_authority", {}),
+                runtime_artifacts=runtime_artifacts,
+            )
         _evidence, evidence_json, evidence_sha256 = _canonical_session_workspace_evidence(
             final_document
         )
-        operation.state = _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN
+        operation.state = expected_state
         operation.workspace_evidence_json = evidence_json
         operation.workspace_evidence_sha256 = evidence_sha256
         operation.updated_at = datetime.now()
@@ -10369,17 +10719,19 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
         if operation.state not in {
             _SESSION_HARD_DELETE_WORKSPACE_RETIRED,
             _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN,
+            _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_PROTECTED,
         }:
             db.rollback()
             return {"completed": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
         parsed = _session_deletion_operation_dict(operation)
-        preserved_foreign = (
-            parsed["workspace_disposition"] == _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN
-        )
+        preserved_workspace = parsed["workspace_disposition"] in {
+            _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN,
+            _SESSION_WORKSPACE_DISPOSITION_PRESERVED_PROTECTED,
+        }
         terminals, reason_code = _revalidate_session_hard_deletion_in_transaction(
             db,
             operation,
-            require_workspace_retired=not preserved_foreign,
+            require_workspace_retired=not preserved_workspace,
         )
         if reason_code is not None or terminals is None:
             db.rollback()
@@ -10595,11 +10947,26 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
             )
         )
 
+        retained_resources = []
+        if parsed["workspace_disposition"] == _SESSION_WORKSPACE_DISPOSITION_PRESERVED_PROTECTED:
+            evidence = parsed.get("workspace_evidence")
+            if not isinstance(evidence, Mapping):
+                db.rollback()
+                return {"completed": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
+            try:
+                retained_resources = _normalize_session_retained_resources(
+                    evidence.get("retained_resources", ())
+                )
+            except ValueError:
+                db.rollback()
+                return {"completed": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
         db.add(
             SessionDeletionReceiptModel(
                 session_id=session_id,
                 session_name=session_name,
-                retained_resources_json="[]",
+                retained_resources_json=json.dumps(
+                    retained_resources, sort_keys=True, separators=(",", ":")
+                ),
                 deletion_reason="operator_session_hard_delete",
                 authority_fingerprint=hashlib.sha256(
                     (
@@ -16720,6 +17087,118 @@ def _workflow_effect_semantic_outcome(db: Any, effect: WorkflowEffectModel) -> s
         .one_or_none()
     )
     return str(resolution[0]) if resolution is not None else str(effect.state)
+
+
+def retire_indeterminate_workflow_effect(
+    effect_id: int,
+    *,
+    expected_workflow_id: int,
+    expected_workflow_turn_id: int,
+    expected_root_terminal_id: str,
+    expected_effect_kind: str,
+) -> Dict[str, Any]:
+    """Fence one exact unknown external outcome without replaying or relabelling it."""
+    _ensure_workflow_schema()
+    now = datetime.now()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        effect = db.get(WorkflowEffectModel, effect_id)
+        workflow = db.get(WorkflowModel, expected_workflow_id)
+        turn = db.get(WorkflowTurnModel, expected_workflow_turn_id)
+        if effect is None or workflow is None or turn is None:
+            db.rollback()
+            return {"retired": False, "reason_code": "OWNER_RESOLUTION_TARGET_CHANGED"}
+        exact = (
+            int(effect.workflow_id) == expected_workflow_id
+            and int(effect.workflow_turn_id) == expected_workflow_turn_id
+            and str(effect.effect_kind) == expected_effect_kind
+            and int(turn.workflow_id) == expected_workflow_id
+            and str(workflow.root_terminal_id) == expected_root_terminal_id
+        )
+        if not exact:
+            db.rollback()
+            return {"retired": False, "reason_code": "OWNER_RESOLUTION_TARGET_CHANGED"}
+        existing = (
+            db.query(WorkflowEffectResolutionModel)
+            .filter_by(workflow_effect_id=effect_id)
+            .one_or_none()
+        )
+        if existing is not None:
+            matched = (
+                str(existing.outcome) == "unknown_preserved"
+                and str(existing.reason_code) == "OPERATOR_RETIRED_INDETERMINATE"
+            )
+            db.rollback()
+            return (
+                {"retired": True, "already_retired": True, "outcome": "unknown_preserved"}
+                if matched
+                else {"retired": False, "reason_code": "OWNER_RESOLUTION_ALREADY_DECIDED"}
+            )
+        if (
+            effect.state != "indeterminate"
+            or workflow.status != WORKFLOW_OWNER_GATE
+            or int(workflow.active_turn_id or 0) != expected_workflow_turn_id
+        ):
+            db.rollback()
+            return {"retired": False, "reason_code": "OWNER_RESOLUTION_NOT_ELIGIBLE"}
+        if (
+            db.query(ProviderExecutionLeaseModel.terminal_id)
+            .filter_by(terminal_id=expected_root_terminal_id)
+            .first()
+            is not None
+            or db.query(WorkflowProviderReconnectAttemptModel.id)
+            .filter(
+                WorkflowProviderReconnectAttemptModel.workflow_id == expected_workflow_id,
+                WorkflowProviderReconnectAttemptModel.state.in_(
+                    (
+                        PROVIDER_RECONNECT_RESERVED,
+                        PROVIDER_RECONNECT_LAUNCHED,
+                        PROVIDER_RECONNECT_READY,
+                    )
+                ),
+            )
+            .first()
+            is not None
+        ):
+            db.rollback()
+            return {"retired": False, "reason_code": "OWNER_RESOLUTION_EXECUTION_ACTIVE"}
+        if not _append_workflow_effect_resolution(
+            db,
+            effect,
+            "unknown_preserved",
+            "OPERATOR_RETIRED_INDETERMINATE",
+            now,
+            evidence_turn_id=expected_workflow_turn_id,
+        ):
+            db.rollback()
+            return {"retired": False, "reason_code": "OWNER_RESOLUTION_ALREADY_DECIDED"}
+        workflow.status = WORKFLOW_CANCELLED
+        workflow.terminal_reason = _OPERATOR_RETIRED_INDETERMINATE_EFFECT
+        workflow.updated_at = now
+        (
+            db.query(WorkflowTurnModel)
+            .filter(
+                WorkflowTurnModel.workflow_id == expected_workflow_id,
+                WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+            )
+            .update(
+                {
+                    WorkflowTurnModel.state: TURN_CANCELLED,
+                    WorkflowTurnModel.claim_token: None,
+                    WorkflowTurnModel.claim_expires_at: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        _fail_closed_workflow_inbox_transports_in_transaction(db, expected_workflow_id)
+        _cancel_parent_assignments(db, expected_root_terminal_id, now)
+        db.commit()
+        return {
+            "retired": True,
+            "already_retired": False,
+            "outcome": "unknown_preserved",
+            "workflow_status": WORKFLOW_CANCELLED,
+        }
 
 
 def _terminal_session_identity_in_transaction(db: Any, terminal_id: str) -> Optional[str]:

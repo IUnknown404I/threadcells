@@ -281,6 +281,18 @@ class RecoveryTakeoverCapabilitiesRequest(BaseModel):
         return value
 
 
+class IndeterminateEffectRetirementRequest(BaseModel):
+    """Exact owner-confirmed fence for one unknown external effect outcome."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_workflow_id: int = Field(ge=1)
+    expected_workflow_turn_id: int = Field(ge=1)
+    expected_root_terminal_id: TerminalId
+    expected_effect_kind: Literal["send_message", "assign", "handoff", "acknowledgement"]
+    confirmed: Literal[True]
+
+
 class ManagedAttemptFenceRequest(BaseModel):
     """Exact owner authority required to fence one orphaned child attempt."""
 
@@ -1007,6 +1019,33 @@ def _require_operator(request: Request, authorization: Optional[str]) -> str:
         raise OperatorAuthenticationError("operator authentication failed")
     except (OperatorAuthenticationError, RuntimeError, _OperatorOriginError) as exc:
         raise _operator_auth_error(exc) from exc
+
+
+@app.post("/api/v1/workflow-effects/{effect_id}/retire-indeterminate")
+async def retire_indeterminate_effect_endpoint(
+    effect_id: int,
+    body: IndeterminateEffectRetirementRequest,
+    request: Request,
+    authorization: Annotated[Optional[str], Header()] = None,
+) -> Dict:
+    """Preserve an unknown outcome while permanently stopping future execution."""
+    _require_operator(request, authorization)
+    from cli_agent_orchestrator.clients.database import retire_indeterminate_workflow_effect
+
+    result = await _run_workflow_io(
+        retire_indeterminate_workflow_effect,
+        effect_id,
+        expected_workflow_id=body.expected_workflow_id,
+        expected_workflow_turn_id=body.expected_workflow_turn_id,
+        expected_root_terminal_id=body.expected_root_terminal_id,
+        expected_effect_kind=body.expected_effect_kind,
+    )
+    if not result.get("retired"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"reason_code": result.get("reason_code")},
+        )
+    return result
 
 
 @app.get("/operator/session")
@@ -1738,6 +1777,27 @@ async def get_housekeeping_report_endpoint() -> Dict:
         ) from exc
 
 
+@app.get("/api/v1/housekeeping/history")
+async def get_housekeeping_history_endpoint(
+    limit: int = 10,
+    before_id: Optional[int] = None,
+) -> Dict:
+    """Return one bounded cursor page; this endpoint is intentionally not polled."""
+    from cli_agent_orchestrator.clients.database import list_housekeeping_runs
+
+    try:
+        return await _run_ui_read(
+            list_housekeeping_runs,
+            limit=limit,
+            before_id=before_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"reason_code": "HOUSEKEEPING_HISTORY_QUERY_INVALID"},
+        ) from exc
+
+
 @app.get("/schemas/v1")
 async def list_public_schemas_endpoint() -> List[Dict[str, str]]:
     from cli_agent_orchestrator.services.schema_service import list_schemas
@@ -2196,17 +2256,23 @@ async def delete_session(
     confirm_dirty_workspace: bool = False,
     cancel_unresolved_work: bool = False,
     retire_historical_indeterminate: bool = False,
+    preserve_protected_workspace: bool = False,
     cancellation_plan_token: Optional[str] = None,
 ) -> Dict:
     try:
+        delete_kwargs: Dict[str, Any] = {
+            "registry": get_plugin_registry(request),
+            "confirm_dirty_workspace": confirm_dirty_workspace,
+            "cancel_unresolved_work": cancel_unresolved_work,
+            "retire_historical_indeterminate": retire_historical_indeterminate,
+            "cancellation_plan_token": cancellation_plan_token,
+        }
+        if preserve_protected_workspace:
+            delete_kwargs["preserve_protected_workspace"] = True
         result = await run_in_threadpool(
             session_service.delete_session,
             session_name,
-            registry=get_plugin_registry(request),
-            confirm_dirty_workspace=confirm_dirty_workspace,
-            cancel_unresolved_work=cancel_unresolved_work,
-            retire_historical_indeterminate=retire_historical_indeterminate,
-            cancellation_plan_token=cancellation_plan_token,
+            **delete_kwargs,
         )
         return {"success": True, **result}
     except (SessionNotFoundError, ValueError, SessionLifecycleError) as e:

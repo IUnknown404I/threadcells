@@ -2118,8 +2118,14 @@ def record_housekeeping_run(report: Mapping[str, Any]) -> Dict[str, Any]:
             ),
         }
         encoded = json.dumps(bounded, sort_keys=True, separators=(",", ":"))
-    started = datetime.fromisoformat(str(report["started_at"])).replace(tzinfo=None)
     completed = datetime.fromisoformat(str(report["completed_at"])).replace(tzinfo=None)
+    duration_seconds = max(0.0, float(report.get("duration_seconds") or 0.0))
+    started_value = report.get("started_at")
+    started = (
+        datetime.fromisoformat(str(started_value)).replace(tzinfo=None)
+        if started_value is not None
+        else completed - timedelta(seconds=duration_seconds)
+    )
     HousekeepingRunModel.__table__.create(bind=engine, checkfirst=True)
     with SessionLocal() as db:
         row = HousekeepingRunModel(
@@ -2127,7 +2133,7 @@ def record_housekeeping_run(report: Mapping[str, Any]) -> Dict[str, Any]:
             completed_at=completed,
             mode=str(report.get("mode") or "unknown")[:32],
             outcome=str(report.get("final_status") or "failed")[:64],
-            duration_seconds=max(0.0, float(report.get("duration_seconds") or 0.0)),
+            duration_seconds=duration_seconds,
             freed_bytes=max(0, int(report.get("freed_bytes") or 0)),
             report_json=encoded,
         )

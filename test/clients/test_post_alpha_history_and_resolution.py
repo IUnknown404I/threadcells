@@ -302,6 +302,31 @@ def test_housekeeping_history_is_bounded_paginated_and_keeps_failed_truth(monkey
         assert db.query(HousekeepingRunModel).count() == 50
 
 
+def test_housekeeping_history_derives_missing_start_from_completion_and_duration(
+    monkeypatch, tmp_path
+):
+    _database(monkeypatch, tmp_path)
+    completed_at = "2026-09-18T00:00:03+00:00"
+    database.record_housekeeping_run(
+        {
+            "ok": True,
+            "dry_run": False,
+            "mode": "full",
+            "started_at": None,
+            "completed_at": completed_at,
+            "duration_seconds": 2.5,
+            "final_status": "completed",
+            "freed_bytes": 1,
+        }
+    )
+
+    item = database.list_housekeeping_runs(limit=1)["items"][0]
+    assert item["started_at"] == "2026-09-18T00:00:00.500000"
+    assert item["completed_at"] == "2026-09-18T00:00:03"
+    assert item["duration_seconds"] == 2.5
+    assert item["report"]["started_at"] is None
+
+
 def test_housekeeping_records_each_real_run_once_and_never_records_preview(monkeypatch):
     records = []
     report = {

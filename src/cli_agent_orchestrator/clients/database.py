@@ -8248,10 +8248,15 @@ def get_session_hard_deletion_operation(session_id: str) -> Optional[Dict[str, A
     """Return one bounded in-progress hard-delete fence."""
     _ensure_session_deletion_receipt_schema()
     with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         operation = db.get(SessionDeletionOperationModel, session_id)
-        return (
-            _session_deletion_operation_with_graph(db, operation) if operation is not None else None
-        )
+        if operation is None:
+            db.rollback()
+            return None
+        promoted, _reason_code = _promote_session_protected_workspace_in_transaction(db, operation)
+        result = _session_deletion_operation_with_graph(db, operation)
+        db.commit() if promoted else db.rollback()
+        return result
 
 
 def _backfill_terminal_deletion_session_lifetime_authority(connection: Any) -> dict[str, int]:
@@ -10031,6 +10036,12 @@ def revalidate_session_hard_deletion(
         if operation is None or str(operation.session_name) != session_name:
             db.rollback()
             return {"valid": False, "reason_code": "SESSION_DELETE_FENCE_MISSING"}
+        promoted, promotion_error = _promote_session_protected_workspace_in_transaction(
+            db, operation
+        )
+        if promotion_error is not None:
+            db.rollback()
+            return {"valid": False, "reason_code": promotion_error}
         terminals, reason_code = _revalidate_session_hard_deletion_in_transaction(
             db,
             operation,
@@ -10042,7 +10053,7 @@ def revalidate_session_hard_deletion(
             if terminals is not None
             else None
         )
-        db.rollback()
+        db.commit() if promoted else db.rollback()
         return (
             {
                 "valid": False,
@@ -10090,12 +10101,22 @@ def begin_session_hard_deletion(
             ):
                 db.rollback()
                 raise AmbiguousSessionIdentity(session_id)
+            promoted, promotion_error = _promote_session_protected_workspace_in_transaction(
+                db, existing
+            )
+            if promotion_error is not None:
+                db.rollback()
+                return {"started": False, "reason_code": promotion_error}
             _terminals, reason_code = _revalidate_session_hard_deletion_in_transaction(
                 db,
                 existing,
                 require_workspace_retired=False,
             )
-            db.rollback()
+            operation = _session_deletion_operation_with_graph(db, existing)
+            if promoted:
+                db.commit()
+            else:
+                db.rollback()
             if reason_code is not None:
                 return {"started": False, "reason_code": reason_code}
             return {"started": True, "already_started": True, **operation}
@@ -10229,6 +10250,55 @@ def _session_protected_workspace_preservation_document(
     }
 
 
+def _promote_session_protected_workspace_in_transaction(
+    db: Any,
+    operation: SessionDeletionOperationModel,
+) -> tuple[bool, str | None]:
+    """Repair a pre-fix bind/admit gap before any destructive retry branch."""
+    parsed = _session_deletion_operation_dict(operation)
+    if not parsed["preserve_protected_workspace"]:
+        return False, None
+    if parsed["workspace_disposition"] in {
+        _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN,
+        _SESSION_WORKSPACE_DISPOSITION_PRESERVED_PROTECTED,
+    }:
+        return False, None
+    if parsed["workspace_authority"] is None:
+        return False, None
+    if (
+        parsed["workspace_disposition"] != _SESSION_WORKSPACE_DISPOSITION_RETIRED
+        or operation.state != _SESSION_HARD_DELETE_FENCED
+    ):
+        return False, "SESSION_DELETE_STATE_INVALID"
+    terminals = _session_plan_terminals(db, parsed["session_id"], parsed["terminal_ids"])
+    if terminals is None:
+        return False, "SESSION_IDENTITY_CHANGED"
+    plan = _session_unresolved_work_plan_in_transaction(
+        db, session_id=parsed["session_id"], terminals=terminals
+    )
+    if not plan.get("can_preserve_protected_workspace"):
+        return False, "SESSION_DELETE_PLAN_CHANGED"
+    retained = [
+        {
+            "terminal_id": str(item["item_id"]),
+            "reason_code": "TERMINAL_WORKSPACE_CLEANUP_AUTHORITY_MISSING",
+        }
+        for item in plan.get("_unsafe_items", [])
+    ]
+    _evidence, evidence_json, evidence_sha256 = _canonical_session_workspace_evidence(
+        _session_protected_workspace_preservation_document(
+            workspace_authority_sha256=str(parsed["workspace_authority_sha256"]),
+            retained_resources=retained,
+        )
+    )
+    operation.workspace_disposition = _SESSION_WORKSPACE_DISPOSITION_PRESERVED_PROTECTED
+    operation.workspace_evidence_json = evidence_json
+    operation.workspace_evidence_sha256 = evidence_sha256
+    operation.updated_at = datetime.now()
+    db.flush()
+    return True, None
+
+
 def bind_session_hard_deletion_workspace_authority(
     session_id: str,
     session_name: str,
@@ -10292,9 +10362,26 @@ def bind_session_hard_deletion_workspace_authority(
                 hmac.compare_digest(str(parsed["workspace_authority_sha256"]), digest)
                 and parsed["workspace_authority"] == normalized
             )
-            db.rollback()
+            promoted = False
+            promotion_error = None
+            if matched:
+                promoted, promotion_error = _promote_session_protected_workspace_in_transaction(
+                    db, operation
+                )
+            if promotion_error is not None:
+                db.rollback()
+                return {"bound": False, "reason_code": promotion_error}
+            if promoted:
+                db.commit()
+            else:
+                db.rollback()
             return (
-                {"bound": True, "already_bound": True, "workspace_authority_sha256": digest}
+                {
+                    "bound": True,
+                    "already_bound": True,
+                    "workspace_authority_sha256": digest,
+                    "workspace_disposition": operation.workspace_disposition,
+                }
                 if matched
                 else {
                     "bound": False,
@@ -10306,10 +10393,15 @@ def bind_session_hard_deletion_workspace_authority(
             return {"bound": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
         operation.workspace_authority_json = encoded
         operation.workspace_authority_sha256 = digest
+        protected_preservation = bool(parsed["preserve_protected_workspace"])
         operation.workspace_disposition = (
             _SESSION_WORKSPACE_DISPOSITION_PRESERVED_FOREIGN
             if foreign_authority is not None
-            else _SESSION_WORKSPACE_DISPOSITION_RETIRED
+            else (
+                _SESSION_WORKSPACE_DISPOSITION_PRESERVED_PROTECTED
+                if protected_preservation
+                else _SESSION_WORKSPACE_DISPOSITION_RETIRED
+            )
         )
         if foreign_authority is not None:
             graph_terminal_ids = _session_graph_terminal_ids(db, session_id, parsed["terminal_ids"])
@@ -10321,6 +10413,32 @@ def bind_session_hard_deletion_workspace_authority(
                     workspace_authority_sha256=digest,
                     graph_terminal_ids=graph_terminal_ids,
                     foreign_authority=foreign_authority,
+                )
+            )
+            operation.workspace_evidence_json = evidence_json
+            operation.workspace_evidence_sha256 = evidence_sha256
+        elif protected_preservation:
+            terminals = _session_plan_terminals(db, session_id, parsed["terminal_ids"])
+            if terminals is None:
+                db.rollback()
+                return {"bound": False, "reason_code": "SESSION_IDENTITY_CHANGED"}
+            plan = _session_unresolved_work_plan_in_transaction(
+                db, session_id=session_id, terminals=terminals
+            )
+            if not plan.get("can_preserve_protected_workspace"):
+                db.rollback()
+                return {"bound": False, "reason_code": "SESSION_DELETE_PLAN_CHANGED"}
+            retained = [
+                {
+                    "terminal_id": str(item["item_id"]),
+                    "reason_code": "TERMINAL_WORKSPACE_CLEANUP_AUTHORITY_MISSING",
+                }
+                for item in plan.get("_unsafe_items", [])
+            ]
+            _evidence, evidence_json, evidence_sha256 = _canonical_session_workspace_evidence(
+                _session_protected_workspace_preservation_document(
+                    workspace_authority_sha256=digest,
+                    retained_resources=retained,
                 )
             )
             operation.workspace_evidence_json = evidence_json
@@ -10567,6 +10685,21 @@ def mark_session_hard_deletion_workspace_retired(
                 else {"marked": False, "reason_code": "SESSION_DELETE_FENCE_MISSING"}
             )
         parsed = _session_deletion_operation_dict(operation)
+        if parsed["preserve_protected_workspace"]:
+            promoted, promotion_error = _promote_session_protected_workspace_in_transaction(
+                db, operation
+            )
+            if promotion_error is not None:
+                db.rollback()
+                return {"marked": False, "reason_code": promotion_error}
+            if promoted:
+                db.commit()
+            else:
+                db.rollback()
+            return {
+                "marked": False,
+                "reason_code": "PROTECTED_WORKSPACE_CONFIRMATION_REQUIRED",
+            }
         if parsed["workspace_authority"] is None:
             db.rollback()
             return {"marked": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
@@ -10716,12 +10849,23 @@ def complete_session_hard_deletion(session_id: str, session_name: str) -> Dict[s
         if operation is None or str(operation.session_name) != session_name:
             db.rollback()
             return {"completed": False, "reason_code": "SESSION_DELETE_FENCE_MISSING"}
+        promoted, promotion_error = _promote_session_protected_workspace_in_transaction(
+            db, operation
+        )
+        if promotion_error is not None:
+            db.rollback()
+            return {"completed": False, "reason_code": promotion_error}
+        if promoted:
+            parsed = _session_deletion_operation_dict(operation)
         if operation.state not in {
             _SESSION_HARD_DELETE_WORKSPACE_RETIRED,
             _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_FOREIGN,
             _SESSION_HARD_DELETE_WORKSPACE_PRESERVED_PROTECTED,
         }:
-            db.rollback()
+            if promoted:
+                db.commit()
+            else:
+                db.rollback()
             return {"completed": False, "reason_code": "WORKSPACE_CLEANUP_UNPROVEN"}
         parsed = _session_deletion_operation_dict(operation)
         preserved_workspace = parsed["workspace_disposition"] in {
@@ -14215,15 +14359,31 @@ def _active_child_assignment_statuses() -> tuple[str, ...]:
 
 def _cancel_parent_assignments(db, parent_terminal_id: str, now: datetime) -> int:
     """Fence unresolved callback edges without discarding a direct V1 claim."""
-    assignments = (
-        db.query(ChildAssignmentModel)
-        .filter(
-            ChildAssignmentModel.parent_terminal_id == parent_terminal_id,
-            ChildAssignmentModel.status.in_(_active_child_assignment_statuses()),
-            ChildAssignmentModel.review_superseded_at.is_(None),
-        )
-        .all()
+    return _cancel_parent_assignments_for_workflow(
+        db,
+        parent_terminal_id,
+        now,
+        workflow_id=None,
     )
+
+
+def _cancel_parent_assignments_for_workflow(
+    db: Any,
+    parent_terminal_id: str,
+    now: datetime,
+    *,
+    workflow_id: Optional[int],
+) -> int:
+    """Fence callback edges for one workflow, or every workflow on terminal close."""
+    query = db.query(ChildAssignmentModel).filter(
+        ChildAssignmentModel.parent_terminal_id == parent_terminal_id,
+        ChildAssignmentModel.status.in_(_active_child_assignment_statuses()),
+        ChildAssignmentModel.review_superseded_at.is_(None),
+    )
+    if workflow_id is not None:
+        query = query.filter(ChildAssignmentModel.request_workflow_id == workflow_id)
+    assignments = query.all()
+    exact_parent_workflow = db.get(WorkflowModel, workflow_id) if workflow_id is not None else None
     for assignment in assignments:
         # A direct handoff result has already crossed its strict final-output
         # boundary and was durably finalized.  Parent cancellation must not
@@ -14234,7 +14394,9 @@ def _cancel_parent_assignments(db, parent_terminal_id: str, now: datetime) -> in
         kind = "handoff" if assignment.status.startswith("handoff_") else "assign"
         assignment.status = ChildAssignmentStatus.CANCELLED.value
         assignment.updated_at = now
-        parent_workflow = _open_workflow(db, parent_terminal_id, create=False)
+        parent_workflow = exact_parent_workflow or _open_workflow(
+            db, parent_terminal_id, create=False
+        )
         result = _create_result_for_assignment(db, assignment, kind, parent_workflow)
         if result.status == DelegationResultStatus.AWAITING.value:
             result.status = DelegationResultStatus.CANCELLED.value
@@ -17138,6 +17300,13 @@ def retire_indeterminate_workflow_effect(
             effect.state != "indeterminate"
             or workflow.status != WORKFLOW_OWNER_GATE
             or int(workflow.active_turn_id or 0) != expected_workflow_turn_id
+            or db.query(WorkflowModel.id)
+            .filter(
+                WorkflowModel.id == expected_workflow_id,
+                workflow_current_execution_authority_predicate(WorkflowModel),
+            )
+            .one_or_none()
+            is None
         ):
             db.rollback()
             return {"retired": False, "reason_code": "OWNER_RESOLUTION_NOT_ELIGIBLE"}
@@ -17190,8 +17359,13 @@ def retire_indeterminate_workflow_effect(
                 synchronize_session=False,
             )
         )
-        _fail_closed_workflow_inbox_transports_in_transaction(db, expected_workflow_id)
-        _cancel_parent_assignments(db, expected_root_terminal_id, now)
+        _fail_closed_workflow_inbox_transports_in_transaction(db, workflow_id=expected_workflow_id)
+        _cancel_parent_assignments_for_workflow(
+            db,
+            expected_root_terminal_id,
+            now,
+            workflow_id=expected_workflow_id,
+        )
         db.commit()
         return {
             "retired": True,

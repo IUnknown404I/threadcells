@@ -10,10 +10,13 @@ from sqlalchemy.orm import sessionmaker
 from cli_agent_orchestrator.clients import database
 from cli_agent_orchestrator.clients.database import (
     Base,
+    ChildAssignmentModel,
     HousekeepingRunModel,
+    InboxModel,
     WorkflowEffectModel,
     WorkflowEffectResolutionModel,
     WorkflowModel,
+    WorkflowProviderReconnectAttemptModel,
     WorkflowTurnModel,
 )
 from cli_agent_orchestrator.services import housekeeping_service
@@ -81,6 +84,191 @@ def test_owner_retires_exact_indeterminate_effect_without_replay_or_success(monk
         assert db.get(WorkflowModel, ids[1]).status == "cancelled"
         resolution = db.query(WorkflowEffectResolutionModel).one()
         assert resolution.outcome == "unknown_preserved"
+
+
+def test_superseded_owner_gate_cannot_retire_or_cancel_successor_work(monkeypatch, tmp_path):
+    _database(monkeypatch, tmp_path)
+    with database.SessionLocal() as db:
+        gate = WorkflowModel(root_terminal_id="owner", status="owner_gate")
+        db.add(gate)
+        db.flush()
+        gate_turn = WorkflowTurnModel(
+            workflow_id=gate.id,
+            kind="external_input",
+            dedupe_key="historical-gate",
+            state="sent",
+        )
+        db.add(gate_turn)
+        db.flush()
+        gate.active_turn_id = gate_turn.id
+        effect = WorkflowEffectModel(
+            workflow_id=gate.id,
+            workflow_turn_id=gate_turn.id,
+            effect_kind="send_message",
+            effect_key="historical-unknown",
+            state="indeterminate",
+            claim_token="historical-claim",
+        )
+        successor = WorkflowModel(
+            root_terminal_id="owner",
+            status="open",
+            resumed_from_owner_gate_workflow_id=gate.id,
+        )
+        db.add_all([effect, successor])
+        db.flush()
+        successor_turn = WorkflowTurnModel(
+            workflow_id=successor.id,
+            kind="external_input",
+            dedupe_key="successor-input",
+            state="claimed",
+        )
+        db.add(successor_turn)
+        db.flush()
+        successor.active_turn_id = successor_turn.id
+        assignment = ChildAssignmentModel(
+            parent_terminal_id="owner",
+            child_terminal_id="successor-child",
+            status="awaiting_result",
+            attempt_id="successor-attempt",
+            request_workflow_id=successor.id,
+            request_workflow_turn_id=successor_turn.id,
+        )
+        reconnect = WorkflowProviderReconnectAttemptModel(
+            workflow_id=successor.id,
+            workflow_turn_id=successor_turn.id,
+            root_terminal_id="owner",
+            attempt_number=1,
+            attempt_token="successor-reconnect",
+            state="reserved",
+        )
+        db.add_all([assignment, reconnect])
+        db.commit()
+        ids = (effect.id, gate.id, gate_turn.id, successor.id, assignment.id, reconnect.id)
+
+    assert database.retire_indeterminate_workflow_effect(
+        ids[0],
+        expected_workflow_id=ids[1],
+        expected_workflow_turn_id=ids[2],
+        expected_root_terminal_id="owner",
+        expected_effect_kind="send_message",
+    ) == {"retired": False, "reason_code": "OWNER_RESOLUTION_NOT_ELIGIBLE"}
+    with database.SessionLocal() as db:
+        assert db.get(WorkflowModel, ids[1]).status == "owner_gate"
+        assert db.get(WorkflowModel, ids[3]).status == "open"
+        assert db.get(ChildAssignmentModel, ids[4]).status == "awaiting_result"
+        assert db.get(WorkflowProviderReconnectAttemptModel, ids[5]).state == "reserved"
+        assert db.query(WorkflowEffectResolutionModel).count() == 0
+
+
+def test_exact_retirement_fails_only_target_inbox_and_assignment_across_restart(
+    monkeypatch, tmp_path
+):
+    engine = _database(monkeypatch, tmp_path)
+    with database.SessionLocal() as db:
+        target_message = InboxModel(
+            sender_id="operator",
+            receiver_id="owner",
+            message="target",
+            status="pending",
+        )
+        other_message = InboxModel(
+            sender_id="operator",
+            receiver_id="owner",
+            message="other",
+            status="pending",
+        )
+        target = WorkflowModel(root_terminal_id="owner", status="owner_gate")
+        other = WorkflowModel(root_terminal_id="owner", status="terminal")
+        db.add_all([target_message, other_message, target, other])
+        db.flush()
+        target_turn = WorkflowTurnModel(
+            workflow_id=target.id,
+            kind="external_input",
+            dedupe_key="target-input",
+            state="sent",
+            inbox_message_id=target_message.id,
+        )
+        other_turn = WorkflowTurnModel(
+            workflow_id=other.id,
+            kind="external_input",
+            dedupe_key="other-input",
+            state="sent",
+            inbox_message_id=other_message.id,
+        )
+        db.add_all([target_turn, other_turn])
+        db.flush()
+        target.active_turn_id = target_turn.id
+        other.active_turn_id = other_turn.id
+        effect = WorkflowEffectModel(
+            workflow_id=target.id,
+            workflow_turn_id=target_turn.id,
+            effect_kind="send_message",
+            effect_key="target-unknown",
+            state="indeterminate",
+            claim_token="target-claim",
+        )
+        target_assignment = ChildAssignmentModel(
+            parent_terminal_id="owner",
+            child_terminal_id="target-child",
+            status="awaiting_result",
+            attempt_id="target-attempt",
+            request_workflow_id=target.id,
+            request_workflow_turn_id=target_turn.id,
+        )
+        other_assignment = ChildAssignmentModel(
+            parent_terminal_id="owner",
+            child_terminal_id="other-child",
+            status="awaiting_result",
+            attempt_id="other-attempt",
+            request_workflow_id=other.id,
+            request_workflow_turn_id=other_turn.id,
+        )
+        db.add_all([effect, target_assignment, other_assignment])
+        db.commit()
+        ids = (
+            effect.id,
+            target.id,
+            target_turn.id,
+            target_message.id,
+            other_message.id,
+            target_assignment.id,
+            other_assignment.id,
+        )
+
+    expected = {
+        "retired": True,
+        "already_retired": False,
+        "outcome": "unknown_preserved",
+        "workflow_status": "cancelled",
+    }
+    assert (
+        database.retire_indeterminate_workflow_effect(
+            ids[0],
+            expected_workflow_id=ids[1],
+            expected_workflow_turn_id=ids[2],
+            expected_root_terminal_id="owner",
+            expected_effect_kind="send_message",
+        )
+        == expected
+    )
+
+    engine.dispose()
+    restarted_engine = create_engine(str(engine.url))
+    monkeypatch.setattr(database, "engine", restarted_engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=restarted_engine))
+    assert database.retire_indeterminate_workflow_effect(
+        ids[0],
+        expected_workflow_id=ids[1],
+        expected_workflow_turn_id=ids[2],
+        expected_root_terminal_id="owner",
+        expected_effect_kind="send_message",
+    ) == {"retired": True, "already_retired": True, "outcome": "unknown_preserved"}
+    with database.SessionLocal() as db:
+        assert db.get(InboxModel, ids[3]).status == "failed"
+        assert db.get(InboxModel, ids[4]).status == "pending"
+        assert db.get(ChildAssignmentModel, ids[5]).status == "cancelled"
+        assert db.get(ChildAssignmentModel, ids[6]).status == "awaiting_result"
+        assert db.query(WorkflowEffectResolutionModel).count() == 1
 
 
 def test_housekeeping_history_is_bounded_paginated_and_keeps_failed_truth(monkeypatch, tmp_path):

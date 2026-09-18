@@ -811,6 +811,91 @@ def test_legacy_terminal_receipt_can_only_delete_with_protected_preservation(mon
     ]
 
 
+def test_protected_preservation_recovers_bind_admit_crash_without_purge(monkeypatch, tmp_path):
+    engine = _install_database(monkeypatch, f"sqlite:///{tmp_path / 'preserve-gap.db'}")
+    with database.SessionLocal() as db:
+        db.add(_terminal("owner"))
+        db.add(
+            TerminalDeletionReceiptModel(
+                terminal_id="legacy-retired-child",
+                session_id="session",
+                session_name="cao-session",
+                window_name="legacy-retired-child",
+                session_lifetime_authority_version=1,
+                deleted_at=datetime(2026, 9, 8, 9, 30, 0),
+            )
+        )
+        db.commit()
+
+    assert database.begin_session_hard_deletion(
+        "session",
+        "cao-session",
+        expected_terminal_ids=["owner"],
+        allow_dirty_workspace=False,
+        preserve_protected_workspace=True,
+    )["started"]
+    bound = database.bind_session_hard_deletion_workspace_authority(
+        "session",
+        "cao-session",
+        workspace_authority=_unmanaged_workspace_authority(["owner"]),
+    )
+    assert bound["workspace_disposition"] == "preserved_protected"
+
+    # Recreate the durable pre-fix crash image: authority binding committed as
+    # destructive retirement, but preservation admission never committed.
+    with database.SessionLocal() as db:
+        operation = db.get(SessionDeletionOperationModel, "session")
+        operation.workspace_disposition = "retired"
+        operation.workspace_evidence_json = None
+        operation.workspace_evidence_sha256 = None
+        db.commit()
+    engine.dispose()
+    restarted_engine = create_engine(f"sqlite:///{tmp_path / 'preserve-gap.db'}")
+    monkeypatch.setattr(database, "engine", restarted_engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=restarted_engine))
+
+    resumed = database.get_session_hard_deletion_operation("session")
+    assert resumed["workspace_disposition"] == "preserved_protected"
+    destructive_mark = database.mark_session_hard_deletion_workspace_retired(
+        "session",
+        workspace_evidence=[
+            {
+                "terminal_id": "owner",
+                "managed": False,
+                "path_absent": True,
+                "git_unregistered": True,
+                "branch_absent": True,
+                "runtime_artifacts_absent": True,
+            },
+            {
+                "terminal_id": "legacy-retired-child",
+                "managed": False,
+                "path_absent": True,
+                "git_unregistered": True,
+                "branch_absent": True,
+                "runtime_artifacts_absent": True,
+            },
+        ],
+    )
+    assert destructive_mark == {
+        "marked": False,
+        "reason_code": "PROTECTED_WORKSPACE_CONFIRMATION_REQUIRED",
+    }
+    artifacts = {"runtime_artifacts_absent": True, "terminals": ["owner"]}
+    assert database.mark_session_hard_deletion_workspace_preserved(
+        "session", runtime_artifacts=artifacts
+    )["marked"]
+    assert database.mark_session_hard_deletion_workspace_preserved(
+        "session", runtime_artifacts=artifacts
+    )["already_marked"]
+    completed = database.complete_session_hard_deletion("session", "cao-session")
+    assert completed["completed"] is True
+    assert completed["workspace_disposition"] == "preserved_protected"
+    assert database.resolve_session_lifetime("session")["workspace_disposition"] == (
+        "preserved_protected"
+    )
+
+
 def test_hard_delete_purges_owned_graph_and_preserves_shared_registry_and_other_session(
     monkeypatch,
 ):

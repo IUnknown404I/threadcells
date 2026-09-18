@@ -67,10 +67,16 @@ const housekeeping = {
   },
   schedule: { frequent: '6h', weekly: 'Sun 04:00 UTC', pressure: 'on_red' },
 }
+const longHousekeepingIdentifier = `worktree:${'long-resource-identifier-'.repeat(8)}terminal`
+const longHousekeepingReason = `RESOURCE_${'OWNERSHIP_BOUNDARY_'.repeat(8)}UNPROVEN`
 const report = {
   ok: true, freed_bytes: 1536, logs_compressed: 2, logs_deleted: 1,
   attachments_deleted: 0, ephemeral_resources_removed: 1, browser_revisions_removed: 0,
-  cache_pruned: 1, skipped_open: 1, skipped_unknown: 0, execution_failures: [], warnings: [],
+  cache_pruned: 1, skipped_open: 1, skipped_unknown: 0,
+  protected_resources: [{ canonical_identity: longHousekeepingIdentifier, category: 'worktrees', bytes: 256, reason: longHousekeepingReason }],
+  execution_skips: [{ candidate: longHousekeepingIdentifier, reason_code: longHousekeepingReason }],
+  execution_failures: [{ candidate: longHousekeepingIdentifier, reason_code: longHousekeepingReason }],
+  warnings: [`metadata_unknown:${longHousekeepingIdentifier}`],
 }
 const housekeepingPlan = {
   schema_version: 1, plan_id: 'a'.repeat(64), generated_at: 100, mode: 'frequent', root: '/fixture',
@@ -182,6 +188,18 @@ try {
 
     await page.goto(`${origin}/settings/housekeeping`)
     await page.getByText('Cleanup policy', { exact: true }).waitFor()
+    const longReportIdentifier = page.getByText(longHousekeepingIdentifier, { exact: false }).first()
+    await longReportIdentifier.waitFor()
+    if (viewport.width === 390) {
+      const wrapping = await longReportIdentifier.evaluate(element => {
+        const style = getComputedStyle(element)
+        const lineHeight = Number.parseFloat(style.lineHeight)
+        return { height: element.getBoundingClientRect().height, lineHeight, scrollWidth: element.scrollWidth, clientWidth: element.clientWidth }
+      })
+      assert(wrapping.height > wrapping.lineHeight * 1.5, `long Housekeeping identifier did not wrap at ${viewport.width}px`)
+      assert(wrapping.scrollWidth <= wrapping.clientWidth, `long Housekeeping identifier is clipped at ${viewport.width}px`)
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth), 390, 'Housekeeping report expands the 390px page')
+    }
     assert.equal(await page.getByText('retain_minutes', { exact: true }).count(), 0)
     assert.equal(await page.getByText('Protected · inventory only', { exact: true }).count(), 1)
     assert.equal(await page.getByText('1.5 KiB', { exact: true }).count(), 1)
@@ -191,7 +209,7 @@ try {
     assert.equal(await page.getByText('Unlock operator changes to execute this inspected plan.', { exact: true }).count(), 1)
     assert.equal(await page.getByText(/could not safely confirm an exclusive claim/).count(), 1)
     assert.equal(await page.getByText(/retirement cleanup claim unknown/).count(), 0)
-    assert((await page.getByText(/Diagnostic ID:/).textContent())?.includes('diagnostic-only'))
+    assert((await page.getByText(/Diagnostic ID:/).filter({ hasText: 'diagnostic-only' }).textContent())?.includes('diagnostic-only'))
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth), 0, `Housekeeping plan overflow at ${viewport.width}px`)
     await page.screenshot({ path: `${evidenceDir}/housekeeping-plan-${viewport.width}.png`, fullPage: true })
     if (viewport.width < 1000) await page.getByRole('link', { name: 'About' }).tap()

@@ -302,7 +302,7 @@ function HousekeepingReport({ report }: { report: Record<string, any> | null }) 
     ? undefined
     : t('housekeeping.diskSnapshot', { percent: resultingDisk.used_percent, free: bytes(resultingDisk.free_bytes) })
   const fullCounts = Number(report.cache_pruned || 0) + Number(report.reproducible_caches_removed || 0) + Number(report.browser_revisions_removed || 0) + Number(report.ephemeral_resources_removed || 0) + Number(report.build_artifacts_removed || 0)
-  return <div className="space-y-3">
+  return <div className="min-w-0 space-y-3">
     <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
       <Summary label={t('housekeeping.result')} value={t(resultKey)} />
       <Summary label={t('housekeeping.started')} value={started} />
@@ -329,25 +329,25 @@ function HousekeepingReport({ report }: { report: Record<string, any> | null }) 
 </div>)}</dl> : <p className="mt-3 text-xs text-gray-400">{t('housekeeping.noClassReclaim')}</p>}</div>
     </div>
     <div className="grid gap-3 sm:grid-cols-2">
-      <section className="rounded-xl border border-gray-700/60 bg-gray-800/60 p-4">
+      <section className="min-w-0 rounded-xl border border-gray-700/60 bg-gray-800/60 p-4">
         <h3 className="text-sm font-semibold text-gray-200">{t('housekeeping.protectedResources')}</h3>
         <p className="mt-1 text-xs text-gray-400">{tp('housekeeping.protectedResourcesCount', protectedResources.length)}</p>
-        {protectedResources.length ? <ul className="mt-2 max-h-40 list-disc space-y-1 overflow-auto pl-5 text-xs text-gray-300">{protectedResources.map((item: any, index: number) => <li key={`protected-${index}`}>{item.canonical_identity ? `${item.canonical_identity}: ` : ''}{item.reason || t('housekeeping.protected')}{item.category ? ` · ${String(item.category)}` : ''}{item.bytes === undefined ? '' : ` · ${bytes(Number(item.bytes || 0))}`}</li>)}</ul> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noneRecorded')}</p>}
+        {protectedResources.length ? <ul className="mt-2 max-h-40 min-w-0 list-disc space-y-1 overflow-auto pl-5 text-xs text-gray-300">{protectedResources.map((item: any, index: number) => <li key={`protected-${index}`} className="break-all">{item.canonical_identity ? `${item.canonical_identity}: ` : ''}{item.reason || t('housekeeping.protected')}{item.category ? ` · ${String(item.category)}` : ''}{item.bytes === undefined ? '' : ` · ${bytes(Number(item.bytes || 0))}`}</li>)}</ul> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noneRecorded')}</p>}
       </section>
-      <section className="rounded-xl border border-gray-700/60 bg-gray-800/60 p-4">
+      <section className="min-w-0 rounded-xl border border-gray-700/60 bg-gray-800/60 p-4">
         <h3 className="text-sm font-semibold text-gray-200">{t('housekeeping.executionSkips')}</h3>
         <p className="mt-1 text-xs text-gray-400">{t('housekeeping.executionSkipCount', { count: executionSkips.length })}</p>
-        {executionSkips.length ? <ul className="mt-2 max-h-40 list-disc space-y-1 overflow-auto pl-5 text-xs text-cyan-200">{executionSkips.map((item: any, index: number) => <li key={`skip-${index}`}>{item.candidate ? `${item.candidate}: ` : ''}{item.reason_code || 'EXECUTION_SKIPPED'}</li>)}</ul> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noneRecorded')}</p>}
+        {executionSkips.length ? <ul className="mt-2 max-h-40 min-w-0 list-disc space-y-1 overflow-auto pl-5 text-xs text-cyan-200">{executionSkips.map((item: any, index: number) => <li key={`skip-${index}`} className="break-all">{item.candidate ? `${item.candidate}: ` : ''}{item.reason_code || 'EXECUTION_SKIPPED'}</li>)}</ul> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noneRecorded')}</p>}
       </section>
-      <section className="rounded-xl border border-amber-800/50 bg-amber-950/10 p-4">
+      <section className="min-w-0 rounded-xl border border-amber-800/50 bg-amber-950/10 p-4">
         <h3 className="text-sm font-semibold text-amber-100">{t('housekeeping.diagnosticWarnings')}</h3>
         <p className="mt-1 text-xs text-amber-200/70">{t('housekeeping.warningCount', { count: warnings.length })}</p>
         {warnings.length ? <HousekeepingWarnings warnings={warnings} className="mt-2 max-h-40 overflow-auto" /> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noneRecorded')}</p>}
       </section>
-      <section className="rounded-xl border border-red-900/50 bg-red-950/10 p-4">
+      <section className="min-w-0 rounded-xl border border-red-900/50 bg-red-950/10 p-4">
         <h3 className="text-sm font-semibold text-red-100">{t('housekeeping.executionFailures')}</h3>
         <p className="mt-1 text-xs text-red-200/70">{t('housekeeping.failureCount', { count: executionFailures.length })}</p>
-        {executionFailures.length ? <ul className="mt-2 max-h-40 list-disc space-y-1 overflow-auto pl-5 text-xs text-red-300">{executionFailures.map((item: any, index: number) => <li key={`failure-${index}`}>{item.candidate ? `${item.candidate}: ` : ''}{item.reason_code || 'EXECUTION_FAILURE'}</li>)}</ul> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noFailures')}</p>}
+        {executionFailures.length ? <ul className="mt-2 max-h-40 min-w-0 list-disc space-y-1 overflow-auto pl-5 text-xs text-red-300">{executionFailures.map((item: any, index: number) => <li key={`failure-${index}`} className="break-all">{item.candidate ? `${item.candidate}: ` : ''}{item.reason_code || 'EXECUTION_FAILURE'}</li>)}</ul> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noFailures')}</p>}
       </section>
     </div>
     <Artifact value={report} label={t('housekeeping.rawReport')}/>

@@ -29,6 +29,7 @@ from cli_agent_orchestrator.clients.database import (
     AmbiguousSessionIdentity,
     SessionLifetimeAuthorityError,
     admit_session_foreign_workspace_preservation,
+    admit_session_protected_workspace_preservation,
     begin_session_hard_deletion,
     bind_session_hard_deletion_workspace_authority,
     cancel_session_work_for_deletion,
@@ -44,6 +45,7 @@ from cli_agent_orchestrator.clients.database import (
     mark_session_hard_deletion_workspace_retired,
     resolve_session_lifetime,
     revalidate_session_hard_deletion,
+    session_workspace_is_proven_foreign_successor,
     transition_writable_work_context,
 )
 from cli_agent_orchestrator.clients.tmux import tmux_client
@@ -461,7 +463,11 @@ def _session_deletion_preflight(
     modified_files = 0
     untracked_files = 0
     workspace_capture: dict[str, Any] | None = None
-    if not unsafe_blockers:
+    can_preserve_protected = bool(plan.get("can_preserve_protected_workspace")) and all(
+        "TERMINAL_WORKSPACE_CLEANUP_AUTHORITY_MISSING" in item.get("reason_codes", [])
+        for item in unsafe_blockers
+    )
+    if not unsafe_blockers or can_preserve_protected:
         captured = _capture_session_workspace_retirement_authority(
             authority,
             context=context,
@@ -487,10 +493,15 @@ def _session_deletion_preflight(
                 # launch path could be a moved registration or external loss.
                 # Only the retired context (or an already-fenced retry, which
                 # bypasses fresh preflight) makes that absence authoritative.
-                add_unsafe(
-                    "workspace_authority",
-                    "WORKSPACE_RETIREMENT_STATE_CONFLICT",
-                )
+                if not session_workspace_is_proven_foreign_successor(
+                    authority.session_id,
+                    expected_terminal_ids=[str(item["id"]) for item in authority.terminals],
+                    workspace_authority=captured["authority"],
+                ):
+                    add_unsafe(
+                        "workspace_authority",
+                        "WORKSPACE_RETIREMENT_STATE_CONFLICT",
+                    )
             modified_files = int(captured.get("modified_files") or 0)
             untracked_files = int(captured.get("untracked_files") or 0)
     unsafe_blockers = [item for item in blockers if item["disposition"] == "unsafe"]
@@ -504,7 +515,13 @@ def _session_deletion_preflight(
     can_resolve_and_delete = not unsafe_blockers and bool(
         cancellable_blockers or retirement_blockers
     )
-    if unsafe_blockers:
+    can_preserve_protected = bool(plan.get("can_preserve_protected_workspace")) and all(
+        "TERMINAL_WORKSPACE_CLEANUP_AUTHORITY_MISSING" in item.get("reason_codes", [])
+        for item in unsafe_blockers
+    )
+    if can_preserve_protected:
+        deletion_mode = "eligible_with_protected_workspace_preservation"
+    elif unsafe_blockers:
         deletion_mode = "blocked_live_or_unsafe_authority"
     elif retirement_blockers:
         deletion_mode = "eligible_with_historical_indeterminate_retirement"
@@ -551,7 +568,9 @@ def _session_deletion_preflight(
         else None
     )
     deletion_plan_token = None
-    if workspace_authority_sha256 is not None and (eligible or can_resolve_and_delete):
+    if workspace_authority_sha256 is not None and (
+        eligible or can_resolve_and_delete or can_preserve_protected
+    ):
         deletion_plan_token = hashlib.sha256(
             json.dumps(
                 {
@@ -569,6 +588,8 @@ def _session_deletion_preflight(
         "deletion_mode": deletion_mode,
         "cancellable": cancellable,
         "can_resolve_and_delete": can_resolve_and_delete,
+        "can_preserve_protected_workspace": can_preserve_protected,
+        "requires_protected_workspace_confirmation": can_preserve_protected,
         "requires_cancellation_confirmation": (bool(cancellable_blockers) and not unsafe_blockers),
         "requires_historical_indeterminate_confirmation": retirement_available,
         "plan_token": deletion_plan_token,
@@ -621,6 +642,7 @@ def delete_session(
     confirm_dirty_workspace: bool = False,
     cancel_unresolved_work: bool = False,
     retire_historical_indeterminate: bool = False,
+    preserve_protected_workspace: bool = False,
     cancellation_plan_token: str | None = None,
 ) -> Dict:
     """Permanently delete one Session after fencing every live authority.
@@ -659,7 +681,17 @@ def delete_session(
                 confirmed_workspace_sha256 = preflight.get("_workspace_authority_sha256")
                 if not preflight["eligible"]:
                     resolution_requested = cancel_unresolved_work or retire_historical_indeterminate
-                    if resolution_requested:
+                    if preflight.get("can_preserve_protected_workspace"):
+                        if (
+                            not preserve_protected_workspace
+                            or not cancellation_plan_token
+                            or cancellation_plan_token != preflight.get("plan_token")
+                        ):
+                            raise SessionLifecycleError(
+                                "PROTECTED_WORKSPACE_CONFIRMATION_REQUIRED",
+                                "Unknown workspace authority requires explicit preservation confirmation",
+                            )
+                    elif resolution_requested:
                         if (
                             not preflight.get("can_resolve_and_delete")
                             or not cancellation_plan_token
@@ -747,11 +779,16 @@ def delete_session(
 
                 wake_provider_execution_queue(registry)
                 try:
+                    begin_kwargs: dict[str, Any] = {
+                        "expected_terminal_ids": terminal_ids,
+                        "allow_dirty_workspace": bool(confirm_dirty_workspace),
+                    }
+                    if preserve_protected_workspace:
+                        begin_kwargs["preserve_protected_workspace"] = True
                     started = begin_session_hard_deletion(
                         authority.session_id,
                         authority.session_name,
-                        expected_terminal_ids=terminal_ids,
-                        allow_dirty_workspace=bool(confirm_dirty_workspace),
+                        **begin_kwargs,
                     )
                 except AmbiguousSessionIdentity as exc:
                     raise SessionLifecycleError(
@@ -821,8 +858,10 @@ def delete_session(
                 graph_terminal_ids = [
                     str(value) for value in revalidated.get("graph_terminal_ids", terminal_ids)
                 ]
-                historical_terminal_cleanup = list_session_historical_terminal_cleanup_authorities(
-                    authority.session_id
+                historical_terminal_cleanup = (
+                    []
+                    if operation.get("preserve_protected_workspace")
+                    else list_session_historical_terminal_cleanup_authorities(authority.session_id)
                 )
                 if operation.get("workspace_authority") is None:
                     if planned_workspace_authority is None:
@@ -869,6 +908,28 @@ def delete_session(
                         "workspace_authority_sha256"
                     )
                     operation["workspace_disposition"] = bound.get("workspace_disposition")
+                    if operation.get("preserve_protected_workspace"):
+                        preservation = admit_session_protected_workspace_preservation(
+                            authority.session_id,
+                            authority.session_name,
+                        )
+                        if not preservation.get("admitted"):
+                            raise SessionLifecycleError(
+                                str(
+                                    preservation.get("reason_code")
+                                    or "PROTECTED_WORKSPACE_CONFIRMATION_REQUIRED"
+                                ),
+                                "Protected workspace preservation could not be admitted",
+                            )
+                        refreshed_operation = get_session_hard_deletion_operation(
+                            authority.session_id
+                        )
+                        if refreshed_operation is None:
+                            raise SessionLifecycleError(
+                                "SESSION_DELETE_FENCE_MISSING",
+                                "The durable Session deletion fence disappeared",
+                            )
+                        operation = refreshed_operation
                     if operation["workspace_disposition"] == "preserved_foreign":
                         refreshed_operation = get_session_hard_deletion_operation(
                             authority.session_id
@@ -945,11 +1006,12 @@ def delete_session(
                                 "Writable workspace context changed during deletion",
                             )
                         allow_dirty = bool(operation["allow_dirty_workspace"])
-                        preserve_foreign = (
-                            operation.get("workspace_disposition") == "preserved_foreign"
-                        )
+                        preserve_workspace = operation.get("workspace_disposition") in {
+                            "preserved_foreign",
+                            "preserved_protected",
+                        }
                         if (
-                            not preserve_foreign
+                            not preserve_workspace
                             and context is not None
                             and not context_already_retired
                         ):
@@ -982,7 +1044,7 @@ def delete_session(
                                     "Managed workspace authority changed during deletion",
                                 )
                         workspace_evidence: list[dict[str, object]] = []
-                        if not preserve_foreign:
+                        if not preserve_workspace:
                             cleanup = purge_session_managed_worktrees(
                                 terminals,
                                 operation["workspace_authority"],
@@ -1003,7 +1065,7 @@ def delete_session(
                                 "TERMINAL_ARTIFACT_CLEANUP_UNPROVEN",
                                 "Terminal output or attachment cleanup could not be proven",
                             )
-                        if not preserve_foreign:
+                        if not preserve_workspace:
                             # Individual terminal retirement removes the worktree
                             # but deliberately preserves its private task branch.
                             # Consume the exact receipt-bound Git identity here;
@@ -1035,7 +1097,7 @@ def delete_session(
                                     }
                                 )
                         if (
-                            not preserve_foreign
+                            not preserve_workspace
                             and context is not None
                             and not context_already_retired
                         ):
@@ -1054,7 +1116,7 @@ def delete_session(
                                 authority.session_id,
                                 runtime_artifacts=artifact_cleanup,
                             )
-                            if preserve_foreign
+                            if preserve_workspace
                             else mark_session_hard_deletion_workspace_retired(
                                 authority.session_id,
                                 workspace_evidence=workspace_evidence,
@@ -1101,7 +1163,11 @@ def delete_session(
 
         result["deleted"].append(authority.session_name)
         result["already_deleted"] = bool(deletion["already_deleted"])
-        result["retained_resources"] = []
+        result["retained_resources"] = (
+            list(resolve_session_authority(authority.session_id).retained_resources)
+            if deletion.get("workspace_disposition") == "preserved_protected"
+            else []
+        )
         result["purged_rows"] = dict(deletion.get("before_counts", {}))
         result["remaining_rows"] = dict(deletion.get("after_counts", {}))
         result["tombstone_count"] = int(deletion.get("tombstone_count", 1))

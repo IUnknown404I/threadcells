@@ -760,6 +760,142 @@ def test_legacy_terminal_receipt_without_workspace_cleanup_authority_fails_close
     }
 
 
+def test_legacy_terminal_receipt_can_only_delete_with_protected_preservation(monkeypatch):
+    _install_database(monkeypatch)
+    with database.SessionLocal() as db:
+        db.add(_terminal("owner"))
+        db.add(
+            TerminalDeletionReceiptModel(
+                terminal_id="legacy-retired-child",
+                session_id="session",
+                session_name="cao-session",
+                window_name="legacy-retired-child",
+                session_lifetime_authority_version=1,
+                deleted_at=datetime(2026, 9, 8, 9, 30, 0),
+            )
+        )
+        db.commit()
+
+    plan = database.get_session_unresolved_work_plan("session", expected_terminal_ids=["owner"])
+    assert plan["can_preserve_protected_workspace"] is True
+    assert plan["plan_token"] is not None
+    started = database.begin_session_hard_deletion(
+        "session",
+        "cao-session",
+        expected_terminal_ids=["owner"],
+        allow_dirty_workspace=False,
+        preserve_protected_workspace=True,
+    )
+    assert started["started"] is True
+    assert database.bind_session_hard_deletion_workspace_authority(
+        "session",
+        "cao-session",
+        workspace_authority=_unmanaged_workspace_authority(["owner"]),
+    )["bound"]
+    assert database.admit_session_protected_workspace_preservation("session", "cao-session")[
+        "admitted"
+    ]
+    assert database.mark_session_hard_deletion_workspace_preserved(
+        "session",
+        runtime_artifacts={"runtime_artifacts_absent": True, "terminals": ["owner"]},
+    )["marked"]
+    completed = database.complete_session_hard_deletion("session", "cao-session")
+    assert completed["completed"] is True
+    assert completed["workspace_disposition"] == "preserved_protected"
+    lifetime = database.resolve_session_lifetime("session")
+    assert lifetime["retained_resources"] == [
+        {
+            "terminal_id": "legacy-retired-child",
+            "reason_code": "TERMINAL_WORKSPACE_CLEANUP_AUTHORITY_MISSING",
+        }
+    ]
+
+
+def test_protected_preservation_recovers_bind_admit_crash_without_purge(monkeypatch, tmp_path):
+    engine = _install_database(monkeypatch, f"sqlite:///{tmp_path / 'preserve-gap.db'}")
+    with database.SessionLocal() as db:
+        db.add(_terminal("owner"))
+        db.add(
+            TerminalDeletionReceiptModel(
+                terminal_id="legacy-retired-child",
+                session_id="session",
+                session_name="cao-session",
+                window_name="legacy-retired-child",
+                session_lifetime_authority_version=1,
+                deleted_at=datetime(2026, 9, 8, 9, 30, 0),
+            )
+        )
+        db.commit()
+
+    assert database.begin_session_hard_deletion(
+        "session",
+        "cao-session",
+        expected_terminal_ids=["owner"],
+        allow_dirty_workspace=False,
+        preserve_protected_workspace=True,
+    )["started"]
+    bound = database.bind_session_hard_deletion_workspace_authority(
+        "session",
+        "cao-session",
+        workspace_authority=_unmanaged_workspace_authority(["owner"]),
+    )
+    assert bound["workspace_disposition"] == "preserved_protected"
+
+    # Recreate the durable pre-fix crash image: authority binding committed as
+    # destructive retirement, but preservation admission never committed.
+    with database.SessionLocal() as db:
+        operation = db.get(SessionDeletionOperationModel, "session")
+        operation.workspace_disposition = "retired"
+        operation.workspace_evidence_json = None
+        operation.workspace_evidence_sha256 = None
+        db.commit()
+    engine.dispose()
+    restarted_engine = create_engine(f"sqlite:///{tmp_path / 'preserve-gap.db'}")
+    monkeypatch.setattr(database, "engine", restarted_engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=restarted_engine))
+
+    resumed = database.get_session_hard_deletion_operation("session")
+    assert resumed["workspace_disposition"] == "preserved_protected"
+    destructive_mark = database.mark_session_hard_deletion_workspace_retired(
+        "session",
+        workspace_evidence=[
+            {
+                "terminal_id": "owner",
+                "managed": False,
+                "path_absent": True,
+                "git_unregistered": True,
+                "branch_absent": True,
+                "runtime_artifacts_absent": True,
+            },
+            {
+                "terminal_id": "legacy-retired-child",
+                "managed": False,
+                "path_absent": True,
+                "git_unregistered": True,
+                "branch_absent": True,
+                "runtime_artifacts_absent": True,
+            },
+        ],
+    )
+    assert destructive_mark == {
+        "marked": False,
+        "reason_code": "PROTECTED_WORKSPACE_CONFIRMATION_REQUIRED",
+    }
+    artifacts = {"runtime_artifacts_absent": True, "terminals": ["owner"]}
+    assert database.mark_session_hard_deletion_workspace_preserved(
+        "session", runtime_artifacts=artifacts
+    )["marked"]
+    assert database.mark_session_hard_deletion_workspace_preserved(
+        "session", runtime_artifacts=artifacts
+    )["already_marked"]
+    completed = database.complete_session_hard_deletion("session", "cao-session")
+    assert completed["completed"] is True
+    assert completed["workspace_disposition"] == "preserved_protected"
+    assert database.resolve_session_lifetime("session")["workspace_disposition"] == (
+        "preserved_protected"
+    )
+
+
 def test_hard_delete_purges_owned_graph_and_preserves_shared_registry_and_other_session(
     monkeypatch,
 ):
@@ -2180,9 +2316,9 @@ def test_workspace_authority_preserves_foreign_writer_on_target_path(monkeypatch
         assert lease.authority_generation == "foreign-generation"
 
 
-@pytest.mark.parametrize("successor_exited", [False, True])
+@pytest.mark.parametrize("successor_state", ["running", "exited", "deleted"])
 def test_completed_takeover_predecessor_delete_preserves_successor_authority(
-    monkeypatch, tmp_path, successor_exited
+    monkeypatch, tmp_path, successor_state
 ):
     managed, authority = _managed_supervisor_deletion_fixture(monkeypatch, tmp_path)
     with database.SessionLocal() as db:
@@ -2244,8 +2380,52 @@ def test_completed_takeover_predecessor_delete_preserves_successor_authority(
             )
         )
         db.commit()
-    if successor_exited:
+    if successor_state in {"exited", "deleted"}:
         assert database.mark_terminal_runtime_exited("successor") is True
+    if successor_state == "deleted":
+        _git(Path(managed.source), "worktree", "remove", managed.path)
+        with database.SessionLocal() as db:
+            db.query(WorktreeWriterLeaseModel).filter_by(canonical_worktree=managed.path).delete()
+            db.query(WritableWorkContextModel).filter_by(id="context").delete()
+            db.query(TerminalModel).filter_by(id="successor").delete()
+            db.add(
+                SessionDeletionReceiptModel(
+                    session_id="successor-session",
+                    session_name="cao-successor",
+                    retained_resources_json="[]",
+                    terminal_fences_json=('[{"auth_token_sha256":null,"terminal_id":"successor"}]'),
+                    workspace_disposition="retired",
+                    workspace_evidence_json="[]",
+                    receipt_version=3,
+                )
+            )
+            db.add(
+                SessionDeletedTerminalFenceModel(
+                    terminal_id="successor",
+                    session_id="successor-session",
+                    auth_token_sha256=None,
+                    deleted_at=datetime(2026, 9, 8, 10, 3, 0),
+                )
+            )
+            db.commit()
+        row = authority["worktrees"][0]
+        row.update(
+            {
+                "present": False,
+                "registered": False,
+                "path_identity": None,
+                "git_dir": None,
+                "git_dir_identity": None,
+                "head": None,
+                "branch": None,
+                "head_ref": None,
+                "detached": None,
+                "clean": True,
+                "modified_files": 0,
+                "untracked_files": 0,
+                "content_fingerprint": None,
+            }
+        )
     authority["work_context"] = None
 
     plan = database.get_session_unresolved_work_plan("session", expected_terminal_ids=["owner"])
@@ -2274,21 +2454,27 @@ def test_completed_takeover_predecessor_delete_preserves_successor_authority(
     replay = database.complete_session_hard_deletion("session", "cao-session")
     assert replay["completed"] is True
     assert replay["already_deleted"] is True
-    assert Path(managed.path).is_dir()
+    assert Path(managed.path).is_dir() is (successor_state != "deleted")
     with database.SessionLocal() as db:
         assert db.get(TerminalModel, "owner") is None
         successor = db.get(TerminalModel, "successor")
-        assert successor is not None
-        assert successor.runtime_lifecycle == ("exited" if successor_exited else "running")
         context = db.get(WritableWorkContextModel, "context")
-        assert context is not None
-        assert context.session_id == "successor-session"
-        assert context.terminal_id == "successor"
-        assert context.state == "admitted"
         lease = db.get(WorktreeWriterLeaseModel, managed.path)
-        if successor_exited:
+        if successor_state == "deleted":
+            assert successor is None
+            assert context is None
             assert lease is None
+            assert db.get(SessionDeletionReceiptModel, "successor-session") is not None
         else:
+            assert successor is not None
+            assert successor.runtime_lifecycle == successor_state
+            assert context is not None
+            assert context.session_id == "successor-session"
+            assert context.terminal_id == "successor"
+            assert context.state == "admitted"
+        if successor_state == "exited":
+            assert lease is None
+        elif successor_state == "running":
             assert lease is not None
             assert lease.terminal_id == "successor"
             assert lease.authority_generation == "successor-writer"

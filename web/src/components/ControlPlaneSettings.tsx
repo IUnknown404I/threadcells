@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { BookOpen, Boxes, CheckCircle2, Clock3, Database, HardDrive, HeartHandshake, Info, Loader2, Search, ShieldCheck, Sparkles, Trash2 } from 'lucide-react'
-import { api, CaoApiError, FullCleanupOperation, FullCleanupPlan, HousekeepingPlan, HousekeepingSettings, OrchestrationCapacity, ProviderSettings, RegistryRecord } from '../api'
+import { BookOpen, Boxes, CheckCircle2, Clock3, Copy, Database, Download, HardDrive, HeartHandshake, Info, Loader2, Search, ShieldCheck, Sparkles, Trash2 } from 'lucide-react'
+import { api, CaoApiError, FullCleanupOperation, FullCleanupPlan, HousekeepingHistoryPage, HousekeepingPlan, HousekeepingSettings, OrchestrationCapacity, ProviderSettings, RegistryRecord } from '../api'
 import { BUILD_IDENTITY } from '../buildIdentity'
+import { buildSafeDiagnosticReport, copyDiagnosticReport, downloadDiagnosticReport } from '../diagnosticReport'
+import { useStore } from '../store'
 import { providerRuntimeLabel } from '../providerAvailability'
 import { OperatorAccessCard, useOperatorAccess } from './OperatorAccess'
 import { ConfirmModal } from './ConfirmModal'
@@ -368,6 +370,7 @@ function HousekeepingSettingsPage() {
   const [mode, setMode] = useState<'frequent' | 'weekly' | 'pressure'>('frequent')
   const [plan, setPlan] = useState<HousekeepingPlan | null>(null)
   const [report, setReport] = useState<Record<string, any> | null>(null)
+  const [history, setHistory] = useState<HousekeepingHistoryPage>({ items: [], next_before_id: null })
   const [running, setRunning] = useState(false)
   const [executionBlock, setExecutionBlock] = useState<'changed' | 'busy' | null>(null)
   const [fullPlan, setFullPlan] = useState<FullCleanupPlan | null>(null)
@@ -382,7 +385,10 @@ function HousekeepingSettingsPage() {
   const planningRef = useRef<'normal' | 'full' | null>(null)
   const planningAbortRef = useRef<AbortController | null>(null)
   const mountedRef = useRef(true)
-  const load = () => Promise.all([api.getHousekeepingSettings(), api.getHousekeepingReport(), api.getOrchestrationCapacity()]).then(([value, latest, resources]) => { setSettings(value); setReport(latest); setCapacity(resources) }).catch(reason => setError(reason.message))
+  const load = () => {
+    void api.getHousekeepingHistory().then(setHistory).catch(() => undefined)
+    return Promise.all([api.getHousekeepingSettings(), api.getHousekeepingReport(), api.getOrchestrationCapacity()]).then(([value, latest, resources]) => { setSettings(value); setReport(latest); setCapacity(resources) }).catch(reason => setError(reason.message))
+  }
   useEffect(() => { void load() }, [])
   useEffect(() => {
     mountedRef.current = true
@@ -801,11 +807,22 @@ function HousekeepingSettingsPage() {
 <section aria-labelledby="latest-report-heading">
 <h2 id="latest-report-heading" className="mb-3 text-base font-semibold text-gray-100">{t('housekeeping.latestReport')}</h2>
 <HousekeepingReport report={report}/>
+</section>
+<section aria-labelledby="housekeeping-history-heading">
+<h2 id="housekeeping-history-heading" className="mb-3 text-base font-semibold text-gray-100">{t('housekeeping.history')}</h2>
+<div className="space-y-2">{history.items.map(item => <details key={item.id} className="rounded-xl border border-gray-700/60 bg-gray-800/60 p-3">
+<summary className="min-h-9 cursor-pointer text-sm text-gray-200">{item.completed_at} · {item.mode} · {item.outcome} · {item.duration_seconds.toFixed(1)}s · {bytes(item.freed_bytes)}</summary>
+<div className="mt-3"><HousekeepingReport report={item.report}/></div>
+</details>)}{history.items.length === 0 && <p className="text-sm text-gray-400">{t('housekeeping.historyEmpty')}</p>}</div>
+{history.next_before_id && <button type="button" className="mt-3 min-h-11 rounded-lg border border-gray-600 px-4 text-sm text-gray-200" onClick={() => void api.getHousekeepingHistory(10, history.next_before_id).then(next => setHistory({ items: [...history.items, ...next.items], next_before_id: next.next_before_id }))}>{t('housekeeping.loadOlder')}</button>}
 </section>{error && <p role="alert" className="rounded-lg border border-red-700/50 bg-red-950/30 p-3 text-sm text-red-300">{error}</p>}{fullCleanupDanger}</section>
 }
 
 function AboutSettings() {
   const { t } = useI18n()
+  const connected = useStore(state => state.connected)
+  const [diagnosticStatus, setDiagnosticStatus] = useState('')
+  const diagnostic = buildSafeDiagnosticReport({ version: BUILD_IDENTITY.version, revision: BUILD_IDENTITY.revision, uiState: connected ? 'connected' : 'disconnected' })
   const principles = [
     [t('about.operationalTruth'), t('about.operationalTruthCopy'), <ShieldCheck size={18}/>],
     [t('about.nativeAgents'), t('about.nativeAgentsCopy'), <Boxes size={18}/>],
@@ -837,6 +854,15 @@ function AboutSettings() {
 </div>
 </div>
 </header>
+<section aria-labelledby="diagnostic-heading" className="rounded-xl border border-gray-700/60 bg-gray-800/60 p-5">
+<h2 id="diagnostic-heading" className="text-base font-semibold text-gray-100">{t('about.diagnosticTitle')}</h2>
+<p className="mt-2 text-sm leading-6 text-gray-400">{t('about.diagnosticCopy')}</p>
+<div className="mt-3 flex flex-wrap gap-2">
+<button type="button" onClick={() => void copyDiagnosticReport(diagnostic).then(copied => { if (copied) setDiagnosticStatus(t('about.diagnosticCopied')); else { downloadDiagnosticReport(diagnostic); setDiagnosticStatus(t('about.diagnosticDownloaded')) } }).catch(() => { downloadDiagnosticReport(diagnostic); setDiagnosticStatus(t('about.diagnosticDownloaded')) })} className="inline-flex min-h-11 items-center gap-2 rounded-lg bg-emerald-700 px-4 text-sm font-medium text-white hover:bg-emerald-600"><Copy size={15}/>{t('about.copyDiagnostic')}</button>
+<button type="button" onClick={() => { downloadDiagnosticReport(diagnostic); setDiagnosticStatus(t('about.diagnosticDownloaded')) }} className="inline-flex min-h-11 items-center gap-2 rounded-lg border border-gray-600 px-4 text-sm text-gray-200 hover:bg-gray-700"><Download size={15}/>{t('about.downloadDiagnostic')}</button>
+</div>
+{diagnosticStatus && <p role="status" className="mt-2 text-xs text-emerald-300">{diagnosticStatus}</p>}
+</section>
 <section className="grid gap-4 lg:grid-cols-2">
 <div className="rounded-xl border border-gray-700/60 bg-gray-800/60 p-5">
 <h2 className="text-base font-semibold text-gray-100">{t('about.what')}</h2>

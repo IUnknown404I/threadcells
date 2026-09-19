@@ -236,6 +236,36 @@ def _heavy_utilization(config: Mapping[str, Any]) -> tuple[int, int]:
     return active, limit
 
 
+def _root_disk_status(
+    config: Mapping[str, Any],
+    *,
+    disk_usage: shutil._ntuple_diskusage | None = None,
+) -> dict[str, Any]:
+    """Return the canonical rounded root-disk health projection."""
+    disk = disk_usage or shutil.disk_usage("/")
+    used_percent = round((disk.used * 100 / disk.total) if disk.total else 100.0, 1)
+    state = (
+        "CRITICAL"
+        if used_percent >= int(config.get("root_used_critical_percent", 92))
+        else (
+            "RED"
+            if used_percent >= int(config.get("root_used_red_percent", 85))
+            else (
+                "YELLOW"
+                if used_percent >= int(config.get("root_used_yellow_percent", 70))
+                else "GREEN"
+            )
+        )
+    )
+    return {
+        "state": state,
+        "used_percent": used_percent,
+        "free_bytes": disk.free,
+        "total_bytes": disk.total,
+        "free_gib": round(disk.free / (1024**3), 2),
+    }
+
+
 def get_resource_status(
     config: Mapping[str, Any] | None = None,
     *,
@@ -264,17 +294,9 @@ def get_resource_status(
     available_cpus = cpu_count if cpu_count is not None else _available_cpu_count()
     disk = disk_usage or shutil.disk_usage("/")
     mem_available_mib = memory.get("MemAvailable", 0) // (1024 * 1024)
-    root_used_percent = round((disk.used * 100 / disk.total) if disk.total else 100.0, 1)
-    root_free_gib = round(disk.free / (1024**3), 2)
-    root_disk_state = (
-        "CRITICAL"
-        if root_used_percent >= int(cfg["root_used_critical_percent"])
-        else (
-            "RED"
-            if root_used_percent >= int(cfg["root_used_red_percent"])
-            else "YELLOW" if root_used_percent >= int(cfg["root_used_yellow_percent"]) else "GREEN"
-        )
-    )
+    root_disk = _root_disk_status(cfg, disk_usage=disk)
+    root_used_percent = float(root_disk["used_percent"])
+    root_free_gib = float(root_disk["free_gib"])
     full_avg10 = pressure.get("full_avg10", 0.0)
     some_avg10 = pressure.get("some_avg10", 0.0)
 
@@ -391,7 +413,7 @@ def get_resource_status(
             "swap_free_mib": memory.get("SwapFree", 0) // (1024 * 1024),
         },
         "root_disk": {
-            "state": root_disk_state,
+            "state": root_disk["state"],
             "used_percent": root_used_percent,
             "free_gib": root_free_gib,
         },

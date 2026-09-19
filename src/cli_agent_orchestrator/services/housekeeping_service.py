@@ -20,7 +20,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence, cast
 
-from cli_agent_orchestrator.services.operations_service import load_operations_config
+from cli_agent_orchestrator.services.operations_service import (
+    _root_disk_status,
+    load_operations_config,
+)
 
 
 @dataclass
@@ -973,8 +976,7 @@ def _scheduled_effective_mode(
     if requested_mode != "frequent":
         return requested_mode
     disk = (disk_usage or shutil.disk_usage)("/")
-    used_percent = (disk.used * 100 / disk.total) if disk.total else 100.0
-    if used_percent >= int(config.get("root_used_red_percent", 85)):
+    if _root_disk_status(config, disk_usage=disk)["state"] in {"RED", "CRITICAL"}:
         return "pressure"
     return requested_mode
 
@@ -1470,24 +1472,12 @@ def _complete_housekeeping_summary(
 ) -> HousekeepingSummary:
     """Attach immutable timing, outcome, and post-run disk evidence."""
     disk = shutil.disk_usage("/")
+    root_disk = _root_disk_status(config, disk_usage=disk)
     summary.disk_after = disk.free
     summary.observed_disk_free_delta = summary.disk_after - summary.disk_before
-    used_percent = round((disk.used * 100 / disk.total) if disk.total else 100.0, 1)
     summary.post_disk_state = {
-        "state": (
-            "CRITICAL"
-            if used_percent >= int(config.get("root_used_critical_percent", 92))
-            else (
-                "RED"
-                if used_percent >= int(config.get("root_used_red_percent", 85))
-                else (
-                    "YELLOW"
-                    if used_percent >= int(config.get("root_used_yellow_percent", 70))
-                    else "GREEN"
-                )
-            )
-        ),
-        "used_percent": used_percent,
+        "state": root_disk["state"],
+        "used_percent": root_disk["used_percent"],
         "free_bytes": disk.free,
         "total_bytes": disk.total,
     }
@@ -1526,6 +1516,7 @@ def run_housekeeping(
     scheduled: bool = False,
     expected_plan_id: str | None = None,
     privileged_cleanup_executor: Callable[..., Any] | None = None,
+    _automatic_on_red: bool = False,
 ) -> HousekeepingSummary:
     if mode not in {"frequent", "weekly", "pressure", "full"}:
         raise ValueError("invalid housekeeping mode")
@@ -1533,7 +1524,10 @@ def run_housekeeping(
         raise RuntimeError("HOUSEKEEPING_PLAN_REQUIRED")
     cfg = dict(config or load_operations_config())
     if scheduled:
-        mode = _scheduled_effective_mode(mode, cfg)
+        requested_mode = mode
+        mode = _scheduled_effective_mode(requested_mode, cfg)
+        if requested_mode == "frequent" and mode == "pressure":
+            _automatic_on_red = True
     if mode in {"weekly", "pressure"} and not cfg.get("_housekeeping_heavy_slot"):
         from cli_agent_orchestrator.services.operations_service import acquire_heavy_slot
 
@@ -1548,6 +1542,7 @@ def run_housekeeping(
                 proc_root=proc_root,
                 scheduled=scheduled,
                 expected_plan_id=expected_plan_id,
+                _automatic_on_red=_automatic_on_red,
             )
     root = Path(str(cfg["root"]))
     lock_dir = Path(str(cfg["lock_dir"]))
@@ -1564,6 +1559,27 @@ def run_housekeeping(
         _housekeeping_execution_lock(lock_dir),
         _full_cleanup_execution_fence(cfg) if mode == "full" else nullcontext(),
     ):
+        if _automatic_on_red:
+            root_disk = _root_disk_status(cfg)
+            if root_disk["state"] not in {"RED", "CRITICAL"}:
+                summary.disk_before = int(root_disk["free_bytes"])
+                summary.execution_skips.append(
+                    {
+                        "candidate": "root_disk:/",
+                        "reason_code": "ROOT_DISK_PRESSURE_CLEARED",
+                    }
+                )
+                return _finalize_housekeeping_summary(
+                    summary,
+                    root=root,
+                    config=cfg,
+                    proc_root=proc_root,
+                    completed_at=(
+                        time.time()
+                        if now is None
+                        else current + max(0.0, time.monotonic() - started_monotonic)
+                    ),
+                )
         from cli_agent_orchestrator.services.full_cleanup_operation_service import (
             require_no_active_full_cleanup_operation,
         )

@@ -2,9 +2,11 @@ import json
 import os
 import pwd
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+from cli_agent_orchestrator.services.operations_service import _root_disk_status
 from cli_agent_orchestrator.services.housekeeping_service import (
     HousekeepingSummary,
     _cleanup_browser_cache,
@@ -77,16 +79,116 @@ def test_pressure_recovery_executes_the_exact_fresh_plan(tmp_path, monkeypatch):
 
 
 def test_scheduled_frequent_poll_promotes_red_disk_to_pressure_recovery():
-    disk = shutil._ntuple_diskusage(total=1000, used=850, free=150)
+    disk = shutil._ntuple_diskusage(total=10_000, used=8_496, free=1_504)
+    config = {"root_used_red_percent": 85}
+
+    assert _root_disk_status(config, disk_usage=disk) == {
+        "state": "RED",
+        "used_percent": 85.0,
+        "free_bytes": 1_504,
+        "total_bytes": 10_000,
+        "free_gib": 0.0,
+    }
 
     assert (
         _scheduled_effective_mode(
             "frequent",
-            {"root_used_red_percent": 85},
+            config,
             disk_usage=lambda _path: disk,
         )
         == "pressure"
     )
+
+
+def test_automatic_pressure_revalidates_after_heavy_wait_under_singleton(tmp_path, monkeypatch):
+    state = {"heavy": False, "singleton": False, "disk_reads": 0}
+    red = shutil._ntuple_diskusage(total=10_000, used=8_496, free=1_504)
+    green = shutil._ntuple_diskusage(total=10_000, used=8_000, free=2_000)
+
+    def disk_usage(_path):
+        state["disk_reads"] += 1
+        if state["disk_reads"] == 1:
+            assert state["heavy"] is False
+            assert state["singleton"] is False
+            return red
+        assert state["heavy"] is True
+        assert state["singleton"] is True
+        return green
+
+    @contextmanager
+    def heavy_slot(*_args, **_kwargs):
+        state["heavy"] = True
+        try:
+            yield 0
+        finally:
+            state["heavy"] = False
+
+    @contextmanager
+    def housekeeping_lock(_lock_dir):
+        assert state["heavy"] is True
+        state["singleton"] = True
+        try:
+            yield
+        finally:
+            state["singleton"] = False
+
+    def destructive_plan(**_kwargs):
+        raise AssertionError("cleared automatic pressure must not build a plan")
+
+    config = _config(tmp_path)
+    config["root_used_red_percent"] = 85
+    monkeypatch.setattr(shutil, "disk_usage", disk_usage)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.operations_service.acquire_heavy_slot",
+        heavy_slot,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service._housekeeping_execution_lock",
+        housekeeping_lock,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service.plan_housekeeping",
+        destructive_plan,
+    )
+    for name in (
+        "_reconcile_supervisor_context_roles",
+        "_reconcile_writer_leases",
+        "_reconcile_provider_executions",
+        "_reconcile_legacy_terminal_authority",
+        "_inventory_warnings",
+    ):
+        monkeypatch.setattr(
+            f"cli_agent_orchestrator.services.housekeeping_service.{name}",
+            lambda *_args, **_kwargs: None,
+        )
+
+    summary = run_housekeeping(
+        config=config,
+        dry_run=False,
+        mode="frequent",
+        scheduled=True,
+        now=123.0,
+        proc_root=tmp_path / "proc",
+    )
+
+    assert state == {"heavy": False, "singleton": False, "disk_reads": 3}
+    assert summary.mode == "pressure"
+    assert summary.plan_id is None
+    assert summary.planned_candidates == 0
+    assert summary.freed_bytes == 0
+    assert summary.execution_skips == [
+        {
+            "candidate": "root_disk:/",
+            "reason_code": "ROOT_DISK_PRESSURE_CLEARED",
+        }
+    ]
+    assert summary.final_status == "completed_with_issues"
+    persisted = json.loads(
+        (tmp_path / "state" / "cao" / "housekeeping-status.json").read_text(encoding="utf-8")
+    )
+    assert persisted["plan_id"] is None
+    assert persisted["freed_bytes"] == 0
+    assert persisted["execution_skips"] == summary.execution_skips
 
 
 def test_scheduled_poll_keeps_non_red_and_weekly_modes():

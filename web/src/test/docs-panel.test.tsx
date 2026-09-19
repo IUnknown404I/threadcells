@@ -33,7 +33,7 @@ describe('DocsPanel', () => {
     const localizedBundle = {
       schema: 2,
       product: 'ThreadCells',
-      version: '0.4.1a0',
+      version: '0.4.2a0',
       commit: 'abcdef0123456789',
       locales: {
         en: [{ slug: 'getting-started', group: 'Getting started', order: 1, title: 'Quick setup', markdown: '# Quick setup\n\nEnglish body.', headings: [] }],

@@ -181,7 +181,7 @@ describe('Control-plane settings routes', () => {
     expect(screen.getByRole('button', { name: 'AI generation prompt' })).toBeInTheDocument()
   })
 
-  it('exposes plan, confirmed run, policy, schedule, and report controls', async () => {
+  it('runs the inspected disk-pressure plan through the UI and renders its report', async () => {
     const settings = {
       schema_version: 1 as const,
       policy: {
@@ -196,14 +196,25 @@ describe('Control-plane settings routes', () => {
       schedule: { frequent: '6h', weekly: 'Sun 04:00 UTC', pressure: 'on_red' },
     }
     vi.spyOn(api, 'getHousekeepingSettings').mockResolvedValue(settings)
-    vi.spyOn(api, 'getHousekeepingReport').mockResolvedValue({ status: 'never_run' })
+    const completedReport = {
+      ok: true,
+      mode: 'pressure',
+      plan_id: 'a'.repeat(64),
+      final_status: 'completed',
+      freed_bytes: 100,
+      disk_before: 1000,
+      disk_after: 1100,
+    }
+    vi.spyOn(api, 'getHousekeepingReport')
+      .mockResolvedValueOnce({ status: 'never_run' })
+      .mockResolvedValue(completedReport)
     vi.spyOn(api, 'getOperatorSession').mockResolvedValue(operatorStatus(true))
     vi.spyOn(api, 'getOrchestrationCapacity').mockResolvedValue({
-      resource_state: 'GREEN', reasons: [], resident_supervisors: { active: 1, limit: 5, available: 4, certain: true }, provider_executions: { active: 0, limit: 3, available: 3, certain: true }, work_contexts: { active: 0, limit: 2, available: 2, certain: true }, heavy_executions: { active: 0, limit: 1, available: 1, waiting: 0 }, memory: { available_mib: 1024, swap_total_mib: 0, swap_free_mib: 0 }, root_disk: { used_percent: 42, free_gib: 50 }, memory_pressure: { some_avg10: 0, full_avg10: 0 }, cpu_load: { one_minute: 0, cpu_count: 4 }, housekeeping: null,
+      resource_state: 'RED', reasons: ['root_disk_red'], resident_supervisors: { active: 1, limit: 5, available: 4, certain: true }, provider_executions: { active: 0, limit: 3, available: 3, certain: true }, work_contexts: { active: 0, limit: 2, available: 2, certain: true }, heavy_executions: { active: 0, limit: 1, available: 1, waiting: 0 }, memory: { available_mib: 1024, swap_total_mib: 0, swap_free_mib: 0 }, root_disk: { state: 'RED', used_percent: 90, free_gib: 4 }, memory_pressure: { some_avg10: 0, full_avg10: 0 }, cpu_load: { one_minute: 0, cpu_count: 4 }, housekeeping: null,
     })
     const planId = 'a'.repeat(64)
-    const plan = vi.spyOn(api, 'getHousekeepingPlan').mockResolvedValue({ schema_version: 1, plan_id: planId, generated_at: 100, mode: 'frequent', root: '/fixture', reclaimable_bytes: 100, class_summaries: { logs: { candidate_count: 1, actionable_count: 1, reclaimable_bytes: 100, preserved_count: 0, preserved_bytes: 0, protection_reasons: {} }, backups: { candidate_count: 1, actionable_count: 0, reclaimable_bytes: 0, preserved_count: 1, preserved_bytes: 4096, protection_reasons: { BACKUP_PROTECTED: 1 } } }, warnings: ['retirement_cleanup_claim_unknown:diagnostic-only'], candidates: [{ canonical_identity: 'logs:item', category: 'logs', action: 'compress', bytes: 100, estimated_reclaim_bytes: 100, retention_reason: 'older_than_policy', protection_reason: null, resource_kind: 'path' }, { canonical_identity: 'backup:protected', category: 'backups', action: 'preserve', bytes: 4096, estimated_reclaim_bytes: 0, retention_reason: 'protected_inventory', protection_reason: 'BACKUP_PROTECTED', resource_kind: 'inventory' }] })
-    const run = vi.spyOn(api, 'runHousekeeping').mockResolvedValue({ ok: true, plan_id: planId })
+    const plan = vi.spyOn(api, 'getHousekeepingPlan').mockResolvedValue({ schema_version: 1, plan_id: planId, generated_at: 100, mode: 'pressure', root: '/fixture', reclaimable_bytes: 100, class_summaries: { logs: { candidate_count: 1, actionable_count: 1, reclaimable_bytes: 100, preserved_count: 0, preserved_bytes: 0, protection_reasons: {} }, backups: { candidate_count: 1, actionable_count: 0, reclaimable_bytes: 0, preserved_count: 1, preserved_bytes: 4096, protection_reasons: { BACKUP_PROTECTED: 1 } } }, warnings: ['retirement_cleanup_claim_unknown:diagnostic-only'], candidates: [{ canonical_identity: 'logs:item', category: 'logs', action: 'compress', bytes: 100, estimated_reclaim_bytes: 100, retention_reason: 'older_than_policy', protection_reason: null, resource_kind: 'path' }, { canonical_identity: 'backup:protected', category: 'backups', action: 'preserve', bytes: 4096, estimated_reclaim_bytes: 0, retention_reason: 'protected_inventory', protection_reason: 'BACKUP_PROTECTED', resource_kind: 'inventory' }] })
+    const run = vi.spyOn(api, 'runHousekeeping').mockResolvedValue(completedReport)
 
     render(<ControlPlaneSettings section="housekeeping" navigate={() => {}} />)
     expect(await screen.findByRole('heading', { name: 'Housekeeping' })).toBeInTheDocument()
@@ -213,8 +224,9 @@ describe('Control-plane settings routes', () => {
     expect(screen.queryByText('retain_minutes')).not.toBeInTheDocument()
     expect(screen.queryByDisplayValue('10080')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Execute inspected plan safely' })).toBeDisabled()
+    fireEvent.change(screen.getByLabelText('Cleanup class'), { target: { value: 'pressure' } })
     fireEvent.click(screen.getByRole('button', { name: 'Build dry-run plan' }))
-    await waitFor(() => expect(plan).toHaveBeenCalledWith('frequent', expect.any(AbortSignal)))
+    await waitFor(() => expect(plan).toHaveBeenCalledWith('pressure', expect.any(AbortSignal)))
     expect((await screen.findAllByText('100 B')).length).toBeGreaterThan(0)
     expect(screen.getByText('logs:item')).toBeInTheDocument()
     expect(within(screen.getByText('Protected / skipped').parentElement as HTMLElement).getByText('1')).toBeInTheDocument()
@@ -225,7 +237,8 @@ describe('Control-plane settings routes', () => {
     expect(screen.queryByText(/retirement cleanup claim unknown/)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Execute inspected plan safely' })).not.toBeDisabled()
     fireEvent.click(screen.getByRole('button', { name: 'Execute inspected plan safely' }))
-    await waitFor(() => expect(run).toHaveBeenCalledWith('frequent', false, planId))
+    await waitFor(() => expect(run).toHaveBeenCalledWith('pressure', false, planId))
+    await waitFor(() => expect(within(screen.getByText('Reclaimed total').parentElement as HTMLElement).getByText('100 B')).toBeInTheDocument())
   })
 
   it('keeps one normal plan visibly loading through operator polling and prevents duplicates', async () => {

@@ -45,6 +45,10 @@ Built-ins are immutable. `duplicate_builtin` creates a custom ID rather than sha
 
 ### Housekeeping
 
+`GET /api/v1/housekeeping/history` returns a bounded cursor page (`limit` 1–20 and optional `before_id`) of persisted non-preview runs. It performs no total count or unbounded scan.
+
+`POST /api/v1/workflow-effects/{effect_id}/retire-indeterminate` requires the authenticated operator boundary and an exact workflow, turn, root-terminal, effect-kind scope plus explicit confirmation. It records `unknown_preserved` and stops future execution without replaying the effect.
+
 - `GET /api/v1/housekeeping` returns class policy and effective schedules.
 - `PUT /api/v1/housekeeping` validates and persists an audited configuration (operator-authenticated).
 - `GET /api/v1/housekeeping/plan?mode=frequent` returns an immutable dry-run plan.

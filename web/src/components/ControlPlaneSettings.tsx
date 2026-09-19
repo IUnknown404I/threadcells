@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { BookOpen, Boxes, CheckCircle2, Clock3, Database, HardDrive, HeartHandshake, Info, Loader2, Search, ShieldCheck, Sparkles, Trash2 } from 'lucide-react'
-import { api, CaoApiError, FullCleanupOperation, FullCleanupPlan, HousekeepingPlan, HousekeepingSettings, OrchestrationCapacity, ProviderSettings, RegistryRecord } from '../api'
+import { BookOpen, Boxes, CheckCircle2, Clock3, Copy, Database, Download, HardDrive, HeartHandshake, Info, Loader2, Search, ShieldCheck, Sparkles, Trash2 } from 'lucide-react'
+import { api, CaoApiError, FullCleanupOperation, FullCleanupPlan, HousekeepingHistoryPage, HousekeepingPlan, HousekeepingSettings, OrchestrationCapacity, ProviderSettings, RegistryRecord } from '../api'
 import { BUILD_IDENTITY } from '../buildIdentity'
+import { buildSafeDiagnosticReport, copyDiagnosticReport, downloadDiagnosticReport } from '../diagnosticReport'
+import { useStore } from '../store'
 import { providerRuntimeLabel } from '../providerAvailability'
 import { OperatorAccessCard, useOperatorAccess } from './OperatorAccess'
 import { ConfirmModal } from './ConfirmModal'
@@ -300,7 +302,7 @@ function HousekeepingReport({ report }: { report: Record<string, any> | null }) 
     ? undefined
     : t('housekeeping.diskSnapshot', { percent: resultingDisk.used_percent, free: bytes(resultingDisk.free_bytes) })
   const fullCounts = Number(report.cache_pruned || 0) + Number(report.reproducible_caches_removed || 0) + Number(report.browser_revisions_removed || 0) + Number(report.ephemeral_resources_removed || 0) + Number(report.build_artifacts_removed || 0)
-  return <div className="space-y-3">
+  return <div className="min-w-0 space-y-3">
     <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
       <Summary label={t('housekeeping.result')} value={t(resultKey)} />
       <Summary label={t('housekeeping.started')} value={started} />
@@ -327,25 +329,25 @@ function HousekeepingReport({ report }: { report: Record<string, any> | null }) 
 </div>)}</dl> : <p className="mt-3 text-xs text-gray-400">{t('housekeeping.noClassReclaim')}</p>}</div>
     </div>
     <div className="grid gap-3 sm:grid-cols-2">
-      <section className="rounded-xl border border-gray-700/60 bg-gray-800/60 p-4">
+      <section className="min-w-0 rounded-xl border border-gray-700/60 bg-gray-800/60 p-4">
         <h3 className="text-sm font-semibold text-gray-200">{t('housekeeping.protectedResources')}</h3>
         <p className="mt-1 text-xs text-gray-400">{tp('housekeeping.protectedResourcesCount', protectedResources.length)}</p>
-        {protectedResources.length ? <ul className="mt-2 max-h-40 list-disc space-y-1 overflow-auto pl-5 text-xs text-gray-300">{protectedResources.map((item: any, index: number) => <li key={`protected-${index}`}>{item.canonical_identity ? `${item.canonical_identity}: ` : ''}{item.reason || t('housekeeping.protected')}{item.category ? ` · ${String(item.category)}` : ''}{item.bytes === undefined ? '' : ` · ${bytes(Number(item.bytes || 0))}`}</li>)}</ul> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noneRecorded')}</p>}
+        {protectedResources.length ? <ul className="mt-2 max-h-40 min-w-0 list-disc space-y-1 overflow-auto pl-5 text-xs text-gray-300">{protectedResources.map((item: any, index: number) => <li key={`protected-${index}`} className="break-all">{item.canonical_identity ? `${item.canonical_identity}: ` : ''}{item.reason || t('housekeeping.protected')}{item.category ? ` · ${String(item.category)}` : ''}{item.bytes === undefined ? '' : ` · ${bytes(Number(item.bytes || 0))}`}</li>)}</ul> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noneRecorded')}</p>}
       </section>
-      <section className="rounded-xl border border-gray-700/60 bg-gray-800/60 p-4">
+      <section className="min-w-0 rounded-xl border border-gray-700/60 bg-gray-800/60 p-4">
         <h3 className="text-sm font-semibold text-gray-200">{t('housekeeping.executionSkips')}</h3>
         <p className="mt-1 text-xs text-gray-400">{t('housekeeping.executionSkipCount', { count: executionSkips.length })}</p>
-        {executionSkips.length ? <ul className="mt-2 max-h-40 list-disc space-y-1 overflow-auto pl-5 text-xs text-cyan-200">{executionSkips.map((item: any, index: number) => <li key={`skip-${index}`}>{item.candidate ? `${item.candidate}: ` : ''}{item.reason_code || 'EXECUTION_SKIPPED'}</li>)}</ul> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noneRecorded')}</p>}
+        {executionSkips.length ? <ul className="mt-2 max-h-40 min-w-0 list-disc space-y-1 overflow-auto pl-5 text-xs text-cyan-200">{executionSkips.map((item: any, index: number) => <li key={`skip-${index}`} className="break-all">{item.candidate ? `${item.candidate}: ` : ''}{item.reason_code || 'EXECUTION_SKIPPED'}</li>)}</ul> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noneRecorded')}</p>}
       </section>
-      <section className="rounded-xl border border-amber-800/50 bg-amber-950/10 p-4">
+      <section className="min-w-0 rounded-xl border border-amber-800/50 bg-amber-950/10 p-4">
         <h3 className="text-sm font-semibold text-amber-100">{t('housekeeping.diagnosticWarnings')}</h3>
         <p className="mt-1 text-xs text-amber-200/70">{t('housekeeping.warningCount', { count: warnings.length })}</p>
         {warnings.length ? <HousekeepingWarnings warnings={warnings} className="mt-2 max-h-40 overflow-auto" /> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noneRecorded')}</p>}
       </section>
-      <section className="rounded-xl border border-red-900/50 bg-red-950/10 p-4">
+      <section className="min-w-0 rounded-xl border border-red-900/50 bg-red-950/10 p-4">
         <h3 className="text-sm font-semibold text-red-100">{t('housekeeping.executionFailures')}</h3>
         <p className="mt-1 text-xs text-red-200/70">{t('housekeeping.failureCount', { count: executionFailures.length })}</p>
-        {executionFailures.length ? <ul className="mt-2 max-h-40 list-disc space-y-1 overflow-auto pl-5 text-xs text-red-300">{executionFailures.map((item: any, index: number) => <li key={`failure-${index}`}>{item.candidate ? `${item.candidate}: ` : ''}{item.reason_code || 'EXECUTION_FAILURE'}</li>)}</ul> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noFailures')}</p>}
+        {executionFailures.length ? <ul className="mt-2 max-h-40 min-w-0 list-disc space-y-1 overflow-auto pl-5 text-xs text-red-300">{executionFailures.map((item: any, index: number) => <li key={`failure-${index}`} className="break-all">{item.candidate ? `${item.candidate}: ` : ''}{item.reason_code || 'EXECUTION_FAILURE'}</li>)}</ul> : <p className="mt-2 text-xs text-gray-400">{t('housekeeping.noFailures')}</p>}
       </section>
     </div>
     <Artifact value={report} label={t('housekeeping.rawReport')}/>
@@ -368,6 +370,7 @@ function HousekeepingSettingsPage() {
   const [mode, setMode] = useState<'frequent' | 'weekly' | 'pressure'>('frequent')
   const [plan, setPlan] = useState<HousekeepingPlan | null>(null)
   const [report, setReport] = useState<Record<string, any> | null>(null)
+  const [history, setHistory] = useState<HousekeepingHistoryPage>({ items: [], next_before_id: null })
   const [running, setRunning] = useState(false)
   const [executionBlock, setExecutionBlock] = useState<'changed' | 'busy' | null>(null)
   const [fullPlan, setFullPlan] = useState<FullCleanupPlan | null>(null)
@@ -382,7 +385,10 @@ function HousekeepingSettingsPage() {
   const planningRef = useRef<'normal' | 'full' | null>(null)
   const planningAbortRef = useRef<AbortController | null>(null)
   const mountedRef = useRef(true)
-  const load = () => Promise.all([api.getHousekeepingSettings(), api.getHousekeepingReport(), api.getOrchestrationCapacity()]).then(([value, latest, resources]) => { setSettings(value); setReport(latest); setCapacity(resources) }).catch(reason => setError(reason.message))
+  const load = () => {
+    void api.getHousekeepingHistory().then(setHistory).catch(() => undefined)
+    return Promise.all([api.getHousekeepingSettings(), api.getHousekeepingReport(), api.getOrchestrationCapacity()]).then(([value, latest, resources]) => { setSettings(value); setReport(latest); setCapacity(resources) }).catch(reason => setError(reason.message))
+  }
   useEffect(() => { void load() }, [])
   useEffect(() => {
     mountedRef.current = true
@@ -801,11 +807,22 @@ function HousekeepingSettingsPage() {
 <section aria-labelledby="latest-report-heading">
 <h2 id="latest-report-heading" className="mb-3 text-base font-semibold text-gray-100">{t('housekeeping.latestReport')}</h2>
 <HousekeepingReport report={report}/>
+</section>
+<section aria-labelledby="housekeeping-history-heading">
+<h2 id="housekeeping-history-heading" className="mb-3 text-base font-semibold text-gray-100">{t('housekeeping.history')}</h2>
+<div className="space-y-2">{history.items.map(item => <details key={item.id} className="rounded-xl border border-gray-700/60 bg-gray-800/60 p-3">
+<summary className="min-h-9 cursor-pointer text-sm text-gray-200">{item.completed_at} · {item.mode} · {item.outcome} · {item.duration_seconds.toFixed(1)}s · {bytes(item.freed_bytes)}</summary>
+<div className="mt-3"><HousekeepingReport report={item.report}/></div>
+</details>)}{history.items.length === 0 && <p className="text-sm text-gray-400">{t('housekeeping.historyEmpty')}</p>}</div>
+{history.next_before_id && <button type="button" className="mt-3 min-h-11 rounded-lg border border-gray-600 px-4 text-sm text-gray-200" onClick={() => void api.getHousekeepingHistory(10, history.next_before_id).then(next => setHistory({ items: [...history.items, ...next.items], next_before_id: next.next_before_id }))}>{t('housekeeping.loadOlder')}</button>}
 </section>{error && <p role="alert" className="rounded-lg border border-red-700/50 bg-red-950/30 p-3 text-sm text-red-300">{error}</p>}{fullCleanupDanger}</section>
 }
 
 function AboutSettings() {
   const { t } = useI18n()
+  const connected = useStore(state => state.connected)
+  const [diagnosticStatus, setDiagnosticStatus] = useState('')
+  const diagnostic = buildSafeDiagnosticReport({ version: BUILD_IDENTITY.version, revision: BUILD_IDENTITY.revision, uiState: connected ? 'connected' : 'disconnected' })
   const principles = [
     [t('about.operationalTruth'), t('about.operationalTruthCopy'), <ShieldCheck size={18}/>],
     [t('about.nativeAgents'), t('about.nativeAgentsCopy'), <Boxes size={18}/>],
@@ -837,6 +854,15 @@ function AboutSettings() {
 </div>
 </div>
 </header>
+<section aria-labelledby="diagnostic-heading" className="rounded-xl border border-gray-700/60 bg-gray-800/60 p-5">
+<h2 id="diagnostic-heading" className="text-base font-semibold text-gray-100">{t('about.diagnosticTitle')}</h2>
+<p className="mt-2 text-sm leading-6 text-gray-400">{t('about.diagnosticCopy')}</p>
+<div className="mt-3 flex flex-wrap gap-2">
+<button type="button" onClick={() => void copyDiagnosticReport(diagnostic).then(copied => { if (copied) setDiagnosticStatus(t('about.diagnosticCopied')); else { downloadDiagnosticReport(diagnostic); setDiagnosticStatus(t('about.diagnosticDownloaded')) } }).catch(() => { downloadDiagnosticReport(diagnostic); setDiagnosticStatus(t('about.diagnosticDownloaded')) })} className="inline-flex min-h-11 items-center gap-2 rounded-lg bg-emerald-700 px-4 text-sm font-medium text-white hover:bg-emerald-600"><Copy size={15}/>{t('about.copyDiagnostic')}</button>
+<button type="button" onClick={() => { downloadDiagnosticReport(diagnostic); setDiagnosticStatus(t('about.diagnosticDownloaded')) }} className="inline-flex min-h-11 items-center gap-2 rounded-lg border border-gray-600 px-4 text-sm text-gray-200 hover:bg-gray-700"><Download size={15}/>{t('about.downloadDiagnostic')}</button>
+</div>
+{diagnosticStatus && <p role="status" className="mt-2 text-xs text-emerald-300">{diagnosticStatus}</p>}
+</section>
 <section className="grid gap-4 lg:grid-cols-2">
 <div className="rounded-xl border border-gray-700/60 bg-gray-800/60 p-5">
 <h2 className="text-base font-semibold text-gray-100">{t('about.what')}</h2>

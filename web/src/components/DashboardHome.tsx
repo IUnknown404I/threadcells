@@ -170,17 +170,20 @@ export function DashboardHome({ onNavigate, overviewState }: { onNavigate: (dest
 
   const handleDeleteSession = async () => {
     if (!pendingDeleteSession || !deletePreflight || deletingSessionRef.current) return
-    if (!deletePreflight.eligible && !deletePreflight.can_resolve_and_delete) return
+    if (!deletePreflight.eligible && !deletePreflight.can_resolve_and_delete && !deletePreflight.can_preserve_protected_workspace) return
     deletingSessionRef.current = true
     setDeletingSession(pendingDeleteSession.id)
     try {
-      const deleted = await deleteSession(
+      const deletionArgs = [
         pendingDeleteSession.id,
         deletePreflight.requires_dirty_confirmation,
         deletePreflight.requires_cancellation_confirmation,
         deletePreflight.plan_token,
         deletePreflight.requires_historical_indeterminate_confirmation,
-      )
+      ] as const
+      const deleted = deletePreflight.requires_protected_workspace_confirmation
+        ? await deleteSession(...deletionArgs, true)
+        : await deleteSession(...deletionArgs)
       if (deleted) {
         sessionFeed.reload()
         setPendingDeleteSession(null)

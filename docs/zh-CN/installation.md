@@ -1,7 +1,7 @@
 ---
 slug: installation
 source: docs/INSTALLATION.md
-source_sha256: sha256:39f7b5b745a164524a96fc9dbd62423d2546416477714ed4e6bc203b6e4eb508
+source_sha256: sha256:a1d4cafbb6ab28b3b2bd2a98c9e01532b961a112cf99f918e9dd899df16cd7af
 ---
 # 安装
 
@@ -64,7 +64,7 @@ ThreadCells 可以注册其 CLI 缺失的适配器。这不是安装失败；只
 
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
-candidate="$PWD/threadcells-candidate/threadcells-0.4.0a0-local"
+candidate="$PWD/threadcells-candidate/threadcells-0.4.1a0-local"
 python3 scripts/verify_local_candidate.py --candidate "$candidate"
 ```
 

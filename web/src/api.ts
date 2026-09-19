@@ -368,13 +368,15 @@ export interface SessionRecoveryOperation {
 
 export interface SessionDeletionPreflight {
   eligible: boolean
-  deletion_mode: 'eligible_normal' | 'eligible_with_cancellable_work' | 'eligible_with_historical_indeterminate_retirement' | 'blocked_live_or_unsafe_authority' | 'deletion_in_progress'
+  deletion_mode: 'eligible_normal' | 'eligible_with_cancellable_work' | 'eligible_with_historical_indeterminate_retirement' | 'eligible_with_protected_workspace_preservation' | 'blocked_live_or_unsafe_authority' | 'deletion_in_progress'
   deletion_in_progress?: boolean
   cancellable: boolean
   can_resolve_and_delete: boolean
   already_deleted: boolean
   requires_cancellation_confirmation: boolean
   requires_historical_indeterminate_confirmation: boolean
+  can_preserve_protected_workspace?: boolean
+  requires_protected_workspace_confirmation?: boolean
   requires_dirty_confirmation: boolean
   modified_files: number
   untracked_files: number
@@ -736,6 +738,20 @@ export interface HousekeepingSettings {
   updated_at?: string | null
 }
 
+export interface HousekeepingHistoryPage {
+  items: Array<{
+    id: number
+    started_at: string
+    completed_at: string
+    mode: string
+    outcome: string
+    duration_seconds: number
+    freed_bytes: number
+    report: Record<string, any>
+  }>
+  next_before_id: number | null
+}
+
 export type HousekeepingMode = 'frequent' | 'weekly' | 'pressure'
 
 export interface HousekeepingCandidate {
@@ -973,6 +989,7 @@ export const api = {
   getLatestFullCleanupOperation: () => fetchJSON<FullCleanupOperation>('/api/v1/housekeeping/full-cleanup/operations/latest'),
   getFullCleanupOperation: (operationId: string) => fetchJSON<FullCleanupOperation>(`/api/v1/housekeeping/full-cleanup/operations/${encodeURIComponent(operationId)}`),
   getHousekeepingReport: () => fetchJSON<Record<string, any>>('/api/v1/housekeeping/report'),
+  getHousekeepingHistory: (limit = 10, beforeId?: number | null) => fetchJSON<HousekeepingHistoryPage>(`/api/v1/housekeeping/history?limit=${limit}${beforeId ? `&before_id=${beforeId}` : ''}`),
   getUsageStatistics: () => fetchJSON<UsageStatistics>('/usage/statistics'),
   getBranding: () => fetchJSON<RuntimeBranding>('/settings/branding'),
   updateBranding: (data: { title?: string; subtitle?: string }) => fetchJSON<RuntimeBranding>('/settings/branding', {
@@ -1022,12 +1039,13 @@ export const api = {
     // runs for genuine caller cancellation (navigation, disconnect, etc.).
     fetchJSON<Terminal>(`/sessions?provider=${encodeURIComponent(provider)}&agent_profile=${encodeURIComponent(agentProfile)}${sessionName ? `&session_name=${encodeURIComponent(sessionName)}` : ''}${workingDirectory ? `&working_directory=${encodeURIComponent(workingDirectory)}` : ''}${projectId ? `&projectId=${encodeURIComponent(projectId)}` : ''}${ownerGrant ? `&owner_grant_launch_id=${encodeURIComponent(ownerGrant.launch_id)}` : ''}${workContextRequestId ? `&workContextRequestId=${encodeURIComponent(workContextRequestId)}` : ''}`, { method: 'POST', headers: ownerGrant ? { 'X-ThreadCells-Owner-Grant': ownerGrant.grant } : undefined, timeoutMs: null }),
   getSessionDeletionPreflight: (name: string) => fetchJSON<SessionDeletionPreflight>(`/sessions/${encodeURIComponent(name)}/deletion-preflight`),
-  deleteSession: (name: string, confirmDirtyWorkspace = false, cancelUnresolvedWork = false, cancellationPlanToken?: string | null, retireHistoricalIndeterminate = false) => {
+  deleteSession: (name: string, confirmDirtyWorkspace = false, cancelUnresolvedWork = false, cancellationPlanToken?: string | null, retireHistoricalIndeterminate = false, preserveProtectedWorkspace = false) => {
     const search = new URLSearchParams({
       confirm_dirty_workspace: String(confirmDirtyWorkspace),
       cancel_unresolved_work: String(cancelUnresolvedWork),
       retire_historical_indeterminate: String(retireHistoricalIndeterminate),
     })
+    if (preserveProtectedWorkspace) search.set('preserve_protected_workspace', 'true')
     if (cancellationPlanToken) search.set('cancellation_plan_token', cancellationPlanToken)
     return fetchJSON<{
       success: boolean

@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1-alpha] - 2026-09-18
+
+### Added
+
+- Add an allowlist-only diagnostic copy/download summary with version, revision, UI state, and explicit reason/correlation identifiers ([#15](https://github.com/IUnknown404I/threadcells/issues/15)).
+- Add bounded, paginated Housekeeping run history with full success, partial, and failed reports ([#16](https://github.com/IUnknown404I/threadcells/issues/16)).
+- Add a scoped owner-authenticated retirement path for indeterminate effects that preserves the unknown external outcome without replay.
+
+### Changed
+
+- Use the normal authenticated operator session for recovery takeover instead of collecting a second recovery password ([#108](https://github.com/IUnknown404I/threadcells/issues/108)).
+- Explain protected Session workspaces as either proven successor-owned resources or unverified resources that require explicit non-destructive preservation.
+
+### Fixed
+
+- Allow a completed recovery predecessor to converge after its successor retires, while preserving the successor-owned branch and work-context history.
+- Allow receipt-only Sessions with missing legacy cleanup provenance to remove history only after an explicit preservation confirmation; physical workspaces and refs remain untouched and recorded in the tombstone.
+
+### Safety
+
+- Revalidate exact workflow/effect/turn/terminal scope, active provider authority, workspace generation, and Git identity at each privileged transition.
+- Keep diagnostic data, Housekeeping retention, and history queries bounded by construction.
+
 ## [0.4.0-alpha] - 2026-09-16
 
 ### Added

@@ -1485,7 +1485,14 @@ describe('owner-authorized recovery takeover', () => {
     vi.mocked(api.getRecoveryTakeoverCapabilities).mockResolvedValue({
       capabilities: [{ terminal_id: terminal.id, eligible: true, reason_code: null }],
     })
-    const login = vi.spyOn(api, 'createOperatorSession').mockResolvedValue({ authenticated: true })
+    vi.spyOn(api, 'getOperatorSession').mockResolvedValue({
+      configured: true,
+      configuration_state: 'ready',
+      authenticated: true,
+      expires_in_seconds: 240,
+      session_ttl_seconds: 300,
+      verifier_reference: 'THREADCELLS_OPERATOR_VERIFIER_FILE',
+    })
     vi.spyOn(api, 'getRecoveryTakeoverPreview').mockResolvedValue({
       eligible: true,
       reason_code: null,
@@ -1524,11 +1531,8 @@ describe('owner-authorized recovery takeover', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Expand recovery-old' }))
     fireEvent.click(await screen.findByTitle('Recover supervisor authority'))
     expect(screen.getByRole('dialog', { name: 'Recover supervisor authority' })).toBeInTheDocument()
-    fireEvent.change(screen.getByLabelText('Operator secret'), {
-      target: { value: 'owner-passphrase' },
-    })
-    fireEvent.click(screen.getByRole('button', { name: 'Authenticate & inspect' }))
-    await waitFor(() => expect(login).toHaveBeenCalledWith('owner-passphrase'))
+    expect(screen.queryByLabelText('Operator secret')).not.toBeInTheDocument()
+    fireEvent.click(await screen.findByRole('button', { name: 'Inspect recovery' }))
     expect(await screen.findByText('Dirty — uncommitted state will be preserved')).toBeInTheDocument()
     fireEvent.click(screen.getByLabelText('Confirm recovery takeover'))
     fireEvent.click(screen.getByRole('button', { name: 'Take over supervisor' }))

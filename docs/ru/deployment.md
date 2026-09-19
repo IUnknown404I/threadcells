@@ -1,7 +1,7 @@
 ---
 slug: deployment
 source: docs/DEPLOYMENT.md
-source_sha256: sha256:87e53fe669210e7a674b6457ecb4b27066d671634e3276930b089bf348916b18
+source_sha256: sha256:2f71e2165fadf1905d5e3ea0805eeb4d9e58f6f363676d1babe4251a4fb4c6cd
 ---
 # Локальное развёртывание
 
@@ -14,7 +14,7 @@ source_sha256: sha256:87e53fe669210e7a674b6457ecb4b27066d671634e3276930b089bf348
 ```bash
 python3 scripts/build_local_candidate.py --output "$PWD/threadcells-candidate"
 python3 scripts/verify_local_candidate.py \
-  --candidate "$PWD/threadcells-candidate/threadcells-0.4.0a0-local"
+  --candidate "$PWD/threadcells-candidate/threadcells-0.4.1a0-local"
 ```
 
 Кандидат должен содержать Python-код, упакованные Web-ресурсы, Docs bundle из allowlist, идентичность сборки, контрольные суммы и метаданные релиза из одной ревизии.

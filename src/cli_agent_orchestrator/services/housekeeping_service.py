@@ -1519,7 +1519,7 @@ def _finalize_zero_work_housekeeping_summary(
     return summary
 
 
-def run_housekeeping(
+def _run_housekeeping_impl(
     *,
     config: Mapping[str, Any] | None = None,
     dry_run: bool,
@@ -1547,7 +1547,7 @@ def run_housekeeping(
         with acquire_heavy_slot(cfg, recovery_safe=True):
             nested = dict(cfg)
             nested["_housekeeping_heavy_slot"] = True
-            return run_housekeeping(
+            return _run_housekeeping_impl(
                 config=nested,
                 dry_run=dry_run,
                 mode=mode,
@@ -1675,6 +1675,59 @@ def run_housekeeping(
                 else current + max(0.0, time.monotonic() - started_monotonic)
             ),
         )
+
+
+def run_housekeeping(
+    *,
+    config: Mapping[str, Any] | None = None,
+    dry_run: bool,
+    mode: str,
+    now: float | None = None,
+    proc_root: Path = Path("/proc"),
+    scheduled: bool = False,
+    expected_plan_id: str | None = None,
+    privileged_cleanup_executor: Callable[..., Any] | None = None,
+) -> HousekeepingSummary:
+    """Run maintenance and persist exactly one bounded non-preview history row."""
+    started = time.time() if now is None else now
+    try:
+        summary = _run_housekeeping_impl(
+            config=config,
+            dry_run=dry_run,
+            mode=mode,
+            now=now,
+            proc_root=proc_root,
+            scheduled=scheduled,
+            expected_plan_id=expected_plan_id,
+            privileged_cleanup_executor=privileged_cleanup_executor,
+        )
+    except Exception as exc:
+        if not dry_run:
+            from cli_agent_orchestrator.clients.database import record_housekeeping_run
+
+            completed = time.time()
+            record_housekeeping_run(
+                {
+                    "ok": False,
+                    "dry_run": False,
+                    "mode": mode,
+                    "full_cleanup": mode == "full",
+                    "started_at": datetime.fromtimestamp(started, timezone.utc).isoformat(),
+                    "completed_at": datetime.fromtimestamp(completed, timezone.utc).isoformat(),
+                    "duration_seconds": round(max(0.0, completed - started), 3),
+                    "final_status": "failed",
+                    "freed_bytes": 0,
+                    "completed_with_issues": True,
+                    "warnings": [f"run_failed:{type(exc).__name__}"],
+                    "execution_failures": [{"reason_code": str(exc)[:256]}],
+                }
+            )
+        raise
+    if not dry_run:
+        from cli_agent_orchestrator.clients.database import record_housekeeping_run
+
+        record_housekeeping_run(summary.as_dict())
+    return summary
 
 
 def _render_cli_value(value: Any) -> str:

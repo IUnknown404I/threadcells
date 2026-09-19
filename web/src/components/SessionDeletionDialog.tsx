@@ -71,9 +71,12 @@ export function SessionDeletionDialog({
   const { t } = useI18n()
   if (!preflight) return null
   const retirement = preflight.deletion_mode === 'eligible_with_historical_indeterminate_retirement'
+  const protectedPreservation = preflight.deletion_mode === 'eligible_with_protected_workspace_preservation'
   const unsafe = preflight.deletion_mode === 'blocked_live_or_unsafe_authority'
   const cancellable = preflight.deletion_mode === 'eligible_with_cancellable_work'
-  const message = unsafe
+  const message = protectedPreservation
+    ? t('sessionDeletion.protectedPreservationMessage')
+    : unsafe
     ? t('sessionDeletion.unsafeMessage')
     : retirement
       ? t('sessionDeletion.historicalUnknownMessage')
@@ -97,7 +100,7 @@ export function SessionDeletionDialog({
         { label: t('sessionDeletion.session'), value: sessionName },
         { label: t('sessionDeletion.status'), value: statusLabel },
       ]}
-      confirmLabel={t(retirement ? 'sessionDeletion.retireAndDelete' : cancellable ? 'sessionDeletion.cancelAndDelete' : 'sessionDeletion.delete')}
+      confirmLabel={t(protectedPreservation ? 'sessionDeletion.preserveAndDelete' : retirement ? 'sessionDeletion.retireAndDelete' : cancellable ? 'sessionDeletion.cancelAndDelete' : 'sessionDeletion.delete')}
       cancelLabel={t(unsafe ? 'common.close' : 'common.cancel')}
       variant="danger"
       loading={loading}
@@ -137,6 +140,12 @@ export function SessionDeletionDialog({
         <p className="text-sm leading-5 text-gray-300">
           {t('sessionDeletion.cancelCopy')}
         </p>
+      )}
+      {protectedPreservation && (
+        <div data-testid="session-deletion-protected-preservation" role="status" className="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3">
+          <p className="text-sm font-medium text-amber-200">{t('sessionDeletion.protectedPreservationTitle')}</p>
+          <p className="mt-2 text-sm leading-5 text-gray-300">{t('sessionDeletion.protectedPreservationCopy')}</p>
+        </div>
       )}
       {retirement && (
         <div data-testid="session-deletion-historical-indeterminate" role="status" className="rounded-lg border border-amber-700/40 bg-amber-950/20 p-3">

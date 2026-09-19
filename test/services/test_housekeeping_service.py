@@ -239,6 +239,7 @@ def test_scheduled_frequent_red_run_uses_pressure_plan_and_skips_frequency_gate(
     tmp_path, monkeypatch
 ):
     observed = {}
+    recorded = []
     config = _config(tmp_path)
     config.update(
         _housekeeping_heavy_slot=True,
@@ -285,6 +286,10 @@ def test_scheduled_frequent_red_run_uses_pressure_plan_and_skips_frequency_gate(
         "cli_agent_orchestrator.services.housekeeping_service._finalize_housekeeping_summary",
         lambda summary, **_kwargs: summary,
     )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.record_housekeeping_run",
+        recorded.append,
+    )
 
     summary = run_housekeeping(
         config=config,
@@ -297,6 +302,7 @@ def test_scheduled_frequent_red_run_uses_pressure_plan_and_skips_frequency_gate(
 
     assert summary.mode == "pressure"
     assert observed["plan"]["mode"] == "pressure"
+    assert recorded[0]["mode"] == "pressure"
 
 
 def test_summary_records_separate_outcome_timing_and_post_disk_state(monkeypatch):

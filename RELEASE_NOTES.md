@@ -1,6 +1,6 @@
-# ThreadCells v0.4.0-alpha
+# ThreadCells v0.4.1-alpha
 
-ThreadCells `v0.4.0-alpha` is a reliability and product-completion release. It makes workflow continuation, exact review, Session deletion, recovery, and Housekeeping agree on durable lifecycle truth, then brings the Web UI, public documentation, landing page, and real-product media to that same state. It remains a technical preview for trusted operators on one Linux host.
+ThreadCells `v0.4.1-alpha` is a focused post-alpha reliability release. It closes the remaining protected-workspace deletion cases, moves recovery takeover onto the normal authenticated owner session, adds truthful retirement for an unknown external effect, and adds safe diagnostics and bounded Housekeeping history. It remains a technical preview for trusted operators on one Linux host.
 
 ## Highlights
 
@@ -12,11 +12,11 @@ Current and History expose this lineage without relying on terminal output as th
 
 ### Recovery and deletion tell the same story
 
-Recovery replacement continues to fence the predecessor writer before a successor becomes writable. Once takeover is durably complete, historical `recovery_fenced` metadata no longer blocks deletion of an otherwise eligible predecessor Session. Deletion remains idempotent and preserves the successor worktree, writer lease, and writable context. A genuinely unresolved or indeterminate recovery authority remains protected and is reported as the concrete blocker.
+Recovery replacement continues to fence the predecessor writer before a successor becomes writable. Once takeover is durably complete, historical `recovery_fenced` metadata no longer blocks deletion of an otherwise eligible predecessor Session—even after the successor has exited and its work context is retired. Deletion remains idempotent and preserves the successor branch and durable ownership evidence. Receipt-only Sessions whose legacy cleanup provenance is missing can remove Session history only after the operator explicitly chooses non-destructive preservation; ThreadCells never treats that confirmation as workspace cleanup authority.
 
 ### Housekeeping with explainable evidence
 
-Housekeeping now inventories protected backup and tool roots without converting unknown ownership or partial measurements into reclaimable bytes. Dry runs distinguish estimates from actual reclaimed space. Reports separate protected resources, execution-time safety skips, diagnostic warnings, failures, start/completion time, duration, and post-run disk state.
+Housekeeping now persists the newest 50 non-preview runs and exposes them in bounded cursor pages. Success, partial completion, and failure retain their time, outcome, duration, reclaimed bytes, warnings, and detailed bounded report without adding a polling or logging subsystem. Dry runs remain transient.
 
 The privileged protected-inventory request is pathless, bounded, serialized, and bound to the exact trusted root configuration. Full Cleanup retains its exact-plan, all-idle, permanent-confirmation, and execute-time revalidation gates. A disconnect or restart recovers the one durable operation result rather than starting another destructive pass.
 
@@ -25,6 +25,7 @@ The privileged protected-inventory request is pathless, bounded, serialized, and
 - Agents keeps History, Inbox, and Output readable on desktop while Terminal, Finish, and Delete use equal icon-only controls. The six primary actions stay in one stable right-aligned row without an empty Recovery slot.
 - Home, Agents, Current, History, Full Output, status badges, and Session actions use consistent lifecycle projections.
 - Absolute timestamps support browser Auto or a selected IANA time zone without changing durable server values.
+- About can copy or download an explainable safe diagnostic summary. It is assembled from named scalar fields only and excludes secrets, cookies, prompts, transcripts, environment values, and unknown/nested input.
 - Mobile and intermediate-width layouts preserve usable labels, touch targets, and page bounds.
 
 ## Public experience
@@ -44,9 +45,9 @@ Existing active legacy Sessions are preserved rather than moved, reset, cleaned,
 - ThreadCells remains a single-host technical preview for a trusted operator. Worktrees isolate Git checkouts, not operating-system, filesystem, or network access.
 - Provider readiness, resume, usage, authentication, and model controls depend on the installed native CLI. Codex is the release-acceptance reference; other adapters are conditional where documented.
 - Full Cleanup requires authoritative all-idle state and may correctly preserve backups, tools, dirty/unpublished worktrees, or other ambiguous resources.
-- A historical workflow with an indeterminate external send still needs evidence or a supported owner-resolution path; this release does not invent its outcome.
+- An authenticated owner can retire one exactly scoped indeterminate external effect. The result remains `unknown_preserved`; ThreadCells neither replays it nor reports success, failure, or acknowledgement.
 - The authenticated UI supports English and opt-in Russian. Public documentation remains available in all seven supported locales.
 
-The OCI artifact at `ghcr.io/iunknown404i/threadcells-release-bundle:v0.4.0-alpha` is a distribution bundle, not a runtime container image. Verify `BUNDLE-SHA256SUMS` and the archive checksum before using its contents. `latest-alpha` may point to this exact artifact; the unqualified stable `latest` tag is not published.
+The OCI artifact at `ghcr.io/iunknown404i/threadcells-release-bundle:v0.4.1-alpha` is a distribution bundle, not a runtime container image. Verify `BUNDLE-SHA256SUMS` and the archive checksum before using its contents. `latest-alpha` may point to this exact artifact; the unqualified stable `latest` tag is not published.
 
 All previous tags and immutable release artifacts remain unchanged. See the [public documentation](https://iunknown404i.github.io/threadcells/docs/) and [release process](docs/RELEASE_PROCESS.md) for the complete operating and distribution model.

@@ -101,7 +101,7 @@ def test_scheduled_frequent_poll_promotes_red_disk_to_pressure_recovery():
 
 
 def test_automatic_pressure_revalidates_after_heavy_wait_under_singleton(tmp_path, monkeypatch):
-    state = {"heavy": False, "singleton": False, "disk_reads": 0}
+    state = {"heavy": False, "singleton": False, "disk_reads": 0, "events": []}
     red = shutil._ntuple_diskusage(total=10_000, used=8_496, free=1_504)
     green = shutil._ntuple_diskusage(total=10_000, used=8_000, free=2_000)
 
@@ -113,6 +113,9 @@ def test_automatic_pressure_revalidates_after_heavy_wait_under_singleton(tmp_pat
             return red
         assert state["heavy"] is True
         assert state["singleton"] is True
+        state["events"].append(
+            "automatic_revalidation" if state["disk_reads"] == 2 else "final_disk"
+        )
         return green
 
     @contextmanager
@@ -132,8 +135,13 @@ def test_automatic_pressure_revalidates_after_heavy_wait_under_singleton(tmp_pat
         finally:
             state["singleton"] = False
 
-    def destructive_plan(**_kwargs):
-        raise AssertionError("cleared automatic pressure must not build a plan")
+    def full_cleanup_gate():
+        assert state["heavy"] is True
+        assert state["singleton"] is True
+        state["events"].append("full_cleanup_gate")
+
+    def forbidden_call(*_args, **_kwargs):
+        raise AssertionError("cleared automatic pressure must perform zero work")
 
     config = _config(tmp_path)
     config["root_used_red_percent"] = 85
@@ -148,18 +156,27 @@ def test_automatic_pressure_revalidates_after_heavy_wait_under_singleton(tmp_pat
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.housekeeping_service.plan_housekeeping",
-        destructive_plan,
+        forbidden_call,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping.executor.execute_plan",
+        forbidden_call,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.full_cleanup_operation_service.require_no_active_full_cleanup_operation",
+        full_cleanup_gate,
     )
     for name in (
         "_reconcile_supervisor_context_roles",
         "_reconcile_writer_leases",
         "_reconcile_provider_executions",
+        "_reconcile_retirement_cleanups",
         "_reconcile_legacy_terminal_authority",
         "_inventory_warnings",
     ):
         monkeypatch.setattr(
             f"cli_agent_orchestrator.services.housekeeping_service.{name}",
-            lambda *_args, **_kwargs: None,
+            forbidden_call,
         )
 
     summary = run_housekeeping(
@@ -171,7 +188,12 @@ def test_automatic_pressure_revalidates_after_heavy_wait_under_singleton(tmp_pat
         proc_root=tmp_path / "proc",
     )
 
-    assert state == {"heavy": False, "singleton": False, "disk_reads": 3}
+    assert state == {
+        "heavy": False,
+        "singleton": False,
+        "disk_reads": 3,
+        "events": ["full_cleanup_gate", "automatic_revalidation", "final_disk"],
+    }
     assert summary.mode == "pressure"
     assert summary.plan_id is None
     assert summary.planned_candidates == 0

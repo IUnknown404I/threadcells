@@ -1506,6 +1506,19 @@ def _complete_housekeeping_summary(
     return summary
 
 
+def _finalize_zero_work_housekeeping_summary(
+    summary: HousekeepingSummary,
+    *,
+    root: Path,
+    config: Mapping[str, Any],
+    completed_at: float,
+) -> HousekeepingSummary:
+    """Publish a truthful no-op result without acquiring resource authority."""
+    _complete_housekeeping_summary(summary, config=config, completed_at=completed_at)
+    _write_status(root, summary)
+    return summary
+
+
 def run_housekeeping(
     *,
     config: Mapping[str, Any] | None = None,
@@ -1559,6 +1572,11 @@ def run_housekeeping(
         _housekeeping_execution_lock(lock_dir),
         _full_cleanup_execution_fence(cfg) if mode == "full" else nullcontext(),
     ):
+        from cli_agent_orchestrator.services.full_cleanup_operation_service import (
+            require_no_active_full_cleanup_operation,
+        )
+
+        require_no_active_full_cleanup_operation()
         if _automatic_on_red:
             root_disk = _root_disk_status(cfg)
             if root_disk["state"] not in {"RED", "CRITICAL"}:
@@ -1569,22 +1587,16 @@ def run_housekeeping(
                         "reason_code": "ROOT_DISK_PRESSURE_CLEARED",
                     }
                 )
-                return _finalize_housekeeping_summary(
+                return _finalize_zero_work_housekeeping_summary(
                     summary,
                     root=root,
                     config=cfg,
-                    proc_root=proc_root,
                     completed_at=(
                         time.time()
                         if now is None
                         else current + max(0.0, time.monotonic() - started_monotonic)
                     ),
                 )
-        from cli_agent_orchestrator.services.full_cleanup_operation_service import (
-            require_no_active_full_cleanup_operation,
-        )
-
-        require_no_active_full_cleanup_operation()
         if mode == "full":
             summary.idle_gate = full_cleanup_idle_gate(cfg)
             if not summary.idle_gate["eligible"]:

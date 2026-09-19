@@ -21,6 +21,7 @@ from cli_agent_orchestrator.services.housekeeping_service import (
     _reconcile_supervisor_context_roles,
     _reconcile_writer_leases,
     _runtime_open_paths_inventory,
+    _scheduled_effective_mode,
     housekeeping_main,
     run_housekeeping,
     run_pressure_recovery,
@@ -73,6 +74,105 @@ def test_pressure_recovery_executes_the_exact_fresh_plan(tmp_path, monkeypatch):
     assert observed["plan"]["mode"] == "pressure"
     assert observed["run"]["dry_run"] is False
     assert observed["run"]["expected_plan_id"] == "a" * 64
+
+
+def test_scheduled_frequent_poll_promotes_red_disk_to_pressure_recovery():
+    disk = shutil._ntuple_diskusage(total=1000, used=850, free=150)
+
+    assert (
+        _scheduled_effective_mode(
+            "frequent",
+            {"root_used_red_percent": 85},
+            disk_usage=lambda _path: disk,
+        )
+        == "pressure"
+    )
+
+
+def test_scheduled_poll_keeps_non_red_and_weekly_modes():
+    yellow = shutil._ntuple_diskusage(total=1000, used=849, free=151)
+    red = shutil._ntuple_diskusage(total=1000, used=900, free=100)
+
+    assert (
+        _scheduled_effective_mode(
+            "frequent",
+            {"root_used_red_percent": 85},
+            disk_usage=lambda _path: yellow,
+        )
+        == "frequent"
+    )
+    assert (
+        _scheduled_effective_mode(
+            "weekly",
+            {"root_used_red_percent": 85},
+            disk_usage=lambda _path: red,
+        )
+        == "weekly"
+    )
+
+
+def test_scheduled_frequent_red_run_uses_pressure_plan_and_skips_frequency_gate(
+    tmp_path, monkeypatch
+):
+    observed = {}
+    config = _config(tmp_path)
+    config.update(
+        _housekeeping_heavy_slot=True,
+        root_used_red_percent=85,
+    )
+    red = shutil._ntuple_diskusage(total=1000, used=900, free=100)
+    plan = SimpleNamespace(
+        plan_id="a" * 64,
+        candidates=(),
+        reclaimable_bytes=0,
+        class_summaries={},
+        warnings=(),
+    )
+    report = SimpleNamespace(
+        ok=True,
+        freed_bytes=0,
+        reclaimed_bytes_by_class={},
+        skipped=[],
+        failures=[],
+        active_release=None,
+        rollback_available=None,
+        executed=[],
+    )
+    monkeypatch.setattr(shutil, "disk_usage", lambda _path: red)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service.get_housekeeping_settings",
+        lambda _config: {"policy": {}, "schedule": {}},
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service._scheduled_mode_due",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("pressure recovery must not use a periodic receipt")
+        ),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service.plan_housekeeping",
+        lambda **kwargs: observed.setdefault("plan", kwargs) and plan,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping.executor.execute_plan",
+        lambda *_args, **_kwargs: report,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service._finalize_housekeeping_summary",
+        lambda summary, **_kwargs: summary,
+    )
+
+    summary = run_housekeeping(
+        config=config,
+        dry_run=False,
+        mode="frequent",
+        scheduled=True,
+        now=123.0,
+        proc_root=tmp_path / "proc",
+    )
+
+    assert summary.mode == "pressure"
+    assert observed["plan"]["mode"] == "pressure"
 
 
 def test_summary_records_separate_outcome_timing_and_post_disk_state(monkeypatch):

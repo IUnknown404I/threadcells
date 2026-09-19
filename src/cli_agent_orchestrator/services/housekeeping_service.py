@@ -956,6 +956,29 @@ def _scheduled_mode_due(
     return False, "pressure_schedule_is_event_driven"
 
 
+def _scheduled_effective_mode(
+    requested_mode: str,
+    config: Mapping[str, Any],
+    *,
+    disk_usage: Callable[[str], Any] | None = None,
+) -> str:
+    """Promote the frequent poll to pressure recovery when disk is RED.
+
+    The frequent timer is the canonical event poller for the ``on_red``
+    schedule.  Resolve the mode before Heavy admission so an otherwise idle
+    RED host can recover without waiting for a new user/provider request.
+    Weekly ticks keep their own retention boundary and must not create a
+    second pressure poller.
+    """
+    if requested_mode != "frequent":
+        return requested_mode
+    disk = (disk_usage or shutil.disk_usage)("/")
+    used_percent = (disk.used * 100 / disk.total) if disk.total else 100.0
+    if used_percent >= int(config.get("root_used_red_percent", 85)):
+        return "pressure"
+    return requested_mode
+
+
 @contextmanager
 def _housekeeping_execution_lock(lock_dir: Path):
     """Own the canonical Housekeeping mutation boundary for one operation."""
@@ -1509,6 +1532,8 @@ def run_housekeeping(
     if not dry_run and not scheduled and expected_plan_id is None:
         raise RuntimeError("HOUSEKEEPING_PLAN_REQUIRED")
     cfg = dict(config or load_operations_config())
+    if scheduled:
+        mode = _scheduled_effective_mode(mode, cfg)
     if mode in {"weekly", "pressure"} and not cfg.get("_housekeeping_heavy_slot"):
         from cli_agent_orchestrator.services.operations_service import acquire_heavy_slot
 
@@ -1549,7 +1574,7 @@ def run_housekeeping(
             if not summary.idle_gate["eligible"]:
                 raise RuntimeError(str(summary.idle_gate["reason_code"]))
         settings = get_housekeeping_settings(cfg)
-        if scheduled:
+        if scheduled and mode != "pressure":
             due, schedule_warning = _scheduled_mode_due(
                 root, mode, settings["schedule"], now=current
             )

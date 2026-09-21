@@ -313,9 +313,16 @@ is supplied independently of optional sender-ID injection, so use its identity
 rather than inferring a child from free-form result prose.
 
 After reading, incorporating, and acknowledging a complete ordinary assigned
-result, evaluate `retire_completed_child(child_terminal_id, logical_turn_id)`
-before the next `assign`. Invoke it only when there is no current recovery or
-evidence need. It is prohibited for self, foreign children, handoffs,
+result, the lifecycle reconciler retires the child automatically once it is
+quiescent and its managed worktree is proven clean. A completed reviewer result
+gets one explicit 15-minute reuse lease for the policy-approved blocker
+rereview; after that durable deadline it becomes retirement-eligible even while
+the parent remains open or owner-gated. A rereview registration and retirement
+claim are serialized, so never retry against a reviewer reported as in
+retirement. Use `retire_completed_child(child_terminal_id, logical_turn_id)`
+only for bounded operator recovery when automatic reconciliation has not
+converged and there is no current recovery or evidence need. It is prohibited
+for self, foreign children, handoffs,
 unacknowledged/incomplete/cancelled results, non-terminal child workflows, or
 children with unresolved delegated work; handoff cleanup remains its existing
 path. A managed direct handoff enters that cleanup saga only after its exact

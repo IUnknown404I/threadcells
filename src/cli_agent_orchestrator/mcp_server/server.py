@@ -17,6 +17,7 @@ from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from pydantic import Field
 
 from cli_agent_orchestrator.clients.database import (
+    ActiveChildCompletionBarrier,
     acknowledge_child_assignment_result_outcome,
     acknowledge_handoff_child_result_direct,
     bind_child_assignment_input_turn,
@@ -32,7 +33,6 @@ from cli_agent_orchestrator.clients.database import (
     complete_assigned_child_retirement,
     complete_child_retirement,
     create_assigned_child_completion_result_message,
-    create_child_assignment_result_message,
     describe_child_assignment_acknowledgement,
     describe_workflow_effect_rejection,
     finish_workflow_effect,
@@ -2536,35 +2536,12 @@ def _send_message_impl(
                         "logical_turn_id": continuation["turn_id"],
                         "managed_handoff_continuation": True,
                     }
-                assigned_result, duplicate = create_child_assignment_result_message(
-                    sender_id,
-                    receiver_id,
-                    message,
-                    workflow_effect_id=effect["id"],
-                    workflow_turn_id=logical_turn_id,
-                )
-                if assigned_result is not None:
-                    try:
-                        inbox_service.check_and_send_pending_messages(receiver_id)
-                    except Exception as exc:
-                        # Persistence is authoritative; retry delivery through the
-                        # normal watchdog/restart path rather than reopening the
-                        # child submission effect.
-                        logger.warning("Immediate assigned-result delivery failed: %s", exc)
-                    return {
-                        "success": True,
-                        "duplicate": duplicate,
-                        "message_id": assigned_result.id,
-                        "sender_id": assigned_result.sender_id,
-                        "receiver_id": assigned_result.receiver_id,
-                        "result_id": assigned_result.result_id,
-                    }
-                if duplicate:
-                    return {
-                        "success": True,
-                        "ignored": True,
-                        "reason": "assigned callback was already closed or cancelled",
-                    }
+                # Assigned children may send ordinary progress or coordination
+                # messages. Final result authority belongs to their explicit
+                # complete_workflow effect, never to the first message that
+                # happens to target the assigning parent. This also prevents a
+                # nested result, commit notice, or status update from completing
+                # the enclosing attempt.
         return _send_to_inbox(receiver_id, message)
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -2957,6 +2934,20 @@ async def complete_workflow(
                 # reuses this one Inbox row if the immediate parent wake loses
                 # the provider-idle boundary.
                 logger.warning("Immediate assigned-completion delivery failed: %s", exc)
+    except ActiveChildCompletionBarrier as barrier:
+        # No completion state crossed the database boundary. Keep this exact
+        # logical effect safely reclaimable after the descendant is
+        # incorporated, matching the pre-effect fast-path above.
+        _finish_privileged_effect(effect, "not_admitted")
+        return {
+            "success": False,
+            "terminal_id": terminal_id,
+            "status": "open",
+            "retryable": True,
+            "error": "active child completion barrier",
+            "active_children": barrier.active_children,
+            "failed_children": barrier.failed_children,
+        }
     except Exception:
         _finish_privileged_effect(effect, "indeterminate")
         raise
@@ -2965,12 +2956,20 @@ async def complete_workflow(
     )
     if success:
         inbox_service.wake_provider_execution_queue()
-    _finish_privileged_effect(effect, "completed" if success else "indeterminate")
+    if success:
+        effect_outcome = "completed"
+    else:
+        active_children, failed_children = get_parent_completion_barrier(terminal_id)
+        effect_outcome = "not_admitted" if active_children else "indeterminate"
+    _finish_privileged_effect(effect, effect_outcome)
+    retry: Dict[str, Any] = {"retryable": True, "error": "active child completion barrier"}
+    if not success and active_children:
+        retry.update(active_children=active_children, failed_children=failed_children)
     return {
         "success": success,
         "terminal_id": terminal_id,
         "status": "terminal" if success else "open",
-        **({"retryable": True, "error": "active child completion barrier"} if not success else {}),
+        **(retry if not success else {}),
     }
 
 

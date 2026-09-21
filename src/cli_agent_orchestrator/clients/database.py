@@ -75,6 +75,15 @@ class AmbiguousTerminalIdentity(RuntimeError):
     """Terminal deletion authority changed after runtime death was proven."""
 
 
+class ActiveChildCompletionBarrier(RuntimeError):
+    """A completion transaction lost to an active descendant admission."""
+
+    def __init__(self, active_children: int, failed_children: int):
+        super().__init__("active child completion barrier")
+        self.active_children = active_children
+        self.failed_children = failed_children
+
+
 class TerminalModel(Base):
     """SQLAlchemy model for terminal metadata only."""
 
@@ -24901,6 +24910,89 @@ def _terminalize_handoff_recovery_exhausted(
         assignment.status = ChildAssignmentStatus.HANDOFF_RESULT_FAILED.value
 
 
+def _terminalize_assigned_result_incomplete(
+    db: Any,
+    assignment: ChildAssignmentModel,
+    reason_code: str,
+    actor_terminal_id: str,
+) -> Optional[InboxModel]:
+    """Finalize and expose one truthful assigned outcome with no child report.
+
+    This lifecycle fallback retains the assignment/result identity and
+    authorship instead of promoting ordinary Inbox prose, Git state, or a
+    descendant's result. Re-entry is idempotent: a previously finalized
+    artifact and its one notice always win.
+    """
+    result = _create_result_for_assignment(
+        db,
+        assignment,
+        "assign",
+        _open_workflow(db, assignment.parent_terminal_id, create=False),
+    )
+    if result.status == DelegationResultStatus.AWAITING.value:
+        blocker = (
+            "status: incomplete\n"
+            "classification: RECOVERABLE_EXECUTION\n"
+            f"reason_code: {reason_code}\n"
+            "evidence: assigned child terminated before saving authoritative final content"
+        )
+        result.status = DelegationResultStatus.INCOMPLETE.value
+        result.reason_code = reason_code
+        result.authorship = "cao_lifecycle_snapshot"
+        result.document_json = _legacy_document(blocker)
+        result.content_sha256 = hashlib.sha256(blocker.encode()).hexdigest()
+        result.content_bytes = len(blocker.encode())
+        result.finalized_at = result.updated_at = datetime.now()
+        _record_result_event(
+            db,
+            result.id,
+            f"result-incomplete:{assignment.id}:{reason_code}",
+            "incomplete",
+            "cao_lifecycle",
+            actor_terminal_id,
+            detail={"reason_code": reason_code},
+        )
+        _purge_staged_handoff_submission(db, result.id)
+    child_workflow = _open_workflow(db, assignment.child_terminal_id, create=False)
+    if child_workflow is not None and child_workflow.status == WORKFLOW_OPEN:
+        child_workflow.status = WORKFLOW_CANCELLED
+        child_workflow.terminal_reason = reason_code
+        child_workflow.updated_at = datetime.now()
+        _fail_closed_workflow_inbox_transports_in_transaction(
+            db, workflow_id=int(child_workflow.id)
+        )
+    lifecycle = db.get(ManagedAttemptLifecycleModel, assignment.id)
+    if lifecycle is not None and lifecycle.state not in {"fenced", "completed", "failed"}:
+        now = datetime.now()
+        lifecycle.state = "failed"
+        lifecycle.reason_code = reason_code
+        lifecycle.failed_at = now
+        lifecycle.recovery_next_retry_at = None
+        lifecycle.recovery_deadline_at = None
+        lifecycle.updated_at = now
+        _managed_attempt_event(
+            db,
+            lifecycle,
+            f"managed-attempt-failed:{assignment.id}:{reason_code}",
+            "failed",
+            reason_code=reason_code,
+        )
+    document = json.loads(result.document_json) if result.document_json else {}
+    body = document.get("body_markdown") if isinstance(document, dict) else None
+    if result.status not in (
+        DelegationResultStatus.COMPLETE.value,
+        DelegationResultStatus.INCOMPLETE.value,
+    ) or not isinstance(body, str):
+        return None
+    return _queue_delegation_result_notice(
+        db,
+        assignment,
+        result,
+        body,
+        delegation_kind="assign",
+    )
+
+
 def managed_final_problem(body: object) -> Optional[str]:
     """Reject text which cannot be a delegated work result."""
     if not isinstance(body, str) or not body.strip():
@@ -27371,6 +27463,13 @@ def create_assigned_child_completion_result_message(
     _ensure_delegation_result_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
+        # This is the completion-vs-descendant-admission winner boundary.
+        # register_child_assignment uses the same SQLite writer fence and
+        # revalidates that this workflow is OPEN. Whichever BEGIN IMMEDIATE
+        # wins therefore decides the whole lifecycle: completion either sees
+        # the admitted descendant and changes nothing, or terminalizes the
+        # child before a later descendant can be registered.
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         effect = (
             db.query(WorkflowEffectModel)
             .join(WorkflowModel, WorkflowModel.id == WorkflowEffectModel.workflow_id)
@@ -27400,6 +27499,13 @@ def create_assigned_child_completion_result_message(
         parent_workflow = _open_workflow(db, assignment.parent_terminal_id, create=False)
         if parent_workflow is None or parent_workflow.status != WORKFLOW_OPEN:
             return None, True
+
+        active_children, failed_children = _parent_completion_barrier_in_transaction(
+            db, child_terminal_id
+        )
+        if active_children:
+            db.rollback()
+            raise ActiveChildCompletionBarrier(active_children, failed_children)
 
         if assignment.result_message_id is not None:
             inbox_msg, duplicate, reason = _finalize_managed_delegation_result(
@@ -27510,25 +27616,31 @@ def get_parent_completion_barrier(parent_terminal_id: str) -> tuple[int, int]:
     """Return ``(active, failed)`` callbacks that still await parent acknowledgement."""
     _ensure_child_assignment_schema()
     with SessionLocal() as db:
-        assignments = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.parent_terminal_id == parent_terminal_id)
-            .all()
+        return _parent_completion_barrier_in_transaction(db, parent_terminal_id)
+
+
+def _parent_completion_barrier_in_transaction(db: Any, parent_terminal_id: str) -> tuple[int, int]:
+    """Read the descendant barrier from the caller's transaction snapshot."""
+    assignments = (
+        db.query(ChildAssignmentModel)
+        .filter(ChildAssignmentModel.parent_terminal_id == parent_terminal_id)
+        .all()
+    )
+    active_statuses = _active_child_assignment_statuses()
+    active = sum(
+        assignment.review_superseded_at is None and assignment.status in active_statuses
+        for assignment in assignments
+    )
+    failed = sum(
+        assignment.review_superseded_at is None
+        and assignment.status
+        in (
+            ChildAssignmentStatus.RESULT_FAILED.value,
+            ChildAssignmentStatus.HANDOFF_RESULT_FAILED.value,
         )
-        active_statuses = _active_child_assignment_statuses()
-        active = sum(
-            assignment.review_superseded_at is None and assignment.status in active_statuses
-            for assignment in assignments
-        )
-        failed = sum(
-            assignment.review_superseded_at is None
-            and (
-                assignment.status == ChildAssignmentStatus.RESULT_FAILED.value
-                or assignment.status == ChildAssignmentStatus.HANDOFF_RESULT_FAILED.value
-            )
-            for assignment in assignments
-        )
-        return active, failed
+        for assignment in assignments
+    )
+    return active, failed
 
 
 def _review_acknowledgement_reason(
@@ -27764,6 +27876,18 @@ def acknowledge_child_assignment_result_outcome(
                 "assignment_status": assignment.status,
                 **canonical_identity,
             }
+        if assignment.status in (
+            ChildAssignmentStatus.AWAITING_RESULT.value,
+            ChildAssignmentStatus.HANDOFF_AWAITING_RESULT.value,
+            ChildAssignmentStatus.HANDOFF_RECOVERY_AWAITING_RESULT.value,
+        ):
+            return {
+                "accepted": False,
+                "reason_code": "RESULT_NOT_FINALIZED",
+                "workflow_state": parent_workflow.status,
+                "assignment_status": assignment.status,
+                **canonical_identity,
+            }
         if assignment.status not in (
             ChildAssignmentStatus.RESULT_DELIVERED.value,
             ChildAssignmentStatus.HANDOFF_RESULT_DELIVERED.value,
@@ -27867,6 +27991,17 @@ def describe_child_assignment_acknowledgement(
                 "assignment_status": assignment.status,
                 **canonical_identity,
             }
+        if assignment.status in (
+            ChildAssignmentStatus.AWAITING_RESULT.value,
+            ChildAssignmentStatus.HANDOFF_AWAITING_RESULT.value,
+            ChildAssignmentStatus.HANDOFF_RECOVERY_AWAITING_RESULT.value,
+        ):
+            return {
+                "reason_code": "RESULT_NOT_FINALIZED",
+                "workflow_state": workflow.status,
+                "assignment_status": assignment.status,
+                **canonical_identity,
+            }
         return {
             "reason_code": None,
             "workflow_state": workflow.status,
@@ -27964,6 +28099,16 @@ def cancel_child_assignments_for_terminal(terminal_id: str) -> int:
                     ChildAssignmentStatus.HANDOFF_RESULT_FAILED.value,
                 )
             )
+            child_finalized_assign = (
+                assignment.child_terminal_id == terminal_id
+                and assignment.status
+                in (
+                    ChildAssignmentStatus.RESULT_QUEUED.value,
+                    ChildAssignmentStatus.RESULT_DELIVERED.value,
+                    ChildAssignmentStatus.RESULT_FAILED.value,
+                    ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value,
+                )
+            )
             # A managed child may leave its current provider invocation before
             # producing an authority. Preserve the exact relation/result for
             # same-child bounded recovery instead of cancelling it on a
@@ -28005,20 +28150,38 @@ def cancel_child_assignments_for_terminal(terminal_id: str) -> int:
                 _terminalize_handoff_recovery_exhausted(db, assignment, result, terminal_id)
                 changed += 1
                 continue
-            if assignment.status in active_statuses and not child_completed_handoff:
+            if (
+                assignment.status in active_statuses
+                and not child_completed_handoff
+                and not child_finalized_assign
+            ):
                 kind = "handoff" if assignment.status.startswith("handoff_") else "assign"
                 child_lifecycle_exit = (
                     assignment.child_terminal_id == terminal_id
                     and assignment.parent_terminal_id != terminal_id
                 )
-                assignment.status = ChildAssignmentStatus.CANCELLED.value
-                assignment.updated_at = datetime.now()
                 result = _create_result_for_assignment(
                     db,
                     assignment,
                     kind,
                     _open_workflow(db, assignment.parent_terminal_id, create=False),
                 )
+                if child_lifecycle_exit and kind == "assign":
+                    # Keep a finalized assigned artifact deliverable after its
+                    # producer exits. If no authoritative report exists,
+                    # finalize this same identity truthfully and wake the
+                    # parent instead of cancelling into an unacknowledgeable
+                    # awaiting-result hole.
+                    notice = _terminalize_assigned_result_incomplete(
+                        db, assignment, "child_exited", terminal_id
+                    )
+                    if notice is None:
+                        assignment.status = ChildAssignmentStatus.CANCELLED.value
+                        assignment.updated_at = datetime.now()
+                    changed += 1
+                    continue
+                assignment.status = ChildAssignmentStatus.CANCELLED.value
+                assignment.updated_at = datetime.now()
                 if result.status == DelegationResultStatus.AWAITING.value:
                     result.status = (
                         DelegationResultStatus.INCOMPLETE.value
@@ -28489,6 +28652,24 @@ def terminalize_missing_terminal_assignments_for_restart() -> int:
                 kind,
                 _open_workflow(db, assignment.parent_terminal_id, create=False),
             )
+            if not child_exists and parent_exists and kind == "assign":
+                if assignment.status in (
+                    ChildAssignmentStatus.RESULT_QUEUED.value,
+                    ChildAssignmentStatus.RESULT_DELIVERED.value,
+                    ChildAssignmentStatus.RESULT_FAILED.value,
+                ):
+                    continue
+                notice = _terminalize_assigned_result_incomplete(
+                    db,
+                    assignment,
+                    "restart_missing_child_terminal",
+                    assignment.child_terminal_id,
+                )
+                if notice is None:
+                    assignment.status = ChildAssignmentStatus.CANCELLED.value
+                    assignment.updated_at = now
+                changed += 1
+                continue
             if result.status == DelegationResultStatus.AWAITING.value:
                 result.status = (
                     DelegationResultStatus.INCOMPLETE.value
@@ -28520,6 +28701,67 @@ def terminalize_missing_terminal_assignments_for_restart() -> int:
             changed += 1
         if changed:
             db.commit()
+        return changed
+
+
+def reconcile_terminated_assigned_results() -> int:
+    """Terminalize historical assigned attempts whose producer cannot resume.
+
+    Older runtimes could close a child's workflow or provider before its own
+    canonical result was finalized. Terminal metadata may still exist, so the
+    missing-terminal restart repair cannot see this state. Reconcile only an
+    exact awaiting assigned relation with positive terminal workflow/runtime
+    evidence; ordinary messages and descendant results are never consulted.
+    """
+    _ensure_child_assignment_schema()
+    _ensure_delegation_result_schema()
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        assignments = (
+            db.query(ChildAssignmentModel)
+            .filter(ChildAssignmentModel.status == ChildAssignmentStatus.AWAITING_RESULT.value)
+            .order_by(ChildAssignmentModel.id.asc())
+            .all()
+        )
+        changed = 0
+        for assignment in assignments:
+            result = (
+                db.query(DelegationResultModel)
+                .filter_by(child_assignment_id=assignment.id, delegation_kind="assign")
+                .first()
+            )
+            if result is None or result.status != DelegationResultStatus.AWAITING.value:
+                continue
+            child = db.query(TerminalModel).filter_by(id=assignment.child_terminal_id).first()
+            if child is None:
+                # terminalize_missing_terminal_assignments_for_restart owns
+                # this state and its established reason code.
+                continue
+            child_workflow = _open_workflow(db, assignment.child_terminal_id, create=False)
+            workflow_closed = bool(
+                child_workflow is not None
+                and child_workflow.status in (WORKFLOW_TERMINAL, WORKFLOW_CANCELLED)
+            )
+            runtime_exited = child.runtime_lifecycle == "exited"
+            if not workflow_closed and not runtime_exited:
+                continue
+            reason_code = (
+                "child_terminated_without_authoritative_result"
+                if workflow_closed
+                else "child_runtime_exited_without_authoritative_result"
+            )
+            notice = _terminalize_assigned_result_incomplete(
+                db, assignment, reason_code, assignment.child_terminal_id
+            )
+            if notice is None:
+                assignment.status = ChildAssignmentStatus.CANCELLED.value
+                assignment.updated_at = datetime.now()
+            changed += 1
+        if changed:
+            db.commit()
+        else:
+            db.rollback()
         return changed
 
 

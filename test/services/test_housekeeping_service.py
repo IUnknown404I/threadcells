@@ -6,7 +6,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
-from cli_agent_orchestrator.services.operations_service import _root_disk_status
 from cli_agent_orchestrator.services.housekeeping_service import (
     HousekeepingSummary,
     _cleanup_browser_cache,
@@ -28,6 +27,7 @@ from cli_agent_orchestrator.services.housekeeping_service import (
     run_housekeeping,
     run_pressure_recovery,
 )
+from cli_agent_orchestrator.services.operations_service import _root_disk_status
 
 
 def _config(root: Path):

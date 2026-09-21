@@ -27,6 +27,7 @@ from cli_agent_orchestrator.clients.database import (
     get_claimed_handoff_child_result_direct,
     get_delegation_result,
     get_delegation_result_for_assignment,
+    get_parent_completion_barrier,
     get_pending_handoff_child_terminal_ids,
     managed_final_problem,
     mark_child_assignment_result_delivered,
@@ -34,8 +35,10 @@ from cli_agent_orchestrator.clients.database import (
     parse_v1_result_capture,
     persist_terminal_result_snapshot,
     purge_expired_delegation_results,
+    reconcile_terminated_assigned_results,
     register_child_assignment,
     register_handoff_child,
+    requeue_unacknowledged_child_assignment_results,
     start_workflow_input,
     terminalize_missing_terminal_assignments_for_restart,
 )
@@ -602,6 +605,20 @@ def test_unfinished_child_exit_is_incomplete_not_success(monkeypatch):
     assert result is not None
     assert result["status"] == "incomplete"
     assert result["reason_code"] == "child_exited"
+    with database.SessionLocal() as db:
+        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id="child").one()
+        assert assignment.status == "result_queued"
+        assert assignment.result_message_id is not None
+
+    # Repeated exit observation is inert; the same truthful result remains
+    # the parent's acknowledgement/capacity-release authority.
+    assert cancel_child_assignments_for_terminal("child") == 0
+    with database.SessionLocal() as db:
+        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id="child").one()
+        message_id = assignment.result_message_id
+    assert mark_child_assignment_result_delivered(message_id)
+    assert acknowledge_child_assignment_result("parent", result_id=result["id"])
+    assert get_parent_completion_barrier("parent") == (0, 0)
 
 
 def test_assigned_result_rejects_forged_sender_without_admitted_effect(monkeypatch):
@@ -673,6 +690,128 @@ def test_restart_terminalizes_awaiting_relation_with_missing_child(monkeypatch):
     assert result is not None
     assert result["status"] == "incomplete"
     assert result["reason_code"] == "restart_missing_child_terminal"
+    with database.SessionLocal() as db:
+        assignment = (
+            db.query(ChildAssignmentModel).filter_by(child_terminal_id="missing-child").one()
+        )
+        assert assignment.status == "result_queued"
+        message_id = assignment.result_message_id
+    assert terminalize_missing_terminal_assignments_for_restart() == 0
+    assert mark_child_assignment_result_delivered(message_id)
+    assert requeue_unacknowledged_child_assignment_results() == 1
+    assert get_delegation_result(result["id"])["status"] == "incomplete"
+    assert mark_child_assignment_result_delivered(message_id)
+    assert acknowledge_child_assignment_result("parent", result_id=result["id"])
+
+
+def test_restart_terminalizes_closed_child_with_retained_metadata(monkeypatch):
+    _isolated_db(monkeypatch)
+    assert start_workflow_input("closed-child") is not None
+    assert register_child_assignment("parent", "closed-child")
+    with database.SessionLocal() as db:
+        db.add(
+            TerminalModel(
+                id="closed-child",
+                tmux_session="cao-test",
+                tmux_window="closed-child",
+                provider="codex",
+                runtime_lifecycle="exited",
+            )
+        )
+        child_workflow = db.query(WorkflowModel).filter_by(root_terminal_id="closed-child").one()
+        child_workflow.status = "terminal"
+        db.commit()
+
+    assert reconcile_terminated_assigned_results() == 1
+    assert reconcile_terminated_assigned_results() == 0
+    result = get_delegation_result_for_assignment("closed-child")
+    assert result is not None
+    assert result["status"] == "incomplete"
+    assert result["authorship"] == "cao_lifecycle_snapshot"
+    assert result["reason_code"] == "child_terminated_without_authoritative_result"
+    with database.SessionLocal() as db:
+        assignment = (
+            db.query(ChildAssignmentModel).filter_by(child_terminal_id="closed-child").one()
+        )
+        assert assignment.status == "result_queued"
+        assert assignment.result_message_id is not None
+        lifecycle = db.get(database.ManagedAttemptLifecycleModel, assignment.id)
+        assert lifecycle is not None
+        assert lifecycle.state == "failed"
+        assert lifecycle.reason_code == "child_terminated_without_authoritative_result"
+
+
+def test_ordinary_assigned_message_does_not_finalize_result(monkeypatch):
+    _isolated_db(monkeypatch)
+    assert register_child_assignment("parent", "child")
+    authority = _authorized_callback("child")
+    sent = {}
+
+    def _ordinary_send(receiver_id, message):
+        sent.update(receiver_id=receiver_id, message=message)
+        return {"success": True, "message_id": 799}
+
+    monkeypatch.setenv("CAO_TERMINAL_ID", "child")
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.mcp_server.server.schedule_managed_handoff_continuation",
+        lambda *_: {"managed": False},
+    )
+    monkeypatch.setattr("cli_agent_orchestrator.mcp_server.server._send_to_inbox", _ordinary_send)
+
+    from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+
+    response = _send_message_impl(
+        "parent",
+        "ordinary progress only",
+        {"id": authority["workflow_effect_id"]},
+        authority["workflow_turn_id"],
+    )
+    assert response == {"success": True, "message_id": 799}
+    assert sent == {"receiver_id": "parent", "message": "ordinary progress only"}
+    result = get_delegation_result_for_assignment("child")
+    assert result is not None and result["status"] == "awaiting"
+    assert (
+        acknowledge_child_assignment_result_outcome("parent", result_id=result["id"])["reason_code"]
+        == "RESULT_NOT_FINALIZED"
+    )
+
+
+def _complete_assigned_child(child_id: str, report: str):
+    turn = start_workflow_input(child_id)
+    assert turn is not None and claim_workflow_turn_receipt(child_id, turn)
+    effect = claim_workflow_effect(child_id, turn, "complete_workflow", report)
+    assert effect is not None
+    notice, duplicate = create_assigned_child_completion_result_message(
+        child_id, report, effect["id"], turn
+    )
+    assert notice is not None and duplicate is False
+    return notice
+
+
+def test_nested_assignments_produce_distinct_original_actor_results(monkeypatch):
+    _isolated_db(monkeypatch)
+    assert register_child_assignment("root", "child")
+    assert register_child_assignment("child", "grandchild")
+
+    grandchild_notice = _complete_assigned_child("grandchild", "grandchild final")
+    grandchild_result = get_delegation_result(grandchild_notice.result_id)
+    assert grandchild_result["parent_terminal_id"] == "child"
+    assert grandchild_result["authorship"] == "child_workflow_completion"
+    assert mark_child_assignment_result_delivered(grandchild_notice.id)
+    assert acknowledge_child_assignment_result("child", "grandchild", grandchild_notice.result_id)
+
+    child_notice = _complete_assigned_child("child", "child's own final")
+    child_result = get_delegation_result(child_notice.result_id)
+    assert child_result["parent_terminal_id"] == "root"
+    assert child_result["child_terminal_id"] == "child"
+    assert child_result["document"]["body_markdown"] == "child's own final"
+    assert child_notice.result_id != grandchild_notice.result_id
+
+    foreign = acknowledge_child_assignment_result_outcome(
+        "root", "child", grandchild_notice.result_id
+    )
+    assert foreign["accepted"] is False
+    assert foreign["reason_code"] == "RESULT_IDENTITY_MISMATCH"
 
 
 @pytest.mark.parametrize(

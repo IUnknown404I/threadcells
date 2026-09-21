@@ -71,6 +71,7 @@ from cli_agent_orchestrator.clients.database import (
     reconcile_receipted_callback_after_reconnect_promotion,
     reconcile_result_callbacks_superseded_by_resume,
     reconcile_superseded_workflow_turns_for_restart,
+    reconcile_terminated_assigned_results,
     release_completed_assigned_child_retirement,
     release_undispatched_completed_child_retirement_claims_for_restart,
     request_workflow_provider_reconnect,
@@ -631,6 +632,7 @@ def _reconcile_pending_messages_with_admission(registry: PluginRegistry | None =
     queue or a synthetic terminal event.
     """
     terminalize_missing_terminal_assignments_for_restart()
+    reconcile_terminated_assigned_results()
     released_claims = release_undispatched_completed_child_retirement_claims_for_restart()
     if released_claims:
         logger.info(

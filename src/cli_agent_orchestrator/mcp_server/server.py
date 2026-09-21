@@ -32,7 +32,6 @@ from cli_agent_orchestrator.clients.database import (
     complete_assigned_child_retirement,
     complete_child_retirement,
     create_assigned_child_completion_result_message,
-    create_child_assignment_result_message,
     describe_child_assignment_acknowledgement,
     describe_workflow_effect_rejection,
     finish_workflow_effect,
@@ -2536,35 +2535,12 @@ def _send_message_impl(
                         "logical_turn_id": continuation["turn_id"],
                         "managed_handoff_continuation": True,
                     }
-                assigned_result, duplicate = create_child_assignment_result_message(
-                    sender_id,
-                    receiver_id,
-                    message,
-                    workflow_effect_id=effect["id"],
-                    workflow_turn_id=logical_turn_id,
-                )
-                if assigned_result is not None:
-                    try:
-                        inbox_service.check_and_send_pending_messages(receiver_id)
-                    except Exception as exc:
-                        # Persistence is authoritative; retry delivery through the
-                        # normal watchdog/restart path rather than reopening the
-                        # child submission effect.
-                        logger.warning("Immediate assigned-result delivery failed: %s", exc)
-                    return {
-                        "success": True,
-                        "duplicate": duplicate,
-                        "message_id": assigned_result.id,
-                        "sender_id": assigned_result.sender_id,
-                        "receiver_id": assigned_result.receiver_id,
-                        "result_id": assigned_result.result_id,
-                    }
-                if duplicate:
-                    return {
-                        "success": True,
-                        "ignored": True,
-                        "reason": "assigned callback was already closed or cancelled",
-                    }
+                # Assigned children may send ordinary progress or coordination
+                # messages. Final result authority belongs to their explicit
+                # complete_workflow effect, never to the first message that
+                # happens to target the assigning parent. This also prevents a
+                # nested result, commit notice, or status update from completing
+                # the enclosing attempt.
         return _send_to_inbox(receiver_id, message)
     except Exception as e:
         return {"success": False, "error": str(e)}

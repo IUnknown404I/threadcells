@@ -2,6 +2,7 @@ import json
 import os
 import pwd
 import shutil
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,10 +22,12 @@ from cli_agent_orchestrator.services.housekeeping_service import (
     _reconcile_supervisor_context_roles,
     _reconcile_writer_leases,
     _runtime_open_paths_inventory,
+    _scheduled_effective_mode,
     housekeeping_main,
     run_housekeeping,
     run_pressure_recovery,
 )
+from cli_agent_orchestrator.services.operations_service import _root_disk_status
 
 
 def _config(root: Path):
@@ -73,6 +76,233 @@ def test_pressure_recovery_executes_the_exact_fresh_plan(tmp_path, monkeypatch):
     assert observed["plan"]["mode"] == "pressure"
     assert observed["run"]["dry_run"] is False
     assert observed["run"]["expected_plan_id"] == "a" * 64
+
+
+def test_scheduled_frequent_poll_promotes_red_disk_to_pressure_recovery():
+    disk = shutil._ntuple_diskusage(total=10_000, used=8_496, free=1_504)
+    config = {"root_used_red_percent": 85}
+
+    assert _root_disk_status(config, disk_usage=disk) == {
+        "state": "RED",
+        "used_percent": 85.0,
+        "free_bytes": 1_504,
+        "total_bytes": 10_000,
+        "free_gib": 0.0,
+    }
+
+    assert (
+        _scheduled_effective_mode(
+            "frequent",
+            config,
+            disk_usage=lambda _path: disk,
+        )
+        == "pressure"
+    )
+
+
+def test_automatic_pressure_revalidates_after_heavy_wait_under_singleton(tmp_path, monkeypatch):
+    state = {"heavy": False, "singleton": False, "disk_reads": 0, "events": []}
+    red = shutil._ntuple_diskusage(total=10_000, used=8_496, free=1_504)
+    green = shutil._ntuple_diskusage(total=10_000, used=8_000, free=2_000)
+
+    def disk_usage(_path):
+        state["disk_reads"] += 1
+        if state["disk_reads"] == 1:
+            assert state["heavy"] is False
+            assert state["singleton"] is False
+            return red
+        assert state["heavy"] is True
+        assert state["singleton"] is True
+        state["events"].append(
+            "automatic_revalidation" if state["disk_reads"] == 2 else "final_disk"
+        )
+        return green
+
+    @contextmanager
+    def heavy_slot(*_args, **_kwargs):
+        state["heavy"] = True
+        try:
+            yield 0
+        finally:
+            state["heavy"] = False
+
+    @contextmanager
+    def housekeeping_lock(_lock_dir):
+        assert state["heavy"] is True
+        state["singleton"] = True
+        try:
+            yield
+        finally:
+            state["singleton"] = False
+
+    def full_cleanup_gate():
+        assert state["heavy"] is True
+        assert state["singleton"] is True
+        state["events"].append("full_cleanup_gate")
+
+    def forbidden_call(*_args, **_kwargs):
+        raise AssertionError("cleared automatic pressure must perform zero work")
+
+    config = _config(tmp_path)
+    config["root_used_red_percent"] = 85
+    monkeypatch.setattr(shutil, "disk_usage", disk_usage)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.operations_service.acquire_heavy_slot",
+        heavy_slot,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service._housekeeping_execution_lock",
+        housekeeping_lock,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service.plan_housekeeping",
+        forbidden_call,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping.executor.execute_plan",
+        forbidden_call,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.full_cleanup_operation_service.require_no_active_full_cleanup_operation",
+        full_cleanup_gate,
+    )
+    for name in (
+        "_reconcile_supervisor_context_roles",
+        "_reconcile_writer_leases",
+        "_reconcile_provider_executions",
+        "_reconcile_retirement_cleanups",
+        "_reconcile_legacy_terminal_authority",
+        "_inventory_warnings",
+    ):
+        monkeypatch.setattr(
+            f"cli_agent_orchestrator.services.housekeeping_service.{name}",
+            forbidden_call,
+        )
+
+    summary = run_housekeeping(
+        config=config,
+        dry_run=False,
+        mode="frequent",
+        scheduled=True,
+        now=123.0,
+        proc_root=tmp_path / "proc",
+    )
+
+    assert state == {
+        "heavy": False,
+        "singleton": False,
+        "disk_reads": 3,
+        "events": ["full_cleanup_gate", "automatic_revalidation", "final_disk"],
+    }
+    assert summary.mode == "pressure"
+    assert summary.plan_id is None
+    assert summary.planned_candidates == 0
+    assert summary.freed_bytes == 0
+    assert summary.execution_skips == [
+        {
+            "candidate": "root_disk:/",
+            "reason_code": "ROOT_DISK_PRESSURE_CLEARED",
+        }
+    ]
+    assert summary.final_status == "completed_with_issues"
+    persisted = json.loads(
+        (tmp_path / "state" / "cao" / "housekeeping-status.json").read_text(encoding="utf-8")
+    )
+    assert persisted["plan_id"] is None
+    assert persisted["freed_bytes"] == 0
+    assert persisted["execution_skips"] == summary.execution_skips
+
+
+def test_scheduled_poll_keeps_non_red_and_weekly_modes():
+    yellow = shutil._ntuple_diskusage(total=1000, used=849, free=151)
+    red = shutil._ntuple_diskusage(total=1000, used=900, free=100)
+
+    assert (
+        _scheduled_effective_mode(
+            "frequent",
+            {"root_used_red_percent": 85},
+            disk_usage=lambda _path: yellow,
+        )
+        == "frequent"
+    )
+    assert (
+        _scheduled_effective_mode(
+            "weekly",
+            {"root_used_red_percent": 85},
+            disk_usage=lambda _path: red,
+        )
+        == "weekly"
+    )
+
+
+def test_scheduled_frequent_red_run_uses_pressure_plan_and_skips_frequency_gate(
+    tmp_path, monkeypatch
+):
+    observed = {}
+    recorded = []
+    config = _config(tmp_path)
+    config.update(
+        _housekeeping_heavy_slot=True,
+        root_used_red_percent=85,
+    )
+    red = shutil._ntuple_diskusage(total=1000, used=900, free=100)
+    plan = SimpleNamespace(
+        plan_id="a" * 64,
+        candidates=(),
+        reclaimable_bytes=0,
+        class_summaries={},
+        warnings=(),
+    )
+    report = SimpleNamespace(
+        ok=True,
+        freed_bytes=0,
+        reclaimed_bytes_by_class={},
+        skipped=[],
+        failures=[],
+        active_release=None,
+        rollback_available=None,
+        executed=[],
+    )
+    monkeypatch.setattr(shutil, "disk_usage", lambda _path: red)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service.get_housekeeping_settings",
+        lambda _config: {"policy": {}, "schedule": {}},
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service._scheduled_mode_due",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("pressure recovery must not use a periodic receipt")
+        ),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service.plan_housekeeping",
+        lambda **kwargs: observed.setdefault("plan", kwargs) and plan,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping.executor.execute_plan",
+        lambda *_args, **_kwargs: report,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.housekeeping_service._finalize_housekeeping_summary",
+        lambda summary, **_kwargs: summary,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.clients.database.record_housekeeping_run",
+        recorded.append,
+    )
+
+    summary = run_housekeeping(
+        config=config,
+        dry_run=False,
+        mode="frequent",
+        scheduled=True,
+        now=123.0,
+        proc_root=tmp_path / "proc",
+    )
+
+    assert summary.mode == "pressure"
+    assert observed["plan"]["mode"] == "pressure"
+    assert recorded[0]["mode"] == "pressure"
 
 
 def test_summary_records_separate_outcome_timing_and_post_disk_state(monkeypatch):

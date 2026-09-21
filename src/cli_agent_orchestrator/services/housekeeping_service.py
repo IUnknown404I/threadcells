@@ -20,7 +20,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence, cast
 
-from cli_agent_orchestrator.services.operations_service import load_operations_config
+from cli_agent_orchestrator.services.operations_service import (
+    _root_disk_status,
+    load_operations_config,
+)
 
 
 @dataclass
@@ -956,6 +959,28 @@ def _scheduled_mode_due(
     return False, "pressure_schedule_is_event_driven"
 
 
+def _scheduled_effective_mode(
+    requested_mode: str,
+    config: Mapping[str, Any],
+    *,
+    disk_usage: Callable[[str], Any] | None = None,
+) -> str:
+    """Promote the frequent poll to pressure recovery when disk is RED.
+
+    The frequent timer is the canonical event poller for the ``on_red``
+    schedule.  Resolve the mode before Heavy admission so an otherwise idle
+    RED host can recover without waiting for a new user/provider request.
+    Weekly ticks keep their own retention boundary and must not create a
+    second pressure poller.
+    """
+    if requested_mode != "frequent":
+        return requested_mode
+    disk = (disk_usage or shutil.disk_usage)("/")
+    if _root_disk_status(config, disk_usage=disk)["state"] in {"RED", "CRITICAL"}:
+        return "pressure"
+    return requested_mode
+
+
 @contextmanager
 def _housekeeping_execution_lock(lock_dir: Path):
     """Own the canonical Housekeeping mutation boundary for one operation."""
@@ -1447,24 +1472,12 @@ def _complete_housekeeping_summary(
 ) -> HousekeepingSummary:
     """Attach immutable timing, outcome, and post-run disk evidence."""
     disk = shutil.disk_usage("/")
+    root_disk = _root_disk_status(config, disk_usage=disk)
     summary.disk_after = disk.free
     summary.observed_disk_free_delta = summary.disk_after - summary.disk_before
-    used_percent = round((disk.used * 100 / disk.total) if disk.total else 100.0, 1)
     summary.post_disk_state = {
-        "state": (
-            "CRITICAL"
-            if used_percent >= int(config.get("root_used_critical_percent", 92))
-            else (
-                "RED"
-                if used_percent >= int(config.get("root_used_red_percent", 85))
-                else (
-                    "YELLOW"
-                    if used_percent >= int(config.get("root_used_yellow_percent", 70))
-                    else "GREEN"
-                )
-            )
-        ),
-        "used_percent": used_percent,
+        "state": root_disk["state"],
+        "used_percent": root_disk["used_percent"],
         "free_bytes": disk.free,
         "total_bytes": disk.total,
     }
@@ -1493,6 +1506,19 @@ def _complete_housekeeping_summary(
     return summary
 
 
+def _finalize_zero_work_housekeeping_summary(
+    summary: HousekeepingSummary,
+    *,
+    root: Path,
+    config: Mapping[str, Any],
+    completed_at: float,
+) -> HousekeepingSummary:
+    """Publish a truthful no-op result without acquiring resource authority."""
+    _complete_housekeeping_summary(summary, config=config, completed_at=completed_at)
+    _write_status(root, summary)
+    return summary
+
+
 def _run_housekeeping_impl(
     *,
     config: Mapping[str, Any] | None = None,
@@ -1503,12 +1529,18 @@ def _run_housekeeping_impl(
     scheduled: bool = False,
     expected_plan_id: str | None = None,
     privileged_cleanup_executor: Callable[..., Any] | None = None,
+    _automatic_on_red: bool = False,
 ) -> HousekeepingSummary:
     if mode not in {"frequent", "weekly", "pressure", "full"}:
         raise ValueError("invalid housekeeping mode")
     if not dry_run and not scheduled and expected_plan_id is None:
         raise RuntimeError("HOUSEKEEPING_PLAN_REQUIRED")
     cfg = dict(config or load_operations_config())
+    if scheduled:
+        requested_mode = mode
+        mode = _scheduled_effective_mode(requested_mode, cfg)
+        if requested_mode == "frequent" and mode == "pressure":
+            _automatic_on_red = True
     if mode in {"weekly", "pressure"} and not cfg.get("_housekeeping_heavy_slot"):
         from cli_agent_orchestrator.services.operations_service import acquire_heavy_slot
 
@@ -1523,6 +1555,7 @@ def _run_housekeeping_impl(
                 proc_root=proc_root,
                 scheduled=scheduled,
                 expected_plan_id=expected_plan_id,
+                _automatic_on_red=_automatic_on_red,
             )
     root = Path(str(cfg["root"]))
     lock_dir = Path(str(cfg["lock_dir"]))
@@ -1544,12 +1577,32 @@ def _run_housekeeping_impl(
         )
 
         require_no_active_full_cleanup_operation()
+        if _automatic_on_red:
+            root_disk = _root_disk_status(cfg)
+            if root_disk["state"] not in {"RED", "CRITICAL"}:
+                summary.disk_before = int(root_disk["free_bytes"])
+                summary.execution_skips.append(
+                    {
+                        "candidate": "root_disk:/",
+                        "reason_code": "ROOT_DISK_PRESSURE_CLEARED",
+                    }
+                )
+                return _finalize_zero_work_housekeeping_summary(
+                    summary,
+                    root=root,
+                    config=cfg,
+                    completed_at=(
+                        time.time()
+                        if now is None
+                        else current + max(0.0, time.monotonic() - started_monotonic)
+                    ),
+                )
         if mode == "full":
             summary.idle_gate = full_cleanup_idle_gate(cfg)
             if not summary.idle_gate["eligible"]:
                 raise RuntimeError(str(summary.idle_gate["reason_code"]))
         settings = get_housekeeping_settings(cfg)
-        if scheduled:
+        if scheduled and mode != "pressure":
             due, schedule_warning = _scheduled_mode_due(
                 root, mode, settings["schedule"], now=current
             )

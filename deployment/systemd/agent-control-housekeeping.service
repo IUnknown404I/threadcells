@@ -1,5 +1,5 @@
 [Unit]
-Description=ThreadCells frequent deterministic housekeeping
+Description=ThreadCells frequent and RED-pressure deterministic housekeeping
 After=agent-control-cao.service
 
 [Service]

@@ -6,14 +6,14 @@ describe('safe diagnostic report', () => {
 
   it('copies only explicitly allowlisted scalar fields', () => {
     const report = buildSafeDiagnosticReport({
-      version: '0.4.1-alpha',
+      version: '0.4.2-alpha',
       revision: 'abcdef0',
       uiState: 'disconnected',
       reasonCode: 'RECOVERY_REQUIRED',
       correlationId: 'corr_123456',
       ...({ cookie: 'secret', nested: { resume_token: 'private' } } as object),
     })
-    expect(report).toContain('version: 0.4.1-alpha')
+    expect(report).toContain('version: 0.4.2-alpha')
     expect(report).toContain('reason_code: RECOVERY_REQUIRED')
     expect(report).toContain('correlation_id: corr_123456')
     expect(report).not.toContain('secret')

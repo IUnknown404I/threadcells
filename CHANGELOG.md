@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2-alpha] - 2026-09-19
+
+### Changed
+
+- Use the installed frequent Housekeeping tick as the canonical RED/CRITICAL disk-pressure poller while preserving the independent weekly retention schedule.
+- Reuse one canonical root-disk projection for capacity reporting, pressure admission, and post-run evidence.
+
+### Fixed
+
+- Revalidate automatic disk pressure after Heavy-slot and Housekeeping-singleton admission so cleared pressure produces a recorded zero-work result instead of stale cleanup.
+- Skip periodic frequency receipts for a promoted pressure run and execute only the exact freshly planned pressure candidate set.
+
+### Safety
+
+- Keep automatic pressure recovery inside the existing Heavy and Housekeeping fences, with protected/unknown resources, overlap accounting, retention policy, and execute-time identity checks unchanged.
+- Keep Full Cleanup separate, explicitly confirmed, and blocked unless authoritative lifecycle truth proves the system idle.
+
 ## [0.4.1-alpha] - 2026-09-18
 
 ### Added

@@ -74,6 +74,15 @@ class AmbiguousTerminalIdentity(RuntimeError):
     """Terminal deletion authority changed after runtime death was proven."""
 
 
+class ActiveChildCompletionBarrier(RuntimeError):
+    """A completion transaction lost to an active descendant admission."""
+
+    def __init__(self, active_children: int, failed_children: int):
+        super().__init__("active child completion barrier")
+        self.active_children = active_children
+        self.failed_children = failed_children
+
+
 class TerminalModel(Base):
     """SQLAlchemy model for terminal metadata only."""
 
@@ -26795,6 +26804,13 @@ def create_assigned_child_completion_result_message(
     _ensure_delegation_result_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
+        # This is the completion-vs-descendant-admission winner boundary.
+        # register_child_assignment uses the same SQLite writer fence and
+        # revalidates that this workflow is OPEN. Whichever BEGIN IMMEDIATE
+        # wins therefore decides the whole lifecycle: completion either sees
+        # the admitted descendant and changes nothing, or terminalizes the
+        # child before a later descendant can be registered.
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         effect = (
             db.query(WorkflowEffectModel)
             .join(WorkflowModel, WorkflowModel.id == WorkflowEffectModel.workflow_id)
@@ -26824,6 +26840,13 @@ def create_assigned_child_completion_result_message(
         parent_workflow = _open_workflow(db, assignment.parent_terminal_id, create=False)
         if parent_workflow is None or parent_workflow.status != WORKFLOW_OPEN:
             return None, True
+
+        active_children, failed_children = _parent_completion_barrier_in_transaction(
+            db, child_terminal_id
+        )
+        if active_children:
+            db.rollback()
+            raise ActiveChildCompletionBarrier(active_children, failed_children)
 
         if assignment.result_message_id is not None:
             inbox_msg, duplicate, reason = _finalize_managed_delegation_result(
@@ -26934,25 +26957,31 @@ def get_parent_completion_barrier(parent_terminal_id: str) -> tuple[int, int]:
     """Return ``(active, failed)`` callbacks that still await parent acknowledgement."""
     _ensure_child_assignment_schema()
     with SessionLocal() as db:
-        assignments = (
-            db.query(ChildAssignmentModel)
-            .filter(ChildAssignmentModel.parent_terminal_id == parent_terminal_id)
-            .all()
+        return _parent_completion_barrier_in_transaction(db, parent_terminal_id)
+
+
+def _parent_completion_barrier_in_transaction(db: Any, parent_terminal_id: str) -> tuple[int, int]:
+    """Read the descendant barrier from the caller's transaction snapshot."""
+    assignments = (
+        db.query(ChildAssignmentModel)
+        .filter(ChildAssignmentModel.parent_terminal_id == parent_terminal_id)
+        .all()
+    )
+    active_statuses = _active_child_assignment_statuses()
+    active = sum(
+        assignment.review_superseded_at is None and assignment.status in active_statuses
+        for assignment in assignments
+    )
+    failed = sum(
+        assignment.review_superseded_at is None
+        and assignment.status
+        in (
+            ChildAssignmentStatus.RESULT_FAILED.value,
+            ChildAssignmentStatus.HANDOFF_RESULT_FAILED.value,
         )
-        active_statuses = _active_child_assignment_statuses()
-        active = sum(
-            assignment.review_superseded_at is None and assignment.status in active_statuses
-            for assignment in assignments
-        )
-        failed = sum(
-            assignment.review_superseded_at is None
-            and (
-                assignment.status == ChildAssignmentStatus.RESULT_FAILED.value
-                or assignment.status == ChildAssignmentStatus.HANDOFF_RESULT_FAILED.value
-            )
-            for assignment in assignments
-        )
-        return active, failed
+        for assignment in assignments
+    )
+    return active, failed
 
 
 def _review_acknowledgement_reason(

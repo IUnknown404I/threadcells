@@ -17,6 +17,7 @@ from fastmcp.server.middleware import CallNext, Middleware, MiddlewareContext
 from pydantic import Field
 
 from cli_agent_orchestrator.clients.database import (
+    ActiveChildCompletionBarrier,
     acknowledge_child_assignment_result_outcome,
     acknowledge_handoff_child_result_direct,
     bind_child_assignment_input_turn,
@@ -2933,6 +2934,20 @@ async def complete_workflow(
                 # reuses this one Inbox row if the immediate parent wake loses
                 # the provider-idle boundary.
                 logger.warning("Immediate assigned-completion delivery failed: %s", exc)
+    except ActiveChildCompletionBarrier as barrier:
+        # No completion state crossed the database boundary. Keep this exact
+        # logical effect safely reclaimable after the descendant is
+        # incorporated, matching the pre-effect fast-path above.
+        _finish_privileged_effect(effect, "not_admitted")
+        return {
+            "success": False,
+            "terminal_id": terminal_id,
+            "status": "open",
+            "retryable": True,
+            "error": "active child completion barrier",
+            "active_children": barrier.active_children,
+            "failed_children": barrier.failed_children,
+        }
     except Exception:
         _finish_privileged_effect(effect, "indeterminate")
         raise
@@ -2941,12 +2956,20 @@ async def complete_workflow(
     )
     if success:
         inbox_service.wake_provider_execution_queue()
-    _finish_privileged_effect(effect, "completed" if success else "indeterminate")
+    if success:
+        effect_outcome = "completed"
+    else:
+        active_children, failed_children = get_parent_completion_barrier(terminal_id)
+        effect_outcome = "not_admitted" if active_children else "indeterminate"
+    _finish_privileged_effect(effect, effect_outcome)
+    retry: Dict[str, Any] = {"retryable": True, "error": "active child completion barrier"}
+    if not success and active_children:
+        retry.update(active_children=active_children, failed_children=failed_children)
     return {
         "success": success,
         "terminal_id": terminal_id,
         "status": "terminal" if success else "open",
-        **({"retryable": True, "error": "active child completion barrier"} if not success else {}),
+        **(retry if not success else {}),
     }
 
 

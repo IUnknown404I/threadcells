@@ -237,7 +237,10 @@ class TestDefaultBundledSkills:
             assert metadata.name == skill_name
             assert metadata.description
 
-    def test_default_skills_cover_core_communication_primitives(self):
+    def test_default_skills_cover_core_communication_primitives(self, monkeypatch):
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.skills.SKILLS_DIR", self.bundled_skills_dir
+        )
         supervisor_content = (
             self.bundled_skills_dir / "cao-supervisor-protocols" / "SKILL.md"
         ).read_text()
@@ -245,12 +248,16 @@ class TestDefaultBundledSkills:
             self.bundled_skills_dir / "cao-session-management" / "SKILL.md"
         ).read_text()
         worker_content = (self.bundled_skills_dir / "cao-worker-protocols" / "SKILL.md").read_text()
+        loaded_supervisor_content = load_skill_content("cao-supervisor-protocols")
 
         assert "assign" in supervisor_content
         assert "handoff" in supervisor_content
         assert "next_wait_slice_id" in supervisor_content
         assert "wait_slice_id=next_wait_slice_id" in supervisor_content
         assert "send_message" in supervisor_content
+        assert "15-minute reuse lease" in supervisor_content
+        assert "lifecycle reconciler retires the child automatically" in supervisor_content
+        assert "15-minute reuse lease" in loaded_supervisor_content
         assert "idle" in supervisor_content.lower()
         assert "next_wait_slice_id" in session_content
         assert "wait_slice_id=next_wait_slice_id" in session_content

@@ -55,6 +55,11 @@ from cli_agent_orchestrator.models.usage import UsageObservation
 
 logger = logging.getLogger(__name__)
 
+# An acknowledged reviewer remains available only long enough for the parent
+# to request the one policy-approved blocker rereview.  The deadline is
+# durable so restart and daemon reconciliation make the same decision.
+REVIEWER_REUSE_TTL_SECONDS = 15 * 60
+
 Base: Any = declarative_base()
 
 
@@ -810,6 +815,7 @@ class ChildAssignmentModel(Base):
     review_subject_revision_source = Column(String, nullable=True)
     review_subject_worktree = Column(String, nullable=True)
     review_superseded_at = Column(DateTime, nullable=True)
+    reviewer_reuse_expires_at = Column(DateTime, nullable=True)
     # Recovery must not wake a parent until the completed child has been
     # cleaned up.  Keep that receipt independent from Inbox delivery state.
     cleanup_acknowledged = Column(Boolean, nullable=False, default=False)
@@ -4059,6 +4065,7 @@ def _migrate_child_assignment_columns() -> bool:
                 "review_subject_revision_source VARCHAR, "
                 "review_subject_worktree VARCHAR, "
                 "review_superseded_at DATETIME, "
+                "reviewer_reuse_expires_at DATETIME, "
                 "cleanup_acknowledged BOOLEAN NOT NULL DEFAULT 0, "
                 "direct_result_output TEXT, "
                 "handoff_input_received BOOLEAN NOT NULL DEFAULT 0, "
@@ -4138,6 +4145,7 @@ def _migrate_child_assignment_columns() -> bool:
             "review_subject_revision_source": "VARCHAR",
             "review_subject_worktree": "VARCHAR",
             "review_superseded_at": "DATETIME",
+            "reviewer_reuse_expires_at": "DATETIME",
         }
         columns = {row[1] for row in conn.execute("PRAGMA table_info(child_assignments)")}
         for name, sql_type in additive_columns.items():
@@ -4195,6 +4203,17 @@ def _migrate_child_assignment_columns() -> bool:
                     + " AND ".join(nonreview_predicates)
                     + ")"
                 )
+            # Give rolling-upgrade reviewer acknowledgements the same bounded
+            # lease from their last durable transition.  Old rows therefore
+            # expire immediately instead of becoming immortal after upgrade.
+            conn.execute(
+                "UPDATE child_assignments "
+                "SET reviewer_reuse_expires_at = "
+                "datetime(COALESCE(updated_at, created_at), '+15 minutes') "
+                "WHERE reviewer_reuse_expires_at IS NULL "
+                "AND status = 'result_acknowledged' "
+                "AND review_subject_kind IS NOT NULL"
+            )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_child_assignments_child_terminal_id "
             "ON child_assignments(child_terminal_id)"
@@ -23396,6 +23415,8 @@ def _reviewer_reuse_window_open(
     db: Any,
     assignment: ChildAssignmentModel,
     terminal: TerminalModel,
+    *,
+    now: Optional[datetime] = None,
 ) -> bool:
     """Keep a current reviewer resident while its parent may request rereview.
 
@@ -23404,7 +23425,13 @@ def _reviewer_reuse_window_open(
     admit an owner-authorized correction; retiring the reviewer in either
     state would destroy the sole same-reviewer recovery path.
     """
-    if assignment.review_superseded_at is not None or not _terminal_is_reviewer(terminal):
+    observed_at = now or datetime.now()
+    if (
+        assignment.review_superseded_at is not None
+        or not _terminal_is_reviewer(terminal)
+        or assignment.reviewer_reuse_expires_at is None
+        or assignment.reviewer_reuse_expires_at <= observed_at
+    ):
         return False
     if assignment.review_scope_sha256 is not None:
         latest_for_scope = (
@@ -23783,6 +23810,9 @@ def claim_completed_child_retirement(
     _ensure_delegation_result_schema()
     _ensure_workflow_schema()
     with SessionLocal() as db:
+        # Serialize the eligibility snapshot with rereview registration. Both
+        # paths use BEGIN IMMEDIATE, so exactly one can claim this child.
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
         assignment = _latest_child_assignment(db, child_terminal_id)
         if assignment is None:
             return {"eligible": False, "error": "child_assignment_not_found"}
@@ -24834,6 +24864,21 @@ def _terminalize_child_after_authoritative_result(
     return True
 
 
+def _ensure_reviewer_reuse_deadline(
+    assignment: ChildAssignmentModel, result: DelegationResultModel
+) -> None:
+    """Start one non-extending reviewer lease at authoritative completion."""
+    if (
+        assignment.review_subject_kind is not None
+        and not assignment.status.startswith("handoff_")
+        and assignment.reviewer_reuse_expires_at is None
+    ):
+        completed_at = result.finalized_at or datetime.now()
+        assignment.reviewer_reuse_expires_at = completed_at + timedelta(
+            seconds=REVIEWER_REUSE_TTL_SECONDS
+        )
+
+
 def _handoff_requires_structured_result(db: Any, assignment: ChildAssignmentModel) -> bool:
     """Whether this handoff has the injected authenticated V1 capability."""
     terminal = db.query(TerminalModel).filter_by(id=assignment.child_terminal_id).first()
@@ -25130,6 +25175,7 @@ def _finalize_managed_delegation_result(
             db.query(DelegationResultModel).filter_by(child_assignment_id=assignment.id).first()
         )
         if result is not None and result.status == DelegationResultStatus.COMPLETE.value:
+            _ensure_reviewer_reuse_deadline(assignment, result)
             _terminalize_child_after_authoritative_result(
                 db, assignment.child_terminal_id, "repaired authoritative delegated result"
             )
@@ -25164,6 +25210,7 @@ def _finalize_managed_delegation_result(
     result_body = document.get("body_markdown") if isinstance(document, dict) else None
     if result.status != DelegationResultStatus.COMPLETE.value or not isinstance(result_body, str):
         return None, False, "RESULT_NOT_COMPLETE"
+    _ensure_reviewer_reuse_deadline(assignment, result)
     if not _terminalize_child_after_authoritative_result(
         db, assignment.child_terminal_id, "authoritative delegated result accepted"
     ):
@@ -25671,7 +25718,10 @@ def _register_child_attempt(
         ) or not _workspace_accepts_new_work(db, child_terminal_id):
             db.rollback()
             return False
-        if not _retirement_quiescence_allows_commit(db, parent_terminal_id):
+        if not _retirement_quiescence_allows_commit(
+            db, parent_terminal_id
+        ) or not _retirement_quiescence_allows_commit(db, child_terminal_id):
+            db.rollback()
             return False
         if workflow_effect_id is not None:
             exact_retry = (
@@ -25752,6 +25802,11 @@ def _register_child_attempt(
                 prior_result is None
                 or prior_result.status == DelegationResultStatus.AWAITING.value
                 or (prior_workflow is not None and prior_workflow.status == WORKFLOW_OPEN)
+            ):
+                db.rollback()
+                return False
+            if require_existing_reviewer_attempt and not _reviewer_reuse_window_open(
+                db, prior, cast(TerminalModel, child)
             ):
                 db.rollback()
                 return False
@@ -25887,7 +25942,9 @@ def _register_child_attempt(
                 },
             )
         _create_result_for_assignment(db, assignment, delegation_kind, workflow)
-        if not _retirement_quiescence_allows_commit(db, parent_terminal_id):
+        if not _retirement_quiescence_allows_commit(
+            db, parent_terminal_id
+        ) or not _retirement_quiescence_allows_commit(db, child_terminal_id):
             db.rollback()
             return False
         db.commit()
@@ -27899,12 +27956,24 @@ def acknowledge_child_assignment_result_outcome(
                 "assignment_status": assignment.status,
                 **canonical_identity,
             }
+        assigned_result = assignment.status == ChildAssignmentStatus.RESULT_DELIVERED.value
         assignment.status = (
             ChildAssignmentStatus.HANDOFF_RESULT_ACKNOWLEDGED.value
-            if assignment.status == ChildAssignmentStatus.HANDOFF_RESULT_DELIVERED.value
+            if not assigned_result
             else ChildAssignmentStatus.RESULT_ACKNOWLEDGED.value
         )
-        assignment.updated_at = datetime.now()
+        acknowledged_at = datetime.now()
+        if (
+            assigned_result
+            and assignment.review_subject_kind is not None
+            and assignment.reviewer_reuse_expires_at is None
+        ):
+            # Rolling compatibility for a result finalized before the expiry
+            # column existed. Never extend a deadline created at completion.
+            assignment.reviewer_reuse_expires_at = acknowledged_at + timedelta(
+                seconds=REVIEWER_REUSE_TTL_SECONDS
+            )
+        assignment.updated_at = acknowledged_at
         db.commit()
         return {
             "accepted": True,

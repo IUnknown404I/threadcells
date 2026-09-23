@@ -2208,6 +2208,43 @@ def test_issue_82_parent_owner_gate_does_not_strand_acknowledged_child(
         )
 
 
+def test_reviewer_expiry_reconciles_runtime_capacity_and_preserves_result(
+    resource_db, monkeypatch, mocker
+):
+    """An expired warm reviewer follows the ordinary exactly-once exit saga."""
+    parent, child = "parent-reviewer-expiry", "child-reviewer-expiry"
+    result_id = _acknowledged_child(parent, child, monkeypatch)
+    _issue_82_running_child(child, provider_lease=True)
+    with database.SessionLocal() as db:
+        terminal = db.get(TerminalModel, child)
+        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id=child).one()
+        terminal.agent_profile = "reviewer_sol_high"
+        assignment.review_subject_kind = "legacy_unscoped"
+        assignment.reviewer_reuse_expires_at = datetime.now()
+        db.commit()
+
+    mocker.patch.object(
+        inbox_service.terminal_service,
+        "get_terminal",
+        return_value={"id": child, "status": "completed", "lifecycle": "running"},
+    )
+    mocker.patch.object(inbox_service.terminal_service, "validate_managed_worktree_cleanup")
+    mocker.patch.object(inbox_service.terminal_service, "cleanup_managed_worktree")
+    exit_terminal = mocker.patch.object(
+        inbox_service.terminal_service, "exit_terminal", side_effect=_issue_82_exit
+    )
+
+    assert inbox_service.reconcile_completed_assigned_children(child) == 1
+    assert inbox_service.reconcile_completed_assigned_children(child) == 0
+    exit_terminal.assert_called_once_with(child)
+    with database.SessionLocal() as db:
+        assert db.get(TerminalModel, child).runtime_lifecycle == "exited"
+        assert db.get(ProviderExecutionLeaseModel, child) is None
+        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id=child).one()
+        assert assignment.retirement_completed_at is not None
+    assert get_delegation_result(result_id)["status"] == DelegationResultStatus.COMPLETE.value
+
+
 def test_issue_82_parallel_assigned_children_reconcile_independently_once(
     resource_db, monkeypatch, mocker
 ):

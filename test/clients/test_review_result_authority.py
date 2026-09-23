@@ -1198,6 +1198,55 @@ def test_block_acknowledge_preserves_same_reviewer_for_exact_correction(
     ] == ["reviewer"]
 
 
+def test_reviewer_reuse_lease_expires_and_retirement_fences_late_rereview(authority_db, tmp_path):
+    """The bounded lease releases capacity and retirement wins atomically."""
+    repo, revision = _repository(tmp_path)
+    with database.SessionLocal() as db:
+        db.add(_reviewer("reviewer", repo, revision))
+        db.commit()
+
+    _start_review("parent", "reviewer", "Review exact revision")
+    result = _submit_result("parent", "reviewer", "BLOCK")
+    parent_turn = activate_workflow_turn_for_inbox(result["notice_id"])
+    assert isinstance(parent_turn, int)
+    assert mark_workflow_turn_sent_for_inbox(result["notice_id"])
+    assert claim_workflow_turn_receipt("parent", parent_turn)
+    assert acknowledge_child_assignment_result_outcome("parent", result_id=result["result_id"])[
+        "accepted"
+    ]
+
+    with database.SessionLocal() as db:
+        assignment = db.query(ChildAssignmentModel).filter_by(child_terminal_id="reviewer").one()
+        assert assignment.reviewer_reuse_expires_at is not None
+        assignment.reviewer_reuse_expires_at = datetime.now() - timedelta(seconds=1)
+        db.commit()
+
+    assert [
+        candidate["child_terminal_id"]
+        for candidate in list_completed_assigned_child_retirement_candidates()
+    ] == ["reviewer"]
+    retirement = database.claim_completed_assigned_child_retirement("parent", "reviewer")
+    assert retirement["eligible"] is True
+
+    request = "Late rereview must not cross retirement"
+    effect = claim_workflow_effect("parent", parent_turn, "assign", request)
+    assert effect is not None
+    assert not register_child_assignment(
+        "parent",
+        "reviewer",
+        workflow_turn_id=parent_turn,
+        workflow_effect_id=effect["id"],
+        request_message=request,
+        require_existing_reviewer_attempt=True,
+        requested_review_revision=revision,
+    )
+
+    with database.SessionLocal() as db:
+        attempts = db.query(ChildAssignmentModel).filter_by(child_terminal_id="reviewer").all()
+        assert len(attempts) == 1
+        assert attempts[0].retirement_claim_token == retirement["claim_token"]
+
+
 def test_resumed_reviewer_callback_preserves_exact_attempt_authority(authority_db, tmp_path):
     """A one-use execution resume remains inside the immutable review attempt."""
     repo, revision = _repository(tmp_path)
@@ -1770,8 +1819,15 @@ def test_legacy_unique_child_schema_migrates_without_fabricating_revision(monkey
         )
         conn.execute(
             "INSERT INTO child_assignments "
-            "(parent_terminal_id, child_terminal_id, status) VALUES (?, ?, ?)",
-            ("parent", "reviewer", "result_delivered"),
+            "(parent_terminal_id, child_terminal_id, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                "parent",
+                "reviewer",
+                "result_acknowledged",
+                "2026-09-21 12:00:00",
+                "2026-09-21 12:00:00",
+            ),
         )
     monkeypatch.setattr("cli_agent_orchestrator.constants.DATABASE_FILE", database_file)
 
@@ -1779,12 +1835,17 @@ def test_legacy_unique_child_schema_migrates_without_fabricating_revision(monkey
     with sqlite3.connect(database_file) as conn:
         migrated = conn.execute(
             "SELECT attempt_id, review_subject_kind, review_subject_revision, "
-            "review_subject_revision_source "
+            "review_subject_revision_source, reviewer_reuse_expires_at "
             "FROM child_assignments"
         ).fetchone()
         assert migrated is not None
         assert migrated[0]
-        assert migrated[1:] == ("legacy_unscoped", None, None)
+        assert migrated[1:] == (
+            "legacy_unscoped",
+            None,
+            None,
+            "2026-09-21 12:15:00",
+        )
         # A pre-upgrade process does not know about attempt_id.  Its write
         # must remain possible after the new process has rebuilt the shared
         # table; the database supplies identity, while the absent review
@@ -1830,3 +1891,4 @@ def test_current_child_schema_adds_explicit_revision_provenance(monkeypatch, tmp
     with sqlite3.connect(database_file) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(child_assignments)")}
         assert "review_subject_revision_source" in columns
+        assert "reviewer_reuse_expires_at" in columns

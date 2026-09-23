@@ -9300,6 +9300,146 @@ def test_f14_complete_workflow_retries_after_inbox_ack(workflow_db, monkeypatch)
     assert get_workflow_status(parent) == "terminal"
 
 
+def test_f14_assigned_completion_and_new_descendant_have_one_atomic_winner(
+    workflow_db, monkeypatch
+):
+    """A descendant admitted after the fast read still fences all completion state."""
+    root, child, grandchild = (
+        "root-completion-race",
+        "child-completion-race",
+        "grandchild-completion-race",
+    )
+    child_turn = _start_admitted_input(child)
+    assert register_child_assignment(root, child)
+    monkeypatch.setenv("CAO_TERMINAL_ID", child)
+
+    # Freeze completion immediately after the old advisory zero-barrier read,
+    # then let descendant admission win its own BEGIN IMMEDIATE transaction.
+    # The finalizer must revalidate under the same writer transaction as every
+    # result/lifecycle/notice mutation.
+    zero_read = Barrier(2)
+    descendant_committed = Barrier(2)
+    original_barrier = mcp_server.get_parent_completion_barrier
+
+    def interleaved_barrier(terminal_id):
+        observed = original_barrier(terminal_id)
+        if terminal_id == child:
+            zero_read.wait(timeout=10)
+            descendant_committed.wait(timeout=10)
+        return observed
+
+    monkeypatch.setattr(mcp_server, "get_parent_completion_barrier", interleaved_barrier)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        completion = executor.submit(
+            lambda: asyncio.run(mcp_server.complete_workflow(child_turn, "child final"))
+        )
+        zero_read.wait(timeout=10)
+        assert register_child_assignment(child, grandchild)
+        descendant_committed.wait(timeout=10)
+        blocked = completion.result(timeout=10)
+
+    assert blocked == {
+        "success": False,
+        "terminal_id": child,
+        "status": "open",
+        "retryable": True,
+        "error": "active child completion barrier",
+        "active_children": 1,
+        "failed_children": 0,
+    }
+    with database.SessionLocal() as db:
+        child_assignment = (
+            db.query(database.ChildAssignmentModel)
+            .filter_by(parent_terminal_id=root, child_terminal_id=child)
+            .one()
+        )
+        child_result = (
+            db.query(database.DelegationResultModel)
+            .filter_by(child_assignment_id=child_assignment.id)
+            .one()
+        )
+        child_workflow = db.query(WorkflowModel).filter_by(root_terminal_id=child).one()
+        lifecycle = db.get(database.ManagedAttemptLifecycleModel, child_assignment.id)
+        assert child_result.status == "awaiting"
+        assert child_assignment.result_message_id is None
+        assert child_workflow.status == "open"
+        assert lifecycle is not None and lifecycle.state != "completed"
+        assert (
+            db.query(WorkflowEffectModel)
+            .filter_by(workflow_turn_id=child_turn, effect_kind="complete_workflow")
+            .one()
+            .state
+            == "not_admitted"
+        )
+        assert db.query(InboxModel).filter(InboxModel.result_id == child_result.id).count() == 0
+
+    # Reopen the same SQLite file as a process-restart simulation. The exact
+    # not-admitted effect remains reclaimable, while the durable descendant
+    # barrier still prevents any success artifact from appearing.
+    database_url = str(workflow_db.url)
+    workflow_db.dispose()
+    restart_engine = create_engine(
+        database_url,
+        connect_args={"check_same_thread": False, "timeout": 30},
+    )
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=restart_engine))
+    assert get_parent_completion_barrier(child) == (1, 0)
+    with database.SessionLocal() as db:
+        assert db.query(WorkflowModel).filter_by(root_terminal_id=child).one().status == "open"
+        restarted_assignment = (
+            db.query(database.ChildAssignmentModel)
+            .filter_by(parent_terminal_id=root, child_terminal_id=child)
+            .one()
+        )
+        assert (
+            db.query(database.DelegationResultModel)
+            .filter_by(child_assignment_id=restarted_assignment.id)
+            .one()
+            .status
+            == "awaiting"
+        )
+
+    grandchild_turn = _start_admitted_input(grandchild)
+    grandchild_effect = claim_workflow_effect(
+        grandchild, grandchild_turn, "complete_workflow", "grandchild final"
+    )
+    assert grandchild_effect is not None
+    grandchild_notice, duplicate = database.create_assigned_child_completion_result_message(
+        grandchild,
+        "grandchild final",
+        grandchild_effect["id"],
+        grandchild_turn,
+    )
+    assert grandchild_notice is not None and duplicate is False
+    assert mark_child_assignment_result_delivered(grandchild_notice.id)
+    assert acknowledge_child_assignment_result(child, grandchild, grandchild_notice.result_id)
+
+    monkeypatch.setattr(mcp_server, "get_parent_completion_barrier", original_barrier)
+    monkeypatch.setenv("CAO_TERMINAL_ID", child)
+    with patch.object(mcp_server.inbox_service, "check_and_send_pending_messages"):
+        completed = asyncio.run(mcp_server.complete_workflow(child_turn, "child final"))
+    assert completed["success"] is True
+    with pytest.raises(ValueError, match="parent workflow is not open"):
+        register_child_assignment(child, "too-late-descendant")
+
+    with database.SessionLocal() as db:
+        child_assignment = (
+            db.query(database.ChildAssignmentModel)
+            .filter_by(parent_terminal_id=root, child_terminal_id=child)
+            .one()
+        )
+        child_result = (
+            db.query(database.DelegationResultModel)
+            .filter_by(child_assignment_id=child_assignment.id)
+            .one()
+        )
+        assert child_result.status == "complete"
+        assert child_assignment.result_message_id is not None
+        assert db.query(InboxModel).filter(InboxModel.result_id == child_result.id).count() == 1
+        assert db.query(WorkflowModel).filter_by(root_terminal_id=child).one().status == "terminal"
+    restart_engine.dispose()
+
+
 def test_acknowledgement_mcp_preserves_durable_replay_reason(workflow_db, monkeypatch):
     parent, child = "parent-ack-reason", "child-ack-reason"
     first_turn = start_workflow_input(parent)

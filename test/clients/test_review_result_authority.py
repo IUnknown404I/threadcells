@@ -1007,9 +1007,52 @@ def test_mcp_assign_reuses_same_reviewer_with_exact_new_attempt_and_ack(
     with (
         patch.object(mcp_server, "_fence_privileged_runtime"),
         patch.object(mcp_server.inbox_service, "check_and_send_pending_messages"),
+        patch.object(
+            mcp_server,
+            "_send_to_inbox",
+            return_value={"success": True, "message_id": 9001},
+        ) as ordinary_send,
     ):
-        submitted = asyncio.run(mcp_server.send_message(child_turn_id, "parent", "PASS revision B"))
-    assert submitted["success"] is True
+        progress = asyncio.run(
+            mcp_server.send_message(child_turn_id, "parent", "Review complete; finalizing now")
+        )
+        with database.SessionLocal() as db:
+            current_attempt = (
+                db.query(ChildAssignmentModel)
+                .filter_by(child_terminal_id="reviewer")
+                .order_by(ChildAssignmentModel.id.desc())
+                .first()
+            )
+            assert current_attempt is not None
+            current_result = (
+                db.query(database.DelegationResultModel)
+                .filter_by(child_assignment_id=current_attempt.id)
+                .one()
+            )
+            assert current_result.status == "awaiting"
+            assert current_attempt.result_message_id is None
+        completed = asyncio.run(mcp_server.complete_workflow(child_turn_id, "PASS revision B"))
+
+    assert progress["success"] is True
+    ordinary_send.assert_called_once()
+    assert completed["success"] is True
+    with database.SessionLocal() as db:
+        current_attempt = (
+            db.query(ChildAssignmentModel)
+            .filter_by(child_terminal_id="reviewer")
+            .order_by(ChildAssignmentModel.id.desc())
+            .first()
+        )
+        assert current_attempt is not None and current_attempt.result_message_id is not None
+        current_result = (
+            db.query(database.DelegationResultModel)
+            .filter_by(child_assignment_id=current_attempt.id)
+            .one()
+        )
+        submitted = {
+            "message_id": current_attempt.result_message_id,
+            "result_id": current_result.id,
+        }
     assert submitted["result_id"] != result_a["result_id"]
     assert activate_workflow_turn_for_inbox(submitted["message_id"]) is not None
     assert mark_workflow_turn_sent_for_inbox(submitted["message_id"])

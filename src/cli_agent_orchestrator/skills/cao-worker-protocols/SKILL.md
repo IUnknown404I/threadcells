@@ -30,9 +30,10 @@ When the task came through `assign`, the task message should include a callback 
 
 1. Extract the callback terminal ID from the task message.
 2. Format the result clearly and concisely.
-3. Call `send_message(receiver_id=..., message=...)` with the completed result.
+3. Call `complete_workflow(reason=...)` with the completed result. This explicit
+   terminal effect creates and delivers the assignment's canonical result.
 
-Do not stop after writing a normal response if the assignment explicitly requires a callback. The requesting terminal depends on `send_message` to receive the result.
+Do not stop after writing a normal response if the assignment explicitly requires a callback. The requesting terminal depends on the canonical assigned-result notice. `send_message` is only ordinary progress or coordination and never finalizes an assignment.
 
 Assigned tasks may include callback instructions directly in the main message or in an appended suffix such as `[Assigned by terminal ...]`. Treat that callback terminal ID as authoritative.
 
@@ -46,7 +47,7 @@ Return results that are easy for the supervisor to merge into a larger workflow:
 - Include the requested output or deliverable
 - Keep the message specific enough to act on without re-reading the whole task
 
-If the task asks for progress updates, use `send_message` for those updates too. Otherwise prefer one final callback with the completed deliverable.
+If the task asks for progress updates, use `send_message` for those updates too. Submit the final deliverable once through `complete_workflow`.
 
 ## Filesystem and Reporting Discipline
 
@@ -62,7 +63,8 @@ the repository-local task-prompt efficiency policy.
 ## Reliability Guidelines
 
 - Parse the callback terminal ID before you start expensive work.
-- If `send_message` is available and the task requires a callback, call it directly rather than ending with prose alone.
+- Use `complete_workflow` exactly once for the final assigned report. Use
+  `send_message` only for non-final progress or coordination.
 - Keep callback messages structured so the supervisor can merge them into a larger workflow.
 - For handoff tasks, return the completed output directly and let the orchestrator handle delivery.
 
@@ -113,8 +115,8 @@ work.
 
 ## Durable result artifacts
 
-Your first assigned `send_message` callback is recorded as one immutable
-delegation result. Send the final structured report once; a transport retry may
+Your assigned `complete_workflow` callback is recorded as one immutable
+delegation result. Submit the final structured report once; a transport retry may
 repeat it safely, but do not send a changed replacement after completion. For a
 handoff, return the final report normally: CAO records it only after its stable
 final-output validation succeeds. The supervisor reads the resulting `result_id`

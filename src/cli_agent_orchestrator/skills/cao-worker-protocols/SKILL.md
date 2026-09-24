@@ -65,6 +65,9 @@ the repository-local task-prompt efficiency policy.
 - Parse the callback terminal ID before you start expensive work.
 - Use `complete_workflow` exactly once for the final assigned report. Use
   `send_message` only for non-final progress or coordination.
+- A parent follow-up received while the assigned result is unfinished retains
+  the existing assignment authority. Continue that same task and finalize its
+  canonical result; do not create or name a replacement result.
 - Keep callback messages structured so the supervisor can merge them into a larger workflow.
 - For handoff tasks, return the completed output directly and let the orchestrator handle delivery.
 

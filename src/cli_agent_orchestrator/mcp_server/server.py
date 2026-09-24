@@ -68,6 +68,7 @@ from cli_agent_orchestrator.clients.database import (
     reserve_completed_assigned_child_retirement_exit,
     revalidate_completed_assigned_child_retirement,
     revalidate_historical_assigned_child_retirement,
+    schedule_assigned_child_continuation,
     schedule_managed_handoff_continuation,
     set_workflow_terminal_state,
     terminal_has_critical_owner_authority,
@@ -2505,6 +2506,41 @@ def _send_message_impl(
             # Generic messages use the HTTP API below, whose persistence
             # boundary owns this same cross-process fence.
             with workflow_execution_admission_fence():
+                assigned_continuation = schedule_assigned_child_continuation(
+                    sender_id,
+                    receiver_id,
+                    message,
+                    workflow_effect_id=effect["id"],
+                    workflow_turn_id=logical_turn_id,
+                )
+                if assigned_continuation.get("managed"):
+                    if not assigned_continuation.get("accepted"):
+                        return {
+                            "success": False,
+                            "reason_code": assigned_continuation["reason_code"],
+                            "error": "assigned child continuation was not admitted",
+                        }
+                    scheduled_message = assigned_continuation.get("message")
+                    if scheduled_message is not None:
+                        try:
+                            inbox_service.check_and_send_pending_messages(receiver_id)
+                        except Exception as exc:
+                            logger.warning(
+                                "Immediate assigned continuation delivery failed: %s", exc
+                            )
+                    return {
+                        "success": True,
+                        "duplicate": bool(assigned_continuation.get("duplicate")),
+                        "message_id": (
+                            scheduled_message.id if scheduled_message is not None else None
+                        ),
+                        "sender_id": sender_id,
+                        "receiver_id": receiver_id,
+                        "logical_turn_id": assigned_continuation["turn_id"],
+                        "assignment_id": assigned_continuation["assignment_id"],
+                        "result_id": assigned_continuation["result_id"],
+                        "assigned_child_continuation": True,
+                    }
                 continuation = schedule_managed_handoff_continuation(
                     sender_id, receiver_id, message
                 )

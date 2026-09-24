@@ -86,15 +86,17 @@ class TestSendMessageSenderIdInjection:
 
 
 @patch("cli_agent_orchestrator.mcp_server.server.inbox_service.check_and_send_pending_messages")
+@patch("cli_agent_orchestrator.mcp_server.server.schedule_assigned_child_continuation")
 @patch("cli_agent_orchestrator.mcp_server.server.schedule_managed_handoff_continuation")
 @patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
 def test_managed_same_child_send_schedules_admitted_continuation_before_delivery(
-    mock_schedule, mock_deliver
+    mock_schedule, mock_assigned, mock_deliver
 ):
     """A parent continuation cannot fall through to the Inbox-only send path."""
     from cli_agent_orchestrator.mcp_server.server import _send_message_impl
 
     message = MagicMock(id=91)
+    mock_assigned.return_value = {"managed": False}
     mock_schedule.return_value = {
         "managed": True,
         "accepted": True,
@@ -117,4 +119,50 @@ def test_managed_same_child_send_schedules_admitted_continuation_before_delivery
         "receiver_id": "child",
         "logical_turn_id": 92,
         "managed_handoff_continuation": True,
+    }
+
+
+@patch("cli_agent_orchestrator.mcp_server.server.inbox_service.check_and_send_pending_messages")
+@patch("cli_agent_orchestrator.mcp_server.server.schedule_managed_handoff_continuation")
+@patch("cli_agent_orchestrator.mcp_server.server.schedule_assigned_child_continuation")
+@patch("cli_agent_orchestrator.mcp_server.server.ENABLE_SENDER_ID_INJECTION", False)
+def test_assigned_followup_dispatches_exact_bound_continuation(
+    mock_assigned, mock_handoff, mock_deliver
+):
+    from cli_agent_orchestrator.mcp_server.server import _send_message_impl
+
+    message = MagicMock(id=101)
+    mock_assigned.return_value = {
+        "managed": True,
+        "accepted": True,
+        "duplicate": False,
+        "assignment_id": 773,
+        "result_id": "canonical-result",
+        "turn_id": 103,
+        "message": message,
+    }
+    effect = {"id": 99}
+
+    with patch.dict(os.environ, {"CAO_TERMINAL_ID": "parent"}):
+        result = _send_message_impl("child", "continue exact assignment", effect, 97)
+
+    mock_assigned.assert_called_once_with(
+        "parent",
+        "child",
+        "continue exact assignment",
+        workflow_effect_id=99,
+        workflow_turn_id=97,
+    )
+    mock_handoff.assert_not_called()
+    mock_deliver.assert_called_once_with("child")
+    assert result == {
+        "success": True,
+        "duplicate": False,
+        "message_id": 101,
+        "sender_id": "parent",
+        "receiver_id": "child",
+        "logical_turn_id": 103,
+        "assignment_id": 773,
+        "result_id": "canonical-result",
+        "assigned_child_continuation": True,
     }

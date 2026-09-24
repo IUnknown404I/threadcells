@@ -48,9 +48,11 @@ from cli_agent_orchestrator.clients.database import (
     claim_workflow_effect,
     claim_workflow_turn,
     claim_workflow_turn_receipt,
+    create_assigned_child_completion_result_message,
     create_child_assignment_result_message,
     create_handoff_child_result_message,
     create_inbox_message,
+    ensure_workflow_turn_for_inbox,
     finish_workflow_effect,
     get_delegation_result_for_assignment,
     get_handoff_child_result_message,
@@ -78,6 +80,7 @@ from cli_agent_orchestrator.clients.database import (
     requeue_unadmitted_workflow_turns_for_restart,
     requeue_workflow_turn,
     resolve_workflow_input_binding,
+    schedule_assigned_child_continuation,
     schedule_managed_handoff_continuation,
     set_workflow_terminal_state,
     start_workflow_input,
@@ -9037,6 +9040,319 @@ def test_f14_restart_after_assigned_completion_before_wake_recovers_one_parent_t
 
     monkeypatch.setenv("CAO_TERMINAL_ID", parent)
     assert asyncio.run(mcp_server.claim_workflow_turn_receipt(parent_turn))["accepted"] is True
+
+
+def test_assigned_followup_retains_result_authority_through_final_delivery_and_restart(
+    workflow_db, monkeypatch
+):
+    """The incident sequence finalizes the precreated result and advances its parent."""
+    parent, child = "parent-assigned-followup", "child-assigned-followup"
+    parent_turn = _start_admitted_input(parent)
+    request = claim_workflow_effect(parent, parent_turn, "assign", child)
+    assert request is not None
+    _ensure_running_test_terminal(child)
+    assert register_child_assignment(
+        parent,
+        child,
+        workflow_turn_id=parent_turn,
+        workflow_effect_id=request["id"],
+        request_message="complete the assigned contour",
+    )
+    binding = issue_workflow_input_binding(
+        child,
+        "complete the assigned contour",
+        child_assignment_workflow_effect_id=request["id"],
+    )
+    assert binding is not None
+    child_turn = resolve_workflow_input_binding(child, binding)
+    assert child_turn is not None
+    assert bind_child_assignment_input_turn(child, binding)
+    assert claim_workflow_turn_receipt(child, child_turn)
+    assert finish_workflow_effect(parent, request["id"], request["claim_token"], "completed")
+    with database.SessionLocal() as db:
+        assignment = (
+            db.query(database.ChildAssignmentModel)
+            .filter_by(parent_terminal_id=parent, child_terminal_id=child)
+            .one()
+        )
+        canonical = (
+            db.query(database.DelegationResultModel)
+            .filter_by(child_assignment_id=assignment.id)
+            .one()
+        )
+        assignment_id, canonical_result_id = assignment.id, canonical.id
+
+    # The child's progress report is an ordinary message, not result authority.
+    progress = create_inbox_message(child, parent, "intermediate report only")
+    progress_turn = ensure_workflow_turn_for_inbox(progress.id)
+    assert progress_turn is not None
+    assert activate_workflow_turn_for_inbox(progress.id) == progress_turn
+    assert mark_workflow_turn_sent_for_inbox(progress.id)
+    assert database.update_pending_message_status(progress.id, database.MessageStatus.DELIVERED)
+    assert claim_workflow_turn_receipt(parent, progress_turn)
+    with database.SessionLocal() as db:
+        assert db.get(InboxModel, progress.id).kind == "message"
+        assert db.get(database.DelegationResultModel, canonical_result_id).status == "awaiting"
+
+    # Provider final creates the same-workflow system continuation. It now
+    # remains a proven descendant of the assignment instead of losing it.
+    open_final = observe_workflow_final(child)
+    assert isinstance(open_final, int)
+    open_final_claim = claim_workflow_turn(child)
+    assert open_final_claim is not None and open_final_claim["id"] == open_final
+    assert activate_workflow_turn(child, open_final)
+    assert mark_workflow_turn_sent(
+        open_final,
+        open_final_claim["claim_token"],
+        open_final_claim["claim_generation"],
+    )
+    assert claim_workflow_turn_receipt(child, open_final)
+
+    followup_effect = claim_workflow_effect(
+        parent, progress_turn, "send_message", "finish the original assignment"
+    )
+    assert followup_effect is not None
+    scheduled = schedule_assigned_child_continuation(
+        parent,
+        child,
+        "finish the original assignment",
+        workflow_effect_id=followup_effect["id"],
+        workflow_turn_id=progress_turn,
+    )
+    assert scheduled["accepted"] is True
+    assert scheduled["assignment_id"] == assignment_id
+    assert scheduled["result_id"] == canonical_result_id
+    followup_turn = scheduled["turn_id"]
+
+    # Lost response plus process restart returns the same durable continuation.
+    workflow_db.dispose()
+    replay = schedule_assigned_child_continuation(
+        parent,
+        child,
+        "finish the original assignment",
+        workflow_effect_id=followup_effect["id"],
+        workflow_turn_id=progress_turn,
+    )
+    assert replay["accepted"] is True and replay["duplicate"] is True
+    assert replay["turn_id"] == followup_turn
+    assert finish_workflow_effect(
+        parent,
+        followup_effect["id"],
+        followup_effect["claim_token"],
+        "completed",
+    )
+
+    assert observe_workflow_final(child) is not None
+    followup_claim = claim_workflow_turn(child, inbox_message_id=scheduled["message"].id)
+    assert followup_claim is not None and followup_claim["id"] == followup_turn
+    assert activate_workflow_turn(child, followup_turn)
+    assert mark_workflow_turn_sent(
+        followup_turn,
+        followup_claim["claim_token"],
+        followup_claim["claim_generation"],
+    )
+    assert database.update_pending_message_status(
+        scheduled["message"].id, database.MessageStatus.DELIVERED
+    )
+    assert claim_workflow_turn_receipt(child, followup_turn)
+
+    monkeypatch.setenv("CAO_TERMINAL_ID", child)
+    with (
+        patch.object(mcp_server.inbox_service, "check_and_send_pending_messages"),
+        patch.object(mcp_server.inbox_service, "wake_provider_execution_queue"),
+    ):
+        completed = asyncio.run(
+            mcp_server.complete_workflow(followup_turn, "final assigned result")
+        )
+    assert completed["success"] is True
+
+    result = database.get_delegation_result(canonical_result_id)
+    assert result is not None
+    assert result["status"] == "complete"
+    assert result["authorship"] == "child_workflow_completion"
+    assert result["document"]["body_markdown"] == "final assigned result"
+    with database.SessionLocal() as db:
+        assignment = db.get(database.ChildAssignmentModel, assignment_id)
+        assert assignment.result_message_id is not None
+        result_notice = db.get(InboxModel, assignment.result_message_id)
+        assert result_notice.result_id == canonical_result_id
+        assert (
+            db.query(database.DelegationResultModel)
+            .filter_by(child_assignment_id=assignment_id)
+            .count()
+            == 1
+        )
+        bound = db.get(WorkflowTurnModel, followup_turn)
+        assert bound.child_assignment_id == assignment_id
+        assert bound.assignment_predecessor_turn_id == open_final
+        assert bound.continuation_parent_effect_id == followup_effect["id"]
+        assert (
+            db.query(database.DelegationResultEventModel)
+            .filter_by(
+                result_id=canonical_result_id,
+                workflow_turn_id=followup_turn,
+                event_type="completed",
+            )
+            .count()
+            == 1
+        )
+
+    result_turn = database.get_workflow_turn_for_inbox(result_notice.id)["turn_id"]
+    assert activate_workflow_turn_for_inbox(result_notice.id) == result_turn
+    assert mark_workflow_turn_sent_for_inbox(result_notice.id)
+    assert database.update_pending_message_status(
+        result_notice.id, database.MessageStatus.DELIVERED
+    )
+    assert mark_child_assignment_result_delivered(result_notice.id)
+    assert claim_workflow_turn_receipt(parent, result_turn)
+    monkeypatch.setenv("CAO_TERMINAL_ID", parent)
+    read = asyncio.run(mcp_server.read_delegation_result(result_turn, canonical_result_id))
+    assert read["success"] is True
+    acknowledged = asyncio.run(
+        mcp_server.acknowledge_assigned_result(
+            result_turn,
+            child_terminal_id=child,
+            result_id=canonical_result_id,
+        )
+    )
+    assert acknowledged["success"] is True
+    successor = observe_workflow_final(parent)
+    assert isinstance(successor, int) and successor > result_turn
+
+    # A normal message after finalization is not rebound to the old result.
+    successor_claim = claim_workflow_turn(parent)
+    assert successor_claim is not None and successor_claim["id"] == successor
+    assert activate_workflow_turn(parent, successor)
+    assert mark_workflow_turn_sent(
+        successor,
+        successor_claim["claim_token"],
+        successor_claim["claim_generation"],
+    )
+    assert claim_workflow_turn_receipt(parent, successor)
+    ordinary_effect = claim_workflow_effect(
+        parent, successor, "send_message", "ordinary post-result note"
+    )
+    assert ordinary_effect is not None
+    ordinary = schedule_assigned_child_continuation(
+        parent,
+        child,
+        "ordinary post-result note",
+        workflow_effect_id=ordinary_effect["id"],
+        workflow_turn_id=successor,
+    )
+    assert ordinary == {"managed": False}
+    assert finish_workflow_effect(
+        parent,
+        ordinary_effect["id"],
+        ordinary_effect["claim_token"],
+        "completed",
+    )
+
+    # A later assignment receives its own result and continuation authority;
+    # the finalized artifact is never selected again.
+    second_child = f"{child}-second"
+    _ensure_running_test_terminal(second_child)
+    new_request = claim_workflow_effect(parent, successor, "assign", second_child)
+    assert new_request is not None
+    assert register_child_assignment(
+        parent,
+        second_child,
+        workflow_turn_id=successor,
+        workflow_effect_id=new_request["id"],
+        request_message="second independent assignment",
+    )
+    second_binding = issue_workflow_input_binding(
+        second_child,
+        "second independent assignment",
+        child_assignment_workflow_effect_id=new_request["id"],
+    )
+    assert second_binding is not None
+    second_child_turn = resolve_workflow_input_binding(second_child, second_binding)
+    assert second_child_turn is not None
+    assert bind_child_assignment_input_turn(second_child, second_binding)
+    assert claim_workflow_turn_receipt(second_child, second_child_turn)
+    assert finish_workflow_effect(
+        parent,
+        new_request["id"],
+        new_request["claim_token"],
+        "completed",
+    )
+    second_followup_effect = claim_workflow_effect(
+        parent, successor, "send_message", "second assignment follow-up"
+    )
+    assert second_followup_effect is not None
+    second_followup = schedule_assigned_child_continuation(
+        parent,
+        second_child,
+        "second assignment follow-up",
+        workflow_effect_id=second_followup_effect["id"],
+        workflow_turn_id=successor,
+    )
+    assert second_followup["accepted"] is True
+    assert second_followup["assignment_id"] != assignment_id
+    assert second_followup["result_id"] != canonical_result_id
+    assert database.get_delegation_result(canonical_result_id)["status"] == "complete"
+
+
+def test_assigned_followup_rejects_ambiguous_active_relation_without_writes(workflow_db):
+    parent, child = "parent-ambiguous-followup", "child-ambiguous-followup"
+    parent_turn = _start_admitted_input(parent)
+    request = claim_workflow_effect(parent, parent_turn, "assign", child)
+    assert request is not None
+    _ensure_running_test_terminal(child)
+    assert register_child_assignment(
+        parent,
+        child,
+        workflow_turn_id=parent_turn,
+        workflow_effect_id=request["id"],
+        request_message="first assignment",
+    )
+    binding = issue_workflow_input_binding(
+        child,
+        "first assignment",
+        child_assignment_workflow_effect_id=request["id"],
+    )
+    assert binding is not None
+    child_turn = resolve_workflow_input_binding(child, binding)
+    assert child_turn is not None
+    assert bind_child_assignment_input_turn(child, binding)
+    assert claim_workflow_turn_receipt(child, child_turn)
+    assert finish_workflow_effect(parent, request["id"], request["claim_token"], "completed")
+
+    # Simulate a pre-fix ambiguous durable state. The correction must report
+    # it, never choose the highest assignment ID or create a continuation.
+    with database.SessionLocal() as db:
+        parent_workflow = db.query(WorkflowModel).filter_by(root_terminal_id=parent).one()
+        duplicate = database.ChildAssignmentModel(
+            parent_terminal_id=parent,
+            child_terminal_id=child,
+            status=database.ChildAssignmentStatus.AWAITING_RESULT.value,
+            attempt_id="ambiguous-second-attempt",
+        )
+        db.add(duplicate)
+        db.flush()
+        database._create_result_for_assignment(db, duplicate, "assign", parent_workflow)
+        db.commit()
+
+    followup_effect = claim_workflow_effect(
+        parent, parent_turn, "send_message", "ambiguous follow-up"
+    )
+    assert followup_effect is not None
+    rejected = schedule_assigned_child_continuation(
+        parent,
+        child,
+        "ambiguous follow-up",
+        workflow_effect_id=followup_effect["id"],
+        workflow_turn_id=parent_turn,
+    )
+    assert rejected == {
+        "managed": True,
+        "accepted": False,
+        "reason_code": "ASSIGNED_CONTINUATION_AMBIGUOUS",
+    }
+    with database.SessionLocal() as db:
+        assert db.query(InboxModel).filter_by(kind="assigned_followup_continuation").count() == 0
+        assert db.query(WorkflowTurnModel).filter_by(kind="assigned_followup").count() == 0
 
 
 def test_f13_historical_receipt_cannot_be_borrowed_by_a_later_model_turn(workflow_db, monkeypatch):

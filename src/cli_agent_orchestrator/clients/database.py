@@ -1113,6 +1113,12 @@ class WorkflowTurnModel(Base):
     payload = Column(String, nullable=True)
     state = Column(String, nullable=False, default="queued")
     inbox_message_id = Column(Integer, nullable=True, unique=True)
+    # Parent follow-ups for an unfinished assigned child retain their exact
+    # delegation authority on the provider turn itself.  These are audit and
+    # authorization links, not hints inferred from the message payload.
+    child_assignment_id = Column(Integer, nullable=True, index=True)
+    assignment_predecessor_turn_id = Column(Integer, nullable=True, index=True)
+    continuation_parent_effect_id = Column(Integer, nullable=True, unique=True)
     attempt_count = Column(Integer, nullable=False, default=0)
     not_before = Column(DateTime, nullable=True)
     # The stable reason an executable turn is waiting before provider
@@ -3357,6 +3363,16 @@ def _migrate_workflow_turn_columns() -> None:
             )
         if "resume_parent_turn_id" not in columns:
             conn.execute("ALTER TABLE workflow_turns ADD COLUMN resume_parent_turn_id INTEGER")
+        if "child_assignment_id" not in columns:
+            conn.execute("ALTER TABLE workflow_turns ADD COLUMN child_assignment_id INTEGER")
+        if "assignment_predecessor_turn_id" not in columns:
+            conn.execute(
+                "ALTER TABLE workflow_turns ADD COLUMN assignment_predecessor_turn_id INTEGER"
+            )
+        if "continuation_parent_effect_id" not in columns:
+            conn.execute(
+                "ALTER TABLE workflow_turns ADD COLUMN continuation_parent_effect_id INTEGER"
+            )
         if "superseded_by_turn_id" not in columns:
             conn.execute("ALTER TABLE workflow_turns ADD COLUMN superseded_by_turn_id INTEGER")
         if "superseded_at" not in columns:
@@ -3364,6 +3380,19 @@ def _migrate_workflow_turn_columns() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS ix_workflow_turns_superseded_by_turn_id "
             "ON workflow_turns(superseded_by_turn_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_workflow_turns_child_assignment_id "
+            "ON workflow_turns(child_assignment_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_workflow_turns_assignment_predecessor_turn_id "
+            "ON workflow_turns(assignment_predecessor_turn_id)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_workflow_turns_continuation_parent_effect_id "
+            "ON workflow_turns(continuation_parent_effect_id) "
+            "WHERE continuation_parent_effect_id IS NOT NULL"
         )
         if {"root_terminal_id", "status", "id"}.issubset(workflow_columns):
             conn.execute(
@@ -13640,6 +13669,287 @@ def ensure_workflow_turn_for_inbox(message_id: int) -> Optional[int]:
         return cast(int, turn.id)
 
 
+def schedule_assigned_child_continuation(
+    parent_terminal_id: str,
+    child_terminal_id: str,
+    message: str,
+    *,
+    workflow_effect_id: int,
+    workflow_turn_id: int,
+) -> Dict[str, Any]:
+    """Bind one parent follow-up to the exact unfinished assigned attempt.
+
+    A matching active assignment makes this a managed continuation.  No match
+    leaves the message on the ordinary Inbox path; multiple matches or an
+    unprovable child lineage fail visibly.  The parent effect, assignment,
+    predecessor turn, Inbox row, and successor turn commit atomically.
+    """
+    _ensure_child_assignment_schema()
+    _ensure_delegation_result_schema()
+    _ensure_managed_attempt_lifecycle_schema()
+    _ensure_workflow_schema()
+    with SessionLocal() as db:
+        db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        effect = (
+            db.query(WorkflowEffectModel)
+            .join(WorkflowModel, WorkflowModel.id == WorkflowEffectModel.workflow_id)
+            .filter(
+                WorkflowEffectModel.id == workflow_effect_id,
+                WorkflowEffectModel.effect_kind == "send_message",
+                WorkflowEffectModel.state == "claimed",
+                WorkflowEffectModel.workflow_turn_id == workflow_turn_id,
+                WorkflowModel.root_terminal_id == parent_terminal_id,
+                WorkflowModel.status == WORKFLOW_OPEN,
+                WorkflowModel.active_turn_id == workflow_turn_id,
+            )
+            .one_or_none()
+        )
+        if effect is None:
+            db.rollback()
+            return {
+                "managed": True,
+                "accepted": False,
+                "reason_code": "PARENT_EFFECT_NOT_ADMITTED",
+            }
+
+        # A scheduler commit can survive a lost MCP response while the child
+        # races ahead and finalizes the assignment.  Recover the exact durable
+        # successor by the admitted parent effect before consulting mutable
+        # assignment state; otherwise that retry could fall through as an
+        # unrelated ordinary message after finalization.
+        duplicate_turn = (
+            db.query(WorkflowTurnModel)
+            .filter_by(continuation_parent_effect_id=effect.id)
+            .one_or_none()
+        )
+        if duplicate_turn is not None:
+            duplicate_assignment = (
+                db.get(
+                    ChildAssignmentModel,
+                    cast(int, duplicate_turn.child_assignment_id),
+                )
+                if duplicate_turn.child_assignment_id is not None
+                else None
+            )
+            duplicate_result = (
+                db.query(DelegationResultModel)
+                .filter_by(child_assignment_id=duplicate_assignment.id)
+                .one_or_none()
+                if duplicate_assignment is not None
+                else None
+            )
+            duplicate_message = (
+                db.get(InboxModel, cast(int, duplicate_turn.inbox_message_id))
+                if duplicate_turn.inbox_message_id is not None
+                else None
+            )
+            if (
+                duplicate_assignment is None
+                or duplicate_result is None
+                or duplicate_message is None
+                or duplicate_assignment.parent_terminal_id != parent_terminal_id
+                or duplicate_assignment.child_terminal_id != child_terminal_id
+                or duplicate_result.parent_terminal_id != parent_terminal_id
+                or duplicate_result.child_terminal_id != child_terminal_id
+                or duplicate_message.sender_id != parent_terminal_id
+                or duplicate_message.receiver_id != child_terminal_id
+            ):
+                db.rollback()
+                return {
+                    "managed": True,
+                    "accepted": False,
+                    "reason_code": "ASSIGNED_CONTINUATION_IDENTITY_UNPROVEN",
+                }
+            db.rollback()
+            return {
+                "managed": True,
+                "accepted": True,
+                "duplicate": True,
+                "assignment_id": duplicate_assignment.id,
+                "result_id": duplicate_result.id,
+                "turn_id": duplicate_turn.id,
+                "message": _inbox_model_to_message(duplicate_message),
+            }
+
+        candidates = (
+            db.query(ChildAssignmentModel)
+            .join(
+                DelegationResultModel,
+                DelegationResultModel.child_assignment_id == ChildAssignmentModel.id,
+            )
+            .filter(
+                ChildAssignmentModel.parent_terminal_id == parent_terminal_id,
+                ChildAssignmentModel.child_terminal_id == child_terminal_id,
+                ChildAssignmentModel.status == ChildAssignmentStatus.AWAITING_RESULT.value,
+                DelegationResultModel.delegation_kind == "assign",
+                DelegationResultModel.status == DelegationResultStatus.AWAITING.value,
+                DelegationResultModel.finalized_at.is_(None),
+            )
+            .order_by(ChildAssignmentModel.id.asc())
+            .all()
+        )
+        if not candidates:
+            db.rollback()
+            return {"managed": False}
+        if len(candidates) != 1:
+            db.rollback()
+            return {
+                "managed": True,
+                "accepted": False,
+                "reason_code": "ASSIGNED_CONTINUATION_AMBIGUOUS",
+            }
+        assignment = candidates[0]
+        result = db.query(DelegationResultModel).filter_by(child_assignment_id=assignment.id).one()
+        if (
+            assignment.request_workflow_effect_id is None
+            or assignment.child_workflow_id is None
+            or assignment.child_workflow_turn_id is None
+            or result.parent_workflow_id != assignment.request_workflow_id
+            or result.parent_terminal_id != parent_terminal_id
+            or result.child_terminal_id != child_terminal_id
+            or result.authorship != "cao_lifecycle_snapshot"
+        ):
+            db.rollback()
+            return {
+                "managed": True,
+                "accepted": False,
+                "reason_code": "ASSIGNED_CONTINUATION_IDENTITY_UNPROVEN",
+            }
+
+        child_workflow = _open_workflow(db, child_terminal_id, create=False)
+        predecessor = (
+            db.get(WorkflowTurnModel, cast(int, child_workflow.active_turn_id))
+            if child_workflow is not None and child_workflow.active_turn_id is not None
+            else None
+        )
+        resolved = (
+            _assignment_for_child_workflow(
+                db,
+                child_terminal_id,
+                cast(int, child_workflow.id),
+                parent_terminal_id=parent_terminal_id,
+                authority_turn_id=cast(int, predecessor.id),
+            )
+            if child_workflow is not None and predecessor is not None
+            else None
+        )
+        admitted = bool(
+            predecessor is not None
+            and db.query(WorkflowTurnReceiptModel.id)
+            .filter_by(
+                workflow_turn_id=predecessor.id,
+                receiver_terminal_id=child_terminal_id,
+            )
+            .one_or_none()
+            is not None
+        )
+        if resolved is None or resolved.id != assignment.id or not admitted:
+            db.rollback()
+            return {
+                "managed": True,
+                "accepted": False,
+                "reason_code": "ASSIGNED_CONTINUATION_LINEAGE_UNPROVEN",
+            }
+
+        pending = (
+            db.query(WorkflowTurnModel.id)
+            .filter(
+                WorkflowTurnModel.child_assignment_id == assignment.id,
+                WorkflowTurnModel.state.in_((TURN_QUEUED, TURN_CLAIMED)),
+            )
+            .first()
+        )
+        if pending is not None:
+            db.rollback()
+            return {
+                "managed": True,
+                "accepted": False,
+                "reason_code": "ASSIGNED_CONTINUATION_PENDING",
+            }
+
+        assert child_workflow is not None and predecessor is not None
+        successor_workflow = child_workflow
+        if successor_workflow.status != WORKFLOW_OPEN:
+            successor_workflow = WorkflowModel(
+                root_terminal_id=child_terminal_id,
+                status=WORKFLOW_OPEN,
+            )
+            db.add(successor_workflow)
+            db.flush()
+        inbox = InboxModel(
+            sender_id=parent_terminal_id,
+            receiver_id=child_terminal_id,
+            message=message,
+            status=MessageStatus.PENDING.value,
+            kind="assigned_followup_continuation",
+        )
+        db.add(inbox)
+        db.flush()
+        successor = WorkflowTurnModel(
+            workflow_id=successor_workflow.id,
+            kind="assigned_followup",
+            dedupe_key=f"assigned-followup:{assignment.id}:{effect.id}",
+            payload=message,
+            inbox_message_id=inbox.id,
+            state=TURN_QUEUED,
+            child_assignment_id=assignment.id,
+            assignment_predecessor_turn_id=predecessor.id,
+            continuation_parent_effect_id=effect.id,
+        )
+        db.add(successor)
+        db.flush()
+        lifecycle = db.get(ManagedAttemptLifecycleModel, assignment.id)
+        now = datetime.now()
+        if lifecycle is not None and lifecycle.state not in _MANAGED_ATTEMPT_TERMINAL_STATES:
+            lifecycle.child_workflow_id = successor_workflow.id
+            lifecycle.child_workflow_turn_id = successor.id
+            lifecycle.state = "prompt_delivery_scheduled"
+            lifecycle.reason_code = None
+            lifecycle.prompt_delivery_scheduled_at = now
+            lifecycle.prompt_delivery_acknowledged_at = None
+            lifecycle.provider_admitted_at = None
+            lifecycle.provider_running_at = None
+            lifecycle.waiting_result_at = None
+            lifecycle.recovery_attempt_count = 0
+            lifecycle.recovery_scheduled_at = None
+            lifecycle.recovery_next_retry_at = None
+            lifecycle.recovery_deadline_at = now + timedelta(
+                seconds=_MANAGED_ATTEMPT_ADMISSION_DEADLINE_SECONDS
+            )
+            lifecycle.updated_at = now
+            _managed_attempt_event(
+                db,
+                lifecycle,
+                f"assigned-followup-scheduled:{assignment.id}:{successor.id}",
+                "prompt_delivery_scheduled",
+            )
+        _record_result_event(
+            db,
+            result.id,
+            f"assigned-followup-scheduled:{assignment.id}:{successor.id}",
+            "assigned-followup-scheduled",
+            "cao_lifecycle",
+            parent_terminal_id,
+            workflow_turn_id,
+            {
+                "parent_effect_id": effect.id,
+                "predecessor_turn_id": predecessor.id,
+                "successor_turn_id": successor.id,
+                "successor_workflow_id": successor_workflow.id,
+            },
+        )
+        db.commit()
+        return {
+            "managed": True,
+            "accepted": True,
+            "duplicate": False,
+            "assignment_id": assignment.id,
+            "result_id": result.id,
+            "turn_id": successor.id,
+            "message": _inbox_model_to_message(inbox),
+        }
+
+
 def schedule_managed_handoff_continuation(
     parent_terminal_id: str, child_terminal_id: str, message: str
 ) -> Dict[str, Any]:
@@ -16701,6 +17011,7 @@ def claim_or_resume_workflow_turn_receipt(
                 claim_generation=0,
                 provider_processing_observed_at=now,
                 resume_parent_turn_id=logical_turn_id,
+                child_assignment_id=interrupted.child_assignment_id,
                 created_at=now,
                 updated_at=now,
             )
@@ -18094,11 +18405,7 @@ def _child_workflow_authority_descends_from_assignment(
         if current_id == assignment_turn_id:
             return True
         parent_id = current.resume_parent_turn_id
-        if (
-            current.kind != "execution_resume"
-            or parent_id is None
-            or cast(int, parent_id) >= current_id
-        ):
+        if parent_id is None or cast(int, parent_id) >= current_id:
             return False
         parent = db.get(WorkflowTurnModel, cast(int, parent_id))
         parent_receipt = (
@@ -18109,13 +18416,166 @@ def _child_workflow_authority_descends_from_assignment(
             )
             .one_or_none()
         )
+        if parent is None or parent.workflow_id != child_workflow.id or parent_receipt is None:
+            return False
+        if current.kind == "execution_resume":
+            if (
+                parent.state != TURN_FINISHED
+                or parent_receipt.resumed_by_turn_id != current_id
+                or parent_receipt.resumed_at is None
+            ):
+                return False
+        elif current.kind == "open_final":
+            # This successor is minted only by observe_workflow_final under
+            # the OPEN workflow CAS.  Its exact key and same-workflow parent
+            # are durable continuation authority; unlike execution_resume it
+            # does not consume the provider resume token on the parent receipt.
+            if parent.state != TURN_FINISHED or current.dedupe_key != f"open-final:{parent_id}":
+                return False
+        else:
+            return False
+        current = parent
+    return False
+
+
+def _assigned_continuation_authority_descends_from_assignment(
+    db: Any,
+    assignment: ChildAssignmentModel,
+    authority_turn_id: int,
+) -> bool:
+    """Prove a parent follow-up is an explicit descendant of one assignment.
+
+    The cross-workflow edge is stored on the successor turn together with the
+    exact parent ``send_message`` effect.  Message text and assignment recency
+    are intentionally irrelevant.  Provider-generated ``open_final`` and
+    one-use ``execution_resume`` hops may follow a bound parent continuation,
+    but every hop must retain its existing durable proof.
+    """
+    if assignment.child_workflow_id is None or assignment.child_workflow_turn_id is None:
+        return False
+    current = db.get(WorkflowTurnModel, authority_turn_id)
+    visited: set[int] = set()
+    while current is not None:
+        current_id = cast(int, current.id)
+        workflow = db.get(WorkflowModel, cast(int, current.workflow_id))
+        receipt = (
+            db.query(WorkflowTurnReceiptModel)
+            .filter_by(
+                workflow_turn_id=current_id,
+                receiver_terminal_id=assignment.child_terminal_id,
+            )
+            .one_or_none()
+        )
+        if (
+            current_id in visited
+            or workflow is None
+            or workflow.root_terminal_id != assignment.child_terminal_id
+            or current.state not in {TURN_SENT, TURN_FINISHED}
+            or current.superseded_by_turn_id is not None
+            or current.superseded_at is not None
+            or receipt is None
+        ):
+            return False
+        visited.add(current_id)
+        if (
+            current.workflow_id == assignment.child_workflow_id
+            and _child_workflow_authority_descends_from_assignment(
+                db,
+                workflow,
+                cast(int, assignment.child_workflow_turn_id),
+                assignment.child_terminal_id,
+                authority_turn_id=current_id,
+            )
+        ):
+            return True
+
+        parent_id: Optional[int]
+        if current.kind == "assigned_followup":
+            parent_id = cast(Optional[int], current.assignment_predecessor_turn_id)
+            inbox = (
+                db.get(InboxModel, cast(int, current.inbox_message_id))
+                if current.inbox_message_id is not None
+                else None
+            )
+            effect = (
+                db.get(WorkflowEffectModel, cast(int, current.continuation_parent_effect_id))
+                if current.continuation_parent_effect_id is not None
+                else None
+            )
+            effect_workflow = (
+                db.get(WorkflowModel, cast(int, effect.workflow_id)) if effect is not None else None
+            )
+            if (
+                current.child_assignment_id != assignment.id
+                or parent_id is None
+                or parent_id >= current_id
+                or inbox is None
+                or inbox.kind != "assigned_followup_continuation"
+                or inbox.sender_id != assignment.parent_terminal_id
+                or inbox.receiver_id != assignment.child_terminal_id
+                or inbox.result_id is not None
+                or effect is None
+                or effect.effect_kind != "send_message"
+                or effect.state not in {"claimed", "completed"}
+                or effect_workflow is None
+                or effect_workflow.root_terminal_id != assignment.parent_terminal_id
+            ):
+                return False
+        elif current.kind == "execution_resume":
+            parent_id = cast(Optional[int], current.resume_parent_turn_id)
+            parent_receipt = (
+                db.query(WorkflowTurnReceiptModel)
+                .filter_by(
+                    workflow_turn_id=parent_id,
+                    receiver_terminal_id=assignment.child_terminal_id,
+                )
+                .one_or_none()
+                if parent_id is not None
+                else None
+            )
+            if (
+                parent_id is None
+                or parent_id >= current_id
+                or parent_receipt is None
+                or parent_receipt.resumed_by_turn_id != current_id
+                or parent_receipt.resumed_at is None
+            ):
+                return False
+        elif current.kind == "open_final":
+            parent_id = cast(Optional[int], current.resume_parent_turn_id)
+            if (
+                parent_id is None
+                or parent_id >= current_id
+                or current.dedupe_key != f"open-final:{parent_id}"
+            ):
+                return False
+        else:
+            return False
+        parent = db.get(WorkflowTurnModel, parent_id)
+        parent_workflow = (
+            db.get(WorkflowModel, cast(int, parent.workflow_id)) if parent is not None else None
+        )
+        explicitly_terminalized = bool(
+            current.kind == "assigned_followup"
+            and parent is not None
+            and parent_workflow is not None
+            and parent.state == TURN_SENT
+            and parent_workflow.status == WORKFLOW_TERMINAL
+            and parent_workflow.active_turn_id == parent.id
+            and db.query(WorkflowEffectModel.id)
+            .filter_by(
+                workflow_id=parent.workflow_id,
+                workflow_turn_id=parent.id,
+                effect_kind="complete_workflow",
+                state="completed",
+            )
+            .one_or_none()
+            is not None
+        )
         if (
             parent is None
-            or parent.workflow_id != child_workflow.id
-            or parent.state != TURN_FINISHED
-            or parent_receipt is None
-            or parent_receipt.resumed_by_turn_id != current_id
-            or parent_receipt.resumed_at is None
+            or (current.kind != "assigned_followup" and parent.workflow_id != current.workflow_id)
+            or (parent.state != TURN_FINISHED and not explicitly_terminalized)
         ):
             return False
         current = parent
@@ -18530,6 +18990,7 @@ def _materialize_provider_reconnect_execution_successor(
         not_before=None,
         queue_reason="PROVIDER_RECONNECT_CONTINUATION_PENDING",
         resume_parent_turn_id=source_turn.id,
+        child_assignment_id=source_turn.child_assignment_id,
         created_at=now,
         updated_at=now,
     )
@@ -20445,6 +20906,7 @@ def observe_workflow_final(
                     payload="Provider reported final while this workflow remains OPEN.",
                     state=TURN_QUEUED,
                     resume_parent_turn_id=active_turn_id,
+                    child_assignment_id=active_turn.child_assignment_id,
                     not_before=(
                         now
                         if delay_seconds == 0
@@ -25420,6 +25882,15 @@ def _assignment_for_child_workflow(
     exact_query = query.filter(ChildAssignmentModel.child_workflow_id == child_workflow_id)
     exact = exact_query.order_by(ChildAssignmentModel.id.desc()).first()
     child_workflow = db.get(WorkflowModel, child_workflow_id)
+    authority_turn = (
+        db.get(WorkflowTurnModel, authority_turn_id)
+        if authority_turn_id is not None
+        else (
+            db.get(WorkflowTurnModel, cast(int, child_workflow.active_turn_id))
+            if child_workflow is not None and child_workflow.active_turn_id is not None
+            else None
+        )
+    )
     if (
         exact is not None
         and exact.child_workflow_turn_id is not None
@@ -25433,7 +25904,31 @@ def _assignment_for_child_workflow(
         )
     ):
         return cast(ChildAssignmentModel, exact)
+    if (
+        exact is not None
+        and authority_turn is not None
+        and authority_turn.child_assignment_id == exact.id
+        and _assigned_continuation_authority_descends_from_assignment(
+            db,
+            exact,
+            cast(int, authority_turn.id),
+        )
+    ):
+        return cast(ChildAssignmentModel, exact)
     if exact is not None:
+        return None
+    if authority_turn is not None and authority_turn.child_assignment_id is not None:
+        continued = query.filter(
+            ChildAssignmentModel.id == authority_turn.child_assignment_id
+        ).one_or_none()
+        if continued is None:
+            return None
+        if _assigned_continuation_authority_descends_from_assignment(
+            db,
+            continued,
+            cast(int, authority_turn.id),
+        ):
+            return cast(ChildAssignmentModel, continued)
         return None
     return cast(
         Optional[ChildAssignmentModel],
@@ -27494,7 +27989,26 @@ def create_assigned_child_completion_result_message(
             int(effect.workflow_id),
             authority_turn_id=workflow_turn_id,
         )
-        if assignment is None or assignment.status == ChildAssignmentStatus.CANCELLED.value:
+        if assignment is None:
+            authority_turn = db.get(WorkflowTurnModel, workflow_turn_id)
+            workflow_assignment = (
+                db.query(ChildAssignmentModel.id)
+                .filter_by(
+                    child_terminal_id=child_terminal_id,
+                    child_workflow_id=effect.workflow_id,
+                )
+                .first()
+            )
+            if workflow_assignment is not None or (
+                authority_turn is not None
+                and (
+                    authority_turn.kind == "assigned_followup"
+                    or authority_turn.child_assignment_id is not None
+                )
+            ):
+                raise PermissionError("assigned completion lineage is not proven")
+            return None, False
+        if assignment.status == ChildAssignmentStatus.CANCELLED.value:
             return None, False
         parent_workflow = _open_workflow(db, assignment.parent_terminal_id, create=False)
         if parent_workflow is None or parent_workflow.status != WORKFLOW_OPEN:

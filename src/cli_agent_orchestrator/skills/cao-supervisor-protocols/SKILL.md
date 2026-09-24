@@ -130,7 +130,10 @@ Typical pattern:
 
 ## Idle-Based Message Delivery
 
-Assigned workers usually return results through `send_message`. Those inbox messages are delivered to the supervisor automatically when the supervisor terminal becomes idle.
+Assigned workers finalize through `complete_workflow(reason=...)`. ThreadCells
+delivers the resulting canonical result notice to the supervisor automatically
+when the supervisor terminal becomes idle. A worker's `send_message` is only
+ordinary progress or coordination and does not finalize the assignment.
 
 This means supervisors should:
 
@@ -144,15 +147,19 @@ If you need multiple worker results, dispatch them all first, then end the turn.
 
 ## Callback Pattern
 
-When you use `assign`, include the callback terminal ID in the task message. Tell the worker exactly which terminal should receive the result and instruct the worker to use `send_message`.
+When you use `assign`, include the callback terminal ID in the task message and
+instruct the worker to finalize once through `complete_workflow`.
 
 Example pattern:
 
 ```text
-Analyze dataset A. Send results back to terminal abc123 using send_message.
+Analyze dataset A. Finalize the canonical result once through complete_workflow;
+the assigning parent is terminal abc123.
 ```
 
-Some CAO deployments also append an automatic callback suffix to assigned messages. Treat that appended context as helpful reinforcement, but still write task messages that are explicit and self-contained.
+Some CAO deployments also append automatic callback context to assigned
+messages. Treat that context as helpful reinforcement, but still write task
+messages that are explicit and self-contained.
 
 ## Direct Supervisor Communication
 
@@ -165,6 +172,10 @@ Examples:
 - Send a concise status update to a collaborating supervisor.
 
 When sending direct messages, include enough context that the receiver can act without re-reading the full original task.
+For an unfinished assigned child, ThreadCells binds the parent's admitted
+follow-up to that exact assignment and canonical result. A rejected ambiguous
+or unproven binding is a real lifecycle error; do not compensate by embedding
+assignment IDs in prose or by creating a new assignment.
 
 ## Practical Workflow
 
